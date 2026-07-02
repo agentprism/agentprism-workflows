@@ -1,0 +1,162 @@
+// The capability-negotiation seam (pure, no subprocess): parsing an initialize response, protocol
+// version validation, and the two gates (custom `_meta` keys / MCP transports) that decide what the
+// client is allowed to send based on what the connected agent advertised.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import type { InitializeResponse } from "@agentclientprotocol/sdk";
+import {
+  CODEX_CUSTOM_CAPABILITY_NAMESPACE,
+  CODEX_META_KEYS,
+  META_KEYS,
+  type McpServerConfig,
+} from "@automatalabs/shared-types";
+import {
+  GATED_CUSTOM_META_KEYS,
+  gateCustomMeta,
+  isSupportedProtocolVersion,
+  negotiateCapabilities,
+  unsupportedMcpServer,
+} from "../src/index.js";
+
+/** The fork's advertisement shape, keyed under its namespace (mirrors what the fork emits). */
+function forkAdvertisement(flags: Record<string, boolean>): InitializeResponse {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    agentCapabilities: {
+      sessionCapabilities: { close: {} },
+      _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: flags },
+    },
+  };
+}
+
+// ---- negotiateCapabilities ----------------------------------------------------------
+
+test("negotiateCapabilities extracts version, agentInfo, close support, and the custom block", () => {
+  const negotiated = negotiateCapabilities({
+    protocolVersion: PROTOCOL_VERSION,
+    agentInfo: { name: "codex-acp", title: "Codex", version: "1.2.0" },
+    agentCapabilities: {
+      sessionCapabilities: { close: {} },
+      mcpCapabilities: { http: true, sse: false },
+      _meta: {
+        [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: { outputSchema: true, baseInstructions: true, developerInstructions: true },
+      },
+    },
+  });
+  assert.equal(negotiated.protocolVersion, PROTOCOL_VERSION);
+  assert.deepEqual(negotiated.agentInfo, { name: "codex-acp", title: "Codex", version: "1.2.0" });
+  assert.equal(negotiated.supportsClose, true);
+  assert.deepEqual(negotiated.customMetaSupport, {
+    outputSchema: true,
+    baseInstructions: true,
+    developerInstructions: true,
+  });
+});
+
+test("negotiateCapabilities: a minimal response yields no close support and no custom block (legacy)", () => {
+  const negotiated = negotiateCapabilities({ protocolVersion: PROTOCOL_VERSION });
+  assert.deepEqual(negotiated.agent, {});
+  assert.equal(negotiated.agentInfo, undefined);
+  assert.equal(negotiated.supportsClose, false);
+  assert.equal(negotiated.customMetaSupport, undefined, "no namespace advertised => legacy passthrough");
+});
+
+test("negotiateCapabilities ignores a non-object custom namespace value", () => {
+  const negotiated = negotiateCapabilities({
+    protocolVersion: PROTOCOL_VERSION,
+    agentCapabilities: { _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: true } },
+  });
+  assert.equal(negotiated.customMetaSupport, undefined);
+});
+
+test("negotiateCapabilities ignores a malformed array custom namespace value", () => {
+  const negotiated = negotiateCapabilities({
+    protocolVersion: PROTOCOL_VERSION,
+    agentCapabilities: { _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: [] } },
+  });
+  assert.equal(negotiated.customMetaSupport, undefined);
+});
+
+// ---- isSupportedProtocolVersion -----------------------------------------------------
+
+test("isSupportedProtocolVersion: accepts EXACTLY the client's version, rejects any other", () => {
+  assert.equal(isSupportedProtocolVersion(PROTOCOL_VERSION), true);
+  assert.equal(isSupportedProtocolVersion(PROTOCOL_VERSION + 1), false, "a newer protocol we cannot speak");
+  assert.equal(isSupportedProtocolVersion(PROTOCOL_VERSION - 1), false, "an older protocol we no longer speak");
+  assert.equal(isSupportedProtocolVersion(0), false);
+  assert.equal(isSupportedProtocolVersion(1.5), false);
+});
+
+// ---- gateCustomMeta -----------------------------------------------------------------
+
+test("gateCustomMeta: no advertised namespace => passes every key unchanged (legacy)", () => {
+  const meta = { [META_KEYS.outputSchema]: { a: 1 }, [CODEX_META_KEYS.baseInstructions]: "B" };
+  const support = negotiateCapabilities(forkAdvertisement({})).customMetaSupport; // '{}' block, still a namespace
+  // Sanity: forkAdvertisement({}) DOES advertise the namespace (empty flags) — that gates everything.
+  assert.deepEqual(gateCustomMeta(meta, undefined), meta, "undefined support is the legacy passthrough");
+  // …whereas an advertised-but-empty block treats every flag as unsupported:
+  assert.equal(gateCustomMeta(meta, support), undefined, "advertised empty block drops all gated keys");
+});
+
+test("gateCustomMeta: drops only the un-advertised gated keys, keeps advertised + ungated keys", () => {
+  const support = negotiateCapabilities(
+    forkAdvertisement({ baseInstructions: true, developerInstructions: false, outputSchema: false }),
+  ).customMetaSupport;
+  const meta = {
+    [CODEX_META_KEYS.baseInstructions]: "B",
+    [CODEX_META_KEYS.developerInstructions]: "D",
+    [META_KEYS.runId]: "r1", // ungated key — always survives
+  };
+  assert.deepEqual(gateCustomMeta(meta, support), {
+    [CODEX_META_KEYS.baseInstructions]: "B",
+    [META_KEYS.runId]: "r1",
+  });
+});
+
+test("gateCustomMeta: all advertised => unchanged; does not mutate the input", () => {
+  const support = negotiateCapabilities(
+    forkAdvertisement({ outputSchema: true, baseInstructions: true, developerInstructions: true }),
+  ).customMetaSupport;
+  const meta = { [META_KEYS.outputSchema]: { a: 1 }, [CODEX_META_KEYS.baseInstructions]: "B" };
+  const out = gateCustomMeta(meta, support);
+  assert.deepEqual(out, meta);
+  assert.deepEqual(meta, { [META_KEYS.outputSchema]: { a: 1 }, [CODEX_META_KEYS.baseInstructions]: "B" }, "input untouched");
+});
+
+test("gateCustomMeta: undefined/empty meta is passed through", () => {
+  const support = negotiateCapabilities(forkAdvertisement({})).customMetaSupport;
+  assert.equal(gateCustomMeta(undefined, support), undefined);
+});
+
+test("GATED_CUSTOM_META_KEYS are exactly the fork's three bare wire keys", () => {
+  assert.deepEqual([...GATED_CUSTOM_META_KEYS].sort(), [
+    CODEX_META_KEYS.baseInstructions,
+    CODEX_META_KEYS.developerInstructions,
+    META_KEYS.outputSchema,
+  ].sort());
+});
+
+// ---- unsupportedMcpServer -----------------------------------------------------------
+
+const HTTP_SERVER: McpServerConfig = { type: "http", name: "http-mcp", url: "https://x", headers: [] };
+const SSE_SERVER: McpServerConfig = { type: "sse", name: "sse-mcp", url: "https://x", headers: [] };
+const STDIO_SERVER: McpServerConfig = { name: "stdio-mcp", command: "srv", args: [], env: [] };
+
+test("unsupportedMcpServer: gates http/sse on mcpCapabilities; stdio is always serviceable", () => {
+  const agent = { mcpCapabilities: { http: true, sse: false } };
+  assert.equal(unsupportedMcpServer([HTTP_SERVER], agent), undefined, "http advertised => ok");
+  assert.equal(unsupportedMcpServer([STDIO_SERVER], agent), undefined, "stdio is baseline => ok");
+  assert.deepEqual(unsupportedMcpServer([SSE_SERVER], agent), { name: "sse-mcp", transport: "sse" });
+  // The FIRST unsupported server is reported.
+  assert.deepEqual(unsupportedMcpServer([STDIO_SERVER, SSE_SERVER], agent), { name: "sse-mcp", transport: "sse" });
+});
+
+test("unsupportedMcpServer: no advertised mcpCapabilities => legacy, gate nothing", () => {
+  assert.equal(unsupportedMcpServer([SSE_SERVER, HTTP_SERVER], {}), undefined);
+});
+
+test("unsupportedMcpServer: undefined/empty server list is serviceable", () => {
+  assert.equal(unsupportedMcpServer(undefined, { mcpCapabilities: { http: false, sse: false } }), undefined);
+  assert.equal(unsupportedMcpServer([], { mcpCapabilities: { http: false, sse: false } }), undefined);
+});

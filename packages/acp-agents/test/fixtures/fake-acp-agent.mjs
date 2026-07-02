@@ -83,10 +83,14 @@ class FakeAgent {
 
   initialize(params) {
     record({ method: "initialize", params });
+    // Scenario-driven initialize response (protocolVersion + agentCapabilities + agentInfo), so a
+    // capability-negotiation test can drive a mismatched protocol version, advertise mcpCapabilities,
+    // or advertise the @automatalabs/codex-acp custom-capability namespace. Defaults to a capable
+    // backend that advertises session/close (so the runner releases sessions without killing the
+    // pooled process) — the shape every other test relies on.
+    if (scenario.initialize) return scenario.initialize;
     return {
       protocolVersion: PROTOCOL_VERSION,
-      // Advertise session/close so the runner closes sessions (releasing them) without killing
-      // the pooled process. Mirrors a capable backend.
       agentCapabilities: { sessionCapabilities: { close: {} } },
     };
   }

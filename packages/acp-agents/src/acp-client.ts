@@ -39,8 +39,21 @@ import {
   type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
-import { META_KEYS, type AgentHistoryEntry, type McpServerConfig } from "@automatalabs/shared-types";
+import {
+  META_KEYS,
+  WorkflowError,
+  WorkflowErrorCode,
+  type AgentHistoryEntry,
+  type McpServerConfig,
+} from "@automatalabs/shared-types";
 import type { Backend, BackendId, StructuredSource } from "./backend.js";
+import {
+  gateCustomMeta,
+  isSupportedProtocolVersion,
+  negotiateCapabilities,
+  unsupportedMcpServer,
+  type NegotiatedCapabilities,
+} from "./capabilities.js";
 import { emitSessionUpdate, type AcpEventContext, type AcpEventSink } from "./events.js";
 import { decidePermission, type ToolPolicy } from "./permissions.js";
 import { UsageAccumulator } from "./usage.js";
@@ -302,7 +315,8 @@ export class PooledConnection {
   private resolveDead!: () => void;
   private deathError: Error | undefined;
 
-  private supportsClose = false;
+  /** Set from the one-time initialize handshake; undefined until it completes (or if it failed). */
+  private negotiated: NegotiatedCapabilities | undefined;
   private _alive = true;
   private _activeSessions = 0;
   private stderrTail = "";
@@ -379,6 +393,18 @@ export class PooledConnection {
     return this._activeSessions;
   }
 
+  /** The capabilities negotiated on this connection's one-time initialize handshake, or undefined
+   *  until it completes — derived-state-behind-a-getter, like `alive`/`activeSessions`. */
+  get capabilities(): NegotiatedCapabilities | undefined {
+    return this.negotiated;
+  }
+
+  /** Drop the fork's custom bare `_meta` keys the connected agent did not advertise support for
+   *  (see gateCustomMeta). Applied to BOTH session/new and session/prompt `_meta`. */
+  gateCustomMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+    return gateCustomMeta(meta, this.negotiated?.customMetaSupport);
+  }
+
   /** Mark this connection dead exactly once, then ask the pool to evict it. Idempotent. */
   private die(error: Error): void {
     if (!this._alive) return;
@@ -433,13 +459,32 @@ export class PooledConnection {
         this.race(
           this.rpc.initialize({
             protocolVersion: PROTOCOL_VERSION,
+            // Truthful advertisement: MultiplexClient implements NONE of the client-side
+            // fs/terminal methods, so we advertise none (the ACP rule is "advertise only what you
+            // implement"). Everything omitted here is treated as unsupported by the agent.
             clientCapabilities: {},
             clientInfo: { ...CLIENT_INFO },
           }),
         ),
         deadline,
       ]);
-      this.supportsClose = Boolean(response.agentCapabilities?.sessionCapabilities?.close);
+      const negotiated = negotiateCapabilities(response);
+      // Version negotiation: the agent replies with the version it chose (our requested version if
+      // it supports it, else its own latest). If this client cannot speak it, the ACP spec says
+      // CLOSE the connection and inform the user — kill the process (so the pool evicts it) and
+      // surface a legible error instead of proceeding on an unspoken protocol. Non-recoverable: a
+      // deterministic protocol incompatibility must fail fast, not be retried as a transient
+      // AGENT_EXECUTION_ERROR.
+      if (!isSupportedProtocolVersion(negotiated.protocolVersion)) {
+        this.killNow();
+        throw new WorkflowError(
+          `ACP agent (${this.backendId}) selected protocol version ${negotiated.protocolVersion}, which ` +
+            `this client (protocol v${PROTOCOL_VERSION}) does not support — closing the connection.${this.stderrSuffix()}`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
+      this.negotiated = negotiated;
     } finally {
       clearTimeout(timer);
     }
@@ -454,22 +499,40 @@ export class PooledConnection {
     this._activeSessions += 1;
     try {
       await this.ready;
+      // Capability gate: reject a client-provided MCP server whose transport the connected agent
+      // does not advertise (http/sse gated on mcpCapabilities; stdio is always serviceable).
+      // Fail-fast and non-recoverable — re-running the same incompatible transport can never
+      // succeed. Lenient for agents that advertise no mcpCapabilities (the legacy passthrough).
+      const unsupported = this.negotiated
+        ? unsupportedMcpServer(opts.mcpServers, this.negotiated.agent)
+        : undefined;
+      if (unsupported) {
+        throw new WorkflowError(
+          `MCP server "${unsupported.name}" uses the "${unsupported.transport}" transport, which the ` +
+            `${this.backendId} agent does not support`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false, agentLabel: opts.label },
+        );
+      }
       const state = new SessionState(opts.policy, opts.label, opts.runId);
       // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
       // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
       // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
-      // Codex base/developer instructions), then the engine runId correlation stamp. When no
-      // layer is present, no `_meta` is sent.
-      const meta = stampRunId(
-        layerMeta(
-          this.backend.sessionMetaDefaults?.(),
-          opts.meta,
-          this.backend.sessionMeta(opts.schema, {
-            baseInstructions: opts.baseInstructions,
-            developerInstructions: opts.developerInstructions,
-          }),
+      // Codex base/developer instructions), then the engine runId correlation stamp. The result
+      // is gated against the agent's advertised custom capabilities (a Codex instruction key the
+      // agent said it does not honor is dropped). When no layer survives, no `_meta` is sent.
+      const meta = this.gateCustomMeta(
+        stampRunId(
+          layerMeta(
+            this.backend.sessionMetaDefaults?.(),
+            opts.meta,
+            this.backend.sessionMeta(opts.schema, {
+              baseInstructions: opts.baseInstructions,
+              developerInstructions: opts.developerInstructions,
+            }),
+          ),
+          opts.runId,
         ),
-        opts.runId,
       );
       const request: NewSessionRequest = {
         cwd: opts.cwd,
@@ -504,7 +567,7 @@ export class PooledConnection {
   async releaseSession(sessionId: string): Promise<void> {
     this.client.unregister(sessionId);
     if (this._activeSessions > 0) this._activeSessions -= 1;
-    if (!this.supportsClose || !this._alive) return;
+    if (!this.negotiated?.supportsClose || !this._alive) return;
     try {
       await this.race(withTimeout(this.rpc.closeSession({ sessionId }), CLOSE_SESSION_TIMEOUT_MS));
     } catch {
@@ -697,10 +760,13 @@ export class SessionHandle implements StructuredSource {
     this.opts.signal?.throwIfAborted();
     this.state.beginTurn();
     const prompt: ContentBlock[] = [{ type: "text", text }];
+    // Gate the turn `_meta` against the agent's advertised custom capabilities: the Codex
+    // outputSchema forward is dropped when the connected agent said it does not honor it.
+    const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
     const request: PromptRequest = {
       sessionId: this.sessionId,
       prompt,
-      ...(promptMeta ? { _meta: promptMeta } : {}),
+      ...(gatedMeta ? { _meta: gatedMeta } : {}),
     };
     const response = await this.pooled.race(this.pooled.rpc.prompt(request));
     this.state.usage.recordPromptUsage(response.usage);

@@ -23,6 +23,18 @@ export const CODEX_META_KEYS = {
   developerInstructions: "developerInstructions",
 } as const;
 
+/** The `agentCapabilities._meta` NAMESPACE under which the @automatalabs/codex-acp fork advertises
+ *  its custom capabilities (the ACP extensibility convention — custom capabilities are namespaced
+ *  `_meta` keys: https://agentclientprotocol.com/protocol/v1/extensibility). Keyed by the fork's
+ *  published package identity so it never collides with another extension. Under this key the fork
+ *  publishes a `{ [bareKey]: boolean }` block whose flags are named EXACTLY the bare `_meta` wire
+ *  keys they gate — META_KEYS.outputSchema and CODEX_META_KEYS.{baseInstructions,
+ *  developerInstructions} — so a client tests `block[bareKey] === true` before sending each key.
+ *  An agent that omits this namespace has NOT opted into negotiation: the client keeps sending
+ *  every key (the pre-advertisement / non-fork legacy path), because fork releases ≤ 1.2.0 and
+ *  arbitrary custom ACP servers honor these inputs without advertising them. */
+export const CODEX_CUSTOM_CAPABILITY_NAMESPACE = "@automatalabs/codex-acp";
+
 /** VENDOR (claude-agent-acp) — NOT ours; the SDK's. Set at session/new for the Claude
  *  structured-output path: _meta.claudeCode.options.outputFormat = { type:"json_schema", schema }
  *  AND _meta.claudeCode.emitRawSDKMessages = true (MANDATORY — the parsed object lands on
