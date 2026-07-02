@@ -203,6 +203,19 @@ class MultiplexClient implements Client {
   }
 }
 
+const DEFAULT_INIT_TIMEOUT_MS = 60_000;
+
+/** Deadline for the one-time ACP `initialize` handshake per pooled process. Overridable via
+ *  AGENTPRISM_ACP_INIT_TIMEOUT_MS (e.g. for slow cold-start backends). Clamped to >= 1s. */
+function initializeTimeoutMs(): number {
+  const env = process.env.AGENTPRISM_ACP_INIT_TIMEOUT_MS;
+  if (env !== undefined) {
+    const parsed = Number.parseInt(env, 10);
+    if (Number.isFinite(parsed) && parsed >= 1000) return parsed;
+  }
+  return DEFAULT_INIT_TIMEOUT_MS;
+}
+
 /** Shallow-merge `_meta` layers lowest-to-highest precedence, treating empty layers as absent
  *  so an unconfigured session keeps sending NO `_meta` at all. */
 function layerMeta(...layers: Array<Record<string, unknown> | undefined>): Record<string, unknown> | undefined {
@@ -397,14 +410,39 @@ export class PooledConnection {
   }
 
   private async initialize(): Promise<void> {
-    const response = await this.race(
-      this.rpc.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {},
-        clientInfo: { ...CLIENT_INFO },
-      }),
-    );
-    this.supportsClose = Boolean(response.agentCapabilities?.sessionCapabilities?.close);
+    // Handshake deadline: a command that is NOT an ACP server never answers `initialize`, and
+    // without a deadline the first openSession() would hang forever. On timeout the process is
+    // killed and a legible error surfaces (fail-fast hygiene — this is NOT a security gate;
+    // the process has already been spawned by then). Tunable for slow cold starts.
+    const timeoutMs = initializeTimeoutMs();
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `ACP agent (${this.backendId}) did not complete the ACP initialize handshake within ${timeoutMs}ms — ` +
+              `is the configured command an ACP server?${this.stderrSuffix()}`,
+          ),
+        );
+        this.killNow();
+      }, timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const response = await Promise.race([
+        this.race(
+          this.rpc.initialize({
+            protocolVersion: PROTOCOL_VERSION,
+            clientCapabilities: {},
+            clientInfo: { ...CLIENT_INFO },
+          }),
+        ),
+        deadline,
+      ]);
+      this.supportsClose = Boolean(response.agentCapabilities?.sessionCapabilities?.close);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

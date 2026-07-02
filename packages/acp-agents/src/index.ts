@@ -8,7 +8,7 @@ export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
 export type { AcpRunnerOptions } from "./runner.js";
 
 // The custom-backend registry: run ANY ACP agent as an agent() target.
-export { BACKENDS_ENV, resolveBackendRegistry } from "./registry.js";
+export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from "./registry.js";
 export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./registry.js";
 
 export { PooledConnection, SessionHandle } from "./acp-client.js";

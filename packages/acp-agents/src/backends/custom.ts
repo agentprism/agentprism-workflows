@@ -11,6 +11,7 @@
 //                  keys and the runId stamp win over both).
 // SessionMetaInputs (Codex base/developer instruction overrides) are IGNORED — they are a
 // codex-acp vendor contract; a custom agent's knobs travel through the generic meta channels.
+import { createHash } from "node:crypto";
 import type { TSchema } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
 import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
@@ -20,6 +21,9 @@ import { parseFinalJson } from "../structured-output.js";
 
 export class CustomAcpBackend implements Backend {
   readonly id: string;
+  /** id + spawn-config hash: two registries (e.g. two scripts' `meta.backends`) may declare
+   *  the SAME name with DIFFERENT commands — the pool must never share a process across them. */
+  readonly poolKey: string;
   /** The agent may ignore the `_meta.outputSchema` forward, so the runner must also state the
    *  schema in the prompt — otherwise the model returns JSON with keys it invented and the
    *  repair ladder can never converge on a contract the model was never shown. */
@@ -27,6 +31,12 @@ export class CustomAcpBackend implements Backend {
 
   constructor(private readonly config: RegisteredBackend) {
     this.id = config.name;
+    const spawnIdentity = JSON.stringify({
+      command: config.command,
+      args: config.args ?? [],
+      env: config.env ?? {},
+    });
+    this.poolKey = `${config.name}#${createHash("sha256").update(spawnIdentity).digest("hex").slice(0, 12)}`;
   }
 
   spawnConfig(): SpawnConfig {

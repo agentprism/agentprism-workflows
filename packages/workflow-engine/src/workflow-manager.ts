@@ -11,7 +11,14 @@
  */
 
 import { EventEmitter } from "node:events";
-import type { AgentRunner, JournalEntry, TokenUsage, WorkflowMeta, WorkflowRunResult } from "@automatalabs/shared-types";
+import type {
+  AgentRunner,
+  JournalEntry,
+  TokenUsage,
+  WorkflowBackendConfig,
+  WorkflowMeta,
+  WorkflowRunResult,
+} from "@automatalabs/shared-types";
 import { preview, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
@@ -79,6 +86,13 @@ export interface ExecOptions {
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
+  /**
+   * APPROVED script-declared custom ACP backends (`meta.backends`) for this run. The
+   * composition root owns the approval decision (MCP elicitation, SDK allowScriptBackends,
+   * or the env opt-in) — omitting this leaves script-declared backends inert. Threaded to
+   * runWorkflow's scriptBackends verbatim.
+   */
+  scriptBackends?: Record<string, WorkflowBackendConfig>;
 }
 
 export interface WorkflowManagerOptions {
@@ -393,6 +407,7 @@ export class WorkflowManager extends EventEmitter {
       concurrency,
       agentRetries,
       confirm,
+      scriptBackends,
     } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
@@ -421,6 +436,7 @@ export class WorkflowManager extends EventEmitter {
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
         confirm,
+        scriptBackends,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,

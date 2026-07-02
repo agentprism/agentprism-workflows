@@ -68,6 +68,26 @@ export function resolveBackendRegistry(
   return registry;
 }
 
+/**
+ * Layer a RUN-SCOPED registry (an approved script-declared `meta.backends`, arriving via
+ * RunOptions.backends) UNDER the host registry: run entries are validated with the same rules
+ * (reserved names rejected), and a host-registered name always wins on conflict — a script can
+ * never hijack a name the operator configured. Returns the host registry unchanged when the
+ * run declares nothing.
+ */
+export function registryWithRunBackends(
+  host: BackendRegistry,
+  run?: Record<string, CustomBackendConfig>,
+): BackendRegistry {
+  if (!run || Object.keys(run).length === 0) return host;
+  const merged = new Map<string, RegisteredBackend>();
+  for (const [name, config] of Object.entries(run)) {
+    merged.set(...validateEntry(name, config, "script backends (meta.backends)"));
+  }
+  for (const [name, entry] of host) merged.set(name, entry); // host wins on conflict
+  return merged;
+}
+
 function validateEntry(rawName: string, config: unknown, source: string): [string, RegisteredBackend] {
   const name = rawName.toLowerCase();
   if (!NAME_PATTERN.test(name)) {

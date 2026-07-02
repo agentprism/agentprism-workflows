@@ -40,6 +40,11 @@ export interface SessionMetaInputs {
 
 export interface Backend {
   readonly id: BackendId;
+  /** Pool identity for this backend's long-lived processes. Defaults to `id` — but a CUSTOM
+   *  backend sets it to id + a spawn-config hash, because two runs may declare the SAME name
+   *  with DIFFERENT commands (script-declared `meta.backends`): keying the pool by name alone
+   *  would hand run B a pooled process spawned from run A's command. */
+  readonly poolKey?: string;
   /** When true, the runner EMBEDS the JSON Schema in the prompt text on schema runs. For the
    *  built-ins the native constraint channel is authoritative and this stays unset; a CUSTOM
    *  backend sets it because its agent may ignore the `_meta.outputSchema` forward entirely —

@@ -2,6 +2,7 @@
 import type { Static, TSchema } from "typebox";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { McpServerConfig } from "./mcp-config.js";
+import type { WorkflowBackendConfig } from "./workflow-result.js";
 
 /** Real token/cost usage for ONE subagent run. Delivered OUT-OF-BAND via
  *  RunOptions.onUsage — NEVER via run()'s return value. Fires on BOTH the success
@@ -40,8 +41,8 @@ export interface AgentUsage {
  * model, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
  * onUsage, onHistory. Plus ADDITIVE run inputs that wire infrastructure / shape the backend,
  * NOT the logical call, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
- * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, and the Codex-only
- * `baseInstructions` / `developerInstructions`.
+ * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
+ * backend registry `backends`, and the Codex-only `baseInstructions` / `developerInstructions`.
  * `maxSchemaRetries` is runner-internal (the engine never passes it). Pi's
  * `tools?: ToolDefinition[]` is DROPPED — a pi-coding-agent type with no ACP analog (ACP
  * injects tools via session/new mcpServers, not this field) and never passed by the engine.
@@ -93,6 +94,14 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  part of the resume identity hash (hashAgentCall) — it correlates, it does not identify the
    *  logical call. Omitted => no runId `_meta` is stamped. */
   runId?: string;
+  /** RUN-SCOPED custom ACP backends (an APPROVED script-declared `meta.backends`, threaded
+   *  by the engine on every agent() call of the run). The runner validates entries with the
+   *  same rules as the host registry (reserved names rejected) and consults them for routing
+   *  AFTER the host-registered names — a script can never hijack a name the host configured.
+   *  ADDITIVE and NOT part of the resume identity hash (hashAgentCall): like `mcpServers`,
+   *  it wires infrastructure, not the logical call (the routing `model` string IS hashed).
+   *  Omitted => only host-registered + built-in backends are routable. */
+  backends?: Record<string, WorkflowBackendConfig>;
   /** Generic ACP `_meta` passthrough, SESSION-scoped: merged into the outgoing ACP
    *  `session/new` `_meta` so a workflow can drive ANY ACP agent's custom extension surface
    *  (the protocol reserves `_meta` for exactly this). Merge precedence: these keys are laid
