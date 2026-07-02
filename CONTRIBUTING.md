@@ -64,9 +64,10 @@ pnpm release          # pnpm build && changeset publish (CI only)
 
 Publishing runs from [`.github/workflows/release.yml`](.github/workflows/release.yml) on push to `main`, via **OIDC trusted publishing** (no long-lived npm token; SLSA provenance):
 
-1. Add a changeset (`pnpm changeset`) in your PR describing the change + bump levels, and merge it to `main`.
-2. Changesets opens a **"Version Packages"** PR that applies the bumps + changelogs.
-3. Merging that PR triggers `changeset publish`, which publishes the bumped packages.
+1. Check/bump the ACP protocol deps (`@agentclientprotocol/sdk`, `@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`) to current before cutting a release.
+2. Add a changeset (`pnpm changeset`) in your PR describing the change + bump levels, and merge it to `main`.
+3. Changesets opens a **"Version Packages"** PR that applies the bumps + changelogs.
+4. Merging that PR triggers `changeset publish`, which publishes the bumped packages.
 
 The Codex `outputSchema` forward lives in the published `@automatalabs/codex-acp` fork (exact-pinned by `acp-agents`), so a change to that wire key is a **coordinated release**: publish the fork first, then bump the pinned dep. The repo is licensed Apache-2.0 (`LICENSE`).
 

@@ -109,13 +109,20 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  `baseInstructions`/`developerInstructions` forwards, the `runId` stamp) override on
    *  conflict — user meta can never break the structured-output or correlation channels.
    *  ADDITIVE and NOT part of the resume identity hash (hashAgentCall): it shapes the agent,
-   *  not the logical call. Omitted => the request `_meta` is whatever the backend set. */
+   *  not the logical call. Omitted => the request `_meta` is whatever the backend set.
+   *  The bare keys `outputSchema`, `baseInstructions`, `developerInstructions` are RESERVED
+   *  negotiation-gated names: an agent advertising the `@automatalabs/codex-acp` capability
+   *  namespace with the same-named flag not `true` drops that key before sending (see
+   *  CODEX_CUSTOM_CAPABILITY_NAMESPACE in meta.ts). */
   meta?: Record<string, unknown>;
   /** Generic ACP `_meta` passthrough, TURN-scoped: merged into the outgoing ACP
    *  `session/prompt` `_meta` (the extension point where e.g. the Codex `outputSchema`
    *  forward rides). Same merge precedence as `meta`: user keys first, backend-computed keys
    *  (e.g. `outputSchema` when a schema is set) win on conflict. ADDITIVE and NOT hashed.
-   *  Omitted => the prompt `_meta` is whatever the backend set. */
+   *  Omitted => the prompt `_meta` is whatever the backend set. The bare keys `outputSchema`,
+   *  `baseInstructions`, `developerInstructions` are RESERVED negotiation-gated names: an agent
+   *  advertising the `@automatalabs/codex-acp` capability namespace with the same-named flag not
+   *  `true` drops that key before sending (see CODEX_CUSTOM_CAPABILITY_NAMESPACE in meta.ts). */
   promptMeta?: Record<string, unknown>;
   /** CODEX-ONLY. Replaces Codex's built-in base system prompt for the session. The runner forwards
    *  it on ACP `session/new` `_meta.baseInstructions`, which the @automatalabs/codex-acp adapter
