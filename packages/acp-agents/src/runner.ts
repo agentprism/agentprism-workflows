@@ -38,7 +38,12 @@ import type { Backend } from "./backend.js";
 import { ClaudeBackend } from "./backends/claude.js";
 import { CodexBackend } from "./backends/codex.js";
 import { CustomAcpBackend } from "./backends/custom.js";
-import { resolveBackendRegistry, type BackendRegistry, type CustomBackendConfig } from "./registry.js";
+import {
+  registryWithRunBackends,
+  resolveBackendRegistry,
+  type BackendRegistry,
+  type CustomBackendConfig,
+} from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
 import { toJsonSchema } from "./schema-strict.js";
 import type { ToolPolicy } from "./permissions.js";
@@ -104,7 +109,19 @@ export class AcpAgentRunner implements AgentRunner {
   ): Promise<AgentResult<S>> {
     const opts = options as AnyRunOptions;
     const schema = opts.schema;
-    const backend = selectBackend(opts, this.backends);
+    // Layer any run-scoped backends (an APPROVED script-declared meta.backends) under the
+    // host registry. Malformed/reserved entries fail the call loudly and are NOT retried —
+    // re-running a misdeclared registry can never succeed.
+    let registry: BackendRegistry;
+    try {
+      registry = registryWithRunBackends(this.backends, opts.backends);
+    } catch (error) {
+      throw new WorkflowError((error as Error).message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+        agentLabel: opts.label,
+      });
+    }
+    const backend = selectBackend(opts, registry);
     const policy: ToolPolicy = { allow: opts.toolNames, deny: opts.disallowedToolNames };
     const cwd = opts.cwd ?? process.cwd();
 

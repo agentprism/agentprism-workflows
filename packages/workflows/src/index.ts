@@ -11,9 +11,9 @@
 // in ./dsl.d.ts (referenced above), not exported here.
 
 import { createAcpRunner } from "@automatalabs/acp-agents";
-import { WorkflowManager } from "@automatalabs/workflow-engine";
+import { parseWorkflowScript, WorkflowError, WorkflowErrorCode, WorkflowManager } from "@automatalabs/workflow-engine";
 import type { ExecOptions } from "@automatalabs/workflow-engine";
-import type { AgentRunner, WorkflowRunResult } from "@automatalabs/shared-types";
+import type { AgentRunner, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
@@ -79,7 +79,20 @@ export type {
 // ── Shared seam types: the AgentRunner contract and its opts/result/usage shapes,
 //    so callers can implement or type a custom runner without reaching past the SDK. ──
 export type { AgentRunner, RunOptions, AgentResult, AgentUsage } from "@automatalabs/shared-types";
-export type { JournalEntry } from "@automatalabs/shared-types";
+export type { JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
+
+/**
+ * Approval policy for SCRIPT-DECLARED custom ACP backends (`meta.backends`). Script backends
+ * spawn arbitrary commands on this machine, so they are INERT unless the embedder approves
+ * them: `true` approves everything the script declares; a callback is asked per backend (and
+ * a single decline aborts the run — a declined backend would otherwise silently reroute its
+ * agent() calls to the default backend). Omitted/false + a script that declares backends =>
+ * runDynamicWorkflow THROWS with guidance rather than running a script whose declared
+ * dependencies were dropped.
+ */
+export type ScriptBackendApproval =
+  | boolean
+  | ((backend: { name: string } & WorkflowBackendConfig) => boolean | Promise<boolean>);
 
 /** Options for {@link runDynamicWorkflow}. */
 export interface RunDynamicWorkflowOptions {
@@ -93,6 +106,8 @@ export interface RunDynamicWorkflowOptions {
   args?: unknown;
   /** Per-execution options forwarded to `WorkflowManager.runSync` (timeouts, signal, budget, …). */
   exec?: ExecOptions;
+  /** Approval policy for script-declared `meta.backends` (see {@link ScriptBackendApproval}). */
+  allowScriptBackends?: ScriptBackendApproval;
 }
 
 /**
@@ -105,9 +120,52 @@ export interface RunDynamicWorkflowOptions {
  * `WorkflowRunResult` (status `completed | paused | failed | aborted`) — never throwing
  * for an ordinary pause/fail — so the caller can read `result.status` directly.
  */
-export function runDynamicWorkflow(
+export async function runDynamicWorkflow(
   script: string,
   opts: RunDynamicWorkflowOptions = {},
 ): Promise<WorkflowRunResult> {
-  return new WorkflowManager({ agent: opts.runner ?? createAcpRunner() }).runSync(script, opts.args, opts.exec);
+  // Script-declared backends need explicit approval BEFORE the run. A malformed script is
+  // deliberately not diagnosed here — runSync re-parses and throws the engine's own parse
+  // error (its pre-existing contract), so the approval gate never masks a parse message.
+  let declared: Record<string, WorkflowBackendConfig> | undefined;
+  try {
+    declared = parseWorkflowScript(script).meta.backends;
+  } catch {
+    declared = undefined;
+  }
+  let exec = opts.exec;
+  if (declared && Object.keys(declared).length > 0) {
+    exec = { ...(exec ?? {}), scriptBackends: await approveScriptBackends(declared, opts.allowScriptBackends) };
+  }
+  return new WorkflowManager({ agent: opts.runner ?? createAcpRunner() }).runSync(script, opts.args, exec);
+}
+
+/** Resolve the embedder's approval policy over the declared backends; throw with guidance when
+ *  approval is missing or any backend is declined (an unapproved dependency must abort, never
+ *  silently reroute). */
+async function approveScriptBackends(
+  declared: Record<string, WorkflowBackendConfig>,
+  approval: ScriptBackendApproval | undefined,
+): Promise<Record<string, WorkflowBackendConfig>> {
+  const names = Object.keys(declared).join(", ");
+  if (approval === undefined || approval === false) {
+    throw new WorkflowError(
+      `script declares custom ACP backends (meta.backends: ${names}) — these spawn commands on this machine and require explicit approval. ` +
+        `Pass allowScriptBackends: true (or a per-backend approval callback) to runDynamicWorkflow, ` +
+        `or thread an approved registry yourself via exec.scriptBackends.`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  if (approval === true) return declared;
+  for (const [name, config] of Object.entries(declared)) {
+    if (!(await approval({ name, ...config }))) {
+      throw new WorkflowError(
+        `script backend "${name}" (command: ${config.command}) was declined by the allowScriptBackends callback — aborting the run`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+  }
+  return declared;
 }

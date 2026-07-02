@@ -68,7 +68,10 @@ export class AcpAgentPool {
    * double-book a connection.
    */
   private selectConnection(backend: Backend): PooledConnection {
-    const connections = this.connectionsFor(backend.id);
+    // Pool identity: poolKey (id + spawn-config hash for custom backends) over bare id, so two
+    // runs declaring the same NAME with different COMMANDS never share a process.
+    const key = backend.poolKey ?? backend.id;
+    const connections = this.connectionsFor(key);
     const live = connections.filter((c) => c.alive);
 
     const idle = live.find((c) => c.activeSessions === 0);
@@ -77,7 +80,7 @@ export class AcpAgentPool {
     if (live.length < this.size) {
       this.installExitHook();
       const connection = PooledConnection.create(backend, {
-        onDead: (dead) => this.drop(backend.id, dead),
+        onDead: (dead) => this.drop(key, dead),
         onEvent: this.deps.onEvent,
       });
       connections.push(connection);
@@ -88,18 +91,18 @@ export class AcpAgentPool {
     return live.reduce((least, c) => (c.activeSessions < least.activeSessions ? c : least));
   }
 
-  private connectionsFor(id: BackendId): PooledConnection[] {
-    let arr = this.byBackend.get(id);
+  private connectionsFor(key: string): PooledConnection[] {
+    let arr = this.byBackend.get(key);
     if (!arr) {
       arr = [];
-      this.byBackend.set(id, arr);
+      this.byBackend.set(key, arr);
     }
     return arr;
   }
 
   /** Evict a dead connection so it is never handed out again. */
-  private drop(id: BackendId, connection: PooledConnection): void {
-    const arr = this.byBackend.get(id);
+  private drop(key: string, connection: PooledConnection): void {
+    const arr = this.byBackend.get(key);
     if (!arr) return;
     const index = arr.indexOf(connection);
     if (index >= 0) arr.splice(index, 1);

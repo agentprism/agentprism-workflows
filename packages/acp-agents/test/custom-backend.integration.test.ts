@@ -204,6 +204,60 @@ test("custom backend: registers via AGENTPRISM_BACKENDS env and serves as the de
   assert.ok(readLog().some((e) => e.method === "prompt"), "the env-registered agent served the run");
 });
 
+test("run-level backends (RunOptions.backends): route without any constructor/env registration", async () => {
+  const { config, cwd, readLog } = fakeBackend({ turns: [{ text: "run-scoped" }] });
+  // NO backends option, NO env: the registry arrives per-run (an approved meta.backends).
+  const out = await makeRunner({}).run("hi", { model: "fake", cwd, backends: { fake: config } });
+  assert.equal(out, "run-scoped");
+  assert.ok(readLog().some((e) => e.method === "prompt"), "the run-declared agent served the call");
+});
+
+test("run-level backends: host registration WINS over a run-declared config of the same name", async () => {
+  const host = fakeBackend({ turns: [{ text: "from-host" }] });
+  const run = fakeBackend({ turns: [{ text: "from-run" }] });
+  const out = await makeRunner({ fake: host.config }).run("hi", {
+    model: "fake",
+    cwd: host.cwd,
+    backends: { fake: run.config },
+  });
+  assert.equal(out, "from-host", "the host-registered command served the call");
+  assert.equal(run.readLog().length, 0, "the run-declared command was never spawned");
+});
+
+test("run-level backends: SAME name with DIFFERENT configs never share a pooled process", async () => {
+  const first = fakeBackend({ turns: [{ text: "one" }] });
+  const second = fakeBackend({ turns: [{ text: "two" }] });
+  const runner = makeRunner({});
+  assert.equal(await runner.run("a", { model: "fake", cwd: first.cwd, backends: { fake: first.config } }), "one");
+  assert.equal(await runner.run("b", { model: "fake", cwd: second.cwd, backends: { fake: second.config } }), "two");
+  // Each config logged its own __start: two distinct processes, keyed by spawn-config hash.
+  const firstPids = first.readLog().filter((e) => e.method === "__start");
+  const secondPids = second.readLog().filter((e) => e.method === "__start");
+  assert.equal(firstPids.length, 1, "first config spawned exactly one process");
+  assert.equal(secondPids.length, 1, "second config spawned its OWN process (no pool collision)");
+});
+
+test("run-level backends: malformed/reserved declarations fail NON-RECOVERABLY with a clear message", async () => {
+  await assert.rejects(
+    makeRunner({}).run("hi", { model: "x", backends: { claude: { command: "x" } } }),
+    (error: Error & { recoverable?: boolean }) => /reserved/.test(error.message) && error.recoverable === false,
+  );
+});
+
+test("initialize handshake: a non-ACP command fails fast with a legible error (and is killed)", async () => {
+  process.env.AGENTPRISM_ACP_INIT_TIMEOUT_MS = "1500";
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      makeRunner({ notacp: { command: "sleep", args: ["60"] } }).run("hi", { model: "notacp" }),
+      /did not complete the ACP initialize handshake within 1500ms/,
+    );
+    assert.ok(Date.now() - started < 15_000, "failed fast, not after a long hang");
+  } finally {
+    delete process.env.AGENTPRISM_ACP_INIT_TIMEOUT_MS;
+  }
+});
+
 test("builtin backends: generic meta/promptMeta merge under the protocol-critical channels", async () => {
   // The fake serves the CLAUDE spawn override here — proving the passthrough also works for
   // built-ins and never clobbers the Claude schema channel.

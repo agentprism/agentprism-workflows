@@ -10,6 +10,7 @@ import { META_KEYS } from "@automatalabs/shared-types";
 import {
   BACKENDS_ENV,
   CustomAcpBackend,
+  registryWithRunBackends,
   resolveBackendRegistry,
   selectBackend,
 } from "../src/index.js";
@@ -135,6 +136,52 @@ test("CustomAcpBackend: reads the result off the final text like Codex (JSON, fe
   });
   assert.equal(backend.nativeStructured(source("no json here")), undefined);
   assert.equal(backend.nativeStructured(source("")), undefined);
+});
+
+// ---- registryWithRunBackends (script-declared meta.backends) --------------------------
+
+test("run backends: layered UNDER the host registry — host wins on name conflict", () => {
+  const host = resolveBackendRegistry({ browser: { command: "host-browser" } });
+  const merged = registryWithRunBackends(host, {
+    browser: { command: "script-browser" },
+    imagegen: { command: "imagegen-acp" },
+  });
+  assert.equal(merged.get("browser")?.command, "host-browser", "a script can never hijack a host name");
+  assert.equal(merged.get("imagegen")?.command, "imagegen-acp", "non-conflicting script entries register");
+  assert.equal(host.size, 1, "the host registry is not mutated");
+});
+
+test("run backends: empty/absent run declarations return the host registry unchanged", () => {
+  const host = resolveBackendRegistry({ browser: { command: "host-browser" } });
+  assert.equal(registryWithRunBackends(host, undefined), host);
+  assert.equal(registryWithRunBackends(host, {}), host);
+});
+
+test("run backends: validated with the same rules (reserved names, config shapes)", () => {
+  const host = resolveBackendRegistry();
+  assert.throws(() => registryWithRunBackends(host, { claude: { command: "x" } }), /reserved/);
+  assert.throws(() => registryWithRunBackends(host, { b: { command: "" } }), /non-empty string "command"/);
+});
+
+// ---- poolKey (spawn-config identity) ----------------------------------------------------
+
+test("CustomAcpBackend.poolKey: same config => same key; different command/args/env => different keys", () => {
+  const a1 = new CustomAcpBackend({ name: "browser", command: "browser-acp", args: ["--headless"] });
+  const a2 = new CustomAcpBackend({ name: "browser", command: "browser-acp", args: ["--headless"] });
+  const differentCommand = new CustomAcpBackend({ name: "browser", command: "other-acp", args: ["--headless"] });
+  const differentEnv = new CustomAcpBackend({ name: "browser", command: "browser-acp", args: ["--headless"], env: { A: "1" } });
+  assert.equal(a1.poolKey, a2.poolKey);
+  assert.notEqual(a1.poolKey, differentCommand.poolKey, "same NAME, different COMMAND must never share a pool slot");
+  assert.notEqual(a1.poolKey, differentEnv.poolKey);
+  assert.ok(a1.poolKey.startsWith("browser#"), "the key stays name-prefixed for observability");
+  // sessionMeta does not affect the spawned process, so it must not fragment the pool.
+  const differentSessionMeta = new CustomAcpBackend({
+    name: "browser",
+    command: "browser-acp",
+    args: ["--headless"],
+    sessionMeta: { mode: "verify" },
+  });
+  assert.equal(a1.poolKey, differentSessionMeta.poolKey);
 });
 
 // ---- selectBackend routing ------------------------------------------------------------

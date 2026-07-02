@@ -20,12 +20,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
-import { WorkflowManager } from "@automatalabs/workflows";
+import { parseWorkflowScript, WorkflowManager } from "@automatalabs/workflows";
 import type {
   ExecOptions,
   WorkflowSnapshot,
   AgentRunner,
   JournalEntry,
+  WorkflowBackendConfig,
   WorkflowRunResult,
 } from "@automatalabs/workflows";
 
@@ -106,6 +107,118 @@ function createConfirm(server: Server): WorkflowConfirmCallback {
   };
 }
 
+/** Headless opt-in for script-declared backends (set in the mcpServers `env` block). */
+const ALLOW_SCRIPT_BACKENDS_ENV = "AGENTPRISM_ALLOW_SCRIPT_BACKENDS";
+
+function scriptBackendsAllowedByEnv(): boolean {
+  const value = process.env[ALLOW_SCRIPT_BACKENDS_ENV]?.trim().toLowerCase();
+  return value === "1" || value === "true";
+}
+
+/** One approval decision per unique spawn config. The key is the full config JSON so a script
+ *  that changes a backend's command/args/env re-prompts; approvals are session-sticky,
+ *  declines are not (the user may change their mind on a later call). */
+type BackendApprovals = Set<string>;
+
+function backendApprovalKey(name: string, config: WorkflowBackendConfig): string {
+  return JSON.stringify({ name, command: config.command, args: config.args ?? [], env: config.env ?? {} });
+}
+
+function describeBackend(name: string, config: WorkflowBackendConfig): string {
+  const lines = [`backend "${name}"`, `  command: ${config.command}${(config.args ?? []).length ? " " + (config.args ?? []).join(" ") : ""}`];
+  const env = config.env ?? {};
+  if (Object.keys(env).length > 0) {
+    lines.push(`  env: ${Object.entries(env).map(([k, v]) => `${k}=${v}`).join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+type ScriptBackendsGate =
+  | { ok: true; backends?: Record<string, WorkflowBackendConfig> }
+  | { ok: false; message: string };
+
+/**
+ * The TRUST GATE for script-declared `meta.backends` (they spawn arbitrary commands on this
+ * machine, so they are inert until approved):
+ *   1. env opt-in (AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1) approves headlessly — the operator
+ *      accepted the risk in their MCP config;
+ *   2. else, a client that advertises the elicitation capability is asked to approve each
+ *      unique spawn config (approvals are session-sticky); a decline aborts the call;
+ *   3. else, the call fails with guidance naming the env opt-in — an informative tool error,
+ *      never a silent drop (dropped backends would silently reroute agent() calls to the
+ *      default backend) and never a hang.
+ * Unlike checkpoint confirm (which degrades to its headless default), an elicitation FAILURE
+ * here is a DENY — this is a security gate, not a workflow gate.
+ */
+async function resolveScriptBackends(
+  server: Server,
+  script: string,
+  approvals: BackendApprovals,
+): Promise<ScriptBackendsGate> {
+  // A malformed script is not this gate's concern: runSync re-parses and resolves the usual
+  // terminal failed result with the real parse message.
+  let declared: Record<string, WorkflowBackendConfig> | undefined;
+  try {
+    declared = parseWorkflowScript(script).meta.backends;
+  } catch {
+    return { ok: true };
+  }
+  if (!declared || Object.keys(declared).length === 0) return { ok: true };
+
+  if (scriptBackendsAllowedByEnv()) return { ok: true, backends: declared };
+
+  if (!server.getClientCapabilities()?.elicitation) {
+    return {
+      ok: false,
+      message:
+        `This workflow declares custom ACP backends (meta.backends: ${Object.keys(declared).join(", ")}), ` +
+        `which spawn commands on this machine and require user approval — but this MCP client does not ` +
+        `support elicitation, so approval cannot be requested interactively. To allow script-declared ` +
+        `backends, set ${ALLOW_SCRIPT_BACKENDS_ENV}=1 in the "env" block of this server's mcpServers ` +
+        `config entry (this approves ALL script-declared backends headlessly), or remove meta.backends ` +
+        `and register the backends host-side via AGENTPRISM_BACKENDS instead.`,
+    };
+  }
+
+  for (const [name, config] of Object.entries(declared)) {
+    const key = backendApprovalKey(name, config);
+    if (approvals.has(key)) continue;
+    let approved = false;
+    try {
+      const elicited = await server.elicitInput({
+        message:
+          `Workflow wants to spawn a custom ACP agent backend on this machine:\n\n` +
+          `${describeBackend(name, config)}\n\n` +
+          `Approve spawning this command?`,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            approve: {
+              type: "boolean",
+              title: "Approve",
+              description: `Allow the workflow to spawn "${config.command}" as backend "${name}".`,
+            },
+          },
+          required: ["approve"],
+        },
+      });
+      approved = elicited.action === "accept" && elicited.content?.approve === true;
+    } catch {
+      approved = false; // elicitation failed -> DENY (security gate; never degrade to allow)
+    }
+    if (!approved) {
+      return {
+        ok: false,
+        message:
+          `User declined to spawn script-declared backend "${name}" (command: ${config.command}) — ` +
+          `the workflow was not run. Remove meta.backends.${name} or re-run and approve it.`,
+      };
+    }
+    approvals.add(key);
+  }
+  return { ok: true, backends: declared };
+}
+
 /** Human-readable summary for a completed run. */
 function formatCompletedSummary(run: WorkflowRunResult): string {
   const lines: string[] = [
@@ -161,6 +274,8 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
   // Composition root: the ACP-backed AgentRunner is injected into the engine here. The
   // manager owns run lifecycle, status stamping, and the persisted journal used by resume.
   const manager = new WorkflowManager({ agent: runner });
+  // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
+  const backendApprovals: BackendApprovals = new Set();
 
   mcp.registerTool(
     "workflow",
@@ -178,7 +293,18 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
       const input = clampWorkflowInput(args);
       const reporter = createProgressReporter(extra);
 
+      // Trust gate for script-declared meta.backends — BEFORE any run exists. A refusal is an
+      // informative tool error (never a silent drop, never a hang on a non-eliciting client).
+      const backendsGate = await resolveScriptBackends(mcp.server, input.script, backendApprovals);
+      if (!backendsGate.ok) {
+        return {
+          content: [{ type: "text", text: backendsGate.message }],
+          isError: true,
+        };
+      }
+
       const exec: ExecOptions = {
+        scriptBackends: backendsGate.backends,
         signal: extra.signal,
         maxAgents: input.maxAgents,
         concurrency: input.concurrency,

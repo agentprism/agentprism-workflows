@@ -177,6 +177,14 @@ return value.
 > programmatic option wins per name). A `schema` is forwarded to custom backends as turn-level
 > `_meta.outputSchema` and the result is JSON-parsed off the final message — agents that ignore the
 > schema channel still work via the validate/re-prompt ladder.
+>
+> A workflow **script** can also declare backends itself via `meta.backends` (same config shape,
+> keyed by name). Because script-declared backends spawn commands on your machine, they are inert
+> unless you approve them: pass `allowScriptBackends: true` to `runDynamicWorkflow`, or a callback
+> `(backend) => boolean | Promise<boolean>` to decide per backend — an unapproved declaration
+> throws with guidance, and a declined backend aborts the run (it would otherwise silently reroute
+> its `agent()` calls to the default backend). Host-registered names always win over script
+> declarations. Lower-level callers can thread a pre-approved registry via `exec.scriptBackends`.
 
 ### c) `WorkflowManager` — stateful / resumable runs
 

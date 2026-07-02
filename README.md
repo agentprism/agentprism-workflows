@@ -246,7 +246,28 @@ await runDynamicWorkflow(script, { runner });
 
 Inside a script: `agent("Verify the checkout flow…", { model: "browser", schema: VERDICT, meta: { credsRef: "vault://qa" } })`. `model: "browser/vision-large"` additionally selects `vision-large` via the agent's config-option catalog. The same registry can be declared without code via the `AGENTPRISM_BACKENDS` env var (JSON of the same shape) — which is how the MCP server picks it up. Names are case-insensitive; `claude`/`codex` are reserved.
 
-Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `_meta.outputSchema` (plain JSON Schema), and the result is read by JSON-parsing the final assistant message — agents that ignore the schema channel still work via the client-side validate/re-prompt ladder. Per-call `meta` merges over the registry's `sessionMeta` defaults; protocol-critical keys (schema channels, `runId`) always win.
+Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `_meta.outputSchema` (plain JSON Schema) **and** stated in the prompt's output contract, and the result is read by JSON-parsing the final assistant message — agents that ignore the schema channel still work via the client-side validate/re-prompt ladder. Per-call `meta` merges over the registry's `sessionMeta` defaults; protocol-critical keys (schema channels, `runId`) always win.
+
+#### Script-declared backends (`meta.backends`)
+
+A workflow script can also declare the backends it needs, so the workflow is a self-contained artifact (and so *agent-authored* workflows can bring their own ACP servers):
+
+```js
+export const meta = {
+  name: "visual-qa",
+  description: "verify the preview deployment",
+  backends: {
+    browser: { command: "browser-acp", args: ["--headless"], sessionMeta: { mode: "verify" } },
+  },
+};
+const verdict = await agent("Verify the checkout flow…", { model: "browser", schema: VERDICT });
+```
+
+Script-declared backends spawn commands on the host, so they are **inert until approved** — the engine parses them but never acts on them:
+
+- **SDK**: pass `allowScriptBackends: true` (or a per-backend approval callback) to `runDynamicWorkflow`; unapproved declarations throw with guidance rather than silently rerouting.
+- **MCP server**: clients that support **elicitation** are asked to approve each unique spawn config (session-sticky); other clients get an informative tool error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in.
+- Host-registered names always win on conflict — a script can never hijack a name the operator configured.
 
 ---
 
@@ -256,7 +277,9 @@ Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `
 |---|---|---|
 | `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend when the model/tier doesn't imply one (`claude` \| `codex` \| a registered custom name). |
 | `AGENTPRISM_BACKENDS` | (none) | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Programmatic `createAcpRunner({ backends })` wins per name. |
+| `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | (unset) | MCP server only: `1`/`true` approves **script-declared** `meta.backends` headlessly (for clients without elicitation support). |
 | `AGENTPRISM_ACP_POOL_SIZE` | `1` | Long-lived processes held per backend. |
+| `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | `60000` | Deadline for a backend's one-time ACP `initialize` handshake (a non-ACP command fails fast instead of hanging). |
 | `AGENTPRISM_CLAUDE_ACP_CMD` / `…_ARGS` | (bundled) | Override the Claude ACP server command/args. |
 | `AGENTPRISM_CODEX_ACP_CMD` / `…_ARGS` / `…_BIN` | (bundled) | Override the Codex ACP server command/args/binary. |
 

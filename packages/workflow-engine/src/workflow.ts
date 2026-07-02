@@ -9,6 +9,7 @@ import type {
   AgentUsage,
   JournalEntry,
   McpServerConfig,
+  WorkflowBackendConfig,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunResult,
@@ -113,6 +114,14 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   sharedRuntime?: SharedRuntime;
   /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
   loadSavedWorkflow?: (name: string) => string | undefined;
+  /**
+   * APPROVED script-declared custom ACP backends (from `meta.backends`), threaded to every
+   * agent() call as RunOptions.backends. The engine NEVER reads meta.backends itself — a
+   * composition root must obtain approval (MCP elicitation / SDK allowScriptBackends / env
+   * opt-in) and pass the result here, so script backends are inert by default at every
+   * layer. ADDITIVE: not part of the resume identity hash.
+   */
+  scriptBackends?: Record<string, WorkflowBackendConfig>;
   /**
    * Ask the human a checkpoint() question and resolve to their reply. Threaded from
    * a UI-bearing tool context. Absent => headless: checkpoint() takes its declared
@@ -514,6 +523,9 @@ export async function runWorkflow<T = unknown>(
                 // NOT part of the resume identity (hashAgentCall).
                 meta: agentOptions.meta,
                 promptMeta: agentOptions.promptMeta,
+                // APPROVED script-declared backends (composition-root-gated). Additive,
+                // NOT part of the resume identity (hashAgentCall).
+                backends: options.scriptBackends,
                 // Engine run id as an end-to-end correlation stamp on the ACP session/new _meta.
                 // Additive telemetry, NOT part of the resume identity (hashAgentCall).
                 runId,
@@ -666,6 +678,9 @@ export async function runWorkflow<T = unknown>(
     shared.depth++;
     try {
       const child = await runWorkflow(childScript, {
+        // Spread inherits the PARENT's approved scriptBackends (same trust context — the
+        // parent chose to nest); the child's own meta.backends stays inert (nothing here
+        // approves it, and only the composition root can).
         ...options,
         args: childArgs,
         sharedRuntime: shared,
@@ -1051,6 +1066,38 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
       if (!phase || typeof phase !== "object" || typeof (phase as WorkflowMetaPhase).title !== "string") {
         throw new Error("each meta phase must have a title string");
       }
+    }
+  }
+  if (value.backends !== undefined) validateMetaBackends(value.backends);
+}
+
+/** Structural validation of script-declared `meta.backends`. The engine only PARSES these —
+ *  it never spawns them; the composition root decides whether to approve and thread them
+ *  (ExecOptions.scriptBackends). Deep policy checks (reserved names, etc.) live in the
+ *  runner, which re-validates whatever it is handed. */
+function validateMetaBackends(backends: unknown): void {
+  if (!backends || typeof backends !== "object" || Array.isArray(backends)) {
+    throw new Error("meta.backends must be an object of { <name>: { command, args?, env?, sessionMeta? } }");
+  }
+  for (const [name, config] of Object.entries(backends as Record<string, unknown>)) {
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+      throw new Error(`meta.backends.${name} must be an object with at least { command }`);
+    }
+    const c = config as Record<string, unknown>;
+    if (typeof c.command !== "string" || !c.command.trim()) {
+      throw new Error(`meta.backends.${name}.command must be a non-empty string`);
+    }
+    if (c.args !== undefined && !(Array.isArray(c.args) && c.args.every((a) => typeof a === "string"))) {
+      throw new Error(`meta.backends.${name}.args must be an array of strings`);
+    }
+    if (
+      c.env !== undefined &&
+      (!c.env || typeof c.env !== "object" || Array.isArray(c.env) || Object.values(c.env).some((v) => typeof v !== "string"))
+    ) {
+      throw new Error(`meta.backends.${name}.env must be an object of string values`);
+    }
+    if (c.sessionMeta !== undefined && (!c.sessionMeta || typeof c.sessionMeta !== "object" || Array.isArray(c.sessionMeta))) {
+      throw new Error(`meta.backends.${name}.sessionMeta must be an object`);
     }
   }
 }

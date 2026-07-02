@@ -361,6 +361,22 @@ built-in `Backend` strategies. Two additive surfaces open the seam to **any** AC
   dialect: schema IN as turn-level `_meta.outputSchema` (plain JSON Schema, not
   OpenAI-strict), result OUT as final-text JSON — with the client-side validate/re-prompt
   ladder (§6) as the repair path for agents that ignore the schema channel entirely.
+- **Script-declared backends** (`meta.backends` → `ExecOptions.scriptBackends` →
+  `RunOptions.backends`): a script can declare the backends it needs, making workflows
+  self-contained (and letting agent-authored workflows bring their own ACP servers). This
+  crosses a TRUST BOUNDARY — a spawn config is arbitrary code execution — so the layering is
+  secure-by-default at every seam: the ENGINE parses/validates `meta.backends` but never acts
+  on it; only a COMPOSITION ROOT that obtained approval threads it (SDK:
+  `allowScriptBackends` true/callback, throwing on unapproved declarations; MCP server: an
+  elicitation per unique spawn config for capable clients — approvals session-sticky, an
+  elicitation failure is a DENY, and non-eliciting clients get a tool error naming the
+  `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` env opt-in). The runner re-validates run-scoped entries
+  (reserved names rejected) and layers them UNDER the host registry — host names win. The
+  pool keys connections by `Backend.poolKey` (id + spawn-config hash for custom backends) so
+  two runs declaring the same NAME with different COMMANDS never share a process, and the
+  one-time `initialize` handshake has a deadline (`AGENTPRISM_ACP_INIT_TIMEOUT_MS`, default
+  60s) so a command that is not an ACP server fails legibly instead of hanging — fail-fast
+  hygiene, NOT a security gate (the process has already been spawned by then).
 - **Generic `_meta` passthrough** (`RunOptions.meta` / `RunOptions.promptMeta`, script-level
   `agent(p, { meta, promptMeta })`): the protocol reserves `_meta` for custom extension
   properties, so workflows can drive any agent's extension surface without a code change here.

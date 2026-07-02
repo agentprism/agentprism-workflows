@@ -17,6 +17,25 @@ export interface WorkflowMetaPhase {
   model?: string;
 }
 
+/** One SCRIPT-DECLARED custom ACP backend (`meta.backends[name]`) — how to spawn an agent
+ *  server the workflow wants to route `agent()` calls to. Structurally identical to the
+ *  host-level registry config (acp-agents `CustomBackendConfig`), but declared by the SCRIPT
+ *  AUTHOR, so it is a TRUST-GATED input: the engine parses it and otherwise ignores it; only
+ *  a composition root that has obtained approval (MCP elicitation, the SDK's
+ *  `allowScriptBackends`, or the AGENTPRISM_ALLOW_SCRIPT_BACKENDS env opt-in) threads it
+ *  into the run via ExecOptions.scriptBackends. */
+export interface WorkflowBackendConfig {
+  /** The ACP server executable (absolute path or on PATH). */
+  command: string;
+  /** Arguments for the command. Default []. */
+  args?: string[];
+  /** Extra environment for the subprocess, merged OVER the inherited process.env. */
+  env?: Record<string, string>;
+  /** Static `_meta` sent on every session/new for this backend (defaults; per-call
+   *  RunOptions.meta merges over them). */
+  sessionMeta?: Record<string, unknown>;
+}
+
 /** The `export const meta = {...}` literal parsed from the head of a script. */
 export interface WorkflowMeta {
   name: string;
@@ -24,6 +43,10 @@ export interface WorkflowMeta {
   phases?: WorkflowMetaPhase[];
   /** Default model for agents whose phase has no route and that set no model/tier. */
   model?: string;
+  /** Script-declared custom ACP backends, keyed by routing name (`agent({ model: "<name>" })`
+   *  or `"<name>/<inner-model>"`). INERT unless the composition root approves and threads
+   *  them (see WorkflowBackendConfig); host-registered names always win on conflict. */
+  backends?: Record<string, WorkflowBackendConfig>;
 }
 
 /** One cached agent()/checkpoint() result, keyed by its deterministic call index

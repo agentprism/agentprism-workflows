@@ -172,6 +172,8 @@ Each `agent()` call is dispatched to an **ACP agent server** chosen by the call'
 
 Beyond the built-ins, **any ACP agent** can be registered as a named backend via `AGENTPRISM_BACKENDS` (see the table below) and routed to with `agent(p, { model: "<name>" })` — or `"<name>/<inner-model>"` to also select a model from the agent's catalog. Scripts can pass arbitrary session/turn `_meta` to such agents with `agent(p, { meta, promptMeta })`.
 
+A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config (approvals stick for the session); otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
+
 **Auth is environment-inherited.** Agent subprocesses are spawned with the MCP server's own `process.env`. There is no separate credential channel — whatever the underlying agent CLIs read for auth (an Anthropic key / Claude subscription auth for `claude-agent-acp`; OpenAI/Codex auth for `codex-acp`) must be present in the environment the host launches `agentprism-workflow` with. Put those vars in the `env` block of your `mcpServers` config (alongside the `AGENTPRISM_*` settings), or export them in the shell that starts the host. Refer to each backend project's docs for its exact auth variables.
 
 ---
@@ -184,6 +186,8 @@ All settings are read from the environment of the `agentprism-workflow` process 
 | --- | --- | --- |
 | `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend used when an `agent()` call's `model`/`tier` doesn't pin a provider: `codex`, a registered custom backend name, or anything else for Claude (all case-insensitive). |
 | `AGENTPRISM_BACKENDS` | — | Custom ACP backends as a JSON object: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Registered names route `model`/`tier` specs **before** the built-in heuristics; `claude`/`codex` are reserved. |
+| `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | — | `1`/`true` approves **script-declared** `meta.backends` headlessly. Only needed for clients without elicitation support — eliciting clients are prompted per spawn config instead. Understand the risk: this lets any workflow script spawn arbitrary commands. |
+| `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | `60000` | Deadline for a backend's one-time ACP `initialize` handshake; a command that is not an ACP server fails fast with a clear error instead of hanging. |
 | `AGENTPRISM_ACP_POOL_SIZE` | `1` | Long-lived ACP server processes to keep **per backend**. Each pooled process multiplexes many concurrent sessions; raise it to spread concurrent load across processes. Clamped to ≥ 1. |
 | `AGENTPRISM_CLAUDE_ACP_CMD` | — | Override the command used to launch the Claude ACP server. When set, the default resolution/`npx` fallback is bypassed. |
 | `AGENTPRISM_CLAUDE_ACP_ARGS` | — | Whitespace-separated argv passed to `AGENTPRISM_CLAUDE_ACP_CMD`. |
