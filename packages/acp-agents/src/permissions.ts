@@ -28,6 +28,19 @@ import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
+import type { AcpEventContext } from "./events.js";
+
+/** Async human-in-the-loop decider for ACP permission requests. When present, it REPLACES the
+ *  synchronous ToolPolicy path for the sessions it applies to: the agent turn parks until this
+ *  resolver selects an ACP permission outcome. It may resolve arbitrarily later (seconds or
+ *  minutes); the library guarantees every parked request is settled with the ACP
+ *  `{ outcome: { outcome: "cancelled" } }` response when its session is released, its turn is
+ *  cancelled via session/cancel, or its connection dies, so teardown can never leave an agent
+ *  turn hung behind an unanswered permission prompt. */
+export type PermissionResolver = (
+  params: RequestPermissionRequest,
+  ctx: AcpEventContext,
+) => Promise<RequestPermissionResponse> | RequestPermissionResponse;
 
 export interface ToolPolicy {
   /** Allow-list (agentType `tools`). When non-empty, a tool that matches NOTHING is denied. */

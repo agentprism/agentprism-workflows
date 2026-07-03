@@ -61,7 +61,7 @@ export { CodexBackend } from "./backends/codex.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
 export { decidePermission } from "./permissions.js";
-export type { ToolPolicy } from "./permissions.js";
+export type { PermissionResolver, ToolPolicy } from "./permissions.js";
 
 export { UsageAccumulator } from "./usage.js";
 

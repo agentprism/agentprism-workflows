@@ -47,7 +47,7 @@ import {
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
 import { toJsonSchema } from "./schema-strict.js";
-import type { ToolPolicy } from "./permissions.js";
+import type { PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
@@ -58,6 +58,9 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Custom ACP backends, keyed by registered name (see registry.ts for the config shape
    *  and the routing rules). Names are case-insensitive; "claude"/"codex" are reserved. */
   backends?: Record<string, CustomBackendConfig>;
+  /** Runner-wide human-in-the-loop permission resolver. When set, it replaces ToolPolicy
+   *  auto-decisions for every session that does not provide its own resolver. */
+  onPermissionRequest?: PermissionResolver;
 }
 
 export class AcpAgentRunner implements AgentRunner {
@@ -70,7 +73,10 @@ export class AcpAgentRunner implements AgentRunner {
   private readonly emitEvent: AcpEventSink = (name, event) => this.events.emit(name, event);
 
   constructor(options: AcpRunnerOptions = {}) {
-    this.pool = new AcpAgentPool(options, { onEvent: this.emitEvent });
+    this.pool = new AcpAgentPool(options, {
+      onEvent: this.emitEvent,
+      permissionResolver: options.onPermissionRequest,
+    });
     this.backends = resolveBackendRegistry(options.backends);
   }
 
