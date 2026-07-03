@@ -16,7 +16,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 function fakeInteractive(session: Partial<SessionHandle>): InteractiveSession {
-  return InteractiveSession.create({
+  return new InteractiveSession({
     session: {
       sessionId: "unit-session",
       currentTurnText: () => "",

@@ -3,25 +3,13 @@
 // or until abort teardown answers the request as ACP "cancelled".
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import { AcpAgentRunner, type AcpPermissionEvent, type AcpRunnerOptions } from "../src/index.js";
+import { createFakeAgentHarness, delay, waitFor, withTimeout } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const MODEL = "claude";
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
 const CANCELLED: RequestPermissionResponse = { outcome: { outcome: "cancelled" } };
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-  "AGENTPRISM_DEFAULT_BACKEND",
-];
 
 interface LogEntry {
   method: string;
@@ -29,67 +17,16 @@ interface LogEntry {
   params?: { sessionId?: string };
 }
 
-const runners: AcpAgentRunner[] = [];
-
-afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
-});
-
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-perm-resolver-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
+const harness = createFakeAgentHarness({ prefix: "acp-perm-resolver-it-", backends: ["claude"] });
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 function makeRunner(options: AcpRunnerOptions): AcpAgentRunner {
-  const runner = new AcpAgentRunner(options);
-  runners.push(runner);
-  return runner;
+  return harness.makeRunner(options);
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 2500): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: condition not met in time");
-    await delay(10);
-  }
-}
-
-function withTimeout<T>(promise: Promise<T>, ms = 2500): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
+afterEach(async () => {
+  await harness.cleanup();
+});
 
 function permissionOutcome(log: LogEntry[]): RequestPermissionResponse["outcome"] | undefined {
   return log.find((entry) => entry.method === "permissionOutcome")?.outcome;

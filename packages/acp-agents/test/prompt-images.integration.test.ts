@@ -2,24 +2,9 @@
 // session/prompt request, so these assertions pin the exact wire content after negotiation.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import { AcpAgentRunner } from "../src/index.js";
-
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_CODEX_ACP_CMD",
-  "AGENTPRISM_CODEX_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-];
+import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
 interface LogEntry {
   method: string;
@@ -28,42 +13,16 @@ interface LogEntry {
   };
 }
 
-const runners: AcpAgentRunner[] = [];
-function makeRunner(): AcpAgentRunner {
-  const runner = new AcpAgentRunner();
-  runners.push(runner);
-  return runner;
-}
-
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-image-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_CODEX_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CODEX_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
+const harness = createFakeAgentHarness({ prefix: "acp-image-it-" });
+const { makeRunner } = harness;
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 function promptBlocks(log: LogEntry[]): ContentBlock[] {
   return log.find((e) => e.method === "prompt")?.params?.prompt ?? [];
 }
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
+  await harness.cleanup();
 });
 
 test("promptCapabilities.image:true sends text plus the verbatim image block", async () => {

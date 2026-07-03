@@ -3,6 +3,7 @@
 // one-shot workflow-engine contract.
 import type { ContentBlock, StopReason } from "@agentclientprotocol/sdk";
 import type { McpServerConfig, PromptImage } from "@automatalabs/shared-types";
+import type { RunOptions } from "@automatalabs/shared-types";
 import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
 import type { PooledConnection, SessionHandle } from "./acp-client.js";
@@ -32,6 +33,10 @@ export interface InteractiveSessionOptions {
   disallowedToolNames?: string[];
   /** Session-scoped permission resolver; overrides the runner-wide resolver for this session. */
   onPermissionRequest?: PermissionResolver;
+  /** The actually-resolved concrete model id (display/telemetry). */
+  onModelResolved?: RunOptions["onModelResolved"];
+  /** A requested model/tier spec that was not found and fell back to the session default. */
+  onModelFallback?: RunOptions["onModelFallback"];
   /** Event/telemetry label stamped onto this session's emitted ACP events. */
   label?: string;
   /** Correlation id stamped into session/new `_meta` and emitted event context. */
@@ -58,21 +63,25 @@ export interface InteractiveTurn {
 
 type Subscribe = <K extends AcpEventName>(name: K, listener: AcpEventListener<K>) => () => void;
 
-/** Internal construction bag. Exported only because the class is public in TypeScript; hosts
- *  should create sessions through AcpAgentRunner.openSession(), never by constructing this. */
-export interface InteractiveSessionDeps {
+/** Internal construction bag for the runner-owned wrapper around an already-open ACP session. */
+interface InteractiveSessionDeps {
   readonly session: SessionHandle;
   readonly connection: PooledConnection;
   readonly backend: Backend;
   readonly subscribe: Subscribe;
-  readonly onRelease: () => void;
+  readonly onRelease: (self: InteractiveSession) => void;
   readonly signal?: AbortSignal;
   readonly label?: string;
 }
 
 /** A held-open multi-turn ACP session backed by a dedicated agent process. Only one prompt may
  *  be in flight at a time; hosts that want queued turns should serialize calls themselves so
- *  cancellation, permissions, and turn text stay attributable to a single active turn. */
+ *  cancellation, permissions, and turn text stay attributable to a single active turn. If the
+ *  dedicated process dies, the runner observes that per session by auto-releasing this wrapper:
+ *  session-scoped listeners are removed, later prompt() calls fail with the released-session
+ *  error, and `session_close` is emitted on this session's event stream. The connection-scoped
+ *  `backend_error` event is emitted on the runner bus only; it is not delivered through
+ *  session.on(). */
 export class InteractiveSession {
   readonly sessionId: string;
   readonly backendId: BackendId;
@@ -81,25 +90,24 @@ export class InteractiveSession {
   private readonly connection: PooledConnection;
   private readonly backend: Backend;
   private readonly subscribe: Subscribe;
-  private readonly onReleaseCallback: () => void;
+  private readonly onReleaseCallback: (self: InteractiveSession) => void;
+  private readonly signal: AbortSignal | undefined;
   private readonly label: string | undefined;
   private readonly subscriptions = new Set<() => void>();
   private removeAbort: (() => void) | undefined;
   private promptInFlight = false;
   private releasePromise: Promise<void> | undefined;
 
-  /** @internal Build the public wrapper around an already-open ACP session. */
-  static create(deps: InteractiveSessionDeps): InteractiveSession {
-    return new InteractiveSession(deps);
-  }
-
-  /** Constructed by InteractiveSession.create() after session/new succeeds. */
-  private constructor(deps: InteractiveSessionDeps) {
+  /** Construct the public wrapper around an already-open ACP session. Hosts normally receive
+   *  instances from AcpAgentRunner.openSession(), which supplies the internal session/connection
+   *  dependencies and owns lifecycle tracking. */
+  constructor(deps: InteractiveSessionDeps) {
     this.session = deps.session;
     this.connection = deps.connection;
     this.backend = deps.backend;
     this.subscribe = deps.subscribe;
     this.onReleaseCallback = deps.onRelease;
+    this.signal = deps.signal;
     this.label = deps.label;
     this.sessionId = deps.session.sessionId;
     this.backendId = deps.connection.backendId;
@@ -129,6 +137,7 @@ export class InteractiveSession {
     opts: { images?: readonly PromptImage[]; promptMeta?: Record<string, unknown> } = {},
   ): Promise<InteractiveTurn> {
     if (this.releasePromise) throw new Error("InteractiveSession has been released");
+    this.signal?.throwIfAborted();
     if (this.promptInFlight) {
       throw new Error("InteractiveSession.prompt() already has a prompt in flight; await it before sending another turn");
     }
@@ -196,7 +205,7 @@ export class InteractiveSession {
       // best-effort: mirrors pool disposal semantics.
     } finally {
       this.removeSubscriptions();
-      this.onReleaseCallback();
+      this.onReleaseCallback(this);
     }
   }
 

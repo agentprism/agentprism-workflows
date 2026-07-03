@@ -45,6 +45,7 @@ export type {
   AcpEventSink,
   AcpSessionUpdate,
   AcpUpdateKind,
+  AcpPermissionPendingEvent,
   AcpPermissionEvent,
   AcpRawMessageEvent,
   AcpBackendErrorEvent,

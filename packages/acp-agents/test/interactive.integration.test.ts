@@ -3,24 +3,12 @@
 // session can take multiple prompt turns, but it never consumes the pool slot used by run().
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type ContentBlock, type RequestPermissionResponse } from "@agentclientprotocol/sdk";
-import { AcpAgentRunner } from "../src/index.js";
+import { AcpAgentRunner, type AcpRunnerOptions } from "../src/index.js";
+import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
 const REJECT: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "reject-1" } };
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-  "AGENTPRISM_DEFAULT_BACKEND",
-];
 
 interface LogEntry {
   method: string;
@@ -33,49 +21,15 @@ interface LogEntry {
   };
 }
 
-const runners: AcpAgentRunner[] = [];
+const harness = createFakeAgentHarness({ prefix: "acp-interactive-it-", backends: ["claude"] });
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
-afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
-});
-
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-interactive-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
-
-function makeRunner(options: ConstructorParameters<typeof AcpAgentRunner>[0] = {}): AcpAgentRunner {
-  const runner = new AcpAgentRunner(options);
-  runners.push(runner);
-  return runner;
+function makeRunner(options: AcpRunnerOptions = {}): AcpAgentRunner {
+  return harness.makeRunner(options);
 }
 
 const count = (entries: LogEntry[], method: string): number =>
   entries.filter((entry) => entry.method === method).length;
-
-async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: condition not met in time");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
 
 function pidOfFirst(entries: LogEntry[], method: string): number {
   const pid = entries.find((entry) => entry.method === method)?.pid;
@@ -86,6 +40,10 @@ function pidOfFirst(entries: LogEntry[], method: string): number {
 function permissionOutcome(log: LogEntry[]): RequestPermissionResponse["outcome"] | undefined {
   return log.find((entry) => entry.method === "permissionOutcome")?.outcome;
 }
+
+afterEach(async () => {
+  await harness.cleanup();
+});
 
 test("interactive session drives three prompt turns on one dedicated process", async () => {
   const image = { data: "ZmFrZS1pbWFnZQ==", mimeType: "image/png", uri: "file:///tmp/screen.png" };
@@ -154,6 +112,20 @@ test("per-session on() ignores events from a parallel run() session", async () =
   await session.release();
 });
 
+test("openSession surfaces model fallback callbacks", async () => {
+  const { cwd } = configure({ turns: [{ text: "unused" }] });
+  const runner = makeRunner();
+  const fallbacks: string[] = [];
+  const session = await runner.openSession({
+    cwd,
+    model: "not-a-real-model",
+    onModelFallback: (spec) => fallbacks.push(spec),
+  });
+
+  assert.deepEqual(fallbacks, ["not-a-real-model"]);
+  await session.release();
+});
+
 test("release() closes the interactive session and dedicated process, leaving the pooled process alive", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   const runner = makeRunner();
@@ -180,6 +152,21 @@ test("release() closes the interactive session and dedicated process, leaving th
     false,
     "pooled process remained alive until runner.dispose()",
   );
+});
+
+test("dedicated process death auto-releases the interactive session", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "unused" }] });
+  const runner = makeRunner();
+  const session = await runner.openSession({ cwd, label: "crash-watch" });
+  const pid = pidOfFirst(readLog(), "newSession");
+  const closes: string[] = [];
+  session.on("session_close", (event) => closes.push(event.sessionId));
+
+  process.kill(pid, "SIGKILL");
+  await waitFor(() => closes.includes(session.sessionId));
+
+  await assert.rejects(() => session.prompt("after death"), /InteractiveSession has been released/);
+  await runner.dispose();
 });
 
 test("a second prompt while one is in flight throws and the active turn can be cancelled", async () => {

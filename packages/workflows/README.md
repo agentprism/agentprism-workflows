@@ -283,9 +283,10 @@ await runner.dispose();
 | event | payload |
 |-------|---------|
 | `session_update` | `{ update }` — catch-all for **every** update, regardless of kind |
-| `permission_request` | `{ request, outcome }` — a tool permission the runner auto-answered |
+| `permission_pending` | `{ request }` — resolver-only; emitted after the request is parked and before the resolver is invoked |
+| `permission_request` | `{ request, outcome }` — the final permission outcome returned to the agent |
 | `raw_message` | `{ method, message }` — a vendor extension notification (e.g. Claude `_claude/sdkMessage`) |
-| `session_open` / `session_close` | a session opened / was released on a pooled connection |
+| `session_open` / `session_close` | an ACP session opened / was released |
 | `backend_error` | `{ backendId, error }` — a pooled backend process crashed |
 
 **Context envelope.** A pooled runner multiplexes many concurrent runs over one process, so every
@@ -406,8 +407,10 @@ WorkflowManager,              // stateful / resumable run manager
 // ── ACP backend ──
 createAcpRunner,              // () => AcpAgentRunner (the default AgentRunner; has .on(...) events)
 AcpAgentRunner,               // class — implements AgentRunner over ACP
+InteractiveSession,           // held-open multi-turn ACP session returned by openSession()
 selectBackend,                // pick Claude vs Codex from a model/tier spec
 ClaudeBackend, CodexBackend,  // the concrete backends
+clientCapabilitiesFor, adaptPromptContent,
 toJsonSchema, toStrictJsonSchema,
 TypedEventEmitter,            // the tiny typed emitter backing runner.on(...)
 
@@ -418,9 +421,12 @@ WorkflowError, WorkflowErrorCode, isWorkflowError, isProviderUsageLimit,
 RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
 AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
+InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
+ClientHandlers, FsHandlers, TerminalHandlers, AcpSessionContext, NegotiatedCapabilities,
 // ACP events: the runner.on(...) surface
 AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext,
-AcpSessionUpdate, AcpUpdateKind, AcpPermissionEvent, AcpRawMessageEvent, AcpBackendErrorEvent,
+AcpSessionUpdate, AcpUpdateKind, AcpPermissionPendingEvent, AcpPermissionEvent,
+AcpRawMessageEvent, AcpBackendErrorEvent,
 ```
 
 (The DSL globals — `agent`, `parallel`, `pipeline`, … — are **not** exported; they are realm

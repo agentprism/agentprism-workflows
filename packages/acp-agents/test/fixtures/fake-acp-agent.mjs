@@ -137,6 +137,8 @@ class FakeAgent {
   newSession(params) {
     record({ method: "newSession", params });
     // UNIQUE per call: one pooled process serves many sessions over its lifetime.
+    // Process-unique ids: real ACP agents mint globally-unique session ids, and the per-session
+    // event filter depends on that — two fixture processes must never collide on an id.
     const sessionId = `fake-session-${process.pid}-${(this.sessionCounter += 1)}`;
     return { sessionId, configOptions: this.configOptions };
   }

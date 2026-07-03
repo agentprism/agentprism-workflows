@@ -72,7 +72,7 @@ export function validatePromptImages(images: readonly PromptImage[] | undefined,
 
 /** Convert base64 image attachments to ACP image ContentBlocks without capability adaptation.
  *  SessionHandle.prompt() performs the advertised-capability downgrade at send time. */
-export function imageContentBlocks(images: readonly PromptImage[]): ContentBlock[] {
+function imageContentBlocks(images: readonly PromptImage[]): ContentBlock[] {
   const blocks: ContentBlock[] = [];
   for (const image of images) {
     blocks.push(

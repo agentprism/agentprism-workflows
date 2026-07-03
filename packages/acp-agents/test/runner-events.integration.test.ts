@@ -4,44 +4,17 @@
 // typed bus -> on() listeners — is exercised; only the agent on the far end is faked.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { AcpAgentRunner, type AcpRunnerEventMap } from "../src/index.js";
+import { type AcpRunnerEventMap } from "../src/index.js";
+import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const MODEL = "anthropic/claude-opus-4-1"; // routes to the Claude backend (both point at the fake)
 
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_CODEX_ACP_CMD",
-  "AGENTPRISM_CODEX_ACP_ARGS",
-  "AGENTPRISM_FAKE_SCENARIO",
-  "AGENTPRISM_DEFAULT_BACKEND",
-];
-
-const runners: AcpAgentRunner[] = [];
-function makeRunner(): AcpAgentRunner {
-  const runner = new AcpAgentRunner();
-  runners.push(runner);
-  return runner;
-}
-
-function configure(scenario: unknown): { cwd: string } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-evt-"));
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_CODEX_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CODEX_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return { cwd: dir };
-}
+const harness = createFakeAgentHarness({ prefix: "acp-evt-" });
+const { makeRunner } = harness;
+const configure = (scenario: unknown) => harness.configure(scenario);
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
+  await harness.cleanup();
 });
 
 test("on() bubbles agent_message_chunk + usage_update + session lifecycle with run context", async () => {

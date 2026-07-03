@@ -3,16 +3,15 @@
 // by the selected backend, and an undeclared custom backend never inherits Codex's contract.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Type } from "typebox";
 import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, META_KEYS } from "@automatalabs/shared-types";
 import { AcpAgentRunner, type CustomBackendConfig } from "../src/index.js";
+import { createFakeAgentHarness, FAKE_AGENT_FIXTURE, readLog as readLogFile } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const EXAMPLE_NAMESPACE = "@example/img-acp";
 const EXAMPLE_CUSTOM_CAPABILITIES = { namespace: EXAMPLE_NAMESPACE, gatedKeys: ["renderTarget"] } as const;
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
@@ -24,10 +23,10 @@ interface LogEntry {
   };
 }
 
-const runners: AcpAgentRunner[] = [];
+const harness = createFakeAgentHarness();
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
+  await harness.cleanup();
 });
 
 function fakeBackend(scenario: unknown, extra?: Partial<CustomBackendConfig>): {
@@ -40,7 +39,7 @@ function fakeBackend(scenario: unknown, extra?: Partial<CustomBackendConfig>): {
   return {
     config: {
       command: process.execPath,
-      args: [FIXTURE],
+      args: [FAKE_AGENT_FIXTURE],
       env: {
         AGENTPRISM_FAKE_SCENARIO: JSON.stringify(scenario),
         AGENTPRISM_FAKE_LOG: log,
@@ -48,21 +47,12 @@ function fakeBackend(scenario: unknown, extra?: Partial<CustomBackendConfig>): {
       ...extra,
     },
     cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
+    readLog: () => readLogFile<LogEntry>(log),
   };
 }
 
 function makeRunner(backends: Record<string, CustomBackendConfig>): AcpAgentRunner {
-  const runner = new AcpAgentRunner({ backends });
-  runners.push(runner);
-  return runner;
+  return harness.makeRunner({ backends });
 }
 
 function initializeWithMeta(meta?: Record<string, unknown>): unknown {

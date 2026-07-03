@@ -3,32 +3,22 @@
 // teardown settlement without exporting MultiplexClient.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import {
   AcpAgentPool,
   ClaudeBackend,
   type AcpEventSink,
+  type AcpPermissionPendingEvent,
   type AcpPermissionEvent,
   type AcpPoolDeps,
   type PermissionResolver,
   type ToolPolicy,
 } from "../src/index.js";
+import { createFakeAgentHarness, waitFor, withTimeout } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
 const REJECT: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "reject-1" } };
 const CANCELLED: RequestPermissionResponse = { outcome: { outcome: "cancelled" } };
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-];
 
 interface LogEntry {
   method: string;
@@ -40,37 +30,11 @@ interface RecordedEvent {
   event: unknown;
 }
 
-const pools: AcpAgentPool[] = [];
-
-afterEach(async () => {
-  await Promise.all(pools.splice(0).map((pool) => pool.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
-});
-
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-perm-resolver-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
+const harness = createFakeAgentHarness({ prefix: "acp-perm-resolver-", backends: ["claude"] });
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 function makePool(deps: AcpPoolDeps): AcpAgentPool {
-  const pool = new AcpAgentPool({}, deps);
-  pools.push(pool);
-  return pool;
+  return harness.track(new AcpAgentPool({}, deps));
 }
 
 function eventSink(events: RecordedEvent[]): AcpEventSink {
@@ -83,6 +47,12 @@ function permissionEvents(events: RecordedEvent[]): AcpPermissionEvent[] {
   return events
     .filter((entry) => entry.name === "permission_request")
     .map((entry) => entry.event as AcpPermissionEvent);
+}
+
+function pendingEvents(events: RecordedEvent[]): AcpPermissionPendingEvent[] {
+  return events
+    .filter((entry) => entry.name === "permission_pending")
+    .map((entry) => entry.event as AcpPermissionPendingEvent);
 }
 
 function permissionOutcome(log: LogEntry[]): RequestPermissionResponse["outcome"] | undefined {
@@ -116,30 +86,9 @@ async function runOnePermissionTurn(options: {
   return { readLog };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: condition not met in time");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
-function withTimeout<T>(promise: Promise<T>, ms = 2000): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
+afterEach(async () => {
+  await harness.cleanup();
+});
 
 test("session permissionResolver wins over runner resolver and ToolPolicy", async () => {
   const events: RecordedEvent[] = [];
@@ -163,10 +112,62 @@ test("runner permissionResolver wins over ToolPolicy when no session resolver is
   assert.deepEqual(permissionOutcome(readLog()), ALLOW.outcome);
 });
 
+test("resolver path emits permission_pending before the final permission_request", async () => {
+  const events: RecordedEvent[] = [];
+  const { readLog } = await runOnePermissionTurn({
+    poolResolver: () => ALLOW,
+    policy: { deny: ["bash"] },
+    events,
+  });
+
+  assert.deepEqual(permissionOutcome(readLog()), ALLOW.outcome);
+  assert.deepEqual(
+    events
+      .filter((entry) => entry.name === "permission_pending" || entry.name === "permission_request")
+      .map((entry) => entry.name),
+    ["permission_pending", "permission_request"],
+  );
+  assert.equal(pendingEvents(events).length, 1);
+  assert.equal("outcome" in (pendingEvents(events)[0] as unknown as Record<string, unknown>), false);
+  assert.deepEqual(permissionEvents(events).map((event) => event.outcome), [ALLOW]);
+});
+
 test("without a resolver the synchronous ToolPolicy path still decides immediately", async () => {
-  const { readLog } = await runOnePermissionTurn({ policy: { deny: ["bash"] } });
+  const events: RecordedEvent[] = [];
+  const { readLog } = await runOnePermissionTurn({ policy: { deny: ["bash"] }, events });
 
   assert.deepEqual(permissionOutcome(readLog()), REJECT.outcome);
+  assert.deepEqual(pendingEvents(events), []);
+  assert.deepEqual(permissionEvents(events).map((event) => event.outcome), [REJECT]);
+});
+
+test("retainSessionLog:false keeps only the current turn text and history", async () => {
+  const { cwd } = configure({ turns: [{ text: "one" }, { text: "two" }] });
+  const pool = makePool({});
+  const session = await pool.acquire(new ClaudeBackend(), {
+    cwd,
+    schema: undefined,
+    policy: {},
+    retainSessionLog: false,
+  });
+
+  try {
+    await session.prompt("first");
+    assert.equal(session.currentTurnText(), "one");
+    assert.deepEqual(
+      session.history.map((entry) => entry.text),
+      ["one"],
+    );
+
+    await session.prompt("second");
+    assert.equal(session.currentTurnText(), "two");
+    assert.deepEqual(
+      session.history.map((entry) => entry.text),
+      ["two"],
+    );
+  } finally {
+    await session.release();
+  }
 });
 
 test("resolver-selected reject outcomes are honored and emitted once", async () => {
