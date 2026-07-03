@@ -1,5 +1,5 @@
-// Pure prompt-content adaptation: ACP promptCapabilities.image gates image ContentBlocks, while
-// baseline text/resource_link and out-of-scope optional block types pass through untouched.
+// Pure prompt-content adaptation: ACP PromptCapabilities gate optional ContentBlocks, while
+// baseline text/resource_link pass through untouched.
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
@@ -43,7 +43,7 @@ test("adaptPromptContent: degrades image blocks when promptCapabilities.image is
   ]);
 });
 
-test("adaptPromptContent: returns the same array reference when there are no image blocks", () => {
+test("adaptPromptContent: returns the same array reference when there are no optional blocks", () => {
   const blocks: ContentBlock[] = [
     { type: "text", text: "read this" },
     { type: "resource_link", name: "notes", uri: "file:///tmp/notes.md" },
@@ -52,7 +52,65 @@ test("adaptPromptContent: returns the same array reference when there are no ima
   assert.equal(adaptPromptContent(blocks, {}, "custom"), blocks);
 });
 
-test("adaptPromptContent: never mutates the input and leaves non-image blocks untouched", () => {
+test("adaptPromptContent: returns the same array reference when all optional blocks are supported", () => {
+  const blocks: ContentBlock[] = [
+    { type: "text", text: "before" },
+    { type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+    { type: "audio", data: "ZmFrZQ==", mimeType: "audio/wav" },
+    { type: "resource", resource: { uri: "file:///tmp/context.txt", text: "context" } },
+  ];
+
+  assert.equal(
+    adaptPromptContent(
+      blocks,
+      { promptCapabilities: { image: true, audio: true, embeddedContext: true } },
+      "custom",
+    ),
+    blocks,
+  );
+});
+
+test("adaptPromptContent: degrades audio blocks when promptCapabilities.audio is absent or false", () => {
+  const absent = adaptPromptContent([{ type: "audio", data: "ZmFrZQ==", mimeType: "audio/wav" }], {}, "claude");
+  assert.deepEqual(absent, [
+    {
+      type: "text",
+      text: "[audio omitted: audio/wav — the claude agent does not advertise promptCapabilities.audio]",
+    },
+  ]);
+
+  const unsupported = adaptPromptContent(
+    [{ type: "audio", data: "ZmFrZQ==", mimeType: "audio/ogg" }],
+    { promptCapabilities: { audio: false } },
+    "browser",
+  );
+  assert.deepEqual(unsupported, [
+    {
+      type: "text",
+      text: "[audio omitted: audio/ogg — the browser agent does not advertise promptCapabilities.audio]",
+    },
+  ]);
+
+  const supported: ContentBlock[] = [{ type: "audio", data: "ZmFrZQ==", mimeType: "audio/mpeg" }];
+  assert.equal(adaptPromptContent(supported, { promptCapabilities: { audio: true } }, "codex"), supported);
+});
+
+test("adaptPromptContent: degrades resource blocks when embedded context is absent", () => {
+  const out = adaptPromptContent(
+    [{ type: "resource", resource: { uri: "file:///tmp/context.txt", text: "context" } }],
+    {},
+    "browser",
+  );
+
+  assert.deepEqual(out, [
+    {
+      type: "text",
+      text: "[resource omitted: uri=file:///tmp/context.txt — the browser agent does not advertise promptCapabilities.embeddedContext]",
+    },
+  ]);
+});
+
+test("adaptPromptContent: never mutates the input and leaves supported optional blocks untouched", () => {
   const text: ContentBlock = { type: "text", text: "before" };
   const audio: ContentBlock = { type: "audio", data: "ZmFrZQ==", mimeType: "audio/wav" };
   const resource: ContentBlock = {
@@ -67,7 +125,11 @@ test("adaptPromptContent: never mutates the input and leaves non-image blocks un
   ];
   const snapshot = structuredClone(blocks);
 
-  const out = adaptPromptContent(blocks, { promptCapabilities: { image: false } }, "browser");
+  const out = adaptPromptContent(
+    blocks,
+    { promptCapabilities: { image: false, audio: true, embeddedContext: true } },
+    "browser",
+  );
 
   assert.notEqual(out, blocks, "a degraded image allocates a new array");
   assert.deepEqual(blocks, snapshot, "input array and blocks are untouched");

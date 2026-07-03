@@ -30,6 +30,12 @@ import {
 } from "@automatalabs/shared-types";
 import type { Backend } from "./backend.js";
 
+const PROMPT_CAPABILITY_BY_BLOCK_KIND = {
+  image: "image",
+  audio: "audio",
+  resource: "embeddedContext",
+} as const;
+
 /** The bare `_meta` keys whose emission is gated by Codex's custom-capability advertisement.
  *  Each is named EXACTLY like the advertised flag that gates it, so `support[key] === true` is the
  *  whole test. session/new carries baseInstructions/developerInstructions and session/prompt carries
@@ -119,34 +125,62 @@ export function gateCustomMeta(
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-/** Adapt prompt content to the agent's PromptCapabilities. Text and resource_link are ACP
- *  baseline content; this client currently only gates image because it is the only optional
- *  ContentBlock it constructs. Unsupported images are represented as explicit bracketed text
- *  notes so the attachment is never silently lost. Returns the SAME array reference when no block
- *  changes and never mutates the input or any surviving block. */
+/** Adapt prompt content to the agent's PromptCapabilities. ACP baseline content (text and
+ *  resource_link) is never gated; optional blocks follow the spec's capability table:
+ *  image->promptCapabilities.image, audio->promptCapabilities.audio, and resource->
+ *  promptCapabilities.embeddedContext. Unsupported optional blocks are represented as explicit
+ *  bracketed text notes so context is never silently lost. Returns the SAME array reference when
+ *  no block changes and never mutates the input or any surviving block. */
 export function adaptPromptContent(
   blocks: ContentBlock[],
   agent: AgentCapabilities,
   backendId: string,
 ): ContentBlock[] {
-  if (agent.promptCapabilities?.image === true) return blocks;
-
   let adapted: ContentBlock[] | undefined;
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i]!;
-    if (block.type === "image") {
+    const replacement = unsupportedPromptBlockNote(block, agent, backendId);
+    if (replacement) {
       adapted ??= blocks.slice(0, i);
-      const uriSuffix = typeof block.uri === "string" && block.uri.length > 0 ? `; uri=${block.uri}` : "";
-      adapted.push({
-        type: "text",
-        text: `[image omitted: ${block.mimeType}${uriSuffix} — the ${backendId} agent does not advertise promptCapabilities.image]`,
-      });
+      adapted.push(replacement);
     } else if (adapted) {
       adapted.push(block);
     }
   }
 
   return adapted ?? blocks;
+}
+
+function unsupportedPromptBlockNote(
+  block: ContentBlock,
+  agent: AgentCapabilities,
+  backendId: string,
+): ContentBlock | undefined {
+  const capability =
+    PROMPT_CAPABILITY_BY_BLOCK_KIND[block.type as keyof typeof PROMPT_CAPABILITY_BY_BLOCK_KIND];
+  if (!capability || agent.promptCapabilities?.[capability] === true) return undefined;
+
+  switch (block.type) {
+    case "image": {
+      const uriSuffix = typeof block.uri === "string" && block.uri.length > 0 ? `; uri=${block.uri}` : "";
+      return {
+        type: "text",
+        text: `[image omitted: ${block.mimeType}${uriSuffix} — the ${backendId} agent does not advertise promptCapabilities.image]`,
+      };
+    }
+    case "audio":
+      return {
+        type: "text",
+        text: `[audio omitted: ${block.mimeType} — the ${backendId} agent does not advertise promptCapabilities.audio]`,
+      };
+    case "resource":
+      return {
+        type: "text",
+        text: `[resource omitted: uri=${block.resource.uri} — the ${backendId} agent does not advertise promptCapabilities.embeddedContext]`,
+      };
+    default:
+      return undefined;
+  }
 }
 
 /** The first client-provided MCP server whose transport the agent did NOT advertise, or undefined

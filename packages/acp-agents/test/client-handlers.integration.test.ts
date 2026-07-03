@@ -234,3 +234,45 @@ test("terminal handlers advertise terminal:true and route createTerminal with co
     terminalId: `term:${seen[0].ctx.sessionId}`,
   });
 });
+
+test("terminal/release after session release still routes with the session cwd", async () => {
+  const { cwd, readLog } = configure({
+    turns: [
+      {
+        postTurnClientCalls: [
+          {
+            method: "terminal/release",
+            label: "release",
+            params: { terminalId: "term-after-close" },
+          },
+        ],
+        text: "ok",
+      },
+    ],
+  });
+  const seen: Array<{ terminalId: string; ctx: AcpSessionContext }> = [];
+  const terminalHandlers: TerminalHandlers = {
+    createTerminal: () => ({ terminalId: "unused" }),
+    terminalOutput: () => ({ output: "", truncated: false }),
+    waitForTerminalExit: () => ({ exitCode: 0 }),
+    killTerminal: () => undefined,
+    releaseTerminal: (params, ctx) => {
+      seen.push({ terminalId: params.terminalId, ctx });
+      return undefined;
+    },
+  };
+
+  await makeRunner({ terminal: terminalHandlers }).run("hi", {
+    model: "codex",
+    cwd,
+    label: "teardown-run",
+    runId: "run-teardown-1",
+  });
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].terminalId, "term-after-close");
+  assert.equal(seen[0].ctx.cwd, cwd);
+  assert.equal(seen[0].ctx.label, "teardown-run");
+  assert.equal(seen[0].ctx.runId, "run-teardown-1");
+  assert.deepEqual(clientCall(readLog(), "terminal/release", "release")?.response, {});
+});

@@ -47,3 +47,29 @@ test("runner: images validation rejects a missing mimeType string and names the 
     await runner.dispose();
   }
 });
+
+test("runner: images validation rejects a bad uri string and names the bad index", async () => {
+  const runner = new AcpAgentRunner();
+  try {
+    await assert.rejects(
+      () =>
+        runner.run("hi", {
+          images: [
+            { data: "ZmFrZQ==", mimeType: "image/png" },
+            { data: "ZmFrZQ==", mimeType: "image/png", uri: "" },
+          ],
+          label: "image-agent",
+        }),
+      (err: unknown) => {
+        assert.ok(isWorkflowError(err));
+        assert.equal(err.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.equal(err.recoverable, false);
+        assert.equal(err.agentLabel, "image-agent");
+        assert.match(err.message, /images\[1\]\.uri/);
+        return true;
+      },
+    );
+  } finally {
+    await runner.dispose();
+  }
+});

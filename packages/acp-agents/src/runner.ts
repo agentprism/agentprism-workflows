@@ -49,7 +49,6 @@ import { mapThrownError } from "./errors-map.js";
 import { toJsonSchema } from "./schema-strict.js";
 import type { ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
-import { validateClientHandlers } from "./client-handlers.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
 
@@ -71,7 +70,6 @@ export class AcpAgentRunner implements AgentRunner {
   private readonly emitEvent: AcpEventSink = (name, event) => this.events.emit(name, event);
 
   constructor(options: AcpRunnerOptions = {}) {
-    validateClientHandlers(options.clientHandlers);
     this.pool = new AcpAgentPool(options, { onEvent: this.emitEvent });
     this.backends = resolveBackendRegistry(options.backends);
   }
@@ -330,6 +328,13 @@ function validatePromptImages(images: readonly PromptImage[] | undefined, label?
     if (typeof image.mimeType !== "string" || image.mimeType.trim() === "") {
       throw new WorkflowError(
         `images[${i}].mimeType must be a non-empty string`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+    if (image.uri !== undefined && (typeof image.uri !== "string" || image.uri.trim() === "")) {
+      throw new WorkflowError(
+        `images[${i}].uri must be a non-empty string when present`,
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false, agentLabel: label },
       );

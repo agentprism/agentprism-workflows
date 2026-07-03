@@ -24,6 +24,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
+  CLIENT_METHODS,
   ndJsonStream,
   PROTOCOL_VERSION,
   RequestError,
@@ -89,25 +90,22 @@ const CLIENT_INFO = {
 } as const;
 
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
-const CLIENT_METHOD_NAMES = {
-  writeTextFile: "fs/write_text_file",
-  readTextFile: "fs/read_text_file",
-  createTerminal: "terminal/create",
-  terminalOutput: "terminal/output",
-  releaseTerminal: "terminal/release",
-  waitForTerminalExit: "terminal/wait_for_exit",
-  killTerminal: "terminal/kill",
-} as const;
-
 /** Bound the best-effort session/close round-trip so a slow agent can't hang run()'s finally. */
 const CLOSE_SESSION_TIMEOUT_MS = 5_000;
 /** Bound the graceful SIGTERM shutdown before escalating to SIGKILL. */
 const DISPOSE_SIGKILL_GRACE_MS = 2_000;
+const TOMBSTONE_SESSION_CAP = 64;
 
 interface RawResultSuccess {
   type: string;
   subtype: string;
   structured_output?: unknown;
+}
+
+interface SessionTombstone {
+  readonly cwd: string;
+  readonly label?: string;
+  readonly runId?: string;
 }
 
 /** Per-session accumulator: assistant text, tool history, usage, the Claude raw structured_output,
@@ -186,6 +184,11 @@ class SessionState {
  *  many concurrent sessions without their streams crossing. */
 class MultiplexClient implements Client {
   private readonly sessions = new Map<string, SessionState>();
+  /** Recently unregistered sessions kept ONLY for the teardown window: ACP agents may
+   *  legitimately release terminals (or finish fs/terminal cleanup) after this client releases
+   *  the session because session/close is cancel + free resources and the Agent owns terminal
+   *  release. Store only the slim routing context and cap it FIFO so the memory cost is bounded. */
+  private readonly tombstones = new Map<string, SessionTombstone>();
 
   /** `backendId` stamps event context; `onEvent` (optional) bubbles every notification, permission
    *  request and session lifecycle change up to the runner's typed bus. */
@@ -201,19 +204,24 @@ class MultiplexClient implements Client {
 
   private handlerContext(params: { sessionId: string }): AcpSessionContext {
     const state = this.sessions.get(params.sessionId);
-    if (!state) throw unknownSession(params.sessionId);
-    return { sessionId: params.sessionId, cwd: state.cwd, label: state.label, runId: state.runId };
+    if (state) return { sessionId: params.sessionId, cwd: state.cwd, label: state.label, runId: state.runId };
+    const tombstone = this.tombstones.get(params.sessionId);
+    if (tombstone) return { sessionId: params.sessionId, ...tombstone };
+    throw unknownSession(params.sessionId);
   }
 
-  private terminalHandler<K extends keyof TerminalHandlers>(method: K): TerminalHandlers[K] {
-    const handler = this.handlers?.terminal?.[method];
-    if (typeof handler !== "function") {
-      throw methodNotAdvertised(CLIENT_METHOD_NAMES[method]);
-    }
-    return handler;
+  private dispatch<P extends { sessionId: string }, R>(
+    params: P,
+    wireMethod: string,
+    handler: ((params: P, ctx: AcpSessionContext) => R) | undefined,
+  ): R {
+    if (typeof handler !== "function") throw methodNotAdvertised(wireMethod);
+    const ctx = this.handlerContext(params);
+    return handler(params, ctx);
   }
 
   register(sessionId: string, state: SessionState): void {
+    this.tombstones.delete(sessionId);
     this.sessions.set(sessionId, state);
     this.onEvent?.("session_open", this.contextFor(sessionId, state));
   }
@@ -221,7 +229,19 @@ class MultiplexClient implements Client {
   unregister(sessionId: string): void {
     const state = this.sessions.get(sessionId);
     this.sessions.delete(sessionId);
-    if (state) this.onEvent?.("session_close", this.contextFor(sessionId, state));
+    if (state) {
+      this.tombstones.set(sessionId, {
+        cwd: state.cwd,
+        label: state.label,
+        runId: state.runId,
+      });
+      while (this.tombstones.size > TOMBSTONE_SESSION_CAP) {
+        const oldest = this.tombstones.keys().next().value;
+        if (oldest === undefined) break;
+        this.tombstones.delete(oldest);
+      }
+      this.onEvent?.("session_close", this.contextFor(sessionId, state));
+    }
   }
 
   requestPermission(params: RequestPermissionRequest): RequestPermissionResponse {
@@ -238,48 +258,41 @@ class MultiplexClient implements Client {
   }
 
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> | ReadTextFileResponse {
-    const ctx = this.handlerContext(params);
-    const handler = this.handlers?.fs?.readTextFile;
-    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHOD_NAMES.readTextFile);
-    return handler(params, ctx);
+    return this.dispatch(params, CLIENT_METHODS.fs_read_text_file, this.handlers?.fs?.readTextFile);
   }
 
   writeTextFile(
     params: WriteTextFileRequest,
   ): Promise<WriteTextFileResponse | void> | WriteTextFileResponse | void {
-    const ctx = this.handlerContext(params);
-    const handler = this.handlers?.fs?.writeTextFile;
-    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHOD_NAMES.writeTextFile);
-    return handler(params, ctx);
+    return this.dispatch(params, CLIENT_METHODS.fs_write_text_file, this.handlers?.fs?.writeTextFile);
   }
 
   createTerminal(params: CreateTerminalRequest): Promise<CreateTerminalResponse> | CreateTerminalResponse {
-    const ctx = this.handlerContext(params);
-    return this.terminalHandler("createTerminal")(params, ctx);
+    return this.dispatch(params, CLIENT_METHODS.terminal_create, this.handlers?.terminal?.createTerminal);
   }
 
   terminalOutput(params: TerminalOutputRequest): Promise<TerminalOutputResponse> | TerminalOutputResponse {
-    const ctx = this.handlerContext(params);
-    return this.terminalHandler("terminalOutput")(params, ctx);
+    return this.dispatch(params, CLIENT_METHODS.terminal_output, this.handlers?.terminal?.terminalOutput);
   }
 
   releaseTerminal(
     params: ReleaseTerminalRequest,
   ): Promise<ReleaseTerminalResponse | void> | ReleaseTerminalResponse | void {
-    const ctx = this.handlerContext(params);
-    return this.terminalHandler("releaseTerminal")(params, ctx);
+    return this.dispatch(params, CLIENT_METHODS.terminal_release, this.handlers?.terminal?.releaseTerminal);
   }
 
   waitForTerminalExit(
     params: WaitForTerminalExitRequest,
   ): Promise<WaitForTerminalExitResponse> | WaitForTerminalExitResponse {
-    const ctx = this.handlerContext(params);
-    return this.terminalHandler("waitForTerminalExit")(params, ctx);
+    return this.dispatch(
+      params,
+      CLIENT_METHODS.terminal_wait_for_exit,
+      this.handlers?.terminal?.waitForTerminalExit,
+    );
   }
 
   killTerminal(params: KillTerminalRequest): Promise<KillTerminalResponse | void> | KillTerminalResponse | void {
-    const ctx = this.handlerContext(params);
-    return this.terminalHandler("killTerminal")(params, ctx);
+    return this.dispatch(params, CLIENT_METHODS.terminal_kill, this.handlers?.terminal?.killTerminal);
   }
 
   sessionUpdate(params: SessionNotification): void {
@@ -663,9 +676,9 @@ export class PooledConnection {
   }
 
   /**
-   * Release a session: stop routing it, free the load slot, and best-effort session/close on the
-   * wire (capability-gated, bounded, never fatal). The PROCESS is NOT killed — it returns to the
-   * pool for the next agent() call.
+   * Release a session: move it to teardown-only routing, free the load slot, and best-effort
+   * session/close on the wire (capability-gated, bounded, never fatal). The PROCESS is NOT
+   * killed — it returns to the pool for the next agent() call.
    */
   async releaseSession(sessionId: string): Promise<void> {
     this.client.unregister(sessionId);
@@ -862,19 +875,16 @@ export class SessionHandle implements StructuredSource {
   async prompt(content: string | ContentBlock[], promptMeta?: Record<string, unknown>): Promise<PromptResponse> {
     this.opts.signal?.throwIfAborted();
     this.state.beginTurn();
-    const prompt: ContentBlock[] =
-      typeof content === "string" ? [{ type: "text", text: content }] : content;
-    const adaptedPrompt = adaptPromptContent(
-      prompt,
-      this.pooled.capabilities?.agent ?? {},
-      this.pooled.backendId,
-    );
+    const prompt: ContentBlock[] | string =
+      typeof content === "string"
+        ? content
+        : adaptPromptContent(content, this.pooled.capabilities?.agent ?? {}, this.pooled.backendId);
     // Gate the turn `_meta` against the agent's advertised custom capabilities: a declared
     // turn-level key is dropped when the connected agent said it does not honor it.
     const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
     const request: PromptRequest = {
       sessionId: this.sessionId,
-      prompt: adaptedPrompt,
+      prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
       ...(gatedMeta ? { _meta: gatedMeta } : {}),
     };
     const response = await this.pooled.race(this.pooled.rpc.prompt(request));

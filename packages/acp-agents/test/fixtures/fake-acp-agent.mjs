@@ -19,7 +19,13 @@
 // prove the process was spawned once and only closed on pool dispose.
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
-import { AgentSideConnection, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
+import {
+  AgentSideConnection,
+  CLIENT_METHODS,
+  ndJsonStream,
+  PROTOCOL_VERSION,
+  RequestError,
+} from "@agentclientprotocol/sdk";
 
 const scenario = JSON.parse(process.env.AGENTPRISM_FAKE_SCENARIO ?? "{}");
 const logPath = process.env.AGENTPRISM_FAKE_LOG;
@@ -85,15 +91,14 @@ function promptText(params) {
 
 function normalizeClientMethod(method) {
   switch (method) {
-    case "readTextFile":
     case "fs/read_text_file":
       return "fs/read_text_file";
-    case "writeTextFile":
     case "fs/write_text_file":
       return "fs/write_text_file";
-    case "createTerminal":
     case "terminal/create":
       return "terminal/create";
+    case "terminal/release":
+      return "terminal/release";
     default:
       return method;
   }
@@ -109,6 +114,7 @@ class FakeAgent {
     this.configOptions = scenario.configOptions ?? defaultConfigOptions;
     this.turnIndex = 0;
     this.sessionCounter = 0;
+    this.turnBySession = new Map();
     // Per-session cancellation: a `waitForCancel` turn parks until session/cancel arrives.
     this.cancelled = new Set();
     this.cancelWaiters = new Map();
@@ -135,8 +141,14 @@ class FakeAgent {
     return { sessionId, configOptions: this.configOptions };
   }
 
-  closeSession(params) {
+  async closeSession(params) {
     record({ method: "closeSession", params });
+    const turn = this.turnBySession.get(params.sessionId);
+    const postTurnClientCalls = Array.isArray(turn?.postTurnClientCalls) ? turn.postTurnClientCalls : [];
+    for (const call of postTurnClientCalls) {
+      await this.callClient(call, params.sessionId);
+    }
+    this.turnBySession.delete(params.sessionId);
     return {};
   }
 
@@ -154,6 +166,7 @@ class FakeAgent {
     const turns = scenario.turns ?? [{ text: "ok" }];
     const turn = turns[Math.min(this.turnIndex, turns.length - 1)] ?? {};
     this.turnIndex += 1;
+    this.turnBySession.set(params.sessionId, turn);
 
     // 0) crash path: simulate the backend process dying mid-turn (before responding). With a
     // sentinel, crash EXACTLY ONCE across restarts so the engine's retry lands on a fresh process.
@@ -201,11 +214,7 @@ class FakeAgent {
 
     // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors
     // logged so tests can assert the real JSON-RPC path without changing the default turn.
-    const clientCalls = Array.isArray(turn.clientCalls)
-      ? turn.clientCalls
-      : turn.clientCall
-        ? [turn.clientCall]
-        : [];
+    const clientCalls = Array.isArray(turn.clientCalls) ? turn.clientCalls : [];
     for (const call of clientCalls) {
       await this.callClient(call, params.sessionId);
     }
@@ -281,6 +290,12 @@ class FakeAgent {
           request.command ??= "true";
           const terminal = await this.conn.createTerminal(request);
           response = { terminalId: terminal.id };
+          break;
+        }
+        case "terminal/release": {
+          const request = paramsWithSession(call, sessionId);
+          request.terminalId ??= "fake-terminal";
+          response = await this.conn.request(CLIENT_METHODS.terminal_release, request);
           break;
         }
         default:
