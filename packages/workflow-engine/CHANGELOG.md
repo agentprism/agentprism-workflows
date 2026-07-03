@@ -1,5 +1,15 @@
 # @automatalabs/workflow-engine
 
+## 0.5.0
+
+### Minor Changes
+
+- 1597c87: Fix: the run's base cwd (`WorkflowRunOptions.cwd` / `WorkflowManagerOptions.cwd`) now reaches every subagent ACP session. Previously the engine only passed a session cwd for worktree-isolated agents, so non-isolated agents silently ran in the HOST process's cwd — wrong whenever the embedder's process does not live at the project root. Precedence: worktree isolation > per-agent `agent({ cwd })` (new `AgentOptions.cwd`; relative resolves against the run cwd) > run cwd > `process.cwd()`. Like `mcpServers`, cwd is additive — never part of the resume identity hash. The SDK exposes it as `runDynamicWorkflow(script, { cwd })`.
+
+### Patch Changes
+
+- 1597c87: Fix: `onProgress` snapshots now carry live derived counters. The manager's mutation sites only push/patch `snapshot.agents`, so `agentCount`/`runningCount`/`doneCount`/`errorCount` stayed frozen at their initial 0s and every consumer rendered "0/0 agents" for the whole run (the MCP shell was silently working around it by re-deriving counts from `agents[]`). The manager now recomputes the counters (via `recomputeWorkflowSnapshot`) before every emission.
+
 ## 0.4.0
 
 ### Minor Changes
