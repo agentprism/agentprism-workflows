@@ -19,7 +19,7 @@ import type {
   WorkflowMeta,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
-import { preview, type WorkflowSnapshot } from "./display.js";
+import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
@@ -463,7 +463,14 @@ export class WorkflowManager extends EventEmitter {
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
-    const progress = () => onProgress?.(managed.snapshot);
+    // Sync the derived counters (agentCount/runningCount/doneCount/errorCount) from the
+    // agents array BEFORE every emission: the mutation sites below only push/patch
+    // `snapshot.agents`, so without this the counters stay frozen at their initial 0s and
+    // every onProgress consumer reads "0/0" forever.
+    const progress = () => {
+      Object.assign(managed.snapshot, recomputeWorkflowSnapshot(managed.snapshot));
+      onProgress?.(managed.snapshot);
+    };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     const hostSignal = externalSignal ?? signal;
     if (hostSignal) {
