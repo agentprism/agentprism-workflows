@@ -828,7 +828,7 @@ export class SessionHandle implements StructuredSource {
 
   constructor(
     private readonly pooled: PooledConnection,
-    private readonly sessionId: string,
+    readonly sessionId: string,
     private readonly state: SessionState,
     configOptions: SessionConfigOption[],
     private readonly opts: AcpSessionOptions,

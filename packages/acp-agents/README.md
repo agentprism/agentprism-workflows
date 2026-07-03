@@ -94,6 +94,43 @@ const runner = createAcpRunner({
 });
 ```
 
+## Interactive sessions
+
+Use `runner.openSession(options)` when a host needs to hold one ACP session open across multiple prompt turns. It uses the same backend selection and session/new inputs as `run()` (`model` / `tier`, absolute `cwd`, tool policy, `mcpServers`, `meta`, `runId`, Codex instruction overrides), but it spawns a **dedicated** agent process for that session instead of borrowing from the pool. A long-lived interactive session therefore never starves `run()` calls on the same backend, even with the default pool size of one.
+
+Prompt turns are explicit and serialized: call `prompt(content, { images?, promptMeta? })`, await the returned `{ stopReason, text }`, then send the next turn. A second `prompt()` while one is in flight rejects with a host-side error; queue turns in your host if you want queued UX. `text` is only the assistant text from that turn. Per-turn `images` use the same ACP image block path as `run()` and still degrade through capability negotiation when the agent does not advertise image prompts.
+
+`cancel()` sends ACP `session/cancel` for the active turn. `release()` is idempotent: it best-effort closes the ACP session and then disposes the dedicated process. Passing `signal` to `openSession()` releases the session on abort, and `runner.dispose()` releases any still-open interactive sessions before closing the pooled processes.
+
+```ts
+const runner = createAcpRunner();
+
+try {
+  const session = await runner.openSession({
+    model: "anthropic/claude-sonnet-4",
+    cwd: "/abs/path/to/worktree",
+    onPermissionRequest: async (request) => choosePermission(request),
+  });
+
+  const off = session.on("agent_message_chunk", (e) => {
+    if (e.content.type === "text") process.stdout.write(e.content.text);
+  });
+
+  try {
+    const first = await session.prompt("Inspect the failing test.");
+    const second = await session.prompt("Patch the smallest fix.", {
+      images: [{ data: base64Png, mimeType: "image/png" }],
+    });
+    console.log(first.stopReason, second.text);
+  } finally {
+    off();
+    await session.release();
+  }
+} finally {
+  await runner.dispose();
+}
+```
+
 ## Listening in: live ACP events
 
 `AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_request`, `raw_message`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId? }` context envelope (a pooled runner multiplexes many runs at once). `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
@@ -114,7 +151,8 @@ The full event map (`AcpRunnerEventMap`) and helpers (`TypedEventEmitter`) are e
 From [`src/index.ts`](./src/index.ts):
 
 - **`createAcpRunner(options?)`** — factory returning an `AcpAgentRunner` (this is what `@automatalabs/workflows` injects into the engine).
-- **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)` and `dispose()`.
+- **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `openSession(options)`, and `dispose()`.
+- **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
 - **`selectBackend({ model, tier }, registry?)`** — the cross-provider routing rule: which backend a spec maps to (registered custom names match first, exact or `name/<inner-model>`).
 - **`ClaudeBackend` / `CodexBackend`** — the two built-in backend strategies (spawn config + per-backend schema wiring).
 - **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, customCapabilities? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; `claude`/`codex` reserved). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. `customCapabilities: { namespace, gatedKeys }` declares the agent's `agentCapabilities._meta` negotiation contract: once the agent advertises that namespace, each declared bare `_meta` key is sent only when its same-named flag is `true` (no declaration = never gated).

@@ -1,0 +1,208 @@
+// Public held-open ACP session API. This is intentionally NOT the AgentRunner seam: it exposes
+// a multi-turn session for hosts that want to drive an ACP agent directly while run() remains the
+// one-shot workflow-engine contract.
+import type { ContentBlock, StopReason } from "@agentclientprotocol/sdk";
+import type { McpServerConfig, PromptImage } from "@automatalabs/shared-types";
+import type { Backend, BackendId } from "./backend.js";
+import type { NegotiatedCapabilities } from "./capabilities.js";
+import type { PooledConnection, SessionHandle } from "./acp-client.js";
+import type { AcpEventListener, AcpEventName } from "./events.js";
+import type { PermissionResolver } from "./permissions.js";
+import {
+  appendPromptImages,
+  mergeTurnMeta,
+  validatePromptImages,
+} from "./prompt.js";
+
+/** Options for AcpAgentRunner.openSession(): backend selection and session/new inputs for one
+ *  held-open interactive ACP session. `cwd` is required and absolute; unlike run(), there is no
+ *  default to process.cwd() because the session can span many turns. The session-scoped
+ *  permission resolver wins over the runner-wide default; tool allow/deny policy is used only
+ *  when no resolver is present. */
+export interface InteractiveSessionOptions {
+  /** Model spec (`provider/modelId`, bare model id, or registered custom backend route). */
+  model?: string;
+  /** Coarse tier consulted only when `model` is unset. */
+  tier?: string;
+  /** Absolute working directory for ACP session/new. Required for held-open sessions. */
+  cwd: string;
+  /** Tool allow-list used by the headless permission auto-responder. */
+  toolNames?: string[];
+  /** Tool deny-list, applied after the allow-list. */
+  disallowedToolNames?: string[];
+  /** Session-scoped permission resolver; overrides the runner-wide resolver for this session. */
+  onPermissionRequest?: PermissionResolver;
+  /** Event/telemetry label stamped onto this session's emitted ACP events. */
+  label?: string;
+  /** Correlation id stamped into session/new `_meta` and emitted event context. */
+  runId?: string;
+  /** Generic session-scoped `_meta` passthrough merged under backend-computed session meta. */
+  meta?: Record<string, unknown>;
+  /** CODEX-ONLY base instruction override, forwarded at session/new. */
+  baseInstructions?: string;
+  /** CODEX-ONLY developer instruction override, forwarded at session/new. */
+  developerInstructions?: string;
+  /** Client-provided MCP servers to attach at session/new. */
+  mcpServers?: McpServerConfig[];
+  /** Host-owned cancellation. Aborting releases this interactive session. */
+  signal?: AbortSignal;
+}
+
+/** One completed interactive prompt turn. `text` is the assistant text from THIS turn only:
+ *  it is read from SessionHandle.currentTurnText(), the same turn-segmented accessor run() uses
+ *  for structured-output repair turns. */
+export interface InteractiveTurn {
+  readonly stopReason: StopReason;
+  readonly text: string;
+}
+
+type Subscribe = <K extends AcpEventName>(name: K, listener: AcpEventListener<K>) => () => void;
+
+/** Internal construction bag. Exported only because the class is public in TypeScript; hosts
+ *  should create sessions through AcpAgentRunner.openSession(), never by constructing this. */
+export interface InteractiveSessionDeps {
+  readonly session: SessionHandle;
+  readonly connection: PooledConnection;
+  readonly backend: Backend;
+  readonly subscribe: Subscribe;
+  readonly onRelease: () => void;
+  readonly signal?: AbortSignal;
+  readonly label?: string;
+}
+
+/** A held-open multi-turn ACP session backed by a dedicated agent process. Only one prompt may
+ *  be in flight at a time; hosts that want queued turns should serialize calls themselves so
+ *  cancellation, permissions, and turn text stay attributable to a single active turn. */
+export class InteractiveSession {
+  readonly sessionId: string;
+  readonly backendId: BackendId;
+
+  private readonly session: SessionHandle;
+  private readonly connection: PooledConnection;
+  private readonly backend: Backend;
+  private readonly subscribe: Subscribe;
+  private readonly onReleaseCallback: () => void;
+  private readonly label: string | undefined;
+  private readonly subscriptions = new Set<() => void>();
+  private removeAbort: (() => void) | undefined;
+  private promptInFlight = false;
+  private releasePromise: Promise<void> | undefined;
+
+  /** @internal Build the public wrapper around an already-open ACP session. */
+  static create(deps: InteractiveSessionDeps): InteractiveSession {
+    return new InteractiveSession(deps);
+  }
+
+  /** Constructed by InteractiveSession.create() after session/new succeeds. */
+  private constructor(deps: InteractiveSessionDeps) {
+    this.session = deps.session;
+    this.connection = deps.connection;
+    this.backend = deps.backend;
+    this.subscribe = deps.subscribe;
+    this.onReleaseCallback = deps.onRelease;
+    this.label = deps.label;
+    this.sessionId = deps.session.sessionId;
+    this.backendId = deps.connection.backendId;
+
+    if (deps.signal) {
+      const signal = deps.signal;
+      const onAbort = () => {
+        void this.release();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      this.removeAbort = () => signal.removeEventListener("abort", onAbort);
+      if (signal.aborted) void this.release();
+    }
+  }
+
+  /** Negotiated initialize capabilities for this session's dedicated connection. */
+  get capabilities(): NegotiatedCapabilities | undefined {
+    return this.connection.capabilities;
+  }
+
+  /** Send one prompt turn. A concurrent prompt on the same InteractiveSession is rejected with a
+   *  clear host-side error; queueing is deliberately left to the host so turn boundaries remain
+   *  explicit. Per-turn images are appended only to this prompt, and SessionHandle.prompt()
+   *  performs capability adaptation before sending. */
+  async prompt(
+    content: string | ContentBlock[],
+    opts: { images?: readonly PromptImage[]; promptMeta?: Record<string, unknown> } = {},
+  ): Promise<InteractiveTurn> {
+    if (this.releasePromise) throw new Error("InteractiveSession has been released");
+    if (this.promptInFlight) {
+      throw new Error("InteractiveSession.prompt() already has a prompt in flight; await it before sending another turn");
+    }
+    validatePromptImages(opts.images, this.label);
+
+    this.promptInFlight = true;
+    try {
+      const turnContent = appendPromptImages(content, opts.images);
+      const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(undefined));
+      const response = await this.session.prompt(turnContent, promptMeta);
+      return {
+        stopReason: response.stopReason,
+        text: this.session.currentTurnText(),
+      };
+    } finally {
+      this.promptInFlight = false;
+    }
+  }
+
+  /** Best-effort ACP session/cancel for the active turn. Pending permission resolvers are
+   *  settled as cancelled by the SessionHandle/PooledConnection cancel path. */
+  async cancel(): Promise<void> {
+    if (this.releasePromise) return;
+    await this.session.cancel();
+  }
+
+  /** Subscribe to runner events for THIS ACP session only. Events from other one-shot or
+   *  interactive sessions on the same runner are filtered out by sessionId. The returned
+   *  unsubscribe thunk and every still-live subscription are removed automatically on release. */
+  on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void {
+    if (this.releasePromise) return () => {};
+    const wrapped: AcpEventListener<K> = (event) => {
+      if ((event as { sessionId?: string }).sessionId === this.sessionId) listener(event);
+    };
+    const removeRunnerListener = this.subscribe(name, wrapped);
+    let active = true;
+    const off = () => {
+      if (!active) return;
+      active = false;
+      removeRunnerListener();
+      this.subscriptions.delete(off);
+    };
+    this.subscriptions.add(off);
+    return off;
+  }
+
+  /** Release the ACP session and close the dedicated process. Idempotent. Session close is
+   *  best-effort and bounded by SessionHandle; process disposal mirrors pool teardown. */
+  release(): Promise<void> {
+    this.releasePromise ??= this.doRelease();
+    return this.releasePromise;
+  }
+
+  private async doRelease(): Promise<void> {
+    this.removeAbort?.();
+    this.removeAbort = undefined;
+    try {
+      await this.session.release();
+    } catch {
+      // best-effort: release must still dispose the dedicated process and unregister.
+    }
+    try {
+      await this.connection.dispose();
+    } catch {
+      // best-effort: mirrors pool disposal semantics.
+    } finally {
+      this.removeSubscriptions();
+      this.onReleaseCallback();
+    }
+  }
+
+  private removeSubscriptions(): void {
+    const subscriptions = [...this.subscriptions];
+    for (const off of subscriptions) off();
+    this.subscriptions.clear();
+  }
+}
