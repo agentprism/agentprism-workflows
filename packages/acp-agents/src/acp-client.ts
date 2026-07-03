@@ -26,17 +26,32 @@ import {
   ClientSideConnection,
   ndJsonStream,
   PROTOCOL_VERSION,
+  RequestError,
   type Client,
+  type CreateTerminalRequest,
+  type CreateTerminalResponse,
   type ContentBlock,
+  type KillTerminalRequest,
+  type KillTerminalResponse,
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
+  type ReadTextFileRequest,
+  type ReadTextFileResponse,
+  type ReleaseTerminalRequest,
+  type ReleaseTerminalResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionConfigOption,
   type SessionConfigSelectOption,
   type SessionConfigSelectOptions,
   type SessionNotification,
+  type TerminalOutputRequest,
+  type TerminalOutputResponse,
+  type WaitForTerminalExitRequest,
+  type WaitForTerminalExitResponse,
+  type WriteTextFileRequest,
+  type WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
 import {
@@ -57,6 +72,12 @@ import {
 import { emitSessionUpdate, type AcpEventContext, type AcpEventSink } from "./events.js";
 import { decidePermission, type ToolPolicy } from "./permissions.js";
 import { UsageAccumulator } from "./usage.js";
+import {
+  clientCapabilitiesFor,
+  type AcpSessionContext,
+  type ClientHandlers,
+  type TerminalHandlers,
+} from "./client-handlers.js";
 
 /** A benign client identity. NOT JetBrains/IntelliJ 2026.1 — that exact identity makes
  *  codex-acp disable session config options (our model/effort routing channel). */
@@ -67,6 +88,15 @@ const CLIENT_INFO = {
 } as const;
 
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
+const CLIENT_METHOD_NAMES = {
+  writeTextFile: "fs/write_text_file",
+  readTextFile: "fs/read_text_file",
+  createTerminal: "terminal/create",
+  terminalOutput: "terminal/output",
+  releaseTerminal: "terminal/release",
+  waitForTerminalExit: "terminal/wait_for_exit",
+  killTerminal: "terminal/kill",
+} as const;
 
 /** Bound the best-effort session/close round-trip so a slow agent can't hang run()'s finally. */
 const CLOSE_SESSION_TIMEOUT_MS = 5_000;
@@ -91,6 +121,7 @@ class SessionState {
   /** `label`/`runId` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
   constructor(
+    readonly cwd: string,
     readonly policy: ToolPolicy,
     readonly label?: string,
     readonly runId?: string,
@@ -160,10 +191,25 @@ class MultiplexClient implements Client {
   constructor(
     private readonly backendId: BackendId,
     private readonly onEvent?: AcpEventSink,
+    private readonly handlers?: ClientHandlers,
   ) {}
 
   private contextFor(sessionId: string, state: SessionState | undefined): AcpEventContext {
     return { sessionId, backendId: this.backendId, label: state?.label, runId: state?.runId };
+  }
+
+  private handlerContext(params: { sessionId: string }): AcpSessionContext {
+    const state = this.sessions.get(params.sessionId);
+    if (!state) throw unknownSession(params.sessionId);
+    return { sessionId: params.sessionId, cwd: state.cwd, label: state.label, runId: state.runId };
+  }
+
+  private terminalHandler<K extends keyof TerminalHandlers>(method: K): TerminalHandlers[K] {
+    const handler = this.handlers?.terminal?.[method];
+    if (typeof handler !== "function") {
+      throw methodNotAdvertised(CLIENT_METHOD_NAMES[method]);
+    }
+    return handler;
   }
 
   register(sessionId: string, state: SessionState): void {
@@ -190,6 +236,51 @@ class MultiplexClient implements Client {
     return outcome;
   }
 
+  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> | ReadTextFileResponse {
+    const ctx = this.handlerContext(params);
+    const handler = this.handlers?.fs?.readTextFile;
+    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHOD_NAMES.readTextFile);
+    return handler(params, ctx);
+  }
+
+  writeTextFile(
+    params: WriteTextFileRequest,
+  ): Promise<WriteTextFileResponse | void> | WriteTextFileResponse | void {
+    const ctx = this.handlerContext(params);
+    const handler = this.handlers?.fs?.writeTextFile;
+    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHOD_NAMES.writeTextFile);
+    return handler(params, ctx);
+  }
+
+  createTerminal(params: CreateTerminalRequest): Promise<CreateTerminalResponse> | CreateTerminalResponse {
+    const ctx = this.handlerContext(params);
+    return this.terminalHandler("createTerminal")(params, ctx);
+  }
+
+  terminalOutput(params: TerminalOutputRequest): Promise<TerminalOutputResponse> | TerminalOutputResponse {
+    const ctx = this.handlerContext(params);
+    return this.terminalHandler("terminalOutput")(params, ctx);
+  }
+
+  releaseTerminal(
+    params: ReleaseTerminalRequest,
+  ): Promise<ReleaseTerminalResponse | void> | ReleaseTerminalResponse | void {
+    const ctx = this.handlerContext(params);
+    return this.terminalHandler("releaseTerminal")(params, ctx);
+  }
+
+  waitForTerminalExit(
+    params: WaitForTerminalExitRequest,
+  ): Promise<WaitForTerminalExitResponse> | WaitForTerminalExitResponse {
+    const ctx = this.handlerContext(params);
+    return this.terminalHandler("waitForTerminalExit")(params, ctx);
+  }
+
+  killTerminal(params: KillTerminalRequest): Promise<KillTerminalResponse | void> | KillTerminalResponse | void {
+    const ctx = this.handlerContext(params);
+    return this.terminalHandler("killTerminal")(params, ctx);
+  }
+
   sessionUpdate(params: SessionNotification): void {
     const state = this.sessions.get(params.sessionId);
     // Fold into the accumulator FIRST (the drain contract), THEN bubble the event up unchanged.
@@ -214,6 +305,14 @@ class MultiplexClient implements Client {
       message: rawMessage,
     });
   }
+}
+
+function unknownSession(sessionId: string): RequestError {
+  return RequestError.invalidParams({ sessionId }, `unknown session: ${sessionId}`);
+}
+
+function methodNotAdvertised(method: string): RequestError {
+  return new RequestError(-32601, `${method} was not advertised by this client`, { method });
 }
 
 const DEFAULT_INIT_TIMEOUT_MS = 60_000;
@@ -289,6 +388,8 @@ export interface PooledConnectionDeps {
    *  session lifecycle change on this connection is bubbled up through it (additive observability;
    *  it is invoked AFTER the drain accumulation and never affects the run). */
   onEvent?: AcpEventSink;
+  /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
+  clientHandlers?: ClientHandlers;
 }
 
 /**
@@ -306,6 +407,7 @@ export class PooledConnection {
   private readonly client: MultiplexClient;
   private readonly onDead: (connection: PooledConnection) => void;
   private readonly onEvent: AcpEventSink | undefined;
+  private readonly clientHandlers: ClientHandlers | undefined;
   /** Set true at the start of dispose() so the graceful-shutdown death is NOT reported as a crash. */
   private disposing = false;
   /** Resolves once `initialize` completed (or rejects if the process died first). */
@@ -326,7 +428,8 @@ export class PooledConnection {
     this.backendId = backend.id;
     this.onDead = deps.onDead;
     this.onEvent = deps.onEvent;
-    this.client = new MultiplexClient(this.backendId, this.onEvent);
+    this.clientHandlers = deps.clientHandlers;
+    this.client = new MultiplexClient(this.backendId, this.onEvent, deps.clientHandlers);
 
     const { command, args, env } = backend.spawnConfig();
     // NOTE: deliberately NO `cwd` here. cwd is per-SESSION (session/new), so one pooled process
@@ -459,10 +562,9 @@ export class PooledConnection {
         this.race(
           this.rpc.initialize({
             protocolVersion: PROTOCOL_VERSION,
-            // Truthful advertisement: MultiplexClient implements NONE of the client-side
-            // fs/terminal methods, so we advertise none (the ACP rule is "advertise only what you
-            // implement"). Everything omitted here is treated as unsupported by the agent.
-            clientCapabilities: {},
+            // Truthful advertisement: computed from the consumer-provided handlers registered on
+            // this runner. Omitted flags are unsupported; false flags are never sent deliberately.
+            clientCapabilities: clientCapabilitiesFor(this.clientHandlers),
             clientInfo: { ...CLIENT_INFO },
           }),
         ),
@@ -514,7 +616,7 @@ export class PooledConnection {
           { recoverable: false, agentLabel: opts.label },
         );
       }
-      const state = new SessionState(opts.policy, opts.label, opts.runId);
+      const state = new SessionState(opts.cwd, opts.policy, opts.label, opts.runId);
       // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
       // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
       // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;

@@ -48,11 +48,12 @@ import { mapThrownError } from "./errors-map.js";
 import { toJsonSchema } from "./schema-strict.js";
 import type { ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
+import { validateClientHandlers } from "./client-handlers.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
 
-/** Constructor options for the runner: pool sizing PLUS the custom-backend registry.
- *  `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
+/** Constructor options for the runner: pool sizing, client-side handlers, and the custom-backend
+ *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
 export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Custom ACP backends, keyed by registered name (see registry.ts for the config shape
    *  and the routing rules). Names are case-insensitive; "claude"/"codex" are reserved. */
@@ -69,6 +70,7 @@ export class AcpAgentRunner implements AgentRunner {
   private readonly emitEvent: AcpEventSink = (name, event) => this.events.emit(name, event);
 
   constructor(options: AcpRunnerOptions = {}) {
+    validateClientHandlers(options.clientHandlers);
     this.pool = new AcpAgentPool(options, { onEvent: this.emitEvent });
     this.backends = resolveBackendRegistry(options.backends);
   }

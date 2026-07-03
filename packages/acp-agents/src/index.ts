@@ -27,6 +27,11 @@ export type { NegotiatedCapabilities } from "./capabilities.js";
 export { AcpAgentPool, resolvePoolSize } from "./pool.js";
 export type { AcpPoolOptions, AcpPoolDeps } from "./pool.js";
 
+// Consumer-provided client-side ACP handlers: fs/terminal routing plus truthful initialize
+// clientCapabilities derived from the registered handler set.
+export { clientCapabilitiesFor } from "./client-handlers.js";
+export type { AcpSessionContext, ClientHandlers, FsHandlers, TerminalHandlers } from "./client-handlers.js";
+
 // The typed ACP event bus surfaced on AcpAgentRunner (`runner.on(name, evt => …)`).
 export { TypedEventEmitter, emitSessionUpdate } from "./events.js";
 export type {

@@ -34,6 +34,19 @@ function record(entry) {
   }
 }
 
+function serializeError(error) {
+  if (error && typeof error === "object") {
+    const out = {
+      name: typeof error.name === "string" ? error.name : "Error",
+      message: typeof error.message === "string" ? error.message : String(error),
+    };
+    if ("code" in error) out.code = error.code;
+    if ("data" in error) out.data = error.data;
+    return out;
+  }
+  return { name: "Error", message: String(error) };
+}
+
 // Lifecycle markers so the test can assert ONE spawn and a clean close on dispose.
 record({ method: "__start", pid: process.pid });
 let exitRecorded = false;
@@ -68,6 +81,26 @@ const defaultConfigOptions = [
 function promptText(params) {
   const blocks = Array.isArray(params.prompt) ? params.prompt : [];
   return blocks.map((block) => (block && block.type === "text" ? block.text : "")).join("");
+}
+
+function normalizeClientMethod(method) {
+  switch (method) {
+    case "readTextFile":
+    case "fs/read_text_file":
+      return "fs/read_text_file";
+    case "writeTextFile":
+    case "fs/write_text_file":
+      return "fs/write_text_file";
+    case "createTerminal":
+    case "terminal/create":
+      return "terminal/create";
+    default:
+      return method;
+  }
+}
+
+function paramsWithSession(call, sessionId) {
+  return { ...(call.params ?? {}), sessionId };
 }
 
 class FakeAgent {
@@ -166,7 +199,18 @@ class FakeAgent {
       record({ method: "permissionOutcome", outcome: response.outcome });
     }
 
-    // 2) optional assistant text chunks (drained before the prompt response resolves). `echoPrompt`
+    // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors
+    // logged so tests can assert the real JSON-RPC path without changing the default turn.
+    const clientCalls = Array.isArray(turn.clientCalls)
+      ? turn.clientCalls
+      : turn.clientCall
+        ? [turn.clientCall]
+        : [];
+    for (const call of clientCalls) {
+      await this.callClient(call, params.sessionId);
+    }
+
+    // 3) optional assistant text chunks (drained before the prompt response resolves). `echoPrompt`
     // echoes this turn's prompt text back so a concurrency test can prove per-session routing.
     const texts = turn.echoPrompt
       ? [promptText(params)]
@@ -182,7 +226,7 @@ class FakeAgent {
       });
     }
 
-    // 3) optional usage_update notification (carries the cumulative cost)
+    // 4) optional usage_update notification (carries the cumulative cost)
     if (turn.usageUpdate) {
       await this.conn.sessionUpdate({
         sessionId: params.sessionId,
@@ -190,7 +234,7 @@ class FakeAgent {
       });
     }
 
-    // 4) optional Claude raw structured_output via the _claude/sdkMessage ext notification. The
+    // 5) optional Claude raw structured_output via the _claude/sdkMessage ext notification. The
     // real claude-agent-acp stamps the owning sessionId on it, so the runner can route the result
     // to the right session under concurrency — mirror that exactly.
     if (turn.structuredOutput !== undefined) {
@@ -200,7 +244,7 @@ class FakeAgent {
       });
     }
 
-    // 5) hard failure path: reject the prompt request (provider wall / process fault).
+    // 6) hard failure path: reject the prompt request (provider wall / process fault).
     // Real backends (claude-agent-acp failActive / codex-acp request errors) reject with the
     // failure text carried in the JSON-RPC error MESSAGE, which is what the SDK surfaces as
     // RequestError.message on the client. Mirror that exactly so errors-map classifies it.
@@ -212,6 +256,40 @@ class FakeAgent {
       stopReason: turn.stopReason ?? "end_turn",
       ...(turn.usage ? { usage: turn.usage } : {}),
     };
+  }
+
+  async callClient(call, sessionId) {
+    const clientMethod = normalizeClientMethod(call.method);
+    try {
+      let response;
+      switch (clientMethod) {
+        case "fs/read_text_file": {
+          const request = paramsWithSession(call, sessionId);
+          request.path ??= "/tmp/fake.txt";
+          response = await this.conn.readTextFile(request);
+          break;
+        }
+        case "fs/write_text_file": {
+          const request = paramsWithSession(call, sessionId);
+          request.path ??= "/tmp/fake.txt";
+          request.content ??= "";
+          response = await this.conn.writeTextFile(request);
+          break;
+        }
+        case "terminal/create": {
+          const request = paramsWithSession(call, sessionId);
+          request.command ??= "true";
+          const terminal = await this.conn.createTerminal(request);
+          response = { terminalId: terminal.id };
+          break;
+        }
+        default:
+          throw new Error(`Unsupported fake client call: ${String(call.method)}`);
+      }
+      record({ method: "clientCall", clientMethod, label: call.label, response });
+    } catch (error) {
+      record({ method: "clientCall", clientMethod, label: call.label, error: serializeError(error) });
+    }
   }
 
   cancel(params) {

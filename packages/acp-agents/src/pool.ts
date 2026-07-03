@@ -12,6 +12,7 @@
 // every process. A process-exit safety net kills children if the host exits without disposing.
 import type { Backend, BackendId } from "./backend.js";
 import { PooledConnection, SessionHandle, type AcpSessionOptions } from "./acp-client.js";
+import { validateClientHandlers, type ClientHandlers } from "./client-handlers.js";
 import type { AcpEventSink } from "./events.js";
 
 const DEFAULT_POOL_SIZE = 1;
@@ -20,6 +21,8 @@ const POOL_SIZE_ENV = "AGENTPRISM_ACP_POOL_SIZE";
 export interface AcpPoolOptions {
   /** Long-lived processes to keep PER backend. Default 1; falls back to AGENTPRISM_ACP_POOL_SIZE. */
   size?: number;
+  /** Client-side ACP fs/terminal handlers advertised at initialize and routed per session. */
+  clientHandlers?: ClientHandlers;
 }
 
 /** Internal wiring the runner injects (NOT part of the public AcpPoolOptions surface): the typed
@@ -43,6 +46,7 @@ export function resolvePoolSize(option?: number): number {
 
 export class AcpAgentPool {
   private readonly size: number;
+  private readonly clientHandlers: ClientHandlers | undefined;
   private readonly byBackend = new Map<BackendId, PooledConnection[]>();
   private readonly onProcessExit = () => this.killAllSync();
   private exitHookInstalled = false;
@@ -52,7 +56,9 @@ export class AcpAgentPool {
     options: AcpPoolOptions = {},
     private readonly deps: AcpPoolDeps = {},
   ) {
+    validateClientHandlers(options.clientHandlers);
     this.size = resolvePoolSize(options.size);
+    this.clientHandlers = options.clientHandlers;
   }
 
   /** Acquire a session for one agent() run: get/grow a pooled connection and open a session. */
@@ -82,6 +88,7 @@ export class AcpAgentPool {
       const connection = PooledConnection.create(backend, {
         onDead: (dead) => this.drop(key, dead),
         onEvent: this.deps.onEvent,
+        clientHandlers: this.clientHandlers,
       });
       connections.push(connection);
       return connection;
