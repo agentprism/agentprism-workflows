@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/banner.png" alt="AgentPrism — One script. Many agents." />
+</p>
+
 # AgentPrism Workflows
 
 Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code and OpenAI Codex), with deterministic journaling, resume, token budgets, and git-worktree isolation.
