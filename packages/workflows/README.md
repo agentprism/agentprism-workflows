@@ -430,9 +430,13 @@ TypedEventEmitter,            // the tiny typed emitter backing runner.on(...)
 // ── Errors ──
 WorkflowError, WorkflowErrorCode, isWorkflowError, isProviderUsageLimit,
 
+// ── Persistence paths ──
+AGENTPRISM_PERSISTENCE_ROOT_ENV,
+
 // ── Types ──
 RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
+WorkflowPathOptions, RunPersistenceOptions,
 AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
 ClientHandlers, FsHandlers, TerminalHandlers, AcpSessionContext, NegotiatedCapabilities,

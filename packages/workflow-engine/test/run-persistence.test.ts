@@ -34,6 +34,27 @@ const a = await agent('first', { label: 'first' })
 const b = await agent('second', { label: 'second' })
 return { a, b }`;
 
+const loggingScript = `export const meta = { name: 'logging_demo', description: 'logging demo' }
+log('root check')
+const a = await agent('first', { label: 'first' })
+return { a }`;
+
+function deferredAgent() {
+  let resolveRun: ((value: unknown) => void) | undefined;
+  return {
+    resolve(value: unknown = "ok") {
+      resolveRun?.(value);
+    },
+    runner: {
+      async run() {
+        return new Promise((resolve) => {
+          resolveRun = resolve;
+        });
+      },
+    },
+  };
+}
+
 test(
   "createRunPersistence creates runs directory on first save",
   withTempCwd(async (cwd) => {
@@ -134,6 +155,39 @@ test(
       () => new WorkflowManager({ cwd, persistenceRoot: "relative-root" }),
       /persistenceRoot.*absolute/,
     );
+  }),
+);
+
+test(
+  "WorkflowManager resolves persistence root once for run state and logs",
+  withTempCwd(async (cwd) => {
+    const constructionRoot = mkdtempSync(join(tmpdir(), "ap-dw-root-once-a-"));
+    const mutatedRoot = mkdtempSync(join(tmpdir(), "ap-dw-root-once-b-"));
+    try {
+      process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV] = constructionRoot;
+      const manager = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(prompt: string) {
+            return `ok:${prompt}`;
+          },
+        },
+      });
+      process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV] = mutatedRoot;
+
+      const result = await manager.runSync(loggingScript);
+
+      const constructionRunsDir = workflowProjectPaths(cwd, { persistenceRoot: constructionRoot }).runsDir;
+      const mutatedRunsDir = workflowProjectPaths(cwd, { persistenceRoot: mutatedRoot }).runsDir;
+      assert.equal(result.status, "completed");
+      assert.equal(existsSync(join(constructionRunsDir, `${result.runId}.json`)), true, "run state uses construction root");
+      assert.equal(existsSync(join(constructionRunsDir, `${result.runId}.log`)), true, "logs use construction root");
+      assert.equal(existsSync(join(mutatedRunsDir, `${result.runId}.json`)), false, "mutated env gets no run state");
+      assert.equal(existsSync(join(mutatedRunsDir, `${result.runId}.log`)), false, "mutated env gets no logs");
+    } finally {
+      rmSync(constructionRoot, { recursive: true, force: true });
+      rmSync(mutatedRoot, { recursive: true, force: true });
+    }
   }),
 );
 
@@ -819,9 +873,76 @@ test(
     assert.equal((result.result as { b?: unknown }).b, "ok:second");
     const runsDir = workflowProjectPaths(cwd).runsDir;
     const files = existsSync(runsDir) ? readdirSync(runsDir) : [];
-    assert.deepEqual(files, [], "journaling:false should not write run-state, log, lock, or sidecar files");
-    assert.deepEqual(manager.listRuns(), [], "journaling:false should not read persisted run journals");
+    assert.deepEqual(files, [], "journaling:false should not leave run-state, log, lock, or sidecar files");
+    assert.deepEqual(manager.listRuns(), [], "there are no persisted run journals for this run");
     await assert.rejects(() => manager.resume(result.runId), /journaling disabled for this run/);
+  }),
+);
+
+test(
+  "WorkflowManager journaling:false still acquires and releases the run lease",
+  withTempCwd(async (cwd) => {
+    const agent = deferredAgent();
+    const manager = new WorkflowManager({ cwd, journaling: false, agent: agent.runner });
+
+    const { runId, promise } = manager.startInBackground(loggingScript);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const lockPath = join(runsDir, `${runId}.lock`);
+
+    assert.equal(existsSync(lockPath), true, "active non-journaled run still owns a cross-process lock");
+    agent.resolve("ok");
+    const result = await promise;
+
+    assert.equal(result.status, "completed");
+    assert.equal(existsSync(lockPath), false, "lock is released when the non-journaled run settles");
+    assert.deepEqual(readdirSync(runsDir), [], "no journal/log files are left behind");
+  }),
+);
+
+test(
+  "WorkflowManager lists per-run journaling:true output under a journaling:false manager",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      journaling: false,
+      agent: {
+        async run(prompt: string) {
+          return `ok:${prompt}`;
+        },
+      },
+    });
+
+    const result = await manager.runSync(twoAgentScript, undefined, { journaling: true });
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(
+      manager.listRuns().map((run) => run.runId),
+      [result.runId],
+      "manager default does not hide persisted per-run journaling:true output",
+    );
+  }),
+);
+
+test(
+  "WorkflowManager journaling:false manager still lists other persisted runs",
+  withTempCwd(async (cwd) => {
+    const writer = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          return `ok:${prompt}`;
+        },
+      },
+    });
+    const written = await writer.runSync(loggingScript);
+
+    const manager = new WorkflowManager({ cwd, journaling: false });
+
+    assert.deepEqual(
+      manager.listAllRuns().map((run) => run.runId),
+      [written.runId],
+      "journaling:false controls writes for new runs, not enumeration of existing state",
+    );
   }),
 );
 

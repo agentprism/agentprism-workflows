@@ -123,8 +123,9 @@ set `new WorkflowManager({ persistenceRoot: "/absolute/data/root" })`; when omit
 `AGENTPRISM_PERSISTENCE_ROOT` is used, then the homedir default. The root must be absolute.
 Set `journaling: false` on the manager or per `runSync`/`startInBackground` call when the
 host owns transcript storage. That mode writes no engine run-state/log journal files and
-otherwise preserves run results, events, retries, and status transitions; resume is
-intentionally unavailable and rejects with `journaling disabled for this run` for those runs.
+otherwise preserves run results, events, retries, status transitions, cross-process leases,
+and listing of persisted runs written by other executions; resume is intentionally unavailable
+and rejects with `journaling disabled for this run` for those runs.
 
 ## Key exports
 

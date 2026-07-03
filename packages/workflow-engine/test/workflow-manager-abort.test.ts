@@ -75,6 +75,11 @@ phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
 
+const twoAgentScript = `export const meta = { name: 'tracked_demo_two', description: 'two agents' }
+const a = await agent('first', { label: 'a' })
+const b = await agent('second', { label: 'b' })
+return { a, b }`;
+
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -88,6 +93,47 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     }
   };
 }
+
+// ─── Observer isolation ───────────────────────────────────────────────────────
+
+test(
+  "throwing manager event observers do not fail the run or block sibling listeners",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    let siblingCalled = false;
+
+    manager.on("agentStart", () => {
+      throw new Error("host observer failed");
+    });
+    manager.on("agentStart", () => {
+      siblingCalled = true;
+    });
+
+    const result = await manager.runSync(oneAgentScript);
+
+    assert.equal(result.status, "completed");
+    assert.equal(manager.getRun(result.runId)?.status, "completed");
+    assert.equal(siblingCalled, true, "sibling observer still receives the event");
+  }),
+);
+
+test(
+  "manager event once listeners fire exactly once under isolated dispatch",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    let starts = 0;
+
+    manager.once("agentStart", () => {
+      starts++;
+    });
+
+    const result = await manager.runSync(twoAgentScript);
+
+    assert.equal(result.status, "completed");
+    assert.equal(starts, 1, "once listener should self-remove after the first event");
+    assert.equal(manager.listenerCount("agentStart"), 0);
+  }),
+);
 
 // ─── Abort Propagation (3 tests) ───────────────────────────────────────────────
 

@@ -20,7 +20,7 @@ import type {
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
 import { preview, type WorkflowSnapshot } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -29,6 +29,7 @@ import {
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
+import { workflowHomeDir } from "./workflow-paths.js";
 import { type EngineRunResult, parseWorkflowScript, runWorkflow } from "./workflow.js";
 
 export interface ManagedRun {
@@ -136,6 +137,11 @@ export interface WorkflowManagerOptions {
   journaling?: boolean;
 }
 
+/**
+ * Stateful workflow run manager. Events are OBSERVABILITY ONLY: listeners are
+ * best-effort observers, isolated from sibling listeners and from run execution. A
+ * throwing host observer never fails, pauses, aborts, or masks cleanup for the run.
+ */
 export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
   private persistence: RunPersistence;
@@ -150,7 +156,7 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private agentsDir?: string;
-  private persistenceRoot?: string;
+  private persistenceRoot: string;
   private journaling: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
@@ -164,10 +170,24 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.agentsDir = options.agentsDir;
-    this.persistenceRoot = options.persistenceRoot;
+    this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
     this.journaling = options.journaling ?? true;
     this.persistence = createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
-    if (this.journaling) this.recoverStaleRuns();
+    this.recoverStaleRuns();
+  }
+
+  override emit(eventName: string | symbol, ...args: unknown[]): boolean {
+    const listeners = this.rawListeners(eventName);
+    for (const listener of listeners) {
+      try {
+        // rawListeners() returns EventEmitter's once-wrappers. Calling the wrapper
+        // preserves once() self-removal while isolating each observer's throw.
+        Reflect.apply(listener, this, args);
+      } catch {
+        // Manager events are live observability; bad listeners cannot perturb runs.
+      }
+    }
+    return listeners.length > 0;
   }
 
   /** Bind the manager to the current session, so new runs are tagged with it and
@@ -233,8 +253,8 @@ export class WorkflowManager extends EventEmitter {
     const controller = new AbortController();
     const parsed = parseWorkflowScript(script);
     const journaling = this.resolveJournaling(exec);
-    const lease = journaling ? this.persistence.acquireRunLease(runId) : undefined;
-    if (journaling && !lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
 
     const managed: ManagedRun = {
       runId,
@@ -309,9 +329,9 @@ export class WorkflowManager extends EventEmitter {
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
     const managed = this.createManaged(script, args, this.resolveJournaling(exec));
-    const lease = managed.journaling ? this.persistence.acquireRunLease(managed.runId) : undefined;
-    if (managed.journaling && !lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
-    managed.lease = lease ?? undefined;
+    const lease = this.persistence.acquireRunLease(managed.runId);
+    if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
+    managed.lease = lease;
     this.runs.set(managed.runId, managed);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
@@ -770,14 +790,12 @@ export class WorkflowManager extends EventEmitter {
    * reappear when you switch back. Unbound (tests/legacy) returns everything.
    */
   listRuns(): PersistedRunState[] {
-    if (!this.journaling) return [];
     const all = this.persistence.list();
     return this.sessionId ? all.filter((r) => r.sessionId === this.sessionId) : all;
   }
 
   /** All persisted runs regardless of session (used by cross-session recovery). */
   listAllRuns(): PersistedRunState[] {
-    if (!this.journaling) return [];
     return this.persistence.list();
   }
 
@@ -804,19 +822,4 @@ export class WorkflowManager extends EventEmitter {
   getPersistence(): RunPersistence {
     return this.persistence;
   }
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (error && typeof error === "object") {
-    const message = (error as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message;
-    try {
-      const json = JSON.stringify(error);
-      if (json) return json;
-    } catch {
-      // Fall through to String() for cyclic objects or exotic throwables.
-    }
-  }
-  return String(error);
 }

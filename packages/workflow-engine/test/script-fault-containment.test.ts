@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkflowError } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
-import { AGENTPRISM_PERSISTENCE_ROOT_ENV } from "../src/workflow-paths.js";
+import { AGENTPRISM_PERSISTENCE_ROOT_ENV, workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 const noopAgent = {
@@ -29,6 +29,32 @@ const faultScripts = [
     name: "sync non-Error object throw",
     script: scriptBody("sync_object_throw", "throw { message: 'object boom', code: 'OBJECT_BOOM' }"),
     message: /object boom/,
+  },
+  {
+    name: "sync throwing message getter object throw",
+    script: scriptBody(
+      "sync_throwing_getter_throw",
+      [
+        "const throwable = {",
+        "  get message() { throw new Error('message getter boom') },",
+        "  toString() { return 'throwable with unreadable message' }",
+        "}",
+        "throw throwable",
+      ].join("\n"),
+    ),
+    message: /throwable with unreadable message/,
+  },
+  {
+    name: "sync circular object throw",
+    script: scriptBody(
+      "sync_circular_throw",
+      [
+        "const throwable = { message: '', toString() { return 'circular throwable' } }",
+        "throwable.self = throwable",
+        "throw throwable",
+      ].join("\n"),
+    ),
+    message: /circular throwable/,
   },
   {
     name: "async rejection after await",
@@ -74,6 +100,14 @@ async function withUnhandledRejectionTripwire(fn: () => Promise<void>): Promise<
   }
 }
 
+function assertLeaseReleased(cwd: string, runId: string): void {
+  assert.equal(
+    existsSync(join(workflowProjectPaths(cwd).runsDir, `${runId}.lock`)),
+    false,
+    "failed workflow must release its run lease",
+  );
+}
+
 for (const fault of faultScripts) {
   test(
     `runSync contains ${fault.name} as a failed workflow result`,
@@ -85,6 +119,7 @@ for (const fault of faultScripts) {
         assert.equal(result.status, "failed");
         assert.match(result.reason ?? "", fault.message);
         assert.equal(manager.getRun(result.runId)?.status, "failed");
+        assertLeaseReleased(cwd, result.runId);
       });
     }),
   );
@@ -107,6 +142,7 @@ for (const fault of faultScripts) {
         );
         assert.equal(manager.getRun(runId)?.status, "failed");
         assert.match(manager.getRun(runId)?.error?.message ?? "", fault.message);
+        assertLeaseReleased(cwd, runId);
       });
     }),
   );

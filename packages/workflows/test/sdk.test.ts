@@ -34,6 +34,7 @@ import {
   WorkflowError,
   TypedEventEmitter,
   toJsonSchema,
+  AGENTPRISM_PERSISTENCE_ROOT_ENV,
 } from "../src/index.js";
 import type {
   AcpEventContext,
@@ -43,6 +44,8 @@ import type {
   AgentEventPayload,
   AgentRunner,
   RunOptions,
+  RunPersistenceOptions,
+  WorkflowPathOptions,
 } from "../src/index.js";
 
 /**
@@ -70,6 +73,11 @@ class EventedRunner {
   private readonly events = new TypedEventEmitter<AcpRunnerEventMap>();
   readonly sessionId = "session-1";
   readonly backendId = "claude";
+  private readonly waitForRun: (() => Promise<void>) | undefined;
+
+  constructor(options: { waitForRun?: () => Promise<void> } = {}) {
+    this.waitForRun = options.waitForRun;
+  }
 
   on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void {
     return this.events.on(name, listener);
@@ -94,6 +102,7 @@ class EventedRunner {
     this.emit("session_update", { ...ctx, update });
     this.emit("agent_message_chunk", { ...ctx, ...update } as AcpRunnerEventMap["agent_message_chunk"]);
 
+    await this.waitForRun?.();
     this.emit("session_close", ctx);
     return `evented:${prompt}`;
   }
@@ -112,6 +121,22 @@ function eventedAgent(runner: EventedRunner): AgentRunner {
   return runner as unknown as AgentRunner;
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(message);
+}
+
 /** Valid one-agent script: meta first, exactly one agent() call, returns its result. */
 const ONE_AGENT_SCRIPT = [
   'export const meta = { name: "one-agent", description: "a single subagent" };',
@@ -126,6 +151,10 @@ test("facade re-exports the public surface", () => {
   assert.equal(typeof runDynamicWorkflow, "function");
   assert.equal(typeof WorkflowError, "function");
   assert.equal(typeof toJsonSchema, "function");
+  assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
+  const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
+  const runPersistenceOptions: RunPersistenceOptions = pathOptions;
+  assert.equal(runPersistenceOptions.persistenceRoot, pathOptions.persistenceRoot);
 });
 
 test("createAcpRunner exposes a typed ACP event bus (on/once/off/listenerCount) via the barrel", async () => {
@@ -238,6 +267,49 @@ test("WorkflowManager forwards injected runner live ACP events as agentEvent", a
   assert.equal(chunk.backendId, runner.backendId);
   assert.equal(chunk.event.content.type, "text");
   assert.equal(chunk.event.content.type === "text" ? chunk.event.content.text : "", "live");
+  assert.equal(runner.listenerCount("session_update"), 1, "constructor bridge survives run settlement");
+  manager.dispose();
+  assert.equal(runner.listenerCount("session_update"), 0, "dispose removes constructor bridge");
+});
+
+test("WorkflowManager removes exec runner bridge after runSync settles", async () => {
+  const runner = new EventedRunner();
+  const manager = new WorkflowManager();
+
+  const result = await manager.runSync(ONE_AGENT_SCRIPT, undefined, { agent: eventedAgent(runner) });
+
+  assert.equal(result.status, "completed");
+  assert.equal(runner.listenerCount("session_update"), 0);
+  assert.equal(runner.listenerCount("session_open"), 0);
+});
+
+test("WorkflowManager keeps a shared exec runner bridge until concurrent runs settle", async () => {
+  const gates: Array<ReturnType<typeof deferred>> = [];
+  const runner = new EventedRunner({
+    waitForRun: () => {
+      const gate = deferred();
+      gates.push(gate);
+      return gate.promise;
+    },
+  });
+  const agent = eventedAgent(runner);
+  const manager = new WorkflowManager();
+
+  const first = manager.runSync(ONE_AGENT_SCRIPT, undefined, { agent });
+  const second = manager.runSync(ONE_AGENT_SCRIPT, undefined, { agent });
+  await waitUntil(() => gates.length === 2, "both concurrent runs should reach the runner");
+
+  assert.equal(runner.listenerCount("session_update"), 1, "shared runner is subscribed once");
+  assert.equal(runner.listenerCount("session_open"), 1);
+
+  gates[0]?.resolve();
+  assert.equal((await first).status, "completed");
+  assert.equal(runner.listenerCount("session_update"), 1, "bridge remains until the second run settles");
+
+  gates[1]?.resolve();
+  assert.equal((await second).status, "completed");
+  assert.equal(runner.listenerCount("session_update"), 0, "bridge is removed after the final release");
+  assert.equal(runner.listenerCount("session_open"), 0);
 });
 
 test("WorkflowManager agentEvent bridge unsubscribes on dispose", () => {

@@ -10,7 +10,7 @@
 // vm-realm globals, NOT importable symbols; they are documented for author IntelliSense
 // in ./dsl.d.ts (referenced above), not exported here.
 
-import { createAcpRunner } from "@automatalabs/acp-agents";
+import { ACP_CROSS_CUTTING_EVENT_NAMES, createAcpRunner } from "@automatalabs/acp-agents";
 import {
   parseWorkflowScript,
   WorkflowError,
@@ -32,8 +32,11 @@ export type {
   CheckpointOptions,
   WorkflowRunResult,
   WorkflowSnapshot,
+  WorkflowPathOptions,
+  RunPersistenceOptions,
 } from "@automatalabs/workflow-engine";
 export {
+  AGENTPRISM_PERSISTENCE_ROOT_ENV,
   WorkflowError,
   WorkflowErrorCode,
   isWorkflowError,
@@ -101,18 +104,26 @@ export type { AgentRunner, RunOptions, AgentResult, AgentUsage } from "@automata
 export type { JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
 
 /** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */
-const MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES = [
-  "permission_pending",
-  "permission_request",
-  "session_open",
-  "session_close",
-  "backend_error",
-  "raw_message",
-] as const satisfies readonly AcpEventName[];
+type ManagerAcpCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;
+const MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES =
+  ACP_CROSS_CUTTING_EVENT_NAMES satisfies readonly ManagerAcpCrossCuttingEventName[];
+type Assert<T extends true> = T;
+type IsNever<T> = [T] extends [never] ? true : false;
+type _ManagerAcpCrossCuttingEventNamesComplete = Assert<
+  IsNever<Exclude<ManagerAcpCrossCuttingEventName, (typeof MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES)[number]>>
+>;
+type _ManagerAcpCrossCuttingEventNamesExact = Assert<
+  IsNever<Exclude<(typeof MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES)[number], ManagerAcpCrossCuttingEventName>>
+>;
 
 type AcpEventBusRunner = AgentRunner & {
   on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void;
 };
+
+interface AcpBridgeEntry {
+  refs: number;
+  unsubscribers: Array<() => void>;
+}
 
 type ContextProperty<T, K extends PropertyKey> = K extends keyof T ? T[K] : never;
 type OptionalContextProperty<T, K extends PropertyKey> = K extends keyof T ? T[K] : undefined;
@@ -145,11 +156,11 @@ export type AgentEventPayload<K extends AcpEventName = AcpEventName> = AgentEven
  * only the manager's runner subscriptions (runner process ownership stays with the caller).
  */
 export class WorkflowManager extends EngineWorkflowManager {
-  private readonly acpBridgeUnsubscribers = new Map<AcpEventBusRunner, Array<() => void>>();
+  private readonly acpBridges = new Map<AcpEventBusRunner, AcpBridgeEntry>();
 
   constructor(options: WorkflowManagerOptions = {}) {
     super(options);
-    this.bridgeAcpRunner(options.agent);
+    this.acquireAcpRunnerBridge(options.agent);
   }
 
   override startInBackground(
@@ -157,27 +168,42 @@ export class WorkflowManager extends EngineWorkflowManager {
     args?: unknown,
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
-    this.bridgeAcpRunner(exec.agent);
-    return super.startInBackground(script, args, exec);
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      const started = super.startInBackground(script, args, exec);
+      void started.promise.then(releaseBridge, releaseBridge);
+      return started;
+    } catch (error) {
+      releaseBridge();
+      throw error;
+    }
   }
 
   override async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    this.bridgeAcpRunner(exec.agent);
-    return super.runSync(script, args, exec);
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      return await super.runSync(script, args, exec);
+    } finally {
+      releaseBridge();
+    }
   }
 
   override async resume(runId: string, exec: ExecOptions = {}): Promise<boolean> {
-    this.bridgeAcpRunner(exec.agent);
-    return super.resume(runId, exec);
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      return await super.resume(runId, exec);
+    } finally {
+      releaseBridge();
+    }
   }
 
   /** Detach manager-owned ACP event subscriptions. The manager does NOT dispose the runner: the
    *  caller may share one runner across managers or own its process lifetime explicitly. */
   dispose(): void {
-    for (const unsubscribers of this.acpBridgeUnsubscribers.values()) {
-      for (const unsubscribe of unsubscribers) unsubscribe();
+    for (const bridge of this.acpBridges.values()) {
+      for (const unsubscribe of bridge.unsubscribers) unsubscribe();
     }
-    this.acpBridgeUnsubscribers.clear();
+    this.acpBridges.clear();
   }
 
   /** Node-style alias for hosts that tear down managers through close hooks. */
@@ -185,32 +211,38 @@ export class WorkflowManager extends EngineWorkflowManager {
     this.dispose();
   }
 
-  override emit(eventName: string | symbol, ...args: unknown[]): boolean {
-    if (eventName !== "agentEvent") return super.emit(eventName, ...args);
-    const listeners = this.rawListeners(eventName);
-    for (const listener of listeners) {
-      try {
-        Reflect.apply(listener, this, args);
-      } catch {
-        // agentEvent is live observability; a bad host listener must not block sibling observers.
-      }
+  private acquireAcpRunnerBridge(agent: AgentRunner | undefined): () => void {
+    if (!isAcpEventBusRunner(agent)) return () => {};
+    let bridge = this.acpBridges.get(agent);
+    if (!bridge) {
+      bridge = {
+        refs: 0,
+        unsubscribers: [
+          agent.on("session_update", (event) => {
+            this.emit("agentEvent", toSessionUpdateAgentEventPayload(event));
+          }),
+          ...MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES.map((name) =>
+            agent.on(name, (event) => {
+              this.emit("agentEvent", toAgentEventPayload(name, event));
+            }),
+          ),
+        ],
+      };
+      this.acpBridges.set(agent, bridge);
     }
-    return listeners.length > 0;
-  }
+    bridge.refs++;
 
-  private bridgeAcpRunner(agent: AgentRunner | undefined): void {
-    if (!isAcpEventBusRunner(agent) || this.acpBridgeUnsubscribers.has(agent)) return;
-    const unsubscribers: Array<() => void> = [
-      agent.on("session_update", (event) => {
-        this.emit("agentEvent", toSessionUpdateAgentEventPayload(event));
-      }),
-      ...MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES.map((name) =>
-        agent.on(name, (event) => {
-          this.emit("agentEvent", toAgentEventPayload(name, event));
-        }),
-      ),
-    ];
-    this.acpBridgeUnsubscribers.set(agent, unsubscribers);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      const current = this.acpBridges.get(agent);
+      if (current !== bridge) return;
+      current.refs--;
+      if (current.refs > 0) return;
+      for (const unsubscribe of current.unsubscribers) unsubscribe();
+      this.acpBridges.delete(agent);
+    };
   }
 }
 

@@ -36,7 +36,7 @@ export { clientCapabilitiesFor } from "./client-handlers.js";
 export type { AcpSessionContext, ClientHandlers, FsHandlers, TerminalHandlers } from "./client-handlers.js";
 
 // The typed ACP event bus surfaced on AcpAgentRunner (`runner.on(name, evt => …)`).
-export { TypedEventEmitter, emitSessionUpdate } from "./events.js";
+export { ACP_CROSS_CUTTING_EVENT_NAMES, TypedEventEmitter, emitSessionUpdate } from "./events.js";
 export type {
   AcpRunnerEventMap,
   AcpEventName,
