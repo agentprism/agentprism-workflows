@@ -9,6 +9,7 @@ import type {
   AgentUsage,
   JournalEntry,
   McpServerConfig,
+  PromptImage,
   WorkflowBackendConfig,
   WorkflowMeta,
   WorkflowMetaPhase,
@@ -190,6 +191,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * logical call, so it is intentionally NOT part of the resume identity hash (hashAgentCall).
    */
   mcpServers?: McpServerConfig[];
+  /**
+   * Base64 image attachments appended to the prompt as ACP image ContentBlocks by the runner.
+   * ADDITIVE: it shapes the agent input, not the logical call identity, so it is intentionally
+   * NOT part of the resume identity hash (hashAgentCall).
+   */
+  images?: readonly PromptImage[];
   /**
    * Generic ACP `_meta` passthrough, SESSION-scoped: merged into the outgoing ACP
    * `session/new` `_meta`, so a script can drive any ACP agent's custom extension surface
@@ -519,6 +526,8 @@ export async function runWorkflow<T = unknown>(
                 cwd: runCwd,
                 // Additive run input: wires tools, NOT part of the resume identity (hashAgentCall).
                 mcpServers: agentOptions.mcpServers,
+                // Additive prompt attachments, NOT part of the resume identity (hashAgentCall).
+                images: agentOptions.images,
                 // Generic ACP _meta passthroughs (session/new + session/prompt). Additive,
                 // NOT part of the resume identity (hashAgentCall).
                 meta: agentOptions.meta,

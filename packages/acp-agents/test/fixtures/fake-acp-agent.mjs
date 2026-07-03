@@ -19,7 +19,13 @@
 // prove the process was spawned once and only closed on pool dispose.
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
-import { AgentSideConnection, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
+import {
+  AgentSideConnection,
+  CLIENT_METHODS,
+  ndJsonStream,
+  PROTOCOL_VERSION,
+  RequestError,
+} from "@agentclientprotocol/sdk";
 
 const scenario = JSON.parse(process.env.AGENTPRISM_FAKE_SCENARIO ?? "{}");
 const logPath = process.env.AGENTPRISM_FAKE_LOG;
@@ -32,6 +38,19 @@ function record(entry) {
   } catch {
     // best-effort observation channel
   }
+}
+
+function serializeError(error) {
+  if (error && typeof error === "object") {
+    const out = {
+      name: typeof error.name === "string" ? error.name : "Error",
+      message: typeof error.message === "string" ? error.message : String(error),
+    };
+    if ("code" in error) out.code = error.code;
+    if ("data" in error) out.data = error.data;
+    return out;
+  }
+  return { name: "Error", message: String(error) };
 }
 
 // Lifecycle markers so the test can assert ONE spawn and a clean close on dispose.
@@ -70,12 +89,32 @@ function promptText(params) {
   return blocks.map((block) => (block && block.type === "text" ? block.text : "")).join("");
 }
 
+function normalizeClientMethod(method) {
+  switch (method) {
+    case "fs/read_text_file":
+      return "fs/read_text_file";
+    case "fs/write_text_file":
+      return "fs/write_text_file";
+    case "terminal/create":
+      return "terminal/create";
+    case "terminal/release":
+      return "terminal/release";
+    default:
+      return method;
+  }
+}
+
+function paramsWithSession(call, sessionId) {
+  return { ...(call.params ?? {}), sessionId };
+}
+
 class FakeAgent {
   constructor(conn) {
     this.conn = conn;
     this.configOptions = scenario.configOptions ?? defaultConfigOptions;
     this.turnIndex = 0;
     this.sessionCounter = 0;
+    this.turnBySession = new Map();
     // Per-session cancellation: a `waitForCancel` turn parks until session/cancel arrives.
     this.cancelled = new Set();
     this.cancelWaiters = new Map();
@@ -102,8 +141,14 @@ class FakeAgent {
     return { sessionId, configOptions: this.configOptions };
   }
 
-  closeSession(params) {
+  async closeSession(params) {
     record({ method: "closeSession", params });
+    const turn = this.turnBySession.get(params.sessionId);
+    const postTurnClientCalls = Array.isArray(turn?.postTurnClientCalls) ? turn.postTurnClientCalls : [];
+    for (const call of postTurnClientCalls) {
+      await this.callClient(call, params.sessionId);
+    }
+    this.turnBySession.delete(params.sessionId);
     return {};
   }
 
@@ -121,6 +166,7 @@ class FakeAgent {
     const turns = scenario.turns ?? [{ text: "ok" }];
     const turn = turns[Math.min(this.turnIndex, turns.length - 1)] ?? {};
     this.turnIndex += 1;
+    this.turnBySession.set(params.sessionId, turn);
 
     // 0) crash path: simulate the backend process dying mid-turn (before responding). With a
     // sentinel, crash EXACTLY ONCE across restarts so the engine's retry lands on a fresh process.
@@ -166,7 +212,14 @@ class FakeAgent {
       record({ method: "permissionOutcome", outcome: response.outcome });
     }
 
-    // 2) optional assistant text chunks (drained before the prompt response resolves). `echoPrompt`
+    // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors
+    // logged so tests can assert the real JSON-RPC path without changing the default turn.
+    const clientCalls = Array.isArray(turn.clientCalls) ? turn.clientCalls : [];
+    for (const call of clientCalls) {
+      await this.callClient(call, params.sessionId);
+    }
+
+    // 3) optional assistant text chunks (drained before the prompt response resolves). `echoPrompt`
     // echoes this turn's prompt text back so a concurrency test can prove per-session routing.
     const texts = turn.echoPrompt
       ? [promptText(params)]
@@ -182,7 +235,7 @@ class FakeAgent {
       });
     }
 
-    // 3) optional usage_update notification (carries the cumulative cost)
+    // 4) optional usage_update notification (carries the cumulative cost)
     if (turn.usageUpdate) {
       await this.conn.sessionUpdate({
         sessionId: params.sessionId,
@@ -190,7 +243,7 @@ class FakeAgent {
       });
     }
 
-    // 4) optional Claude raw structured_output via the _claude/sdkMessage ext notification. The
+    // 5) optional Claude raw structured_output via the _claude/sdkMessage ext notification. The
     // real claude-agent-acp stamps the owning sessionId on it, so the runner can route the result
     // to the right session under concurrency — mirror that exactly.
     if (turn.structuredOutput !== undefined) {
@@ -200,7 +253,7 @@ class FakeAgent {
       });
     }
 
-    // 5) hard failure path: reject the prompt request (provider wall / process fault).
+    // 6) hard failure path: reject the prompt request (provider wall / process fault).
     // Real backends (claude-agent-acp failActive / codex-acp request errors) reject with the
     // failure text carried in the JSON-RPC error MESSAGE, which is what the SDK surfaces as
     // RequestError.message on the client. Mirror that exactly so errors-map classifies it.
@@ -212,6 +265,46 @@ class FakeAgent {
       stopReason: turn.stopReason ?? "end_turn",
       ...(turn.usage ? { usage: turn.usage } : {}),
     };
+  }
+
+  async callClient(call, sessionId) {
+    const clientMethod = normalizeClientMethod(call.method);
+    try {
+      let response;
+      switch (clientMethod) {
+        case "fs/read_text_file": {
+          const request = paramsWithSession(call, sessionId);
+          request.path ??= "/tmp/fake.txt";
+          response = await this.conn.readTextFile(request);
+          break;
+        }
+        case "fs/write_text_file": {
+          const request = paramsWithSession(call, sessionId);
+          request.path ??= "/tmp/fake.txt";
+          request.content ??= "";
+          response = await this.conn.writeTextFile(request);
+          break;
+        }
+        case "terminal/create": {
+          const request = paramsWithSession(call, sessionId);
+          request.command ??= "true";
+          const terminal = await this.conn.createTerminal(request);
+          response = { terminalId: terminal.id };
+          break;
+        }
+        case "terminal/release": {
+          const request = paramsWithSession(call, sessionId);
+          request.terminalId ??= "fake-terminal";
+          response = await this.conn.request(CLIENT_METHODS.terminal_release, request);
+          break;
+        }
+        default:
+          throw new Error(`Unsupported fake client call: ${String(call.method)}`);
+      }
+      record({ method: "clientCall", clientMethod, label: call.label, response });
+    } catch (error) {
+      record({ method: "clientCall", clientMethod, label: call.label, error: serializeError(error) });
+    }
   }
 
   cancel(params) {

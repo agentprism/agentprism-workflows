@@ -19,6 +19,11 @@ import {
   unsupportedMcpServer,
 } from "../src/index.js";
 
+const CODEX_CUSTOM_CAPABILITIES = {
+  namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
+  gatedKeys: GATED_CUSTOM_META_KEYS,
+} as const;
+
 /** The fork's advertisement shape, keyed under its namespace (mirrors what the fork emits). */
 function forkAdvertisement(flags: Record<string, boolean>): InitializeResponse {
   return {
@@ -32,18 +37,21 @@ function forkAdvertisement(flags: Record<string, boolean>): InitializeResponse {
 
 // ---- negotiateCapabilities ----------------------------------------------------------
 
-test("negotiateCapabilities extracts version, agentInfo, close support, and the custom block", () => {
-  const negotiated = negotiateCapabilities({
-    protocolVersion: PROTOCOL_VERSION,
-    agentInfo: { name: "codex-acp", title: "Codex", version: "1.2.0" },
-    agentCapabilities: {
-      sessionCapabilities: { close: {} },
-      mcpCapabilities: { http: true, sse: false },
-      _meta: {
-        [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: { outputSchema: true, baseInstructions: true, developerInstructions: true },
+test("negotiateCapabilities extracts version, agentInfo, close support, and the declared custom block", () => {
+  const negotiated = negotiateCapabilities(
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      agentInfo: { name: "codex-acp", title: "Codex", version: "1.2.0" },
+      agentCapabilities: {
+        sessionCapabilities: { close: {} },
+        mcpCapabilities: { http: true, sse: false },
+        _meta: {
+          [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: { outputSchema: true, baseInstructions: true, developerInstructions: true },
+        },
       },
     },
-  });
+    CODEX_CUSTOM_CAPABILITIES,
+  );
   assert.equal(negotiated.protocolVersion, PROTOCOL_VERSION);
   assert.deepEqual(negotiated.agentInfo, { name: "codex-acp", title: "Codex", version: "1.2.0" });
   assert.equal(negotiated.supportsClose, true);
@@ -52,29 +60,43 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
     baseInstructions: true,
     developerInstructions: true,
   });
+  assert.deepEqual(negotiated.gatedKeys, GATED_CUSTOM_META_KEYS);
 });
 
 test("negotiateCapabilities: a minimal response yields no close support and no custom block (legacy)", () => {
-  const negotiated = negotiateCapabilities({ protocolVersion: PROTOCOL_VERSION });
+  const negotiated = negotiateCapabilities({ protocolVersion: PROTOCOL_VERSION }, CODEX_CUSTOM_CAPABILITIES);
   assert.deepEqual(negotiated.agent, {});
   assert.equal(negotiated.agentInfo, undefined);
   assert.equal(negotiated.supportsClose, false);
   assert.equal(negotiated.customMetaSupport, undefined, "no namespace advertised => legacy passthrough");
+  assert.deepEqual(negotiated.gatedKeys, GATED_CUSTOM_META_KEYS);
+});
+
+test("negotiateCapabilities: no backend declaration ignores even a known custom namespace", () => {
+  const negotiated = negotiateCapabilities(forkAdvertisement({ outputSchema: false }));
+  assert.equal(negotiated.customMetaSupport, undefined);
+  assert.equal(negotiated.gatedKeys, undefined);
 });
 
 test("negotiateCapabilities ignores a non-object custom namespace value", () => {
-  const negotiated = negotiateCapabilities({
-    protocolVersion: PROTOCOL_VERSION,
-    agentCapabilities: { _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: true } },
-  });
+  const negotiated = negotiateCapabilities(
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: { _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: true } },
+    },
+    CODEX_CUSTOM_CAPABILITIES,
+  );
   assert.equal(negotiated.customMetaSupport, undefined);
 });
 
 test("negotiateCapabilities ignores a malformed array custom namespace value", () => {
-  const negotiated = negotiateCapabilities({
-    protocolVersion: PROTOCOL_VERSION,
-    agentCapabilities: { _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: [] } },
-  });
+  const negotiated = negotiateCapabilities(
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: { _meta: { [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: [] } },
+    },
+    CODEX_CUSTOM_CAPABILITIES,
+  );
   assert.equal(negotiated.customMetaSupport, undefined);
 });
 
@@ -92,7 +114,7 @@ test("isSupportedProtocolVersion: accepts EXACTLY the client's version, rejects 
 
 test("gateCustomMeta: no advertised namespace => passes every key unchanged (legacy)", () => {
   const meta = { [META_KEYS.outputSchema]: { a: 1 }, [CODEX_META_KEYS.baseInstructions]: "B" };
-  const support = negotiateCapabilities(forkAdvertisement({})).customMetaSupport; // '{}' block, still a namespace
+  const support = negotiateCapabilities(forkAdvertisement({}), CODEX_CUSTOM_CAPABILITIES).customMetaSupport; // '{}' block, still a namespace
   // Sanity: forkAdvertisement({}) DOES advertise the namespace (empty flags) — that gates everything.
   assert.deepEqual(gateCustomMeta(meta, undefined), meta, "undefined support is the legacy passthrough");
   // …whereas an advertised-but-empty block treats every flag as unsupported:
@@ -102,6 +124,7 @@ test("gateCustomMeta: no advertised namespace => passes every key unchanged (leg
 test("gateCustomMeta: drops only the un-advertised gated keys, keeps advertised + ungated keys", () => {
   const support = negotiateCapabilities(
     forkAdvertisement({ baseInstructions: true, developerInstructions: false, outputSchema: false }),
+    CODEX_CUSTOM_CAPABILITIES,
   ).customMetaSupport;
   const meta = {
     [CODEX_META_KEYS.baseInstructions]: "B",
@@ -117,6 +140,7 @@ test("gateCustomMeta: drops only the un-advertised gated keys, keeps advertised 
 test("gateCustomMeta: all advertised => unchanged; does not mutate the input", () => {
   const support = negotiateCapabilities(
     forkAdvertisement({ outputSchema: true, baseInstructions: true, developerInstructions: true }),
+    CODEX_CUSTOM_CAPABILITIES,
   ).customMetaSupport;
   const meta = { [META_KEYS.outputSchema]: { a: 1 }, [CODEX_META_KEYS.baseInstructions]: "B" };
   const out = gateCustomMeta(meta, support);
@@ -125,7 +149,7 @@ test("gateCustomMeta: all advertised => unchanged; does not mutate the input", (
 });
 
 test("gateCustomMeta: undefined/empty meta is passed through", () => {
-  const support = negotiateCapabilities(forkAdvertisement({})).customMetaSupport;
+  const support = negotiateCapabilities(forkAdvertisement({}), CODEX_CUSTOM_CAPABILITIES).customMetaSupport;
   assert.equal(gateCustomMeta(undefined, support), undefined);
 });
 

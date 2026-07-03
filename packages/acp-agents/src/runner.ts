@@ -21,9 +21,10 @@ import {
   WorkflowErrorCode,
   type AgentResult,
   type AgentRunner,
+  type PromptImage,
   type RunOptions,
 } from "@automatalabs/shared-types";
-import type { StopReason } from "@agentclientprotocol/sdk";
+import type { ContentBlock, StopReason } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
 import type { SessionHandle } from "./acp-client.js";
 import { AcpAgentPool, type AcpPoolOptions } from "./pool.js";
@@ -51,8 +52,8 @@ import { resolveStructuredOutput, type StructuredSession } from "./structured-ou
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
 
-/** Constructor options for the runner: pool sizing PLUS the custom-backend registry.
- *  `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
+/** Constructor options for the runner: pool sizing, client-side handlers, and the custom-backend
+ *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
 export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Custom ACP backends, keyed by registered name (see registry.ts for the config shape
    *  and the routing rules). Names are case-insensitive; "claude"/"codex" are reserved. */
@@ -124,6 +125,7 @@ export class AcpAgentRunner implements AgentRunner {
     const backend = selectBackend(opts, registry);
     const policy: ToolPolicy = { allow: opts.toolNames, deny: opts.disallowedToolNames };
     const cwd = opts.cwd ?? process.cwd();
+    validatePromptImages(opts.images, opts.label);
 
     const session: SessionHandle = await this.pool.acquire(backend, {
       cwd,
@@ -151,10 +153,12 @@ export class AcpAgentRunner implements AgentRunner {
       await applyModelSelection(session, innerModelSpec(opts.model ?? opts.tier, backend), opts);
 
       const text = buildPrompt(prompt, opts, schema, backend);
+      const initialPrompt =
+        opts.images && opts.images.length > 0 ? promptWithImages(text, opts.images) : text;
       // Generic turn-scoped _meta passthrough merged UNDER the backend-computed keys (e.g. the
       // outputSchema forward when a schema is set) — user meta never clobbers the schema channel.
       const promptMeta = mergeTurnMeta(opts.promptMeta, backend.promptMeta(schema));
-      const response = await session.prompt(text, promptMeta);
+      const response = await session.prompt(initialPrompt, promptMeta);
       opts.signal?.throwIfAborted();
       // Inspect the turn's stop reason BEFORE the text/schema path: a refusal or truncation
       // must surface distinctly here, never be misread as empty output or burned through the
@@ -308,6 +312,46 @@ function buildPrompt(
     parts.push(contract.join("\n"));
   }
   return parts.join("\n\n");
+}
+
+function validatePromptImages(images: readonly PromptImage[] | undefined, label?: string): void {
+  if (!images || images.length === 0) return;
+  for (let i = 0; i < images.length; i += 1) {
+    const image = images[i] as PromptImage | undefined;
+    if (typeof image?.data !== "string" || image.data.trim() === "") {
+      throw new WorkflowError(
+        `images[${i}].data must be a non-empty string`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+    if (typeof image.mimeType !== "string" || image.mimeType.trim() === "") {
+      throw new WorkflowError(
+        `images[${i}].mimeType must be a non-empty string`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+    if (image.uri !== undefined && (typeof image.uri !== "string" || image.uri.trim() === "")) {
+      throw new WorkflowError(
+        `images[${i}].uri must be a non-empty string when present`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+  }
+}
+
+function promptWithImages(text: string, images: readonly PromptImage[]): ContentBlock[] {
+  const blocks: ContentBlock[] = [{ type: "text", text }];
+  for (const image of images) {
+    blocks.push(
+      image.uri === undefined
+        ? { type: "image", data: image.data, mimeType: image.mimeType }
+        : { type: "image", data: image.data, mimeType: image.mimeType, uri: image.uri },
+    );
+  }
+  return blocks;
 }
 
 /** Pick the backend by model/tier. Cross-provider routing = which ACP server to spawn.

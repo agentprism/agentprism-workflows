@@ -51,6 +51,10 @@ export interface Backend {
    *  without the schema in the prompt, such an agent returns well-formed JSON with the WRONG
    *  KEYS and the repair ladder can never converge (it can fix prose, not unseen contracts). */
   readonly embedSchemaInPrompt?: boolean;
+  /** The agentCapabilities._meta namespace this backend's agent advertises under, and the bare
+   *  `_meta` keys gated by same-named boolean flags in that block; undefined = this backend has
+   *  no custom-capability contract (its custom `_meta`, if any, is never gated). */
+  readonly customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
   /** How to launch this backend's ACP server over stdio. */
   spawnConfig(): SpawnConfig;
   /** OPTIONAL backend-level `_meta` DEFAULTS for session/new (e.g. a custom registry entry's

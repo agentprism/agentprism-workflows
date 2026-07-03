@@ -26,10 +26,16 @@ export interface AgentUsage {
   cost: number;
 }
 
+export interface PromptImage {
+  readonly data: string;
+  readonly mimeType: string;
+  readonly uri?: string;
+}
+
 /**
  * The opts side of the AgentRunner seam — exactly the bag the engine passes at
  * workflow.ts:465 (cast `as any` there; frozen-typed here). Inputs flow IN
- * (prompt/schema/model/tier/cwd/signal/instructions/tool policy); telemetry flows
+ * (prompt/schema/images/model/tier/cwd/signal/instructions/tool policy); telemetry flows
  * OUT via the on* callbacks, NEVER via the return value.
  *
  * NAME = RunOptions (the Phase-1 deliverable name); `AgentRunOptions` is exported as
@@ -37,8 +43,8 @@ export interface AgentUsage {
  *
  * FIELD NAMES ARE FROZEN: the engine binds these by name through an `as any` cast
  * (workflow.ts:488), so a renamed field would NOT raise a compile error — it would
- * mis-bind at runtime. Engine-passed core fields (13): label, schema, signal, instructions,
- * model, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
+ * mis-bind at runtime. Engine-passed core fields (14): label, schema, signal, instructions,
+ * images, model, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
  * onUsage, onHistory. Plus ADDITIVE run inputs that wire infrastructure / shape the backend,
  * NOT the logical call, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
@@ -134,6 +140,11 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  `_meta.developerInstructions` -> `thread/start.developerInstructions`. ADDITIVE and NOT
    *  hashed. Ignored by the Claude backend. Omitted => Codex default. */
   developerInstructions?: string;
+  /** Base64 image attachments appended to the prompt as ACP image ContentBlocks. When the
+   *  connected agent does not advertise promptCapabilities.image, each attachment DEGRADES to a
+   *  bracketed text note (never an error, never silently dropped) per the ACP rule that the client
+   *  adapts content to the agent's advertised prompt capabilities. */
+  images?: readonly PromptImage[];
 }
 
 /** The result side of the seam: schema => the validated object, no schema => text.
