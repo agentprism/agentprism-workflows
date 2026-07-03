@@ -19,6 +19,8 @@ export interface WorkflowLoggerOptions {
   runId?: string;
   /** Working directory for file paths. */
   cwd?: string;
+  /** Absolute workflow persistence root; explicit value wins over AGENTPRISM_PERSISTENCE_ROOT. */
+  persistenceRoot?: string;
   /** Whether to persist logs to disk. */
   persist?: boolean;
   /** Callback for each log entry. */
@@ -30,7 +32,7 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   const persistLogs = options.persist ?? true;
   const cwd = options.cwd ?? process.cwd();
   const runId = options.runId ?? `run-${Date.now()}`;
-  const runsDir = workflowProjectPaths(cwd).runsDir;
+  const runsDir = workflowProjectPaths(cwd, { persistenceRoot: options.persistenceRoot }).runsDir;
   let logFile: string | null = null;
 
   const write = (level: string, message: string) => {

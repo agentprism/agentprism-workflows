@@ -108,7 +108,16 @@ export type FsLayer = {
   writeFileSync: typeof writeFileSync;
 };
 
-export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>): RunPersistence {
+export interface RunPersistenceOptions {
+  /** Absolute workflow persistence root; explicit value wins over AGENTPRISM_PERSISTENCE_ROOT. */
+  persistenceRoot?: string;
+}
+
+export function createRunPersistence(
+  cwd: string,
+  fsOverride?: Partial<FsLayer>,
+  options: RunPersistenceOptions = {},
+): RunPersistence {
   const _existsSync = fsOverride?.existsSync ?? existsSync;
   const _mkdirSync = fsOverride?.mkdirSync ?? mkdirSync;
   const _readdirSync = fsOverride?.readdirSync ?? readdirSync;
@@ -117,7 +126,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
   const _unlinkSync = fsOverride?.unlinkSync ?? unlinkSync;
   const _writeFileSync = fsOverride?.writeFileSync ?? writeFileSync;
 
-  const paths = workflowProjectPaths(cwd);
+  const paths = workflowProjectPaths(cwd, { persistenceRoot: options.persistenceRoot });
   const runsDir = paths.runsDir;
   const legacyRunsDir = paths.legacyRunsDir;
 

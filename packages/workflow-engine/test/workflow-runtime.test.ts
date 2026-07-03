@@ -144,6 +144,33 @@ return a`,
   );
 });
 
+test("runWorkflow journaling:false skips journal callbacks and rejects resume inputs", async () => {
+  const agent = countingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'no_journal', description: 'no journal' }
+const a = await agent('work', { label: 'a' })
+return a`;
+
+  const result = await runWorkflow(script, {
+    agent: agent.runner,
+    journaling: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  assert.equal(result.result, "ran:work");
+  assert.equal(agent.state.calls, 1);
+  assert.deepEqual(journal, [], "journaling:false should suppress onAgentJournal writes");
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: agent.runner,
+        journaling: false,
+        resumeJournal: new Map(),
+      }),
+    /journaling disabled for this run/,
+  );
+});
+
 test("runWorkflow does not retry nonrecoverable errors", async () => {
   let calls = 0;
   await assert.rejects(

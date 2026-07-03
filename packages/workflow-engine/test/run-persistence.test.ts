@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
 import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
-import { workflowProjectPaths } from "../src/workflow-paths.js";
+import { AGENTPRISM_PERSISTENCE_ROOT_ENV, workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Run state now lives under the user's workflow home (~/.agentprism/workflows/projects/<key>/runs),
@@ -16,14 +16,23 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "ap-dw-rp-"));
     const fakeHome = mkdtempSync(join(tmpdir(), "ap-dw-home-"));
+    const priorRoot = process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV];
     try {
+      delete process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV];
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
+      if (priorRoot === undefined) delete process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV];
+      else process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV] = priorRoot;
       rmSync(cwd, { recursive: true, force: true });
       rmSync(fakeHome, { recursive: true, force: true });
     }
   };
 }
+
+const twoAgentScript = `export const meta = { name: 'persistence_demo', description: 'persistence demo' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+return { a, b }`;
 
 test(
   "createRunPersistence creates runs directory on first save",
@@ -45,6 +54,86 @@ test(
     assert.ok(existsSync(runsDir), "dir should be created");
     assert.ok(existsSync(join(runsDir, "test-1.json")), "run file should exist");
     assert.equal(existsSync(join(cwd, WORKFLOW_RUNS_DIR)), false, "legacy project runs dir should not be created");
+  }),
+);
+
+test(
+  "createRunPersistence writes under an explicit persistence root and remains fsOverride-compatible",
+  withTempCwd(async (cwd) => {
+    const persistenceRoot = mkdtempSync(join(tmpdir(), "ap-dw-root-"));
+    const writePaths: string[] = [];
+    try {
+      const rp = createRunPersistence(
+        cwd,
+        {
+          writeFileSync: ((path: Parameters<typeof writeFileSync>[0], data: Parameters<typeof writeFileSync>[1]) => {
+            writePaths.push(String(path));
+            return writeFileSync(path, data);
+          }) as typeof writeFileSync,
+        },
+        { persistenceRoot },
+      );
+      rp.save({
+        runId: "custom-root",
+        workflowName: "demo",
+        script: "export const meta = { name: 'd', description: 'd' }",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const runsDir = workflowProjectPaths(cwd, { persistenceRoot }).runsDir;
+      assert.ok(existsSync(join(runsDir, "custom-root.json")), "run file should land under explicit root");
+      assert.ok(writePaths.length > 0, "fsOverride should still observe writes");
+      assert.ok(writePaths.every((path) => path.startsWith(runsDir)), "fsOverride writes should target explicit root");
+      assert.equal(existsSync(workflowProjectPaths(cwd).runsDir), false, "homedir default should not receive files");
+    } finally {
+      rmSync(persistenceRoot, { recursive: true, force: true });
+    }
+  }),
+);
+
+test(
+  "createRunPersistence uses AGENTPRISM_PERSISTENCE_ROOT when no explicit root is supplied",
+  withTempCwd(async (cwd) => {
+    const persistenceRoot = mkdtempSync(join(tmpdir(), "ap-dw-root-env-"));
+    const prior = process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV];
+    try {
+      process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV] = persistenceRoot;
+      const rp = createRunPersistence(cwd);
+      rp.save({
+        runId: "env-root",
+        workflowName: "demo",
+        script: "export const meta = { name: 'd', description: 'd' }",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      assert.ok(
+        existsSync(join(workflowProjectPaths(cwd, { persistenceRoot }).runsDir, "env-root.json")),
+        "run file should land under env root",
+      );
+    } finally {
+      if (prior === undefined) delete process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV];
+      else process.env[AGENTPRISM_PERSISTENCE_ROOT_ENV] = prior;
+      rmSync(persistenceRoot, { recursive: true, force: true });
+    }
+  }),
+);
+
+test(
+  "WorkflowManager rejects a relative persistence root",
+  withTempCwd(async (cwd) => {
+    assert.throws(
+      () => new WorkflowManager({ cwd, persistenceRoot: "relative-root" }),
+      /persistenceRoot.*absolute/,
+    );
   }),
 );
 
@@ -707,6 +796,32 @@ test(
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
     assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+  }),
+);
+
+test(
+  "WorkflowManager journaling:false writes no journal files and rejects resume clearly",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      journaling: false,
+      agent: {
+        async run(prompt: string) {
+          return `ok:${prompt}`;
+        },
+      },
+    });
+
+    const result = await manager.runSync(twoAgentScript);
+
+    assert.equal(result.status, "completed");
+    assert.equal((result.result as { a?: unknown }).a, "ok:first");
+    assert.equal((result.result as { b?: unknown }).b, "ok:second");
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const files = existsSync(runsDir) ? readdirSync(runsDir) : [];
+    assert.deepEqual(files, [], "journaling:false should not write run-state, log, lock, or sidecar files");
+    assert.deepEqual(manager.listRuns(), [], "journaling:false should not read persisted run journals");
+    await assert.rejects(() => manager.resume(result.runId), /journaling disabled for this run/);
   }),
 );
 

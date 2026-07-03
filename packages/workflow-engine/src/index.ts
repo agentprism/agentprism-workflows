@@ -30,6 +30,7 @@ export {
   type PersistedRunState,
   type PersistedAgentState,
   type FsLayer,
+  type RunPersistenceOptions,
 } from "./run-persistence.js";
 
 // ── Errors: the shared seam contract (re-exported) + engine-local helpers ──
@@ -113,7 +114,9 @@ export {
   workflowHomeDir,
   workflowUserSavedDir,
   workflowProjectKey,
+  AGENTPRISM_PERSISTENCE_ROOT_ENV,
   type WorkflowProjectPaths,
+  type WorkflowPathOptions,
 } from "./workflow-paths.js";
 export { createWorkflowLogger, type WorkflowLogger, type WorkflowLoggerOptions } from "./logger.js";
 

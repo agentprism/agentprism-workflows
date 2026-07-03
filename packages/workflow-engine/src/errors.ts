@@ -70,8 +70,23 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
   }
 
   return new WorkflowError(
-    error instanceof Error ? error.message : String(error),
+    errorMessage(error),
     WorkflowErrorCode.AGENT_EXECUTION_ERROR,
     { recoverable: true, agentLabel: context?.agentLabel, details: error },
   );
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+    try {
+      const json = JSON.stringify(error);
+      if (json) return json;
+    } catch {
+      // Fall through to String() for cyclic objects or exotic throwables.
+    }
+  }
+  return String(error);
 }
