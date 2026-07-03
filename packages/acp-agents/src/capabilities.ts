@@ -19,6 +19,7 @@
 import {
   PROTOCOL_VERSION,
   type AgentCapabilities,
+  type ContentBlock,
   type Implementation,
   type InitializeResponse,
 } from "@agentclientprotocol/sdk";
@@ -116,6 +117,36 @@ export function gateCustomMeta(
   }
   const result = gated ?? meta;
   return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/** Adapt prompt content to the agent's PromptCapabilities. Text and resource_link are ACP
+ *  baseline content; this client currently only gates image because it is the only optional
+ *  ContentBlock it constructs. Unsupported images are represented as explicit bracketed text
+ *  notes so the attachment is never silently lost. Returns the SAME array reference when no block
+ *  changes and never mutates the input or any surviving block. */
+export function adaptPromptContent(
+  blocks: ContentBlock[],
+  agent: AgentCapabilities,
+  backendId: string,
+): ContentBlock[] {
+  if (agent.promptCapabilities?.image === true) return blocks;
+
+  let adapted: ContentBlock[] | undefined;
+  for (let i = 0; i < blocks.length; i += 1) {
+    const block = blocks[i]!;
+    if (block.type === "image") {
+      adapted ??= blocks.slice(0, i);
+      const uriSuffix = typeof block.uri === "string" && block.uri.length > 0 ? `; uri=${block.uri}` : "";
+      adapted.push({
+        type: "text",
+        text: `[image omitted: ${block.mimeType}${uriSuffix} — the ${backendId} agent does not advertise promptCapabilities.image]`,
+      });
+    } else if (adapted) {
+      adapted.push(block);
+    }
+  }
+
+  return adapted ?? blocks;
 }
 
 /** The first client-provided MCP server whose transport the agent did NOT advertise, or undefined

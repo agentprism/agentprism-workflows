@@ -63,6 +63,7 @@ import {
 } from "@automatalabs/shared-types";
 import type { Backend, BackendId, StructuredSource } from "./backend.js";
 import {
+  adaptPromptContent,
   gateCustomMeta,
   isSupportedProtocolVersion,
   negotiateCapabilities,
@@ -858,16 +859,22 @@ export class SessionHandle implements StructuredSource {
   }
 
   /** Send a prompt turn and drain it; returns the final PromptResponse. */
-  async prompt(text: string, promptMeta?: Record<string, unknown>): Promise<PromptResponse> {
+  async prompt(content: string | ContentBlock[], promptMeta?: Record<string, unknown>): Promise<PromptResponse> {
     this.opts.signal?.throwIfAborted();
     this.state.beginTurn();
-    const prompt: ContentBlock[] = [{ type: "text", text }];
+    const prompt: ContentBlock[] =
+      typeof content === "string" ? [{ type: "text", text: content }] : content;
+    const adaptedPrompt = adaptPromptContent(
+      prompt,
+      this.pooled.capabilities?.agent ?? {},
+      this.pooled.backendId,
+    );
     // Gate the turn `_meta` against the agent's advertised custom capabilities: a declared
     // turn-level key is dropped when the connected agent said it does not honor it.
     const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
     const request: PromptRequest = {
       sessionId: this.sessionId,
-      prompt,
+      prompt: adaptedPrompt,
       ...(gatedMeta ? { _meta: gatedMeta } : {}),
     };
     const response = await this.pooled.race(this.pooled.rpc.prompt(request));

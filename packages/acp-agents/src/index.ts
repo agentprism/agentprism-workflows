@@ -18,6 +18,7 @@ export type { AcpSessionOptions, PooledConnectionDeps } from "./acp-client.js";
 // sends (custom `_meta` keys, MCP transports) on what the connected agent advertised.
 export {
   GATED_CUSTOM_META_KEYS,
+  adaptPromptContent,
   gateCustomMeta,
   isSupportedProtocolVersion,
   negotiateCapabilities,
