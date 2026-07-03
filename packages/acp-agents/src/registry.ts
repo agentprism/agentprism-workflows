@@ -24,6 +24,9 @@ export interface CustomBackendConfig {
   /** Static `_meta` sent on every session/new for this backend (backend-level defaults).
    *  Per-call RunOptions.meta merges over these; backend-computed keys win over both. */
   sessionMeta?: Record<string, unknown>;
+  /** agentCapabilities._meta namespace + bare `_meta` keys this custom agent negotiates.
+   *  Undefined means the backend's custom `_meta`, if any, is never gated. */
+  customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
 }
 
 /** A validated registry entry: the (lowercased) name plus its config. */
@@ -116,6 +119,7 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
   if (c.sessionMeta !== undefined && (c.sessionMeta === null || typeof c.sessionMeta !== "object" || Array.isArray(c.sessionMeta))) {
     throw new Error(`${source}: backend "${rawName}" "sessionMeta" must be an object`);
   }
+  const customCapabilities = validateCustomCapabilities(c.customCapabilities, source, rawName);
   return [
     name,
     {
@@ -124,8 +128,34 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
       ...(c.args !== undefined ? { args: c.args as string[] } : {}),
       ...(c.env !== undefined ? { env: c.env as Record<string, string> } : {}),
       ...(c.sessionMeta !== undefined ? { sessionMeta: c.sessionMeta as Record<string, unknown> } : {}),
+      ...(customCapabilities !== undefined ? { customCapabilities } : {}),
     },
   ];
+}
+
+function validateCustomCapabilities(
+  value: unknown,
+  source: string,
+  rawName: string,
+): CustomBackendConfig["customCapabilities"] | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${source}: backend "${rawName}" "customCapabilities" must be an object`);
+  }
+  const c = value as Record<string, unknown>;
+  if (typeof c.namespace !== "string" || c.namespace.trim() === "") {
+    throw new Error(`${source}: backend "${rawName}" "customCapabilities.namespace" must be a non-empty string`);
+  }
+  if (
+    !Array.isArray(c.gatedKeys) ||
+    c.gatedKeys.length === 0 ||
+    !c.gatedKeys.every((key) => typeof key === "string" && key.trim() !== "")
+  ) {
+    throw new Error(
+      `${source}: backend "${rawName}" "customCapabilities.gatedKeys" must be a non-empty array of non-empty strings`,
+    );
+  }
+  return { namespace: c.namespace, gatedKeys: [...c.gatedKeys] as string[] };
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {

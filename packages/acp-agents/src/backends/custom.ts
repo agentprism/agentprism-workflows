@@ -28,9 +28,11 @@ export class CustomAcpBackend implements Backend {
    *  schema in the prompt — otherwise the model returns JSON with keys it invented and the
    *  repair ladder can never converge on a contract the model was never shown. */
   readonly embedSchemaInPrompt = true;
+  readonly customCapabilities?: NonNullable<Backend["customCapabilities"]>;
 
   constructor(private readonly config: RegisteredBackend) {
     this.id = config.name;
+    if (config.customCapabilities) this.customCapabilities = config.customCapabilities;
     const spawnIdentity = JSON.stringify({
       command: config.command,
       args: config.args ?? [],

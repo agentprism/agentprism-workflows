@@ -1,18 +1,21 @@
 // Negotiated ACP capabilities for one pooled connection — the derived state the connection acts on
-// after its ONE-TIME `initialize` handshake. Parses the InitializeResponse into: the agent's chosen
-// protocolVersion (validated against what this client speaks), its full advertised agentCapabilities
-// + agentInfo, whether session/close is supported, and the @automatalabs/codex-acp fork's custom
-// capability advertisement (the namespaced `_meta` block gating which bare `_meta` inputs the client
-// may send).
+// after its ONE-TIME `initialize` handshake. Parses the InitializeResponse + the backend's optional
+// custom-capability declaration into: the agent's chosen protocolVersion (validated against what this
+// client speaks), its full advertised agentCapabilities + agentInfo, whether session/close is
+// supported, and the declared custom-capability advertisement (the namespaced `_meta` block gating
+// which backend-declared bare `_meta` inputs the client may send). The negotiated record is a pure
+// parse of (response + declaration): `gatedKeys` captures the declaration at handshake time, and
+// PooledConnection gates against that captured list.
 //
-// GATING PHILOSOPHY — lenient for legacy agents. An agent that advertises NOTHING is treated as
-// today's behavior (every gated key still sent), because the currently-published fork
-// (@automatalabs/codex-acp ≤ 1.2.0) and arbitrary custom ACP servers honor these inputs WITHOUT
-// advertising them; a strict "omitted => unsupported" reading would silently regress them. Only once
-// an agent DOES advertise the fork namespace (opts into negotiation) is each bare key gated on its
-// same-named flag — and, symmetrically, only once an agent advertises mcpCapabilities is an
-// unsupported MCP transport rejected. Truthfully-advertised absence still gates (per spec) WITHIN an
-// advertised capability; total silence is the legacy passthrough.
+// GATING PHILOSOPHY — backend-declared and lenient for legacy agents. A backend with NO declaration
+// has NO custom-capability contract: its custom `_meta`, if any, is never gated, even when the agent
+// advertises some other backend's namespace. Once a backend declares a namespace + bare keys, an
+// agent that advertises NO usable namespace block is legacy passthrough (every declared key still
+// sent); malformed namespace values (non-object or arrays) are treated as not advertised. Only once
+// an agent DOES advertise the declared namespace object is each declared bare key gated on its
+// same-named flag === true. Symmetrically, only once an agent advertises mcpCapabilities is an
+// unsupported MCP transport rejected. Truthfully-advertised absence still gates WITHIN an advertised
+// capability; total silence is the legacy passthrough.
 import {
   PROTOCOL_VERSION,
   type AgentCapabilities,
@@ -20,13 +23,13 @@ import {
   type InitializeResponse,
 } from "@agentclientprotocol/sdk";
 import {
-  CODEX_CUSTOM_CAPABILITY_NAMESPACE,
   CODEX_META_KEYS,
   META_KEYS,
   type McpServerConfig,
 } from "@automatalabs/shared-types";
+import type { Backend } from "./backend.js";
 
-/** The bare `_meta` keys whose emission is gated by the fork's custom-capability advertisement.
+/** The bare `_meta` keys whose emission is gated by Codex's custom-capability advertisement.
  *  Each is named EXACTLY like the advertised flag that gates it, so `support[key] === true` is the
  *  whole test. session/new carries baseInstructions/developerInstructions and session/prompt carries
  *  outputSchema — one list covers both (a key absent from a given `_meta` is simply skipped). */
@@ -48,26 +51,38 @@ export interface NegotiatedCapabilities {
   agentInfo: Implementation | undefined;
   /** Whether session/close is advertised (gates the best-effort release-time close). */
   supportsClose: boolean;
-  /** The parsed @automatalabs/codex-acp custom-capability block (the namespaced `_meta` object), or
-   *  undefined when the agent did not advertise the namespace at all — the legacy passthrough. */
+  /** The parsed backend-declared custom-capability block (the namespaced `_meta` object), or
+   *  undefined when the backend declared none or the agent did not advertise it — passthrough. */
   customMetaSupport: Record<string, unknown> | undefined;
+  /** The backend-declared bare `_meta` keys gated by customMetaSupport; undefined when this backend
+   *  has no custom-capability contract, so custom `_meta` is never gated. */
+  gatedKeys: readonly string[] | undefined;
 }
 
 /** Parse an initialize response into the connection's derived capability state. */
-export function negotiateCapabilities(response: InitializeResponse): NegotiatedCapabilities {
+export function negotiateCapabilities(
+  response: InitializeResponse,
+  customCapabilities?: Backend["customCapabilities"],
+): NegotiatedCapabilities {
   const agent = response.agentCapabilities ?? {};
   return {
     protocolVersion: response.protocolVersion,
     agent,
     agentInfo: response.agentInfo ?? undefined,
     supportsClose: Boolean(agent.sessionCapabilities?.close),
-    customMetaSupport: readCustomNamespace(agent._meta),
+    customMetaSupport: customCapabilities
+      ? readCustomNamespace(agent._meta, customCapabilities.namespace)
+      : undefined,
+    gatedKeys: customCapabilities ? [...customCapabilities.gatedKeys] : undefined,
   };
 }
 
-function readCustomNamespace(meta: AgentCapabilities["_meta"]): Record<string, unknown> | undefined {
+function readCustomNamespace(
+  meta: AgentCapabilities["_meta"],
+  namespace: string,
+): Record<string, unknown> | undefined {
   if (!meta || typeof meta !== "object") return undefined;
-  const block = (meta as Record<string, unknown>)[CODEX_CUSTOM_CAPABILITY_NAMESPACE];
+  const block = (meta as Record<string, unknown>)[namespace];
   return block && typeof block === "object" && !Array.isArray(block)
     ? (block as Record<string, unknown>)
     : undefined;
@@ -82,17 +97,18 @@ export function isSupportedProtocolVersion(version: number): boolean {
   return version === PROTOCOL_VERSION;
 }
 
-/** Remove the fork's custom bare `_meta` keys the connected agent did NOT advertise support for.
+/** Remove the declared custom bare `_meta` keys the connected agent did NOT advertise support for.
  *  A no-op when the agent advertised no namespace (`support` undefined => legacy => every key
  *  passes) or the meta is empty/undefined. Never mutates its input; collapses to undefined if
  *  gating empties the object (so no `_meta` is sent at all). */
 export function gateCustomMeta(
   meta: Record<string, unknown> | undefined,
   support: Record<string, unknown> | undefined,
+  gatedKeys: readonly string[] = GATED_CUSTOM_META_KEYS,
 ): Record<string, unknown> | undefined {
   if (!meta || !support) return meta;
   let gated: Record<string, unknown> | undefined;
-  for (const key of GATED_CUSTOM_META_KEYS) {
+  for (const key of gatedKeys) {
     if (key in meta && support[key] !== true) {
       gated ??= { ...meta };
       delete gated[key];

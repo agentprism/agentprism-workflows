@@ -399,10 +399,10 @@ export class PooledConnection {
     return this.negotiated;
   }
 
-  /** Drop the fork's custom bare `_meta` keys the connected agent did not advertise support for
-   *  (see gateCustomMeta). Applied to BOTH session/new and session/prompt `_meta`. */
+  /** Drop the backend-declared bare `_meta` keys the connected agent did not advertise support
+   *  for (see gateCustomMeta). Applied to BOTH session/new and session/prompt `_meta`. */
   gateCustomMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-    return gateCustomMeta(meta, this.negotiated?.customMetaSupport);
+    return gateCustomMeta(meta, this.negotiated?.customMetaSupport, this.negotiated?.gatedKeys);
   }
 
   /** Mark this connection dead exactly once, then ask the pool to evict it. Idempotent. */
@@ -468,7 +468,7 @@ export class PooledConnection {
         ),
         deadline,
       ]);
-      const negotiated = negotiateCapabilities(response);
+      const negotiated = negotiateCapabilities(response, this.backend.customCapabilities);
       // Version negotiation: the agent replies with the version it chose (our requested version if
       // it supports it, else its own latest). If this client cannot speak it, the ACP spec says
       // CLOSE the connection and inform the user — kill the process (so the pool evicts it) and
@@ -519,8 +519,8 @@ export class PooledConnection {
       // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
       // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
       // Codex base/developer instructions), then the engine runId correlation stamp. The result
-      // is gated against the agent's advertised custom capabilities (a Codex instruction key the
-      // agent said it does not honor is dropped). When no layer survives, no `_meta` is sent.
+      // is gated against the agent's advertised custom capabilities (a declared key the agent
+      // said it does not honor is dropped). When no layer survives, no `_meta` is sent.
       const meta = this.gateCustomMeta(
         stampRunId(
           layerMeta(
@@ -760,8 +760,8 @@ export class SessionHandle implements StructuredSource {
     this.opts.signal?.throwIfAborted();
     this.state.beginTurn();
     const prompt: ContentBlock[] = [{ type: "text", text }];
-    // Gate the turn `_meta` against the agent's advertised custom capabilities: the Codex
-    // outputSchema forward is dropped when the connected agent said it does not honor it.
+    // Gate the turn `_meta` against the agent's advertised custom capabilities: a declared
+    // turn-level key is dropped when the connected agent said it does not honor it.
     const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
     const request: PromptRequest = {
       sessionId: this.sessionId,

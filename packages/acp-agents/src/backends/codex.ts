@@ -8,9 +8,10 @@
 // reads the final text and JSON.parses it.
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
-import { CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
+import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
 import type { Backend, SessionMetaInputs, SpawnConfig, StructuredSource } from "../backend.js";
 import { splitArgs } from "../backend.js";
+import { GATED_CUSTOM_META_KEYS } from "../capabilities.js";
 import { toStrictJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
 
@@ -18,6 +19,10 @@ const require = createRequire(import.meta.url);
 
 export class CodexBackend implements Backend {
   readonly id = "codex" as const;
+  readonly customCapabilities = {
+    namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
+    gatedKeys: GATED_CUSTOM_META_KEYS,
+  } as const;
 
   spawnConfig(): SpawnConfig {
     const env = process.env;
