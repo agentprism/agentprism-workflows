@@ -4,8 +4,8 @@
 // seam (which stays a pure prompt -> result function). The event NAMES are the ACP `sessionUpdate`
 // discriminants verbatim (agent_message_chunk, tool_call, …) so the surface tracks the protocol
 // 1:1; each payload is that exact ACP update variant intersected with AcpEventContext. A handful
-// of non-update events (permission_request, raw_message, session_open/close, backend_error) round
-// out "everything the runner sees on the wire".
+// of non-update events (permission_pending/request, raw_message, session_open/close,
+// backend_error) round out "everything the runner sees on the wire".
 //
 // Listeners are OBSERVERS and best-effort: a throwing listener is isolated and never breaks the
 // run, the synchronous update drain, or sibling listeners — the same contract as onUsage/onHistory.
@@ -39,7 +39,17 @@ type AcpSessionUpdateEvents = {
   [K in AcpUpdateKind]: Extract<AcpSessionUpdate, { sessionUpdate: K }> & AcpEventContext;
 };
 
-/** A tool-permission request the runner auto-answered, paired with the decision it returned. */
+/** A tool-permission request parked on an async resolver. This is the FIRST phase of the
+ *  resolver path only: it fires after the request is tracked for teardown cancellation and before
+ *  the host resolver is invoked. It carries no outcome because no ACP response has been returned
+ *  yet. Synchronous ToolPolicy decisions never emit this event. */
+export interface AcpPermissionPendingEvent extends AcpEventContext {
+  request: RequestPermissionRequest;
+}
+
+/** A tool-permission request the runner answered, paired with the FINAL decision it returned.
+ *  This is the SECOND phase for resolver-backed permissions and the ONLY phase for synchronous
+ *  ToolPolicy permissions. It fires exactly once per request with the outcome sent to the agent. */
 export interface AcpPermissionEvent extends AcpEventContext {
   request: RequestPermissionRequest;
   outcome: RequestPermissionResponse;
@@ -66,7 +76,9 @@ export interface AcpBackendErrorEvent {
 export type AcpRunnerEventMap = AcpSessionUpdateEvents & {
   /** Catch-all: fires for EVERY session/update regardless of kind (carries the raw update). */
   session_update: { update: AcpSessionUpdate } & AcpEventContext;
-  /** A permission request the runner auto-answered, with the decision returned. */
+  /** A permission request parked on an async resolver; resolver path only, no outcome yet. */
+  permission_pending: AcpPermissionPendingEvent;
+  /** A permission request the runner answered, with the FINAL decision returned. */
   permission_request: AcpPermissionEvent;
   /** A vendor extension notification arrived for a session. */
   raw_message: AcpRawMessageEvent;

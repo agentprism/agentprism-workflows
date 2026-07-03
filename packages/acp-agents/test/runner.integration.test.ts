@@ -8,27 +8,12 @@
 // can assert exactly what crossed the wire (clientInfo, _meta, permission outcomes).
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { Type } from "typebox";
 import { isWorkflowError, WorkflowErrorCode, type AgentUsage, type McpServerConfig } from "@automatalabs/shared-types";
 import { AcpAgentRunner } from "../src/index.js";
+import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_CODEX_ACP_CMD",
-  "AGENTPRISM_CODEX_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-  "AGENTPRISM_FAKE_CRASH_SENTINEL",
-  "AGENTPRISM_DEFAULT_BACKEND",
-];
 
 interface LogEntry {
   method: string;
@@ -44,45 +29,19 @@ interface LogEntry {
   outcome?: { outcome: string; optionId?: string };
 }
 
-// The runner now POOLS long-lived ACP processes, so each run() leaves a live process behind until
-// the runner is disposed. Track every runner a test builds and dispose them all in afterEach so
-// no pooled process leaks (and the test runner can exit). Assertions are otherwise unchanged.
-const runners: AcpAgentRunner[] = [];
+const harness = createFakeAgentHarness({ prefix: "acp-it-", crashSentinel: true });
+
 function makeRunner(): AcpAgentRunner {
-  const runner = new AcpAgentRunner();
-  runners.push(runner);
-  return runner;
+  return harness.makeRunner();
 }
 
 /** Point BOTH backends' spawn override at the fake agent and script its behavior. Backend
  *  selection is driven by the run()'s `model`, not these env vars. Returns a log reader. */
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_CODEX_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CODEX_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  process.env.AGENTPRISM_FAKE_CRASH_SENTINEL = path.join(dir, "crash.sentinel");
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 afterEach(async () => {
   // Dispose every runner this test built (closes its pooled processes) before clearing env.
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
+  await harness.cleanup();
 });
 
 // ---- (7) benign clientInfo at initialize --------------------------------------------

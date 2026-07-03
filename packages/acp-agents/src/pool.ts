@@ -14,6 +14,7 @@ import type { Backend, BackendId } from "./backend.js";
 import { PooledConnection, SessionHandle, type AcpSessionOptions } from "./acp-client.js";
 import { validateClientHandlers, type ClientHandlers } from "./client-handlers.js";
 import type { AcpEventSink } from "./events.js";
+import type { PermissionResolver } from "./permissions.js";
 
 const DEFAULT_POOL_SIZE = 1;
 const POOL_SIZE_ENV = "AGENTPRISM_ACP_POOL_SIZE";
@@ -26,9 +27,10 @@ export interface AcpPoolOptions {
 }
 
 /** Internal wiring the runner injects (NOT part of the public AcpPoolOptions surface): the typed
- *  event sink forwarded to every PooledConnection so ACP events bubble up to `runner.on(...)`. */
+ *  event sink and runner-default permission resolver forwarded to every PooledConnection. */
 export interface AcpPoolDeps {
   onEvent?: AcpEventSink;
+  permissionResolver?: PermissionResolver;
 }
 
 /** Resolve the per-backend pool size: explicit option wins, else env, else 1. Clamped to >= 1. */
@@ -88,6 +90,7 @@ export class AcpAgentPool {
       const connection = PooledConnection.create(backend, {
         onDead: (dead) => this.drop(key, dead),
         onEvent: this.deps.onEvent,
+        permissionResolver: this.deps.permissionResolver,
         clientHandlers: this.clientHandlers,
       });
       connections.push(connection);

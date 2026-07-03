@@ -7,15 +7,14 @@
 // in, final-text JSON out).
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
 import { AcpAgentRunner, BACKENDS_ENV, type CustomBackendConfig } from "../src/index.js";
+import { createFakeAgentHarness, FAKE_AGENT_FIXTURE, readLog as readLogFile } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
 
 interface LogEntry {
@@ -33,11 +32,11 @@ function promptTextOf(entry: LogEntry | undefined): string {
   return (entry?.params?.prompt ?? []).map((b) => (b.type === "text" ? (b.text ?? "") : "")).join("");
 }
 
-const runners: AcpAgentRunner[] = [];
 const TEST_ENV_VARS = [BACKENDS_ENV, "AGENTPRISM_DEFAULT_BACKEND"];
+const harness = createFakeAgentHarness({ prefix: "acp-custom-it-" });
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
+  await harness.cleanup();
   for (const key of TEST_ENV_VARS) delete process.env[key];
 });
 
@@ -53,7 +52,7 @@ function fakeBackend(scenario: unknown, extra?: Partial<CustomBackendConfig>): {
   return {
     config: {
       command: process.execPath,
-      args: [FIXTURE],
+      args: [FAKE_AGENT_FIXTURE],
       env: {
         AGENTPRISM_FAKE_SCENARIO: JSON.stringify(scenario),
         AGENTPRISM_FAKE_LOG: log,
@@ -61,21 +60,12 @@ function fakeBackend(scenario: unknown, extra?: Partial<CustomBackendConfig>): {
       ...extra,
     },
     cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
+    readLog: () => readLogFile<LogEntry>(log),
   };
 }
 
 function makeRunner(backends: Record<string, CustomBackendConfig>): AcpAgentRunner {
-  const runner = new AcpAgentRunner({ backends });
-  runners.push(runner);
-  return runner;
+  return harness.makeRunner({ backends });
 }
 
 test("custom backend: routes by registered name, spawns the registry command, returns text", async () => {
@@ -166,29 +156,13 @@ test("custom backend: schema runs EMBED the JSON Schema in the prompt text (agen
 });
 
 test("builtin backends: schema runs do NOT embed the schema in the prompt (native channel is authoritative)", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-custom-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify({
+  const { cwd, readLog } = harness.configure<LogEntry>({
     turns: [{ structuredOutput: { city: "Oslo", hot: false }, text: "done" }],
   });
-  try {
-    await makeRunner({}).run("classify", { model: "claude", cwd: dir, schema: SCHEMA });
-    const entries = readFileSync(log, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as LogEntry);
-    const promptText = promptTextOf(entries.find((e) => e.method === "prompt"));
-    assert.match(promptText, /Final output contract/, "the generic contract text is still present");
-    assert.doesNotMatch(promptText, /required output schema \(JSON Schema\)/i, "no embedded schema for built-ins");
-  } finally {
-    delete process.env.AGENTPRISM_CLAUDE_ACP_CMD;
-    delete process.env.AGENTPRISM_CLAUDE_ACP_ARGS;
-    delete process.env.AGENTPRISM_FAKE_LOG;
-    delete process.env.AGENTPRISM_FAKE_SCENARIO;
-  }
+  await makeRunner({}).run("classify", { model: "claude", cwd, schema: SCHEMA });
+  const promptText = promptTextOf(readLog().find((e) => e.method === "prompt"));
+  assert.match(promptText, /Final output contract/, "the generic contract text is still present");
+  assert.doesNotMatch(promptText, /required output schema \(JSON Schema\)/i, "no embedded schema for built-ins");
 });
 
 test("custom backend: registers via AGENTPRISM_BACKENDS env and serves as the default backend", async () => {
@@ -196,8 +170,7 @@ test("custom backend: registers via AGENTPRISM_BACKENDS env and serves as the de
   process.env[BACKENDS_ENV] = JSON.stringify({ envfake: config });
   process.env.AGENTPRISM_DEFAULT_BACKEND = "envfake";
   // No `backends` option and NO model on the run: env registration + env default route it.
-  const runner = new AcpAgentRunner();
-  runners.push(runner);
+  const runner = harness.track(new AcpAgentRunner());
 
   const out = await runner.run("hi", { cwd });
   assert.equal(out, "env-registered");
@@ -261,35 +234,19 @@ test("initialize handshake: a non-ACP command fails fast with a legible error (a
 test("builtin backends: generic meta/promptMeta merge under the protocol-critical channels", async () => {
   // The fake serves the CLAUDE spawn override here — proving the passthrough also works for
   // built-ins and never clobbers the Claude schema channel.
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-custom-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify({
+  const { cwd, readLog } = harness.configure<LogEntry>({
     turns: [{ structuredOutput: { city: "Oslo", hot: false }, text: "done" }],
   });
-  try {
-    const out = await makeRunner({}).run("classify", {
-      model: "claude",
-      cwd: dir,
-      schema: SCHEMA,
-      meta: { experiment: "A", claudeCode: "user-loses" },
-    });
-    assert.deepEqual(out, { city: "Oslo", hot: false });
-    const entries = readFileSync(log, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as LogEntry);
-    const meta = entries.find((e) => e.method === "newSession")?.params?._meta;
-    assert.ok(meta, "session/new carried _meta");
-    assert.equal(meta.experiment, "A", "generic session meta reached the wire");
-    const claudeCode = meta.claudeCode as { options?: { outputFormat?: unknown } };
-    assert.ok(claudeCode?.options?.outputFormat, "the Claude schema channel won over the user key");
-  } finally {
-    delete process.env.AGENTPRISM_CLAUDE_ACP_CMD;
-    delete process.env.AGENTPRISM_CLAUDE_ACP_ARGS;
-    delete process.env.AGENTPRISM_FAKE_LOG;
-    delete process.env.AGENTPRISM_FAKE_SCENARIO;
-  }
+  const out = await makeRunner({}).run("classify", {
+    model: "claude",
+    cwd,
+    schema: SCHEMA,
+    meta: { experiment: "A", claudeCode: "user-loses" },
+  });
+  assert.deepEqual(out, { city: "Oslo", hot: false });
+  const meta = readLog().find((e) => e.method === "newSession")?.params?._meta;
+  assert.ok(meta, "session/new carried _meta");
+  assert.equal(meta.experiment, "A", "generic session meta reached the wire");
+  const claudeCode = meta.claudeCode as { options?: { outputFormat?: unknown } };
+  assert.ok(claudeCode?.options?.outputFormat, "the Claude schema channel won over the user key");
 });

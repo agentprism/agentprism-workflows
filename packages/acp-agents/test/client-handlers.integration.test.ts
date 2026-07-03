@@ -4,29 +4,17 @@
 // structured JSON-RPC errors for unadvertised methods.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import {
-  AcpAgentRunner,
   clientCapabilitiesFor,
   type AcpSessionContext,
   type ClientHandlers,
   type TerminalHandlers,
 } from "../src/index.js";
-
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_CODEX_ACP_CMD",
-  "AGENTPRISM_CODEX_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-];
+import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
 interface LogEntry {
   method: string;
@@ -41,40 +29,14 @@ interface LogEntry {
   };
 }
 
-const runners: AcpAgentRunner[] = [];
+const harness = createFakeAgentHarness({ prefix: "acp-client-handlers-it-" });
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
+
+const makeRunner = (clientHandlers?: ClientHandlers) => harness.makeRunner({ clientHandlers });
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
+  await harness.cleanup();
 });
-
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-client-handlers-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_CODEX_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CODEX_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
-
-function makeRunner(clientHandlers?: ClientHandlers): AcpAgentRunner {
-  const runner = new AcpAgentRunner({ clientHandlers });
-  runners.push(runner);
-  return runner;
-}
 
 function advertisedTrueCapabilities(log: LogEntry[]): ClientCapabilities {
   const caps = log.find((entry) => entry.method === "initialize")?.params?.clientCapabilities;

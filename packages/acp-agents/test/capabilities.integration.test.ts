@@ -6,10 +6,6 @@
 // legacy agent that advertises nothing keeps today's send-everything behavior.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Type } from "typebox";
 import {
@@ -20,20 +16,9 @@ import {
   WorkflowErrorCode,
   type McpServerConfig,
 } from "@automatalabs/shared-types";
-import { AcpAgentRunner } from "../src/index.js";
+import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_CODEX_ACP_CMD",
-  "AGENTPRISM_CODEX_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-  "AGENTPRISM_FAKE_CRASH_SENTINEL",
-];
 
 interface LogEntry {
   method: string;
@@ -48,36 +33,12 @@ interface LogEntry {
   };
 }
 
-const runners: AcpAgentRunner[] = [];
-function makeRunner(): AcpAgentRunner {
-  const runner = new AcpAgentRunner();
-  runners.push(runner);
-  return runner;
-}
+const harness = createFakeAgentHarness({ prefix: "acp-cap-it-" });
+const { makeRunner } = harness;
 
 /** Point BOTH backends' spawn override at the fake agent and script its behavior (including the
  *  scenario.initialize the negotiation reads). Returns a log reader. */
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-cap-it-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_CODEX_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CODEX_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 /** A capable initialize response that also advertises the fork's custom-capability namespace with
  *  the given per-key flags. session/close stays advertised so sessions release cleanly. */
@@ -100,8 +61,7 @@ function promptMeta(log: LogEntry[]): Record<string, unknown> {
 }
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
+  await harness.cleanup();
 });
 
 // ---- clientCapabilities: truthful (empty) ------------------------------------------

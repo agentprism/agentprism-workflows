@@ -11,25 +11,9 @@
 //   - dispose() closes every pooled process.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import { AcpAgentRunner } from "../src/index.js";
-
-const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
-
-const TEST_ENV_VARS = [
-  "AGENTPRISM_CLAUDE_ACP_CMD",
-  "AGENTPRISM_CLAUDE_ACP_ARGS",
-  "AGENTPRISM_CODEX_ACP_CMD",
-  "AGENTPRISM_CODEX_ACP_ARGS",
-  "AGENTPRISM_FAKE_LOG",
-  "AGENTPRISM_FAKE_SCENARIO",
-  "AGENTPRISM_FAKE_CRASH_SENTINEL",
-  "AGENTPRISM_DEFAULT_BACKEND",
-];
+import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
 interface LogEntry {
   method: string;
@@ -38,51 +22,21 @@ interface LogEntry {
   params?: { sessionId?: string };
 }
 
+const harness = createFakeAgentHarness({ prefix: "acp-pool-", backends: ["claude"], crashSentinel: true });
+
 /** Point the default (claude) backend's spawn override at the fake and script its behavior. */
-function configure(scenario: unknown): { cwd: string; readLog: () => LogEntry[] } {
-  const dir = mkdtempSync(path.join(tmpdir(), "acp-pool-"));
-  const log = path.join(dir, "log.jsonl");
-  process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
-  process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FIXTURE;
-  process.env.AGENTPRISM_FAKE_LOG = log;
-  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);
-  process.env.AGENTPRISM_FAKE_CRASH_SENTINEL = path.join(dir, "crash.sentinel");
-  return {
-    cwd: dir,
-    readLog: () =>
-      existsSync(log)
-        ? readFileSync(log, "utf8")
-            .trim()
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => JSON.parse(line) as LogEntry)
-        : [],
-  };
-}
+const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 const count = (entries: LogEntry[], method: string): number =>
   entries.filter((e) => e.method === method).length;
 
-/** Poll until `predicate` holds (deterministic vs. fixed delays whose timing depends on spawn). */
-async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: condition not met in time");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
 // Track every runner so a failed assertion never leaks a pooled process.
-const runners: AcpAgentRunner[] = [];
 function makeRunner(size?: number): AcpAgentRunner {
-  const runner = new AcpAgentRunner(size === undefined ? {} : { size });
-  runners.push(runner);
-  return runner;
+  return harness.makeRunner(size === undefined ? {} : { size });
 }
 
 afterEach(async () => {
-  await Promise.all(runners.splice(0).map((runner) => runner.dispose()));
-  for (const key of TEST_ENV_VARS) delete process.env[key];
+  await harness.cleanup();
 });
 
 // ---- N calls REUSE one pooled process -----------------------------------------------

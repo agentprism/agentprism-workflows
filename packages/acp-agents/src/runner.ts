@@ -16,17 +16,17 @@
 //
 // Timeout and abort are the ENGINE's job: we honor opts.signal (wired to ACP session/cancel)
 // and re-throw on abort, but never implement our own timeout.
+import { isAbsolute } from "node:path";
 import {
   WorkflowError,
   WorkflowErrorCode,
   type AgentResult,
   type AgentRunner,
-  type PromptImage,
   type RunOptions,
 } from "@automatalabs/shared-types";
-import type { ContentBlock, StopReason } from "@agentclientprotocol/sdk";
+import type { StopReason } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
-import type { SessionHandle } from "./acp-client.js";
+import { PooledConnection, type AcpSessionOptions, type SessionHandle } from "./acp-client.js";
 import { AcpAgentPool, type AcpPoolOptions } from "./pool.js";
 import {
   TypedEventEmitter,
@@ -36,6 +36,7 @@ import {
   type AcpRunnerEventMap,
 } from "./events.js";
 import type { Backend } from "./backend.js";
+import { InteractiveSession, type InteractiveSessionOptions } from "./interactive.js";
 import { ClaudeBackend } from "./backends/claude.js";
 import { CodexBackend } from "./backends/codex.js";
 import { CustomAcpBackend } from "./backends/custom.js";
@@ -46,11 +47,45 @@ import {
   type CustomBackendConfig,
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
-import { toJsonSchema } from "./schema-strict.js";
-import type { ToolPolicy } from "./permissions.js";
+import type { PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
+import {
+  buildRunPrompt,
+  mergeTurnMeta,
+  promptWithImages,
+  validatePromptImages,
+} from "./prompt.js";
+import type { ClientHandlers } from "./client-handlers.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
+
+interface SessionPreparationOptions {
+  model?: string;
+  tier?: string;
+  toolNames?: string[];
+  disallowedToolNames?: string[];
+  mcpServers?: AnyRunOptions["mcpServers"];
+  meta?: Record<string, unknown>;
+  runId?: string;
+  label?: string;
+  baseInstructions?: string;
+  developerInstructions?: string;
+}
+
+interface SessionPreparationConfig {
+  cwd: string;
+  schema: TSchema | undefined;
+  registry: BackendRegistry;
+  signal?: AbortSignal;
+  permissionResolver?: PermissionResolver;
+  retainSessionLog?: boolean;
+}
+
+interface PreparedSession {
+  backend: Backend;
+  modelSpec: string | undefined;
+  sessionOptions: AcpSessionOptions;
+}
 
 /** Constructor options for the runner: pool sizing, client-side handlers, and the custom-backend
  *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
@@ -58,30 +93,50 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Custom ACP backends, keyed by registered name (see registry.ts for the config shape
    *  and the routing rules). Names are case-insensitive; "claude"/"codex" are reserved. */
   backends?: Record<string, CustomBackendConfig>;
+  /** Runner-wide human-in-the-loop permission resolver. When set, it replaces ToolPolicy
+   *  auto-decisions for every session that does not provide its own resolver. */
+  onPermissionRequest?: PermissionResolver;
 }
 
 export class AcpAgentRunner implements AgentRunner {
   private readonly pool: AcpAgentPool;
   /** The resolved custom-backend registry (env + option, validated at construction). */
   private readonly backends: BackendRegistry;
-  /** Typed bus carrying every ACP event from every pooled session. Beyond the AgentRunner seam
-   *  (additive observability) — subscribing never affects a run and never enters the resume hash. */
+  /** Typed bus carrying every ACP event from every pooled or interactive session. Beyond the
+   *  AgentRunner seam (additive observability) — subscribing never affects a run and never enters
+   *  the resume hash. */
   private readonly events = new TypedEventEmitter<AcpRunnerEventMap>();
   private readonly emitEvent: AcpEventSink = (name, event) => this.events.emit(name, event);
+  /** Client-side handlers and the runner-wide permission resolver are initialize/session wiring,
+   *  so dedicated interactive connections must receive the SAME deps the pool receives. */
+  private readonly clientHandlers: ClientHandlers | undefined;
+  private readonly permissionResolver: PermissionResolver | undefined;
+  /** Held-open interactive sessions own dedicated ACP processes outside the pool. The runner
+   *  tracks their connections so dispose() can release them and the process-exit hook can
+   *  synchronously kill any dedicated children if the host exits without release(). */
+  private readonly interactiveSessions = new Map<InteractiveSession, PooledConnection>();
+  private readonly onProcessExit = () => this.killAllSync();
+  private exitHookInstalled = false;
+  private disposed = false;
 
   constructor(options: AcpRunnerOptions = {}) {
-    this.pool = new AcpAgentPool(options, { onEvent: this.emitEvent });
+    this.clientHandlers = options.clientHandlers;
+    this.permissionResolver = options.onPermissionRequest;
+    this.pool = new AcpAgentPool(options, {
+      onEvent: this.emitEvent,
+      permissionResolver: options.onPermissionRequest,
+    });
     this.backends = resolveBackendRegistry(options.backends);
   }
 
   /**
    * Listen in on the live ACP stream. `name` is an ACP `sessionUpdate` discriminant
    * ("agent_message_chunk", "tool_call", "usage_update", …) or one of the cross-cutting events
-   * ("session_update" catch-all, "permission_request", "raw_message", "session_open",
-   * "session_close", "backend_error"). The listener is typed to the event. Returns an unsubscribe
-   * thunk. A pooled runner multiplexes many concurrent runs, so each event carries
-   * `{ sessionId, backendId, label?, runId? }` for filtering. Listeners are best-effort observers:
-   * a throwing listener is isolated and never affects the run.
+   * ("session_update" catch-all, "permission_pending", "permission_request", "raw_message",
+   * "session_open", "session_close", "backend_error"). The listener is typed to the event.
+   * Returns an unsubscribe thunk. A pooled runner multiplexes many concurrent runs, so each
+   * event carries `{ sessionId, backendId, label?, runId? }` for filtering. Listeners are
+   * best-effort observers: a throwing listener is isolated and never affects the run.
    */
   on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void {
     return this.events.on(name, listener);
@@ -104,6 +159,73 @@ export class AcpAgentRunner implements AgentRunner {
     return this.events.listenerCount(name);
   }
 
+  /**
+   * Open a held ACP session for multi-turn callers. Unlike run(), this does NOT acquire a pool
+   * slot: it spawns one dedicated backend process, opens one ACP session on it, and hands the
+   * caller an InteractiveSession that must be released. The dedicated process means a long-lived
+   * chat/debug loop never starves one-shot run() calls on the same backend (the default pool size
+   * is one).
+   */
+  async openSession(opts: InteractiveSessionOptions): Promise<InteractiveSession> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    validateInteractiveCwd(opts.cwd, opts.label);
+    opts.signal?.throwIfAborted();
+
+    const prepared = this.prepareSession(opts, {
+      cwd: opts.cwd,
+      schema: undefined,
+      registry: this.backends,
+      permissionResolver: opts.onPermissionRequest,
+      retainSessionLog: false,
+    });
+    this.installExitHook();
+    let interactive: InteractiveSession | undefined;
+    const connection = PooledConnection.create(prepared.backend, {
+      onDead: () => {
+        // Dedicated connections are not stored in pool arrays, so there is nothing to evict.
+        // Once the public wrapper exists, process death releases it through the normal path:
+        // subscriptions are removed, session_close is emitted, and future prompt() calls fail
+        // with the clean released-session error. Before then, openSession's catch tears down.
+        void interactive?.release();
+      },
+      onEvent: this.emitEvent,
+      permissionResolver: this.permissionResolver,
+      clientHandlers: this.clientHandlers,
+    });
+    let session: SessionHandle | undefined;
+    try {
+      session = await connection.openSession(prepared.sessionOptions);
+      opts.signal?.throwIfAborted();
+      await applyModelSelection(session, prepared.modelSpec, opts);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+
+      interactive = new InteractiveSession({
+        session,
+        connection,
+        backend: prepared.backend,
+        subscribe: (name, listener) => this.events.on(name, listener),
+        onRelease: (self) => this.interactiveSessions.delete(self),
+        signal: opts.signal,
+        label: opts.label,
+      });
+      this.interactiveSessions.set(interactive, connection);
+      return interactive;
+    } catch (error) {
+      try {
+        await session?.release();
+      } catch {
+        // best-effort: openSession failed, so teardown must never mask the real error.
+      }
+      try {
+        await connection.dispose();
+      } catch {
+        // best-effort: same as pool teardown.
+      }
+      throw error;
+    }
+  }
+
   async run<S extends TSchema | undefined = undefined>(
     prompt: string,
     options: RunOptions<S> = {},
@@ -122,42 +244,29 @@ export class AcpAgentRunner implements AgentRunner {
         agentLabel: opts.label,
       });
     }
-    const backend = selectBackend(opts, registry);
-    const policy: ToolPolicy = { allow: opts.toolNames, deny: opts.disallowedToolNames };
     const cwd = opts.cwd ?? process.cwd();
     validatePromptImages(opts.images, opts.label);
 
-    const session: SessionHandle = await this.pool.acquire(backend, {
+    const prepared = this.prepareSession(opts, {
       cwd,
       schema,
-      policy,
+      registry,
       signal: opts.signal,
-      mcpServers: opts.mcpServers,
-      // Generic session-scoped _meta passthrough (RunOptions.meta) — merged UNDER the
-      // backend-computed keys and the runId stamp in openSession. Additive; never hashed.
-      meta: opts.meta,
-      // Engine correlation id -> session/new _meta (META_KEYS.runId). Additive; never hashed.
-      runId: opts.runId,
-      // Stamped onto emitted ACP events as context (never sent on the wire).
-      label: opts.label,
-      // CODEX-ONLY session instruction overrides -> session/new _meta bare keys. Additive; never
-      // hashed. The Claude backend ignores them.
-      baseInstructions: opts.baseInstructions,
-      developerInstructions: opts.developerInstructions,
     });
+    const session: SessionHandle = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
     try {
       opts.signal?.throwIfAborted();
       // For a CUSTOM backend chosen by its registered name, the name itself is routing, not a
       // model id: "browser" selects nothing; "browser/foo" selects "foo". Built-ins get the
       // full spec unchanged (their catalogs match provider-prefixed and bare ids).
-      await applyModelSelection(session, innerModelSpec(opts.model ?? opts.tier, backend), opts);
+      await applyModelSelection(session, prepared.modelSpec, opts);
 
-      const text = buildPrompt(prompt, opts, schema, backend);
+      const text = buildRunPrompt(prompt, opts, schema, prepared.backend);
       const initialPrompt =
         opts.images && opts.images.length > 0 ? promptWithImages(text, opts.images) : text;
       // Generic turn-scoped _meta passthrough merged UNDER the backend-computed keys (e.g. the
       // outputSchema forward when a schema is set) — user meta never clobbers the schema channel.
-      const promptMeta = mergeTurnMeta(opts.promptMeta, backend.promptMeta(schema));
+      const promptMeta = mergeTurnMeta(opts.promptMeta, prepared.backend.promptMeta(schema));
       const response = await session.prompt(initialPrompt, promptMeta);
       opts.signal?.throwIfAborted();
       // Inspect the turn's stop reason BEFORE the text/schema path: a refusal or truncation
@@ -174,7 +283,7 @@ export class AcpAgentRunner implements AgentRunner {
             assertNormalStopReason(repromptResponse.stopReason, opts.label);
           },
           lastText: () => session.currentTurnText(),
-          tryNative: () => backend.nativeStructured(session),
+          tryNative: () => prepared.backend.nativeStructured(session),
         };
         const result = await resolveStructuredOutput(structuredSession, schema, {
           maxSchemaRetries: opts.maxSchemaRetries,
@@ -220,8 +329,60 @@ export class AcpAgentRunner implements AgentRunner {
   /** Tear down the whole pool (close every long-lived process). Call when the run ends / the
    *  runner is disposed. Beyond the AgentRunner seam (additive) — never enters the resume hash. */
   async dispose(): Promise<void> {
+    this.disposed = true;
+    this.removeExitHook();
+    const sessions = [...this.interactiveSessions.keys()];
+    await Promise.all(sessions.map((session) => session.release()));
     await this.pool.dispose();
     this.events.removeAllListeners();
+  }
+
+  /** Build the backend choice, model-selection spec, tool policy, and session/new options in one
+   *  place for run() and openSession() so new AcpSessionOptions fields cannot drift by path. */
+  private prepareSession(opts: SessionPreparationOptions, config: SessionPreparationConfig): PreparedSession {
+    const backend = selectBackend(opts, config.registry);
+    const policy: ToolPolicy = { allow: opts.toolNames, deny: opts.disallowedToolNames };
+    return {
+      backend,
+      modelSpec: innerModelSpec(opts.model ?? opts.tier, backend),
+      sessionOptions: {
+        cwd: config.cwd,
+        schema: config.schema,
+        policy,
+        permissionResolver: config.permissionResolver,
+        signal: config.signal,
+        mcpServers: opts.mcpServers,
+        // Generic session-scoped _meta passthrough (RunOptions.meta) — merged UNDER the
+        // backend-computed keys and the runId stamp in openSession. Additive; never hashed.
+        meta: opts.meta,
+        // Engine correlation id -> session/new _meta (META_KEYS.runId). Additive; never hashed.
+        runId: opts.runId,
+        // Stamped onto emitted ACP events as context (never sent on the wire).
+        label: opts.label,
+        // CODEX-ONLY session instruction overrides -> session/new _meta bare keys. Additive;
+        // never hashed. The Claude backend ignores them.
+        baseInstructions: opts.baseInstructions,
+        developerInstructions: opts.developerInstructions,
+        retainSessionLog: config.retainSessionLog,
+      },
+    };
+  }
+
+  private installExitHook(): void {
+    if (this.exitHookInstalled) return;
+    this.exitHookInstalled = true;
+    process.once("exit", this.onProcessExit);
+  }
+
+  private removeExitHook(): void {
+    if (!this.exitHookInstalled) return;
+    this.exitHookInstalled = false;
+    process.removeListener("exit", this.onProcessExit);
+  }
+
+  /** Synchronous best-effort child kill for the process-exit hook (no async work is possible). */
+  private killAllSync(): void {
+    for (const connection of this.interactiveSessions.values()) connection.killNow();
   }
 }
 
@@ -271,7 +432,7 @@ function assertNormalStopReason(stopReason: StopReason, label?: string): void {
 async function applyModelSelection(
   session: SessionHandle,
   spec: string | undefined,
-  opts: AnyRunOptions,
+  opts: { onModelResolved?: (modelId: string) => void; onModelFallback?: (requestedSpec: string) => void },
 ): Promise<void> {
   // `spec` is opts.model ?? opts.tier (`model` wins — frozen contract), with a custom
   // backend's routing name already stripped by innerModelSpec.
@@ -283,75 +444,6 @@ async function applyModelSelection(
   // does not advertise is a silent no-op in the session. Surface it on the SAME channel so
   // incorrect tiering is observable (best-effort — reported, never thrown).
   for (const fallback of modifierFallbacks ?? []) opts.onModelFallback?.(fallback);
-}
-
-function buildPrompt(
-  prompt: string,
-  opts: AnyRunOptions,
-  schema: TSchema | undefined,
-  backend: Backend,
-): string {
-  const parts: string[] = [];
-  if (opts.instructions) parts.push(opts.instructions);
-  if (opts.label) parts.push(`Task label: ${opts.label}`);
-  parts.push(prompt);
-  if (schema) {
-    const contract = [
-      "Final output contract:",
-      "- Your FINAL message MUST be a single JSON object that conforms to the required output schema.",
-      "- Output ONLY that JSON object — no prose, no explanation, and no markdown code fences.",
-      "- If you need to inspect files or run commands first, do so, then emit the JSON object as your final message.",
-    ];
-    if (backend.embedSchemaInPrompt) {
-      // The agent behind a custom backend may ignore the `_meta.outputSchema` forward, so the
-      // schema must be STATED, not just wired — otherwise the model invents its own keys and
-      // the repair ladder can never converge. Built-ins skip this: their native constraint
-      // channel is authoritative.
-      contract.push(`- The required output schema (JSON Schema):\n${JSON.stringify(toJsonSchema(schema))}`);
-    }
-    parts.push(contract.join("\n"));
-  }
-  return parts.join("\n\n");
-}
-
-function validatePromptImages(images: readonly PromptImage[] | undefined, label?: string): void {
-  if (!images || images.length === 0) return;
-  for (let i = 0; i < images.length; i += 1) {
-    const image = images[i] as PromptImage | undefined;
-    if (typeof image?.data !== "string" || image.data.trim() === "") {
-      throw new WorkflowError(
-        `images[${i}].data must be a non-empty string`,
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false, agentLabel: label },
-      );
-    }
-    if (typeof image.mimeType !== "string" || image.mimeType.trim() === "") {
-      throw new WorkflowError(
-        `images[${i}].mimeType must be a non-empty string`,
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false, agentLabel: label },
-      );
-    }
-    if (image.uri !== undefined && (typeof image.uri !== "string" || image.uri.trim() === "")) {
-      throw new WorkflowError(
-        `images[${i}].uri must be a non-empty string when present`,
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false, agentLabel: label },
-      );
-    }
-  }
-}
-
-function promptWithImages(text: string, images: readonly PromptImage[]): ContentBlock[] {
-  const blocks: ContentBlock[] = [{ type: "text", text }];
-  for (const image of images) {
-    blocks.push(
-      image.uri === undefined
-        ? { type: "image", data: image.data, mimeType: image.mimeType }
-        : { type: "image", data: image.data, mimeType: image.mimeType, uri: image.uri },
-    );
-  }
-  return blocks;
 }
 
 /** Pick the backend by model/tier. Cross-provider routing = which ACP server to spawn.
@@ -389,13 +481,16 @@ function innerModelSpec(spec: string | undefined, backend: Backend): string | un
   return spec;
 }
 
-/** Merge the generic turn-scoped meta passthrough UNDER the backend-computed turn meta. */
-function mergeTurnMeta(
-  user: Record<string, unknown> | undefined,
-  backend: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-  if (!user) return backend;
-  return { ...user, ...(backend ?? {}) };
+/** Interactive sessions are public and long-lived, so fail before spawning a dedicated process
+ *  when the required worktree root is absent or not absolute. */
+function validateInteractiveCwd(cwd: string, label?: string): void {
+  if (typeof cwd !== "string" || cwd.trim() === "" || !isAbsolute(cwd)) {
+    throw new WorkflowError(
+      "openSession requires cwd to be a non-empty absolute path",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false, agentLabel: label },
+    );
+  }
 }
 
 function backendIdForSpec(spec: string | undefined): "claude" | "codex" | undefined {

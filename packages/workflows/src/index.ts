@@ -34,18 +34,22 @@ export {
   isProviderUsageLimit,
 } from "@automatalabs/workflow-engine";
 
-// ── ACP backend: the default AgentRunner implementation, backend selection, the
-//    concrete backends (built-in + custom registry), the pool/runner options, and the
-//    JSON-Schema helpers. Custom backends let ANY ACP agent serve agent() calls:
+// ── ACP backend: the default AgentRunner implementation, interactive sessions, backend
+//    selection, the concrete backends (built-in + custom registry), the pool/runner options,
+//    capability helpers, client handlers, permission resolvers, and JSON-Schema helpers.
+//    Custom backends let ANY ACP agent serve agent() calls:
 //    `createAcpRunner({ backends: { browser: { command: "…" } } })` (or the
 //    AGENTPRISM_BACKENDS env var), then route with `agent(p, { model: "browser" })`. ──
 export {
   createAcpRunner,
   AcpAgentRunner,
+  InteractiveSession,
   selectBackend,
   ClaudeBackend,
   CodexBackend,
   CustomAcpBackend,
+  clientCapabilitiesFor,
+  adaptPromptContent,
   resolveBackendRegistry,
   BACKENDS_ENV,
   toJsonSchema,
@@ -54,9 +58,17 @@ export {
 export type {
   AcpPoolOptions,
   AcpRunnerOptions,
+  InteractiveSessionOptions,
+  InteractiveTurn,
   BackendRegistry,
   CustomBackendConfig,
   RegisteredBackend,
+  ClientHandlers,
+  FsHandlers,
+  TerminalHandlers,
+  AcpSessionContext,
+  NegotiatedCapabilities,
+  PermissionResolver,
 } from "@automatalabs/acp-agents";
 
 // ── Live ACP events: `createAcpRunner().on("tool_call", evt => …)` to listen in on the
@@ -71,6 +83,7 @@ export type {
   AcpEventContext,
   AcpSessionUpdate,
   AcpUpdateKind,
+  AcpPermissionPendingEvent,
   AcpPermissionEvent,
   AcpRawMessageEvent,
   AcpBackendErrorEvent,

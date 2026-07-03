@@ -6,6 +6,8 @@
 // @automatalabs/workflows facade (which mcp-server builds on) via createAcpRunner().
 export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
 export type { AcpRunnerOptions } from "./runner.js";
+export { InteractiveSession } from "./interactive.js";
+export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
 // The custom-backend registry: run ANY ACP agent as an agent() target.
 export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from "./registry.js";
@@ -43,6 +45,7 @@ export type {
   AcpEventSink,
   AcpSessionUpdate,
   AcpUpdateKind,
+  AcpPermissionPendingEvent,
   AcpPermissionEvent,
   AcpRawMessageEvent,
   AcpBackendErrorEvent,
@@ -61,7 +64,7 @@ export { CodexBackend } from "./backends/codex.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
 export { decidePermission } from "./permissions.js";
-export type { ToolPolicy } from "./permissions.js";
+export type { PermissionResolver, ToolPolicy } from "./permissions.js";
 
 export { UsageAccumulator } from "./usage.js";
 

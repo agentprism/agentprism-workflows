@@ -72,7 +72,7 @@ import {
   type NegotiatedCapabilities,
 } from "./capabilities.js";
 import { emitSessionUpdate, type AcpEventContext, type AcpEventSink } from "./events.js";
-import { decidePermission, type ToolPolicy } from "./permissions.js";
+import { decidePermission, type PermissionResolver, type ToolPolicy } from "./permissions.js";
 import { UsageAccumulator } from "./usage.js";
 import {
   clientCapabilitiesFor,
@@ -109,11 +109,12 @@ interface SessionTombstone {
 }
 
 /** Per-session accumulator: assistant text, tool history, usage, the Claude raw structured_output,
- *  and the tool policy used to auto-answer permission requests for THIS session. */
+ *  and the permission policy/resolver used to answer permission requests for THIS session. */
 class SessionState {
   readonly textChunks: string[] = [];
   readonly history: AgentHistoryEntry[] = [];
   readonly usage = new UsageAccumulator();
+  readonly pendingPermissions = new Set<(outcome: RequestPermissionResponse) => void>();
   rawResultSuccess: RawResultSuccess | undefined;
   private turnStartIndex = 0;
 
@@ -122,13 +123,24 @@ class SessionState {
   constructor(
     readonly cwd: string,
     readonly policy: ToolPolicy,
+    readonly permissionResolver?: PermissionResolver,
     readonly label?: string,
     readonly runId?: string,
+    private readonly retainSessionLog = true,
   ) {}
 
-  /** Mark the start of a new turn so currentTurnText()/structured_output read only this turn. */
+  /** Mark the start of a new turn so currentTurnText()/structured_output read only this turn.
+   *  Long-lived interactive sessions can opt out of retaining old text/history because hosts
+   *  stream live events and keep their own transcript; clearing here prevents dead logs from
+   *  growing for the lifetime of a held-open session. */
   beginTurn(): void {
-    this.turnStartIndex = this.textChunks.length;
+    if (this.retainSessionLog) {
+      this.turnStartIndex = this.textChunks.length;
+    } else {
+      this.textChunks.length = 0;
+      this.history.length = 0;
+      this.turnStartIndex = 0;
+    }
     this.rawResultSuccess = undefined;
   }
 
@@ -177,6 +189,12 @@ class SessionState {
       this.rawResultSuccess = message;
     }
   }
+
+  /** Settle every deferred permission still parked on this session. Used by release/cancel/death
+   *  teardown so an interactive resolver can never strand an ACP prompt turn. */
+  settlePendingPermissions(): void {
+    for (const settle of [...this.pendingPermissions]) settle(cancelledPermissionResponse());
+  }
 }
 
 /** The single ACP Client handler for one pooled connection. It ROUTES every notification and
@@ -191,11 +209,13 @@ class MultiplexClient implements Client {
   private readonly tombstones = new Map<string, SessionTombstone>();
 
   /** `backendId` stamps event context; `onEvent` (optional) bubbles every notification, permission
-   *  request and session lifecycle change up to the runner's typed bus. */
+   *  request and session lifecycle change up to the runner's typed bus. `permissionResolver` is
+   *  the runner-wide default; a SessionState resolver wins when present. */
   constructor(
     private readonly backendId: BackendId,
     private readonly onEvent?: AcpEventSink,
     private readonly handlers?: ClientHandlers,
+    private readonly permissionResolver?: PermissionResolver,
   ) {}
 
   private contextFor(sessionId: string, state: SessionState | undefined): AcpEventContext {
@@ -228,6 +248,7 @@ class MultiplexClient implements Client {
 
   unregister(sessionId: string): void {
     const state = this.sessions.get(sessionId);
+    state?.settlePendingPermissions();
     this.sessions.delete(sessionId);
     if (state) {
       this.tombstones.set(sessionId, {
@@ -244,17 +265,68 @@ class MultiplexClient implements Client {
     }
   }
 
-  requestPermission(params: RequestPermissionRequest): RequestPermissionResponse {
+  settlePendingPermissions(sessionId: string): void {
+    this.sessions.get(sessionId)?.settlePendingPermissions();
+  }
+
+  settleAllPendingPermissions(): void {
+    for (const state of this.sessions.values()) {
+      state.settlePendingPermissions();
+    }
+  }
+
+  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> | RequestPermissionResponse {
     const state = this.sessions.get(params.sessionId);
     // Unknown/closed session: refuse rather than silently allow a tool we can't attribute.
-    if (!state) return { outcome: { outcome: "cancelled" } };
+    if (!state) return cancelledPermissionResponse();
+    const ctx = this.contextFor(params.sessionId, state);
+    const resolver = state.permissionResolver ?? this.permissionResolver;
+    if (resolver) return this.requestPermissionViaResolver(params, state, ctx, resolver);
     const outcome = decidePermission(params, state.policy);
     this.onEvent?.("permission_request", {
-      ...this.contextFor(params.sessionId, state),
+      ...ctx,
       request: params,
       outcome,
     });
     return outcome;
+  }
+
+  private requestPermissionViaResolver(
+    params: RequestPermissionRequest,
+    state: SessionState,
+    ctx: AcpEventContext,
+    resolver: PermissionResolver,
+  ): Promise<RequestPermissionResponse> {
+    let settled = false;
+    let settle!: (outcome: RequestPermissionResponse) => void;
+    const response = new Promise<RequestPermissionResponse>((resolve) => {
+      settle = (outcome) => {
+        if (settled) return;
+        settled = true;
+        state.pendingPermissions.delete(settle);
+        this.onEvent?.("permission_request", { ...ctx, request: params, outcome });
+        resolve(outcome);
+      };
+      state.pendingPermissions.add(settle);
+      this.onEvent?.("permission_pending", { ...ctx, request: params });
+
+      try {
+        Promise.resolve(resolver(params, ctx)).then(
+          (outcome) => {
+            settle(outcome);
+          },
+          () => {
+            // No session-scoped resolver-error event exists; the permission_request event still
+            // reports the FINAL outcome exactly once, so rejection is observable as cancellation.
+            settle(cancelledPermissionResponse());
+          },
+        );
+      } catch {
+        settle(cancelledPermissionResponse());
+      }
+    });
+    response.catch(() => {});
+    return response;
   }
 
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> | ReadTextFileResponse {
@@ -325,6 +397,10 @@ function unknownSession(sessionId: string): RequestError {
   return RequestError.invalidParams({ sessionId }, `unknown session: ${sessionId}`);
 }
 
+function cancelledPermissionResponse(): RequestPermissionResponse {
+  return { outcome: { outcome: "cancelled" } };
+}
+
 function methodNotAdvertised(method: string): RequestError {
   return new RequestError(-32601, `${method} was not advertised by this client`, { method });
 }
@@ -377,6 +453,9 @@ export interface AcpSessionOptions {
   /** The schema for this run, if any (drives the backend's session/prompt `_meta`). */
   schema: TSchema | undefined;
   policy: ToolPolicy;
+  /** Session-scoped permission resolver. When present it wins over the runner default and
+   *  replaces the synchronous ToolPolicy auto-response path for this session. */
+  permissionResolver?: PermissionResolver;
   signal?: AbortSignal;
   /** Client-provided MCP servers to attach at session/new. Omitted => `[]` (the default). */
   mcpServers?: McpServerConfig[];
@@ -393,6 +472,11 @@ export interface AcpSessionOptions {
    *  (bare keys) for the codex-acp adapter; the Claude backend ignores them. Omitted => unset. */
   baseInstructions?: string;
   developerInstructions?: string;
+  /** Retain accumulated assistant text/tool history for the lifetime of this ACP session.
+   *  Default true preserves run()'s diagnostic history contract. Held-open interactive sessions
+   *  pass false because hosts stream live events / keep their own transcript; retaining old turns
+   *  there is dead memory for day-long sessions. */
+  retainSessionLog?: boolean;
 }
 
 /** Notified by a PooledConnection when its process dies, so the pool can drop it. */
@@ -402,6 +486,8 @@ export interface PooledConnectionDeps {
    *  session lifecycle change on this connection is bubbled up through it (additive observability;
    *  it is invoked AFTER the drain accumulation and never affects the run). */
   onEvent?: AcpEventSink;
+  /** Runner-wide permission resolver default. SessionState.permissionResolver overrides it. */
+  permissionResolver?: PermissionResolver;
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
 }
@@ -443,7 +529,7 @@ export class PooledConnection {
     this.onDead = deps.onDead;
     this.onEvent = deps.onEvent;
     this.clientHandlers = deps.clientHandlers;
-    this.client = new MultiplexClient(this.backendId, this.onEvent, deps.clientHandlers);
+    this.client = new MultiplexClient(this.backendId, this.onEvent, deps.clientHandlers, deps.permissionResolver);
 
     const { command, args, env } = backend.spawnConfig();
     // NOTE: deliberately NO `cwd` here. cwd is per-SESSION (session/new), so one pooled process
@@ -528,6 +614,7 @@ export class PooledConnection {
     this._alive = false;
     this.deathError = error;
     this.resolveDead();
+    this.client.settleAllPendingPermissions();
     // A crash (not a graceful dispose) is worth surfacing for observability; the engine still
     // handles it by retrying the run on a fresh process. Best-effort, after death is recorded.
     if (this.onEvent && !this.disposing) {
@@ -630,7 +717,14 @@ export class PooledConnection {
           { recoverable: false, agentLabel: opts.label },
         );
       }
-      const state = new SessionState(opts.cwd, opts.policy, opts.label, opts.runId);
+      const state = new SessionState(
+        opts.cwd,
+        opts.policy,
+        opts.permissionResolver,
+        opts.label,
+        opts.runId,
+        opts.retainSessionLog ?? true,
+      );
       // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
       // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
       // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
@@ -667,6 +761,7 @@ export class PooledConnection {
 
   /** Best-effort ACP cancel for one session (wired to opts.signal). The PROCESS stays pooled. */
   async cancelSession(sessionId: string): Promise<void> {
+    this.client.settlePendingPermissions(sessionId);
     if (!this._alive) return;
     try {
       await this.rpc.cancel({ sessionId });
@@ -749,7 +844,7 @@ export class SessionHandle implements StructuredSource {
 
   constructor(
     private readonly pooled: PooledConnection,
-    private readonly sessionId: string,
+    readonly sessionId: string,
     private readonly state: SessionState,
     configOptions: SessionConfigOption[],
     private readonly opts: AcpSessionOptions,

@@ -34,7 +34,7 @@ const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
 function record(entry) {
   if (!logPath) return;
   try {
-    appendFileSync(logPath, JSON.stringify(entry) + "\n");
+    appendFileSync(logPath, JSON.stringify({ pid: process.pid, ...entry }) + "\n");
   } catch {
     // best-effort observation channel
   }
@@ -137,7 +137,9 @@ class FakeAgent {
   newSession(params) {
     record({ method: "newSession", params });
     // UNIQUE per call: one pooled process serves many sessions over its lifetime.
-    const sessionId = `fake-session-${(this.sessionCounter += 1)}`;
+    // Process-unique ids: real ACP agents mint globally-unique session ids, and the per-session
+    // event filter depends on that — two fixture processes must never collide on an id.
+    const sessionId = `fake-session-${process.pid}-${(this.sessionCounter += 1)}`;
     return { sessionId, configOptions: this.configOptions };
   }
 
