@@ -103,8 +103,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   agentTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
+  /** Absolute workflow persistence root for log persistence; explicit value wins over AGENTPRISM_PERSISTENCE_ROOT. */
+  persistenceRoot?: string;
   /** Run ID for persistence. Auto-generated if not provided. */
   runId?: string;
+  /**
+   * Whether this run participates in journal replay/write callbacks. Default true.
+   * When false, resume inputs are rejected instead of being silently ignored.
+   */
+  journaling?: boolean;
   /** Resume: cached agent results keyed by deterministic call index. */
   resumeJournal?: Map<number, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
@@ -293,6 +300,12 @@ export async function runWorkflow<T = unknown>(
 ): Promise<EngineRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
+  const journaling = options.journaling ?? true;
+  if (!journaling && (options.resumeJournal || options.resumeFromRunId)) {
+    throw new WorkflowError("journaling disabled for this run", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+    });
+  }
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
@@ -313,7 +326,8 @@ export async function runWorkflow<T = unknown>(
   const logger = createWorkflowLogger({
     runId,
     cwd: options.cwd ?? process.cwd(),
-    persist: options.persistLogs ?? true,
+    persistenceRoot: options.persistenceRoot,
+    persist: journaling ? (options.persistLogs ?? true) : false,
     onLog: options.onLog,
   });
 
@@ -454,7 +468,7 @@ export async function runWorkflow<T = unknown>(
     // call. Once any call misses, it AND everything after it run live (matching
     // Claude Code's contract), so an edited upstream call never leaves stale
     // downstream results served from the journal.
-    const cached = options.resumeJournal?.get(callIndex);
+    const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
@@ -565,7 +579,7 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+            if (journaling) options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
@@ -876,7 +890,7 @@ export async function runWorkflow<T = unknown>(
     }
     const callIndex = state.callSeq++;
     const callHash = hashCheckpoint(promptText, checkpointOptions);
-    const cached = options.resumeJournal?.get(callIndex);
+    const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
       return cached.result; // replay the journaled human reply
@@ -897,7 +911,7 @@ export async function runWorkflow<T = unknown>(
       reply = checkpointOptions.default ?? true;
     }
     throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
+    if (journaling) options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
     return reply;
   };
 

@@ -1,23 +1,29 @@
 /// <reference path="./dsl.d.ts" />
 // @automatalabs/workflows — the importable SDK for the AgentPrism dynamic-workflow
-// orchestrator. A THIN FACADE re-export barrel: it owns NO logic of its own, it
-// re-exports the clean public surface of the three engine packages and adds ONE
-// convenience helper (`runDynamicWorkflow`) that defaults the AgentRunner seam to the
-// ACP backend. It is SEPARATE from @automatalabs/mcp-server (the stdio MCP server) and
-// stays a PURE library — it pulls in neither @modelcontextprotocol/sdk nor zod.
+// orchestrator. A FACADE re-export barrel: it re-exports the clean public surface of
+// the three engine packages, adds the SDK-level WorkflowManager ACP-event bridge, and
+// adds ONE convenience helper (`runDynamicWorkflow`) that defaults the AgentRunner seam
+// to the ACP backend. It is SEPARATE from @automatalabs/mcp-server (the stdio MCP server)
+// and stays a PURE library — it pulls in neither @modelcontextprotocol/sdk nor zod.
 //
 // The DSL globals available INSIDE a workflow script (agent, parallel, pipeline, …) are
 // vm-realm globals, NOT importable symbols; they are documented for author IntelliSense
 // in ./dsl.d.ts (referenced above), not exported here.
 
-import { createAcpRunner } from "@automatalabs/acp-agents";
-import { parseWorkflowScript, WorkflowError, WorkflowErrorCode, WorkflowManager } from "@automatalabs/workflow-engine";
-import type { ExecOptions } from "@automatalabs/workflow-engine";
+import { ACP_CROSS_CUTTING_EVENT_NAMES, createAcpRunner } from "@automatalabs/acp-agents";
+import {
+  parseWorkflowScript,
+  WorkflowError,
+  WorkflowErrorCode,
+  WorkflowManager as EngineWorkflowManager,
+} from "@automatalabs/workflow-engine";
+import type { AcpEventListener, AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
+import type { ExecOptions, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
 import type { AgentRunner, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
-export { runWorkflow, parseWorkflowScript, WorkflowManager } from "@automatalabs/workflow-engine";
+export { runWorkflow, parseWorkflowScript } from "@automatalabs/workflow-engine";
 export type {
   WorkflowRunOptions,
   AgentOptions,
@@ -26,8 +32,11 @@ export type {
   CheckpointOptions,
   WorkflowRunResult,
   WorkflowSnapshot,
+  WorkflowPathOptions,
+  RunPersistenceOptions,
 } from "@automatalabs/workflow-engine";
 export {
+  AGENTPRISM_PERSISTENCE_ROOT_ENV,
   WorkflowError,
   WorkflowErrorCode,
   isWorkflowError,
@@ -94,6 +103,183 @@ export type {
 export type { AgentRunner, RunOptions, AgentResult, AgentUsage } from "@automatalabs/shared-types";
 export type { JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
 
+/** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */
+type ManagerAcpCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;
+const MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES =
+  ACP_CROSS_CUTTING_EVENT_NAMES satisfies readonly ManagerAcpCrossCuttingEventName[];
+type Assert<T extends true> = T;
+type IsNever<T> = [T] extends [never] ? true : false;
+type _ManagerAcpCrossCuttingEventNamesComplete = Assert<
+  IsNever<Exclude<ManagerAcpCrossCuttingEventName, (typeof MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES)[number]>>
+>;
+type _ManagerAcpCrossCuttingEventNamesExact = Assert<
+  IsNever<Exclude<(typeof MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES)[number], ManagerAcpCrossCuttingEventName>>
+>;
+
+type AcpEventBusRunner = AgentRunner & {
+  on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void;
+};
+
+interface AcpBridgeEntry {
+  refs: number;
+  unsubscribers: Array<() => void>;
+}
+
+type ContextProperty<T, K extends PropertyKey> = K extends keyof T ? T[K] : never;
+type OptionalContextProperty<T, K extends PropertyKey> = K extends keyof T ? T[K] : undefined;
+
+/** Payload of `WorkflowManager`'s `agentEvent` observer. `event` is the verbatim runner event
+ *  payload; the top-level envelope repeats the ACP context fields hosts filter on. `backend_error`
+ *  is connection-scoped in acp-agents and therefore has no session/run context to repeat. */
+type AgentEventPayloadMap = {
+  [K in AcpEventName]: {
+    name: K;
+    event: AcpRunnerEventMap[K];
+    backendId: ContextProperty<AcpRunnerEventMap[K], "backendId">;
+  } & ("sessionId" extends keyof AcpRunnerEventMap[K]
+    ? { sessionId: ContextProperty<AcpRunnerEventMap[K], "sessionId"> }
+    : { sessionId?: undefined }) & {
+      label?: OptionalContextProperty<AcpRunnerEventMap[K], "label">;
+      runId?: OptionalContextProperty<AcpRunnerEventMap[K], "runId">;
+    };
+};
+export type AgentEventPayload<K extends AcpEventName = AcpEventName> = AgentEventPayloadMap[K];
+
+/**
+ * Stateful workflow manager exported by the SDK facade. It is the workflow-engine manager plus
+ * ONE composition-root bridge for ACP-capable runners: when the injected AgentRunner also exposes
+ * the acp-agents `.on(name, listener)` bus, the manager forwards that live stream as `agentEvent`.
+ *
+ * The engine package stays backend-agnostic; this facade already owns the ACP default runner and
+ * ACP event types, so the bridge belongs here. Forwarding is OBSERVABILITY ONLY: manager
+ * `agentEvent` listeners are isolated from each other and from the run, and `dispose()` removes
+ * only the manager's runner subscriptions (runner process ownership stays with the caller).
+ */
+export class WorkflowManager extends EngineWorkflowManager {
+  private readonly acpBridges = new Map<AcpEventBusRunner, AcpBridgeEntry>();
+
+  constructor(options: WorkflowManagerOptions = {}) {
+    super(options);
+    this.acquireAcpRunnerBridge(options.agent);
+  }
+
+  override startInBackground(
+    script: string,
+    args?: unknown,
+    exec: ExecOptions = {},
+  ): { runId: string; promise: Promise<WorkflowRunResult> } {
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      const started = super.startInBackground(script, args, exec);
+      void started.promise.then(releaseBridge, releaseBridge);
+      return started;
+    } catch (error) {
+      releaseBridge();
+      throw error;
+    }
+  }
+
+  override async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      return await super.runSync(script, args, exec);
+    } finally {
+      releaseBridge();
+    }
+  }
+
+  override async resume(runId: string, exec: ExecOptions = {}): Promise<boolean> {
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      return await super.resume(runId, exec);
+    } finally {
+      releaseBridge();
+    }
+  }
+
+  /** Detach manager-owned ACP event subscriptions. The manager does NOT dispose the runner: the
+   *  caller may share one runner across managers or own its process lifetime explicitly. */
+  dispose(): void {
+    for (const bridge of this.acpBridges.values()) {
+      for (const unsubscribe of bridge.unsubscribers) unsubscribe();
+    }
+    this.acpBridges.clear();
+  }
+
+  /** Node-style alias for hosts that tear down managers through close hooks. */
+  close(): void {
+    this.dispose();
+  }
+
+  private acquireAcpRunnerBridge(agent: AgentRunner | undefined): () => void {
+    if (!isAcpEventBusRunner(agent)) return () => {};
+    let bridge = this.acpBridges.get(agent);
+    if (!bridge) {
+      bridge = {
+        refs: 0,
+        unsubscribers: [
+          agent.on("session_update", (event) => {
+            this.emit("agentEvent", toSessionUpdateAgentEventPayload(event));
+          }),
+          ...MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES.map((name) =>
+            agent.on(name, (event) => {
+              this.emit("agentEvent", toAgentEventPayload(name, event));
+            }),
+          ),
+        ],
+      };
+      this.acpBridges.set(agent, bridge);
+    }
+    bridge.refs++;
+
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      const current = this.acpBridges.get(agent);
+      if (current !== bridge) return;
+      current.refs--;
+      if (current.refs > 0) return;
+      for (const unsubscribe of current.unsubscribers) unsubscribe();
+      this.acpBridges.delete(agent);
+    };
+  }
+}
+
+function isAcpEventBusRunner(agent: AgentRunner | undefined): agent is AcpEventBusRunner {
+  return typeof (agent as Partial<Record<"on", unknown>> | undefined)?.on === "function";
+}
+
+function toSessionUpdateAgentEventPayload(
+  event: AcpRunnerEventMap["session_update"],
+): AgentEventPayload<AcpUpdateKind> {
+  const name = event.update.sessionUpdate;
+  return toAgentEventPayload(name, {
+    ...event.update,
+    sessionId: event.sessionId,
+    backendId: event.backendId,
+    label: event.label,
+    runId: event.runId,
+  } as AcpRunnerEventMap[typeof name]);
+}
+
+function toAgentEventPayload<K extends AcpEventName>(name: K, event: AcpRunnerEventMap[K]): AgentEventPayload<K> {
+  const context = event as Partial<{
+    backendId: string;
+    sessionId: string;
+    label: string;
+    runId: string;
+  }>;
+  return {
+    name,
+    event,
+    backendId: context.backendId,
+    ...(context.sessionId !== undefined ? { sessionId: context.sessionId } : {}),
+    ...(context.label !== undefined ? { label: context.label } : {}),
+    ...(context.runId !== undefined ? { runId: context.runId } : {}),
+  } as AgentEventPayload<K>;
+}
+
 /**
  * Approval policy for SCRIPT-DECLARED custom ACP backends (`meta.backends`). Script backends
  * spawn arbitrary commands on this machine, so they are INERT unless the embedder approves
@@ -150,7 +336,12 @@ export async function runDynamicWorkflow(
   if (declared && Object.keys(declared).length > 0) {
     exec = { ...(exec ?? {}), scriptBackends: await approveScriptBackends(declared, opts.allowScriptBackends) };
   }
-  return new WorkflowManager({ agent: opts.runner ?? createAcpRunner() }).runSync(script, opts.args, exec);
+  const manager = new WorkflowManager({ agent: opts.runner ?? createAcpRunner() });
+  try {
+    return await manager.runSync(script, opts.args, exec);
+  } finally {
+    manager.dispose();
+  }
 }
 
 /** Resolve the embedder's approval policy over the declared backends; throw with guidance when

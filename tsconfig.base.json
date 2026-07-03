@@ -8,6 +8,7 @@
     "declaration": true,
     "declarationMap": true,
     "composite": true,
+    "noImplicitOverride": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true

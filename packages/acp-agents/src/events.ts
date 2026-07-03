@@ -93,6 +93,27 @@ export type AcpRunnerEventMap = AcpSessionUpdateEvents & {
 export type AcpEventName = keyof AcpRunnerEventMap;
 export type AcpEventListener<K extends AcpEventName> = (event: AcpRunnerEventMap[K]) => void;
 
+/** Non-session/update runner events. Kept exact by the type-level guard below so a new
+ *  cross-cutting event cannot be added to AcpRunnerEventMap without updating forwarders. */
+export const ACP_CROSS_CUTTING_EVENT_NAMES = [
+  "permission_pending",
+  "permission_request",
+  "raw_message",
+  "session_open",
+  "session_close",
+  "backend_error",
+] as const satisfies readonly AcpCrossCuttingEventName[];
+
+type AcpCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;
+type Assert<T extends true> = T;
+type IsNever<T> = [T] extends [never] ? true : false;
+type _AcpCrossCuttingEventNamesComplete = Assert<
+  IsNever<Exclude<AcpCrossCuttingEventName, (typeof ACP_CROSS_CUTTING_EVENT_NAMES)[number]>>
+>;
+type _AcpCrossCuttingEventNamesExact = Assert<
+  IsNever<Exclude<(typeof ACP_CROSS_CUTTING_EVENT_NAMES)[number], AcpCrossCuttingEventName>>
+>;
+
 /** Internal emit boundary handed from the runner down through the pool to each connection. */
 export interface AcpEventSink {
   <K extends AcpEventName>(name: K, event: AcpRunnerEventMap[K]): void;

@@ -20,7 +20,7 @@ import type {
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
 import { preview, type WorkflowSnapshot } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -29,6 +29,7 @@ import {
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
+import { workflowHomeDir } from "./workflow-paths.js";
 import { type EngineRunResult, parseWorkflowScript, runWorkflow } from "./workflow.js";
 
 export interface ManagedRun {
@@ -47,6 +48,11 @@ export interface ManagedRun {
   meta?: WorkflowMeta;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
+  /**
+   * False for host-owned transcript storage. The run stays fully tracked in memory,
+   * but the engine writes no run-state/log journal files and resume is forbidden.
+   */
+  journaling: boolean;
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
   /**
@@ -68,6 +74,12 @@ export interface ExecOptions {
   agent?: AgentRunner;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
+  /**
+   * Whether THIS run writes/reads the engine persistence journal. Default is the
+   * manager setting. When false, no run-state/log files are written and resume
+   * rejects with "journaling disabled for this run".
+   */
+  journaling?: boolean;
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -116,8 +128,20 @@ export interface WorkflowManagerOptions {
   defaultAgentRetries?: number;
   /** Override the directory scanned for `agentType` definitions (defaults to AGENTS_DIR). */
   agentsDir?: string;
+  /**
+   * Absolute workflow persistence root. Precedence is this explicit option >
+   * AGENTPRISM_PERSISTENCE_ROOT > `~/.agentprism/workflows`.
+   */
+  persistenceRoot?: string;
+  /** Default journaling policy for runs created by this manager. Default true. */
+  journaling?: boolean;
 }
 
+/**
+ * Stateful workflow run manager. Events are OBSERVABILITY ONLY: listeners are
+ * best-effort observers, isolated from sibling listeners and from run execution. A
+ * throwing host observer never fails, pauses, aborts, or masks cleanup for the run.
+ */
 export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
   private persistence: RunPersistence;
@@ -132,6 +156,8 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private agentsDir?: string;
+  private persistenceRoot: string;
+  private journaling: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -144,8 +170,24 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.agentsDir = options.agentsDir;
-    this.persistence = createRunPersistence(this.cwd);
+    this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
+    this.journaling = options.journaling ?? true;
+    this.persistence = createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
     this.recoverStaleRuns();
+  }
+
+  override emit(eventName: string | symbol, ...args: unknown[]): boolean {
+    const listeners = this.rawListeners(eventName);
+    for (const listener of listeners) {
+      try {
+        // rawListeners() returns EventEmitter's once-wrappers. Calling the wrapper
+        // preserves once() self-removal while isolating each observer's throw.
+        Reflect.apply(listener, this, args);
+      } catch {
+        // Manager events are live observability; bad listeners cannot perturb runs.
+      }
+    }
+    return listeners.length > 0;
   }
 
   /** Bind the manager to the current session, so new runs are tagged with it and
@@ -210,6 +252,7 @@ export class WorkflowManager extends EventEmitter {
     const runId = generateRunId();
     const controller = new AbortController();
     const parsed = parseWorkflowScript(script);
+    const journaling = this.resolveJournaling(exec);
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
 
@@ -233,27 +276,30 @@ export class WorkflowManager extends EventEmitter {
       args,
       meta: parsed.meta,
       journal: [],
+      journaling,
       background: true,
-      lease,
+      lease: lease ?? undefined,
     };
 
     this.runs.set(runId, managed);
 
     try {
       // Persist initial state
-      this.persistence.save({
-        runId,
-        workflowName: parsed.meta.name,
-        script,
-        args,
-        sessionId: this.sessionId,
-        status: "running",
-        phases: managed.snapshot.phases,
-        agents: [],
-        logs: [],
-        startedAt: managed.startedAt.toISOString(),
-        updatedAt: managed.startedAt.toISOString(),
-      });
+      if (managed.journaling) {
+        this.persistence.save({
+          runId,
+          workflowName: parsed.meta.name,
+          script,
+          args,
+          sessionId: this.sessionId,
+          status: "running",
+          phases: managed.snapshot.phases,
+          agents: [],
+          logs: [],
+          startedAt: managed.startedAt.toISOString(),
+          updatedAt: managed.startedAt.toISOString(),
+        });
+      }
     } catch (err) {
       this.releaseRunLease(managed);
       this.runs.delete(runId);
@@ -282,7 +328,7 @@ export class WorkflowManager extends EventEmitter {
    * so the MCP shell can project `run.status` without catching.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args);
+    const managed = this.createManaged(script, args, this.resolveJournaling(exec));
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -296,7 +342,7 @@ export class WorkflowManager extends EventEmitter {
       const wfError =
         error instanceof WorkflowError
           ? error
-          : new WorkflowError(error instanceof Error ? error.message : String(error), WorkflowErrorCode.UNKNOWN, {
+          : new WorkflowError(errorMessage(error), WorkflowErrorCode.UNKNOWN, {
               recoverable: false,
             });
       // executeRun's own catch already settled status + persisted + released the
@@ -313,7 +359,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown): ManagedRun {
+  private createManaged(script: string, args: unknown | undefined, journaling: boolean): ManagedRun {
     const parsed = parseWorkflowScript(script);
     return {
       runId: generateRunId(),
@@ -335,8 +381,13 @@ export class WorkflowManager extends EventEmitter {
       args,
       meta: parsed.meta,
       journal: [],
+      journaling,
       background: false,
     };
+  }
+
+  private resolveJournaling(exec: ExecOptions): boolean {
+    return exec.journaling ?? this.journaling;
   }
 
   /**
@@ -420,6 +471,11 @@ export class WorkflowManager extends EventEmitter {
       else hostSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
     }
     try {
+      if (!managed.journaling && resumeJournal) {
+        throw new WorkflowError("journaling disabled for this run", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+          recoverable: false,
+        });
+      }
       // Resolve the injected agent backend (per-run override > constructor). The
       // engine REQUIRES an AgentRunner and never constructs one.
       const agent = this.resolveAgent(exec);
@@ -438,15 +494,20 @@ export class WorkflowManager extends EventEmitter {
         confirm,
         scriptBackends,
         loadSavedWorkflow: this.loadSavedWorkflow,
-        resumeJournal,
-        resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        journaling: managed.journaling,
+        persistLogs: managed.journaling,
+        persistenceRoot: this.persistenceRoot,
+        resumeJournal: managed.journaling ? resumeJournal : undefined,
+        resumeFromRunId: managed.journaling && resumeJournal ? managed.runId : undefined,
         runId: managed.runId,
-        onAgentJournal: (entry) => {
-          // Append (crash-safe-ish): keep the latest entry per index, then persist.
-          managed.journal = managed.journal.filter((e) => e.index !== entry.index);
-          managed.journal.push(entry);
-          this.persistRun(managed);
-        },
+        onAgentJournal: managed.journaling
+          ? (entry) => {
+              // Append (crash-safe-ish): keep the latest entry per index, then persist.
+              managed.journal = managed.journal.filter((e) => e.index !== entry.index);
+              managed.journal.push(entry);
+              this.persistRun(managed);
+            }
+          : undefined,
         onLog: (message) => {
           managed.snapshot.logs.push(message);
           this.emit("log", { runId: managed.runId, message });
@@ -520,7 +581,7 @@ export class WorkflowManager extends EventEmitter {
         error instanceof WorkflowError
           ? error
           : new WorkflowError(
-              error instanceof Error ? error.message : String(error),
+              errorMessage(error),
               WorkflowErrorCode.WORKFLOW_ABORTED,
               { recoverable: true },
             );
@@ -573,6 +634,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private persistRun(managed: ManagedRun) {
+    if (!managed.journaling) return;
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -649,6 +711,8 @@ export class WorkflowManager extends EventEmitter {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
+    if (active?.journaling === false) throw new Error("journaling disabled for this run");
+    if (!this.resolveJournaling(exec)) throw new Error("journaling disabled for this run");
     if (active?.status === "running") return false;
     if (active?.status === "aborted") return false;
 
@@ -685,6 +749,7 @@ export class WorkflowManager extends EventEmitter {
       args: persisted.args,
       meta,
       journal: persisted.journal ?? [],
+      journaling: true,
       background: true,
       lease,
     };

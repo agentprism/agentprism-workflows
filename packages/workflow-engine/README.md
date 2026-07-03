@@ -118,6 +118,15 @@ const again = await runWorkflow(script, { agent: myRunner, args, resumeJournal, 
 are exported as `DEFAULT_TOKEN_BUDGET`, `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`,
 `MAX_AGENT_RETRIES`, `DEFAULT_AGENT_TIMEOUT_MS`.
 
+`WorkflowManager` persists run state under `~/.agentprism/workflows` by default. Hosts can
+set `new WorkflowManager({ persistenceRoot: "/absolute/data/root" })`; when omitted,
+`AGENTPRISM_PERSISTENCE_ROOT` is used, then the homedir default. The root must be absolute.
+Set `journaling: false` on the manager or per `runSync`/`startInBackground` call when the
+host owns transcript storage. That mode writes no engine run-state/log journal files and
+otherwise preserves run results, events, retries, status transitions, cross-process leases,
+and listing of persisted runs written by other executions; resume is intentionally unavailable
+and rejects with `journaling disabled for this run` for those runs.
+
 ## Key exports
 
 From `@automatalabs/workflow-engine` (see `src/index.ts`):

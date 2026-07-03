@@ -214,6 +214,18 @@ above. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), and per-agent timeout/retry
 defaults.
 
+Manager events are Node `EventEmitter` notifications: `agentStart`, `agentEnd`, `agentHistory`,
+`tokenUsage`, `log`, `phase`, `complete`, `paused`, `resumed`, `stopped`, `error`, and
+`agentEvent`. `agentEvent` forwards the live ACP stream from an ACP-capable runner with `name`,
+`event`, and the runner context fields (`runId`, `label`, `sessionId`, `backendId`) when the event
+carries them; `backend_error` is connection-scoped and carries `backendId` only. ACP
+`session/update` traffic is emitted once under its inner discriminant name, while
+permission/session/raw/backend events keep their runner names.
+
+```ts
+manager.on("agentEvent", ({ runId, label, name }) => console.error(runId, label, name));
+```
+
 ### d) Bring your own backend — implement the `AgentRunner` seam
 
 `AgentRunner` is the single, frozen coupling point between the engine and any backend. Implement
@@ -296,10 +308,11 @@ event (except `backend_error`) carries `{ sessionId, backendId, label?, runId? }
 **Best-effort.** Listeners are observers: a throwing listener is isolated and never breaks the run,
 the update drain, or sibling listeners.
 
-**With `runDynamicWorkflow` / `WorkflowManager`.** Construct the runner yourself, subscribe, then
-inject it: `runDynamicWorkflow(script, { runner })` or `new WorkflowManager({ agent: runner })`.
-Every `agent()` call in the script then streams through your listeners (filter by `label` to tell
-agents apart).
+**With `runDynamicWorkflow` / `WorkflowManager`.** Subscribe at the manager layer:
+`manager.on("agentEvent", ({ runId, label, name, event }) => …)`. Every `agent()` call in the
+script then streams live ACP events through the manager; ACP `session/update` traffic is forwarded
+once under `name = event.sessionUpdate`, so hosts do not receive both the catch-all and the
+per-discriminant runner event.
 
 ---
 
@@ -417,9 +430,13 @@ TypedEventEmitter,            // the tiny typed emitter backing runner.on(...)
 // ── Errors ──
 WorkflowError, WorkflowErrorCode, isWorkflowError, isProviderUsageLimit,
 
+// ── Persistence paths ──
+AGENTPRISM_PERSISTENCE_ROOT_ENV,
+
 // ── Types ──
 RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
+WorkflowPathOptions, RunPersistenceOptions,
 AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
 ClientHandlers, FsHandlers, TerminalHandlers, AcpSessionContext, NegotiatedCapabilities,
