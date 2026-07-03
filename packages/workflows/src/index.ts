@@ -301,6 +301,12 @@ export interface RunDynamicWorkflowOptions {
    * Omitted => defaults to the ACP backend via `createAcpRunner()`.
    */
   runner?: AgentRunner;
+  /**
+   * Base working directory for the run (e.g. the project root): every subagent ACP session
+   * runs here (unless the agent sets its own `cwd` or worktree isolation), worktrees branch
+   * from it, and agentType definitions are scanned from it. Omitted => `process.cwd()`.
+   */
+  cwd?: string;
   /** The `args` value handed to the workflow script's vm-realm `args` global. */
   args?: unknown;
   /** Per-execution options forwarded to `WorkflowManager.runSync` (timeouts, signal, budget, …). */
@@ -336,7 +342,7 @@ export async function runDynamicWorkflow(
   if (declared && Object.keys(declared).length > 0) {
     exec = { ...(exec ?? {}), scriptBackends: await approveScriptBackends(declared, opts.allowScriptBackends) };
   }
-  const manager = new WorkflowManager({ agent: opts.runner ?? createAcpRunner() });
+  const manager = new WorkflowManager({ agent: opts.runner ?? createAcpRunner(), cwd: opts.cwd });
   try {
     return await manager.runSync(script, opts.args, exec);
   } finally {
