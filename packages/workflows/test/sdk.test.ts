@@ -210,6 +210,20 @@ test("runDynamicWorkflow runs a 1-agent script through a stub runner", async () 
   assert.equal(result.result, "stub:hello");
 });
 
+test("runDynamicWorkflow threads opts.cwd through to every agent session", async () => {
+  const runCwd = tmpdir();
+  let captured: string | undefined;
+  const capturing = makeRunner((_prompt, options) => {
+    captured = options.cwd;
+    return "ok";
+  });
+
+  const result = await runDynamicWorkflow(ONE_AGENT_SCRIPT, { runner: capturing, cwd: runCwd });
+
+  assert.equal(result.status, "completed");
+  assert.equal(captured, runCwd);
+});
+
 test("runDynamicWorkflow detaches its one-off manager agentEvent bridge", async () => {
   const runner = new EventedRunner();
   const result = await runDynamicWorkflow(ONE_AGENT_SCRIPT, { runner: eventedAgent(runner) });

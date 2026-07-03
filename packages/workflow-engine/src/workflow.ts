@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { resolve as resolvePath } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -192,6 +193,14 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
+  /**
+   * Working directory for this agent's ACP session. A relative path resolves against the
+   * run's base cwd (WorkflowRunOptions.cwd). Worktree isolation overrides it (the worktree
+   * IS the agent's cwd). ADDITIVE like mcpServers: it wires the agent's environment, not
+   * the logical call, so it is intentionally NOT part of the resume identity hash
+   * (hashAgentCall).
+   */
+  cwd?: string;
   /**
    * Client-provided MCP servers attached to this agent's session (threaded into the runner,
    * which sends them at ACP `session/new { mcpServers }`). ADDITIVE: it wires tools, not the
@@ -492,13 +501,24 @@ export async function runWorkflow<T = unknown>(
       // Note: passing { isolation: undefined } falls through ?? to the def's value — there
       // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
       // or override with a def that has no isolation field if opt-out is needed.
+      if (agentOptions.cwd !== undefined && typeof agentOptions.cwd !== "string") {
+        throw new WorkflowError(
+          `agent "${label}": options.cwd must be a string`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false, agentLabel: label },
+        );
+      }
       let worktree: Worktree | undefined;
       const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
         if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
       }
-      const runCwd = worktree?.isolated ? worktree.cwd : undefined;
+      // Session cwd precedence: worktree isolation > per-agent options.cwd (relative
+      // resolves against the run's base cwd) > the run's base cwd. Threading baseCwd —
+      // instead of leaving the runner to fall back to the HOST's process.cwd() — is what
+      // makes WorkflowRunOptions.cwd actually reach the subagent sessions.
+      const runCwd = worktree?.isolated ? worktree.cwd : resolvePath(baseCwd, agentOptions.cwd ?? ".");
 
       // Captured from the subagent's real session usage; falls back to an
       // estimate when the provider reports no usage (total === 0). Usage is reset
