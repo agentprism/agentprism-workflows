@@ -1,5 +1,18 @@
 # @automatalabs/workflows
 
+## 0.14.0
+
+### Minor Changes
+
+- f1a42fb: Add driven ACP session lifecycle wrappers for listing, deleting, loading, and resuming sessions. Reattached sessions return live `InteractiveSession`s, accumulate replayed load history, adopt response modes/config options, and route permissions through the normal session router.
+
+  Guard raw passthrough for session-stateful methods that would create or reopen unregistered sessions (`session/new`, `session/load`, `session/resume`, `session/fork`) and add the protocol coverage tier `guarded`.
+
+### Patch Changes
+
+- Updated dependencies [f1a42fb]
+  - @automatalabs/acp-agents@0.14.0
+
 ## 0.13.0
 
 ### Minor Changes
