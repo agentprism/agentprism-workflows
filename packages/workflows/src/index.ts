@@ -57,6 +57,10 @@ export {
   ClaudeBackend,
   CodexBackend,
   CustomAcpBackend,
+  AGENT_METHODS,
+  CLIENT_METHODS,
+  AGENT_METHOD_COVERAGE,
+  CLIENT_METHOD_COVERAGE,
   clientCapabilitiesFor,
   adaptPromptContent,
   resolveBackendRegistry,
@@ -78,6 +82,14 @@ export type {
   AcpSessionContext,
   NegotiatedCapabilities,
   PermissionResolver,
+  AgentRequestMethod,
+  AgentRequestParamsByMethod,
+  AgentRequestResponsesByMethod,
+  AgentNotificationMethod,
+  AgentNotificationParamsByMethod,
+  SendRequestOptions,
+  AgentMethodCoverage,
+  ClientMethodCoverage,
 } from "@automatalabs/acp-agents";
 
 // ── Live ACP events: `createAcpRunner().on("tool_call", evt => …)` to listen in on the

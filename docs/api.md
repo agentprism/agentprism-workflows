@@ -165,6 +165,23 @@ One agent call per invocation; returns the assistant text, or the **validated ob
 
 **Model specs**: `provider/modelId`, bare id, or tier word; a trailing bracket drives sibling config options — `gpt-5.1-codex[high]` sets `reasoning_effort`, `[high fast]` also enables Fast mode (boolean-typed or legacy select shape — both supported; the client advertises `session.configOptions.boolean`). Routing: `claude|opus|sonnet|haiku` → Claude; `gpt|codex|o3|o4` → Codex; registered custom-backend names route to their process. An unmatched model/modifier fires `onModelFallback` (observable, never a throw) and the session default runs.
 
+### Protocol passthrough & coverage
+
+`PooledConnection` and `InteractiveSession` expose typed raw ACP `request()` / `notify()` escape hatches for spec methods without named wrappers:
+
+```ts
+import { AGENT_METHODS } from "@automatalabs/workflows";
+
+await session.request(AGENT_METHODS.session_set_mode, {
+  sessionId: session.sessionId,
+  modeId: "plan",
+});
+```
+
+Prefer named wrappers (`prompt()`, `setSessionConfigOption()`, `openSession()`, etc.) when they exist; they preserve engine semantics like drain accumulation and usage recording, while raw `session/prompt` bypasses them.
+
+`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
+
 ### <a name="runner-events"></a>Events (`runner.on(name, listener)`)
 
 Typed bus; returns an unsubscribe thunk. Names are the ACP `sessionUpdate` discriminants verbatim (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …) plus cross-cutting events: `session_update` (catch-all), `permission_pending`, `permission_request`, `raw_message`, `session_open`, `session_close`, `backend_error`. Every payload carries `AcpEventContext`: `{ sessionId, backendId, label?, runId? }` — the engine stamps `runId`/`label` on every workflow agent, so multiplexed streams filter cleanly.

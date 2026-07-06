@@ -33,6 +33,11 @@ import {
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type ContentBlock,
+  type AgentNotificationMethod,
+  type AgentNotificationParamsByMethod,
+  type AgentRequestMethod,
+  type AgentRequestParamsByMethod,
+  type AgentRequestResponsesByMethod,
   type KillTerminalRequest,
   type KillTerminalResponse,
   type NewSessionRequest,
@@ -44,6 +49,7 @@ import {
   type ReleaseTerminalResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type SendRequestOptions,
   type SessionConfigOption,
   type SessionConfigSelectOption,
   type SessionConfigSelectOptions,
@@ -801,6 +807,35 @@ export class PooledConnection {
   /** session/set_config_option on this connection, raced against process death. */
   setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_set_config_option, request));
+  }
+
+  /** RAW protocol escape hatch: this makes the full ACP spec reachable (for example
+   *  session/set_mode, session/fork, authenticate). Prefer the named wrappers when they exist
+   *  because they preserve engine semantics such as accumulation/drain and usage recording;
+   *  calling session/prompt here bypasses those paths. */
+  request<Method extends AgentRequestMethod>(
+    method: Method,
+    params: AgentRequestParamsByMethod[Method],
+    options?: SendRequestOptions,
+  ): Promise<AgentRequestResponsesByMethod[Method]>;
+  request<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+    options?: SendRequestOptions,
+  ): Promise<Response>;
+  request(method: string, params?: unknown, options?: SendRequestOptions): Promise<unknown> {
+    return this.race(this.connection.agent.request(method, params, options));
+  }
+
+  /** RAW protocol notification escape hatch. Prefer named wrappers when they exist because
+   *  wrapper paths carry engine-specific lifecycle semantics that raw protocol calls do not. */
+  notify<Method extends AgentNotificationMethod>(
+    method: Method,
+    params: AgentNotificationParamsByMethod[Method],
+  ): Promise<void>;
+  notify<Params = unknown>(method: string, params?: Params): Promise<void>;
+  notify(method: string, params?: unknown): Promise<void> {
+    return this.race(this.connection.agent.notify(method, params));
   }
 
   /** Best-effort ACP cancel for one session (wired to opts.signal). The PROCESS stays pooled. */
