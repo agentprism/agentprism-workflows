@@ -1,5 +1,22 @@
 # @automatalabs/workflows
 
+## 0.13.0
+
+### Minor Changes
+
+- 8fea18f: Promote ACP session modes to a driven public surface. Runs and interactive sessions can now request strict agent-advertised modes, mode catalogs stay visible and live-updated, and unsupported or failed mode switches raise non-recoverable validation errors before prompting.
+
+  When a mode is explicitly requested without a permission resolver, the headless permission fallback now defaults to deny so confinement is not bypassed by automatic escalation approval.
+
+  Details: `RunOptions.mode` / `AgentOptions.mode` / `InteractiveSessionOptions.mode`, `SessionHandle.modes`/`setMode()`, `InteractiveSession.modes`/`setMode()`, `ToolPolicy.defaultOutcome`, live `current_mode_update` tracking, and `session/set_mode` flipped to "driven" in the coverage manifest. Resume compatibility: `mode` joins the journal identity hash ONLY when set, so journals written before session modes existed keep replaying for mode-less calls.
+
+### Patch Changes
+
+- Updated dependencies [8fea18f]
+  - @automatalabs/shared-types@0.9.0
+  - @automatalabs/acp-agents@0.13.0
+  - @automatalabs/workflow-engine@0.8.0
+
 ## 0.12.0
 
 ### Minor Changes
