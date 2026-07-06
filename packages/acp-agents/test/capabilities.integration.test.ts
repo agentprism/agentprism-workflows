@@ -1,6 +1,6 @@
 // End-to-end ACP capability negotiation against a MOCK ACP agent whose initialize response is
 // scripted per test (test/fixtures/fake-acp-agent.mjs honors scenario.initialize). Proves the real
-// ClientSideConnection negotiates the handshake and then GATES what it sends on what the agent
+// fluent client() connection negotiates the handshake and then GATES what it sends on what the agent
 // advertised: the @automatalabs/codex-acp custom `_meta` keys (session/new instruction overrides +
 // the turn-level outputSchema forward), the MCP transports, and the protocol version — while a
 // legacy agent that advertises nothing keeps today's send-everything behavior.

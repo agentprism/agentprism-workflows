@@ -2,7 +2,7 @@
 //
 // No network and no real Claude/Codex: the runner spawns a fake ACP server (test/fixtures/
 // fake-acp-agent.mjs) via the AGENTPRISM_*_ACP_CMD/ARGS spawn override. That fake speaks REAL
-// ACP over stdio, so the runner's real ClientSideConnection, draining, permission/usage/
+// ACP over stdio, so the runner's real fluent client() connection, draining, permission/usage/
 // structured-output plumbing, and stopReason/throw mapping are all exercised; only the agent
 // on the far end is faked. The fake appends every observed ACP request to a JSONL log so we
 // can assert exactly what crossed the wire (clientInfo, _meta, permission outcomes).

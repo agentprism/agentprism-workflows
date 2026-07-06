@@ -46,7 +46,7 @@ export interface AgentRunner {
    *      AGENT_EMPTY_OUTPUT     (recoverable)      no assistant text on a no-schema call
    *      SCHEMA_NONCOMPLIANCE   (non-recoverable)  schema never satisfied after the ladder
    *      PROVIDER_USAGE_LIMIT   (non-recoverable)  quota/rate wall -> engine PAUSES, carries resetHint
-   *    (AGENT_TIMEOUT + WORKFLOW_ABORTED are added by the ENGINE, not the runner.)
+   *    (AGENT_TIMEOUT + WORKFLOW_ABORTED + SCRIPT_ERROR are added by the ENGINE, not the runner.)
    *
    *  - TIMEOUT and ABORT are the ENGINE's responsibility, not the runner's:
    *    withTimeout (:464) races a setTimeout throwing AGENT_TIMEOUT; the engine passes

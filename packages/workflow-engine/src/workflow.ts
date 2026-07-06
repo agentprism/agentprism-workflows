@@ -24,9 +24,10 @@ import {
   resolveAgentType,
 } from "./agent-registry.js";
 import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
-import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { errorMessage, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { registerRunTripwire } from "./rejection-tripwire.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 // WorkflowMeta / WorkflowMetaPhase / JournalEntry / WorkflowRunResult are the shared,
@@ -391,8 +392,15 @@ export async function runWorkflow<T = unknown>(
     remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
   });
 
+  // Run-scoped fault channel: when the rejection tripwire fires (a promise the SCRIPT
+  // floated rejected with nobody listening), the run is already failing with SCRIPT_ERROR —
+  // this controller cancels the run's in-flight agents so the zombie script stops spending
+  // tokens. Combined with the caller's signal so both channels cancel the same work.
+  const faults = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, faults.signal]) : faults.signal;
+
   const throwIfAborted = () => {
-    if (options.signal?.aborted) {
+    if (signal.aborted) {
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
   };
@@ -551,7 +559,7 @@ export async function runWorkflow<T = unknown>(
               agentRunner.run(prompt, {
                 label,
                 schema: agentOptions.schema,
-                signal: options.signal,
+                signal,
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
                 tier: agentOptions.tier,
@@ -610,7 +618,7 @@ export async function runWorkflow<T = unknown>(
             });
             return result;
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (signal.aborted) throw error;
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
@@ -663,7 +671,7 @@ export async function runWorkflow<T = unknown>(
         try {
           return await thunk();
         } catch (error) {
-          if (options.signal?.aborted) throw error;
+          if (signal.aborted) throw error;
           const workflowError = wrapError(error);
           // Non-recoverable failures (token budget / agent limit exhausted) must
           // halt the whole run, exactly like a directly-awaited agent() — not be
@@ -694,7 +702,7 @@ export async function runWorkflow<T = unknown>(
             value = await stage(value, item, index);
             throwIfAborted();
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (signal.aborted) throw error;
             const workflowError = wrapError(error);
             // Non-recoverable failures halt the whole run (see parallel()).
             if (!workflowError.recoverable) throw workflowError;
@@ -726,6 +734,9 @@ export async function runWorkflow<T = unknown>(
         // approves it, and only the composition root can).
         ...options,
         args: childArgs,
+        // The COMBINED signal, so a parent-side fault/abort cancels the child's agents too
+        // (the child layers its own fault controller on top of this).
+        signal,
         sharedRuntime: shared,
         // A nested run is its own script; never reuse the parent's resume journal.
         resumeJournal: undefined,
@@ -935,18 +946,32 @@ export async function runWorkflow<T = unknown>(
     return reply;
   };
 
+  // Adopt every engine-returned promise into the SCRIPT's realm at the context boundary.
+  // This is what makes the rejection tripwire's realm-identity attribution complete: the
+  // script can only float (a) promises it created itself — natively realm-owned — or
+  // (b) promises these globals returned, plus .then() chains off either — realm-owned via
+  // this adoption (species lookup follows the receiver's realm constructor). Bonus: inside
+  // the script, `agent(...) instanceof Promise` is now true (host promises weren't).
+  // `realmPromiseCtor` is assigned right after createContext(), before any script runs.
+  let realmPromiseCtor: PromiseConstructor | undefined;
+  const tracked = <F extends (...args: never[]) => unknown>(fn: F): F =>
+    ((...args: never[]) => {
+      const out = fn(...args);
+      return out instanceof Promise && realmPromiseCtor ? realmPromiseCtor.resolve(out) : out;
+    }) as F;
+
   const context = vm.createContext({
-    agent,
-    parallel,
-    pipeline,
-    workflow: workflowFn,
-    verify,
-    judgePanel,
-    loopUntilDry,
-    completenessCheck,
-    retry,
-    gate,
-    checkpoint,
+    agent: tracked(agent),
+    parallel: tracked(parallel),
+    pipeline: tracked(pipeline),
+    workflow: tracked(workflowFn),
+    verify: tracked(verify),
+    judgePanel: tracked(judgePanel),
+    loopUntilDry: tracked(loopUntilDry),
+    completenessCheck: tracked(completenessCheck),
+    retry: tracked(retry),
+    gate: tracked(gate),
+    checkpoint: tracked(checkpoint),
     log,
     phase,
     args: options.args,
@@ -965,8 +990,35 @@ export async function runWorkflow<T = unknown>(
     // neutered in-realm by DETERMINISM_PRELUDE below.
   });
 
+  realmPromiseCtor = new vm.Script("Promise").runInContext(context) as PromiseConstructor;
+  const tripwire = registerRunTripwire({
+    realmPromise: realmPromiseCtor,
+    // Cancel in-flight agents so a zombie script (still unwinding after the run already
+    // failed with SCRIPT_ERROR) stops spending tokens. This is the FAULT channel, not the
+    // caller's abort — the manager still classifies the run by the error it receives.
+    onTrip: () => faults.abort(),
+  });
+
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
-  const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+  let result: unknown;
+  try {
+    const scriptPromise = new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(
+      context,
+    ) as Promise<unknown>;
+    // If the tripwire fires while the script is still running, the run fails NOW with
+    // SCRIPT_ERROR; the losing scriptPromise keeps its race handlers, so its own eventual
+    // rejection (e.g. WORKFLOW_ABORTED from the fault-channel cancel) never floats.
+    result = await Promise.race([scriptPromise, tripwire.tripped]);
+    await tripwire.drain();
+  } catch (error) {
+    // A WorkflowError crossing the script boundary keeps its classification (abort, budget,
+    // usage limit, tripwire). Anything else IS the script crashing — label it SCRIPT_ERROR,
+    // never WORKFLOW_ABORTED (nobody cancelled anything).
+    if (error instanceof WorkflowError) throw error;
+    throw new WorkflowError(errorMessage(error), WorkflowErrorCode.SCRIPT_ERROR, { recoverable: false });
+  } finally {
+    tripwire.retire();
+  }
 
   // Persist logs
   const logFile = logger.persist();

@@ -173,7 +173,10 @@ export class WorkflowManager extends EventEmitter {
     this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
     this.journaling = options.journaling ?? true;
     this.persistence = createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
-    this.recoverStaleRuns();
+    // Stale-run recovery mutates the PERSISTED run store, so it is gated on this manager's
+    // journaling default: a `journaling: false` manager (host keeps its own transcript/audit
+    // store) must never rewrite run state that belongs to journaling processes.
+    if (this.journaling) this.recoverStaleRuns();
   }
 
   override emit(eventName: string | symbol, ...args: unknown[]): boolean {
@@ -584,14 +587,14 @@ export class WorkflowManager extends EventEmitter {
 
       return result;
     } catch (error) {
+      // The engine wraps every fault that crosses the script boundary as a WorkflowError
+      // (script crashes are SCRIPT_ERROR), so a bare error HERE is manager/host-level
+      // (persistence, fs). Label it UNKNOWN — never WORKFLOW_ABORTED, which is reserved
+      // for actual cancellation.
       const workflowError =
         error instanceof WorkflowError
           ? error
-          : new WorkflowError(
-              errorMessage(error),
-              WorkflowErrorCode.WORKFLOW_ABORTED,
-              { recoverable: true },
-            );
+          : new WorkflowError(errorMessage(error), WorkflowErrorCode.UNKNOWN, { recoverable: false });
 
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;

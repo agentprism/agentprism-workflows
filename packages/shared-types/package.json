@@ -2,6 +2,9 @@
   "name": "@automatalabs/shared-types",
   "version": "0.7.0",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/VikashLoomba/agentprism-workflows.git",

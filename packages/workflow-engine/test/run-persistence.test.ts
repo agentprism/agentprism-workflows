@@ -854,6 +854,26 @@ test(
 );
 
 test(
+  "WorkflowManager journaling:false never touches persisted run state on construction",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "stale",
+      workflowName: "w",
+      status: "running",
+      script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
+      phases: [],
+      agents: [],
+      logs: [],
+    } as PersistedRunState);
+    // A non-journaling manager (the host keeps its own transcript store) must not rewrite
+    // run state that belongs to journaling processes — stale-run recovery is gated off.
+    new WorkflowManager({ cwd, journaling: false });
+    assert.equal(rp.load("stale")?.status, "running", "journaling:false leaves persisted runs untouched");
+  }),
+);
+
+test(
   "WorkflowManager journaling:false writes no journal files and rejects resume clearly",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({

@@ -16,19 +16,20 @@
 // per-session accumulator (SessionState) by `sessionId`.
 //
 // Draining: ACP delivers a prompt turn as session/update notifications followed by the
-// session/prompt response, in wire order on one stream. Our Client handlers are synchronous
-// (they only push into the routed session's arrays), so by the time `rpc.prompt(...)` resolves,
-// every update for THAT session's turn has already been folded into its accumulator — even while
-// other sessions' updates interleave on the same wire.
+// session/prompt response, in wire order on one stream. Our client handlers are synchronous
+// (they only push into the routed session's arrays), so by the time the session/prompt request
+// resolves, every update for THAT session's turn has already been folded into its accumulator —
+// even while other sessions' updates interleave on the same wire.
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import {
-  ClientSideConnection,
+  AGENT_METHODS,
+  client,
   CLIENT_METHODS,
   ndJsonStream,
   PROTOCOL_VERSION,
   RequestError,
-  type Client,
+  type ClientConnection,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type ContentBlock,
@@ -47,6 +48,8 @@ import {
   type SessionConfigSelectOption,
   type SessionConfigSelectOptions,
   type SessionNotification,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type TerminalOutputRequest,
   type TerminalOutputResponse,
   type WaitForTerminalExitRequest,
@@ -197,10 +200,11 @@ class SessionState {
   }
 }
 
-/** The single ACP Client handler for one pooled connection. It ROUTES every notification and
- *  permission request to the per-session SessionState by `sessionId`, so one process can serve
- *  many concurrent sessions without their streams crossing. */
-class MultiplexClient implements Client {
+/** The single client-side handler set for one pooled connection (registered on the SDK's fluent
+ *  client() app). It ROUTES every notification and permission request to the per-session
+ *  SessionState by `sessionId`, so one process can serve many concurrent sessions without their
+ *  streams crossing. */
+class MultiplexClient {
   private readonly sessions = new Map<string, SessionState>();
   /** Recently unregistered sessions kept ONLY for the teardown window: ACP agents may
    *  legitimately release terminals (or finish fs/terminal cleanup) after this client releases
@@ -499,8 +503,9 @@ export interface PooledConnectionDeps {
  */
 export class PooledConnection {
   readonly backendId: BackendId;
-  /** The held ACP connection; SessionHandles drive their session/* calls through it. */
-  readonly rpc: ClientSideConnection;
+  /** The held ACP connection (fluent client() app); session/* calls go through its
+   *  `agent` ClientContext via the typed wrappers below. */
+  private readonly connection: ClientConnection;
 
   private readonly backend: Backend;
   private readonly child: ChildProcess;
@@ -557,7 +562,36 @@ export class PooledConnection {
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
-    this.rpc = new ClientSideConnection(() => this.client, stream);
+    // The fluent client() app: every inbound agent->client request/notification is registered
+    // here and dispatched to the MultiplexClient router. All request handlers are registered
+    // unconditionally — MultiplexClient.dispatch() answers a method the consumer provided no
+    // handler for with the same -32601 "not advertised" error as before, so behavior is
+    // identical to the previous Client-interface wiring.
+    //
+    // ORDER MATTERS: the two accumulation-feeding notifications MUST be registered FIRST.
+    // The SDK Connection runs only the first matching handler synchronously inside the
+    // read-loop turn; later handlers each cost a microtask hop, which lets an in-flight
+    // session/prompt RESPONSE continuation overtake a session/update notification that
+    // arrived before it on the wire. Registering session/update (and the Claude raw-message
+    // channel) first preserves the drain contract this file documents — every update for a
+    // turn is folded into its accumulator before that turn's prompt() resolves — exactly as
+    // the SDK's own (deprecated) ClientSideConnection wrapper registered them.
+    this.connection = client({ name: CLIENT_INFO.name })
+      .onNotification(CLIENT_METHODS.session_update, ({ params }) => this.client.sessionUpdate(params))
+      .onNotification(
+        CLAUDE_RAW_MESSAGE_METHOD,
+        (params: unknown) => (params ?? {}) as Record<string, unknown>,
+        ({ params }) => this.client.extNotification(CLAUDE_RAW_MESSAGE_METHOD, params),
+      )
+      .onRequest(CLIENT_METHODS.session_request_permission, ({ params }) => this.client.requestPermission(params))
+      .onRequest(CLIENT_METHODS.fs_read_text_file, ({ params }) => this.client.readTextFile(params))
+      .onRequest(CLIENT_METHODS.fs_write_text_file, ({ params }) => this.client.writeTextFile(params))
+      .onRequest(CLIENT_METHODS.terminal_create, ({ params }) => this.client.createTerminal(params))
+      .onRequest(CLIENT_METHODS.terminal_output, ({ params }) => this.client.terminalOutput(params))
+      .onRequest(CLIENT_METHODS.terminal_release, ({ params }) => this.client.releaseTerminal(params))
+      .onRequest(CLIENT_METHODS.terminal_wait_for_exit, ({ params }) => this.client.waitForTerminalExit(params))
+      .onRequest(CLIENT_METHODS.terminal_kill, ({ params }) => this.client.killTerminal(params))
+      .connect(stream);
 
     // Death detection. The connection's `signal` aborts the INSTANT the underlying stream closes
     // (process crash or our own dispose) — in the SAME close() that rejects pending requests — so
@@ -565,7 +599,7 @@ export class PooledConnection {
     // before its in-flight prompt's rejection even propagates, so a concurrent acquire can never
     // hand out a connection whose process has already died. The child 'exit'/'error' events are a
     // belt-and-suspenders backstop (and carry the exit code for a clearer message).
-    this.rpc.signal.addEventListener(
+    this.connection.signal.addEventListener(
       "abort",
       () => this.die(new Error(`ACP agent (${this.backendId}) connection closed${this.stderrSuffix()}`)),
       { once: true },
@@ -661,7 +695,7 @@ export class PooledConnection {
     try {
       const response = await Promise.race([
         this.race(
-          this.rpc.initialize({
+          this.connection.agent.request(AGENT_METHODS.initialize, {
             protocolVersion: PROTOCOL_VERSION,
             // Truthful advertisement: computed from the consumer-provided handlers registered on
             // this runner. Omitted flags are unsupported; false flags are never sent deliberately.
@@ -750,7 +784,7 @@ export class PooledConnection {
         mcpServers: opts.mcpServers ?? [],
         ...(meta ? { _meta: meta } : {}),
       };
-      const response = await this.race(this.rpc.newSession(request));
+      const response = await this.race(this.connection.agent.request(AGENT_METHODS.session_new, request));
       this.client.register(response.sessionId, state);
       return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts);
     } catch (error) {
@@ -759,12 +793,22 @@ export class PooledConnection {
     }
   }
 
+  /** session/prompt on this connection, raced against process death. */
+  prompt(request: PromptRequest): Promise<PromptResponse> {
+    return this.race(this.connection.agent.request(AGENT_METHODS.session_prompt, request));
+  }
+
+  /** session/set_config_option on this connection, raced against process death. */
+  setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+    return this.race(this.connection.agent.request(AGENT_METHODS.session_set_config_option, request));
+  }
+
   /** Best-effort ACP cancel for one session (wired to opts.signal). The PROCESS stays pooled. */
   async cancelSession(sessionId: string): Promise<void> {
     this.client.settlePendingPermissions(sessionId);
     if (!this._alive) return;
     try {
-      await this.rpc.cancel({ sessionId });
+      await this.connection.agent.notify(AGENT_METHODS.session_cancel, { sessionId });
     } catch {
       // best-effort: the session settles as "cancelled" regardless.
     }
@@ -780,7 +824,12 @@ export class PooledConnection {
     if (this._activeSessions > 0) this._activeSessions -= 1;
     if (!this.negotiated?.supportsClose || !this._alive) return;
     try {
-      await this.race(withTimeout(this.rpc.closeSession({ sessionId }), CLOSE_SESSION_TIMEOUT_MS));
+      await this.race(
+        withTimeout(
+          this.connection.agent.request(AGENT_METHODS.session_close, { sessionId }),
+          CLOSE_SESSION_TIMEOUT_MS,
+        ),
+      );
     } catch {
       // best-effort: the session is already untracked; the process stays pooled.
     }
@@ -960,9 +1009,11 @@ export class SessionHandle implements StructuredSource {
 
   /** Set one session config option via the wire method and adopt the echoed catalog. */
   private async applyConfigOption(configId: string, value: string): Promise<void> {
-    const response = await this.pooled.race(
-      this.pooled.rpc.setSessionConfigOption({ sessionId: this.sessionId, configId, value }),
-    );
+    const response = await this.pooled.setSessionConfigOption({
+      sessionId: this.sessionId,
+      configId,
+      value,
+    });
     this.configOptions = response.configOptions;
   }
 
@@ -982,7 +1033,7 @@ export class SessionHandle implements StructuredSource {
       prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
       ...(gatedMeta ? { _meta: gatedMeta } : {}),
     };
-    const response = await this.pooled.race(this.pooled.rpc.prompt(request));
+    const response = await this.pooled.prompt(request);
     this.state.usage.recordPromptUsage(response.usage);
     return response;
   }
