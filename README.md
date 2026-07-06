@@ -291,6 +291,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 ## Documentation
 
+- [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events, `ExecOptions` (incl. per-run `cwd` for worktree-per-run hosts), the runner surface (`run()`, model routing, event bus, interactive sessions, capabilities), backend resolution + every environment variable, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
 - [Agent Client Protocol](https://agentclientprotocol.com) · [Model Context Protocol](https://modelcontextprotocol.io)

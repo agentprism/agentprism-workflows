@@ -32,6 +32,9 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
+  /** The run's working directory (ExecOptions.cwd) when it overrode the manager cwd —
+   *  kept so resume() re-runs in the same directory (e.g. the same worktree). */
+  cwd?: string;
   /** The session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;

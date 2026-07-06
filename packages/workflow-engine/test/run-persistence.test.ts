@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { AGENTPRISM_PERSISTENCE_ROOT_ENV, workflowProjectPaths } from "../src/workflow-paths.js";
@@ -1049,5 +1050,81 @@ test(
 
     // listAllRuns ignores the session binding.
     assert.equal(new WorkflowManager({ cwd, sessionId: "s1" }).listAllRuns().length, 2);
+  }),
+);
+
+// ─── Per-run cwd (ExecOptions.cwd): worktree-per-run hosts ─────────────────────
+
+const perRunCwdScript = `export const meta = { name: 'per_run_cwd', description: 'per-run cwd demo' }
+const a = await agent('first', { label: 'first' })
+return { a }`;
+
+test(
+  "ExecOptions.cwd threads to agent sessions and persists; run state stays keyed to the manager cwd",
+  withTempCwd(async (cwd) => {
+    const runCwd = mkdtempSync(join(tmpdir(), "ap-dw-run-cwd-"));
+    try {
+      const seen: Array<string | undefined> = [];
+      const manager = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(_prompt: string, opts: { cwd?: string } = {}) {
+            seen.push(opts.cwd);
+            return "ok";
+          },
+        },
+      });
+      const result = await manager.runSync(perRunCwdScript, undefined, { cwd: runCwd });
+      assert.equal(result.status, "completed");
+      assert.deepEqual(seen, [runCwd], "the agent session runs in the per-run cwd");
+      // Run STATE is keyed to the MANAGER cwd (survives the per-run directory's deletion),
+      // and it carries the per-run cwd for resume.
+      const rp = createRunPersistence(cwd);
+      assert.equal(rp.load(result.runId)?.cwd, runCwd, "the per-run cwd is persisted with the run");
+    } finally {
+      rmSync(runCwd, { recursive: true, force: true });
+    }
+  }),
+);
+
+test(
+  "resume() re-runs in the run's ORIGINAL per-run cwd, not the manager cwd",
+  withTempCwd(async (cwd) => {
+    const runCwd = mkdtempSync(join(tmpdir(), "ap-dw-run-cwd-"));
+    try {
+      let failFirstPass = true;
+      const seen: Array<string | undefined> = [];
+      const manager = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(_prompt: string, opts: { cwd?: string } = {}) {
+            seen.push(opts.cwd);
+            if (failFirstPass) {
+              throw new WorkflowError("first pass fails", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+                recoverable: false,
+              });
+            }
+            return "ok";
+          },
+        },
+      });
+      manager.on("error", () => {});
+
+      const result = await manager.runSync(perRunCwdScript, undefined, { cwd: runCwd });
+      assert.equal(result.status, "failed");
+
+      failFirstPass = false;
+      // NOTE: no exec.cwd here — resume must recover it from the persisted run.
+      const resumed = await manager.resume(result.runId);
+      assert.equal(resumed, true, "failed run should resume");
+      const deadline = Date.now() + 5_000;
+      while (manager.getRun(result.runId)?.status === "running" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(manager.getRun(result.runId)?.status, "completed");
+      assert.deepEqual(seen, [runCwd, runCwd], "the resumed agent ran in the original per-run cwd");
+    } finally {
+      rmSync(runCwd, { recursive: true, force: true });
+    }
   }),
 );
