@@ -80,10 +80,13 @@ const TERMINAL_HANDLER_METHODS = [
   "releaseTerminal",
 ] as const;
 
-/** The client capability advertisement derived solely from registered consumer handlers. */
+/** The client capability advertisement: fs/terminal derived solely from registered consumer
+ *  handlers, plus the capabilities this client supports natively regardless of handlers —
+ *  boolean session config options (SessionHandle drives the catalog programmatically and
+ *  handles `type: "boolean"` entries, e.g. codex-acp's Fast-mode toggle). */
 export function clientCapabilitiesFor(handlers: ClientHandlers | undefined): ClientCapabilities {
-  if (!handlers) return {};
-  const capabilities: ClientCapabilities = {};
+  const capabilities: ClientCapabilities = { session: { configOptions: { boolean: {} } } };
+  if (!handlers) return capabilities;
 
   const fs = handlers.fs;
   const fsCapabilities: NonNullable<ClientCapabilities["fs"]> = {};

@@ -466,6 +466,72 @@ test("(#3) a `fast` bracket token turns the advertised Fast-mode option on", asy
   assert.equal(fastSet.params?.value, "on");
 });
 
+test("(#3) a `fast` bracket token turns a BOOLEAN-typed Fast-mode option on", async () => {
+  // codex-acp >= 1.4.0 advertises Fast mode as `type: "boolean"` (category "model_config")
+  // when the client declares session.configOptions.boolean — which this client now does.
+  const { cwd, readLog } = configure({
+    configOptions: [
+      {
+        id: "model",
+        type: "select",
+        name: "Model",
+        category: "model",
+        currentValue: "gpt-5.1-codex",
+        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+      },
+      {
+        id: "fast-mode",
+        type: "boolean",
+        name: "Fast mode",
+        category: "model_config",
+        currentValue: false,
+      },
+    ],
+    turns: [{ text: "ok" }],
+  });
+  const fallbacks: string[] = [];
+  await makeRunner().run("hi", {
+    model: "openai/gpt-5.1-codex[fast]",
+    cwd,
+    onModelFallback: (s) => fallbacks.push(s),
+  });
+  const fastSet = readLog().find(
+    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
+  );
+  assert.ok(fastSet, "boolean fast-mode was set via session/set_config_option");
+  assert.equal(fastSet.params?.value, true);
+  assert.equal(fastSet.params?.type, "boolean", "the wire request carries the boolean type discriminator");
+  assert.deepEqual(fallbacks, [], "an applied boolean Fast mode must not fire a fallback");
+});
+
+test("(#3) a boolean Fast-mode option already ON is left untouched", async () => {
+  const { cwd, readLog } = configure({
+    configOptions: [
+      {
+        id: "model",
+        type: "select",
+        name: "Model",
+        category: "model",
+        currentValue: "gpt-5.1-codex",
+        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+      },
+      {
+        id: "fast-mode",
+        type: "boolean",
+        name: "Fast mode",
+        category: "model_config",
+        currentValue: true,
+      },
+    ],
+    turns: [{ text: "ok" }],
+  });
+  await makeRunner().run("hi", { model: "openai/gpt-5.1-codex[fast]", cwd });
+  const fastSet = readLog().find(
+    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
+  );
+  assert.equal(fastSet, undefined, "already-on boolean Fast mode => no wire call");
+});
+
 test("(#3) a plain effort spec does NOT touch a Fast-mode option that is advertised", async () => {
   const { cwd, readLog } = configure({
     configOptions: [

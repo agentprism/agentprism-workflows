@@ -12,10 +12,13 @@ const TERMINAL_HANDLERS: TerminalHandlers = {
   releaseTerminal: () => undefined,
 };
 
-test("clientCapabilitiesFor: empty inputs advertise nothing", () => {
-  assert.deepEqual(clientCapabilitiesFor(undefined), {});
-  assert.deepEqual(clientCapabilitiesFor({}), {});
-  assert.deepEqual(clientCapabilitiesFor({ fs: {} }), {});
+/** Advertised regardless of handlers: SessionHandle handles boolean config options natively. */
+const BASE_CAPABILITIES = { session: { configOptions: { boolean: {} } } };
+
+test("clientCapabilitiesFor: empty inputs advertise only the native session capabilities", () => {
+  assert.deepEqual(clientCapabilitiesFor(undefined), BASE_CAPABILITIES);
+  assert.deepEqual(clientCapabilitiesFor({}), BASE_CAPABILITIES);
+  assert.deepEqual(clientCapabilitiesFor({ fs: {} }), BASE_CAPABILITIES);
 });
 
 test("clientCapabilitiesFor: fs flags are independent and only true flags are emitted", () => {
@@ -23,13 +26,13 @@ test("clientCapabilitiesFor: fs flags are independent and only true flags are em
     clientCapabilitiesFor({
       fs: { readTextFile: () => ({ content: "x" }) },
     }),
-    { fs: { readTextFile: true } },
+    { ...BASE_CAPABILITIES, fs: { readTextFile: true } },
   );
   assert.deepEqual(
     clientCapabilitiesFor({
       fs: { writeTextFile: () => undefined },
     }),
-    { fs: { writeTextFile: true } },
+    { ...BASE_CAPABILITIES, fs: { writeTextFile: true } },
   );
   assert.deepEqual(
     clientCapabilitiesFor({
@@ -38,17 +41,20 @@ test("clientCapabilitiesFor: fs flags are independent and only true flags are em
         writeTextFile: () => ({}),
       },
     }),
-    { fs: { readTextFile: true, writeTextFile: true } },
+    { ...BASE_CAPABILITIES, fs: { readTextFile: true, writeTextFile: true } },
   );
 });
 
 test("clientCapabilitiesFor: terminal is advertised only with the full handler set", () => {
-  assert.deepEqual(clientCapabilitiesFor({ terminal: TERMINAL_HANDLERS }), { terminal: true });
+  assert.deepEqual(clientCapabilitiesFor({ terminal: TERMINAL_HANDLERS }), {
+    ...BASE_CAPABILITIES,
+    terminal: true,
+  });
   assert.deepEqual(
     clientCapabilitiesFor({
       terminal: { ...TERMINAL_HANDLERS, releaseTerminal: undefined } as never,
     }),
-    {},
+    BASE_CAPABILITIES,
   );
 });
 

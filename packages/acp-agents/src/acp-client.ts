@@ -990,30 +990,40 @@ export class SessionHandle implements StructuredSource {
       }
     }
 
-    // Fast mode: a `fast` token turns the advertised toggle on.
+    // Fast mode: a `fast` token turns the advertised toggle on. The agent may advertise
+    // it as a `type: "boolean"` option (agents gate that shape on our
+    // session.configOptions.boolean capability) or as the legacy on/off select.
     if (fastRequested && !effortAbsorbedByModel) {
       const fastOption = this.configOptions.find(isFastModeOption);
-      const onValue = fastOption ? fastModeOnValue(flattenSelectOptions(fastOption.options)) : undefined;
-      if (fastOption && onValue) {
-        if (fastOption.currentValue !== onValue) {
-          await this.applyConfigOption(fastOption.id, onValue);
+      if (fastOption?.type === "boolean") {
+        if (fastOption.currentValue !== true) {
+          await this.applyConfigOption(fastOption.id, true);
         }
       } else {
-        // No Fast-mode option, or it advertises no "on" value.
-        fallbacks.push(`${spec}: Fast mode not advertised`);
+        const onValue = fastOption ? fastModeOnValue(flattenSelectOptions(fastOption.options)) : undefined;
+        if (fastOption && onValue) {
+          if (fastOption.currentValue !== onValue) {
+            await this.applyConfigOption(fastOption.id, onValue);
+          }
+        } else {
+          // No Fast-mode option, or it advertises no "on" value.
+          fallbacks.push(`${spec}: Fast mode not advertised`);
+        }
       }
     }
 
     return fallbacks;
   }
 
-  /** Set one session config option via the wire method and adopt the echoed catalog. */
-  private async applyConfigOption(configId: string, value: string): Promise<void> {
-    const response = await this.pooled.setSessionConfigOption({
-      sessionId: this.sessionId,
-      configId,
-      value,
-    });
+  /** Set one session config option via the wire method and adopt the echoed catalog.
+   *  A boolean value drives a `type: "boolean"` option (the request must carry the type
+   *  discriminator on the wire); a string value drives a select option. */
+  private async applyConfigOption(configId: string, value: string | boolean): Promise<void> {
+    const request: SetSessionConfigOptionRequest =
+      typeof value === "boolean"
+        ? { sessionId: this.sessionId, configId, value, type: "boolean" }
+        : { sessionId: this.sessionId, configId, value };
+    const response = await this.pooled.setSessionConfigOption(request);
     this.configOptions = response.configOptions;
   }
 
@@ -1089,8 +1099,12 @@ function isReasoningEffortOption(option: SessionConfigOption): option is ModelSe
   return option.type === "select" && (option.id === "reasoning_effort" || option.category === "thought_level");
 }
 
-function isFastModeOption(option: SessionConfigOption): option is ModelSelectOption {
-  return option.type === "select" && (option.id === "fast-mode" || option.category === "fast-mode");
+/** Fast mode is matched by its stable id (upstream codex-acp moved the category to
+ *  "model_config"; the legacy category match is kept for older agents). Both the
+ *  `type: "boolean"` and the legacy on/off select shapes qualify — the caller branches
+ *  on `type`. */
+function isFastModeOption(option: SessionConfigOption): boolean {
+  return option.id === "fast-mode" || option.category === "fast-mode";
 }
 
 /** Split the trailing `[...]` of a `model[effort]` spec into its comma/space/plus-separated
