@@ -1,5 +1,12 @@
 # @automatalabs/mcp-server
 
+## 0.3.12
+
+### Patch Changes
+
+- Updated dependencies [f1a42fb]
+  - @automatalabs/workflows@0.14.0
+
 ## 0.3.11
 
 ### Patch Changes
