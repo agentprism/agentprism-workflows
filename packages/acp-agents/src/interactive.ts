@@ -1,7 +1,16 @@
 // Public held-open ACP session API. This is intentionally NOT the AgentRunner seam: it exposes
 // a multi-turn session for hosts that want to drive an ACP agent directly while run() remains the
 // one-shot workflow-engine contract.
-import type { ContentBlock, StopReason } from "@agentclientprotocol/sdk";
+import type {
+  AgentNotificationMethod,
+  AgentNotificationParamsByMethod,
+  AgentRequestMethod,
+  AgentRequestParamsByMethod,
+  AgentRequestResponsesByMethod,
+  ContentBlock,
+  SendRequestOptions,
+  StopReason,
+} from "@agentclientprotocol/sdk";
 import type { McpServerConfig, PromptImage } from "@automatalabs/shared-types";
 import type { RunOptions } from "@automatalabs/shared-types";
 import type { Backend, BackendId } from "./backend.js";
@@ -155,6 +164,37 @@ export class InteractiveSession {
     } finally {
       this.promptInFlight = false;
     }
+  }
+
+  /** RAW protocol escape hatch for held-open sessions. Params carry `sessionId` explicitly;
+   *  use `session.sessionId` so the wire call targets this session. Prefer named wrappers when
+   *  they exist because they preserve engine semantics such as accumulation/drain and usage
+   *  recording; calling session/prompt here bypasses those paths. */
+  request<Method extends AgentRequestMethod>(
+    method: Method,
+    params: AgentRequestParamsByMethod[Method],
+    options?: SendRequestOptions,
+  ): Promise<AgentRequestResponsesByMethod[Method]>;
+  request<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+    options?: SendRequestOptions,
+  ): Promise<Response>;
+  async request(method: string, params?: unknown, options?: SendRequestOptions): Promise<unknown> {
+    if (this.releasePromise) throw new Error("InteractiveSession has been released");
+    return this.connection.request(method, params, options);
+  }
+
+  /** RAW protocol notification escape hatch for held-open sessions. Params carry `sessionId`
+   *  explicitly; use `session.sessionId` so the wire call targets this session. */
+  notify<Method extends AgentNotificationMethod>(
+    method: Method,
+    params: AgentNotificationParamsByMethod[Method],
+  ): Promise<void>;
+  notify<Params = unknown>(method: string, params?: Params): Promise<void>;
+  async notify(method: string, params?: unknown): Promise<void> {
+    if (this.releasePromise) throw new Error("InteractiveSession has been released");
+    await this.connection.notify(method, params);
   }
 
   /** Best-effort ACP session/cancel for the active turn. Pending permission resolvers are

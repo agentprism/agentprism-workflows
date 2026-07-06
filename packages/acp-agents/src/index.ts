@@ -9,12 +9,25 @@ export type { AcpRunnerOptions } from "./runner.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
+export { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
+export type {
+  AgentNotificationMethod,
+  AgentNotificationParamsByMethod,
+  AgentRequestMethod,
+  AgentRequestParamsByMethod,
+  AgentRequestResponsesByMethod,
+  SendRequestOptions,
+} from "@agentclientprotocol/sdk";
+
 // The custom-backend registry: run ANY ACP agent as an agent() target.
 export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from "./registry.js";
 export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./registry.js";
 
 export { PooledConnection, SessionHandle } from "./acp-client.js";
 export type { AcpSessionOptions, PooledConnectionDeps } from "./acp-client.js";
+
+export { AGENT_METHOD_COVERAGE, CLIENT_METHOD_COVERAGE } from "./protocol-coverage.js";
+export type { AgentMethodCoverage, ClientMethodCoverage } from "./protocol-coverage.js";
 
 // ACP capability negotiation: parse/validate the initialize response and gate what the client
 // sends (custom `_meta` keys, MCP transports) on what the connected agent advertised.
