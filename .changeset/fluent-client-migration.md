@@ -1,5 +1,0 @@
----
-"@automatalabs/acp-agents": minor
----
-
-Finish the fluent `client()` migration: the pooled ACP connection is now built with the SDK's `client({ name }).onRequest(...).onNotification(...).connect(stream)` builder instead of the deprecated `ClientSideConnection`, and the dependency moved from the exact `1.1.0` pin to `^1.2.0` (no more dual-install/`overrides` headache for consumers on current SDK releases); `@agentclientprotocol/claude-agent-acp` bumped to 0.56.0. The accumulation-feeding notifications (`session/update`, `_claude/sdkMessage`) are registered FIRST — the SDK runs only the first matching handler synchronously inside the read-loop turn, and that ordering is what preserves the drain contract (every update for a turn is folded into its accumulator before that turn's `prompt()` resolves). Breaking for deep integrators only: `PooledConnection.rpc` (the raw `ClientSideConnection`) is gone; `session/prompt` and `session/set_config_option` are now typed methods on `PooledConnection` (`prompt()`, `setSessionConfigOption()`), both raced against process death.

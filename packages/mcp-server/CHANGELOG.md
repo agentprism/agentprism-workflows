@@ -1,5 +1,15 @@
 # @automatalabs/mcp-server
 
+## 0.3.7
+
+### Patch Changes
+
+- cd20994: Integrator hygiene: `recoverStaleRuns()` is now gated on the manager's `journaling` default — a `journaling: false` WorkflowManager (host keeps its own transcript/audit store) never rewrites persisted run state that belongs to journaling processes. All five published manifests now declare `engines.node >= 22` (previously only the private workspace root did).
+- Updated dependencies [cd20994]
+- Updated dependencies [cd20994]
+  - @automatalabs/shared-types@0.8.0
+  - @automatalabs/workflows@0.10.0
+
 ## 0.3.6
 
 ### Patch Changes
