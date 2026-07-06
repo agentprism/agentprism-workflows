@@ -131,6 +131,42 @@ function paramsWithSession(call, sessionId) {
   return { ...(call.params ?? {}), sessionId };
 }
 
+function elicitationRequestFromScenario(elicitation, sessionId) {
+  const mode = elicitation.mode ?? "form";
+  const base = {
+    sessionId,
+    mode,
+    message: elicitation.message ?? "Input required",
+    ...(elicitation.meta ? { _meta: elicitation.meta } : {}),
+  };
+  if (mode === "url") {
+    return {
+      ...base,
+      elicitationId: elicitation.elicitationId ?? "fake-elicitation",
+      url: elicitation.url ?? "https://example.test/elicitation",
+    };
+  }
+  if (mode === "form") {
+    return {
+      ...base,
+      requestedSchema: elicitation.schema ?? {
+        type: "object",
+        properties: { answer: { type: "string", title: "Answer" } },
+        required: ["answer"],
+      },
+    };
+  }
+  return { ...base, ...(elicitation.params ?? {}) };
+}
+
+function elicitationCompleteFromScenario(complete) {
+  if (typeof complete === "string") return { elicitationId: complete };
+  return {
+    elicitationId: complete?.elicitationId ?? "fake-elicitation",
+    ...(complete?.meta ? { _meta: complete.meta } : {}),
+  };
+}
+
 class FakeAgent {
   constructor(conn) {
     this.conn = conn;
@@ -326,6 +362,19 @@ class FakeAgent {
         ],
       });
       record({ method: "permissionOutcome", outcome: response.outcome });
+    }
+
+    // 1.5) optional elicitation round-trip (agent -> client request) and URL-complete
+    // notification. This exercises the unstable SDK methods over the real connection.
+    if (turn.elicitation) {
+      const request = elicitationRequestFromScenario(turn.elicitation, params.sessionId);
+      const response = await this.conn.unstable_createElicitation(request);
+      record({ method: "elicitationOutcome", request, response });
+    }
+    if (turn.elicitationComplete) {
+      const notification = elicitationCompleteFromScenario(turn.elicitationComplete);
+      await this.conn.unstable_completeElicitation(notification);
+      record({ method: "elicitationComplete", notification });
     }
 
     // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors

@@ -133,7 +133,7 @@ manager.on("agentEvent", (e: AgentEventPayload) => {
 
 Payload (`AgentEventPayload<K>`, exported): `{ name, event, backendId, sessionId?, label?, runId? }` —
 
-- `name` is the ACP event name. `session/update` notifications arrive **unwrapped** as their `sessionUpdate` discriminant (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …); the cross-cutting events (`permission_pending`, `permission_request`, `raw_message`, `session_open`, `session_close`, `backend_error`) arrive under their own names.
+- `name` is the ACP event name. `session/update` notifications arrive **unwrapped** as their `sessionUpdate` discriminant (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …); the cross-cutting events (`permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open`, `session_close`, `backend_error`) arrive under their own names.
 - `event` is the **verbatim** runner payload for that event (typed per `name`).
 - The envelope repeats the context fields hosts filter on: `runId` + `label` identify the workflow agent (stamped by the engine on every `agent()` call), `sessionId`/`backendId` identify the ACP session. `backend_error` is connection-scoped and carries no session/run context.
 
@@ -151,11 +151,12 @@ const runner = createAcpRunner({
   size: 2,                                  // pooled processes per backend (AGENTPRISM_ACP_POOL_SIZE)
   clientHandlers: { fs: {...}, terminal: {...} },  // optional: route agent fs/terminal through the host
   onPermissionRequest: async (req, ctx) => ({ outcome: { outcome: "selected", optionId } }),
+  onElicitation: async (req, ctx) => ({ action: "accept", content: { answer: "yes" } }),
   backends: { myAgent: { command: "/abs/bin", args: [], env: { API_KEY } } },
 });
 ```
 
-`AcpRunnerOptions`: `size?`, `clientHandlers?`, `onPermissionRequest?` (runner-wide async human-in-the-loop resolver; replaces the synchronous `ToolPolicy` auto-decision wherever set — pending resolvers are settled as `cancelled` on session teardown so a turn can never hang), `backends?` (custom ACP backends, merged over env `AGENTPRISM_BACKENDS`; names are case-insensitive, `claude`/`codex` reserved).
+`AcpRunnerOptions`: `size?`, `clientHandlers?`, `onPermissionRequest?` (runner-wide async human-in-the-loop resolver; replaces the synchronous `ToolPolicy` auto-decision wherever set — pending resolvers are settled as `cancelled` on session teardown so a turn can never hang), `onElicitation?` (runner-wide ACP `elicitation/create` responder; see below), `backends?` (custom ACP backends, merged over env `AGENTPRISM_BACKENDS`; names are case-insensitive, `claude`/`codex` reserved).
 
 ### `run(prompt, opts)` — the AgentRunner seam
 
@@ -168,6 +169,16 @@ One agent call per invocation; returns the assistant text, or the **validated ob
 **Session modes (confinement)**: `mode` is an agent-advertised ACP session mode id. Claude-family agents commonly advertise `default`, `plan`, `acceptEdits`, `bypassPermissions`; Codex-family agents commonly advertise `read-only`, `agent`, `agent-full-access`. This is strict: if the backend advertises no modes, does not list the requested id, or rejects `session/set_mode`, the run fails before any prompt is sent.
 
 Permission posture changes when `mode` is explicit: if no `onPermissionRequest` resolver is present, the headless permission fallback flips from allow to deny. Explicit `toolNames` allow-list matches still allow; `disallowedToolNames` still deny; a resolver still decides. This prevents read-only/plan modes from being defeated by automatic escalation approval. Plan/read-only modes confine writes and escalation, not reads.
+
+### Elicitation (agent questions)
+
+ACP `elicitation/create` lets an agent ask the human structured questions during a turn. `mode: "form"` carries an SDK `ElicitationSchema` of primitive fields; `mode: "url"` carries a URL and `elicitationId`, with a later `elicitation/complete` notification when that URL flow finishes. The SDK marks this surface **UNSTABLE/@experimental**, so the public API re-exports the SDK request/response/schema types directly.
+
+Configure `createAcpRunner({ onElicitation })` to answer requests. A resolver receives `(request, context)` and returns `CreateElicitationResponse`, for example `{ action: "accept", content: { ... } }`, `{ action: "decline" }`, or `{ action: "cancel" }`. With no resolver for the session, the client auto-declines with `{ action: "decline" }`; parked resolvers are settled with `{ action: "cancel" }` on session cancel, release, or connection death.
+
+Capability advertisement is fixed at `initialize`: the client advertises `elicitation: { form: {}, url: {} }` only when a runner-wide `onElicitation` exists. A session-scoped `openSession({ onElicitation })`, `loadSession({ onElicitation })`, or `resumeSession({ onElicitation })` wins over the runner resolver for that session, but by itself cannot light up initialize-time capabilities on the connection. Agents on that connection may therefore never ask. A resolver may still decline modes it cannot render.
+
+Claude-family agents use this advertisement to enable `AskUserQuestion`, refusal-fallback dialogs, and MCP-elicitation forwarding. Advertising without a real responder would send those agent questions into a void, so this library never advertises elicitation for a stub auto-decline path.
 
 ### Protocol passthrough & coverage
 
@@ -183,11 +194,11 @@ Prefer named wrappers (`prompt()`, `setMode()`, `openSession()`, etc.) when they
 
 Raw `request()` rejects the session-stateful methods that would create or reopen sessions outside the router: `session/new` (use `openSession()`), `session/load` (use `loadSession()`), `session/resume` (use `resumeSession()`), and `session/fork` (no driven wrapper yet). Those raw sessions are unregistered: updates do not fold into an accumulator, permission requests auto-cancel, and fs/terminal dispatch fails for unknown sessions.
 
-`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
+`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. Client methods are currently 11/14 served; the remaining pending methods are the `mcp/*` bridge methods. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
 
 ### <a name="runner-events"></a>Events (`runner.on(name, listener)`)
 
-Typed bus; returns an unsubscribe thunk. Names are the ACP `sessionUpdate` discriminants verbatim (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …) plus cross-cutting events: `session_update` (catch-all), `permission_pending`, `permission_request`, `raw_message`, `session_open`, `session_close`, `backend_error`. Every payload carries `AcpEventContext`: `{ sessionId, backendId, label?, runId? }` — the engine stamps `runId`/`label` on every workflow agent, so multiplexed streams filter cleanly.
+Typed bus; returns an unsubscribe thunk. Names are the ACP `sessionUpdate` discriminants verbatim (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …) plus cross-cutting events: `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open`, `session_close`, `backend_error`. Every payload carries `AcpEventContext`: `{ sessionId, backendId, label?, runId? }` — the engine stamps `runId`/`label` on every workflow agent, so multiplexed streams filter cleanly.
 
 ### Interactive sessions
 
@@ -202,7 +213,7 @@ await session.cancel();                                     // cancel the active
 await session.release();                                    // end session; pooled process survives
 ```
 
-`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `mcpServers`, `meta`, `retainSessionLog` (default `false` for held-open sessions; set `true` when the host wants the runner to keep the full transcript). `session.text` / `session.history` expose the retained assistant text and message/tool history; `session.modes` exposes the advertised catalog and current mode.
+`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `onElicitation` (session-scoped, wins over runner-wide but cannot affect initialize-time capability advertisement), `mcpServers`, `meta`, `retainSessionLog` (default `false` for held-open sessions; set `true` when the host wants the runner to keep the full transcript). `session.text` / `session.history` expose the retained assistant text and message/tool history; `session.modes` exposes the advertised catalog and current mode.
 
 **Session lifecycle (reattach)**:
 

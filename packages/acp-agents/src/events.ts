@@ -10,6 +10,9 @@
 // Listeners are OBSERVERS and best-effort: a throwing listener is isolated and never breaks the
 // run, the synchronous update drain, or sibling listeners — the same contract as onUsage/onHistory.
 import type {
+  CompleteElicitationNotification,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification,
@@ -55,6 +58,25 @@ export interface AcpPermissionEvent extends AcpEventContext {
   outcome: RequestPermissionResponse;
 }
 
+/** An elicitation/create request parked on an async resolver. Resolver path only; the final
+ *  response is reported by elicitation_request exactly once. */
+export interface AcpElicitationPendingEvent extends AcpEventContext {
+  request: CreateElicitationRequest;
+}
+
+/** An elicitation/create request the runner answered, paired with the FINAL response returned
+ *  to the agent. Fires exactly once for resolver-backed and auto-declined requests. */
+export interface AcpElicitationEvent extends AcpEventContext {
+  request: CreateElicitationRequest;
+  outcome: CreateElicitationResponse;
+}
+
+/** Notification that a URL-based elicitation completed, correlated back to the session context
+ *  captured when its elicitation/create request arrived. */
+export interface AcpElicitationCompleteEvent extends AcpEventContext {
+  notification: CompleteElicitationNotification;
+}
+
 /** A vendor extension notification (e.g. Claude `_claude/sdkMessage`) routed to a session. */
 export interface AcpRawMessageEvent extends AcpEventContext {
   method: string;
@@ -80,6 +102,12 @@ export type AcpRunnerEventMap = AcpSessionUpdateEvents & {
   permission_pending: AcpPermissionPendingEvent;
   /** A permission request the runner answered, with the FINAL decision returned. */
   permission_request: AcpPermissionEvent;
+  /** An elicitation/create request parked on an async resolver; resolver path only. */
+  elicitation_pending: AcpElicitationPendingEvent;
+  /** An elicitation/create request the runner answered, with the FINAL response returned. */
+  elicitation_request: AcpElicitationEvent;
+  /** An elicitation/complete notification correlated to the originating session context. */
+  elicitation_complete: AcpElicitationCompleteEvent;
   /** A vendor extension notification arrived for a session. */
   raw_message: AcpRawMessageEvent;
   /** A new session was opened on a pooled connection. */
@@ -98,6 +126,9 @@ export type AcpEventListener<K extends AcpEventName> = (event: AcpRunnerEventMap
 export const ACP_CROSS_CUTTING_EVENT_NAMES = [
   "permission_pending",
   "permission_request",
+  "elicitation_pending",
+  "elicitation_request",
+  "elicitation_complete",
   "raw_message",
   "session_open",
   "session_close",

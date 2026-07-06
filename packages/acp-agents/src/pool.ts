@@ -14,7 +14,7 @@ import type { Backend, BackendId } from "./backend.js";
 import { PooledConnection, SessionHandle, type AcpSessionOptions } from "./acp-client.js";
 import { validateClientHandlers, type ClientHandlers } from "./client-handlers.js";
 import type { AcpEventSink } from "./events.js";
-import type { PermissionResolver } from "./permissions.js";
+import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 
 const DEFAULT_POOL_SIZE = 1;
 const POOL_SIZE_ENV = "AGENTPRISM_ACP_POOL_SIZE";
@@ -31,6 +31,8 @@ export interface AcpPoolOptions {
 export interface AcpPoolDeps {
   onEvent?: AcpEventSink;
   permissionResolver?: PermissionResolver;
+  elicitationResolver?: ElicitationResolver;
+  advertiseElicitation?: boolean;
 }
 
 /** Resolve the per-backend pool size: explicit option wins, else env, else 1. Clamped to >= 1. */
@@ -91,6 +93,8 @@ export class AcpAgentPool {
         onDead: (dead) => this.drop(key, dead),
         onEvent: this.deps.onEvent,
         permissionResolver: this.deps.permissionResolver,
+        elicitationResolver: this.deps.elicitationResolver,
+        advertiseElicitation: this.deps.advertiseElicitation,
         clientHandlers: this.clientHandlers,
       });
       connections.push(connection);

@@ -24,8 +24,8 @@ export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> 
   [CLIENT_METHODS.mcp_connect]: "pending",
   [CLIENT_METHODS.mcp_message]: "pending",
   [CLIENT_METHODS.mcp_disconnect]: "pending",
-  [CLIENT_METHODS.elicitation_create]: "pending",
-  [CLIENT_METHODS.elicitation_complete]: "pending",
+  [CLIENT_METHODS.elicitation_create]: "served",
+  [CLIENT_METHODS.elicitation_complete]: "served",
 };
 
 export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {

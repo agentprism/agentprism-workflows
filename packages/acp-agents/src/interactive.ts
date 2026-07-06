@@ -18,7 +18,7 @@ import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
 import type { PooledConnection, SessionHandle } from "./acp-client.js";
 import type { AcpEventListener, AcpEventName } from "./events.js";
-import type { PermissionResolver } from "./permissions.js";
+import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 import {
   appendPromptImages,
   mergeTurnMeta,
@@ -28,8 +28,8 @@ import {
 /** Options for AcpAgentRunner.openSession(): backend selection and session/new inputs for one
  *  held-open interactive ACP session. `cwd` is required and absolute; unlike run(), there is no
  *  default to process.cwd() because the session can span many turns. The session-scoped
- *  permission resolver wins over the runner-wide default; tool allow/deny policy is used only
- *  when no resolver is present. */
+ *  permission/elicitation resolvers win over the runner-wide defaults; tool allow/deny policy is
+ *  used only when no permission resolver is present. */
 export interface InteractiveSessionOptions {
   /** Model spec (`provider/modelId`, bare model id, or registered custom backend route). */
   model?: string;
@@ -45,6 +45,8 @@ export interface InteractiveSessionOptions {
   disallowedToolNames?: string[];
   /** Session-scoped permission resolver; overrides the runner-wide resolver for this session. */
   onPermissionRequest?: PermissionResolver;
+  /** Session-scoped elicitation resolver; overrides the runner-wide resolver for this session. */
+  onElicitation?: ElicitationResolver;
   /** The actually-resolved concrete model id (display/telemetry). */
   onModelResolved?: RunOptions["onModelResolved"];
   /** A requested model/tier spec that was not found and fell back to the session default. */
@@ -224,8 +226,8 @@ export class InteractiveSession {
     await this.connection.notify(method, params);
   }
 
-  /** Best-effort ACP session/cancel for the active turn. Pending permission resolvers are
-   *  settled as cancelled by the SessionHandle/PooledConnection cancel path. */
+  /** Best-effort ACP session/cancel for the active turn. Pending permission/elicitation
+   *  resolvers are settled as cancelled by the SessionHandle/PooledConnection cancel path. */
   async cancel(): Promise<void> {
     if (this.releasePromise) return;
     await this.session.cancel();

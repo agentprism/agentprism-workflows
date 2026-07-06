@@ -25,6 +25,8 @@
 // `read` still matches `thread-reader`, and `read` still matches `ReadFileTool`). The
 // exact tier removes this only once a precise name pins the tool.
 import type {
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   PermissionOption,
   PermissionOptionKind,
   RequestPermissionRequest,
@@ -43,6 +45,14 @@ export type PermissionResolver = (
   params: RequestPermissionRequest,
   ctx: AcpEventContext,
 ) => Promise<RequestPermissionResponse> | RequestPermissionResponse;
+
+/** Async human-in-the-loop responder for ACP elicitation/create. ACP marks elicitation
+ *  UNSTABLE/@experimental; this library deliberately exposes the SDK request/response types
+ *  directly so regular SDK bumps and wire tests catch drift instead of freezing a local copy. */
+export type ElicitationResolver = (
+  request: CreateElicitationRequest,
+  context: AcpEventContext,
+) => Promise<CreateElicitationResponse> | CreateElicitationResponse;
 
 export interface ToolPolicy {
   /** Allow-list (agentType `tools`). When non-empty, a tool that matches NOTHING is denied. */
