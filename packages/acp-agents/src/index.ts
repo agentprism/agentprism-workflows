@@ -5,7 +5,12 @@
 // @automatalabs/workflow-engine; the two siblings meet ONLY at AgentRunner, injected by the
 // @automatalabs/workflows facade (which mcp-server builds on) via createAcpRunner().
 export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
-export type { AcpRunnerOptions } from "./runner.js";
+export type {
+  AcpRunnerOptions,
+  DeleteSessionOptions,
+  ListSessionsOptions,
+  ReattachSessionOptions,
+} from "./runner.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
@@ -16,8 +21,17 @@ export type {
   AgentRequestMethod,
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
+  DeleteSessionRequest,
+  DeleteSessionResponse,
+  ListSessionsRequest,
+  ListSessionsResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+  ResumeSessionRequest,
+  ResumeSessionResponse,
   SessionMode,
   SessionModeState,
+  SessionInfo,
   SendRequestOptions,
 } from "@agentclientprotocol/sdk";
 

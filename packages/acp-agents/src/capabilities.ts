@@ -58,6 +58,15 @@ export interface NegotiatedCapabilities {
   agentInfo: Implementation | undefined;
   /** Whether session/close is advertised (gates the best-effort release-time close). */
   supportsClose: boolean;
+  /** Whether session/load is advertised. The current SDK keeps this as the legacy top-level
+   *  `loadSession` flag; tolerate a future sessionCapabilities.load shape for forward compat. */
+  supportsLoadSession: boolean;
+  /** Whether session/list is advertised. */
+  supportsListSessions: boolean;
+  /** Whether session/delete is advertised. */
+  supportsDeleteSession: boolean;
+  /** Whether session/resume is advertised. */
+  supportsResumeSession: boolean;
   /** The parsed backend-declared custom-capability block (the namespaced `_meta` object), or
    *  undefined when the backend declared none or the agent did not advertise it — passthrough. */
   customMetaSupport: Record<string, unknown> | undefined;
@@ -72,16 +81,46 @@ export function negotiateCapabilities(
   customCapabilities?: Backend["customCapabilities"],
 ): NegotiatedCapabilities {
   const agent = response.agentCapabilities ?? {};
+  const sessionCapabilities = agent.sessionCapabilities;
   return {
     protocolVersion: response.protocolVersion,
     agent,
     agentInfo: response.agentInfo ?? undefined,
-    supportsClose: Boolean(agent.sessionCapabilities?.close),
+    supportsClose: advertised(sessionCapabilities?.close),
+    supportsLoadSession:
+      agent.loadSession === true || advertised((sessionCapabilities as Record<string, unknown> | undefined)?.load),
+    supportsListSessions: advertised(sessionCapabilities?.list),
+    supportsDeleteSession: advertised(sessionCapabilities?.delete),
+    supportsResumeSession: advertised(sessionCapabilities?.resume),
     customMetaSupport: customCapabilities
       ? readCustomNamespace(agent._meta, customCapabilities.namespace)
       : undefined,
     gatedKeys: customCapabilities ? [...customCapabilities.gatedKeys] : undefined,
   };
+}
+
+function advertised(capability: unknown): boolean {
+  return capability !== undefined && capability !== null && capability !== false;
+}
+
+/** Human-readable lifecycle advertisement summary for strict wrapper gate errors. */
+export function describeLifecycleAdvertisement(agent: AgentCapabilities): string {
+  const sessionCapabilities = agent.sessionCapabilities;
+  const session = [
+    ["close", sessionCapabilities?.close],
+    ["list", sessionCapabilities?.list],
+    ["delete", sessionCapabilities?.delete],
+    ["resume", sessionCapabilities?.resume],
+    ["fork", sessionCapabilities?.fork],
+    ["additionalDirectories", sessionCapabilities?.additionalDirectories],
+    ["load", (sessionCapabilities as Record<string, unknown> | undefined)?.load],
+  ]
+    .filter(([, value]) => advertised(value))
+    .map(([name]) => name);
+  return [
+    `loadSession=${agent.loadSession === true ? "true" : "false"}`,
+    `sessionCapabilities=${session.length > 0 ? session.join(", ") : "none"}`,
+  ].join("; ");
 }
 
 function readCustomNamespace(
