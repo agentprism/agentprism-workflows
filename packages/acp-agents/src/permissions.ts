@@ -6,7 +6,9 @@
 // permission request does not carry a first-class tool NAME, so we match best-effort
 // against the request's title, kind, and any vendor `_meta.*.toolName` (Claude stamps it).
 // Default is ALLOW so a headless subagent can do real work; a matched deny-rule, or a
-// non-empty allow-list with no match, rejects.
+// non-empty allow-list with no match, rejects. When the host explicitly requests an ACP
+// session mode and no human resolver is present, the runner flips the no-match default to
+// DENY so a sandboxed mode cannot be defeated by auto-approving escalations.
 //
 // MATCH PRECEDENCE LADDER (tightened from the old bidirectional substring, which both
 // silently over-allowed — 'read' ⊂ 'thread-reader' — and ignored the authoritative tool
@@ -47,6 +49,10 @@ export interface ToolPolicy {
   allow?: string[];
   /** Deny-list (agentType `disallowedTools`), applied after the allow-list. */
   deny?: string[];
+  /** No-match fallback for the headless auto-responder. Default "allow" preserves historical
+   *  behavior. Explicit ACP session modes set this to "deny" unless a permission resolver is
+   *  present, otherwise read-only/plan confinement can be bypassed by auto-approved escalations. */
+  defaultOutcome?: "allow" | "deny";
 }
 
 const ALLOW_KIND_ORDER: PermissionOptionKind[] = ["allow_once", "allow_always"];
@@ -65,6 +71,7 @@ export function decidePermission(
 
   const denyList = policy.deny ?? [];
   const allowList = policy.allow ?? [];
+  const defaultOutcome = policy.defaultOutcome ?? "allow";
   const hasDeny = denyList.length > 0;
   const hasAllowList = allowList.length > 0;
 
@@ -78,11 +85,11 @@ export function decidePermission(
     // (Suppresses loose substring matches: a deny `read` no longer catches an exactly
     // allow-listed `thread-reader`.)
     denied = denyExact;
-    allowedByList = !hasAllowList || allowExact;
+    allowedByList = hasAllowList ? allowExact : defaultOutcome === "allow";
   } else {
     // (b) No exact match in either list -> best-effort bidirectional substring fallback.
     denied = hasDeny && substringMatchesAny(allPool, denyList);
-    allowedByList = !hasAllowList || substringMatchesAny(allPool, allowList);
+    allowedByList = hasAllowList ? substringMatchesAny(allPool, allowList) : defaultOutcome === "allow";
   }
   const wantAllow = !denied && allowedByList;
 

@@ -9,6 +9,7 @@ import type {
   AgentRequestResponsesByMethod,
   ContentBlock,
   SendRequestOptions,
+  SessionModeState,
   StopReason,
 } from "@agentclientprotocol/sdk";
 import type { McpServerConfig, PromptImage } from "@automatalabs/shared-types";
@@ -32,6 +33,8 @@ import {
 export interface InteractiveSessionOptions {
   /** Model spec (`provider/modelId`, bare model id, or registered custom backend route). */
   model?: string;
+  /** Agent-advertised session mode id. Strict: openSession fails rather than running unconfined. */
+  mode?: string;
   /** Coarse tier consulted only when `model` is unset. */
   tier?: string;
   /** Absolute working directory for ACP session/new. Required for held-open sessions. */
@@ -137,6 +140,11 @@ export class InteractiveSession {
     return this.connection.capabilities;
   }
 
+  /** Agent-advertised session mode catalog plus the currently active mode, if supported. */
+  get modes(): SessionModeState | null | undefined {
+    return this.session.modes;
+  }
+
   /** Send one prompt turn. A concurrent prompt on the same InteractiveSession is rejected with a
    *  clear host-side error; queueing is deliberately left to the host so turn boundaries remain
    *  explicit. Per-turn images are appended only to this prompt, and SessionHandle.prompt()
@@ -183,6 +191,13 @@ export class InteractiveSession {
   async request(method: string, params?: unknown, options?: SendRequestOptions): Promise<unknown> {
     if (this.releasePromise) throw new Error("InteractiveSession has been released");
     return this.connection.request(method, params, options);
+  }
+
+  /** Switch this session's ACP operating mode. Fails strictly when the agent did not advertise it. */
+  async setMode(modeId: string): Promise<void> {
+    if (this.releasePromise) throw new Error("InteractiveSession has been released");
+    this.signal?.throwIfAborted();
+    await this.session.setMode(modeId);
   }
 
   /** RAW protocol notification escape hatch for held-open sessions. Params carry `sessionId`

@@ -53,9 +53,12 @@ import {
   type SessionConfigOption,
   type SessionConfigSelectOption,
   type SessionConfigSelectOptions,
+  type SessionModeState,
   type SessionNotification,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
+  type SetSessionModeRequest,
+  type SetSessionModeResponse,
   type TerminalOutputRequest,
   type TerminalOutputResponse,
   type WaitForTerminalExitRequest,
@@ -125,6 +128,7 @@ class SessionState {
   readonly usage = new UsageAccumulator();
   readonly pendingPermissions = new Set<(outcome: RequestPermissionResponse) => void>();
   rawResultSuccess: RawResultSuccess | undefined;
+  modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
 
   /** `label`/`runId` are carried here ONLY so the MultiplexClient can stamp them onto emitted
@@ -135,8 +139,11 @@ class SessionState {
     readonly permissionResolver?: PermissionResolver,
     readonly label?: string,
     readonly runId?: string,
+    modes?: SessionModeState | null,
     private readonly retainSessionLog = true,
-  ) {}
+  ) {
+    this.modes = modes;
+  }
 
   /** Mark the start of a new turn so currentTurnText()/structured_output read only this turn.
    *  Long-lived interactive sessions can opt out of retaining old text/history because hosts
@@ -186,6 +193,13 @@ class SessionState {
         // Also feed the context token counts so AgentUsage.total is non-zero for backends
         // that report tokens via usage_update but never via PromptResponse.usage.
         this.usage.recordContextTokens(update.used, update.size);
+        break;
+      }
+      case "current_mode_update": {
+        this.modes = {
+          ...(this.modes ?? { availableModes: [] }),
+          currentModeId: update.currentModeId,
+        };
         break;
       }
       default:
@@ -413,6 +427,32 @@ function cancelledPermissionResponse(): RequestPermissionResponse {
 
 function methodNotAdvertised(method: string): RequestError {
   return new RequestError(-32601, `${method} was not advertised by this client`, { method });
+}
+
+function modeIds(modes: SessionModeState | null | undefined): string[] {
+  return modes?.availableModes.map((mode) => mode.id) ?? [];
+}
+
+function modeSelectionError(
+  backendId: BackendId,
+  requested: string,
+  advertisedIds: string[],
+  label: string | undefined,
+  cause?: unknown,
+): WorkflowError {
+  const advertised = advertisedIds.length > 0 ? advertisedIds.join(", ") : "none";
+  const suffix = cause ? `: ${thrownMessage(cause)}` : "";
+  return new WorkflowError(
+    `ACP agent (${backendId}) cannot apply session mode "${requested}" (advertised modes: ${advertised})${suffix}`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label, details: cause },
+  );
+}
+
+function thrownMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return String(error);
 }
 
 const DEFAULT_INIT_TIMEOUT_MS = 60_000;
@@ -757,14 +797,6 @@ export class PooledConnection {
           { recoverable: false, agentLabel: opts.label },
         );
       }
-      const state = new SessionState(
-        opts.cwd,
-        opts.policy,
-        opts.permissionResolver,
-        opts.label,
-        opts.runId,
-        opts.retainSessionLog ?? true,
-      );
       // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
       // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
       // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
@@ -791,6 +823,15 @@ export class PooledConnection {
         ...(meta ? { _meta: meta } : {}),
       };
       const response = await this.race(this.connection.agent.request(AGENT_METHODS.session_new, request));
+      const state = new SessionState(
+        opts.cwd,
+        opts.policy,
+        opts.permissionResolver,
+        opts.label,
+        opts.runId,
+        response.modes,
+        opts.retainSessionLog ?? true,
+      );
       this.client.register(response.sessionId, state);
       return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts);
     } catch (error) {
@@ -807,6 +848,11 @@ export class PooledConnection {
   /** session/set_config_option on this connection, raced against process death. */
   setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_set_config_option, request));
+  }
+
+  /** session/set_mode on this connection, raced against process death. */
+  setSessionMode(request: SetSessionModeRequest): Promise<SetSessionModeResponse> {
+    return this.race(this.connection.agent.request(AGENT_METHODS.session_set_mode, request));
   }
 
   /** RAW protocol escape hatch: this makes the full ACP spec reachable (for example
@@ -954,6 +1000,11 @@ export class SessionHandle implements StructuredSource {
     return this.state.history;
   }
 
+  /** Agent-advertised session mode catalog plus the currently active mode, if supported. */
+  get modes(): SessionModeState | null | undefined {
+    return this.state.modes;
+  }
+
   /**
    * Select the model for this session from the agent-advertised config options (§5.4).
    * Returns `matched:false` (the caller fires onModelFallback) when the catalog has no value
@@ -1060,6 +1111,21 @@ export class SessionHandle implements StructuredSource {
         : { sessionId: this.sessionId, configId, value };
     const response = await this.pooled.setSessionConfigOption(request);
     this.configOptions = response.configOptions;
+  }
+
+  /** Switch the session's operating mode through ACP's strict confinement channel. */
+  async setMode(modeId: string): Promise<void> {
+    const modes = this.state.modes;
+    const ids = modeIds(modes);
+    if (!modes || !ids.includes(modeId)) {
+      throw modeSelectionError(this.pooled.backendId, modeId, ids, this.opts.label);
+    }
+    try {
+      await this.pooled.setSessionMode({ sessionId: this.sessionId, modeId });
+    } catch (error) {
+      throw modeSelectionError(this.pooled.backendId, modeId, ids, this.opts.label, error);
+    }
+    this.state.modes = { ...modes, currentModeId: modeId };
   }
 
   /** Send a prompt turn and drain it; returns the final PromptResponse. */

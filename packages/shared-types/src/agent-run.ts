@@ -43,8 +43,8 @@ export interface PromptImage {
  *
  * FIELD NAMES ARE FROZEN: the engine binds these by name through an `as any` cast
  * (workflow.ts:488), so a renamed field would NOT raise a compile error — it would
- * mis-bind at runtime. Engine-passed core fields (14): label, schema, signal, instructions,
- * images, model, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
+ * mis-bind at runtime. Engine-passed core fields (15): label, schema, signal, instructions,
+ * images, model, mode, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
  * onUsage, onHistory. Plus ADDITIVE run inputs that wire infrastructure / shape the backend,
  * NOT the logical call, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
@@ -72,6 +72,14 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  which ACP server to spawn; within-provider => session config / Claude _meta model.
    *  Omitted => session default. */
   model?: string;
+  /** Agent-advertised ACP session mode id, e.g. "plan" on Claude-family agents or "read-only"
+   *  on Codex-family agents. STRICT confinement lever: if the agent advertises no modes, does
+   *  not list this id, or rejects `session/set_mode`, the run fails before any prompt is sent.
+   *  Permission posture: when a mode is explicitly requested and no permission resolver is
+   *  present, the headless permission fallback flips from allow to deny; explicit allow-list
+   *  matches still allow, and a resolver still decides. Agent modes confine writes/escalations,
+   *  not reads. */
+  mode?: string;
   /** Coarse tier ("small" | "medium" | "big"). Consulted only when `model` is unset; `model` wins. */
   tier?: string;
   /** Working directory (e.g. an isolated git worktree). ABSOLUTE. Maps to ACP session/new {cwd}. NOT hashed. */

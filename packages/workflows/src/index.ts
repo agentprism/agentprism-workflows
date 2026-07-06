@@ -87,6 +87,8 @@ export type {
   AgentRequestResponsesByMethod,
   AgentNotificationMethod,
   AgentNotificationParamsByMethod,
+  SessionMode,
+  SessionModeState,
   SendRequestOptions,
   AgentMethodCoverage,
   ClientMethodCoverage,

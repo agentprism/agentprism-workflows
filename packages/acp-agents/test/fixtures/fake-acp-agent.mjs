@@ -30,6 +30,7 @@ import {
 const scenario = JSON.parse(process.env.AGENTPRISM_FAKE_SCENARIO ?? "{}");
 const logPath = process.env.AGENTPRISM_FAKE_LOG;
 const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
+const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 
 function record(entry) {
   if (!logPath) return;
@@ -53,6 +54,10 @@ function serializeError(error) {
   return { name: "Error", message: String(error) };
 }
 
+function clone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
 // Lifecycle markers so the test can assert ONE spawn and a clean close on dispose.
 record({ method: "__start", pid: process.pid });
 let exitRecorded = false;
@@ -65,6 +70,12 @@ process.on("exit", () => recordExit("exit"));
 // A normal SIGTERM terminates without running 'exit' handlers, so record + exit explicitly.
 process.on("SIGTERM", () => {
   recordExit("sigterm");
+  process.exit(0);
+});
+const stdinKeepAlive = setInterval(() => {}, 1 << 30);
+process.stdin.on("end", () => {
+  clearInterval(stdinKeepAlive);
+  recordExit("stdin-end");
   process.exit(0);
 });
 
@@ -115,6 +126,7 @@ class FakeAgent {
     this.turnIndex = 0;
     this.sessionCounter = 0;
     this.turnBySession = new Map();
+    this.modesBySession = new Map();
     // Per-session cancellation: a `waitForCancel` turn parks until session/cancel arrives.
     this.cancelled = new Set();
     this.cancelWaiters = new Map();
@@ -140,7 +152,13 @@ class FakeAgent {
     // Process-unique ids: real ACP agents mint globally-unique session ids, and the per-session
     // event filter depends on that — two fixture processes must never collide on an id.
     const sessionId = `fake-session-${process.pid}-${(this.sessionCounter += 1)}`;
-    return { sessionId, configOptions: this.configOptions };
+    const modes = hasScenarioModes ? clone(scenario.modes) : undefined;
+    if (modes) this.modesBySession.set(sessionId, modes);
+    return {
+      sessionId,
+      configOptions: this.configOptions,
+      ...(hasScenarioModes ? { modes } : {}),
+    };
   }
 
   async closeSession(params) {
@@ -151,6 +169,18 @@ class FakeAgent {
       await this.callClient(call, params.sessionId);
     }
     this.turnBySession.delete(params.sessionId);
+    this.modesBySession.delete(params.sessionId);
+    return {};
+  }
+
+  setSessionMode(params) {
+    record({ method: "setSessionMode", params });
+    const modes = this.modesBySession.get(params.sessionId);
+    const ids = modes?.availableModes?.map((mode) => mode.id) ?? [];
+    if (!modes || !ids.includes(params.modeId)) {
+      throw RequestError.invalidParams(params, `unknown session mode: ${params.modeId}`);
+    }
+    this.modesBySession.set(params.sessionId, { ...modes, currentModeId: params.modeId });
     return {};
   }
 
@@ -221,8 +251,23 @@ class FakeAgent {
       await this.callClient(call, params.sessionId);
     }
 
-    // 3) optional assistant text chunks (drained before the prompt response resolves). `echoPrompt`
+    // 3) optional current-mode update, then assistant text chunks (drained before the prompt
+    // response resolves). `echoPrompt`
     // echoes this turn's prompt text back so a concurrency test can prove per-session routing.
+    const currentModeId =
+      typeof turn.currentModeId === "string"
+        ? turn.currentModeId
+        : typeof turn.currentModeUpdate?.currentModeId === "string"
+          ? turn.currentModeUpdate.currentModeId
+          : undefined;
+    if (currentModeId) {
+      const modes = this.modesBySession.get(params.sessionId);
+      if (modes) this.modesBySession.set(params.sessionId, { ...modes, currentModeId });
+      await this.conn.sessionUpdate({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "current_mode_update", currentModeId },
+      });
+    }
     const texts = turn.echoPrompt
       ? [promptText(params)]
       : turn.text === undefined
@@ -320,5 +365,7 @@ class FakeAgent {
   }
 }
 
+process.stdin.resume();
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
-new AgentSideConnection((conn) => new FakeAgent(conn), stream);
+const connection = new AgentSideConnection((conn) => new FakeAgent(conn), stream);
+void connection;
