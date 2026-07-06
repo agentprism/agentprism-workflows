@@ -16,6 +16,8 @@ export type {
   AgentRequestMethod,
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
+  SessionMode,
+  SessionModeState,
   SendRequestOptions,
 } from "@agentclientprotocol/sdk";
 

@@ -31,7 +31,7 @@ export interface AgentRunner {
    *    A {result, usage} wrapper would change the frozen call — rejected.
    *
    *  - The return MUST be JSON-serializable and STABLE for a fixed resume identity
-   *    (sha256{prompt, model, tier, phase, agentType, agentDef, schema}, hashAgentCall
+   *    (sha256{prompt, model, mode-when-set, tier, phase, agentType, agentDef, schema}, hashAgentCall
    *    workflow.ts:1045-1064): the engine journals it verbatim (onAgentJournal,
    *    workflow.ts:502) and replays it on resume (:413). callIndex is assigned at
    *    LEXICAL call time before the limiter (:391), so parallel()/pipeline() fan-out

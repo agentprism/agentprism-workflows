@@ -8,7 +8,7 @@ import { runWorkflow } from "../src/workflow.js";
 // JournalEntry (workflow.ts: onAgentJournal({ index, hash, result })). The resume
 // contract is "replay a cached result iff cached.hash === hash", so this hash is the
 // load-bearing resume key: it MUST be byte-stable for a fixed call identity and MUST
-// change when any identity input (prompt / model / tier / phase / agentType / agentDef
+// change when any identity input (prompt / model / mode-when-set / tier / phase / agentType / agentDef
 // / schema) changes. These tests pin that through the observable journal.
 
 const echo = {
@@ -46,6 +46,8 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
     // resolves every identity input but the prompt to null. If anyone reorders the
     // fields or changes how an absent input is encoded, resume keys shift under old
     // journals and this assertion fails.
+    // NOTE deliberately NO `mode` key here: mode joins the identity ONLY when set, so
+    // journals written before session modes existed keep replaying for mode-less calls.
     const expectedIdentity = JSON.stringify({
       prompt: "only",
       model: null,
@@ -96,6 +98,19 @@ return a`;
     const [plain] = await journalOf(noTier);
     const [tiered] = await journalOf(withTier);
     assert.notEqual(plain.hash, tiered.hash, "adding a tier changes the resume key even for an identical prompt");
+  });
+
+  it("folds mode into the identity (mode change => different hash, same prompt/index)", async () => {
+    const noMode = `export const meta = { name: 'h-mode', description: 'hash' }
+const a = await agent('same', { label: 'a' })
+return a`;
+    const withMode = `export const meta = { name: 'h-mode', description: 'hash' }
+const a = await agent('same', { label: 'a', mode: 'read-only' })
+return a`;
+
+    const [plain] = await journalOf(noMode);
+    const [mode] = await journalOf(withMode);
+    assert.notEqual(plain.hash, mode.hash, "adding a mode changes the resume key even for an identical prompt");
   });
 
   it("folds phase into the identity (phase change => different hash)", async () => {

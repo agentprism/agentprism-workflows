@@ -82,6 +82,26 @@ return xs`;
   assert.equal(result.agentCount, 4);
 });
 
+test("agent() forwards mode to the runner options bag", async () => {
+  const seen: Array<string | undefined> = [];
+  await runWorkflow(
+    `export const meta = { name: 'mode_threading', description: 'mode threading' }
+const r = await agent('x', { label: 'mode-agent', mode: 'read-only' })
+return r`,
+    {
+      agent: {
+        async run(_prompt: string, options: { mode?: string }) {
+          seen.push(options.mode);
+          return "ok";
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(seen, ["read-only"]);
+});
+
 test("runWorkflow retries recoverable empty output then succeeds", async () => {
   let calls = 0;
   const journal: JournalEntry[] = [];

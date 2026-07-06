@@ -84,6 +84,14 @@ test("empty allow/deny arrays behave as 'no policy' (allow)", () => {
   assert.equal(selectedId(decidePermission(req({ title: "anything" }), { allow: [], deny: [] })), "allow-1");
 });
 
+test("defaultOutcome: deny flips only the no-match fallback", () => {
+  assert.equal(selectedId(decidePermission(req({ title: "anything" }), { defaultOutcome: "deny" })), "reject-1");
+  assert.equal(
+    selectedId(decidePermission(req({ title: "Read file" }), { allow: ["read"], defaultOutcome: "deny" })),
+    "allow-1",
+  );
+});
+
 test("matching is case-insensitive and bidirectional substring", () => {
   // pattern longer than the candidate name still matches (p.includes(n))
   assert.equal(selectedId(decidePermission(req({ title: "rm" }), { deny: ["rm -rf"] })), "reject-1");

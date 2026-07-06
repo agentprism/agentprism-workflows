@@ -61,6 +61,7 @@ type AnyRunOptions = RunOptions<TSchema | undefined>;
 
 interface SessionPreparationOptions {
   model?: string;
+  mode?: string;
   tier?: string;
   toolNames?: string[];
   disallowedToolNames?: string[];
@@ -198,6 +199,8 @@ export class AcpAgentRunner implements AgentRunner {
       opts.signal?.throwIfAborted();
       await applyModelSelection(session, prepared.modelSpec, opts);
       opts.signal?.throwIfAborted();
+      if (opts.mode) await session.setMode(opts.mode);
+      opts.signal?.throwIfAborted();
       if (this.disposed) throw new Error("ACP agent runner is disposed");
 
       interactive = new InteractiveSession({
@@ -260,6 +263,8 @@ export class AcpAgentRunner implements AgentRunner {
       // model id: "browser" selects nothing; "browser/foo" selects "foo". Built-ins get the
       // full spec unchanged (their catalogs match provider-prefixed and bare ids).
       await applyModelSelection(session, prepared.modelSpec, opts);
+      opts.signal?.throwIfAborted();
+      if (opts.mode) await session.setMode(opts.mode);
 
       const text = buildRunPrompt(prompt, opts, schema, prepared.backend);
       const initialPrompt =
@@ -341,7 +346,12 @@ export class AcpAgentRunner implements AgentRunner {
    *  place for run() and openSession() so new AcpSessionOptions fields cannot drift by path. */
   private prepareSession(opts: SessionPreparationOptions, config: SessionPreparationConfig): PreparedSession {
     const backend = selectBackend(opts, config.registry);
-    const policy: ToolPolicy = { allow: opts.toolNames, deny: opts.disallowedToolNames };
+    const hasPermissionResolver = Boolean(config.permissionResolver ?? this.permissionResolver);
+    const policy: ToolPolicy = {
+      allow: opts.toolNames,
+      deny: opts.disallowedToolNames,
+      defaultOutcome: opts.mode && !hasPermissionResolver ? "deny" : undefined,
+    };
     return {
       backend,
       modelSpec: innerModelSpec(opts.model ?? opts.tier, backend),

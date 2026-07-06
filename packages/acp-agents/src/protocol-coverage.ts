@@ -34,7 +34,7 @@ export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.providers_disable]: "passthrough",
   [AGENT_METHODS.session_new]: "driven",
   [AGENT_METHODS.session_load]: "passthrough",
-  [AGENT_METHODS.session_set_mode]: "passthrough",
+  [AGENT_METHODS.session_set_mode]: "driven",
   [AGENT_METHODS.session_set_config_option]: "driven",
   [AGENT_METHODS.session_prompt]: "driven",
   [AGENT_METHODS.session_cancel]: "driven",

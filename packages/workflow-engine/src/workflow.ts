@@ -175,6 +175,11 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    */
   model?: string;
   /**
+   * ACP session mode id advertised by the selected backend. Strict confinement lever:
+   * unsupported modes fail the agent call instead of falling back to an unconfined session.
+   */
+  mode?: string;
+  /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config. An explicit `model` takes precedence; a tier takes
    * precedence over the phase model. When the tier has no configured entry it
@@ -470,7 +475,14 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      agentOptions.mode,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+    );
 
     // Reserve the agent slot synchronously — atomic with the limit/budget gate
     // above (no await in between) — so a parallel() fan-out can't all observe the
@@ -562,6 +574,7 @@ export async function runWorkflow<T = unknown>(
                 signal,
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
+                mode: agentOptions.mode,
                 tier: agentOptions.tier,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
@@ -1232,6 +1245,7 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
 function hashAgentCall(
   prompt: string,
   model: string | undefined,
+  mode: string | undefined,
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
@@ -1239,6 +1253,10 @@ function hashAgentCall(
   const identity = JSON.stringify({
     prompt,
     model: model ?? null,
+    // Included only when SET: a mode changes agent behavior (must invalidate resume),
+    // but journals written before modes existed must keep replaying for mode-less
+    // calls — an unconditional `mode: null` key would cache-miss every old journal.
+    ...(mode !== undefined ? { mode } : {}),
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,

@@ -161,9 +161,13 @@ const runner = createAcpRunner({
 
 One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (backend-native structured output + validate-and-re-prompt). Key `RunOptions`:
 
-`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), callbacks `onUsage`, `onHistory`, `onModelResolved`, `onModelFallback`.
+`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), callbacks `onUsage`, `onHistory`, `onModelResolved`, `onModelFallback`.
 
 **Model specs**: `provider/modelId`, bare id, or tier word; a trailing bracket drives sibling config options — `gpt-5.1-codex[high]` sets `reasoning_effort`, `[high fast]` also enables Fast mode (boolean-typed or legacy select shape — both supported; the client advertises `session.configOptions.boolean`). Routing: `claude|opus|sonnet|haiku` → Claude; `gpt|codex|o3|o4` → Codex; registered custom-backend names route to their process. An unmatched model/modifier fires `onModelFallback` (observable, never a throw) and the session default runs.
+
+**Session modes (confinement)**: `mode` is an agent-advertised ACP session mode id. Claude-family agents commonly advertise `default`, `plan`, `acceptEdits`, `bypassPermissions`; Codex-family agents commonly advertise `read-only`, `agent`, `agent-full-access`. This is strict: if the backend advertises no modes, does not list the requested id, or rejects `session/set_mode`, the run fails before any prompt is sent.
+
+Permission posture changes when `mode` is explicit: if no `onPermissionRequest` resolver is present, the headless permission fallback flips from allow to deny. Explicit `toolNames` allow-list matches still allow; `disallowedToolNames` still deny; a resolver still decides. This prevents read-only/plan modes from being defeated by automatic escalation approval. Plan/read-only modes confine writes and escalation, not reads.
 
 ### Protocol passthrough & coverage
 
@@ -172,13 +176,10 @@ One agent call per invocation; returns the assistant text, or the **validated ob
 ```ts
 import { AGENT_METHODS } from "@automatalabs/workflows";
 
-await session.request(AGENT_METHODS.session_set_mode, {
-  sessionId: session.sessionId,
-  modeId: "plan",
-});
+await session.request(AGENT_METHODS.providers_list, {});
 ```
 
-Prefer named wrappers (`prompt()`, `setSessionConfigOption()`, `openSession()`, etc.) when they exist; they preserve engine semantics like drain accumulation and usage recording, while raw `session/prompt` bypasses them.
+Prefer named wrappers (`prompt()`, `setMode()`, `openSession()`, etc.) when they exist; they preserve engine semantics like drain accumulation, local mode state, and usage recording, while raw `session/prompt` bypasses them.
 
 `AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
 
@@ -194,11 +195,12 @@ const turn = await session.prompt("first turn");            // { stopReason, tex
 await session.prompt([{ type: "text", text: "..." }], { images });  // image blocks degrade to a
                                                                     // text note if unadvertised
 const off = session.on("agent_message_chunk", render);      // session-filtered subscription
+await session.setMode("default");                           // switch after host approval
 await session.cancel();                                     // cancel the active turn only
 await session.release();                                    // end session; pooled process survives
 ```
 
-`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `toolNames`/`disallowedToolNames`, `permissionResolver` (session-scoped, wins over runner-wide), `mcpServers`, `meta`, `retainSessionLog` (default `true`; set `false` for day-long sessions where the host keeps its own transcript).
+`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `mcpServers`, `meta`, `retainSessionLog` (default `true`; set `false` for day-long sessions where the host keeps its own transcript). `session.modes` exposes the advertised catalog and current mode.
 
 ### Capabilities
 
@@ -251,6 +253,6 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, tier?, phase?, isolation?, cwd?, mcpServers?, images?, agentType? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, mcpServers?, images?, agentType? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
 
 See the [README](../README.md#writing-workflow-scripts) for authoring guidance and examples, and [`design-notes.md`](design-notes.md) for the protocol-level design.
