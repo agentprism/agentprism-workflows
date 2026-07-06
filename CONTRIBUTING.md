@@ -52,6 +52,8 @@ AGENTPRISM_LIVE_E2E=1 pnpm --filter @automatalabs/mcp-server test
 
 CI must leave `AGENTPRISM_LIVE_E2E` unset.
 
+Because CI can never run the live e2e, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) runs it on every `git push` from a dev machine — the only place with real agent auth. It builds the workspace and drives both real backends (~30–60s, spends real tokens). Bypass a single push with `git push --no-verify` or `AGENTPRISM_SKIP_LIVE_E2E=1 git push`; CI pushes are exempt automatically (`CI` env guard).
+
 ## Releasing
 
 Versioning is managed with **[Changesets](https://github.com/changesets/changesets)**.
