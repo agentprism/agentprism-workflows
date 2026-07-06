@@ -15,6 +15,11 @@ test("client method coverage classifies every installed SDK client method", () =
   // PROTOCOL_METHODS (`$/cancel_request`) is SDK-internal JSON-RPC plumbing, not ACP surface
   // this runner serves or drives.
   assertSameSet(Object.keys(CLIENT_METHOD_COVERAGE), Object.values(CLIENT_METHODS), "client method");
+  assert.equal(
+    Object.values(CLIENT_METHOD_COVERAGE).filter((coverage) => coverage === "served").length,
+    11,
+    "client served count should match docs",
+  );
 });
 
 test("agent method coverage classifies every installed SDK agent method", () => {

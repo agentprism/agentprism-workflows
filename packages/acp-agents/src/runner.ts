@@ -52,7 +52,7 @@ import {
   type CustomBackendConfig,
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
-import type { PermissionResolver, ToolPolicy } from "./permissions.js";
+import type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 import {
   buildRunPrompt,
@@ -84,6 +84,7 @@ interface SessionPreparationConfig {
   registry: BackendRegistry;
   signal?: AbortSignal;
   permissionResolver?: PermissionResolver;
+  elicitationResolver?: ElicitationResolver;
   retainSessionLog?: boolean;
 }
 
@@ -143,6 +144,9 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Runner-wide human-in-the-loop permission resolver. When set, it replaces ToolPolicy
    *  auto-decisions for every session that does not provide its own resolver. */
   onPermissionRequest?: PermissionResolver;
+  /** Runner-wide ACP elicitation responder. When set, initialize advertises unstable
+   *  elicitation form/url support on every connection; sessions may override the resolver. */
+  onElicitation?: ElicitationResolver;
 }
 
 export class AcpAgentRunner implements AgentRunner {
@@ -158,6 +162,7 @@ export class AcpAgentRunner implements AgentRunner {
    *  so dedicated interactive connections must receive the SAME deps the pool receives. */
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly permissionResolver: PermissionResolver | undefined;
+  private readonly elicitationResolver: ElicitationResolver | undefined;
   /** Held-open interactive sessions own dedicated ACP processes outside the pool. The runner
    *  tracks their connections so dispose() can release them and the process-exit hook can
    *  synchronously kill any dedicated children if the host exits without release(). */
@@ -169,9 +174,12 @@ export class AcpAgentRunner implements AgentRunner {
   constructor(options: AcpRunnerOptions = {}) {
     this.clientHandlers = options.clientHandlers;
     this.permissionResolver = options.onPermissionRequest;
+    this.elicitationResolver = options.onElicitation;
     this.pool = new AcpAgentPool(options, {
       onEvent: this.emitEvent,
       permissionResolver: options.onPermissionRequest,
+      elicitationResolver: options.onElicitation,
+      advertiseElicitation: Boolean(options.onElicitation),
     });
     this.backends = resolveBackendRegistry(options.backends);
   }
@@ -179,7 +187,8 @@ export class AcpAgentRunner implements AgentRunner {
   /**
    * Listen in on the live ACP stream. `name` is an ACP `sessionUpdate` discriminant
    * ("agent_message_chunk", "tool_call", "usage_update", …) or one of the cross-cutting events
-   * ("session_update" catch-all, "permission_pending", "permission_request", "raw_message",
+   * ("session_update" catch-all, "permission_pending", "permission_request",
+   * "elicitation_pending", "elicitation_request", "elicitation_complete", "raw_message",
    * "session_open", "session_close", "backend_error"). The listener is typed to the event.
    * Returns an unsubscribe thunk. A pooled runner multiplexes many concurrent runs, so each
    * event carries `{ sessionId, backendId, label?, runId? }` for filtering. Listeners are
@@ -412,6 +421,7 @@ export class AcpAgentRunner implements AgentRunner {
       schema: undefined,
       registry: this.backends,
       permissionResolver: opts.permissionResolver ?? opts.onPermissionRequest,
+      elicitationResolver: opts.onElicitation,
       retainSessionLog: opts.retainSessionLog ?? false,
     });
     this.installExitHook();
@@ -460,6 +470,8 @@ export class AcpAgentRunner implements AgentRunner {
       onDead,
       onEvent: this.emitEvent,
       permissionResolver: this.permissionResolver,
+      elicitationResolver: this.elicitationResolver,
+      advertiseElicitation: Boolean(this.elicitationResolver),
       clientHandlers: this.clientHandlers,
     });
   }
@@ -482,6 +494,7 @@ export class AcpAgentRunner implements AgentRunner {
         schema: config.schema,
         policy,
         permissionResolver: config.permissionResolver,
+        elicitationResolver: config.elicitationResolver,
         signal: config.signal,
         mcpServers: opts.mcpServers,
         // Generic session-scoped _meta passthrough (RunOptions.meta) — merged UNDER the

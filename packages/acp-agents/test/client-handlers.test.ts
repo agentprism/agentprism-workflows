@@ -21,6 +21,13 @@ test("clientCapabilitiesFor: empty inputs advertise only the native session capa
   assert.deepEqual(clientCapabilitiesFor({ fs: {} }), BASE_CAPABILITIES);
 });
 
+test("clientCapabilitiesFor: elicitation is advertised only when requested", () => {
+  assert.deepEqual(clientCapabilitiesFor(undefined, { elicitation: true }), {
+    ...BASE_CAPABILITIES,
+    elicitation: { form: {}, url: {} },
+  });
+});
+
 test("clientCapabilitiesFor: fs flags are independent and only true flags are emitted", () => {
   assert.deepEqual(
     clientCapabilitiesFor({

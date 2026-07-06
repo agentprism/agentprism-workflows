@@ -72,6 +72,13 @@ export interface ClientHandlers {
   terminal?: TerminalHandlers;
 }
 
+export interface ClientCapabilityOptions {
+  /** Advertise unstable ACP elicitation support only when this connection has a runner-wide
+   *  responder. Initialize capabilities are fixed for the connection lifetime, so a later
+   *  session-scoped responder alone cannot truthfully light this up. */
+  elicitation?: boolean;
+}
+
 const TERMINAL_HANDLER_METHODS = [
   "createTerminal",
   "terminalOutput",
@@ -84,8 +91,12 @@ const TERMINAL_HANDLER_METHODS = [
  *  handlers, plus the capabilities this client supports natively regardless of handlers —
  *  boolean session config options (SessionHandle drives the catalog programmatically and
  *  handles `type: "boolean"` entries, e.g. codex-acp's Fast-mode toggle). */
-export function clientCapabilitiesFor(handlers: ClientHandlers | undefined): ClientCapabilities {
+export function clientCapabilitiesFor(
+  handlers: ClientHandlers | undefined,
+  options: ClientCapabilityOptions = {},
+): ClientCapabilities {
   const capabilities: ClientCapabilities = { session: { configOptions: { boolean: {} } } };
+  if (options.elicitation) capabilities.elicitation = { form: {}, url: {} };
   if (!handlers) return capabilities;
 
   const fs = handlers.fs;

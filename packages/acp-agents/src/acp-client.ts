@@ -30,8 +30,11 @@ import {
   PROTOCOL_VERSION,
   RequestError,
   type ClientConnection,
+  type CompleteElicitationNotification,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type ContentBlock,
   type AgentNotificationMethod,
   type AgentNotificationParamsByMethod,
@@ -93,7 +96,12 @@ import {
   type NegotiatedCapabilities,
 } from "./capabilities.js";
 import { emitSessionUpdate, type AcpEventContext, type AcpEventSink } from "./events.js";
-import { decidePermission, type PermissionResolver, type ToolPolicy } from "./permissions.js";
+import {
+  decidePermission,
+  type ElicitationResolver,
+  type PermissionResolver,
+  type ToolPolicy,
+} from "./permissions.js";
 import { UsageAccumulator } from "./usage.js";
 import {
   clientCapabilitiesFor,
@@ -145,6 +153,8 @@ class SessionState {
   readonly history: AgentHistoryEntry[] = [];
   readonly usage = new UsageAccumulator();
   readonly pendingPermissions = new Set<(outcome: RequestPermissionResponse) => void>();
+  readonly pendingElicitations = new Set<(outcome: CreateElicitationResponse) => void>();
+  readonly urlElicitationIds = new Set<string>();
   rawResultSuccess: RawResultSuccess | undefined;
   modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
@@ -155,6 +165,7 @@ class SessionState {
     readonly cwd: string,
     readonly policy: ToolPolicy,
     readonly permissionResolver?: PermissionResolver,
+    readonly elicitationResolver?: ElicitationResolver,
     readonly label?: string,
     readonly runId?: string,
     modes?: SessionModeState | null,
@@ -236,6 +247,12 @@ class SessionState {
   settlePendingPermissions(): void {
     for (const settle of [...this.pendingPermissions]) settle(cancelledPermissionResponse());
   }
+
+  /** Same teardown guarantee for elicitation/create: a parked human prompt must not survive
+   *  release/cancel/death after its ACP session is gone. */
+  settlePendingElicitations(): void {
+    for (const settle of [...this.pendingElicitations]) settle(cancelledElicitationResponse());
+  }
 }
 
 /** The single client-side handler set for one pooled connection (registered on the SDK's fluent
@@ -244,6 +261,7 @@ class SessionState {
  *  streams crossing. */
 class MultiplexClient {
   private readonly sessions = new Map<string, SessionState>();
+  private readonly urlElicitationContexts = new Map<string, AcpEventContext>();
   /** Recently unregistered sessions kept ONLY for the teardown window: ACP agents may
    *  legitimately release terminals (or finish fs/terminal cleanup) after this client releases
    *  the session because session/close is cancel + free resources and the Agent owns terminal
@@ -258,6 +276,7 @@ class MultiplexClient {
     private readonly onEvent?: AcpEventSink,
     private readonly handlers?: ClientHandlers,
     private readonly permissionResolver?: PermissionResolver,
+    private readonly elicitationResolver?: ElicitationResolver,
   ) {}
 
   private contextFor(sessionId: string, state: SessionState | undefined): AcpEventContext {
@@ -291,8 +310,10 @@ class MultiplexClient {
   unregister(sessionId: string): void {
     const state = this.sessions.get(sessionId);
     state?.settlePendingPermissions();
+    state?.settlePendingElicitations();
     this.sessions.delete(sessionId);
     if (state) {
+      for (const elicitationId of state.urlElicitationIds) this.urlElicitationContexts.delete(elicitationId);
       this.tombstones.set(sessionId, {
         cwd: state.cwd,
         label: state.label,
@@ -311,9 +332,19 @@ class MultiplexClient {
     this.sessions.get(sessionId)?.settlePendingPermissions();
   }
 
+  settlePendingElicitations(sessionId: string): void {
+    this.sessions.get(sessionId)?.settlePendingElicitations();
+  }
+
   settleAllPendingPermissions(): void {
     for (const state of this.sessions.values()) {
       state.settlePendingPermissions();
+    }
+  }
+
+  settleAllPendingElicitations(): void {
+    for (const state of this.sessions.values()) {
+      state.settlePendingElicitations();
     }
   }
 
@@ -369,6 +400,77 @@ class MultiplexClient {
     });
     response.catch(() => {});
     return response;
+  }
+
+  requestElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> | CreateElicitationResponse {
+    const sessionId = sessionIdFromElicitationRequest(params);
+    if (!sessionId) return declinedElicitationResponse();
+
+    const state = this.sessions.get(sessionId);
+    const ctx = this.contextFor(sessionId, state);
+    // Unknown/closed session: decline rather than asking a human for a prompt we cannot route.
+    if (!state) {
+      const outcome = declinedElicitationResponse();
+      this.onEvent?.("elicitation_request", { ...ctx, request: params, outcome });
+      return outcome;
+    }
+
+    this.trackUrlElicitation(params, state, ctx);
+    const resolver = state.elicitationResolver ?? this.elicitationResolver;
+    if (resolver) return this.requestElicitationViaResolver(params, state, ctx, resolver);
+
+    const outcome = declinedElicitationResponse();
+    this.onEvent?.("elicitation_request", { ...ctx, request: params, outcome });
+    return outcome;
+  }
+
+  private requestElicitationViaResolver(
+    params: CreateElicitationRequest,
+    state: SessionState,
+    ctx: AcpEventContext,
+    resolver: ElicitationResolver,
+  ): Promise<CreateElicitationResponse> {
+    let settled = false;
+    let settle!: (outcome: CreateElicitationResponse) => void;
+    const response = new Promise<CreateElicitationResponse>((resolve) => {
+      settle = (outcome) => {
+        if (settled) return;
+        settled = true;
+        state.pendingElicitations.delete(settle);
+        this.onEvent?.("elicitation_request", { ...ctx, request: params, outcome });
+        resolve(outcome);
+      };
+      state.pendingElicitations.add(settle);
+      this.onEvent?.("elicitation_pending", { ...ctx, request: params });
+
+      try {
+        Promise.resolve(resolver(params, ctx)).then(
+          (outcome) => {
+            settle(outcome);
+          },
+          () => {
+            // Resolver failure is observable as the FINAL cancel outcome; no extra error event is
+            // needed, and the prompt turn continues instead of hanging behind a rejected promise.
+            settle(cancelledElicitationResponse());
+          },
+        );
+      } catch {
+        settle(cancelledElicitationResponse());
+      }
+    });
+    response.catch(() => {});
+    return response;
+  }
+
+  private trackUrlElicitation(
+    params: CreateElicitationRequest,
+    state: SessionState,
+    ctx: AcpEventContext,
+  ): void {
+    const elicitationId = urlElicitationId(params);
+    if (!elicitationId) return;
+    state.urlElicitationIds.add(elicitationId);
+    this.urlElicitationContexts.set(elicitationId, ctx);
   }
 
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> | ReadTextFileResponse {
@@ -433,6 +535,14 @@ class MultiplexClient {
       message: rawMessage,
     });
   }
+
+  elicitationComplete(params: CompleteElicitationNotification): void {
+    const ctx = this.urlElicitationContexts.get(params.elicitationId);
+    if (!ctx) return;
+    this.urlElicitationContexts.delete(params.elicitationId);
+    this.sessions.get(ctx.sessionId)?.urlElicitationIds.delete(params.elicitationId);
+    this.onEvent?.("elicitation_complete", { ...ctx, notification: params });
+  }
 }
 
 function unknownSession(sessionId: string): RequestError {
@@ -441,6 +551,24 @@ function unknownSession(sessionId: string): RequestError {
 
 function cancelledPermissionResponse(): RequestPermissionResponse {
   return { outcome: { outcome: "cancelled" } };
+}
+
+function declinedElicitationResponse(): CreateElicitationResponse {
+  return { action: "decline" };
+}
+
+function cancelledElicitationResponse(): CreateElicitationResponse {
+  return { action: "cancel" };
+}
+
+function sessionIdFromElicitationRequest(params: CreateElicitationRequest): string | undefined {
+  return "sessionId" in params && typeof params.sessionId === "string" ? params.sessionId : undefined;
+}
+
+function urlElicitationId(params: CreateElicitationRequest): string | undefined {
+  return params.mode === "url" && "elicitationId" in params && typeof params.elicitationId === "string"
+    ? params.elicitationId
+    : undefined;
 }
 
 function methodNotAdvertised(method: string): RequestError {
@@ -550,6 +678,9 @@ export interface AcpSessionOptions {
   /** Session-scoped permission resolver. When present it wins over the runner default and
    *  replaces the synchronous ToolPolicy auto-response path for this session. */
   permissionResolver?: PermissionResolver;
+  /** Session-scoped elicitation resolver. When present it wins over the runner default for this
+   *  session; initialize-time advertisement still depends on the runner-wide resolver. */
+  elicitationResolver?: ElicitationResolver;
   signal?: AbortSignal;
   /** Client-provided MCP servers to attach at session/new. Omitted => `[]` (the default). */
   mcpServers?: McpServerConfig[];
@@ -582,6 +713,11 @@ export interface PooledConnectionDeps {
   onEvent?: AcpEventSink;
   /** Runner-wide permission resolver default. SessionState.permissionResolver overrides it. */
   permissionResolver?: PermissionResolver;
+  /** Runner-wide elicitation resolver default. SessionState.elicitationResolver overrides it. */
+  elicitationResolver?: ElicitationResolver;
+  /** Initialize-time elicitation advertisement; fixed per connection, so it is driven by the
+   *  runner-wide resolver rather than session-scoped responders attached later. */
+  advertiseElicitation?: boolean;
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
 }
@@ -612,6 +748,7 @@ export class PooledConnection {
   private readonly onDead: (connection: PooledConnection) => void;
   private readonly onEvent: AcpEventSink | undefined;
   private readonly clientHandlers: ClientHandlers | undefined;
+  private readonly advertiseElicitation: boolean;
   /** Set true at the start of dispose() so the graceful-shutdown death is NOT reported as a crash. */
   private disposing = false;
   /** Resolves once `initialize` completed (or rejects if the process died first). */
@@ -633,7 +770,14 @@ export class PooledConnection {
     this.onDead = deps.onDead;
     this.onEvent = deps.onEvent;
     this.clientHandlers = deps.clientHandlers;
-    this.client = new MultiplexClient(this.backendId, this.onEvent, deps.clientHandlers, deps.permissionResolver);
+    this.advertiseElicitation = deps.advertiseElicitation ?? Boolean(deps.elicitationResolver);
+    this.client = new MultiplexClient(
+      this.backendId,
+      this.onEvent,
+      deps.clientHandlers,
+      deps.permissionResolver,
+      deps.elicitationResolver,
+    );
 
     const { command, args, env } = backend.spawnConfig();
     // NOTE: deliberately NO `cwd` here. cwd is per-SESSION (session/new), so one pooled process
@@ -682,7 +826,9 @@ export class PooledConnection {
         (params: unknown) => (params ?? {}) as Record<string, unknown>,
         ({ params }) => this.client.extNotification(CLAUDE_RAW_MESSAGE_METHOD, params),
       )
+      .onNotification(CLIENT_METHODS.elicitation_complete, ({ params }) => this.client.elicitationComplete(params))
       .onRequest(CLIENT_METHODS.session_request_permission, ({ params }) => this.client.requestPermission(params))
+      .onRequest(CLIENT_METHODS.elicitation_create, ({ params }) => this.client.requestElicitation(params))
       .onRequest(CLIENT_METHODS.fs_read_text_file, ({ params }) => this.client.readTextFile(params))
       .onRequest(CLIENT_METHODS.fs_write_text_file, ({ params }) => this.client.writeTextFile(params))
       .onRequest(CLIENT_METHODS.terminal_create, ({ params }) => this.client.createTerminal(params))
@@ -792,6 +938,7 @@ export class PooledConnection {
     this.deathError = error;
     this.resolveDead();
     this.client.settleAllPendingPermissions();
+    this.client.settleAllPendingElicitations();
     // A crash (not a graceful dispose) is worth surfacing for observability; the engine still
     // handles it by retrying the run on a fresh process. Best-effort, after death is recorded.
     if (this.onEvent && !this.disposing) {
@@ -842,7 +989,9 @@ export class PooledConnection {
             protocolVersion: PROTOCOL_VERSION,
             // Truthful advertisement: computed from the consumer-provided handlers registered on
             // this runner. Omitted flags are unsupported; false flags are never sent deliberately.
-            clientCapabilities: clientCapabilitiesFor(this.clientHandlers),
+            clientCapabilities: clientCapabilitiesFor(this.clientHandlers, {
+              elicitation: this.advertiseElicitation,
+            }),
             clientInfo: { ...CLIENT_INFO },
           }),
         ),
@@ -902,6 +1051,7 @@ export class PooledConnection {
         opts.cwd,
         opts.policy,
         opts.permissionResolver,
+        opts.elicitationResolver,
         opts.label,
         opts.runId,
         response.modes,
@@ -944,6 +1094,7 @@ export class PooledConnection {
       opts.cwd,
       opts.policy,
       opts.permissionResolver,
+      opts.elicitationResolver,
       opts.label,
       opts.runId,
       undefined,
@@ -1053,6 +1204,7 @@ export class PooledConnection {
   /** Best-effort ACP cancel for one session (wired to opts.signal). The PROCESS stays pooled. */
   async cancelSession(sessionId: string): Promise<void> {
     this.client.settlePendingPermissions(sessionId);
+    this.client.settlePendingElicitations(sessionId);
     if (!this._alive) return;
     try {
       await this.connection.agent.notify(AGENT_METHODS.session_cancel, { sessionId });

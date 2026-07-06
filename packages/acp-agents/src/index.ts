@@ -21,8 +21,24 @@ export type {
   AgentRequestMethod,
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
+  CompleteElicitationNotification,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   DeleteSessionRequest,
   DeleteSessionResponse,
+  ElicitationAcceptAction,
+  ElicitationCapabilities,
+  ElicitationContentValue,
+  ElicitationFormCapabilities,
+  ElicitationFormMode,
+  ElicitationId,
+  ElicitationPropertySchema,
+  ElicitationRequestScope,
+  ElicitationSchema,
+  ElicitationSchemaType,
+  ElicitationSessionScope,
+  ElicitationUrlCapabilities,
+  ElicitationUrlMode,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadSessionRequest,
@@ -62,7 +78,13 @@ export type { AcpPoolOptions, AcpPoolDeps } from "./pool.js";
 // Consumer-provided client-side ACP handlers: fs/terminal routing plus truthful initialize
 // clientCapabilities derived from the registered handler set.
 export { clientCapabilitiesFor } from "./client-handlers.js";
-export type { AcpSessionContext, ClientHandlers, FsHandlers, TerminalHandlers } from "./client-handlers.js";
+export type {
+  AcpSessionContext,
+  ClientCapabilityOptions,
+  ClientHandlers,
+  FsHandlers,
+  TerminalHandlers,
+} from "./client-handlers.js";
 
 // The typed ACP event bus surfaced on AcpAgentRunner (`runner.on(name, evt => …)`).
 export { ACP_CROSS_CUTTING_EVENT_NAMES, TypedEventEmitter, emitSessionUpdate } from "./events.js";
@@ -74,6 +96,9 @@ export type {
   AcpEventSink,
   AcpSessionUpdate,
   AcpUpdateKind,
+  AcpElicitationCompleteEvent,
+  AcpElicitationEvent,
+  AcpElicitationPendingEvent,
   AcpPermissionPendingEvent,
   AcpPermissionEvent,
   AcpRawMessageEvent,
@@ -93,7 +118,7 @@ export { CodexBackend } from "./backends/codex.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
 export { decidePermission } from "./permissions.js";
-export type { PermissionResolver, ToolPolicy } from "./permissions.js";
+export type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 
 export { UsageAccumulator } from "./usage.js";
 
