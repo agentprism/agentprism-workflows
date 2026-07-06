@@ -25,6 +25,7 @@ interface LogEntry {
     clientCapabilities?: {
       fs?: { readTextFile?: boolean; writeTextFile?: boolean };
       terminal?: boolean;
+      session?: { configOptions?: { boolean?: Record<string, never> } };
     };
   };
 }
@@ -46,6 +47,9 @@ function advertisedTrueCapabilities(log: LogEntry[]): ClientCapabilities {
   if (caps?.fs?.writeTextFile === true) fs.writeTextFile = true;
   if (Object.keys(fs).length > 0) advertised.fs = fs;
   if (caps?.terminal === true) advertised.terminal = true;
+  // Handler-independent native capability: comparing it through to clientCapabilitiesFor
+  // also proves it actually crossed the wire at initialize.
+  if (caps?.session?.configOptions?.boolean) advertised.session = { configOptions: { boolean: {} } };
   return advertised;
 }
 
@@ -149,7 +153,10 @@ test("unregistered fs/read_text_file returns a JSON-RPC error, not an empty obje
   const out = await makeRunner().run("hi", { model: "codex", cwd });
 
   assert.equal(out, "ok");
-  assert.deepEqual(advertisedTrueCapabilities(readLog()), {});
+  // No handlers registered => only the handler-independent session capability is advertised.
+  assert.deepEqual(advertisedTrueCapabilities(readLog()), {
+    session: { configOptions: { boolean: {} } },
+  });
   const call = clientCall(readLog(), "fs/read_text_file", "read");
   assert.equal(call?.response, undefined);
   assert.equal(call?.error?.name, "RequestError");
