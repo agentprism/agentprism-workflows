@@ -12,7 +12,7 @@ import type {
   SessionModeState,
   StopReason,
 } from "@agentclientprotocol/sdk";
-import type { McpServerConfig, PromptImage } from "@automatalabs/shared-types";
+import type { AgentHistoryEntry, McpServerConfig, PromptImage } from "@automatalabs/shared-types";
 import type { RunOptions } from "@automatalabs/shared-types";
 import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
@@ -61,6 +61,8 @@ export interface InteractiveSessionOptions {
   developerInstructions?: string;
   /** Client-provided MCP servers to attach at session/new. */
   mcpServers?: McpServerConfig[];
+  /** Keep accumulated text/history after each prompt turn; default false for held-open sessions. */
+  retainSessionLog?: boolean;
   /** Host-owned cancellation. Aborting releases this interactive session. */
   signal?: AbortSignal;
 }
@@ -143,6 +145,16 @@ export class InteractiveSession {
   /** Agent-advertised session mode catalog plus the currently active mode, if supported. */
   get modes(): SessionModeState | null | undefined {
     return this.session.modes;
+  }
+
+  /** Assistant text accumulated in this session's retained log. */
+  get text(): string {
+    return this.session.text;
+  }
+
+  /** Message/tool history accumulated in this session's retained log. */
+  get history(): readonly AgentHistoryEntry[] {
+    return this.session.history;
   }
 
   /** Send one prompt turn. A concurrent prompt on the same InteractiveSession is rejected with a

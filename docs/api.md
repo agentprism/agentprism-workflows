@@ -181,7 +181,9 @@ await session.request(AGENT_METHODS.providers_list, {});
 
 Prefer named wrappers (`prompt()`, `setMode()`, `openSession()`, etc.) when they exist; they preserve engine semantics like drain accumulation, local mode state, and usage recording, while raw `session/prompt` bypasses them.
 
-`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
+Raw `request()` rejects the session-stateful methods that would create or reopen sessions outside the router: `session/new` (use `openSession()`), `session/load` (use `loadSession()`), `session/resume` (use `resumeSession()`), and `session/fork` (no driven wrapper yet). Those raw sessions are unregistered: updates do not fold into an accumulator, permission requests auto-cancel, and fs/terminal dispatch fails for unknown sessions.
+
+`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
 
 ### <a name="runner-events"></a>Events (`runner.on(name, listener)`)
 
@@ -200,7 +202,21 @@ await session.cancel();                                     // cancel the active
 await session.release();                                    // end session; pooled process survives
 ```
 
-`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `mcpServers`, `meta`, `retainSessionLog` (default `true`; set `false` for day-long sessions where the host keeps its own transcript). `session.modes` exposes the advertised catalog and current mode.
+`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `mcpServers`, `meta`, `retainSessionLog` (default `false` for held-open sessions; set `true` when the host wants the runner to keep the full transcript). `session.text` / `session.history` expose the retained assistant text and message/tool history; `session.modes` exposes the advertised catalog and current mode.
+
+**Session lifecycle (reattach)**:
+
+```ts
+const listed = await runner.listSessions({ model: "claude", cwd: "/abs/dir", cursor });
+await runner.deleteSession({ model: "claude", sessionId });
+
+const loaded = await runner.loadSession({ sessionId, cwd: "/abs/dir" });
+const resumed = await runner.resumeSession({ sessionId, cwd: "/abs/dir" });
+```
+
+`listSessions()` returns the SDK `ListSessionsResponse` (`sessions: SessionInfo[]`, plus `nextCursor?`); `deleteSession()` resolves to `void`. `loadSession()` and `resumeSession()` return live `InteractiveSession`s tracked and released like `openSession()` sessions. They accept the same session-scoped fields as `openSession()` plus the required `sessionId`; `mcpServers` defaults to `[]` on the wire. `loadSession()` registers the caller-supplied id before sending `session/load`, so replayed `session/update` history is accumulated and permissions during replay are routed. After it resolves, replay is visible in `session.text` / `session.history`. `resumeSession()` reattaches without replay. Both adopt response `configOptions`/`modes`, so model config selection is applied only when the reopened session advertises it, and `mode` is applied strictly from the response mode catalog.
+
+Lifecycle methods are capability-gated after initialize. Missing support throws a non-recoverable `WorkflowError` naming the backend, method, and advertised lifecycle capabilities. The installed `@agentclientprotocol/claude-agent-acp@0.56.0` and `@automatalabs/codex-acp@1.4.0` both advertise `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close.
 
 ### Capabilities
 

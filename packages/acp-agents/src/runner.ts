@@ -24,7 +24,12 @@ import {
   type AgentRunner,
   type RunOptions,
 } from "@automatalabs/shared-types";
-import type { StopReason } from "@agentclientprotocol/sdk";
+import type {
+  DeleteSessionRequest,
+  ListSessionsRequest,
+  ListSessionsResponse,
+  StopReason,
+} from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
 import { PooledConnection, type AcpSessionOptions, type SessionHandle } from "./acp-client.js";
 import { AcpAgentPool, type AcpPoolOptions } from "./pool.js";
@@ -87,6 +92,47 @@ interface PreparedSession {
   modelSpec: string | undefined;
   sessionOptions: AcpSessionOptions;
 }
+
+interface LifecycleRoutingOptions {
+  /** Model spec used only to select the backend process. */
+  model?: string;
+  /** Coarse tier consulted only when `model` is unset. */
+  tier?: string;
+  /** Event/telemetry label used in strict capability errors. */
+  label?: string;
+  /** Host-owned cancellation while the lifecycle request is in flight. */
+  signal?: AbortSignal;
+}
+
+/** Options for AcpAgentRunner.listSessions(). */
+export interface ListSessionsOptions extends LifecycleRoutingOptions {
+  /** Optional absolute working-directory filter. */
+  cwd?: string;
+  /** Opaque pagination cursor from the previous response. */
+  cursor?: string;
+  /** Generic ACP `_meta` passthrough for session/list. */
+  meta?: Record<string, unknown>;
+}
+
+/** Options for AcpAgentRunner.deleteSession(). */
+export interface DeleteSessionOptions extends LifecycleRoutingOptions {
+  /** Session id returned by session/list or previously persisted by the backend. */
+  sessionId: string;
+  /** Generic ACP `_meta` passthrough for session/delete. */
+  meta?: Record<string, unknown>;
+}
+
+/** Options for AcpAgentRunner.loadSession() and resumeSession(). */
+export interface ReattachSessionOptions extends InteractiveSessionOptions {
+  /** Existing backend session id to route before the lifecycle request is sent. */
+  sessionId: string;
+  /** Alias for onPermissionRequest for hosts that name the resolver by role. */
+  permissionResolver?: PermissionResolver;
+}
+
+type InteractiveAssemblyOptions = InteractiveSessionOptions & {
+  readonly permissionResolver?: PermissionResolver;
+};
 
 /** Constructor options for the runner: pool sizing, client-side handlers, and the custom-backend
  *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
@@ -168,65 +214,75 @@ export class AcpAgentRunner implements AgentRunner {
    * is one).
    */
   async openSession(opts: InteractiveSessionOptions): Promise<InteractiveSession> {
+    return this.createInteractiveSession(opts, "openSession", (connection, prepared) =>
+      connection.openSession(prepared.sessionOptions),
+    );
+  }
+
+  /** List persisted ACP sessions from the selected backend. */
+  async listSessions(opts: ListSessionsOptions = {}): Promise<ListSessionsResponse> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
-    validateInteractiveCwd(opts.cwd, opts.label);
+    validateOptionalLifecycleCwd(opts.cwd, opts.label, "listSessions");
     opts.signal?.throwIfAborted();
 
-    const prepared = this.prepareSession(opts, {
-      cwd: opts.cwd,
-      schema: undefined,
-      registry: this.backends,
-      permissionResolver: opts.onPermissionRequest,
-      retainSessionLog: false,
-    });
-    this.installExitHook();
-    let interactive: InteractiveSession | undefined;
-    const connection = PooledConnection.create(prepared.backend, {
-      onDead: () => {
-        // Dedicated connections are not stored in pool arrays, so there is nothing to evict.
-        // Once the public wrapper exists, process death releases it through the normal path:
-        // subscriptions are removed, session_close is emitted, and future prompt() calls fail
-        // with the clean released-session error. Before then, openSession's catch tears down.
-        void interactive?.release();
-      },
-      onEvent: this.emitEvent,
-      permissionResolver: this.permissionResolver,
-      clientHandlers: this.clientHandlers,
-    });
-    let session: SessionHandle | undefined;
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
     try {
-      session = await connection.openSession(prepared.sessionOptions);
-      opts.signal?.throwIfAborted();
-      await applyModelSelection(session, prepared.modelSpec, opts);
-      opts.signal?.throwIfAborted();
-      if (opts.mode) await session.setMode(opts.mode);
+      const request: ListSessionsRequest = {
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts.cursor ? { cursor: opts.cursor } : {}),
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      const response = await connection.listSessions(request, opts.label);
       opts.signal?.throwIfAborted();
       if (this.disposed) throw new Error("ACP agent runner is disposed");
-
-      interactive = new InteractiveSession({
-        session,
-        connection,
-        backend: prepared.backend,
-        subscribe: (name, listener) => this.events.on(name, listener),
-        onRelease: (self) => this.interactiveSessions.delete(self),
-        signal: opts.signal,
-        label: opts.label,
-      });
-      this.interactiveSessions.set(interactive, connection);
-      return interactive;
-    } catch (error) {
-      try {
-        await session?.release();
-      } catch {
-        // best-effort: openSession failed, so teardown must never mask the real error.
-      }
-      try {
-        await connection.dispose();
-      } catch {
-        // best-effort: same as pool teardown.
-      }
-      throw error;
+      return response;
+    } finally {
+      await disposeBestEffort(connection);
     }
+  }
+
+  /** Delete a persisted ACP session from the selected backend. */
+  async deleteSession(opts: DeleteSessionOptions): Promise<void> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    if (typeof opts.sessionId !== "string" || opts.sessionId.trim() === "") {
+      throw new WorkflowError(
+        "deleteSession requires sessionId to be a non-empty string",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: opts.label },
+      );
+    }
+    opts.signal?.throwIfAborted();
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const request: DeleteSessionRequest = {
+        sessionId: opts.sessionId,
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      await connection.deleteSession(request, opts.label);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** Load an existing ACP session and return a live, routed InteractiveSession. */
+  async loadSession(opts: ReattachSessionOptions): Promise<InteractiveSession> {
+    validateLifecycleSessionId(opts.sessionId, opts.label, "loadSession");
+    return this.createInteractiveSession(opts, "loadSession", (connection, prepared) =>
+      connection.loadSession(opts.sessionId, prepared.sessionOptions),
+    );
+  }
+
+  /** Resume an existing ACP session without replay and return a live, routed InteractiveSession. */
+  async resumeSession(opts: ReattachSessionOptions): Promise<InteractiveSession> {
+    validateLifecycleSessionId(opts.sessionId, opts.label, "resumeSession");
+    return this.createInteractiveSession(opts, "resumeSession", (connection, prepared) =>
+      connection.resumeSession(opts.sessionId, prepared.sessionOptions),
+    );
   }
 
   async run<S extends TSchema | undefined = undefined>(
@@ -340,6 +396,72 @@ export class AcpAgentRunner implements AgentRunner {
     await Promise.all(sessions.map((session) => session.release()));
     await this.pool.dispose();
     this.events.removeAllListeners();
+  }
+
+  private async createInteractiveSession(
+    opts: InteractiveAssemblyOptions,
+    methodName: "openSession" | "loadSession" | "resumeSession",
+    open: (connection: PooledConnection, prepared: PreparedSession) => Promise<SessionHandle>,
+  ): Promise<InteractiveSession> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    validateInteractiveCwd(opts.cwd, opts.label, methodName);
+    opts.signal?.throwIfAborted();
+
+    const prepared = this.prepareSession(opts, {
+      cwd: opts.cwd,
+      schema: undefined,
+      registry: this.backends,
+      permissionResolver: opts.permissionResolver ?? opts.onPermissionRequest,
+      retainSessionLog: opts.retainSessionLog ?? false,
+    });
+    this.installExitHook();
+    let interactive: InteractiveSession | undefined;
+    const connection = this.createDedicatedConnection(prepared.backend, () => {
+      // Dedicated connections are not stored in pool arrays, so there is nothing to evict.
+      // Once the public wrapper exists, process death releases it through the normal path:
+      // subscriptions are removed, session_close is emitted, and future prompt() calls fail
+      // with the clean released-session error. Before then, this method's catch tears down.
+      void interactive?.release();
+    });
+    let session: SessionHandle | undefined;
+    try {
+      session = await open(connection, prepared);
+      opts.signal?.throwIfAborted();
+      await applyModelSelection(session, prepared.modelSpec, opts);
+      opts.signal?.throwIfAborted();
+      if (opts.mode) await session.setMode(opts.mode);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+
+      interactive = new InteractiveSession({
+        session,
+        connection,
+        backend: prepared.backend,
+        subscribe: (name, listener) => this.events.on(name, listener),
+        onRelease: (self) => this.interactiveSessions.delete(self),
+        signal: opts.signal,
+        label: opts.label,
+      });
+      this.interactiveSessions.set(interactive, connection);
+      return interactive;
+    } catch (error) {
+      try {
+        await session?.release();
+      } catch {
+        // best-effort: lifecycle setup failed, so teardown must never mask the real error.
+      }
+      await disposeBestEffort(connection);
+      throw error;
+    }
+  }
+
+  private createDedicatedConnection(backend: Backend, onDead: () => void): PooledConnection {
+    return PooledConnection.create(backend, {
+      onDead,
+      onEvent: this.emitEvent,
+      permissionResolver: this.permissionResolver,
+      clientHandlers: this.clientHandlers,
+    });
   }
 
   /** Build the backend choice, model-selection spec, tool policy, and session/new options in one
@@ -493,13 +615,36 @@ function innerModelSpec(spec: string | undefined, backend: Backend): string | un
 
 /** Interactive sessions are public and long-lived, so fail before spawning a dedicated process
  *  when the required worktree root is absent or not absolute. */
-function validateInteractiveCwd(cwd: string, label?: string): void {
+function validateInteractiveCwd(cwd: string, label: string | undefined, methodName: string): void {
   if (typeof cwd !== "string" || cwd.trim() === "" || !isAbsolute(cwd)) {
     throw new WorkflowError(
-      "openSession requires cwd to be a non-empty absolute path",
+      `${methodName} requires cwd to be a non-empty absolute path`,
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false, agentLabel: label },
     );
+  }
+}
+
+function validateOptionalLifecycleCwd(cwd: string | undefined, label: string | undefined, methodName: string): void {
+  if (cwd === undefined || cwd === null) return;
+  validateInteractiveCwd(cwd, label, methodName);
+}
+
+function validateLifecycleSessionId(sessionId: string, label: string | undefined, methodName: string): void {
+  if (typeof sessionId !== "string" || sessionId.trim() === "") {
+    throw new WorkflowError(
+      `${methodName} requires sessionId to be a non-empty string`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false, agentLabel: label },
+    );
+  }
+}
+
+async function disposeBestEffort(connection: PooledConnection): Promise<void> {
+  try {
+    await connection.dispose();
+  } catch {
+    // Dedicated lifecycle processes are already no longer useful; never mask the request result.
   }
 }
 

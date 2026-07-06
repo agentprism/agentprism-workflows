@@ -31,6 +31,7 @@ const scenario = JSON.parse(process.env.AGENTPRISM_FAKE_SCENARIO ?? "{}");
 const logPath = process.env.AGENTPRISM_FAKE_LOG;
 const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
+const hasLifecycleSupport = scenario.lifecycleSupport === true;
 
 function record(entry) {
   if (!logPath) return;
@@ -56,6 +57,17 @@ function serializeError(error) {
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function scenarioModesFor(block) {
+  if (block && Object.prototype.hasOwnProperty.call(block, "modes")) return clone(block.modes);
+  return hasScenarioModes ? clone(scenario.modes) : undefined;
+}
+
+function scenarioConfigOptionsFor(block, fallback) {
+  return block && Object.prototype.hasOwnProperty.call(block, "configOptions")
+    ? clone(block.configOptions)
+    : clone(fallback);
 }
 
 // Lifecycle markers so the test can assert ONE spawn and a clean close on dispose.
@@ -140,9 +152,15 @@ class FakeAgent {
     // backend that advertises session/close (so the runner releases sessions without killing the
     // pooled process) — the shape every other test relies on.
     if (scenario.initialize) return scenario.initialize;
+    const sessionCapabilities = hasLifecycleSupport
+      ? { close: {}, resume: {}, list: {}, delete: {}, additionalDirectories: {} }
+      : { close: {} };
     return {
       protocolVersion: PROTOCOL_VERSION,
-      agentCapabilities: { sessionCapabilities: { close: {} } },
+      agentCapabilities: {
+        ...(hasLifecycleSupport ? { loadSession: true } : {}),
+        sessionCapabilities,
+      },
     };
   }
 
@@ -159,6 +177,72 @@ class FakeAgent {
       configOptions: this.configOptions,
       ...(hasScenarioModes ? { modes } : {}),
     };
+  }
+
+  async loadSession(params) {
+    record({ method: "loadSession", params });
+    const load = scenario.loadSession ?? {};
+    const modes = scenarioModesFor(load);
+    if (modes) this.modesBySession.set(params.sessionId, modes);
+    const configOptions = scenarioConfigOptionsFor(load, this.configOptions);
+    this.configOptions = configOptions;
+
+    if (load.toolCall) {
+      const response = await this.conn.requestPermission({
+        sessionId: params.sessionId,
+        toolCall: {
+          toolCallId: "load-tc-1",
+          title: load.toolCall.title,
+          kind: load.toolCall.kind,
+          ...(load.toolCall.meta ? { _meta: load.toolCall.meta } : {}),
+        },
+        options: load.toolCall.options ?? [
+          { optionId: "allow-1", name: "Allow", kind: "allow_once" },
+          { optionId: "reject-1", name: "Reject", kind: "reject_once" },
+        ],
+      });
+      record({ method: "permissionOutcome", phase: "load", outcome: response.outcome });
+    }
+
+    const replay =
+      load.replay === undefined
+        ? []
+        : Array.isArray(load.replay)
+          ? load.replay
+          : [load.replay];
+    for (const text of replay) {
+      await this.conn.sessionUpdate({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+      });
+    }
+    return {
+      configOptions,
+      ...(modes ? { modes } : {}),
+    };
+  }
+
+  resumeSession(params) {
+    record({ method: "resumeSession", params });
+    const resume = scenario.resumeSession ?? {};
+    const modes = scenarioModesFor(resume);
+    if (modes) this.modesBySession.set(params.sessionId, modes);
+    const configOptions = scenarioConfigOptionsFor(resume, this.configOptions);
+    this.configOptions = configOptions;
+    return {
+      configOptions,
+      ...(modes ? { modes } : {}),
+    };
+  }
+
+  listSessions(params) {
+    record({ method: "listSessions", params });
+    return clone(scenario.listSessions ?? { sessions: [] });
+  }
+
+  deleteSession(params) {
+    record({ method: "deleteSession", params });
+    return clone(scenario.deleteSession ?? {});
   }
 
   async closeSession(params) {

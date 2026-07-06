@@ -40,6 +40,12 @@ import {
   type AgentRequestResponsesByMethod,
   type KillTerminalRequest,
   type KillTerminalResponse,
+  type DeleteSessionRequest,
+  type DeleteSessionResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
@@ -49,6 +55,8 @@ import {
   type ReleaseTerminalResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse,
   type SendRequestOptions,
   type SessionConfigOption,
   type SessionConfigSelectOption,
@@ -77,6 +85,7 @@ import {
 import type { Backend, BackendId, StructuredSource } from "./backend.js";
 import {
   adaptPromptContent,
+  describeLifecycleAdvertisement,
   gateCustomMeta,
   isSupportedProtocolVersion,
   negotiateCapabilities,
@@ -107,6 +116,15 @@ const CLOSE_SESSION_TIMEOUT_MS = 5_000;
 /** Bound the graceful SIGTERM shutdown before escalating to SIGKILL. */
 const DISPOSE_SIGKILL_GRACE_MS = 2_000;
 const TOMBSTONE_SESSION_CAP = 64;
+const GUARDED_STATEFUL_REQUESTS = new Map<string, string>([
+  [AGENT_METHODS.session_new, "use openSession()"],
+  [AGENT_METHODS.session_load, "use loadSession()"],
+  [AGENT_METHODS.session_resume, "use resumeSession()"],
+  [
+    AGENT_METHODS.session_fork,
+    "no driven wrapper yet; raw forked sessions cannot be routed (permissions auto-cancel)",
+  ],
+]);
 
 interface RawResultSuccess {
   type: string;
@@ -429,6 +447,16 @@ function methodNotAdvertised(method: string): RequestError {
   return new RequestError(-32601, `${method} was not advertised by this client`, { method });
 }
 
+function assertSafeRawRequest(method: string): void {
+  const guidance = GUARDED_STATEFUL_REQUESTS.get(method);
+  if (!guidance) return;
+  throw new Error(
+    `Raw ACP request "${method}" is guarded: ${guidance}. Sessions created, reopened, or forked ` +
+      "outside the router are unregistered: session/update notifications do not fold into an " +
+      "accumulator, permission requests auto-cancel, and fs/terminal dispatch fails for unknown sessions.",
+  );
+}
+
 function modeIds(modes: SessionModeState | null | undefined): string[] {
   return modes?.availableModes.map((mode) => mode.id) ?? [];
 }
@@ -446,6 +474,22 @@ function modeSelectionError(
     `ACP agent (${backendId}) cannot apply session mode "${requested}" (advertised modes: ${advertised})${suffix}`,
     WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
     { recoverable: false, agentLabel: label, details: cause },
+  );
+}
+
+function lifecycleCapabilityError(
+  backendId: BackendId,
+  method: string,
+  capabilities: NegotiatedCapabilities | undefined,
+  label: string | undefined,
+): WorkflowError {
+  const advertised = capabilities
+    ? describeLifecycleAdvertisement(capabilities.agent)
+    : "initialize did not complete";
+  return new WorkflowError(
+    `ACP agent (${backendId}) does not advertise ${method}; advertised lifecycle capabilities: ${advertised}`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label },
   );
 }
 
@@ -540,6 +584,15 @@ export interface PooledConnectionDeps {
   permissionResolver?: PermissionResolver;
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
+}
+
+interface RawAgentRequestContext {
+  sendRequest<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+    mapResponse?: undefined,
+    options?: SendRequestOptions,
+  ): Promise<Response>;
 }
 
 /**
@@ -688,6 +741,50 @@ export class PooledConnection {
     return gateCustomMeta(meta, this.negotiated?.customMetaSupport, this.negotiated?.gatedKeys);
   }
 
+  private assertSupportedMcpServers(opts: AcpSessionOptions): void {
+    const unsupported = this.negotiated
+      ? unsupportedMcpServer(opts.mcpServers, this.negotiated.agent)
+      : undefined;
+    if (!unsupported) return;
+    throw new WorkflowError(
+      `MCP server "${unsupported.name}" uses the "${unsupported.transport}" transport, which the ` +
+        `${this.backendId} agent does not support`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false, agentLabel: opts.label },
+    );
+  }
+
+  private sessionRequestMeta(opts: AcpSessionOptions): Record<string, unknown> | undefined {
+    return this.gateCustomMeta(
+      stampRunId(
+        layerMeta(
+          this.backend.sessionMetaDefaults?.(),
+          opts.meta,
+          this.backend.sessionMeta(opts.schema, {
+            baseInstructions: opts.baseInstructions,
+            developerInstructions: opts.developerInstructions,
+          }),
+        ),
+        opts.runId,
+      ),
+    );
+  }
+
+  private assertLifecycleSupported(method: string, label: string | undefined): void {
+    const supported =
+      method === AGENT_METHODS.session_load
+        ? this.negotiated?.supportsLoadSession
+        : method === AGENT_METHODS.session_list
+          ? this.negotiated?.supportsListSessions
+          : method === AGENT_METHODS.session_delete
+            ? this.negotiated?.supportsDeleteSession
+            : method === AGENT_METHODS.session_resume
+              ? this.negotiated?.supportsResumeSession
+              : false;
+    if (supported) return;
+    throw lifecycleCapabilityError(this.backendId, method, this.negotiated, label);
+  }
+
   /** Mark this connection dead exactly once, then ask the pool to evict it. Idempotent. */
   private die(error: Error): void {
     if (!this._alive) return;
@@ -786,36 +883,14 @@ export class PooledConnection {
       // does not advertise (http/sse gated on mcpCapabilities; stdio is always serviceable).
       // Fail-fast and non-recoverable — re-running the same incompatible transport can never
       // succeed. Lenient for agents that advertise no mcpCapabilities (the legacy passthrough).
-      const unsupported = this.negotiated
-        ? unsupportedMcpServer(opts.mcpServers, this.negotiated.agent)
-        : undefined;
-      if (unsupported) {
-        throw new WorkflowError(
-          `MCP server "${unsupported.name}" uses the "${unsupported.transport}" transport, which the ` +
-            `${this.backendId} agent does not support`,
-          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-          { recoverable: false, agentLabel: opts.label },
-        );
-      }
+      this.assertSupportedMcpServers(opts);
       // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
       // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
       // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
       // Codex base/developer instructions), then the engine runId correlation stamp. The result
       // is gated against the agent's advertised custom capabilities (a declared key the agent
       // said it does not honor is dropped). When no layer survives, no `_meta` is sent.
-      const meta = this.gateCustomMeta(
-        stampRunId(
-          layerMeta(
-            this.backend.sessionMetaDefaults?.(),
-            opts.meta,
-            this.backend.sessionMeta(opts.schema, {
-              baseInstructions: opts.baseInstructions,
-              developerInstructions: opts.developerInstructions,
-            }),
-          ),
-          opts.runId,
-        ),
-      );
+      const meta = this.sessionRequestMeta(opts);
       const request: NewSessionRequest = {
         cwd: opts.cwd,
         // Client-provided MCP servers (additive run input), else the default empty list.
@@ -838,6 +913,96 @@ export class PooledConnection {
       this._activeSessions -= 1;
       throw error;
     }
+  }
+
+  /** Reopen an existing session and replay its transcript through the router before resolving. */
+  loadSession(sessionId: string, opts: AcpSessionOptions): Promise<SessionHandle> {
+    return this.reattachSession(AGENT_METHODS.session_load, sessionId, opts);
+  }
+
+  /** Reopen an existing session without transcript replay. */
+  resumeSession(sessionId: string, opts: AcpSessionOptions): Promise<SessionHandle> {
+    return this.reattachSession(AGENT_METHODS.session_resume, sessionId, opts);
+  }
+
+  private rawAgentRequest<Response, Params>(method: string, params: Params): Promise<Response> {
+    // SDK 1.2.0 still maps session/load through emptyObjectResponse in ClientContext.request(),
+    // but both supported adapters return configOptions/modes there and the driven wrapper must
+    // adopt them. This bypasses only the SDK response mapper, not JSON-RPC validation/racing.
+    const agent = this.connection.agent as unknown as RawAgentRequestContext;
+    return this.race(agent.sendRequest<Response, Params>(method, params));
+  }
+
+  private async reattachSession(
+    method: typeof AGENT_METHODS.session_load | typeof AGENT_METHODS.session_resume,
+    sessionId: string,
+    opts: AcpSessionOptions,
+  ): Promise<SessionHandle> {
+    this._activeSessions += 1;
+    let registered = false;
+    const state = new SessionState(
+      opts.cwd,
+      opts.policy,
+      opts.permissionResolver,
+      opts.label,
+      opts.runId,
+      undefined,
+      opts.retainSessionLog ?? true,
+    );
+    try {
+      await this.ready;
+      this.assertLifecycleSupported(method, opts.label);
+      this.assertSupportedMcpServers(opts);
+      const meta = this.sessionRequestMeta(opts);
+      const request = {
+        sessionId,
+        cwd: opts.cwd,
+        mcpServers: opts.mcpServers ?? [],
+        ...(meta ? { _meta: meta } : {}),
+      };
+
+      // Replayed updates and permission requests can arrive before the response, so the
+      // caller-provided id must be routable before the wire call leaves this process.
+      this.client.register(sessionId, state);
+      registered = true;
+
+      let response: LoadSessionResponse | ResumeSessionResponse;
+      if (method === AGENT_METHODS.session_load) {
+        const loadRequest: LoadSessionRequest = request;
+        response = await this.rawAgentRequest<LoadSessionResponse, LoadSessionRequest>(
+          AGENT_METHODS.session_load,
+          loadRequest,
+        );
+      } else {
+        const resumeRequest: ResumeSessionRequest = request;
+        response = await this.rawAgentRequest<ResumeSessionResponse, ResumeSessionRequest>(
+          AGENT_METHODS.session_resume,
+          resumeRequest,
+        );
+      }
+      state.modes = response.modes;
+      return new SessionHandle(this, sessionId, state, response.configOptions ?? [], opts);
+    } catch (error) {
+      if (registered) this.client.unregister(sessionId);
+      this._activeSessions -= 1;
+      throw error;
+    }
+  }
+
+  /** session/list on a dedicated connection, gated on the initialize advertisement. */
+  async listSessions(request: ListSessionsRequest, label?: string): Promise<ListSessionsResponse> {
+    await this.ready;
+    this.assertLifecycleSupported(AGENT_METHODS.session_list, label);
+    return this.race(this.connection.agent.request(AGENT_METHODS.session_list, request));
+  }
+
+  /** session/delete on a dedicated connection, gated on the initialize advertisement. */
+  async deleteSession(request: DeleteSessionRequest, label?: string): Promise<void> {
+    await this.ready;
+    this.assertLifecycleSupported(AGENT_METHODS.session_delete, label);
+    await this.race(
+      this.connection.agent.request(AGENT_METHODS.session_delete, request) as Promise<DeleteSessionResponse>,
+    );
   }
 
   /** session/prompt on this connection, raced against process death. */
@@ -870,6 +1035,7 @@ export class PooledConnection {
     options?: SendRequestOptions,
   ): Promise<Response>;
   request(method: string, params?: unknown, options?: SendRequestOptions): Promise<unknown> {
+    assertSafeRawRequest(method);
     return this.race(this.connection.agent.request(method, params, options));
   }
 
@@ -998,6 +1164,11 @@ export class SessionHandle implements StructuredSource {
   /** Diagnostic message/tool history accumulated across this session's run. */
   get history(): AgentHistoryEntry[] {
     return this.state.history;
+  }
+
+  /** Assistant text accumulated across the retained session log. */
+  get text(): string {
+    return this.state.textChunks.join("");
   }
 
   /** Agent-advertised session mode catalog plus the currently active mode, if supported. */

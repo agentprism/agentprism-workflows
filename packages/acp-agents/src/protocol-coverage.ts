@@ -5,7 +5,9 @@ type ClientMethod = ValueOf<typeof CLIENT_METHODS>;
 type AgentMethod = ValueOf<typeof AGENT_METHODS>;
 
 export type ClientMethodCoverage = "served" | "pending";
-export type AgentMethodCoverage = "driven" | "passthrough";
+/** `guarded` means the raw passthrough would create/reopen session state outside the router, so
+ *  the client rejects it until a driven wrapper can route updates, permissions, and terminals. */
+export type AgentMethodCoverage = "driven" | "passthrough" | "guarded";
 
 /** Enforceable definition of "full ACP spec support": every SDK method constant is classified
  *  here, and the tripwire test fails when an SDK bump silently widens or shrinks the protocol. */
@@ -33,16 +35,16 @@ export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.providers_set]: "passthrough",
   [AGENT_METHODS.providers_disable]: "passthrough",
   [AGENT_METHODS.session_new]: "driven",
-  [AGENT_METHODS.session_load]: "passthrough",
+  [AGENT_METHODS.session_load]: "driven",
   [AGENT_METHODS.session_set_mode]: "driven",
   [AGENT_METHODS.session_set_config_option]: "driven",
   [AGENT_METHODS.session_prompt]: "driven",
   [AGENT_METHODS.session_cancel]: "driven",
   [AGENT_METHODS.mcp_message]: "passthrough",
-  [AGENT_METHODS.session_list]: "passthrough",
-  [AGENT_METHODS.session_delete]: "passthrough",
-  [AGENT_METHODS.session_fork]: "passthrough",
-  [AGENT_METHODS.session_resume]: "passthrough",
+  [AGENT_METHODS.session_list]: "driven",
+  [AGENT_METHODS.session_delete]: "driven",
+  [AGENT_METHODS.session_fork]: "guarded",
+  [AGENT_METHODS.session_resume]: "driven",
   [AGENT_METHODS.session_close]: "driven",
   [AGENT_METHODS.logout]: "passthrough",
   [AGENT_METHODS.nes_start]: "passthrough",
