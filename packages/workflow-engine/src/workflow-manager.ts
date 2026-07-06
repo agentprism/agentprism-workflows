@@ -44,6 +44,9 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   args?: unknown;
+  /** THIS run's working directory (ExecOptions.cwd), when it overrides the manager cwd.
+   *  Persisted so resume() re-runs in the same directory (e.g. the same worktree). */
+  cwd?: string;
   /** Parsed meta, kept so a terminal (paused/failed) result can still report it. */
   meta?: WorkflowMeta;
   /** Accumulated agent results for resume (deterministic call index -> result). */
@@ -72,6 +75,15 @@ export interface ExecOptions {
    * with a clear AGENT_EXECUTION_ERROR (the engine never constructs an agent).
    */
   agent?: AgentRunner;
+  /**
+   * Working directory for THIS run, overriding the manager's constructor `cwd` —
+   * the natural fit for hosts that run each workflow inside its own git worktree.
+   * Every subagent ACP session runs here (unless worktree isolation or a per-agent
+   * `agent({ cwd })` overrides it further). Persisted with the run so `resume()`
+   * re-runs in the SAME directory. Run STATE stays keyed to the manager cwd, so
+   * listRuns()/resume() are unaffected by the per-run directory's lifetime.
+   */
+  cwd?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
   /**
@@ -278,6 +290,7 @@ export class WorkflowManager extends EventEmitter {
       script,
       args,
       meta: parsed.meta,
+      cwd: exec.cwd,
       journal: [],
       journaling,
       background: true,
@@ -294,6 +307,7 @@ export class WorkflowManager extends EventEmitter {
           workflowName: parsed.meta.name,
           script,
           args,
+          cwd: exec.cwd,
           sessionId: this.sessionId,
           status: "running",
           phases: managed.snapshot.phases,
@@ -331,7 +345,7 @@ export class WorkflowManager extends EventEmitter {
    * so the MCP shell can project `run.status` without catching.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args, this.resolveJournaling(exec));
+    const managed = this.createManaged(script, args, this.resolveJournaling(exec), exec.cwd);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -362,10 +376,16 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args: unknown | undefined, journaling: boolean): ManagedRun {
+  private createManaged(
+    script: string,
+    args: unknown | undefined,
+    journaling: boolean,
+    cwd?: string,
+  ): ManagedRun {
     const parsed = parseWorkflowScript(script);
     return {
       runId: generateRunId(),
+      cwd,
       status: "running",
       snapshot: {
         name: parsed.meta.name,
@@ -490,7 +510,7 @@ export class WorkflowManager extends EventEmitter {
       // engine REQUIRES an AgentRunner and never constructs one.
       const agent = this.resolveAgent(exec);
       const engineResult = await runWorkflow(script, {
-        cwd: this.cwd,
+        cwd: managed.cwd ?? this.cwd,
         args,
         agent,
         mainModel: this.mainModel,
@@ -653,6 +673,8 @@ export class WorkflowManager extends EventEmitter {
         // in workflow run storage — protect via directory permissions, not blanking.
         script: managed.script,
         args: managed.args,
+        // The per-run working directory, so resume() re-runs in the SAME place.
+        cwd: managed.cwd,
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
@@ -757,6 +779,9 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script: persisted.script,
       args: persisted.args,
+      // Explicit override wins; else the run resumes in ITS original directory
+      // (e.g. the same worktree), never silently in the manager cwd.
+      cwd: exec.cwd ?? persisted.cwd,
       meta,
       journal: persisted.journal ?? [],
       journaling: true,
