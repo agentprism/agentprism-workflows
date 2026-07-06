@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { WorkflowError } from "../src/errors.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { AGENTPRISM_PERSISTENCE_ROOT_ENV, workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -119,6 +119,11 @@ for (const fault of faultScripts) {
         assert.equal(result.status, "failed");
         assert.match(result.reason ?? "", fault.message);
         assert.equal(manager.getRun(result.runId)?.status, "failed");
+        // A script crash is labeled SCRIPT_ERROR — never WORKFLOW_ABORTED (nobody cancelled).
+        assert.equal(
+          (manager.getRun(result.runId)?.error as WorkflowError | undefined)?.code,
+          WorkflowErrorCode.SCRIPT_ERROR,
+        );
         assertLeaseReleased(cwd, result.runId);
       });
     }),
@@ -138,7 +143,10 @@ for (const fault of faultScripts) {
         await new Promise((resolve) => setImmediate(resolve));
         await assert.rejects(
           promise,
-          (error: unknown) => error instanceof WorkflowError && fault.message.test(error.message),
+          (error: unknown) =>
+            error instanceof WorkflowError &&
+            fault.message.test(error.message) &&
+            error.code === WorkflowErrorCode.SCRIPT_ERROR,
         );
         assert.equal(manager.getRun(runId)?.status, "failed");
         assert.match(manager.getRun(runId)?.error?.message ?? "", fault.message);

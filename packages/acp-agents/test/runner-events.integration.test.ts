@@ -1,6 +1,6 @@
 // End-to-end: AcpAgentRunner.on(...) bubbles up REAL ACP events from a live run against the mock
 // ACP agent (test/fixtures/fake-acp-agent.mjs). The fake speaks real ACP over stdio, so the whole
-// chain — ClientSideConnection -> MultiplexClient.sessionUpdate -> emitSessionUpdate -> the runner's
+// chain — fluent client() connection -> MultiplexClient.sessionUpdate -> emitSessionUpdate -> the runner's
 // typed bus -> on() listeners — is exercised; only the agent on the far end is faked.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
