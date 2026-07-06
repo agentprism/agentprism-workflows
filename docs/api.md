@@ -39,6 +39,7 @@ import { WorkflowManager, createAcpRunner } from "@automatalabs/workflows";
 
 const manager = new WorkflowManager({ cwd: projectRoot, agent: createAcpRunner() });
 manager.on("agentEnd", (e) => ui.update(e.runId, e));
+manager.on("agentEvent", (e) => ui.stream(e.runId, e));  // live token-level ACP stream (see Events)
 
 const { runId, promise } = manager.startInBackground(script, args, { cwd: worktreePath });
 // ... later:
@@ -98,6 +99,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
 | `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all). |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |
+| `dispose()` / `close()` | — | Facade manager only: detach its `agentEvent` runner subscriptions. Never disposes the runner itself. |
 
 A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused**, not failed — the journal checkpoints and `resume()` picks up after the budget refills (`resetHint` carries the provider's "resets in…" text when present).
 
@@ -117,8 +119,27 @@ A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused
 | `paused` | `reason` (e.g. `"usage_limit"`), `error`, `resetHint?` |
 | `stopped` / `resumed` | — |
 | `error` | `error` (`WorkflowError`) — emitted only when a listener exists, so an unheard `error` never masks the thrown one |
+| `agentEvent` | **The token-level streaming surface** (facade manager only — see below). |
 
-For **token-level** streaming (message chunks, tool calls as they happen), subscribe on the runner's bus instead — see [Runner events](#runner-events); those payloads also carry `runId` + `label`.
+### `agentEvent` — live token-level streaming through the manager
+
+The `WorkflowManager` exported by **`@automatalabs/workflows`** (the facade — not the bare engine class) adds one composition-root bridge: when the injected `AgentRunner` also exposes the acp-agents `.on()` bus (`createAcpRunner()` does), the manager forwards that runner's **entire live ACP stream** as `agentEvent`. This is how a host renders message chunks, tool calls, and plans as they happen without holding a separate runner reference.
+
+```ts
+manager.on("agentEvent", (e: AgentEventPayload) => {
+  if (e.name === "agent_message_chunk" && e.runId) ui.stream(e.runId, e.label, e.event);
+});
+```
+
+Payload (`AgentEventPayload<K>`, exported): `{ name, event, backendId, sessionId?, label?, runId? }` —
+
+- `name` is the ACP event name. `session/update` notifications arrive **unwrapped** as their `sessionUpdate` discriminant (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …); the cross-cutting events (`permission_pending`, `permission_request`, `raw_message`, `session_open`, `session_close`, `backend_error`) arrive under their own names.
+- `event` is the **verbatim** runner payload for that event (typed per `name`).
+- The envelope repeats the context fields hosts filter on: `runId` + `label` identify the workflow agent (stamped by the engine on every `agent()` call), `sessionId`/`backendId` identify the ACP session. `backend_error` is connection-scoped and carries no session/run context.
+
+Bridge lifecycle: ref-counted per runner. A constructor-injected runner is bridged for the manager's lifetime; a per-run `ExecOptions.agent` runner is bridged only while its run is active. `manager.dispose()` (alias `close()`) detaches the manager's subscriptions — it does **not** dispose the runner, whose process lifetime stays with the caller. Forwarding is observability-only: a throwing `agentEvent` listener is isolated and never affects the run.
+
+Alternative: subscribe on the runner's bus directly — see [Runner events](#runner-events); same underlying stream, same `runId`/`label` attribution, no manager involved.
 
 ---
 
