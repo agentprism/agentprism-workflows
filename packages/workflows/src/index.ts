@@ -35,6 +35,7 @@ export type {
   WorkflowRunResult,
   WorkflowSnapshot,
   WorkflowPathOptions,
+  RunPersistence,
   RunPersistenceOptions,
 } from "@automatalabs/workflow-engine";
 export {

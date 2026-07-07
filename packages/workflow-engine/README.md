@@ -16,7 +16,7 @@ injected `AgentRunner` seam — it never imports or names a concrete agent backe
 npm install @automatalabs/workflow-engine
 ```
 
-ESM-only, Node 18+.
+ESM-only, Node 22+.
 
 ## The one thing you inject: `AgentRunner`
 
@@ -115,17 +115,20 @@ const again = await runWorkflow(script, { agent: myRunner, args, resumeJournal, 
 
 `tokenBudget` caps total spend (per-phase sub-budgets via `phase(title, { budget })`);
 `maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. Defaults
-are exported as `DEFAULT_TOKEN_BUDGET`, `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`,
-`MAX_AGENT_RETRIES`, `DEFAULT_AGENT_TIMEOUT_MS`.
+are exported as `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`, and
+`DEFAULT_AGENT_TIMEOUT_MS`.
 
 `WorkflowManager` persists run state under `~/.agentprism/workflows` by default. Hosts can
 set `new WorkflowManager({ persistenceRoot: "/absolute/data/root" })`; when omitted,
 `AGENTPRISM_PERSISTENCE_ROOT` is used, then the homedir default. The root must be absolute.
-Set `journaling: false` on the manager or per `runSync`/`startInBackground` call when the
-host owns transcript storage. That mode writes no engine run-state/log journal files and
-otherwise preserves run results, events, retries, status transitions, cross-process leases,
-and listing of persisted runs written by other executions; resume is intentionally unavailable
-and rejects with `journaling disabled for this run` for those runs.
+Hosts that own storage can instead pass `new WorkflowManager({ persistence })` with a custom
+`RunPersistence`. Set `journaling: false` on the manager or per `runSync`/`startInBackground`
+call when the host owns transcript storage. That mode writes no engine run-state/log journal
+files and otherwise preserves run results, events, retries, status transitions,
+cross-process leases, and listing of persisted runs written by other executions; resume is
+intentionally unavailable and rejects with `journaling disabled for this run` for those runs.
+The manager-level `journal` event still emits live `{ runId, entry }` observations when file
+journaling is disabled.
 
 ## Key exports
 
@@ -140,7 +143,7 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 - **Errors** — `WorkflowError`, `WorkflowErrorCode`, `isWorkflowError`, `wrapError`,
   `isProviderUsageLimit`, `classifyProviderLimit`, `isAbortError`, `isTimeoutError`.
 - **Config caps** — `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`,
-  `DEFAULT_AGENT_TIMEOUT_MS`, `DEFAULT_TOKEN_BUDGET`, `AGENTS_DIR`.
+  `DEFAULT_AGENT_TIMEOUT_MS`, `AGENTS_DIR`.
 - **Model routing / tiers** — `parseModelRoutingFromMeta`, `resolveModelForPhase`,
   `buildDefaultTierConfig`, `loadModelTierConfig`, `saveModelTierConfig`,
   `resolveTierModel`, `sortedTierNames`, `getModelTierConfigPath`.

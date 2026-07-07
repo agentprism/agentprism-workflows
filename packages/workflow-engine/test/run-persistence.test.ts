@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
+import { createRunPersistence, generateRunId, type PersistedRunState, type RunPersistence } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { AGENTPRISM_PERSISTENCE_ROOT_ENV, workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -51,6 +51,52 @@ function deferredAgent() {
         return new Promise((resolve) => {
           resolveRun = resolve;
         });
+      },
+    },
+  };
+}
+
+function memoryPersistence(): {
+  persistence: RunPersistence;
+  saves: PersistedRunState[];
+  acquired: string[];
+  released: string[];
+} {
+  const states = new Map<string, PersistedRunState>();
+  const saves: PersistedRunState[] = [];
+  const acquired: string[] = [];
+  const released: string[] = [];
+  const clone = (state: PersistedRunState): PersistedRunState => structuredClone(state);
+
+  return {
+    saves,
+    acquired,
+    released,
+    persistence: {
+      save(state) {
+        const copy = clone(state);
+        saves.push(copy);
+        states.set(state.runId, copy);
+      },
+      load(runId) {
+        const state = states.get(runId);
+        return state ? clone(state) : null;
+      },
+      list() {
+        return [...states.values()].map(clone);
+      },
+      delete(runId) {
+        return states.delete(runId);
+      },
+      acquireRunLease(runId) {
+        acquired.push(runId);
+        return { runId, token: `${runId}-lease` };
+      },
+      releaseRunLease(lease) {
+        released.push(lease.runId);
+      },
+      getRunsDir() {
+        return "/memory/runs";
       },
     },
   };
@@ -189,6 +235,99 @@ test(
       rmSync(constructionRoot, { recursive: true, force: true });
       rmSync(mutatedRoot, { recursive: true, force: true });
     }
+  }),
+);
+
+test(
+  "WorkflowManager can use an injected persistence implementation for run state",
+  withTempCwd(async (cwd) => {
+    const store = memoryPersistence();
+    const manager = new WorkflowManager({
+      cwd,
+      persistence: store.persistence,
+      agent: {
+        async run(prompt: string) {
+          return `ok:${prompt}`;
+        },
+      },
+    });
+
+    const result = await manager.runSync(twoAgentScript);
+    const persisted = store.persistence.load(result.runId);
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(store.acquired, [result.runId], "run lease is acquired through the injected store");
+    assert.deepEqual(store.released, [result.runId], "run lease is released through the injected store");
+    assert.ok(store.saves.length >= 3, "initial, journal, and final states are saved");
+    assert.equal(persisted?.status, "completed");
+    assert.deepEqual(
+      persisted?.journal?.map((entry) => entry.index),
+      [0, 1],
+      "journal entries are persisted through the injected store",
+    );
+  }),
+);
+
+test(
+  "WorkflowManager emits journal events in append order with runId",
+  withTempCwd(async (cwd) => {
+    const seen: Array<{ runId: string; index: number; result: unknown }> = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          return `ok:${prompt}`;
+        },
+      },
+    });
+    manager.on("journal", (event: { runId: string; entry: { index: number; result: unknown } }) => {
+      seen.push({ runId: event.runId, index: event.entry.index, result: event.entry.result });
+    });
+
+    const script = `export const meta = { name: 'journal_events', description: 'journal events' }
+const approved = await checkpoint('continue?', { default: 'yes' })
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+return { approved, a, b }`;
+    const result = await manager.runSync(script);
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(
+      seen.map((event) => event.index),
+      [0, 1, 2],
+      "checkpoint and agent journal appends stream in deterministic order",
+    );
+    assert.ok(seen.every((event) => event.runId === result.runId), "every journal event is stamped with runId");
+    assert.deepEqual(
+      seen.map((event) => event.result),
+      ["yes", "ok:first", "ok:second"],
+    );
+  }),
+);
+
+test(
+  "WorkflowManager isolates throwing journal listeners from the run and sibling listeners",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          return `ok:${prompt}`;
+        },
+      },
+    });
+    let siblingCalled = false;
+    manager.on("journal", () => {
+      throw new Error("observer failed");
+    });
+    manager.on("journal", () => {
+      siblingCalled = true;
+    });
+
+    const result = await manager.runSync(loggingScript);
+
+    assert.equal(result.status, "completed");
+    assert.equal(siblingCalled, true, "sibling listener still receives the journal event");
   }),
 );
 
@@ -877,6 +1016,7 @@ test(
 test(
   "WorkflowManager journaling:false writes no journal files and rejects resume clearly",
   withTempCwd(async (cwd) => {
+    const journalEvents: number[] = [];
     const manager = new WorkflowManager({
       cwd,
       journaling: false,
@@ -886,10 +1026,14 @@ test(
         },
       },
     });
+    manager.on("journal", (event: { entry: { index: number } }) => {
+      journalEvents.push(event.entry.index);
+    });
 
     const result = await manager.runSync(twoAgentScript);
 
     assert.equal(result.status, "completed");
+    assert.deepEqual(journalEvents, [0, 1], "journal events still emit when file journaling is disabled");
     assert.equal((result.result as { a?: unknown }).a, "ok:first");
     assert.equal((result.result as { b?: unknown }).b, "ok:second");
     const runsDir = workflowProjectPaths(cwd).runsDir;

@@ -212,16 +212,18 @@ if (run.status === "paused") {
 `runSync(script, args?, exec?)` always resolves to a terminal `WorkflowRunResult`. A run **pauses**
 (rather than fails) on a provider usage limit or a headless `checkpoint()`; both are resumable as
 above. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
-`loadSavedWorkflow` resolver (enables nested `workflow('name')`), and per-agent timeout/retry
-defaults.
+`loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
+implementation, and per-agent timeout/retry defaults.
 
 Manager events are Node `EventEmitter` notifications: `agentStart`, `agentEnd`, `agentHistory`,
-`tokenUsage`, `log`, `phase`, `complete`, `paused`, `resumed`, `stopped`, `error`, and
-`agentEvent`. `agentEvent` forwards the live ACP stream from an ACP-capable runner with `name`,
-`event`, and the runner context fields (`runId`, `label`, `sessionId`, `backendId`) when the event
-carries them; `backend_error` is connection-scoped and carries `backendId` only. ACP
-`session/update` traffic is emitted once under its inner discriminant name, while
-permission/session/raw/backend events keep their runner names.
+`journal`, `tokenUsage`, `log`, `phase`, `complete`, `paused`, `resumed`, `stopped`, `error`,
+and `agentEvent`. `journal` emits `{ runId, entry }` for each live journal append, even when
+file journaling is disabled via `journaling: false`. `agentEvent` forwards the live ACP stream
+from an ACP-capable runner with `name`, `event`, and the runner context fields (`runId`, `label`,
+`sessionId`, `backendId`) when the event carries them; `backend_error` is connection-scoped and
+carries `backendId` only. ACP `session/update` traffic is emitted once under its inner
+discriminant name, while permission/elicitation/session/raw/backend events keep their runner
+names.
 
 ```ts
 manager.on("agentEvent", ({ runId, label, name }) => console.error(runId, label, name));
@@ -298,6 +300,9 @@ await runner.dispose();
 | `session_update` | `{ update }` — catch-all for **every** update, regardless of kind |
 | `permission_pending` | `{ request }` — resolver-only; emitted after the request is parked and before the resolver is invoked |
 | `permission_request` | `{ request, outcome }` — the final permission outcome returned to the agent |
+| `elicitation_pending` | `{ request }` — resolver-only; emitted after the elicitation is parked and before the resolver is invoked |
+| `elicitation_request` | `{ request, outcome }` — the final elicitation response returned to the agent |
+| `elicitation_complete` | `{ notification }` — a URL elicitation completion notification |
 | `raw_message` | `{ method, message }` — a vendor extension notification (e.g. Claude `_claude/sdkMessage`) |
 | `session_open` / `session_close` | an ACP session opened / was released |
 | `backend_error` | `{ backendId, error }` — a pooled backend process crashed |
@@ -393,8 +398,8 @@ The backend for each agent is chosen from its `model` (preferred) or `tier` stri
 - **Provider prefix** — `anthropic/…` or `claude/…` ⇒ Claude; `openai/…` or `codex/…` ⇒ Codex.
 - **Bare id** — matched by pattern: `codex` / `gpt` / `openai` / `o<digit>` ⇒ Codex;
   `claude` / `opus` / `sonnet` / `haiku` / `anthropic` ⇒ Claude.
-- **No match / no spec** — the default backend: `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex`,
-  default `claude`).
+- **No match / no spec** — the default backend: `AGENTPRISM_DEFAULT_BACKEND` (`claude`, `codex`,
+  or any registered custom backend name; default `claude`).
 
 ```ts
 import { selectBackend } from "@automatalabs/workflows";
@@ -404,8 +409,9 @@ selectBackend({ model: "gpt-5-codex" }).id;    // "codex"
 selectBackend({ model: "anthropic/claude-sonnet" }).id; // "claude"
 ```
 
-Within a provider, the model spec selects the concrete model on the session (Claude `_meta` model /
-Codex config). Per-backend pool size is `AGENTPRISM_ACP_POOL_SIZE` (or `AcpPoolOptions.size`).
+Within a provider, the model spec selects the concrete model through ACP session config
+(`session/set_config_option`, surfaced as `SessionHandle.selectModel()`). Per-backend pool size is
+`AGENTPRISM_ACP_POOL_SIZE` (or `AcpPoolOptions.size`).
 
 ---
 
@@ -437,13 +443,14 @@ AGENTPRISM_PERSISTENCE_ROOT_ENV,
 // ── Types ──
 RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
-WorkflowPathOptions, RunPersistenceOptions,
+WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
 ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,
 // ACP events: the runner.on(...) surface
 AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext,
 AcpSessionUpdate, AcpUpdateKind, AcpPermissionPendingEvent, AcpPermissionEvent,
+AcpElicitationPendingEvent, AcpElicitationEvent, AcpElicitationCompleteEvent,
 AcpRawMessageEvent, AcpBackendErrorEvent,
 ```
 

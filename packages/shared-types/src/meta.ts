@@ -44,9 +44,9 @@ export interface ClaudeJsonSchemaOutputFormat {
   type: "json_schema";
   schema: Record<string, unknown>;
 }
-export interface ClaudeCodeSessionMeta {
+export interface ClaudeCodeSessionMeta extends Record<string, unknown> {
   claudeCode?: {
-    options?: { outputFormat?: ClaudeJsonSchemaOutputFormat; model?: string; [k: string]: unknown };
+    options?: { outputFormat?: ClaudeJsonSchemaOutputFormat; [k: string]: unknown };
     emitRawSDKMessages?: boolean;
   };
 }

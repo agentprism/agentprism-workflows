@@ -4,12 +4,10 @@
  */
 
 export interface ModelRoute {
-  /** Phase name pattern (regex or exact match). */
+  /** Phase title for an exact, case-sensitive match. */
   phasePattern: string;
   /** Model to use for this phase. */
   model: string;
-  /** Whether to use regex matching. */
-  useRegex?: boolean;
 }
 
 export interface ModelRoutingConfig {
@@ -28,19 +26,10 @@ export function resolveModelForPhase(phase: string | undefined, config: ModelRou
   }
 
   for (const route of config.routes) {
-    if (route.useRegex) {
-      try {
-        const regex = new RegExp(route.phasePattern, "i");
-        if (regex.test(phase)) {
-          return route.model;
-        }
-      } catch {
-        // Invalid regex, skip
-      }
-    } else if (phase === route.phasePattern) {
+    if (phase === route.phasePattern) {
       // Exact, case-sensitive match — phase titles are author-controlled literals,
-      // so fuzzy substring matching only caused mis-routes (e.g. "analyze" matching
-      // "analyze-deep" or vice-versa). Use the regex branch for fuzzy needs.
+      // so fuzzy substring/regex matching only caused mis-routes (e.g. "analyze"
+      // matching "analyze-deep" or vice-versa).
       return route.model;
     }
   }

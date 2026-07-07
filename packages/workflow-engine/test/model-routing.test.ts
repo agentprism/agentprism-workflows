@@ -45,28 +45,13 @@ test("resolveModelForPhase uses the first matching route", () => {
   assert.equal(resolveModelForPhase("Scan", config), "scan-model");
 });
 
-test("resolveModelForPhase uses regex when useRegex is true", () => {
-  const config: ModelRoutingConfig = {
-    routes: [{ phasePattern: "phase-\\d+", model: "regex-model", useRegex: true }],
-  };
-  assert.equal(resolveModelForPhase("phase-3", config), "regex-model");
-  assert.equal(resolveModelForPhase("phase-42", config), "regex-model");
-  assert.equal(resolveModelForPhase("Not Matching", config), undefined);
-});
-
-test("resolveModelForPhase handles invalid regex gracefully (skips)", () => {
+test("resolveModelForPhase treats regex-looking phase patterns as exact literals", () => {
   const config: ModelRoutingConfig = {
     defaultModel: "default-model",
-    routes: [{ phasePattern: "[invalid", model: "bad", useRegex: true }],
+    routes: [{ phasePattern: "phase-\\d+", model: "literal-model" }],
   };
-  assert.equal(resolveModelForPhase("anything", config), "default-model");
-});
-
-test("resolveModelForPhase regex is case-insensitive", () => {
-  const config: ModelRoutingConfig = {
-    routes: [{ phasePattern: "^scan", model: "m", useRegex: true }],
-  };
-  assert.equal(resolveModelForPhase("SCAN", config), "m");
+  assert.equal(resolveModelForPhase("phase-3", config), "default-model");
+  assert.equal(resolveModelForPhase("phase-\\d+", config), "literal-model");
 });
 
 test("parseModelRoutingFromMeta extracts routes from phases", () => {

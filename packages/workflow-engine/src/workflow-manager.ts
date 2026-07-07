@@ -145,6 +145,11 @@ export interface WorkflowManagerOptions {
    * AGENTPRISM_PERSISTENCE_ROOT > `~/.agentprism/workflows`.
    */
   persistenceRoot?: string;
+  /**
+   * Custom run persistence implementation. When omitted, the manager constructs
+   * the default filesystem persistence for `cwd` and `persistenceRoot`.
+   */
+  persistence?: RunPersistence;
   /** Default journaling policy for runs created by this manager. Default true. */
   journaling?: boolean;
 }
@@ -184,7 +189,7 @@ export class WorkflowManager extends EventEmitter {
     this.agentsDir = options.agentsDir;
     this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
     this.journaling = options.journaling ?? true;
-    this.persistence = createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
+    this.persistence = options.persistence ?? createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
     // Stale-run recovery mutates the PERSISTED run store, so it is gated on this manager's
     // journaling default: a `journaling: false` manager (host keeps its own transcript/audit
     // store) must never rewrite run state that belongs to journaling processes.
@@ -524,20 +529,16 @@ export class WorkflowManager extends EventEmitter {
         confirm,
         scriptBackends,
         loadSavedWorkflow: this.loadSavedWorkflow,
-        journaling: managed.journaling,
+        // Manager-level `journal` events are observation, not persistence. Keep the engine's
+        // deterministic journal callback active even when file journaling is disabled; the
+        // manager decides below whether an entry is persisted or only emitted.
+        journaling: true,
         persistLogs: managed.journaling,
         persistenceRoot: this.persistenceRoot,
         resumeJournal: managed.journaling ? resumeJournal : undefined,
         resumeFromRunId: managed.journaling && resumeJournal ? managed.runId : undefined,
         runId: managed.runId,
-        onAgentJournal: managed.journaling
-          ? (entry) => {
-              // Append (crash-safe-ish): keep the latest entry per index, then persist.
-              managed.journal = managed.journal.filter((e) => e.index !== entry.index);
-              managed.journal.push(entry);
-              this.persistRun(managed);
-            }
-          : undefined,
+        onAgentJournal: (entry) => this.recordJournalEntry(managed, entry),
         onLog: (message) => {
           managed.snapshot.logs.push(message);
           this.emit("log", { runId: managed.runId, message });
@@ -661,6 +662,14 @@ export class WorkflowManager extends EventEmitter {
     if (!managed.lease) return;
     this.persistence.releaseRunLease(managed.lease);
     managed.lease = undefined;
+  }
+
+  private recordJournalEntry(managed: ManagedRun, entry: JournalEntry): void {
+    // Append (crash-safe-ish): keep the latest entry per index, then persist.
+    managed.journal = managed.journal.filter((e) => e.index !== entry.index);
+    managed.journal.push(entry);
+    if (managed.journaling) this.persistRun(managed);
+    if (this.listenerCount("journal") > 0) this.emit("journal", { runId: managed.runId, entry });
   }
 
   private persistRun(managed: ManagedRun) {
