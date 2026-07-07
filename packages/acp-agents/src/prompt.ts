@@ -29,7 +29,7 @@ export function buildRunPrompt(
       parts.push(
         [
           "Final output contract:",
-          "- You have been provided an MCP tool named StructuredOutput (it may appear namespaced by its server, e.g. structured_output_StructuredOutput).",
+          "- You have been provided an MCP tool named StructuredOutput (it may appear namespaced by its MCP server name, e.g. structured_output_xxxx_StructuredOutput).",
           "- You MUST call it exactly once with your final answer as its arguments; its parameter schema defines the required output shape.",
           "- Complete all necessary research and tool calls BEFORE calling it.",
           "- Do NOT emit your final answer as plain text.",
