@@ -1,5 +1,16 @@
 # @automatalabs/workflows
 
+## 0.20.0
+
+### Minor Changes
+
+- c55b5bf: Add OpenCode as a first-class ACP backend with `opencode` model routing, OpenCode spawn overrides, config-option mode fallback, and StructuredOutput MCP tool support.
+
+### Patch Changes
+
+- Updated dependencies [c55b5bf]
+  - @automatalabs/acp-agents@0.20.0
+
 ## 0.19.1
 
 ### Patch Changes
