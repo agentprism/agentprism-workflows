@@ -180,7 +180,7 @@ test("OpenCode schema run injects StructuredOutput MCP and resolves captured too
 
   assert.deepEqual(out, { city: "Oslo", hot: false });
   const servers = readLog().find((entry) => entry.method === "newSession")?.params?.mcpServers ?? [];
-  const injected = servers.find((server) => server.name === "structured_output");
+  const injected = servers.find((server) => server.name?.startsWith("structured_output"));
   assert.ok(injected && "type" in injected && injected.type === "http");
   assert.match(injected.url, /^http:\/\/127\.0\.0\.1:\d+\//);
 });

@@ -188,7 +188,7 @@ function structuredOutputServerFor(servers, flow) {
   const candidates = servers.filter((server) => {
     if (!server || server.type !== "http") return false;
     if (wanted) return server.name === wanted;
-    return /^structured_output(?:_\d+)?$/.test(server.name);
+    return typeof server.name === "string" && server.name.startsWith("structured_output");
   });
   return candidates.at(-1);
 }

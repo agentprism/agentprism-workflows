@@ -203,6 +203,38 @@ test("injected server is appended after user MCP servers and avoids structured_o
   assert.match(injected.url, /^http:\/\/127\.0\.0\.1:\d+\//);
 });
 
+test("concurrent schema runs on one connection SERIALIZE and keep captures isolated", async () => {
+  const { config, cwd, readLog } = fakeBackend({
+    mcpHttpSupport: true,
+    turns: [
+      { structuredToolCall: { label: "first", arguments: { city: "Oslo", hot: false } } },
+      { structuredToolCall: { label: "second", arguments: { city: "Lima", hot: true } } },
+    ],
+  });
+  const runner = makeRunner({ fake: config });
+
+  const [a, b] = await Promise.all([
+    runner.run("classify one", { model: "fake", cwd, schema: SCHEMA, label: "one" }),
+    runner.run("classify two", { model: "fake", cwd, schema: SCHEMA, label: "two" }),
+  ]);
+
+  // Isolation: each run resolves to its own turn's capture — never a blend or a duplicate.
+  assert.deepEqual([a, b].toSorted((x, y) => JSON.stringify(x).localeCompare(JSON.stringify(y))), [
+    { city: "Lima", hot: true },
+    { city: "Oslo", hot: false },
+  ]);
+
+  // Serialization: agents with instance-global name-keyed MCP registries (OpenCode) expose
+  // every registered tool to every live session, so the runner must never overlap two
+  // injected sessions on one connection — the second session/new comes only after the first
+  // run fully releases (same constant server name = replacement, single live registration).
+  const wire = readLog().map((entry) => entry.method);
+  const firstClose = wire.indexOf("closeSession");
+  const secondNew = wire.indexOf("newSession", wire.indexOf("newSession") + 1);
+  assert.ok(firstClose !== -1 && secondNew !== -1, `expected two sessions on the wire: ${wire.join(",")}`);
+  assert.ok(secondNew > firstClose, `second newSession must follow first closeSession: ${wire.join(",")}`);
+});
+
 test("structuredOutputTool false in the registry disables injection even with HTTP MCP support", async () => {
   const { config, cwd, readLog } = fakeBackend(
     {

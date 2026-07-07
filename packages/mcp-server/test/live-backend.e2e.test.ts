@@ -101,37 +101,23 @@ const AGENT_PROMPT =
 const OPENCODE_AGENT_PROMPT =
   'Return a JSON object describing a code repository with exactly these values: repo="agentprism" and fileCount=42.';
 
-/** A meta + 3-schema'd-agent workflow script (3 live sessions on ONE pooled process).
- *  Claude/Codex fan out with parallel(); OpenCode runs the same three agents SEQUENTIALLY —
- *  the pooling + tool-injection proofs are identical (one process, three sessions), but
- *  provider-side throttling of concurrent streams (observed as reasoning-only turns with
- *  empty message deltas on Z.AI glm-5.2) is a provider behavior, not our regression surface,
- *  and must not flake this gate. */
+/** A meta + 3-schema'd-agent parallel() workflow script (concurrency 3 => 3 live sessions on
+ *  ONE pooled process). For injected-tool backends (OpenCode) the runner SERIALIZES the three
+ *  schema runs internally — instance-global name-keyed MCP registries expose every registered
+ *  tool to every live session, so overlapping injected sessions would leak captures across
+ *  sessions. parallel() here deliberately exercises that serialization end to end. */
 function buildScript(backend: Backend, modelSpec?: string): string {
   const prompt = backend === "opencode" ? OPENCODE_AGENT_PROMPT : AGENT_PROMPT;
   const modelEntry = modelSpec ? `, model: ${JSON.stringify(modelSpec)}` : "";
-  const agentCall = (label: string) =>
-    `agent(${JSON.stringify(prompt)}, { label: '${label}', phase: 'Fan', schema: SMALL${modelEntry} })`;
-  const body =
-    backend === "opencode"
-      ? [
-          `const results = [];`,
-          `results.push(await ${agentCall("a1")});`,
-          `results.push(await ${agentCall("a2")});`,
-          `results.push(await ${agentCall("a3")});`,
-        ]
-      : [
-          `const results = await parallel([`,
-          `  () => ${agentCall("a1")},`,
-          `  () => ${agentCall("a2")},`,
-          `  () => ${agentCall("a3")},`,
-          `]);`,
-        ];
   return [
     `export const meta = { name: 'live-${backend}', description: 'pooling reuse + structured output', phases: [{ title: 'Fan' }] };`,
     `const SMALL = ${JSON.stringify(SMALL)};`,
     `phase('Fan');`,
-    ...body,
+    `const results = await parallel([`,
+    `  () => agent(${JSON.stringify(prompt)}, { label: 'a1', phase: 'Fan', schema: SMALL${modelEntry} }),`,
+    `  () => agent(${JSON.stringify(prompt)}, { label: 'a2', phase: 'Fan', schema: SMALL${modelEntry} }),`,
+    `  () => agent(${JSON.stringify(prompt)}, { label: 'a3', phase: 'Fan', schema: SMALL${modelEntry} }),`,
+    `]);`,
     `return results;`,
   ].join("\n");
 }

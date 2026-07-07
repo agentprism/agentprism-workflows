@@ -227,6 +227,9 @@ export class AcpAgentRunner implements AgentRunner {
   private readonly permissionResolver: PermissionResolver | undefined;
   private readonly elicitationResolver: ElicitationResolver | undefined;
   private readonly structuredOutputTools = new StructuredOutputToolHost();
+  /** FIFO turn queue per pooled connection for injected-tool schema runs (see the injection
+   *  site for why concurrent injected sessions on one process cannot be isolated). */
+  private readonly structuredToolTurns = new WeakMap<object, Promise<void>>();
   /** Held-open interactive sessions own dedicated ACP processes outside the pool. The runner
    *  tracks their connections so dispose() can release them and the process-exit hook can
    *  synchronously kill any dedicated children if the host exits without release(). */
@@ -513,12 +516,23 @@ export class AcpAgentRunner implements AgentRunner {
     let session: SessionHandle | undefined;
     let structuredTool: StructuredOutputToolRegistration | undefined;
     let structuredToolActive = false;
+    let releaseStructuredToolTurn: (() => void) | undefined;
     try {
       session = await this.pool.acquirePrepared(
         prepared.backend,
         async (connection) => {
           let sessionOptions = prepared.sessionOptions;
           if (shouldInjectStructuredOutputTool(schema, prepared.backend, connection.capabilities)) {
+            // Injected runs are SERIALIZED per connection, and the server name stays CONSTANT.
+            // Agents with instance-global, name-keyed MCP registries (OpenCode) expose every
+            // registered tool to EVERY session on the process, so concurrent same-named
+            // registrations collide and concurrent unique-named ones are cross-visible — either
+            // way one session's model can call another session's tool and leak its capture.
+            // Same-name registration REPLACES the previous entry; holding this per-connection
+            // turn for the whole run guarantees the single live registration belongs to the
+            // active session. Scale schema-run parallelism with pool size (one registry per
+            // process), not sessions.
+            releaseStructuredToolTurn = await this.acquireStructuredToolTurn(connection);
             structuredTool = await this.structuredOutputTools.register(schema);
             structuredToolActive = true;
             sessionOptions = {
@@ -527,7 +541,7 @@ export class AcpAgentRunner implements AgentRunner {
                 ...(sessionOptions.mcpServers ?? []),
                 {
                   type: "http",
-                  name: nextStructuredOutputServerName(sessionOptions.mcpServers),
+                  name: availableMcpServerName(STRUCTURED_OUTPUT_SERVER_NAME, sessionOptions.mcpServers),
                   url: structuredTool.url,
                   headers: [],
                 },
@@ -598,31 +612,50 @@ export class AcpAgentRunner implements AgentRunner {
         authMethods: session?.capabilities?.authMethods,
       });
     } finally {
-      structuredTool?.release();
-      if (session) {
-        // Read real usage on BOTH success and error so partial usage is never lost.
-        try {
-          opts.onUsage?.(session.usage.toAgentUsage());
-        } catch {
-          // usage is best-effort; never let it mask the real result/error.
+      try {
+        structuredTool?.release();
+        if (session) {
+          // Read real usage on BOTH success and error so partial usage is never lost.
+          try {
+            opts.onUsage?.(session.usage.toAgentUsage());
+          } catch {
+            // usage is best-effort; never let it mask the real result/error.
+          }
+          try {
+            opts.onHistory?.(session.history);
+          } catch {
+            // history is diagnostic only.
+          }
+          // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
+          try {
+            await session.release();
+          } catch {
+            // release is best-effort (session already untracked); never mask the real result/error.
+          }
         }
-        try {
-          opts.onHistory?.(session.history);
-        } catch {
-          // history is diagnostic only.
-        }
-        // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
-        try {
-          await session.release();
-        } catch {
-          // release is best-effort (session already untracked); never mask the real result/error.
-        }
+      } finally {
+        // The injected-tool turn spans the WHOLE run incl. session close, so the next queued
+        // schema run's session/new (same-name registry replacement) never overlaps this one.
+        releaseStructuredToolTurn?.();
       }
     }
   }
 
   /** Tear down the whole pool (close every long-lived process). Call when the run ends / the
    *  runner is disposed. Beyond the AgentRunner seam (additive) — never enters the resume hash. */
+  /** Await the connection's current injected-run chain and append this run's turn. The
+   *  returned release MUST be called (run finally) or the connection's schema runs starve. */
+  private async acquireStructuredToolTurn(connection: object): Promise<() => void> {
+    const previous = this.structuredToolTurns.get(connection) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.structuredToolTurns.set(connection, previous.then(() => turn));
+    await previous;
+    return release;
+  }
+
   async dispose(): Promise<void> {
     this.disposed = true;
     this.removeExitHook();
@@ -824,12 +857,12 @@ function supportsStructuredOutputToolTransport(capabilities: PooledConnection["c
   return capabilities?.agent.mcpCapabilities?.http === true;
 }
 
-function nextStructuredOutputServerName(servers: AnyRunOptions["mcpServers"] | undefined): string {
+function availableMcpServerName(base: string, servers: AnyRunOptions["mcpServers"] | undefined): string {
   const used = new Set((servers ?? []).map((server) => server.name));
-  let candidate = STRUCTURED_OUTPUT_SERVER_NAME;
+  let candidate = base;
   let suffix = 2;
   while (used.has(candidate)) {
-    candidate = `${STRUCTURED_OUTPUT_SERVER_NAME}_${suffix}`;
+    candidate = `${base}_${suffix}`;
     suffix += 1;
   }
   return candidate;
