@@ -90,7 +90,7 @@ From [`src/index.ts`](./src/index.ts):
 
 **MCP config**
 - `McpServerConfig` (union) + `McpStdioServerConfig`, `McpHttpServerConfig`,
-  `McpSseServerConfig`, `McpNameValue`.
+  `McpSseServerConfig`, `McpAcpServerConfig`, `McpNameValue`.
 
 **History & meta**
 - `AgentHistoryEntry`, `AgentHistoryRole`, `AgentHistoryKind` (diagnostic, via `onHistory`).

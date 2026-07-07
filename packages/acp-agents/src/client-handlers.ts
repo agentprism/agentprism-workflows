@@ -10,10 +10,16 @@
 // even when a pooled ACP process serves multiple sessions.
 import type {
   ClientCapabilities,
+  ConnectMcpRequest,
+  ConnectMcpResponse,
   CreateTerminalRequest,
   CreateTerminalResponse,
+  DisconnectMcpRequest,
+  DisconnectMcpResponse,
   KillTerminalRequest,
   KillTerminalResponse,
+  MessageMcpRequest,
+  MessageMcpResponse,
   ReadTextFileRequest,
   ReadTextFileResponse,
   ReleaseTerminalRequest,
@@ -67,9 +73,25 @@ export interface TerminalHandlers {
   ): Promise<ReleaseTerminalResponse | void> | ReleaseTerminalResponse | void;
 }
 
+export interface McpHandlers {
+  connect(
+    params: ConnectMcpRequest,
+    ctx: AcpSessionContext,
+  ): Promise<ConnectMcpResponse> | ConnectMcpResponse;
+  message(
+    params: MessageMcpRequest,
+    ctx: AcpSessionContext,
+  ): Promise<MessageMcpResponse> | MessageMcpResponse;
+  disconnect(
+    params: DisconnectMcpRequest,
+    ctx: AcpSessionContext,
+  ): Promise<DisconnectMcpResponse | void> | DisconnectMcpResponse | void;
+}
+
 export interface ClientHandlers {
   fs?: FsHandlers;
   terminal?: TerminalHandlers;
+  mcp?: McpHandlers;
 }
 
 export interface ClientCapabilityOptions {
@@ -87,10 +109,14 @@ const TERMINAL_HANDLER_METHODS = [
   "releaseTerminal",
 ] as const;
 
+const MCP_HANDLER_METHODS = ["connect", "message", "disconnect"] as const;
+
 /** The client capability advertisement: fs/terminal derived solely from registered consumer
  *  handlers, plus the capabilities this client supports natively regardless of handlers —
  *  boolean session config options (SessionHandle drives the catalog programmatically and
- *  handles `type: "boolean"` entries, e.g. codex-acp's Fast-mode toggle). */
+ *  handles `type: "boolean"` entries, e.g. codex-acp's Fast-mode toggle). The installed ACP SDK
+ *  has no ClientCapabilities field for MCP-over-ACP; support is declared by sending
+ *  `mcpServers[{ type: "acp" }]` on session/new and then gated against handlers at that site. */
 export function clientCapabilitiesFor(
   handlers: ClientHandlers | undefined,
   options: ClientCapabilityOptions = {},
@@ -109,12 +135,19 @@ export function clientCapabilitiesFor(
   return capabilities;
 }
 
-/** Fail-fast validation for JavaScript consumers bypassing the TerminalHandlers type. */
+/** Fail-fast validation for JavaScript consumers bypassing the grouped handler types. */
 export function validateClientHandlers(handlers: ClientHandlers | undefined): void {
-  if (!handlers?.terminal) return;
-  const missing = missingTerminalMethods(handlers.terminal);
-  if (missing.length > 0) {
-    throw new Error(`clientHandlers.terminal missing required methods: ${missing.join(", ")}`);
+  if (handlers?.terminal) {
+    const missing = missingTerminalMethods(handlers.terminal);
+    if (missing.length > 0) {
+      throw new Error(`clientHandlers.terminal missing required methods: ${missing.join(", ")}`);
+    }
+  }
+  if (handlers?.mcp) {
+    const missing = missingMcpMethods(handlers.mcp);
+    if (missing.length > 0) {
+      throw new Error(`clientHandlers.mcp missing required methods: ${missing.join(", ")}`);
+    }
   }
 }
 
@@ -122,6 +155,14 @@ function hasFullTerminalHandlers(terminal: TerminalHandlers | undefined): termin
   return Boolean(terminal && missingTerminalMethods(terminal).length === 0);
 }
 
+export function hasFullMcpHandlers(mcp: McpHandlers | undefined): mcp is McpHandlers {
+  return Boolean(mcp && missingMcpMethods(mcp).length === 0);
+}
+
 function missingTerminalMethods(terminal: Partial<TerminalHandlers>): string[] {
   return TERMINAL_HANDLER_METHODS.filter((method) => typeof terminal[method] !== "function");
+}
+
+function missingMcpMethods(mcp: Partial<McpHandlers>): string[] {
+  return MCP_HANDLER_METHODS.filter((method) => typeof mcp[method] !== "function");
 }

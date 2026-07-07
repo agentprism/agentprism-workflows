@@ -7,8 +7,7 @@
 // ZERO ACP/MCP deps (it is the only module BOTH the engine and acp-agents import, and
 // neither may pull the ACP SDK through it). The three transports below are the ones a
 // client may provide over ACP: stdio (command/args/env), http (url/headers), sse
-// (url/headers). The `acp` transport is agent-internal and not client-providable, so it
-// is intentionally omitted.
+// (url/headers), and acp (client-proxied MCP over the ACP connection).
 //
 // IDENTITY NOTE: mcpServers is an ADDITIVE run input. It is NOT part of the resume
 // identity hash (hashAgentCall) — it changes which tools an agent can reach, not the
@@ -50,6 +49,19 @@ export interface McpSseServerConfig {
   headers: McpNameValue[];
 }
 
+/** ACP transport. Matches ACP `McpServerAcp & { type: "acp" }`: the client hosts the MCP
+ *  server and the agent tunnels MCP JSON-RPC back with mcp/connect, mcp/message, mcp/disconnect. */
+export interface McpAcpServerConfig {
+  type: "acp";
+  name: string;
+  serverId: string;
+  _meta?: Record<string, unknown> | null;
+}
+
 /** A client-providable MCP server config — structurally assignable to the ACP SDK's
- *  `McpServer` union (minus the agent-internal `acp` transport). */
-export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig | McpSseServerConfig;
+ *  `McpServer` union. */
+export type McpServerConfig =
+  | McpStdioServerConfig
+  | McpHttpServerConfig
+  | McpSseServerConfig
+  | McpAcpServerConfig;

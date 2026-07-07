@@ -31,6 +31,8 @@ import {
   RequestError,
   type ClientConnection,
   type CompleteElicitationNotification,
+  type ConnectMcpRequest,
+  type ConnectMcpResponse,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type CreateElicitationRequest,
@@ -45,10 +47,16 @@ import {
   type KillTerminalResponse,
   type DeleteSessionRequest,
   type DeleteSessionResponse,
+  type DisconnectMcpRequest,
+  type DisconnectMcpResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type McpConnectionId,
+  type MessageMcpNotification,
+  type MessageMcpRequest,
+  type MessageMcpResponse,
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
@@ -105,6 +113,7 @@ import {
 import { UsageAccumulator } from "./usage.js";
 import {
   clientCapabilitiesFor,
+  hasFullMcpHandlers,
   type AcpSessionContext,
   type ClientHandlers,
   type TerminalHandlers,
@@ -146,6 +155,12 @@ interface SessionTombstone {
   readonly runId?: string;
 }
 
+const parseConnectMcpRequest = (params: unknown): ConnectMcpRequest => params as ConnectMcpRequest;
+const parseMessageMcpRequest = (params: unknown): MessageMcpRequest => params as MessageMcpRequest;
+const parseMessageMcpNotification = (params: unknown): MessageMcpNotification =>
+  params as MessageMcpNotification;
+const parseDisconnectMcpRequest = (params: unknown): DisconnectMcpRequest => params as DisconnectMcpRequest;
+
 /** Per-session accumulator: assistant text, tool history, usage, the Claude raw structured_output,
  *  and the permission policy/resolver used to answer permission requests for THIS session. */
 class SessionState {
@@ -155,6 +170,7 @@ class SessionState {
   readonly pendingPermissions = new Set<(outcome: RequestPermissionResponse) => void>();
   readonly pendingElicitations = new Set<(outcome: CreateElicitationResponse) => void>();
   readonly urlElicitationIds = new Set<string>();
+  readonly mcpConnectionIds = new Set<McpConnectionId>();
   rawResultSuccess: RawResultSuccess | undefined;
   modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
@@ -169,6 +185,7 @@ class SessionState {
     readonly label?: string,
     readonly runId?: string,
     modes?: SessionModeState | null,
+    readonly mcpServerIds: readonly string[] = [],
     private readonly retainSessionLog = true,
   ) {
     this.modes = modes;
@@ -262,6 +279,8 @@ class SessionState {
 class MultiplexClient {
   private readonly sessions = new Map<string, SessionState>();
   private readonly urlElicitationContexts = new Map<string, AcpEventContext>();
+  private readonly mcpServerSessions = new Map<string, string>();
+  private readonly mcpConnectionSessions = new Map<McpConnectionId, string>();
   /** Recently unregistered sessions kept ONLY for the teardown window: ACP agents may
    *  legitimately release terminals (or finish fs/terminal cleanup) after this client releases
    *  the session because session/close is cancel + free resources and the Agent owns terminal
@@ -304,6 +323,7 @@ class MultiplexClient {
   register(sessionId: string, state: SessionState): void {
     this.tombstones.delete(sessionId);
     this.sessions.set(sessionId, state);
+    for (const serverId of state.mcpServerIds) this.mcpServerSessions.set(serverId, sessionId);
     this.onEvent?.("session_open", this.contextFor(sessionId, state));
   }
 
@@ -311,8 +331,12 @@ class MultiplexClient {
     const state = this.sessions.get(sessionId);
     state?.settlePendingPermissions();
     state?.settlePendingElicitations();
+    if (state) this.disconnectMcpConnectionsForSession(sessionId, state);
     this.sessions.delete(sessionId);
     if (state) {
+      for (const serverId of state.mcpServerIds) {
+        if (this.mcpServerSessions.get(serverId) === sessionId) this.mcpServerSessions.delete(serverId);
+      }
       for (const elicitationId of state.urlElicitationIds) this.urlElicitationContexts.delete(elicitationId);
       this.tombstones.set(sessionId, {
         cwd: state.cwd,
@@ -346,6 +370,13 @@ class MultiplexClient {
     for (const state of this.sessions.values()) {
       state.settlePendingElicitations();
     }
+  }
+
+  disconnectAllMcpConnections(): void {
+    for (const [sessionId, state] of this.sessions) {
+      this.disconnectMcpConnectionsForSession(sessionId, state);
+    }
+    this.mcpServerSessions.clear();
   }
 
   requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> | RequestPermissionResponse {
@@ -511,6 +542,47 @@ class MultiplexClient {
     return this.dispatch(params, CLIENT_METHODS.terminal_kill, this.handlers?.terminal?.killTerminal);
   }
 
+  async mcpConnect(params: ConnectMcpRequest): Promise<ConnectMcpResponse> {
+    const handler = this.handlers?.mcp?.connect;
+    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHODS.mcp_connect);
+    const sessionId = this.mcpServerSessions.get(params.serverId);
+    if (!sessionId) throw unknownMcpServer(params.serverId);
+    const response = await handler(params, this.handlerContext({ sessionId }));
+    this.mcpConnectionSessions.set(response.connectionId, sessionId);
+    this.sessions.get(sessionId)?.mcpConnectionIds.add(response.connectionId);
+    return response;
+  }
+
+  async mcpMessage(params: MessageMcpRequest): Promise<MessageMcpResponse> {
+    const handler = this.handlers?.mcp?.message;
+    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHODS.mcp_message);
+    const ctx = this.handlerContext({ sessionId: this.sessionIdForMcpConnection(params.connectionId) });
+    return handler(params, ctx);
+  }
+
+  mcpMessageNotification(params: MessageMcpNotification): void {
+    const handler = this.handlers?.mcp?.message;
+    if (typeof handler !== "function") return;
+    const sessionId = this.mcpConnectionSessions.get(params.connectionId);
+    if (!sessionId) return;
+    try {
+      Promise.resolve(handler(params, this.handlerContext({ sessionId }))).catch(() => {});
+    } catch {
+      // Notifications have no response path; teardown remains best-effort and non-fatal.
+    }
+  }
+
+  async mcpDisconnect(params: DisconnectMcpRequest): Promise<DisconnectMcpResponse> {
+    const handler = this.handlers?.mcp?.disconnect;
+    if (typeof handler !== "function") throw methodNotAdvertised(CLIENT_METHODS.mcp_disconnect);
+    const sessionId = this.sessionIdForMcpConnection(params.connectionId);
+    try {
+      return (await handler(params, this.handlerContext({ sessionId }))) ?? {};
+    } finally {
+      this.dropMcpConnection(params.connectionId, sessionId);
+    }
+  }
+
   sessionUpdate(params: SessionNotification): void {
     const state = this.sessions.get(params.sessionId);
     // Fold into the accumulator FIRST (the drain contract), THEN bubble the event up unchanged.
@@ -543,10 +615,44 @@ class MultiplexClient {
     this.sessions.get(ctx.sessionId)?.urlElicitationIds.delete(params.elicitationId);
     this.onEvent?.("elicitation_complete", { ...ctx, notification: params });
   }
+
+  private sessionIdForMcpConnection(connectionId: McpConnectionId): string {
+    const sessionId = this.mcpConnectionSessions.get(connectionId);
+    if (!sessionId) throw unknownMcpConnection(connectionId);
+    return sessionId;
+  }
+
+  private dropMcpConnection(connectionId: McpConnectionId, sessionId: string): void {
+    this.mcpConnectionSessions.delete(connectionId);
+    this.sessions.get(sessionId)?.mcpConnectionIds.delete(connectionId);
+  }
+
+  private disconnectMcpConnectionsForSession(sessionId: string, state: SessionState): void {
+    const handler = this.handlers?.mcp?.disconnect;
+    const ctx: AcpSessionContext = { sessionId, cwd: state.cwd, label: state.label, runId: state.runId };
+    for (const connectionId of [...state.mcpConnectionIds]) {
+      this.mcpConnectionSessions.delete(connectionId);
+      state.mcpConnectionIds.delete(connectionId);
+      if (typeof handler !== "function") continue;
+      try {
+        Promise.resolve(handler({ connectionId }, ctx)).catch(() => {});
+      } catch {
+        // Best-effort teardown: a broken MCP cleanup hook must not block session release/death.
+      }
+    }
+  }
 }
 
 function unknownSession(sessionId: string): RequestError {
   return RequestError.invalidParams({ sessionId }, `unknown session: ${sessionId}`);
+}
+
+function unknownMcpServer(serverId: string): RequestError {
+  return RequestError.invalidParams({ serverId }, `unknown MCP-over-ACP server: ${serverId}`);
+}
+
+function unknownMcpConnection(connectionId: McpConnectionId): RequestError {
+  return RequestError.invalidParams({ connectionId }, `unknown MCP-over-ACP connection: ${connectionId}`);
 }
 
 function cancelledPermissionResponse(): RequestPermissionResponse {
@@ -646,6 +752,12 @@ function layerMeta(...layers: Array<Record<string, unknown> | undefined>): Recor
   const present = layers.filter((l): l is Record<string, unknown> => Boolean(l && Object.keys(l).length > 0));
   if (present.length === 0) return undefined;
   return Object.assign({}, ...present);
+}
+
+function acpMcpServerIds(servers: McpServerConfig[] | undefined): string[] {
+  return servers
+    ?.filter((server): server is Extract<McpServerConfig, { type: "acp" }> => "type" in server && server.type === "acp")
+    .map((server) => server.serverId) ?? [];
 }
 
 /** Merge the engine runId correlation stamp into a backend's session/new `_meta`. Returns the
@@ -836,6 +948,14 @@ export class PooledConnection {
       .onRequest(CLIENT_METHODS.terminal_release, ({ params }) => this.client.releaseTerminal(params))
       .onRequest(CLIENT_METHODS.terminal_wait_for_exit, ({ params }) => this.client.waitForTerminalExit(params))
       .onRequest(CLIENT_METHODS.terminal_kill, ({ params }) => this.client.killTerminal(params))
+      .onRequest(CLIENT_METHODS.mcp_connect, parseConnectMcpRequest, ({ params }) => this.client.mcpConnect(params))
+      .onRequest(CLIENT_METHODS.mcp_message, parseMessageMcpRequest, ({ params }) => this.client.mcpMessage(params))
+      .onRequest(CLIENT_METHODS.mcp_disconnect, parseDisconnectMcpRequest, ({ params }) =>
+        this.client.mcpDisconnect(params),
+      )
+      .onNotification(CLIENT_METHODS.mcp_message, parseMessageMcpNotification, ({ params }) =>
+        this.client.mcpMessageNotification(params),
+      )
       .connect(stream);
 
     // Death detection. The connection's `signal` aborts the INSTANT the underlying stream closes
@@ -889,9 +1009,19 @@ export class PooledConnection {
 
   private assertSupportedMcpServers(opts: AcpSessionOptions): void {
     const unsupported = this.negotiated
-      ? unsupportedMcpServer(opts.mcpServers, this.negotiated.agent)
+      ? unsupportedMcpServer(opts.mcpServers, this.negotiated.agent, {
+          clientCanServeAcp: hasFullMcpHandlers(this.clientHandlers?.mcp),
+        })
       : undefined;
     if (!unsupported) return;
+    if (unsupported.reason === "client") {
+      throw new WorkflowError(
+        `MCP server "${unsupported.name}" uses the "acp" transport, but this runner has no ` +
+          "complete clientHandlers.mcp implementation to serve it",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: opts.label },
+      );
+    }
     throw new WorkflowError(
       `MCP server "${unsupported.name}" uses the "${unsupported.transport}" transport, which the ` +
         `${this.backendId} agent does not support`,
@@ -939,6 +1069,7 @@ export class PooledConnection {
     this.resolveDead();
     this.client.settleAllPendingPermissions();
     this.client.settleAllPendingElicitations();
+    this.client.disconnectAllMcpConnections();
     // A crash (not a graceful dispose) is worth surfacing for observability; the engine still
     // handles it by retrying the run on a fresh process. Best-effort, after death is recorded.
     if (this.onEvent && !this.disposing) {
@@ -1055,6 +1186,7 @@ export class PooledConnection {
         opts.label,
         opts.runId,
         response.modes,
+        acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
       );
       this.client.register(response.sessionId, state);
@@ -1098,6 +1230,7 @@ export class PooledConnection {
       opts.label,
       opts.runId,
       undefined,
+      acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
     );
     try {

@@ -82,6 +82,7 @@ export type {
   ClientCapabilityOptions,
   ClientHandlers,
   FsHandlers,
+  McpHandlers,
   TerminalHandlers,
   AcpSessionContext,
   NegotiatedCapabilities,
@@ -89,12 +90,22 @@ export type {
   AgentRequestMethod,
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
+  ConnectMcpRequest,
+  ConnectMcpResponse,
   DeleteSessionRequest,
   DeleteSessionResponse,
+  DisconnectMcpRequest,
+  DisconnectMcpResponse,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  McpConnectionId,
+  McpServerAcp,
+  McpServerAcpId,
+  MessageMcpNotification,
+  MessageMcpRequest,
+  MessageMcpResponse,
   ResumeSessionRequest,
   ResumeSessionResponse,
   AgentNotificationMethod,
@@ -147,7 +158,14 @@ export type {
 
 // ── Shared seam types: the AgentRunner contract and its opts/result/usage shapes,
 //    so callers can implement or type a custom runner without reaching past the SDK. ──
-export type { AgentRunner, RunOptions, AgentResult, AgentUsage } from "@automatalabs/shared-types";
+export type {
+  AgentRunner,
+  McpAcpServerConfig,
+  McpServerConfig,
+  RunOptions,
+  AgentResult,
+  AgentUsage,
+} from "@automatalabs/shared-types";
 export type { JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
 
 /** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */

@@ -32,6 +32,7 @@ const logPath = process.env.AGENTPRISM_FAKE_LOG;
 const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 const hasLifecycleSupport = scenario.lifecycleSupport === true;
+const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
 
 function record(entry) {
   if (!logPath) return;
@@ -196,6 +197,7 @@ class FakeAgent {
       agentCapabilities: {
         ...(hasLifecycleSupport ? { loadSession: true } : {}),
         sessionCapabilities,
+        ...(hasMcpAcpSupport ? { mcpCapabilities: { acp: true } } : {}),
       },
     };
   }
@@ -377,6 +379,13 @@ class FakeAgent {
       record({ method: "elicitationComplete", notification });
     }
 
+    // 1.75) optional MCP-over-ACP flow. The fake is the AGENT: it asks the client to connect
+    // to a client-declared ACP MCP server, sends one opaque MCP payload, and optionally leaves the
+    // connection live so release/death teardown can prove the client closes it.
+    if (turn.mcpOverAcp) {
+      await this.callMcpOverAcp(turn.mcpOverAcp);
+    }
+
     // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors
     // logged so tests can assert the real JSON-RPC path without changing the default turn.
     const clientCalls = Array.isArray(turn.clientCalls) ? turn.clientCalls : [];
@@ -484,6 +493,50 @@ class FakeAgent {
       record({ method: "clientCall", clientMethod, label: call.label, response });
     } catch (error) {
       record({ method: "clientCall", clientMethod, label: call.label, error: serializeError(error) });
+    }
+  }
+
+  async callMcpOverAcp(flow) {
+    const serverId = flow.serverId ?? "fake-acp-mcp";
+    let connectionId;
+    try {
+      const request = {
+        serverId,
+        ...(flow.connectMeta ? { _meta: flow.connectMeta } : {}),
+      };
+      const response = await this.conn.request(CLIENT_METHODS.mcp_connect, request);
+      connectionId = response?.connectionId;
+      record({ method: "mcpConnect", label: flow.label, request, response });
+    } catch (error) {
+      record({ method: "mcpConnect", label: flow.label, error: serializeError(error) });
+      return;
+    }
+
+    if (flow.message !== false) {
+      try {
+        const request = {
+          connectionId,
+          method: flow.method ?? "tools/list",
+          ...(Object.prototype.hasOwnProperty.call(flow, "params") ? { params: flow.params } : {}),
+          ...(flow.messageMeta ? { _meta: flow.messageMeta } : {}),
+        };
+        const response = await this.conn.request(CLIENT_METHODS.mcp_message, request);
+        record({ method: "mcpMessage", label: flow.label, request, response });
+      } catch (error) {
+        record({ method: "mcpMessage", label: flow.label, error: serializeError(error) });
+      }
+    }
+
+    if (flow.disconnect === false) return;
+    try {
+      const request = {
+        connectionId,
+        ...(flow.disconnectMeta ? { _meta: flow.disconnectMeta } : {}),
+      };
+      const response = await this.conn.request(CLIENT_METHODS.mcp_disconnect, request);
+      record({ method: "mcpDisconnect", label: flow.label, request, response });
+    } catch (error) {
+      record({ method: "mcpDisconnect", label: flow.label, error: serializeError(error) });
     }
   }
 
