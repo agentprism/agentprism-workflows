@@ -166,7 +166,7 @@ export { UsageAccumulator } from "./usage.js";
 
 export type { McpAcpServerConfig, McpServerConfig } from "@automatalabs/shared-types";
 
-export { toJsonSchema, toStrictJsonSchema } from "./schema-strict.js";
+export { toAnthropicJsonSchema, toJsonSchema, toStrictJsonSchema } from "./schema-strict.js";
 
 export {
   extractValidated,

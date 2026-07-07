@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
-import { toJsonSchema, toStrictJsonSchema } from "../src/index.js";
+import { toAnthropicJsonSchema, toJsonSchema, toStrictJsonSchema } from "../src/index.js";
 
 /** A structural view of a JSON-Schema node for reading runtime fields off either a plain
  *  output object or a typebox schema (which carries the same fields, just not in its static
@@ -237,4 +237,138 @@ test("toStrictJsonSchema: allOf/oneOf normalization does NOT mutate the hash-fee
   toStrictJsonSchema(schema);
   assert.equal(JSON.stringify(schema), before, "the exact bytes the resume hash consumes are unchanged");
   assert.ok(Array.isArray((view(schema) as JsonNode).allOf), "original still carries its allOf");
+});
+
+// ---- toAnthropicJsonSchema (Claude native outputFormat) ----------------------------------
+
+test("toAnthropicJsonSchema: additionalProperties:false forced on EVERY object, required preserved", () => {
+  const schema = buildSchema();
+  const out = toAnthropicJsonSchema(schema);
+
+  // Anthropic REQUIRES additionalProperties:false (authored `true` is a 400 as-is).
+  assert.equal(out.additionalProperties, false);
+  const props = out.properties as Record<string, JsonNode>;
+  assert.equal(props.address.additionalProperties, false);
+  // UNLIKE OpenAI strict: authored required survives — optional `age`/`zip` stay optional...
+  assert.deepEqual(out.required, ["name", "address", "tags"]);
+  assert.deepEqual(props.address.required, ["city"]);
+  // ...and are NOT null-widened.
+  assert.equal(props.age.type, "integer");
+});
+
+test("toAnthropicJsonSchema: unsupported keywords stripped; supported subset kept", () => {
+  const schema = Type.Object({
+    name: Type.String({ minLength: 1, format: "email", description: "the name" }),
+    age: Type.Integer({ minimum: 0, maximum: 130, default: 30 }),
+    tags: Type.Array(Type.String(), { minItems: 1, maxItems: 5, uniqueItems: true }),
+    empties: Type.Array(Type.String(), { minItems: 0 }),
+    status: Type.Unsafe({ type: "string", enum: ["a", "b"] }),
+  }, { title: "Person", $id: "person" });
+  const out = toAnthropicJsonSchema(schema);
+  const props = out.properties as Record<string, JsonNode>;
+
+  assert.equal("title" in out, false);
+  assert.equal("$id" in out, false);
+  // numeric/string constraints gone; description/default/enum kept
+  assert.equal("minLength" in props.name, false);
+  assert.equal(props.name.description, "the name");
+  assert.equal("minimum" in props.age, false);
+  assert.equal("maximum" in props.age, false);
+  assert.equal(props.age.default, 30);
+  assert.deepEqual(props.status.enum, ["a", "b"]);
+  // format: "email" is in Anthropic's supported set -> kept
+  assert.equal(props.name.format, "email");
+  // array constraints: minItems kept ONLY for 0/1; maxItems/uniqueItems always stripped
+  assert.equal(props.tags.minItems, 1);
+  assert.equal("maxItems" in props.tags, false);
+  assert.equal("uniqueItems" in props.tags, false);
+  assert.equal(props.empties.minItems, 0);
+});
+
+test("toAnthropicJsonSchema: minItems 0/1 kept, larger stripped; unsupported format stripped", () => {
+  const schema = Type.Object({
+    one: Type.Array(Type.String(), { minItems: 1 }),
+    two: Type.Array(Type.String(), { minItems: 2 }),
+    slug: Type.String({ format: "custom-slug" }),
+    id: Type.String({ format: "uuid" }),
+  });
+  const out = toAnthropicJsonSchema(schema);
+  const props = out.properties as Record<string, JsonNode>;
+  assert.equal(props.one.minItems, 1);
+  assert.equal("minItems" in props.two, false);
+  assert.equal("format" in props.slug, false);
+  assert.equal(props.id.format, "uuid");
+});
+
+test("toAnthropicJsonSchema: patterns with unsupported regex features stripped, simple kept", () => {
+  const schema = Type.Object({
+    simple: Type.String({ pattern: "^[a-z0-9-]+$" }),
+    lookahead: Type.String({ pattern: "^(?=.*[A-Z]).+$" }),
+    backref: Type.String({ pattern: "^(a)\\1$" }),
+    boundary: Type.String({ pattern: "\\bword\\b" }),
+  });
+  const out = toAnthropicJsonSchema(schema);
+  const props = out.properties as Record<string, JsonNode>;
+  assert.equal(props.simple.pattern, "^[a-z0-9-]+$");
+  assert.equal("pattern" in props.lookahead, false);
+  assert.equal("pattern" in props.backref, false);
+  assert.equal("pattern" in props.boundary, false);
+});
+
+test("toAnthropicJsonSchema: oneOf rewritten to anyOf; anyOf preserved", () => {
+  const schema = Type.Object({
+    choice: Type.Unsafe({ oneOf: [{ type: "string" }, { type: "number" }] }),
+    nullable: Type.Unsafe({ anyOf: [{ type: "string" }, { type: "null" }] }),
+  });
+  const out = toAnthropicJsonSchema(schema);
+  const props = out.properties as Record<string, JsonNode>;
+  assert.equal("oneOf" in props.choice, false);
+  assert.deepEqual(props.choice.anyOf, [{ type: "string" }, { type: "number" }]);
+  assert.deepEqual(props.nullable.anyOf, [{ type: "string" }, { type: "null" }]);
+});
+
+test("toAnthropicJsonSchema: does NOT mutate the hash-feeding original", () => {
+  const schema = buildSchema();
+  const before = JSON.stringify(schema);
+  toAnthropicJsonSchema(schema);
+  assert.equal(JSON.stringify(schema), before, "the exact bytes the resume hash consumes are unchanged");
+  const original = view(schema);
+  assert.equal(original.additionalProperties, true);
+  assert.equal(original.properties?.name?.minLength, 1);
+});
+
+// ---- map keys are data, not keywords (both normalizers) ----------------------------------
+
+test("properties literally named after keywords survive BOTH normalizers", () => {
+  // A review schema might genuinely have properties named "format", "title", or "pattern";
+  // keyword-stripping must not delete them from the properties map.
+  const schema = Type.Object({
+    format: Type.String(),
+    title: Type.String(),
+    pattern: Type.Optional(Type.String()),
+  });
+
+  const anthropic = toAnthropicJsonSchema(schema);
+  assert.deepEqual(Object.keys(anthropic.properties as object), ["format", "title", "pattern"]);
+  assert.deepEqual(anthropic.required, ["format", "title"]);
+
+  const strict = toStrictJsonSchema(schema);
+  assert.deepEqual(Object.keys(strict.properties as object), ["format", "title", "pattern"]);
+  // strict still applies its all-required + nullable-optional rules to the surviving props
+  assert.deepEqual(strict.required, ["format", "title", "pattern"]);
+  const strictProps = strict.properties as Record<string, JsonNode>;
+  assert.deepEqual(strictProps.pattern.type, ["string", "null"]);
+});
+
+test("$defs subschemas are normalized but their NAMES survive keyword filtering", () => {
+  const schema = Type.Object(
+    { a: Type.Ref("minLength") },
+    { $defs: { minLength: Type.Object({ z: Type.String({ minLength: 3 }) }) } },
+  );
+  const out = toAnthropicJsonSchema(schema);
+  const defs = out.$defs as Record<string, JsonNode>;
+  assert.ok(defs.minLength, "a $def named after a keyword survives");
+  assert.equal(defs.minLength.additionalProperties, false, "…and its subschema IS normalized");
+  const z = (defs.minLength.properties as Record<string, JsonNode>).z;
+  assert.equal("minLength" in z, false);
 });

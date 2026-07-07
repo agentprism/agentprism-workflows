@@ -22,11 +22,13 @@ test("ClaudeBackend.sessionMeta carries outputFormat + emitRawSDKMessages at ses
   };
   assert.equal(meta.claudeCode.options.outputFormat.type, "json_schema");
   assert.equal(meta.claudeCode.emitRawSDKMessages, true);
-  // Claude path is non-strict: the SDK applies its own constraint, so validation keywords survive
-  // and additionalProperties is NOT forced false.
+  // Claude path is ANTHROPIC-normalized (not OpenAI-strict): additionalProperties:false is
+  // REQUIRED on every object and unsupported validation keywords are stripped, but authored
+  // `required` is preserved — Anthropic allows optional properties.
   const schema = meta.claudeCode.options.outputFormat.schema;
-  assert.equal((schema.properties as Record<string, Record<string, unknown>>).city.minLength, 1);
-  assert.equal("additionalProperties" in schema, false);
+  assert.equal(schema.additionalProperties, false);
+  assert.equal("minLength" in (schema.properties as Record<string, Record<string, unknown>>).city, false);
+  assert.deepEqual(schema.required, ["city", "hot"]);
 });
 
 test("ClaudeBackend: no schema => no session _meta; never carries schema on the turn", () => {
