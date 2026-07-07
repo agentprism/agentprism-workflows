@@ -1,5 +1,11 @@
 # @automatalabs/shared-types
 
+## 0.12.1
+
+### Patch Changes
+
+- 037ba2c: Backfill version bumps for the StructuredOutput tool-injection slice: shared-types gained the optional `WorkflowBackendConfig.structuredOutputTool` field and workflow-engine validates it in script `meta.backends`. Both changes shipped in the repo at v0.19.0 of the SDK but were not version-bumped; this republishes so the published types and validation match source.
+
 ## 0.12.0
 
 ### Minor Changes
