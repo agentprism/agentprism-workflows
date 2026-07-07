@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.19.0
+
+### Minor Changes
+
+- fea0254: Add client-hosted StructuredOutput MCP tool injection for custom ACP backends that opt in and negotiate HTTP MCP support, preserving native Claude/Codex structured-output channels while giving schema runs a validated tool-capture path before falling back to final-text JSON recovery.
+
 ## 0.18.0
 
 ### Minor Changes
