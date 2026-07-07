@@ -23,11 +23,27 @@ interface LogEntry {
   params?: {
     sessionId?: string;
     modeId?: string;
+    configId?: string;
+    value?: string;
   };
 }
 
 const harness = createFakeAgentHarness({ prefix: "acp-session-modes-it-", backends: ["claude"] });
 const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
+
+const MODE_CONFIG_OPTIONS = [
+  {
+    id: "mode",
+    type: "select",
+    name: "Mode",
+    category: "mode",
+    currentValue: "build",
+    options: [
+      { value: "build", name: "Build" },
+      { value: "plan", name: "Plan" },
+    ],
+  },
+];
 
 function makeRunner(): AcpAgentRunner {
   return harness.makeRunner();
@@ -95,6 +111,39 @@ test("openSession rejects requested modes when the agent advertises no modes", a
   assert.equal(readLog().some((entry) => entry.method === "prompt"), false);
 });
 
+test("openSession uses a mode config option catalog when session/new carries no modes", async () => {
+  const { cwd, readLog } = configure({ configOptions: MODE_CONFIG_OPTIONS, turns: [{ text: "ok" }] });
+  const runner = makeRunner();
+  const session = await runner.openSession({ cwd, model: "claude", mode: "plan" });
+
+  assert.equal(session.modes?.currentModeId, "plan");
+  assert.deepEqual(
+    session.modes?.availableModes.map((mode) => mode.id),
+    ["build", "plan"],
+  );
+  assert.equal((await session.prompt("hi")).text, "ok");
+
+  const wire = methods(readLog());
+  assert.equal(wire.includes("setSessionMode"), false);
+  assert.ok(wire.indexOf("setSessionConfigOption") > wire.indexOf("newSession"));
+  assert.ok(wire.indexOf("setSessionConfigOption") < wire.indexOf("prompt"));
+  const modeSet = readLog().find((entry) => entry.method === "setSessionConfigOption");
+  assert.equal(modeSet?.params?.configId, "mode");
+  assert.equal(modeSet?.params?.value, "plan");
+  await session.release();
+});
+
+test("openSession rejects config-option modes not advertised before prompting", async () => {
+  const { cwd, readLog } = configure({ configOptions: MODE_CONFIG_OPTIONS, turns: [{ text: "unused" }] });
+  const runner = makeRunner();
+
+  await assert.rejects(
+    () => runner.openSession({ cwd, model: "claude", mode: "yolo" }),
+    (error: unknown) => assertModeFailure(error, "yolo", /build, plan/),
+  );
+  assert.equal(readLog().some((entry) => entry.method === "prompt"), false);
+});
+
 test("run({ mode }) drives session/set_mode before prompt and strict failures stay non-recoverable", async () => {
   const ok = configure({ modes: MODES, turns: [{ text: "done" }] });
   const runner = makeRunner();
@@ -102,6 +151,12 @@ test("run({ mode }) drives session/set_mode before prompt and strict failures st
   assert.equal(await runner.run("do it", { model: "claude", cwd: ok.cwd, mode: "plan" }), "done");
   const okWire = methods(ok.readLog());
   assert.ok(okWire.indexOf("setSessionMode") < okWire.indexOf("prompt"));
+  // The MODE must ride session/set_mode when response.modes exists. A model-selection
+  // setSessionConfigOption (configId "model") is unrelated and allowed on this wire.
+  const modeViaConfigOption = ok
+    .readLog()
+    .some((entry) => entry.method === "setSessionConfigOption" && entry.params?.configId === "mode");
+  assert.equal(modeViaConfigOption, false);
 
   await harness.cleanup();
 

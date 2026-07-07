@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
-import { ClaudeBackend, CodexBackend, selectBackend, toStrictJsonSchema } from "../src/index.js";
+import { ClaudeBackend, CodexBackend, OpenCodeBackend, selectBackend, toStrictJsonSchema } from "../src/index.js";
 import type { Backend, StructuredSource } from "../src/index.js";
 
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
@@ -111,17 +111,30 @@ test("CodexBackend.nativeStructured parses the constrained final message (pure J
   assert.equal(backend.nativeStructured(source("   ", undefined)), undefined);
 });
 
+// ---- OpenCode backend ---------------------------------------------------------------
+
+test("OpenCodeBackend is the third built-in backend", () => {
+  const backend: Backend = new OpenCodeBackend();
+  assert.equal(backend.id, "opencode");
+  assert.equal(backend.stripsRoutingPrefix, true);
+  assert.equal(backend.embedSchemaInPrompt, true);
+  assert.equal(backend.injectStructuredOutputTool, true);
+});
+
 // ---- selectBackend cross-provider routing -------------------------------------------
 
 test("selectBackend routes by provider prefix and bare model id", () => {
   // provider prefixes
   assert.equal(selectBackend({ model: "openai/gpt-5-codex" }).id, "codex");
   assert.equal(selectBackend({ model: "codex/whatever" }).id, "codex");
+  assert.equal(selectBackend({ model: "opencode" }).id, "opencode");
+  assert.equal(selectBackend({ model: "opencode/zai/glm-5.2" }).id, "opencode");
   assert.equal(selectBackend({ model: "anthropic/claude-opus-4-1" }).id, "claude");
   assert.equal(selectBackend({ model: "claude/sonnet" }).id, "claude");
   // bare model ids (no provider)
   assert.equal(selectBackend({ model: "gpt-5" }).id, "codex");
   assert.equal(selectBackend({ model: "o3-mini" }).id, "codex");
+  assert.notEqual(selectBackend({ model: "glm-5.2" }).id, "opencode");
   assert.equal(selectBackend({ model: "claude-3-5-sonnet" }).id, "claude");
   assert.equal(selectBackend({ model: "opus" }).id, "claude");
 });
@@ -142,6 +155,9 @@ test("selectBackend honors AGENTPRISM_DEFAULT_BACKEND when nothing else matches"
     process.env.AGENTPRISM_DEFAULT_BACKEND = "codex";
     assert.equal(selectBackend({}).id, "codex");
     assert.equal(selectBackend({ model: "unknownish" }).id, "codex");
+    process.env.AGENTPRISM_DEFAULT_BACKEND = "opencode";
+    assert.equal(selectBackend({}).id, "opencode");
+    assert.equal(selectBackend({ model: "unknownish" }).id, "opencode");
     // an explicit recognizable spec still overrides the default
     assert.equal(selectBackend({ model: "claude-opus" }).id, "claude");
   } finally {

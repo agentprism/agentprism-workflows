@@ -1,16 +1,16 @@
 // The internal Backend strategy (NOT part of @automatalabs/shared-types). One AcpAgentSession
 // transport drives either backend; the Backend supplies the three things that genuinely
-// differ between Claude and Codex:
+// differ between Claude, Codex, and OpenCode:
 //   1. how to spawn the ACP server subprocess,
 //   2. the vendor `_meta` that carries the schema IN (Claude: session/new
 //      _meta.claudeCode.options.outputFormat + emitRawSDKMessages; Codex: per-turn
-//      _meta["outputSchema"], strict-normalized),
+//      _meta["outputSchema"], strict-normalized; OpenCode: generic _meta.outputSchema),
 //   3. how to read the native structured result OUT (Claude: structured_output off the raw
-//      _claude/sdkMessage; Codex: JSON.parse the final assistant message off the stream).
+//      _claude/sdkMessage; Codex/OpenCode: JSON.parse the final assistant message off the stream).
 import type { TSchema } from "typebox";
 
-/** The two built-in backends. Custom registry backends extend the id space beyond these. */
-export type BuiltinBackendId = "claude" | "codex";
+/** The built-in backends. Custom registry backends extend the id space beyond these. */
+export type BuiltinBackendId = "claude" | "codex" | "opencode";
 /** A backend id: one of the built-ins, or the registered name of a custom ACP backend
  *  (see registry.ts). The pool keys connections by this id, so ids must be stable. */
 export type BackendId = string;
@@ -45,9 +45,13 @@ export interface Backend {
    *  with DIFFERENT commands (script-declared `meta.backends`): keying the pool by name alone
    *  would hand run B a pooled process spawned from run A's command. */
   readonly poolKey?: string;
+  /** When true, `model:"id/inner"` uses `id` only for backend routing and sends `inner` to
+   *  the agent's model catalog. Custom backends and OpenCode need this; Claude/Codex provider
+   *  specs pass through whole. */
+  readonly stripsRoutingPrefix?: boolean;
   /** When true, the runner EMBEDS the JSON Schema in the prompt text on schema runs. For the
-   *  built-ins the native constraint channel is authoritative and this stays unset; a CUSTOM
-   *  backend sets it because its agent may ignore the `_meta.outputSchema` forward entirely —
+   *  native built-ins the native constraint channel is authoritative and this stays unset; a
+   *  generic backend sets it because its agent may ignore the `_meta.outputSchema` forward entirely —
    *  without the schema in the prompt, such an agent returns well-formed JSON with the WRONG
    *  KEYS and the repair ladder can never converge (it can fix prose, not unseen contracts). */
   readonly embedSchemaInPrompt?: boolean;

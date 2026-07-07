@@ -707,6 +707,18 @@ function modeIds(modes: SessionModeState | null | undefined): string[] {
   return modes?.availableModes.map((mode) => mode.id) ?? [];
 }
 
+function modeStateFromConfigOption(option: ModelSelectOption, currentModeId: string): SessionModeState {
+  return {
+    currentModeId,
+    availableModes: flattenSelectOptions(option.options).map((value) => ({
+      id: value.value,
+      name: value.name,
+      ...(value.description !== undefined ? { description: value.description } : {}),
+      ...(value._meta !== undefined ? { _meta: value._meta } : {}),
+    })),
+  };
+}
+
 function modeSelectionError(
   backendId: BackendId,
   requested: string,
@@ -1736,15 +1748,31 @@ export class SessionHandle implements StructuredSource {
   async setMode(modeId: string): Promise<void> {
     const modes = this.state.modes;
     const ids = modeIds(modes);
-    if (!modes || !ids.includes(modeId)) {
-      throw modeSelectionError(this.pooled.backendId, modeId, ids, this.opts.label);
+    if (modes) {
+      if (!ids.includes(modeId)) {
+        throw modeSelectionError(this.pooled.backendId, modeId, ids, this.opts.label);
+      }
+      try {
+        await this.pooled.setSessionMode({ sessionId: this.sessionId, modeId });
+      } catch (error) {
+        throw modeSelectionError(this.pooled.backendId, modeId, ids, this.opts.label, error);
+      }
+      this.state.modes = { ...modes, currentModeId: modeId };
+      return;
     }
+
+    const modeOption = this.configOptions.find(isModeConfigOption);
+    const configModeIds = modeOption ? flattenSelectOptions(modeOption.options).map((mode) => mode.value) : [];
+    if (!modeOption || !configModeIds.includes(modeId)) {
+      throw modeSelectionError(this.pooled.backendId, modeId, configModeIds, this.opts.label);
+    }
+
     try {
-      await this.pooled.setSessionMode({ sessionId: this.sessionId, modeId });
+      await this.applyConfigOption(modeOption.id, modeId);
     } catch (error) {
-      throw modeSelectionError(this.pooled.backendId, modeId, ids, this.opts.label, error);
+      throw modeSelectionError(this.pooled.backendId, modeId, configModeIds, this.opts.label, error);
     }
-    this.state.modes = { ...modes, currentModeId: modeId };
+    this.state.modes = modeStateFromConfigOption(modeOption, modeId);
   }
 
   /** Send a prompt turn and drain it; returns the final PromptResponse. */
@@ -1817,6 +1845,10 @@ function isModelSelectOption(option: SessionConfigOption): option is ModelSelect
 
 function isReasoningEffortOption(option: SessionConfigOption): option is ModelSelectOption {
   return option.type === "select" && (option.id === "reasoning_effort" || option.category === "thought_level");
+}
+
+function isModeConfigOption(option: SessionConfigOption): option is ModelSelectOption {
+  return option.type === "select" && (option.id === "mode" || option.category === "mode");
 }
 
 /** Fast mode is matched by its stable id (upstream codex-acp moved the category to

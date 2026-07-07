@@ -1,16 +1,16 @@
 // The custom-backend REGISTRY — lets any ACP agent plug in as an agent() target, not just the
-// built-in Claude/Codex pair. A registered backend is (name -> how to spawn it + optional static
+// built-in backends. A registered backend is (name -> how to spawn it + optional static
 // session `_meta`), resolved once at runner construction from:
 //   1. the programmatic option: createAcpRunner({ backends: { name: config } })   (wins per name)
 //   2. the env var AGENTPRISM_BACKENDS: a JSON object of the same shape
 // Routing then matches `model`/`tier` specs against registered names FIRST (exact name, or
-// `name/<inner-model>` prefix), before the built-in claude/codex heuristics — see runner.ts.
-// Names are case-insensitive (stored lowercased); "claude" and "codex" are reserved because the
+// `name/<inner-model>` prefix), before the built-in heuristics — see runner.ts.
+// Names are case-insensitive (stored lowercased); built-in ids are reserved because the
 // built-ins own their ids (and their own AGENTPRISM_*_ACP_CMD override channel).
 
 export const BACKENDS_ENV = "AGENTPRISM_BACKENDS";
 
-const RESERVED_NAMES = new Set(["claude", "codex"]);
+const RESERVED_NAMES = new Set(["claude", "codex", "opencode"]);
 const NAME_PATTERN = /^[a-z][a-z0-9._-]*$/;
 
 /** How to spawn (and optionally pre-configure) one custom ACP backend. */

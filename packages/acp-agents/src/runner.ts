@@ -1,5 +1,5 @@
 // AcpAgentRunner — the AgentRunner seam implementation (the LEAF the engine injects against).
-// One method, two backend strategies behind it. Per run():
+// One method, backend strategies behind it. Per run():
 //   1. pick the backend by model/tier (cross-provider routing = which ACP server to spawn)
 //   2. ACQUIRE a pooled connection + session/new { cwd } (per-session cwd = worktree isolation;
 //      the PROCESS is pool-managed and REUSED across runs — never spawned/killed per run)
@@ -51,10 +51,11 @@ import {
   type AcpEventSink,
   type AcpRunnerEventMap,
 } from "./events.js";
-import type { Backend } from "./backend.js";
+import type { Backend, BuiltinBackendId } from "./backend.js";
 import { InteractiveSession, type InteractiveSessionOptions } from "./interactive.js";
 import { ClaudeBackend } from "./backends/claude.js";
 import { CodexBackend } from "./backends/codex.js";
+import { OpenCodeBackend } from "./backends/opencode.js";
 import { CustomAcpBackend } from "./backends/custom.js";
 import {
   registryWithRunBackends,
@@ -196,7 +197,7 @@ type InteractiveAssemblyOptions = InteractiveSessionOptions & {
  *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
 export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Custom ACP backends, keyed by registered name (see registry.ts for the config shape
-   *  and the routing rules). Names are case-insensitive; "claude"/"codex" are reserved. */
+   *  and the routing rules). Names are case-insensitive; built-in ids are reserved. */
   backends?: Record<string, CustomBackendConfig>;
   /** Runner-wide human-in-the-loop permission resolver. When set, it replaces ToolPolicy
    *  auto-decisions for every session that does not provide its own resolver. */
@@ -853,7 +854,7 @@ async function applyModelSelection(
 
 /** Pick the backend by model/tier. Cross-provider routing = which ACP server to spawn.
  *  Registered CUSTOM names resolve FIRST (exact name, or `name/<inner-model>` prefix) so a
- *  registry entry is never shadowed by the built-in heuristics; then the claude/codex
+ *  registry entry is never shadowed by the built-in heuristics; then the built-in
  *  heuristics; then the default backend (AGENTPRISM_DEFAULT_BACKEND — which may itself name
  *  a registered custom backend). */
 export function selectBackend(opts: { model?: string; tier?: string }, registry?: BackendRegistry): Backend {
@@ -861,7 +862,18 @@ export function selectBackend(opts: { model?: string; tier?: string }, registry?
   if (custom) return custom;
   const id = backendIdForSpec(opts.model) ?? backendIdForSpec(opts.tier) ?? defaultBackendId(registry);
   if (typeof id !== "string") return id; // the default resolved to a registered custom backend
-  return id === "codex" ? new CodexBackend() : new ClaudeBackend();
+  return builtinBackend(id);
+}
+
+function builtinBackend(id: BuiltinBackendId): Backend {
+  switch (id) {
+    case "claude":
+      return new ClaudeBackend();
+    case "codex":
+      return new CodexBackend();
+    case "opencode":
+      return new OpenCodeBackend();
+  }
 }
 
 /** Match a model/tier spec against the registry: the whole spec, or its `<name>/` prefix. */
@@ -874,12 +886,12 @@ function customBackendForSpec(spec: string | undefined, registry?: BackendRegist
   return config ? new CustomAcpBackend(config) : undefined;
 }
 
-/** Strip a custom backend's routing name off the model/tier spec: the spec `"name"` selects no
- *  inner model; `"name/foo"` selects `"foo"`. Built-in backends receive the spec unchanged, and
- *  a spec that reached a custom DEFAULT backend without naming it also passes through (the
- *  agent's own catalog may know it). */
+/** Strip a routing backend's name off the model/tier spec: the spec `"name"` selects no
+ *  inner model; `"name/foo"` selects `"foo"`. Claude/Codex receive the spec unchanged, and a
+ *  spec that reached a custom DEFAULT backend without naming it also passes through (the agent's
+ *  own catalog may know it). */
 function innerModelSpec(spec: string | undefined, backend: Backend): string | undefined {
-  if (!spec || !(backend instanceof CustomAcpBackend)) return spec;
+  if (!spec || !backend.stripsRoutingPrefix) return spec;
   const lower = spec.toLowerCase();
   if (lower === backend.id) return undefined;
   if (lower.startsWith(`${backend.id}/`)) return spec.slice(backend.id.length + 1) || undefined;
@@ -930,15 +942,17 @@ async function disposeBestEffort(connection: PooledConnection): Promise<void> {
   }
 }
 
-function backendIdForSpec(spec: string | undefined): "claude" | "codex" | undefined {
+function backendIdForSpec(spec: string | undefined): BuiltinBackendId | undefined {
   if (!spec) return undefined;
   const lower = spec.toLowerCase();
   const slash = lower.indexOf("/");
   const provider = slash > 0 ? lower.slice(0, slash) : "";
+  if (provider === "opencode") return "opencode";
   if (provider === "openai" || provider === "codex") return "codex";
   if (provider === "anthropic" || provider === "claude") return "claude";
 
   const id = slash > 0 ? lower.slice(slash + 1) : lower;
+  if (id === "opencode") return "opencode";
   if (/codex|gpt|openai|\bo\d/.test(id)) return "codex";
   if (/claude|opus|sonnet|haiku|anthropic/.test(id)) return "claude";
   return undefined;
@@ -946,11 +960,12 @@ function backendIdForSpec(spec: string | undefined): "claude" | "codex" | undefi
 
 /** Resolve the default backend: a registered custom name wins (returned as a Backend), else
  *  the built-in id. An unknown/unset value falls back to "claude" (the historical default). */
-function defaultBackendId(registry?: BackendRegistry): "claude" | "codex" | Backend {
+function defaultBackendId(registry?: BackendRegistry): BuiltinBackendId | Backend {
   const name = process.env.AGENTPRISM_DEFAULT_BACKEND?.toLowerCase();
   if (name && registry) {
     const config = registry.get(name);
     if (config) return new CustomAcpBackend(config);
   }
+  if (name === "opencode") return "opencode";
   return name === "codex" ? "codex" : "claude";
 }

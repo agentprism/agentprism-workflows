@@ -2,7 +2,7 @@
 //
 // Every OTHER suite in this repo speaks ACP to a FAKE (stub AgentRunner / in-memory
 // transport). This one drives the REAL built mcp-server over stdio and the REAL backend
-// ACP servers (claude-agent-acp and the de-vendored, pnpm-PATCHED npm dep codex-acp), so
+// ACP servers (claude-agent-acp, the de-vendored npm dep codex-acp, and OpenCode), so
 // the two structured-output cruxes — (1) a schema'd agent yields a typebox-validated
 // structured OBJECT (not text), and (2) ONE long-lived pooled backend subprocess serves
 // every session — have a re-runnable guard against the actual adapters.
@@ -14,20 +14,20 @@
 // stderr tail) — it never silently passes.
 //
 // It is also the acceptance test that the npm-installed @automatalabs/codex-acp fork (NOT the
-// old vendor path, and no longer a pnpm patch) drives structured output end to end: the pooling
-// marker is the package's resolved node_modules entry, asserted to live under each backend's
-// published scope and not under any /vendor/ directory.
+// old vendor path, and no longer a pnpm patch) drives structured output end to end. OpenCode is
+// intentionally not bundled; this live gate requires an installed/authenticated `opencode`.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-type Backend = "claude" | "codex";
+type Backend = "claude" | "codex" | "opencode";
 
 // Skip-by-default gate. node:test treats a string `skip` as the skip reason.
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
@@ -46,14 +46,32 @@ const requireAcp = createRequire(new URL("../../acp-agents/package.json", import
 const BACKEND_BIN: Record<Backend, string> = {
   claude: requireAcp.resolve("@agentclientprotocol/claude-agent-acp/dist/index.js"),
   codex: requireAcp.resolve("@automatalabs/codex-acp"),
+  opencode: resolveOpenCodeBin(),
 };
 
 // Each backend's ACP server is a published npm package under its own scope: Claude stays on the
 // upstream @agentclientprotocol adapter; Codex is our patched @automatalabs fork.
-const BACKEND_SCOPE: Record<Backend, string> = {
+const BACKEND_SCOPE: Record<Exclude<Backend, "opencode">, string> = {
   claude: "@agentclientprotocol/",
   codex: "@automatalabs/",
 };
+
+const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/zai/glm-5.2";
+
+function resolveOpenCodeBin(): string {
+  if (process.env.AGENTPRISM_OPENCODE_ACP_CMD) return process.env.AGENTPRISM_OPENCODE_ACP_CMD;
+  try {
+    return requireAcp.resolve("opencode-ai/bin/opencode");
+  } catch {
+    // Not a dependency of this repo; try the package root for projects that install it.
+  }
+  try {
+    const packageJson = requireAcp.resolve("opencode-ai/package.json");
+    return join(dirname(packageJson), "bin", "opencode");
+  } catch {
+    return "opencode";
+  }
+}
 
 // The stable, prefix-independent argv marker: the package-scoped tail of the resolved bin
 // (e.g. "@automatalabs/codex-acp/dist/index.js"). Derived from the real resolved path — not a
@@ -80,17 +98,40 @@ const AGENT_PROMPT =
   'Return a JSON object describing a code repository with exactly these values: repo="agentprism" and fileCount=42. ' +
   "Output ONLY the JSON object. Do not call any tools.";
 
-/** A meta + 3-schema'd-agent parallel() workflow script (concurrency 3 => 3 live sessions). */
-function buildScript(backend: Backend): string {
+const OPENCODE_AGENT_PROMPT =
+  'Return a JSON object describing a code repository with exactly these values: repo="agentprism" and fileCount=42.';
+
+/** A meta + 3-schema'd-agent workflow script (3 live sessions on ONE pooled process).
+ *  Claude/Codex fan out with parallel(); OpenCode runs the same three agents SEQUENTIALLY —
+ *  the pooling + tool-injection proofs are identical (one process, three sessions), but
+ *  provider-side throttling of concurrent streams (observed as reasoning-only turns with
+ *  empty message deltas on Z.AI glm-5.2) is a provider behavior, not our regression surface,
+ *  and must not flake this gate. */
+function buildScript(backend: Backend, modelSpec?: string): string {
+  const prompt = backend === "opencode" ? OPENCODE_AGENT_PROMPT : AGENT_PROMPT;
+  const modelEntry = modelSpec ? `, model: ${JSON.stringify(modelSpec)}` : "";
+  const agentCall = (label: string) =>
+    `agent(${JSON.stringify(prompt)}, { label: '${label}', phase: 'Fan', schema: SMALL${modelEntry} })`;
+  const body =
+    backend === "opencode"
+      ? [
+          `const results = [];`,
+          `results.push(await ${agentCall("a1")});`,
+          `results.push(await ${agentCall("a2")});`,
+          `results.push(await ${agentCall("a3")});`,
+        ]
+      : [
+          `const results = await parallel([`,
+          `  () => ${agentCall("a1")},`,
+          `  () => ${agentCall("a2")},`,
+          `  () => ${agentCall("a3")},`,
+          `]);`,
+        ];
   return [
     `export const meta = { name: 'live-${backend}', description: 'pooling reuse + structured output', phases: [{ title: 'Fan' }] };`,
     `const SMALL = ${JSON.stringify(SMALL)};`,
     `phase('Fan');`,
-    `const results = await parallel([`,
-    `  () => agent(${JSON.stringify(AGENT_PROMPT)}, { label: 'a1', phase: 'Fan', schema: SMALL }),`,
-    `  () => agent(${JSON.stringify(AGENT_PROMPT)}, { label: 'a2', phase: 'Fan', schema: SMALL }),`,
-    `  () => agent(${JSON.stringify(AGENT_PROMPT)}, { label: 'a3', phase: 'Fan', schema: SMALL }),`,
-    `]);`,
+    ...body,
     `return results;`,
   ].join("\n");
 }
@@ -138,7 +179,7 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
   const { Check, Convert } = tbValue;
 
   const MARKER = pkgTail(BACKEND_BIN[backend]);
-  const script = buildScript(backend);
+  const script = buildScript(backend, backend === "opencode" ? OPENCODE_E2E_MODEL : undefined);
 
   const out: LiveOutcome = {
     ran: false,
@@ -159,8 +200,8 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
     serverStderrTail: "",
   };
 
-  // Pass the REAL environment (the backends read ~/.claude/.credentials.json and
-  // ~/.codex/auth.json from $HOME), pin the default backend, and DELETE the pool-size knob so
+  // Pass the REAL environment (the backends read their normal auth files from $HOME), pin the
+  // default backend, and DELETE the pool-size knob so
   // the default (size 1) is what proves "exactly one process".
   const env: NodeJS.ProcessEnv = { ...process.env, AGENTPRISM_DEFAULT_BACKEND: backend };
   delete env.AGENTPRISM_ACP_POOL_SIZE;
@@ -299,12 +340,17 @@ function assertBackend(backend: Backend, out: LiveOutcome): void {
   const d = () => diag(backend, out);
   const bin = BACKEND_BIN[backend];
 
-  // De-vendor proof: the spawn target is an npm install under node_modules with the backend's
-  // published scope (Claude @agentclientprotocol, Codex @automatalabs), never a vendored copy.
-  const scope = BACKEND_SCOPE[backend];
-  assert.ok(bin.includes("/node_modules/"), `${backend} bin must resolve under node_modules: ${bin}`);
-  assert.ok(bin.includes(scope), `${backend} bin must be the ${scope} npm package: ${bin}`);
-  assert.ok(!bin.includes("/vendor/"), `${backend} must NOT use a vendored copy: ${bin}`);
+  // De-vendor proof for bundled adapters: Claude/Codex spawn targets are npm installs under
+  // their published scopes. OpenCode is explicitly not bundled; it may be PATH, env override,
+  // or a host-installed opencode-ai package.
+  if (backend !== "opencode") {
+    const scope = BACKEND_SCOPE[backend];
+    assert.ok(bin.includes("/node_modules/"), `${backend} bin must resolve under node_modules: ${bin}`);
+    assert.ok(bin.includes(scope), `${backend} bin must be the ${scope} npm package: ${bin}`);
+    assert.ok(!bin.includes("/vendor/"), `${backend} must NOT use a vendored copy: ${bin}`);
+  } else {
+    assert.ok(bin.length > 0, "opencode spawn marker must be non-empty");
+  }
 
   // The run must reach the handler with no harness/timeout error and no tool-level error.
   assert.equal(out.errors.length, 0, `live ${backend} run threw before assertion${d()}`);
@@ -356,4 +402,13 @@ test("live-backend e2e: codex (npm-installed + pnpm-patched) drives schema'd str
   assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
   const out = await runLiveBackend("codex");
   assertBackend("codex", out);
+});
+
+test("live-backend e2e: opencode drives schema'd structured output through the injected StructuredOutput tool", {
+  skip: SKIP,
+  timeout: 300_000,
+}, async () => {
+  assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
+  const out = await runLiveBackend("opencode");
+  assertBackend("opencode", out);
 });

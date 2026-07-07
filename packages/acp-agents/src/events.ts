@@ -29,7 +29,7 @@ export type AcpUpdateKind = AcpSessionUpdate["sessionUpdate"];
 export interface AcpEventContext {
   /** ACP session id this event pertains to. */
   sessionId: string;
-  /** Backend that produced it ("claude" | "codex"). */
+  /** Backend that produced it ("claude" | "codex" | "opencode" | custom name). */
   backendId: BackendId;
   /** `RunOptions.label` of the originating run(), if one was set. */
   label?: string;

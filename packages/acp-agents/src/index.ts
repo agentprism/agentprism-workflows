@@ -1,7 +1,7 @@
 // @automatalabs/acp-agents — implements the AgentRunner seam from @automatalabs/shared-types over
 // the Agent Client Protocol. It spawns claude-agent-acp / the installed npm dep @automatalabs/codex-acp
 // (a published fork of @agentclientprotocol/codex-acp with the outputSchema forward baked into its
-// dist) as child processes and drives one subagent run to completion. It NEVER imports
+// dist) / OpenCode's `opencode acp` as child processes and drives one subagent run to completion. It NEVER imports
 // @automatalabs/workflow-engine; the two siblings meet ONLY at AgentRunner, injected by the
 // @automatalabs/workflows facade (which mcp-server builds on) via createAcpRunner().
 export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
@@ -156,6 +156,7 @@ export type {
 } from "./backend.js";
 export { ClaudeBackend } from "./backends/claude.js";
 export { CodexBackend } from "./backends/codex.js";
+export { OpenCodeBackend } from "./backends/opencode.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
 export { decidePermission } from "./permissions.js";

@@ -19,7 +19,7 @@ Rebuild the dynamic-workflow orchestrator so it has **no dependency on Pi**:
 - The **`workflow` tool** is exposed by a **stdio MCP server** (instead of a Pi extension's
   `registerTool`). Any MCP-capable host (Claude Code, Zed, etc.) can call it.
 - Each **`agent()` call inside a workflow script** is backed by an **ACP agent server**
-  (`claude-agent-acp` for Claude, `codex-acp` for Codex) over the **Agent Client Protocol**
+  (`claude-agent-acp` for Claude, `codex-acp` for Codex, `opencode acp` for OpenCode) over the **Agent Client Protocol**
   (instead of Pi's in-process `createAgentSession`).
 
 The deterministic orchestration engine (the JS `vm` realm, `parallel`/`pipeline`, the
@@ -48,8 +48,8 @@ The orchestrator process plays **two protocol roles at once**:
 └──────────────────────────────────────────────┘
         │  session/new, session/prompt … (ACP, JSON-RPC over stdio)
         ▼
-   claude-agent-acp / codex-acp  (one or more long-lived subprocesses)
-        │  → real Claude / Codex agents, each in its own session
+   claude-agent-acp / codex-acp / opencode acp  (one or more long-lived subprocesses)
+        │  → real Claude / Codex / OpenCode agents, each in its own session
 ```
 
 ACP and MCP are sibling JSON-RPC protocols from the same design space (ACP = host↔agent,
@@ -76,10 +76,11 @@ is usable on its own — in particular, the ACP agent logic and the workflow eng
                        composes …  │                │
                  ┌───────────────▼───────┐  ┌──────▼────────────────────────┐
                  │  workflow-engine      │  │  acp-agents                   │
-                 │   vm runtime,         │  │   ACP client + Claude/Codex   │
-                 │   parallel/pipeline,  │  │   backends; structured output,│
-                 │   journal, budget,    │  │   model select, permissions,  │
-                 │   resume, worktree    │  │   usage, cancel               │
+                 │   vm runtime,         │  │   ACP client + built-in       │
+                 │   parallel/pipeline,  │  │   backends (Claude/Codex/     │
+                 │   journal, budget,    │  │   OpenCode), structured       │
+                 │   resume, worktree    │  │   output, model select,       │
+                 │                       │  │   permissions, usage, cancel  │
                  └───────────┬───────────┘  └──────────┬────────────────────┘
                              │   meet at the AgentRunner interface (DI)
                              └──────────────┬──────────┘
@@ -299,9 +300,13 @@ advertises:
 - `codex-acp`: model encoded as `"model[effort]"` (e.g. `gpt-5.2[high]`) + separate
   `reasoning_effort` select; switch via `session/set_config_option` (the wire method;
   `setConfigOption` is just the ACP SDK's JS accessor for it).
+- `opencode acp`: model values are OpenCode catalog ids like `provider/model` (for example
+  `zai/glm-5.2`) under a `model` select. The public routing prefix is stripped at the first slash:
+  `opencode/zai/glm-5.2[high]` routes to the OpenCode backend, selects `zai/glm-5.2`, and applies
+  `[high]` to its `thought_level`/effort option when advertised.
 
 > The **catalog** belongs to the server (Claude models on `claude-agent-acp`, Codex models on
-> `codex-acp`), so cross-**provider** routing = choosing which server; within a provider,
+> `codex-acp`, OpenCode models on `opencode acp`), so cross-**provider** routing = choosing which server; within a provider,
 > per-call tiering works. This is what the engine's `tier: small/medium/big` maps onto.
 
 ### 5.5 Permissions → tool allow/deny — supported
@@ -323,6 +328,8 @@ Ref: https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permissio
 - `claude-agent-acp` reports **tokens + dollar cost** (`cost = total_cost_usd`, USD); response
   `usage { inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens, totalTokens }`.
 - `codex-acp` reports **tokens/quota only** (no dollar cost).
+- OpenCode reports per-turn `PromptResponse.usage` plus cumulative `usage_update` cost/context;
+  the existing accumulator combines the latest cumulative cost with the per-turn token split.
 
 This maps onto the engine's `onUsage` / token accounting; no need for the chars/4 estimator
 fallback in the normal case.
@@ -344,20 +351,22 @@ in ACP (the client does not hand the agent a tool object directly).
 - `claude-agent-acp`: ACP `mcpServers` → SDK `McpServerConfig`, merged with user options
   ([`src/acp-agent.ts:3127-3149`](https://github.com/agentclientprotocol/claude-agent-acp/blob/b8df8e0e5460fd782214f4dde488f7476c80c454/src/acp-agent.ts#L3127-L3149), [`:3242`](https://github.com/agentclientprotocol/claude-agent-acp/blob/b8df8e0e5460fd782214f4dde488f7476c80c454/src/acp-agent.ts#L3242)).
 - `codex-acp`: supports stdio + http (rejects `acp`/`sse`).
+- `opencode acp`: advertises http + sse; this is what enables the runner-hosted
+  StructuredOutput MCP tool for schema runs.
 Ref: https://agentclientprotocol.com/protocol/v1/session-setup#mcp-servers
 
 ### 5.9 Custom backends & the generic `_meta` passthrough
 
-ACP is a *unified* protocol — nothing about the runner is Claude/Codex-specific except the two
-built-in `Backend` strategies. Two additive surfaces open the seam to **any** ACP agent:
+ACP is a *unified* protocol — nothing about the runner is backend-specific except the built-in
+`Backend` strategies for Claude, Codex, and OpenCode. Two additive surfaces open the seam to **any** ACP agent:
 
 - **The backend registry** (`acp-agents/src/registry.ts`): named spawn configs
   (`{ command, args?, env?, sessionMeta?, structuredOutputTool? }`), registered programmatically
   (`createAcpRunner({ backends })`) or via `AGENTPRISM_BACKENDS` (JSON env). Routing matches
   registered names FIRST (`model: "browser"` or `"browser/<inner-model>"` — the name is
   routing; the part after the slash is selected via Session Config Options), then the
-  claude/codex heuristics. `AGENTPRISM_DEFAULT_BACKEND` may name a registry entry.
-  `"claude"`/`"codex"` are reserved. A custom backend speaks the repo's published generic
+  built-in heuristics. `AGENTPRISM_DEFAULT_BACKEND` may name a registry entry.
+  `"claude"`/`"codex"`/`"opencode"` are reserved. A custom backend speaks the repo's published generic
   dialect: schema IN as turn-level `_meta.outputSchema` (plain JSON Schema, not
   OpenAI-strict), optionally a client-hosted StructuredOutput MCP tool when HTTP MCP is
   negotiated, and result OUT as captured tool args or final-text JSON — with the client-side
@@ -584,12 +593,13 @@ tool.
 
 ### 6.5 Client-hosted StructuredOutput MCP tool for custom ACP backends
 
-Native output-format channels remain authoritative for Claude and Codex. For custom ACP backends
-without a native result channel, schema runs can inject a runner-hosted MCP server through
+Native output-format channels remain authoritative for Claude and Codex. OpenCode and custom ACP
+backends without a native result channel can inject a runner-hosted MCP server through
 `session/new.mcpServers` when all gates hold: `RunOptions.schema` is present, the custom backend's
-registry config did not set `structuredOutputTool:false` (default true), and the negotiated
-initialize response strictly advertises `mcpCapabilities.http === true`. Missing or false HTTP MCP
-support falls back to the existing prompt-embedded schema and final-text JSON path.
+registry config did not set `structuredOutputTool:false` (default true; OpenCode always opts in),
+and the negotiated initialize response strictly advertises `mcpCapabilities.http === true`.
+Missing or false HTTP MCP support falls back to the existing prompt-embedded schema and final-text
+JSON path.
 
 The injected server uses Streamable HTTP on `127.0.0.1` with an unguessable token path and is
 runner-scoped, lazy, and closed on runner disposal. Each run registers its own token slot and appends
@@ -603,8 +613,8 @@ extraction → repair prompt.
 ### 6.6 What this means for us
 
 - **Keep native channels primary where they exist.** Claude constrains out-of-the-box via `_meta`;
-  Codex constrains after the ~1-line adapter patch (§6.3). The client-hosted MCP tool is for
-  custom ACP backends with no native structured-output result channel.
+  Codex constrains after the ~1-line adapter patch (§6.3). OpenCode has no native result channel,
+  so it uses the client-hosted MCP tool plus generic `_meta.outputSchema`/prompt fallback.
 - **Keep `resolveStructuredOutput`'s validate-then-re-prompt ([`src/agent.ts:113`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts#L113)) as a guard**,
   because `structured_output` is typed `unknown` and the constraint can still fail
   (`error_max_structured_output_retries`) and tool arguments are still untrusted. Ladder:
@@ -620,25 +630,26 @@ extraction → repair prompt.
 ## 7. The leaf interface: `AcpAgentRunner.run(prompt, opts)`
 
 This lives in the **`acp-agents`** module (§2) and is usable on its own — no `workflow-engine`,
-no `mcp-server`. It drives `claude-agent-acp` and the `@automatalabs/codex-acp` fork (patch baked
-into its dist, §2, §6.3) as ACP server subprocesses. It implements the `AgentRunner` seam the engine injects against (today
-`Pick<WorkflowAgent, "run">`, [`src/workflow.ts:59`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L59)). One method, two backend strategies behind it:
+no `mcp-server`. It drives `claude-agent-acp`, the `@automatalabs/codex-acp` fork (patch baked
+into its dist, §2, §6.3), and `opencode acp` as ACP server subprocesses. It implements the `AgentRunner` seam the engine injects against (today
+`Pick<WorkflowAgent, "run">`, [`src/workflow.ts:59`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L59)). One method, backend strategies behind it:
 
 ```
 run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
-  1. pick backend (Claude vs Codex) by agentType/model
+  1. pick backend (Claude vs Codex vs OpenCode/custom) by agentType/model
   2. session/new({ cwd: worktree?.cwd })           // §5.3 worktree isolation
   3. select model via session config option         // §5.4
   4. apply schema:
        Claude → already set in session/new _meta.claudeCode.options.outputFormat (+ emitRawSDKMessages)
        Codex  → outputSchema on the turn params
+       OpenCode/custom → generic outputSchema + optional StructuredOutput MCP tool
   5. session/prompt(prompt); drain session/update:
        • agent_message_chunk → assistant text
        • tool_call / request_permission → enforce allow/deny (§5.5)
        • usage_update → token accounting (§5.6)
   6. on stopReason:
        schema set → extract structured result
-                     (Claude: structured_output off _claude/sdkMessage; Codex: structuredContent/result),
+                     (Claude: structured_output off _claude/sdkMessage; Codex/OpenCode: final text/tool capture),
                      then VALIDATE; re-prompt on failure (guard)
        no schema   → final assistant text (empty ⇒ recoverable retry)
   7. signal.aborted → session/cancel (§5.7)
@@ -669,6 +680,9 @@ the unchanged engine.
   synchronously with progress notifications; expose `resumeFromRunId` for continuation.
 - **Cross-provider routing = choose the server.** Per-call model tiering works *within* a
   provider via config options; switching providers means routing to a different ACP server.
+- **OpenCode is not bundled.** `OpenCodeBackend` resolves `AGENTPRISM_OPENCODE_ACP_CMD`, then a
+  host-installed `opencode-ai` launcher, then `opencode` from PATH. The package is deliberately not
+  a dependency because its platform binaries are large.
 - **Concurrency** is bound by provider API rate limits + per-session memory, not the protocol;
   intra-session prompts serialize.
 - **Per-turn token-usage breakdown** on `PromptResponse` is still a Draft ACP RFD (servers emit
@@ -690,6 +704,7 @@ the unchanged engine.
 - `@agentclientprotocol/sdk@1.0.0` — https://github.com/agentclientprotocol
 - `@agentclientprotocol/claude-agent-acp@0.56.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.195`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp@1.4.0` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
+- OpenCode (`opencode acp`) — https://opencode.ai
 
 **ACP spec:**
 - Overview / transports — https://agentclientprotocol.com/protocol/v1/transports
