@@ -65,6 +65,10 @@ test("registry: validates names, reserved names, and config field types", () => 
   assert.throws(() => resolveBackendRegistry({ "has space": { command: "x" } }), /invalid backend name/);
   assert.throws(() => resolveBackendRegistry({ claude: { command: "x" } }), /reserved/);
   assert.throws(() => resolveBackendRegistry({ CODEX: { command: "x" } }), /reserved/);
+  assert.throws(
+    () => resolveBackendRegistry({ opencode: { command: "x" } }),
+    /AGENTPRISM_OPENCODE_ACP_CMD/,
+  );
   assert.throws(() => resolveBackendRegistry({ b: { command: "" } }), /non-empty string "command"/);
   assert.throws(
     () => resolveBackendRegistry({ b: { command: "x", args: [1] } as never }),
@@ -173,6 +177,10 @@ test("run backends: empty/absent run declarations return the host registry uncha
 test("run backends: validated with the same rules (reserved names, config shapes)", () => {
   const host = resolveBackendRegistry();
   assert.throws(() => registryWithRunBackends(host, { claude: { command: "x" } }), /reserved/);
+  assert.throws(
+    () => registryWithRunBackends(host, { opencode: { command: "x" } }),
+    /AGENTPRISM_OPENCODE_ACP_CMD/,
+  );
   assert.throws(() => registryWithRunBackends(host, { b: { command: "" } }), /non-empty string "command"/);
   assert.throws(
     () => registryWithRunBackends(host, { b: { command: "x", structuredOutputTool: "no" } as never }),

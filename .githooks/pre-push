@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pre-push gate: run the LIVE backend e2e (packages/mcp-server/test/live-backend.e2e.test.ts)
-# against the REAL Claude + Codex agents before code leaves this machine. CI cannot run
+# against the REAL Claude + Codex + OpenCode agents before code leaves this machine. CI cannot run
 # these (no agent auth — AGENTPRISM_LIVE_E2E stays unset there), so this hook is the only
 # place the structured-output cruxes get exercised against real backends pre-merge.
 #
@@ -17,14 +17,14 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-echo "pre-push: building workspace, then LIVE backend e2e (real Claude/Codex, real tokens; ~30-60s)..." >&2
+echo "pre-push: building workspace, then LIVE backend e2e (real Claude/Codex/OpenCode, real tokens; ~60-120s)..." >&2
 pnpm build >/dev/null 2>&1
 
 # timeout: an expired agent login must fail the push loudly, not hang it forever.
-if ! AGENTPRISM_LIVE_E2E=1 timeout 300 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts; then
+if ! AGENTPRISM_LIVE_E2E=1 timeout 420 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts; then
   echo "" >&2
   echo "pre-push: LIVE backend e2e FAILED — push blocked." >&2
-  echo "  Check agent auth (claude / codex login) and the failure above." >&2
+  echo "  Check agent auth (claude / codex / opencode login) and the failure above." >&2
   echo "  Bypass once: git push --no-verify  (or AGENTPRISM_SKIP_LIVE_E2E=1 git push)" >&2
   exit 1
 fi
