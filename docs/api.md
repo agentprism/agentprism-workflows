@@ -143,6 +143,26 @@ Bridge lifecycle: ref-counted per runner. A constructor-injected runner is bridg
 
 Alternative: subscribe on the runner's bus directly — see [Runner events](#runner-events); same underlying stream, same `runId`/`label` attribution, no manager involved.
 
+### OpenTelemetry
+
+`@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports workflow traces and metrics through `@opentelemetry/api` only:
+
+```ts
+import { attachOtel } from "@automatalabs/agentprism-otel";
+
+const telemetry = attachOtel(manager, { captureContent: false });
+// run workflows...
+telemetry.detach();
+```
+
+| Span | Source |
+|---|---|
+| `workflow` / `workflow <meta.name>` | run root, lazily created from the first manager event carrying `runId` |
+| `invoke_agent <label>` | `agentStart` → `agentEnd` |
+| `execute_tool <title>` | facade `agentEvent` `tool_call` → terminal `tool_call_update` |
+
+Metrics: `agentprism.tokens`, `agentprism.cost`, `agentprism.agents`, and `agentprism.agent.duration`. Content attributes (`prompt`, `result`, tool input/output) are disabled by default and require `captureContent:true`; workflow `log()` messages are always added as root-span events. Without a registered OTel SDK, the API no-ops, so attaching is safe in hosts that do not configure telemetry.
+
 ---
 
 ## AcpAgentRunner (`createAcpRunner`)

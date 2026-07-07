@@ -1,6 +1,6 @@
 {
-  "name": "@automatalabs/acp-agents",
-  "version": "0.20.0",
+  "name": "@automatalabs/agentprism-otel",
+  "version": "0.0.0",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
@@ -8,7 +8,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/VikashLoomba/agentprism-workflows.git",
-    "directory": "packages/acp-agents"
+    "directory": "packages/agentprism-otel"
   },
   "type": "module",
   "main": "./dist/index.js",
@@ -41,12 +41,15 @@
     "test": "tsx --test \"test/**/*.test.ts\"",
     "prepublishOnly": "tsc -b"
   },
-  "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.56.0",
-    "@agentclientprotocol/sdk": "^1.2.1",
-    "@automatalabs/codex-acp": "1.4.0",
-    "@automatalabs/shared-types": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.29",
-    "typebox": "1.3.2"
+  "peerDependencies": {
+    "@opentelemetry/api": "^1.9.0"
+  },
+  "devDependencies": {
+    "@automatalabs/shared-types": "workspace:^",
+    "@automatalabs/workflow-engine": "workspace:^",
+    "@automatalabs/workflows": "workspace:^",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/sdk-metrics": "^2.9.0",
+    "@opentelemetry/sdk-trace-base": "^2.9.0"
   }
 }
