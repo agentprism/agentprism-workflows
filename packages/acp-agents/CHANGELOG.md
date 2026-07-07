@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.20.2
+
+### Patch Changes
+
+- 68c0cff: Raise the @agentclientprotocol/sdk floor to ^1.2.1 (routine ACP dependency refresh; spec-drift tripwire green against 1.2.1).
+
 ## 0.20.1
 
 ### Patch Changes
