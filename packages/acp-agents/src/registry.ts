@@ -27,6 +27,9 @@ export interface CustomBackendConfig {
   /** agentCapabilities._meta namespace + bare `_meta` keys this custom agent negotiates.
    *  Undefined means the backend's custom `_meta`, if any, is never gated. */
   customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
+  /** Enable client-hosted StructuredOutput MCP tool injection when schema runs negotiate HTTP MCP.
+   *  Default true; set false for custom agents that should use only the generic prompt/_meta path. */
+  structuredOutputTool?: boolean;
 }
 
 /** A validated registry entry: the (lowercased) name plus its config. */
@@ -119,6 +122,9 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
   if (c.sessionMeta !== undefined && (c.sessionMeta === null || typeof c.sessionMeta !== "object" || Array.isArray(c.sessionMeta))) {
     throw new Error(`${source}: backend "${rawName}" "sessionMeta" must be an object`);
   }
+  if (c.structuredOutputTool !== undefined && typeof c.structuredOutputTool !== "boolean") {
+    throw new Error(`${source}: backend "${rawName}" "structuredOutputTool" must be a boolean`);
+  }
   const customCapabilities = validateCustomCapabilities(c.customCapabilities, source, rawName);
   return [
     name,
@@ -128,6 +134,7 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
       ...(c.args !== undefined ? { args: c.args as string[] } : {}),
       ...(c.env !== undefined ? { env: c.env as Record<string, string> } : {}),
       ...(c.sessionMeta !== undefined ? { sessionMeta: c.sessionMeta as Record<string, unknown> } : {}),
+      ...(c.structuredOutputTool !== undefined ? { structuredOutputTool: c.structuredOutputTool as boolean } : {}),
       ...(customCapabilities !== undefined ? { customCapabilities } : {}),
     },
   ];

@@ -2,8 +2,10 @@
 // Claude/Codex pair. The generic dialect it speaks is the one this repo already publishes:
 //   - schema IN:   the bare turn-level `_meta.outputSchema` (same key the @automatalabs/codex-acp
 //                  fork reads), as a plain JSON Schema. An agent that honors it constrains its
-//                  final message natively; an agent that ignores it still works — the runner's
-//                  validate/re-prompt ladder repairs off the final text.
+//                  final message natively. When the negotiated agent advertises HTTP MCP support,
+//                  the runner also injects a client-hosted StructuredOutput tool whose inputSchema
+//                  carries the schema; agents that ignore both channels still work via the
+//                  validate/re-prompt ladder over final text.
 //   - result OUT:  JSON.parse of the final assistant message (with a balanced-block fallback),
 //                  exactly like Codex — no vendor extension notification required.
 //   - config-level `_meta`: the registry entry's static `sessionMeta` rides every session/new
@@ -28,10 +30,12 @@ export class CustomAcpBackend implements Backend {
    *  schema in the prompt — otherwise the model returns JSON with keys it invented and the
    *  repair ladder can never converge on a contract the model was never shown. */
   readonly embedSchemaInPrompt = true;
+  readonly injectStructuredOutputTool: boolean;
   readonly customCapabilities?: NonNullable<Backend["customCapabilities"]>;
 
   constructor(private readonly config: RegisteredBackend) {
     this.id = config.name;
+    this.injectStructuredOutputTool = config.structuredOutputTool ?? true;
     if (config.customCapabilities) this.customCapabilities = config.customCapabilities;
     const spawnIdentity = JSON.stringify({
       command: config.command,

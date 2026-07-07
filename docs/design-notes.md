@@ -159,7 +159,7 @@ MCP involved.
 |---|---|---|---|
 | `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives `claude-agent-acp` / `codex-acp` over ACP |
 | `mcp-server` | **Shell** — expose the tool | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering the `workflow` tool; progress via MCP notifications |
-| `acp-agents` | **Structured output** | injected `structured_output` tool ([`src/structured-output.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/structured-output.ts)) | native backend schema constraint (§6); the injected tool is no longer the primary path |
+| `acp-agents` | **Structured output** | injected `structured_output` tool ([`src/structured-output.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/structured-output.ts)) | native backend schema constraint for Claude/Codex plus client-hosted StructuredOutput MCP capture for eligible custom ACP backends (§6) |
 
 ---
 
@@ -352,15 +352,16 @@ ACP is a *unified* protocol — nothing about the runner is Claude/Codex-specifi
 built-in `Backend` strategies. Two additive surfaces open the seam to **any** ACP agent:
 
 - **The backend registry** (`acp-agents/src/registry.ts`): named spawn configs
-  (`{ command, args?, env?, sessionMeta? }`), registered programmatically
+  (`{ command, args?, env?, sessionMeta?, structuredOutputTool? }`), registered programmatically
   (`createAcpRunner({ backends })`) or via `AGENTPRISM_BACKENDS` (JSON env). Routing matches
   registered names FIRST (`model: "browser"` or `"browser/<inner-model>"` — the name is
   routing; the part after the slash is selected via Session Config Options), then the
   claude/codex heuristics. `AGENTPRISM_DEFAULT_BACKEND` may name a registry entry.
   `"claude"`/`"codex"` are reserved. A custom backend speaks the repo's published generic
   dialect: schema IN as turn-level `_meta.outputSchema` (plain JSON Schema, not
-  OpenAI-strict), result OUT as final-text JSON — with the client-side validate/re-prompt
-  ladder (§6) as the repair path for agents that ignore the schema channel entirely.
+  OpenAI-strict), optionally a client-hosted StructuredOutput MCP tool when HTTP MCP is
+  negotiated, and result OUT as captured tool args or final-text JSON — with the client-side
+  validate/re-prompt ladder (§6) as the repair path for agents that ignore the schema channel.
 - **Script-declared backends** (`meta.backends` → `ExecOptions.scriptBackends` →
   `RunOptions.backends`): a script can declare the backends it needs, making workflows
   self-contained (and letting agent-authored workflows bring their own ACP servers). This
@@ -581,15 +582,34 @@ tool's **inputSchema** (the *args* the model passes when it calls a client-hoste
 schema-conformance for a subagent **result** should use the turn/session output format, not a
 tool.
 
-### 6.5 What this means for us
+### 6.5 Client-hosted StructuredOutput MCP tool for custom ACP backends
 
-- **Drop the injected `structured_output` tool as the primary path.** The backend constrains
-  natively — **Claude out-of-the-box via `_meta`; Codex after the ~1-line adapter patch (§6.3)** —
-  stronger than hoping the model calls a tool.
+Native output-format channels remain authoritative for Claude and Codex. For custom ACP backends
+without a native result channel, schema runs can inject a runner-hosted MCP server through
+`session/new.mcpServers` when all gates hold: `RunOptions.schema` is present, the custom backend's
+registry config did not set `structuredOutputTool:false` (default true), and the negotiated
+initialize response strictly advertises `mcpCapabilities.http === true`. Missing or false HTTP MCP
+support falls back to the existing prompt-embedded schema and final-text JSON path.
+
+The injected server uses Streamable HTTP on `127.0.0.1` with an unguessable token path and is
+runner-scoped, lazy, and closed on runner disposal. Each run registers its own token slot and appends
+one MCP server after user-provided entries, named `structured_output` or the next free suffix. The
+server exposes exactly one tool, `StructuredOutput`; agents may display it namespaced by server
+name. Its `inputSchema` is the user's plain JSON Schema, and a valid call captures the arguments.
+Invalid calls return a tool error with TypeBox validation details and do not clobber a prior valid
+capture. The resolution ladder is captured tool args → native/final-text parse → prose JSON
+extraction → repair prompt.
+
+### 6.6 What this means for us
+
+- **Keep native channels primary where they exist.** Claude constrains out-of-the-box via `_meta`;
+  Codex constrains after the ~1-line adapter patch (§6.3). The client-hosted MCP tool is for
+  custom ACP backends with no native structured-output result channel.
 - **Keep `resolveStructuredOutput`'s validate-then-re-prompt ([`src/agent.ts:113`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts#L113)) as a guard**,
   because `structured_output` is typed `unknown` and the constraint can still fail
-  (`error_max_structured_output_retries`). Ladder: native constraint → client-side validate →
-  re-prompt on failure.
+  (`error_max_structured_output_retries`) and tool arguments are still untrusted. Ladder:
+  captured tool args → native constraint/final-text parse → client-side validate → re-prompt on
+  failure.
 - **Abstract behind a per-backend adapter** — the two paths genuinely differ (Claude:
   session-scoped vendor `_meta.claudeCode` + `emitRawSDKMessages`, read off the raw message stream;
   Codex: per-turn `outputSchema` forwarded by the **forked** adapter, read off the normal message

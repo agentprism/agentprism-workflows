@@ -1200,7 +1200,7 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
  *  runner, which re-validates whatever it is handed. */
 function validateMetaBackends(backends: unknown): void {
   if (!backends || typeof backends !== "object" || Array.isArray(backends)) {
-    throw new Error("meta.backends must be an object of { <name>: { command, args?, env?, sessionMeta? } }");
+    throw new Error("meta.backends must be an object of { <name>: { command, args?, env?, sessionMeta?, structuredOutputTool? } }");
   }
   for (const [name, config] of Object.entries(backends as Record<string, unknown>)) {
     if (!config || typeof config !== "object" || Array.isArray(config)) {
@@ -1221,6 +1221,9 @@ function validateMetaBackends(backends: unknown): void {
     }
     if (c.sessionMeta !== undefined && (!c.sessionMeta || typeof c.sessionMeta !== "object" || Array.isArray(c.sessionMeta))) {
       throw new Error(`meta.backends.${name}.sessionMeta must be an object`);
+    }
+    if (c.structuredOutputTool !== undefined && typeof c.structuredOutputTool !== "boolean") {
+      throw new Error(`meta.backends.${name}.structuredOutputTool must be a boolean`);
     }
   }
 }

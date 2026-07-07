@@ -15,6 +15,34 @@ You author a small JavaScript *script* (`export const meta`, then call `agent()`
 
 ---
 
+## Why AgentPrism
+
+### Real harnesses, driven over an open protocol
+
+Each `agent()` call runs on a **shipped coding agent** — Claude Code or Codex — driven over [ACP](https://agentclientprotocol.com), rather than a reimplementation of an agent loop around raw model APIs. You get each vendor's own tool loop, permissions, and context management, plus the auth you already have on your machine (`~/.claude/.credentials.json`, `~/.codex/auth.json`). When the harness improves, your workflows improve with no code change here.
+
+### Many agents, one workflow
+
+The backend is chosen **per `agent()` call**: an `opus` review step, a `gpt-5.5-codex` implementation step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-in pair is a default, not a boundary.
+
+### Durable runs — resume without re-spending tokens
+
+Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. Kill the process mid-run — crash, deploy, Ctrl-C — and `resume()` replays the completed prefix from the journal as cache-hits (**zero tokens**), then executes only the steps that never ran. Provider quota walls don't fail the run either: it **pauses** with the provider's reset hint and resumes after the budget refills.
+
+### Structured output as validated objects
+
+`agent({ schema })` returns a schema-validated object, not text to parse. Claude and Codex constrain generation natively; custom ACP agents that advertise HTTP MCP support get a client-hosted `StructuredOutput` MCP tool injected automatically. The runner still validates and re-prompts on mismatch, so the same API works for native, tool-capture, and final-text JSON fallback paths.
+
+### The full ACP spec, enforced by the build
+
+Every client-side ACP method is served (`fs/*`, `terminal/*`, permission requests, elicitation, MCP-over-ACP) and the agent-side surface — session modes, session lifecycle, auth/providers — is driven, not stubbed. A coverage manifest keyed off the SDK's method constants breaks the build on protocol drift, and a live end-to-end suite against real Claude and Codex backends gates every push.
+
+### Controls for unattended runs
+
+Hard token budgets (run-level caps, `budget.remaining()` in-script), per-call git **worktree isolation**, per-call timeouts and retries, and `checkpoint()` — a journaled human-approval gate that pauses the run until a decision arrives and replays it on resume.
+
+---
+
 ## How it works
 
 One process plays **two protocol roles at once**: it's an **MCP server** (or a library) that accepts a workflow script, and an **ACP client** that drives one or more agent subprocesses to execute each `agent()` call.
@@ -213,7 +241,7 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 
 ## Structured output
 
-Pass a JSON Schema as `agent({ schema })` and the result is a **validated object**, not text. Each backend constrains generation natively (Claude via its output-format channel; Codex via a turn-level `outputSchema`), then the runner validates and re-prompts on mismatch. See [`docs/design-notes.md` §6](docs/design-notes.md) for the per-backend mechanics.
+Pass a JSON Schema as `agent({ schema })` and the result is a **validated object**, not text. Claude and Codex constrain generation natively (Claude via its output-format channel; Codex via a turn-level `outputSchema`), then the runner validates and re-prompts on mismatch. Schema-less ACP agents get a client-hosted `StructuredOutput` MCP tool injected automatically when they advertise HTTP MCP support; the public `agent({ schema })` API is unchanged. See [`docs/design-notes.md` §6](docs/design-notes.md) for the per-backend mechanics.
 
 ---
 
@@ -250,7 +278,7 @@ await runDynamicWorkflow(script, { runner });
 
 Inside a script: `agent("Verify the checkout flow…", { model: "browser", schema: VERDICT, meta: { credsRef: "vault://qa" } })`. `model: "browser/vision-large"` additionally selects `vision-large` via the agent's config-option catalog. The same registry can be declared without code via the `AGENTPRISM_BACKENDS` env var (JSON of the same shape) — which is how the MCP server picks it up. Names are case-insensitive; `claude`/`codex` are reserved.
 
-Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `_meta.outputSchema` (plain JSON Schema) **and** stated in the prompt's output contract, and the result is read by JSON-parsing the final assistant message — agents that ignore the schema channel still work via the client-side validate/re-prompt ladder. Per-call `meta` merges over the registry's `sessionMeta` defaults; protocol-critical keys (schema channels, `runId`) always win.
+Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `_meta.outputSchema` (plain JSON Schema), and when the initialized agent advertises HTTP MCP support the runner injects a localhost `StructuredOutput` MCP tool whose input schema is that same schema. Without HTTP MCP, or when `structuredOutputTool:false` is set on the backend config, the schema is stated in the prompt and the result is read by JSON-parsing the final assistant message. Per-call `meta` merges over the registry's `sessionMeta` defaults; protocol-critical keys (schema channels, `runId`) always win.
 
 #### Script-declared backends (`meta.backends`)
 

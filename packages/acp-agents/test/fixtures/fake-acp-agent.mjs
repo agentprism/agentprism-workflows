@@ -26,6 +26,8 @@ import {
   PROTOCOL_VERSION,
   RequestError,
 } from "@agentclientprotocol/sdk";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const scenario = JSON.parse(process.env.AGENTPRISM_FAKE_SCENARIO ?? "{}");
 const logPath = process.env.AGENTPRISM_FAKE_LOG;
@@ -33,6 +35,7 @@ const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 const hasLifecycleSupport = scenario.lifecycleSupport === true;
 const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
+const hasMcpHttpSupport = scenario.mcpHttpSupport === true;
 const hasProviderSupport = scenario.providersSupport === true || Object.prototype.hasOwnProperty.call(scenario, "providers");
 const hasLogoutSupport = scenario.logoutSupport === true || Object.prototype.hasOwnProperty.call(scenario, "logout");
 
@@ -170,6 +173,26 @@ function elicitationCompleteFromScenario(complete) {
   };
 }
 
+function structuredToolCallsFor(turn) {
+  if (Array.isArray(turn.structuredToolCalls)) return turn.structuredToolCalls;
+  if (Object.prototype.hasOwnProperty.call(turn, "structuredToolCall")) return [turn.structuredToolCall];
+  return [];
+}
+
+function structuredToolArgumentsFor(flow) {
+  return flow && Object.prototype.hasOwnProperty.call(flow, "arguments") ? flow.arguments : flow;
+}
+
+function structuredOutputServerFor(servers, flow) {
+  const wanted = typeof flow?.serverName === "string" ? flow.serverName : undefined;
+  const candidates = servers.filter((server) => {
+    if (!server || server.type !== "http") return false;
+    if (wanted) return server.name === wanted;
+    return /^structured_output(?:_\d+)?$/.test(server.name);
+  });
+  return candidates.at(-1);
+}
+
 class FakeAgent {
   constructor(conn) {
     this.conn = conn;
@@ -178,6 +201,7 @@ class FakeAgent {
     this.sessionCounter = 0;
     this.turnBySession = new Map();
     this.modesBySession = new Map();
+    this.mcpServersBySession = new Map();
     // Per-session cancellation: a `waitForCancel` turn parks until session/cancel arrives.
     this.cancelled = new Set();
     this.cancelWaiters = new Map();
@@ -203,7 +227,14 @@ class FakeAgent {
       agentCapabilities: {
         ...(hasLifecycleSupport ? { loadSession: true } : {}),
         sessionCapabilities,
-        ...(hasMcpAcpSupport ? { mcpCapabilities: { acp: true } } : {}),
+        ...(hasMcpAcpSupport || hasMcpHttpSupport
+          ? {
+              mcpCapabilities: {
+                ...(hasMcpAcpSupport ? { acp: true } : {}),
+                ...(hasMcpHttpSupport ? { http: true } : {}),
+              },
+            }
+          : {}),
         ...(hasProviderSupport ? { providers: {} } : {}),
         ...(hasLogoutSupport ? { auth: { logout: {} } } : {}),
       },
@@ -225,6 +256,7 @@ class FakeAgent {
     const sessionId = `fake-session-${process.pid}-${(this.sessionCounter += 1)}`;
     const modes = hasScenarioModes ? clone(scenario.modes) : undefined;
     if (modes) this.modesBySession.set(sessionId, modes);
+    this.mcpServersBySession.set(sessionId, clone(params.mcpServers ?? []));
     return {
       sessionId,
       configOptions: this.configOptions,
@@ -347,6 +379,7 @@ class FakeAgent {
     }
     this.turnBySession.delete(params.sessionId);
     this.modesBySession.delete(params.sessionId);
+    this.mcpServersBySession.delete(params.sessionId);
     return {};
   }
 
@@ -439,6 +472,11 @@ class FakeAgent {
     // connection live so release/death teardown can prove the client closes it.
     if (turn.mcpOverAcp) {
       await this.callMcpOverAcp(turn.mcpOverAcp);
+    }
+
+    const structuredToolCalls = structuredToolCallsFor(turn);
+    for (const call of structuredToolCalls) {
+      await this.callStructuredOutputTool(call, params.sessionId);
     }
 
     // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors
@@ -592,6 +630,42 @@ class FakeAgent {
       record({ method: "mcpDisconnect", label: flow.label, request, response });
     } catch (error) {
       record({ method: "mcpDisconnect", label: flow.label, error: serializeError(error) });
+    }
+  }
+
+  async callStructuredOutputTool(flow, sessionId) {
+    const servers = this.mcpServersBySession.get(sessionId) ?? [];
+    const server = structuredOutputServerFor(servers, flow);
+    if (!server) {
+      record({
+        method: "structuredToolCall",
+        label: flow?.label,
+        error: { name: "Error", message: "structured output MCP server not found" },
+      });
+      return;
+    }
+
+    const transport = new StreamableHTTPClientTransport(new URL(server.url));
+    const client = new Client({ name: "fake-acp-agent", version: "0.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      if (flow?.listTools) {
+        const tools = await client.listTools();
+        record({ method: "structuredToolList", label: flow?.label, serverName: server.name, tools });
+      }
+      const response = await client.callTool({
+        name: flow?.toolName ?? "StructuredOutput",
+        arguments: structuredToolArgumentsFor(flow),
+      });
+      record({ method: "structuredToolCall", label: flow?.label, serverName: server.name, response });
+    } catch (error) {
+      record({ method: "structuredToolCall", label: flow?.label, serverName: server.name, error: serializeError(error) });
+    } finally {
+      try {
+        await client.close();
+      } catch {
+        // best-effort test client teardown
+      }
     }
   }
 

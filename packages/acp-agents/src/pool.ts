@@ -82,6 +82,26 @@ export class AcpAgentPool {
     }
   }
 
+  /** Acquire a connection slot, then let the caller prepare session/new after initialize. */
+  async acquirePrepared(
+    backend: Backend,
+    prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
+    context: { signal?: AbortSignal; label?: string } = {},
+  ): Promise<SessionHandle> {
+    if (this.disposed) throw new Error("ACP agent pool is disposed");
+    const connection = this.selectConnection(backend);
+    try {
+      return await connection.openPreparedSession(prepare);
+    } catch (error) {
+      if (context.signal?.aborted) throw error;
+      throw mapThrownError(error, {
+        label: context.label,
+        backendId: connection.backendId,
+        authMethods: connection.capabilities?.authMethods,
+      });
+    }
+  }
+
   /**
    * Pick the connection to host the next session. Runs SYNCHRONOUSLY (no await) through to the
    * synchronous load-reservation in openSession(), so concurrent acquires never over-spawn or

@@ -51,6 +51,10 @@ export interface Backend {
    *  without the schema in the prompt, such an agent returns well-formed JSON with the WRONG
    *  KEYS and the repair ladder can never converge (it can fix prose, not unseen contracts). */
   readonly embedSchemaInPrompt?: boolean;
+  /** When true, schema runs may inject a client-hosted MCP StructuredOutput tool if the
+   *  initialized agent strictly advertises HTTP MCP support. Native schema channels leave this
+   *  unset; custom ACP backends opt in unless their registry entry disables it. */
+  readonly injectStructuredOutputTool?: boolean;
   /** The agentCapabilities._meta namespace this backend's agent advertises under, and the bare
    *  `_meta` keys gated by same-named boolean flags in that block; undefined = this backend has
    *  no custom-capability contract (its custom `_meta`, if any, is never gated). */

@@ -10,7 +10,7 @@ import { parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 // at the engine layer: meta.backends alone must thread NOTHING to the runner.
 
 const BACKENDS_SNIPPET =
-  'backends: { browser: { command: "browser-acp", args: ["--headless"], env: { HEADLESS: "1" }, sessionMeta: { mode: "verify" } } }';
+  'backends: { browser: { command: "browser-acp", args: ["--headless"], env: { HEADLESS: "1" }, sessionMeta: { mode: "verify" }, structuredOutputTool: false } }';
 
 const SCRIPT_WITH_BACKENDS = [
   `export const meta = { name: "m", description: "d", ${BACKENDS_SNIPPET} };`,
@@ -40,6 +40,7 @@ describe("meta.backends parsing", () => {
         args: ["--headless"],
         env: { HEADLESS: "1" },
         sessionMeta: { mode: "verify" },
+        structuredOutputTool: false,
       },
     });
   });
@@ -53,6 +54,10 @@ describe("meta.backends parsing", () => {
     assert.throws(() => parseWorkflowScript(bad('{ b: { command: "x", args: "no" } }')), /args must be an array of strings/);
     assert.throws(() => parseWorkflowScript(bad('{ b: { command: "x", env: ["no"] } }')), /env must be an object of string values/);
     assert.throws(() => parseWorkflowScript(bad('{ b: { command: "x", sessionMeta: 3 } }')), /sessionMeta must be an object/);
+    assert.throws(
+      () => parseWorkflowScript(bad('{ b: { command: "x", structuredOutputTool: "no" } }')),
+      /structuredOutputTool must be a boolean/,
+    );
   });
 });
 
@@ -66,7 +71,7 @@ describe("scriptBackends threading (composition-root-gated)", () => {
   it("options.scriptBackends is threaded to every agent() call as RunOptions.backends", async () => {
     const { runner, captured } = capturingRunner();
     const approved: Record<string, WorkflowBackendConfig> = {
-      browser: { command: "browser-acp", args: ["--headless"] },
+      browser: { command: "browser-acp", args: ["--headless"], structuredOutputTool: false },
     };
     await runWorkflow(SCRIPT_WITH_BACKENDS, { agent: runner, persistLogs: false, scriptBackends: approved });
     assert.deepEqual(captured()?.backends, approved);
