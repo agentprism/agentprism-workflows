@@ -42,7 +42,11 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
     {
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { name: "codex-acp", title: "Codex", version: "1.2.0" },
+      authMethods: [{ id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "OPENAI_API_KEY" }] }],
+      _meta: { source: "test" },
       agentCapabilities: {
+        auth: { logout: {} },
+        providers: {},
         sessionCapabilities: { close: {} },
         mcpCapabilities: { http: true, sse: false },
         _meta: {
@@ -54,7 +58,13 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
   );
   assert.equal(negotiated.protocolVersion, PROTOCOL_VERSION);
   assert.deepEqual(negotiated.agentInfo, { name: "codex-acp", title: "Codex", version: "1.2.0" });
+  assert.deepEqual(negotiated.authMethods, [
+    { id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "OPENAI_API_KEY" }] },
+  ]);
+  assert.deepEqual(negotiated.initializeMeta, { source: "test" });
   assert.equal(negotiated.supportsClose, true);
+  assert.equal(negotiated.supportsLogout, true);
+  assert.equal(negotiated.supportsProviders, true);
   assert.deepEqual(negotiated.customMetaSupport, {
     outputSchema: true,
     baseInstructions: true,
@@ -67,7 +77,11 @@ test("negotiateCapabilities: a minimal response yields no close support and no c
   const negotiated = negotiateCapabilities({ protocolVersion: PROTOCOL_VERSION }, CODEX_CUSTOM_CAPABILITIES);
   assert.deepEqual(negotiated.agent, {});
   assert.equal(negotiated.agentInfo, undefined);
+  assert.deepEqual(negotiated.authMethods, []);
+  assert.equal(negotiated.initializeMeta, undefined);
   assert.equal(negotiated.supportsClose, false);
+  assert.equal(negotiated.supportsLogout, false);
+  assert.equal(negotiated.supportsProviders, false);
   assert.equal(negotiated.customMetaSupport, undefined, "no namespace advertised => legacy passthrough");
   assert.deepEqual(negotiated.gatedKeys, GATED_CUSTOM_META_KEYS);
 });

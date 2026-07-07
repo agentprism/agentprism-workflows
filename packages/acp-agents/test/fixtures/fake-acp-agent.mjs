@@ -33,6 +33,8 @@ const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 const hasLifecycleSupport = scenario.lifecycleSupport === true;
 const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
+const hasProviderSupport = scenario.providersSupport === true || Object.prototype.hasOwnProperty.call(scenario, "providers");
+const hasLogoutSupport = scenario.logoutSupport === true || Object.prototype.hasOwnProperty.call(scenario, "logout");
 
 function record(entry) {
   if (!logPath) return;
@@ -188,7 +190,11 @@ class FakeAgent {
     // or advertise the @automatalabs/codex-acp custom-capability namespace. Defaults to a capable
     // backend that advertises session/close (so the runner releases sessions without killing the
     // pooled process) — the shape every other test relies on.
-    if (scenario.initialize) return scenario.initialize;
+    if (scenario.initialize) {
+      const response = clone(scenario.initialize);
+      if (Array.isArray(scenario.authMethods)) response.authMethods = clone(scenario.authMethods);
+      return response;
+    }
     const sessionCapabilities = hasLifecycleSupport
       ? { close: {}, resume: {}, list: {}, delete: {}, additionalDirectories: {} }
       : { close: {} };
@@ -198,12 +204,21 @@ class FakeAgent {
         ...(hasLifecycleSupport ? { loadSession: true } : {}),
         sessionCapabilities,
         ...(hasMcpAcpSupport ? { mcpCapabilities: { acp: true } } : {}),
+        ...(hasProviderSupport ? { providers: {} } : {}),
+        ...(hasLogoutSupport ? { auth: { logout: {} } } : {}),
       },
+      ...(Array.isArray(scenario.authMethods) ? { authMethods: clone(scenario.authMethods) } : {}),
     };
   }
 
   newSession(params) {
     record({ method: "newSession", params });
+    if (scenario.authRequiredOnNewSession) {
+      throw RequestError.authRequired(
+        clone(scenario.authRequiredData),
+        typeof scenario.authRequiredMessage === "string" ? scenario.authRequiredMessage : undefined,
+      );
+    }
     // UNIQUE per call: one pooled process serves many sessions over its lifetime.
     // Process-unique ids: real ACP agents mint globally-unique session ids, and the per-session
     // event filter depends on that — two fixture processes must never collide on an id.
@@ -281,6 +296,46 @@ class FakeAgent {
   deleteSession(params) {
     record({ method: "deleteSession", params });
     return clone(scenario.deleteSession ?? {});
+  }
+
+  authenticate(params) {
+    if (scenario.authenticateHandler === false) throw RequestError.methodNotFound("authenticate");
+    record({ method: "authenticate", params });
+    const auth = scenario.authenticate ?? {};
+    if (auth.throw) throw new RequestError(auth.throwCode ?? -32000, auth.throw);
+    return clone(auth.response ?? {});
+  }
+
+  unstable_listProviders(params) {
+    if (scenario.providersHandler === false || scenario.providers?.listHandler === false) {
+      throw RequestError.methodNotFound("providers/list");
+    }
+    record({ method: "listProviders", params });
+    return clone(scenario.providers?.list ?? { providers: [] });
+  }
+
+  unstable_setProvider(params) {
+    if (scenario.providersHandler === false || scenario.providers?.setHandler === false) {
+      throw RequestError.methodNotFound("providers/set");
+    }
+    record({ method: "setProvider", params });
+    return clone(scenario.providers?.set ?? {});
+  }
+
+  unstable_disableProvider(params) {
+    if (scenario.providersHandler === false || scenario.providers?.disableHandler === false) {
+      throw RequestError.methodNotFound("providers/disable");
+    }
+    record({ method: "disableProvider", params });
+    return clone(scenario.providers?.disable ?? {});
+  }
+
+  logout(params) {
+    if (scenario.logoutHandler === false) throw RequestError.methodNotFound("logout");
+    record({ method: "logout", params });
+    const logout = scenario.logout ?? {};
+    if (logout.throw) throw new RequestError(logout.throwCode ?? -32000, logout.throw);
+    return clone(logout.response ?? {});
   }
 
   async closeSession(params) {

@@ -13,6 +13,7 @@
 import type { Backend, BackendId } from "./backend.js";
 import { PooledConnection, SessionHandle, type AcpSessionOptions } from "./acp-client.js";
 import { validateClientHandlers, type ClientHandlers } from "./client-handlers.js";
+import { mapThrownError } from "./errors-map.js";
 import type { AcpEventSink } from "./events.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 
@@ -69,7 +70,16 @@ export class AcpAgentPool {
   async acquire(backend: Backend, opts: AcpSessionOptions): Promise<SessionHandle> {
     if (this.disposed) throw new Error("ACP agent pool is disposed");
     const connection = this.selectConnection(backend);
-    return connection.openSession(opts);
+    try {
+      return await connection.openSession(opts);
+    } catch (error) {
+      if (opts.signal?.aborted) throw error;
+      throw mapThrownError(error, {
+        label: opts.label,
+        backendId: connection.backendId,
+        authMethods: connection.capabilities?.authMethods,
+      });
+    }
   }
 
   /**

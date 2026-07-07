@@ -10,7 +10,9 @@ export type ClientMethodCoverage = "served" | "pending";
 export type AgentMethodCoverage = "driven" | "passthrough" | "guarded";
 
 /** Enforceable definition of "full ACP spec support": every SDK method constant is classified
- *  here, and the tripwire test fails when an SDK bump silently widens or shrinks the protocol. */
+ *  here, and the tripwire test fails when an SDK bump silently widens or shrinks the protocol.
+ *  Agent side: 15 operational methods are driven (plus initialize), 1 is guarded (session/fork),
+ *  and the passthrough remainder is nes/*, document/*, and mcp/message. */
 export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> = {
   [CLIENT_METHODS.session_request_permission]: "served",
   [CLIENT_METHODS.session_update]: "served",
@@ -30,10 +32,10 @@ export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> 
 
 export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.initialize]: "driven",
-  [AGENT_METHODS.authenticate]: "passthrough",
-  [AGENT_METHODS.providers_list]: "passthrough",
-  [AGENT_METHODS.providers_set]: "passthrough",
-  [AGENT_METHODS.providers_disable]: "passthrough",
+  [AGENT_METHODS.authenticate]: "driven",
+  [AGENT_METHODS.providers_list]: "driven",
+  [AGENT_METHODS.providers_set]: "driven",
+  [AGENT_METHODS.providers_disable]: "driven",
   [AGENT_METHODS.session_new]: "driven",
   [AGENT_METHODS.session_load]: "driven",
   [AGENT_METHODS.session_set_mode]: "driven",
@@ -46,7 +48,7 @@ export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.session_fork]: "guarded",
   [AGENT_METHODS.session_resume]: "driven",
   [AGENT_METHODS.session_close]: "driven",
-  [AGENT_METHODS.logout]: "passthrough",
+  [AGENT_METHODS.logout]: "driven",
   [AGENT_METHODS.nes_start]: "passthrough",
   [AGENT_METHODS.nes_suggest]: "passthrough",
   [AGENT_METHODS.nes_accept]: "passthrough",

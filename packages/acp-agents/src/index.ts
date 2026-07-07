@@ -7,9 +7,15 @@
 export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
 export type {
   AcpRunnerOptions,
+  AuthenticateOptions,
+  AuthMethodsOptions,
+  DisableProviderOptions,
   DeleteSessionOptions,
+  ListProvidersOptions,
   ListSessionsOptions,
+  LogoutOptions,
   ReattachSessionOptions,
+  SetProviderOptions,
 } from "./runner.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
@@ -18,9 +24,21 @@ export { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
 export type {
   AgentNotificationMethod,
   AgentNotificationParamsByMethod,
+  AgentAuthCapabilities,
   AgentRequestMethod,
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
+  AuthCapabilities,
+  AuthEnvVar,
+  AuthenticateRequest,
+  AuthenticateResponse,
+  AuthMethod,
+  AuthMethodAgent,
+  AuthMethodEnvVar,
+  AuthMethodId,
+  AuthMethodTerminal,
+  DisableProviderRequest,
+  DisableProviderResponse,
   CompleteElicitationNotification,
   ConnectMcpRequest,
   ConnectMcpResponse,
@@ -43,10 +61,16 @@ export type {
   ElicitationSessionScope,
   ElicitationUrlCapabilities,
   ElicitationUrlMode,
+  ListProvidersRequest,
+  ListProvidersResponse,
   ListSessionsRequest,
   ListSessionsResponse,
+  LlmProtocol,
   LoadSessionRequest,
   LoadSessionResponse,
+  LogoutCapabilities,
+  LogoutRequest,
+  LogoutResponse,
   McpConnectionId,
   McpServerAcp,
   McpServerAcpId,
@@ -55,10 +79,16 @@ export type {
   MessageMcpResponse,
   ResumeSessionRequest,
   ResumeSessionResponse,
+  ProviderCurrentConfig,
+  ProviderId,
+  ProviderInfo,
+  ProvidersCapabilities,
   SessionMode,
   SessionModeState,
   SessionInfo,
   SendRequestOptions,
+  SetProviderRequest,
+  SetProviderResponse,
 } from "@agentclientprotocol/sdk";
 
 // The custom-backend registry: run ANY ACP agent as an agent() target.
@@ -146,4 +176,5 @@ export {
 } from "./structured-output.js";
 export type { ResolveOptions, StructuredSession } from "./structured-output.js";
 
-export { errorText, mapThrownError } from "./errors-map.js";
+export { ACP_AUTH_REQUIRED_ERROR_CODE, errorText, mapThrownError } from "./errors-map.js";
+export type { ErrorMapContext } from "./errors-map.js";

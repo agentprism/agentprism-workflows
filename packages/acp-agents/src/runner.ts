@@ -25,9 +25,20 @@ import {
   type RunOptions,
 } from "@automatalabs/shared-types";
 import type {
+  AuthenticateRequest,
+  AuthenticateResponse,
+  AuthMethod,
   DeleteSessionRequest,
+  DisableProviderRequest,
+  DisableProviderResponse,
+  ListProvidersRequest,
+  ListProvidersResponse,
   ListSessionsRequest,
   ListSessionsResponse,
+  LogoutRequest,
+  LogoutResponse,
+  SetProviderRequest,
+  SetProviderResponse,
   StopReason,
 } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
@@ -105,6 +116,14 @@ interface LifecycleRoutingOptions {
   signal?: AbortSignal;
 }
 
+/** Options for AcpAgentRunner.authMethods(). */
+export interface AuthMethodsOptions {
+  /** Model spec used only to select the backend process. */
+  model?: string;
+  /** Coarse tier consulted only when `model` is unset. */
+  tier?: string;
+}
+
 /** Options for AcpAgentRunner.listSessions(). */
 export interface ListSessionsOptions extends LifecycleRoutingOptions {
   /** Optional absolute working-directory filter. */
@@ -122,6 +141,36 @@ export interface DeleteSessionOptions extends LifecycleRoutingOptions {
   /** Generic ACP `_meta` passthrough for session/delete. */
   meta?: Record<string, unknown>;
 }
+
+interface AuthProviderRoutingOptions extends LifecycleRoutingOptions {
+  /** Generic ACP `_meta` passthrough for the request. */
+  meta?: Record<string, unknown>;
+}
+
+/** Options for AcpAgentRunner.authenticate(). */
+export interface AuthenticateOptions extends AuthProviderRoutingOptions {
+  /** Authentication method id advertised by runner.authMethods(). */
+  methodId: AuthenticateRequest["methodId"];
+}
+
+/** Options for AcpAgentRunner.listProviders(). */
+export interface ListProvidersOptions extends AuthProviderRoutingOptions {}
+
+/** Options for AcpAgentRunner.setProvider(). */
+export interface SetProviderOptions extends AuthProviderRoutingOptions {
+  providerId: SetProviderRequest["providerId"];
+  apiType: SetProviderRequest["apiType"];
+  baseUrl: SetProviderRequest["baseUrl"];
+  headers?: SetProviderRequest["headers"];
+}
+
+/** Options for AcpAgentRunner.disableProvider(). */
+export interface DisableProviderOptions extends AuthProviderRoutingOptions {
+  providerId: DisableProviderRequest["providerId"];
+}
+
+/** Options for AcpAgentRunner.logout(). */
+export interface LogoutOptions extends AuthProviderRoutingOptions {}
 
 /** Options for AcpAgentRunner.loadSession() and resumeSession(). */
 export interface ReattachSessionOptions extends InteractiveSessionOptions {
@@ -228,6 +277,131 @@ export class AcpAgentRunner implements AgentRunner {
     );
   }
 
+  /** Return the selected backend's initialize-advertised authentication methods. */
+  async authMethods(opts: AuthMethodsOptions = {}): Promise<AuthMethod[]> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+      return await connection.authMethods();
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** Drive ACP authenticate on the selected backend. */
+  async authenticate(opts: AuthenticateOptions): Promise<AuthenticateResponse | void> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    validateRequiredString(opts.methodId, opts.label, "authenticate", "methodId");
+    opts.signal?.throwIfAborted();
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const request: AuthenticateRequest = {
+        methodId: opts.methodId,
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      const response = await connection.authenticate(request, opts.label);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+      return response;
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** List configurable providers from the selected backend. */
+  async listProviders(opts: ListProvidersOptions = {}): Promise<ListProvidersResponse> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    opts.signal?.throwIfAborted();
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const request: ListProvidersRequest = {
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      const response = await connection.listProviders(request, opts.label);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+      return response;
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** Configure one provider on the selected backend. */
+  async setProvider(opts: SetProviderOptions): Promise<SetProviderResponse | void> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    validateRequiredString(opts.providerId, opts.label, "setProvider", "providerId");
+    validateRequiredString(opts.apiType, opts.label, "setProvider", "apiType");
+    validateRequiredString(opts.baseUrl, opts.label, "setProvider", "baseUrl");
+    opts.signal?.throwIfAborted();
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const request: SetProviderRequest = {
+        providerId: opts.providerId,
+        apiType: opts.apiType,
+        baseUrl: opts.baseUrl,
+        ...(opts.headers ? { headers: opts.headers } : {}),
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      const response = await connection.setProvider(request, opts.label);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+      return response;
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** Disable one provider on the selected backend. */
+  async disableProvider(opts: DisableProviderOptions): Promise<DisableProviderResponse | void> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    validateRequiredString(opts.providerId, opts.label, "disableProvider", "providerId");
+    opts.signal?.throwIfAborted();
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const request: DisableProviderRequest = {
+        providerId: opts.providerId,
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      const response = await connection.disableProvider(request, opts.label);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+      return response;
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** Logout through the selected backend. */
+  async logout(opts: LogoutOptions = {}): Promise<LogoutResponse | void> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    opts.signal?.throwIfAborted();
+
+    const backend = selectBackend(opts, this.backends);
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const request: LogoutRequest = {
+        ...(opts.meta ? { _meta: opts.meta } : {}),
+      };
+      const response = await connection.logout(request, opts.label);
+      opts.signal?.throwIfAborted();
+      if (this.disposed) throw new Error("ACP agent runner is disposed");
+      return response;
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
   /** List persisted ACP sessions from the selected backend. */
   async listSessions(opts: ListSessionsOptions = {}): Promise<ListSessionsResponse> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
@@ -321,15 +495,17 @@ export class AcpAgentRunner implements AgentRunner {
       registry,
       signal: opts.signal,
     });
-    const session: SessionHandle = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
+    let session: SessionHandle | undefined;
     try {
+      session = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
+      const activeSession = session;
       opts.signal?.throwIfAborted();
       // For a CUSTOM backend chosen by its registered name, the name itself is routing, not a
       // model id: "browser" selects nothing; "browser/foo" selects "foo". Built-ins get the
       // full spec unchanged (their catalogs match provider-prefixed and bare ids).
-      await applyModelSelection(session, prepared.modelSpec, opts);
+      await applyModelSelection(activeSession, prepared.modelSpec, opts);
       opts.signal?.throwIfAborted();
-      if (opts.mode) await session.setMode(opts.mode);
+      if (opts.mode) await activeSession.setMode(opts.mode);
 
       const text = buildRunPrompt(prompt, opts, schema, prepared.backend);
       const initialPrompt =
@@ -337,7 +513,7 @@ export class AcpAgentRunner implements AgentRunner {
       // Generic turn-scoped _meta passthrough merged UNDER the backend-computed keys (e.g. the
       // outputSchema forward when a schema is set) — user meta never clobbers the schema channel.
       const promptMeta = mergeTurnMeta(opts.promptMeta, prepared.backend.promptMeta(schema));
-      const response = await session.prompt(initialPrompt, promptMeta);
+      const response = await activeSession.prompt(initialPrompt, promptMeta);
       opts.signal?.throwIfAborted();
       // Inspect the turn's stop reason BEFORE the text/schema path: a refusal or truncation
       // must surface distinctly here, never be misread as empty output or burned through the
@@ -347,13 +523,13 @@ export class AcpAgentRunner implements AgentRunner {
       if (schema) {
         const structuredSession: StructuredSession = {
           prompt: async (repromptText: string) => {
-            const repromptResponse = await session.prompt(repromptText, promptMeta);
+            const repromptResponse = await activeSession.prompt(repromptText, promptMeta);
             // A repair turn that refuses / truncates / cancels must also surface distinctly
             // instead of silently continuing the ladder.
             assertNormalStopReason(repromptResponse.stopReason, opts.label);
           },
-          lastText: () => session.currentTurnText(),
-          tryNative: () => prepared.backend.nativeStructured(session),
+          lastText: () => activeSession.currentTurnText(),
+          tryNative: () => prepared.backend.nativeStructured(activeSession),
         };
         const result = await resolveStructuredOutput(structuredSession, schema, {
           maxSchemaRetries: opts.maxSchemaRetries,
@@ -363,7 +539,7 @@ export class AcpAgentRunner implements AgentRunner {
         return result as AgentResult<S>;
       }
 
-      const finalText = session.currentTurnText().trim();
+      const finalText = activeSession.currentTurnText().trim();
       if (!finalText) {
         throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
           recoverable: true,
@@ -374,24 +550,30 @@ export class AcpAgentRunner implements AgentRunner {
     } catch (error) {
       // Abort is the engine's concern (throwIfAborted before/after the call) — re-throw it raw.
       if (opts.signal?.aborted) throw error;
-      throw mapThrownError(error, opts.label);
+      throw mapThrownError(error, {
+        label: opts.label,
+        backendId: prepared.backend.id,
+        authMethods: session?.capabilities?.authMethods,
+      });
     } finally {
-      // Read real usage on BOTH success and error so partial usage is never lost.
-      try {
-        opts.onUsage?.(session.usage.toAgentUsage());
-      } catch {
-        // usage is best-effort; never let it mask the real result/error.
-      }
-      try {
-        opts.onHistory?.(session.history);
-      } catch {
-        // history is diagnostic only.
-      }
-      // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
-      try {
-        await session.release();
-      } catch {
-        // release is best-effort (session already untracked); never mask the real result/error.
+      if (session) {
+        // Read real usage on BOTH success and error so partial usage is never lost.
+        try {
+          opts.onUsage?.(session.usage.toAgentUsage());
+        } catch {
+          // usage is best-effort; never let it mask the real result/error.
+        }
+        try {
+          opts.onHistory?.(session.history);
+        } catch {
+          // history is diagnostic only.
+        }
+        // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
+        try {
+          await session.release();
+        } catch {
+          // release is best-effort (session already untracked); never mask the real result/error.
+        }
       }
     }
   }
@@ -461,7 +643,12 @@ export class AcpAgentRunner implements AgentRunner {
         // best-effort: lifecycle setup failed, so teardown must never mask the real error.
       }
       await disposeBestEffort(connection);
-      throw error;
+      if (opts.signal?.aborted) throw error;
+      throw mapThrownError(error, {
+        label: opts.label,
+        backendId: prepared.backend.id,
+        authMethods: connection.capabilities?.authMethods,
+      });
     }
   }
 
@@ -644,9 +831,18 @@ function validateOptionalLifecycleCwd(cwd: string | undefined, label: string | u
 }
 
 function validateLifecycleSessionId(sessionId: string, label: string | undefined, methodName: string): void {
-  if (typeof sessionId !== "string" || sessionId.trim() === "") {
+  validateRequiredString(sessionId, label, methodName, "sessionId");
+}
+
+function validateRequiredString(
+  value: string,
+  label: string | undefined,
+  methodName: string,
+  fieldName: string,
+): void {
+  if (typeof value !== "string" || value.trim() === "") {
     throw new WorkflowError(
-      `${methodName} requires sessionId to be a non-empty string`,
+      `${methodName} requires ${fieldName} to be a non-empty string`,
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false, agentLabel: label },
     );

@@ -21,6 +21,8 @@ export enum WorkflowErrorCode {
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
   /** Provider subscription/usage/quota/rate limit. Non-recoverable => engine PAUSES (resumable), not failed. Carries resetHint. */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
+  /** The agent requires authentication. Non-recoverable: retrying cannot succeed until the host completes an auth flow via `runner.authenticate()`; the error message should name the advertised auth methods when known. */
+  AUTH_REQUIRED = "AUTH_REQUIRED",
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** The workflow SCRIPT crashed at runtime: an uncaught throw or an unhandled promise
    *  rejection inside the script body. Distinct from WORKFLOW_ABORTED (someone cancelled the

@@ -180,6 +180,35 @@ Capability advertisement is fixed at `initialize`: the client advertises `elicit
 
 Claude-family agents use this advertisement to enable `AskUserQuestion`, refusal-fallback dialogs, and MCP-elicitation forwarding. Advertising without a real responder would send those agent questions into a void, so this library never advertises elicitation for a stub auto-decline path.
 
+### Auth & providers
+
+Authentication methods are discovered without opening a session:
+
+```ts
+const methods = await runner.authMethods({ model: "codex" }); // AuthMethod[]
+await runner.authenticate({ model: "codex", methodId: "api-key" });
+```
+
+`authMethods()` returns the selected backend's initialize-advertised `AuthMethod[]` (`[]` when none). `authenticate({ methodId, meta? })` drives the ACP `authenticate` method on a dedicated connection; ACP has no separate `agentCapabilities` gate for this method, so a backend that does not implement it may return method-not-found, surfaced with the backend id and method name.
+
+If `session/new` or `session/prompt` fails with ACP `RequestError.authRequired()` (JSON-RPC code `-32000`, message prefix `Authentication required`), the runner raises `WorkflowErrorCode.AUTH_REQUIRED` with `recoverable: false`. The message names the backend and, when initialize advertised methods, tells the host to run `authenticate()` with one of those ids. The engine does not retry this; retrying cannot succeed until the host completes auth.
+
+Provider management mirrors the SDK request shapes:
+
+```ts
+const { providers } = await runner.listProviders({ model: "codex" });
+await runner.setProvider({ model: "codex", providerId: "openai", apiType: "openai", baseUrl, headers });
+await runner.disableProvider({ model: "codex", providerId: "openai" });
+await runner.logout({ model: "codex" });
+```
+
+`providers/list`, `providers/set`, and `providers/disable` are gated together by the unstable `agentCapabilities.providers` advertisement. `logout` is gated by `agentCapabilities.auth.logout`. Missing advertised support throws a non-recoverable `WorkflowError` naming the backend, method, and advertised auth/provider capabilities.
+
+Installed adapter status from the bundled dists:
+
+- `@agentclientprotocol/claude-agent-acp@0.56.0`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. It does not advertise or register `providers/*`.
+- `@automatalabs/codex-acp@1.4.0`: advertises `auth.logout`, implements `authenticate` (`api-key`, `chat-gpt`, and `gateway` when gateway support is advertised), and implements `logout`. It does not advertise or register `providers/*`.
+
 ### Protocol passthrough & coverage
 
 `PooledConnection` and `InteractiveSession` expose typed raw ACP `request()` / `notify()` escape hatches for spec methods without named wrappers:
@@ -187,14 +216,14 @@ Claude-family agents use this advertisement to enable `AskUserQuestion`, refusal
 ```ts
 import { AGENT_METHODS } from "@automatalabs/workflows";
 
-await session.request(AGENT_METHODS.providers_list, {});
+await session.request(AGENT_METHODS.mcp_message, { connectionId, method: "tools/list" });
 ```
 
 Prefer named wrappers (`prompt()`, `setMode()`, `openSession()`, etc.) when they exist; they preserve engine semantics like drain accumulation, local mode state, and usage recording, while raw `session/prompt` bypasses them.
 
 Raw `request()` rejects the session-stateful methods that would create or reopen sessions outside the router: `session/new` (use `openSession()`), `session/load` (use `loadSession()`), `session/resume` (use `resumeSession()`), and `session/fork` (no driven wrapper yet). Those raw sessions are unregistered: updates do not fold into an accumulator, permission requests auto-cancel, and fs/terminal dispatch fails for unknown sessions.
 
-`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. Client methods are currently 14/14 served. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
+`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. Agent coverage is 15 operational driven methods plus `initialize`, 1 guarded method (`session/fork`), and passthrough for `nes/*`, `document/*`, and `mcp/message`. Client methods are currently 14/14 served. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
 
 ### <a name="runner-events"></a>Events (`runner.on(name, listener)`)
 
@@ -231,7 +260,7 @@ Lifecycle methods are capability-gated after initialize. Missing support throws 
 
 ### Capabilities
 
-The one-time `initialize` handshake negotiates per-connection capabilities, readable as `NegotiatedCapabilities` (exported). Prompt-content flags are **booleans**: `capabilities.agent.promptCapabilities?.image === true` etc. You rarely need to gate manually — `adaptPromptContent` already degrades unsupported `image`/`audio`/`resource` blocks to a bracketed text note naming the backend. The client truthfully advertises: `fs`/`terminal` only when you registered handlers, plus `session.configOptions.boolean` always (boolean config options are handled natively). The installed ACP SDK has no `ClientCapabilities` field for MCP-over-ACP; the real declaration is a `session/new` MCP server entry `{ type: "acp", name, serverId }`, gated before the session is opened.
+The one-time `initialize` handshake negotiates per-connection capabilities, readable as `NegotiatedCapabilities` (exported). It includes the full `agentCapabilities`, `agentInfo`, initialize `_meta`, and advertised `authMethods`. Prompt-content flags are **booleans**: `capabilities.agent.promptCapabilities?.image === true` etc. You rarely need to gate manually — `adaptPromptContent` already degrades unsupported `image`/`audio`/`resource` blocks to a bracketed text note naming the backend. The client truthfully advertises: `fs`/`terminal` only when you registered handlers, plus `session.configOptions.boolean` always (boolean config options are handled natively). The installed ACP SDK has no `ClientCapabilities` field for MCP-over-ACP; the real declaration is a `session/new` MCP server entry `{ type: "acp", name, serverId }`, gated before the session is opened.
 
 ### MCP-over-ACP client handlers
 
