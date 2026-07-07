@@ -78,6 +78,19 @@ test("registry: validates names, reserved names, and config field types", () => 
     () => resolveBackendRegistry({ b: { command: "x", sessionMeta: [] } as never }),
     /"sessionMeta" must be an object/,
   );
+  assert.throws(
+    () => resolveBackendRegistry({ b: { command: "x", structuredOutputTool: "yes" } as never }),
+    /"structuredOutputTool" must be a boolean/,
+  );
+});
+
+test("registry: validates structuredOutputTool and defaults custom backends to injection-enabled", () => {
+  const enabled = resolveBackendRegistry({ b: { command: "x", structuredOutputTool: true } }).get("b");
+  const disabled = resolveBackendRegistry({ b: { command: "x", structuredOutputTool: false } }).get("b");
+  assert.equal(enabled?.structuredOutputTool, true);
+  assert.equal(disabled?.structuredOutputTool, false);
+  assert.equal(new CustomAcpBackend({ name: "defaulted", command: "x" }).injectStructuredOutputTool, true);
+  assert.equal(new CustomAcpBackend({ name: "disabled", command: "x", structuredOutputTool: false }).injectStructuredOutputTool, false);
 });
 
 // ---- CustomAcpBackend ----------------------------------------------------------------
@@ -161,6 +174,14 @@ test("run backends: validated with the same rules (reserved names, config shapes
   const host = resolveBackendRegistry();
   assert.throws(() => registryWithRunBackends(host, { claude: { command: "x" } }), /reserved/);
   assert.throws(() => registryWithRunBackends(host, { b: { command: "" } }), /non-empty string "command"/);
+  assert.throws(
+    () => registryWithRunBackends(host, { b: { command: "x", structuredOutputTool: "no" } as never }),
+    /"structuredOutputTool" must be a boolean/,
+  );
+  assert.equal(
+    registryWithRunBackends(host, { b: { command: "x", structuredOutputTool: false } }).get("b")?.structuredOutputTool,
+    false,
+  );
 });
 
 // ---- poolKey (spawn-config identity) ----------------------------------------------------

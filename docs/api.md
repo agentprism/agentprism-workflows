@@ -162,9 +162,11 @@ const runner = createAcpRunner({
 
 ### `run(prompt, opts)` — the AgentRunner seam
 
-One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (backend-native structured output + validate-and-re-prompt). Key `RunOptions`:
+One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (native/tool-captured structured output + validate-and-re-prompt). Key `RunOptions`:
 
 `label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), callbacks `onUsage`, `onHistory`, `onModelResolved`, `onModelFallback`.
+
+**Structured output channels.** Claude and Codex keep their native schema channels authoritative and unchanged. Custom ACP backends default to `structuredOutputTool:true`: when `RunOptions.schema` is set, the backend opts in, and the negotiated initialize response advertises `agentCapabilities.mcpCapabilities.http === true`, the runner appends a client-hosted HTTP MCP server to `session/new.mcpServers`. The injected server is named `structured_output` (or `structured_output_2`, etc. on name collision), runs on `127.0.0.1` with an unguessable token path, and exposes one tool named `StructuredOutput`; agents may show it namespaced, for example `structured_output_StructuredOutput`. The tool input schema is the requested JSON Schema, and a valid call captures the result. If any gate fails, or a custom backend sets `structuredOutputTool:false`, behavior falls back to the existing prompt-embedded schema plus final-text JSON parse ladder. User-provided `mcpServers` are preserved and are not part of the resume hash.
 
 **Model specs**: `provider/modelId`, bare id, or tier word; a trailing bracket drives sibling config options — `gpt-5.1-codex[high]` sets `reasoning_effort`, `[high fast]` also enables Fast mode (boolean-typed or legacy select shape — both supported; the client advertises `session.configOptions.boolean`). Routing: `claude|opus|sonnet|haiku` → Claude; `gpt|codex|o3|o4` → Codex; registered custom-backend names route to their process. An unmatched model/modifier fires `onModelFallback` (observable, never a throw) and the session default runs.
 

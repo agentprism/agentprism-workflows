@@ -66,6 +66,11 @@ import { mapThrownError } from "./errors-map.js";
 import type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 import {
+  STRUCTURED_OUTPUT_SERVER_NAME,
+  StructuredOutputToolHost,
+  type StructuredOutputToolRegistration,
+} from "./structured-tool.js";
+import {
   buildRunPrompt,
   mergeTurnMeta,
   promptWithImages,
@@ -74,6 +79,9 @@ import {
 import type { ClientHandlers } from "./client-handlers.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
+
+const STRUCTURED_TOOL_REPROMPT_TEXT =
+  "You did not call the StructuredOutput tool. Call the StructuredOutput tool now, exactly once, with your final answer as its arguments conforming to its parameter schema. Do not reply with plain text.";
 
 interface SessionPreparationOptions {
   model?: string;
@@ -217,6 +225,7 @@ export class AcpAgentRunner implements AgentRunner {
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly permissionResolver: PermissionResolver | undefined;
   private readonly elicitationResolver: ElicitationResolver | undefined;
+  private readonly structuredOutputTools = new StructuredOutputToolHost();
   /** Held-open interactive sessions own dedicated ACP processes outside the pool. The runner
    *  tracks their connections so dispose() can release them and the process-exit hook can
    *  synchronously kill any dedicated children if the host exits without release(). */
@@ -501,8 +510,33 @@ export class AcpAgentRunner implements AgentRunner {
       signal: opts.signal,
     });
     let session: SessionHandle | undefined;
+    let structuredTool: StructuredOutputToolRegistration | undefined;
+    let structuredToolActive = false;
     try {
-      session = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
+      session = await this.pool.acquirePrepared(
+        prepared.backend,
+        async (connection) => {
+          let sessionOptions = prepared.sessionOptions;
+          if (shouldInjectStructuredOutputTool(schema, prepared.backend, connection.capabilities)) {
+            structuredTool = await this.structuredOutputTools.register(schema);
+            structuredToolActive = true;
+            sessionOptions = {
+              ...sessionOptions,
+              mcpServers: [
+                ...(sessionOptions.mcpServers ?? []),
+                {
+                  type: "http",
+                  name: nextStructuredOutputServerName(sessionOptions.mcpServers),
+                  url: structuredTool.url,
+                  headers: [],
+                },
+              ],
+            };
+          }
+          return sessionOptions;
+        },
+        { signal: opts.signal, label: opts.label },
+      );
       const activeSession = session;
       opts.signal?.throwIfAborted();
       // For a CUSTOM backend chosen by its registered name, the name itself is routing, not a
@@ -512,7 +546,7 @@ export class AcpAgentRunner implements AgentRunner {
       opts.signal?.throwIfAborted();
       if (opts.mode) await activeSession.setMode(opts.mode);
 
-      const text = buildRunPrompt(prompt, opts, schema, prepared.backend);
+      const text = buildRunPrompt(prompt, opts, schema, prepared.backend, structuredToolActive);
       const initialPrompt =
         opts.images && opts.images.length > 0 ? promptWithImages(text, opts.images) : text;
       // Generic turn-scoped _meta passthrough merged UNDER the backend-computed keys (e.g. the
@@ -534,12 +568,14 @@ export class AcpAgentRunner implements AgentRunner {
             assertNormalStopReason(repromptResponse.stopReason, opts.label);
           },
           lastText: () => activeSession.currentTurnText(),
+          tryCaptured: structuredTool ? () => structuredTool?.tryCaptured() : undefined,
           tryNative: () => prepared.backend.nativeStructured(activeSession),
         };
         const result = await resolveStructuredOutput(structuredSession, schema, {
           maxSchemaRetries: opts.maxSchemaRetries,
           signal: opts.signal,
           label: opts.label,
+          ...(structuredToolActive ? { repromptText: STRUCTURED_TOOL_REPROMPT_TEXT } : {}),
         });
         return result as AgentResult<S>;
       }
@@ -561,6 +597,7 @@ export class AcpAgentRunner implements AgentRunner {
         authMethods: session?.capabilities?.authMethods,
       });
     } finally {
+      structuredTool?.release();
       if (session) {
         // Read real usage on BOTH success and error so partial usage is never lost.
         try {
@@ -590,7 +627,11 @@ export class AcpAgentRunner implements AgentRunner {
     this.removeExitHook();
     const sessions = [...this.interactiveSessions.keys()];
     await Promise.all(sessions.map((session) => session.release()));
-    await this.pool.dispose();
+    try {
+      await this.pool.dispose();
+    } finally {
+      await this.structuredOutputTools.dispose();
+    }
     this.events.removeAllListeners();
   }
 
@@ -768,6 +809,29 @@ function assertNormalStopReason(stopReason: StopReason, label?: string): void {
       // "end_turn" and any unrecognized future reason: normal completion.
       return;
   }
+}
+
+function shouldInjectStructuredOutputTool(
+  schema: TSchema | undefined,
+  backend: Backend,
+  capabilities: PooledConnection["capabilities"],
+): schema is TSchema {
+  return Boolean(schema && backend.injectStructuredOutputTool && supportsStructuredOutputToolTransport(capabilities));
+}
+
+function supportsStructuredOutputToolTransport(capabilities: PooledConnection["capabilities"]): boolean {
+  return capabilities?.agent.mcpCapabilities?.http === true;
+}
+
+function nextStructuredOutputServerName(servers: AnyRunOptions["mcpServers"] | undefined): string {
+  const used = new Set((servers ?? []).map((server) => server.name));
+  let candidate = STRUCTURED_OUTPUT_SERVER_NAME;
+  let suffix = 2;
+  while (used.has(candidate)) {
+    candidate = `${STRUCTURED_OUTPUT_SERVER_NAME}_${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
 }
 
 async function applyModelSelection(

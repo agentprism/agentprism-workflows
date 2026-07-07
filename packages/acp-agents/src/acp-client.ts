@@ -1217,42 +1217,62 @@ export class PooledConnection {
     this._activeSessions += 1;
     try {
       await this.ready;
-      // Capability gate: reject a client-provided MCP server whose transport the connected agent
-      // does not advertise (http/sse gated on mcpCapabilities; stdio is always serviceable).
-      // Fail-fast and non-recoverable — re-running the same incompatible transport can never
-      // succeed. Lenient for agents that advertise no mcpCapabilities (the legacy passthrough).
-      this.assertSupportedMcpServers(opts);
-      // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
-      // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
-      // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
-      // Codex base/developer instructions), then the engine runId correlation stamp. The result
-      // is gated against the agent's advertised custom capabilities (a declared key the agent
-      // said it does not honor is dropped). When no layer survives, no `_meta` is sent.
-      const meta = this.sessionRequestMeta(opts);
-      const request: NewSessionRequest = {
-        cwd: opts.cwd,
-        // Client-provided MCP servers (additive run input), else the default empty list.
-        mcpServers: opts.mcpServers ?? [],
-        ...(meta ? { _meta: meta } : {}),
-      };
-      const response = await this.race(this.connection.agent.request(AGENT_METHODS.session_new, request));
-      const state = new SessionState(
-        opts.cwd,
-        opts.policy,
-        opts.permissionResolver,
-        opts.elicitationResolver,
-        opts.label,
-        opts.runId,
-        response.modes,
-        acpMcpServerIds(opts.mcpServers),
-        opts.retainSessionLog ?? true,
-      );
-      this.client.register(response.sessionId, state);
-      return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts);
+      return await this.openReadySession(opts);
     } catch (error) {
       this._activeSessions -= 1;
       throw error;
     }
+  }
+
+  /** Reserve a session slot before initialize, then let the caller shape session/new with
+   *  negotiated capabilities in hand. */
+  async openPreparedSession(
+    prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
+  ): Promise<SessionHandle> {
+    this._activeSessions += 1;
+    try {
+      await this.ready;
+      const opts = await prepare(this);
+      return await this.openReadySession(opts);
+    } catch (error) {
+      this._activeSessions -= 1;
+      throw error;
+    }
+  }
+
+  private async openReadySession(opts: AcpSessionOptions): Promise<SessionHandle> {
+    // Capability gate: reject a client-provided MCP server whose transport the connected agent
+    // does not advertise (http/sse gated on mcpCapabilities; stdio is always serviceable).
+    // Fail-fast and non-recoverable — re-running the same incompatible transport can never
+    // succeed. Lenient for agents that advertise no mcpCapabilities (the legacy passthrough).
+    this.assertSupportedMcpServers(opts);
+    // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
+    // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
+    // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
+    // Codex base/developer instructions), then the engine runId correlation stamp. The result
+    // is gated against the agent's advertised custom capabilities (a declared key the agent
+    // said it does not honor is dropped). When no layer survives, no `_meta` is sent.
+    const meta = this.sessionRequestMeta(opts);
+    const request: NewSessionRequest = {
+      cwd: opts.cwd,
+      // Client-provided MCP servers (additive run input), else the default empty list.
+      mcpServers: opts.mcpServers ?? [],
+      ...(meta ? { _meta: meta } : {}),
+    };
+    const response = await this.race(this.connection.agent.request(AGENT_METHODS.session_new, request));
+    const state = new SessionState(
+      opts.cwd,
+      opts.policy,
+      opts.permissionResolver,
+      opts.elicitationResolver,
+      opts.label,
+      opts.runId,
+      response.modes,
+      acpMcpServerIds(opts.mcpServers),
+      opts.retainSessionLog ?? true,
+    );
+    this.client.register(response.sessionId, state);
+    return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts);
   }
 
   /** Reopen an existing session and replay its transcript through the router before resolving. */

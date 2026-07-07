@@ -35,6 +35,9 @@ importers:
       '@automatalabs/shared-types':
         specifier: workspace:*
         version: link:../shared-types
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.29
+        version: 1.29.0(zod@4.4.3)
       typebox:
         specifier: 1.3.2
         version: 1.3.2

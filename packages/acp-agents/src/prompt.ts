@@ -18,24 +18,37 @@ export function buildRunPrompt(
   opts: { instructions?: string; label?: string },
   schema: TSchema | undefined,
   backend: Backend,
+  structuredToolActive = false,
 ): string {
   const parts: string[] = [];
   if (opts.instructions) parts.push(opts.instructions);
   if (opts.label) parts.push(`Task label: ${opts.label}`);
   parts.push(prompt);
   if (schema) {
-    const contract = [
-      "Final output contract:",
-      "- Your FINAL message MUST be a single JSON object that conforms to the required output schema.",
-      "- Output ONLY that JSON object — no prose, no explanation, and no markdown code fences.",
-      "- If you need to inspect files or run commands first, do so, then emit the JSON object as your final message.",
-    ];
-    if (backend.embedSchemaInPrompt) {
-      // Custom ACP agents may ignore `_meta.outputSchema`; state the schema in-band so the
-      // repair ladder is correcting against a visible contract, not an unseen extension key.
-      contract.push(`- The required output schema (JSON Schema):\n${JSON.stringify(toJsonSchema(schema))}`);
+    if (structuredToolActive) {
+      parts.push(
+        [
+          "Final output contract:",
+          "- You have been provided an MCP tool named StructuredOutput (it may appear namespaced by its server, e.g. structured_output_StructuredOutput).",
+          "- You MUST call it exactly once with your final answer as its arguments; its parameter schema defines the required output shape.",
+          "- Complete all necessary research and tool calls BEFORE calling it.",
+          "- Do NOT emit your final answer as plain text.",
+        ].join("\n"),
+      );
+    } else {
+      const contract = [
+        "Final output contract:",
+        "- Your FINAL message MUST be a single JSON object that conforms to the required output schema.",
+        "- Output ONLY that JSON object — no prose, no explanation, and no markdown code fences.",
+        "- If you need to inspect files or run commands first, do so, then emit the JSON object as your final message.",
+      ];
+      if (backend.embedSchemaInPrompt) {
+        // Custom ACP agents may ignore `_meta.outputSchema`; state the schema in-band so the
+        // repair ladder is correcting against a visible contract, not an unseen extension key.
+        contract.push(`- The required output schema (JSON Schema):\n${JSON.stringify(toJsonSchema(schema))}`);
+      }
+      parts.push(contract.join("\n"));
     }
-    parts.push(contract.join("\n"));
   }
   return parts.join("\n\n");
 }

@@ -46,6 +46,7 @@
     "@agentclientprotocol/sdk": "^1.2.0",
     "@agentclientprotocol/claude-agent-acp": "0.56.0",
     "@automatalabs/codex-acp": "1.4.0",
+    "@modelcontextprotocol/sdk": "^1.29",
     "typebox": "1.3.2"
   }
 }

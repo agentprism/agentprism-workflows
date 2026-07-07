@@ -34,6 +34,9 @@ export interface WorkflowBackendConfig {
   /** Static `_meta` sent on every session/new for this backend (defaults; per-call
    *  RunOptions.meta merges over them). */
   sessionMeta?: Record<string, unknown>;
+  /** Enable client-hosted StructuredOutput MCP tool injection when schema runs negotiate HTTP MCP.
+   *  Default true; set false to keep this backend on the prompt/_meta fallback path. */
+  structuredOutputTool?: boolean;
 }
 
 /** The `export const meta = {...}` literal parsed from the head of a script. */

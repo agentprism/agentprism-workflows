@@ -1,8 +1,9 @@
 // Supports area (4): the client-side structured-output GUARD (validate-then-re-prompt ladder)
 // and its primitives. The ladder is:
-//   1. native constraint  2. client-side validate (typebox Convert -> Check)
-//   3. re-prompt up to maxSchemaRetries (strict prose extraction each turn)
-//   4. exhausted -> SCHEMA_NONCOMPLIANCE (non-recoverable).
+//   1. captured StructuredOutput tool args  2. native constraint
+//   3. client-side validate (typebox Convert -> Check)
+//   4. re-prompt up to maxSchemaRetries (strict prose extraction each turn)
+//   5. exhausted -> SCHEMA_NONCOMPLIANCE (non-recoverable).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
@@ -52,21 +53,38 @@ test("extractValidated pulls JSON from prose and only accepts it if it validates
 // ---- ladder -------------------------------------------------------------------------
 
 /** A scriptable StructuredSession double: each prompt() advances to the next scripted turn. */
-function scriptedSession(turns: Array<{ text?: string; native?: unknown }>): StructuredSession & {
+function scriptedSession(turns: Array<{ text?: string; native?: unknown; captured?: unknown }>): StructuredSession & {
   promptCount: number;
+  prompts: string[];
 } {
   let index = 0;
   const current = () => turns[Math.min(index, turns.length - 1)] ?? {};
   return {
     promptCount: 0,
-    async prompt() {
+    prompts: [],
+    async prompt(text: string) {
       this.promptCount += 1;
+      this.prompts.push(text);
       index += 1;
     },
     lastText: () => current().text ?? "",
+    tryCaptured: () => current().captured,
     tryNative: () => current().native,
   };
 }
+
+test("ladder: captured StructuredOutput args win before native and text", async () => {
+  const session = scriptedSession([
+    {
+      captured: { city: "Oslo", hot: false },
+      native: { city: "NYC", hot: true },
+      text: '{"city":"LA","hot":true}',
+    },
+  ]);
+  const out = await resolveStructuredOutput(session, SCHEMA, { maxSchemaRetries: 2 });
+  assert.deepEqual(out, { city: "Oslo", hot: false });
+  assert.equal(session.promptCount, 0);
+});
 
 test("ladder: native constraint hit on the first turn (no re-prompts)", async () => {
   const session = scriptedSession([{ native: { city: "NYC", hot: true } }]);
@@ -90,6 +108,19 @@ test("ladder: invalid native is rejected, then a later re-prompt turn succeeds",
   const out = await resolveStructuredOutput(session, SCHEMA, { maxSchemaRetries: 2 });
   assert.deepEqual(out, { city: "NYC", hot: true });
   assert.equal(session.promptCount, 1); // exactly one repair turn used
+});
+
+test("ladder: custom repair text is used when provided", async () => {
+  const session = scriptedSession([
+    { text: "plain" },
+    { captured: { city: "Oslo", hot: false } },
+  ]);
+  const out = await resolveStructuredOutput(session, SCHEMA, {
+    maxSchemaRetries: 2,
+    repromptText: "call the StructuredOutput tool",
+  });
+  assert.deepEqual(out, { city: "Oslo", hot: false });
+  assert.deepEqual(session.prompts, ["call the StructuredOutput tool"]);
 });
 
 test("ladder: exhausted after maxSchemaRetries => SCHEMA_NONCOMPLIANCE (non-recoverable)", async () => {

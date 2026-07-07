@@ -3,12 +3,13 @@
 // Ported from pi src/agent.ts (findJsonBlock + extractValidated, KEPT VERBATIM; the
 // `defineTool`/`structured_output` capture path is DROPPED because ACP backends constrain
 // natively). resolveStructuredOutput is re-cut for ACP: the native constraint replaces the
-// injected tool, so the ladder is
-//   1. native constraint  (Claude: structured_output off the raw _claude/sdkMessage;
-//                           Codex: the JSON-parsed final assistant message)
-//   2. client-side validate against the schema (typebox Convert -> Check)
-//   3. on miss, re-prompt up to maxSchemaRetries (then strict prose extraction each turn)
-//   4. exhausted -> SCHEMA_NONCOMPLIANCE (non-recoverable; surfaced, never a silent null).
+// injected tool for native backends, so the ladder is
+//   1. client-hosted StructuredOutput capture, when active for custom HTTP-MCP agents
+//   2. native constraint  (Claude: structured_output off the raw _claude/sdkMessage;
+//                           Codex/custom fallback: the JSON-parsed final assistant message)
+//   3. client-side validate against the schema (typebox Convert -> Check)
+//   4. on miss, re-prompt up to maxSchemaRetries (then strict prose extraction each turn)
+//   5. exhausted -> SCHEMA_NONCOMPLIANCE (non-recoverable; surfaced, never a silent null).
 // A re-prompt turn that itself hits a provider wall REJECTS (the ACP request throws); the
 // runner's catch classifies that as PROVIDER_USAGE_LIMIT, so we never need to gate on the
 // assistant's own task text here.
@@ -98,6 +99,8 @@ export interface StructuredSession {
   lastText(): string;
   /** The backend's native structured result for the latest turn (unvalidated), or undefined. */
   tryNative(): unknown;
+  /** Captured StructuredOutput MCP tool arguments, when client-hosted injection is active. */
+  tryCaptured?(): unknown | undefined;
 }
 
 export interface ResolveOptions {
@@ -105,6 +108,7 @@ export interface ResolveOptions {
   maxSchemaRetries?: number;
   signal?: AbortSignal;
   label?: string;
+  repromptText?: string;
 }
 
 const REPROMPT_TEXT = [
@@ -124,6 +128,11 @@ export async function resolveStructuredOutput(
   options: ResolveOptions,
 ): Promise<unknown> {
   const tryResolve = (): unknown => {
+    const captured = session.tryCaptured?.();
+    if (captured !== undefined) {
+      const validated = validateValue(captured, schema);
+      if (validated !== undefined) return validated;
+    }
     const native = session.tryNative();
     if (native !== undefined && native !== null) {
       const validated = validateValue(native, schema);
@@ -136,9 +145,10 @@ export async function resolveStructuredOutput(
   if (resolved !== undefined) return resolved;
 
   const maxRetries = Math.max(0, options.maxSchemaRetries ?? 2);
+  const repromptText = options.repromptText ?? REPROMPT_TEXT;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     options.signal?.throwIfAborted();
-    await session.prompt(REPROMPT_TEXT);
+    await session.prompt(repromptText);
     resolved = tryResolve();
     if (resolved !== undefined) return resolved;
   }
