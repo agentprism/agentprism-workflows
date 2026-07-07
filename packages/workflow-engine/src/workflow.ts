@@ -119,7 +119,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeJournal?: Map<number, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
-  /** Called after each live agent completes so the caller can persist the journal. */
+  /** Called after each live agent/checkpoint completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;

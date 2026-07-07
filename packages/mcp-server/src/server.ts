@@ -20,6 +20,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
+import { createRequire } from "node:module";
 
 import { parseWorkflowScript, WorkflowManager } from "@automatalabs/workflows";
 import type {
@@ -36,7 +37,8 @@ import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-o
 import { createProgressReporter } from "./progress.js";
 
 const SERVER_NAME = "agentprism-workflow";
-const SERVER_VERSION = "0.0.0";
+const require = createRequire(import.meta.url);
+const SERVER_VERSION = (require("../package.json") as { version: string }).version;
 
 /**
  * The checkpoint metadata the engine forwards to `confirm` (workflow.ts checkpoint()).

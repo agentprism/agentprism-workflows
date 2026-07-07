@@ -69,7 +69,8 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  (ACP session/cancel) but MUST NOT implement its own timeout. */
   signal?: AbortSignal;
   /** Model spec (`provider/modelId` or bare `modelId`). Runner interprets: cross-provider =>
-   *  which ACP server to spawn; within-provider => session config / Claude _meta model.
+   *  which ACP server to spawn; within-provider => ACP session config selection
+   *  (`session/set_config_option`, surfaced as SessionHandle.selectModel()).
    *  Omitted => session default. */
   model?: string;
   /** Agent-advertised ACP session mode id, e.g. "plan" on Claude-family agents or "read-only"

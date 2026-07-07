@@ -198,6 +198,11 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   onElicitation?: ElicitationResolver;
 }
 
+/**
+ * ACP-backed AgentRunner implementation. The caller that constructs an AcpAgentRunner owns it:
+ * pass it into managers/runs as needed, then call dispose() (or use `await using`) when that
+ * owner is done with the pooled and dedicated backend processes.
+ */
 export class AcpAgentRunner implements AgentRunner {
   private readonly pool: AcpAgentPool;
   /** The resolved custom-backend registry (env + option, validated at construction). */
@@ -587,6 +592,10 @@ export class AcpAgentRunner implements AgentRunner {
     await Promise.all(sessions.map((session) => session.release()));
     await this.pool.dispose();
     this.events.removeAllListeners();
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.dispose();
   }
 
   private async createInteractiveSession(

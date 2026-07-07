@@ -99,7 +99,7 @@ structured-output vendor wiring (§6). It exposes one method — `run(prompt, op
 — satisfying the `AgentRunner` interface. Its runtime deps are `@agentclientprotocol/sdk`,
 `@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`, `typebox`, and `@automatalabs/shared-types`.
 
-The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.2.0` — a
+The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.4.0` — a
 published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `outputSchema` forward
 (§6.3) into its shipped dist. It's an exact-pinned dependency, so Codex ships on a clean
 `git clone && pnpm install && pnpm build` — no pnpm patch, no `patches/` file, no vendored tree.
@@ -180,13 +180,13 @@ All versions below were verified locally (cloned + `npm install`) on 2026-06-29.
   client/connection helpers). This is what your orchestrator uses to *speak ACP as a client*.
   Ref: https://agentclientprotocol.com · https://github.com/agentclientprotocol
 
-- **`@agentclientprotocol/claude-agent-acp@0.53.0`** — ACP server wrapping Claude.
+- **`@agentclientprotocol/claude-agent-acp@0.56.0`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
   Wraps **`@anthropic-ai/claude-agent-sdk@0.3.195`**.
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
 
-- **`@automatalabs/codex-acp@1.2.0`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
+- **`@automatalabs/codex-acp@1.4.0`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
   the **Codex App Server**). Bin: `codex-acp`. This is a **published fork** of
   `@agentclientprotocol/codex-acp` that bakes the `outputSchema` forward (§6.3) into its shipped
   dist; it is the package `acp-agents` exact-pins and consumes.
@@ -294,8 +294,8 @@ advertises:
   Refs: https://agentclientprotocol.com/protocol/v1/session-config-options ·
   https://agentclientprotocol.com/rfds/model-config-category
 - `claude-agent-acp`: `model` option → `query.setModel(...)`; accepts aliases (`opus`/`sonnet`);
-  initial precedence `ANTHROPIC_MODEL` env → `settings.model` → SDK default; per-call override
-  `_meta.claudeCode.options.model`.
+  initial precedence `ANTHROPIC_MODEL` env → `settings.model` → SDK default. The client selects
+  per-session models through `session/set_config_option`.
 - `codex-acp`: model encoded as `"model[effort]"` (e.g. `gpt-5.2[high]`) + separate
   `reasoning_effort` select; switch via `session/set_config_option` (the wire method;
   `setConfigOption` is just the ACP SDK's JS accessor for it).
@@ -410,7 +410,7 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.53.0` → `@anthropic-ai/claude-agent-sdk@0.3.195`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.56.0` → `@anthropic-ai/claude-agent-sdk@0.3.195`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
@@ -544,10 +544,10 @@ never sets `outputSchema`. The fork forwards it from the prompt's `_meta` (the a
 `runTurn → turnStart → sendRequest({ method: "turn/start", params })` passes it through verbatim;
 `TurnStartParams.outputSchema` already exists, so it's type-clean.
 
-**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.2.0` — its
+**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.4.0` — its
 build compiles the change into the shipped `dist/index.js`, so npm consumers get it directly (unlike
 a pnpm `patchedDependencies` transform, which is a workspace-root install step that never travels in
-a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.2.0`, so the forward is
+a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.4.0`, so the forward is
 present on a clean checkout with no vendoring and no postinstall hook. `CodexBackend` spawns the
 resolved package main (`require.resolve("@automatalabs/codex-acp")`) under the current node.
 
@@ -632,7 +632,7 @@ the unchanged engine.
 ## 8. Caveats / version pins / things to design around
 
 - **Version-specific (Claude):** the structured-output path is verified for
-  `claude-agent-acp@0.53.0` / `@anthropic-ai/claude-agent-sdk@0.3.195`. The `_meta.claudeCode`
+  `claude-agent-acp@0.56.0` / `@anthropic-ai/claude-agent-sdk@0.3.195`. The `_meta.claudeCode`
   channel and `emitRawSDKMessages` are vendor extensions, not standard ACP — pin versions and
   isolate behind the backend adapter.
 - **`emitRawSDKMessages` is mandatory** to read `structured_output` on the Claude path; filter
@@ -642,7 +642,7 @@ the unchanged engine.
 - **Codex structured output needs a codex-acp forward:** the shipped binary (`@openai/codex@0.142.4`,
   verified at `rust-v0.142.4`) honors `turn/start.outputSchema`, but the stock adapter never forwards
   it — the ~1-line `_meta` → `runTurn` forward (§6.3) is **baked into the published fork
-  `@automatalabs/codex-acp@1.2.0`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
+  `@automatalabs/codex-acp@1.4.0`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
   consumers, unlike a pnpm `patchedDependencies` transform). `CodexBackend` also normalizes schemas
   to OpenAI **strict** rules. Output rides the normal message stream (no `emitRawSDKMessages` needed).
 - **MCP turn semantics:** no "deliver result into a later turn" — run the `workflow` tool
@@ -668,8 +668,8 @@ the unchanged engine.
 **Packages (verified versions, 2026-06-29):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.0.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.53.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.195`) — https://github.com/agentclientprotocol/claude-agent-acp
-- `@automatalabs/codex-acp@1.2.0` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
+- `@agentclientprotocol/claude-agent-acp@0.56.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.195`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@automatalabs/codex-acp@1.4.0` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
 
 **ACP spec:**
 - Overview / transports — https://agentclientprotocol.com/protocol/v1/transports

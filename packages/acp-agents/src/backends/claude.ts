@@ -1,4 +1,4 @@
-// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.53.0 (over the Claude
+// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.56.0 (over the Claude
 // Agent SDK). Structured output rides the vendor `_meta.claudeCode` channel at session/new:
 //   options.outputFormat = { type:"json_schema", schema }   // the SDK's native constraint
 //   emitRawSDKMessages = true                                // MANDATORY to READ the result
@@ -6,6 +6,7 @@
 // `_claude/sdkMessage` extension notification (the runner's ACP client captures it).
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
+import type { ClaudeCodeSessionMeta } from "@automatalabs/shared-types";
 import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
 import { splitArgs } from "../backend.js";
 import { toJsonSchema } from "../schema-strict.js";
@@ -35,7 +36,7 @@ export class ClaudeBackend implements Backend {
     // Claude has no analog to Codex's base/developer instruction overrides, so it ignores the
     // optional SessionMetaInputs (the seam still accepts them via the Backend interface).
     if (!schema) return undefined;
-    return {
+    const meta: ClaudeCodeSessionMeta = {
       claudeCode: {
         options: {
           outputFormat: { type: "json_schema", schema: toJsonSchema(schema) },
@@ -43,6 +44,7 @@ export class ClaudeBackend implements Backend {
         emitRawSDKMessages: true,
       },
     };
+    return meta;
   }
 
   promptMeta(): Record<string, unknown> | undefined {

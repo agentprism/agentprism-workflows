@@ -14,7 +14,7 @@ npm install @automatalabs/acp-agents
 
 ## Standalone use: drive one agent
 
-`createAcpRunner().run(prompt, options)` runs a single agent to completion. Pass a [typebox](https://github.com/sinclairzx81/typebox) `schema` to get a validated object back (typed as `Static<typeof schema>`); omit it to get the final assistant text as a `string`. The backend (Claude vs Codex) is selected from `model` / `tier`. Call `dispose()` when you're done to tear down the pooled child processes.
+`createAcpRunner().run(prompt, options)` runs a single agent to completion. Pass a [typebox](https://github.com/sinclairzx81/typebox) `schema` to get a validated object back (typed as `Static<typeof schema>`); omit it to get the final assistant text as a `string`. The backend (Claude vs Codex) is selected from `model` / `tier`. Whoever constructs the runner owns it: call `dispose()` (or use `await using`) when you're done to tear down the pooled child processes.
 
 ```ts
 import { createAcpRunner } from "@automatalabs/acp-agents";
@@ -133,7 +133,7 @@ try {
 
 ## Listening in: live ACP events
 
-`AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_pending`, `permission_request`, `raw_message`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId? }` context envelope (a pooled runner multiplexes many runs at once). `permission_pending` is resolver-only and carries `{ request }` before the host resolver is invoked; `permission_request` fires exactly once with the final `{ request, outcome }` returned to the agent. `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
+`AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions, elicitations). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId? }` context envelope (a pooled runner multiplexes many runs at once). `permission_pending` / `elicitation_pending` are resolver-only and carry `{ request }` before the host resolver is invoked; `permission_request` / `elicitation_request` fire exactly once with the final `{ request, outcome }` returned to the agent; `elicitation_complete` carries `{ notification }` for URL completions. `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
 
 ```ts
 const off = runner.on("agent_message_chunk", (e) => {
@@ -151,14 +151,18 @@ The full event map (`AcpRunnerEventMap`) and helpers (`TypedEventEmitter`) are e
 From [`src/index.ts`](./src/index.ts):
 
 - **`createAcpRunner(options?)`** — factory returning an `AcpAgentRunner` (this is what `@automatalabs/workflows` injects into the engine).
-- **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `openSession(options)`, and `dispose()`.
+- **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `openSession(options)`, `dispose()`, and `[Symbol.asyncDispose]()` for `await using`. The caller that constructs a runner owns its lifecycle.
+- **Auth/provider lifecycle methods** — `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support.
+- **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, and `resumeSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
+- **`AcpRunnerOptions.onElicitation`** — runner-wide ACP elicitation responder; sessions can override with `InteractiveSessionOptions.onElicitation`.
 - **`selectBackend({ model, tier }, registry?)`** — the cross-provider routing rule: which backend a spec maps to (registered custom names match first, exact or `name/<inner-model>`).
 - **`ClaudeBackend` / `CodexBackend`** — the two built-in backend strategies (spawn config + per-backend schema wiring).
 - **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, customCapabilities? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; `claude`/`codex` reserved). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. `customCapabilities: { namespace, gatedKeys }` declares the agent's `agentCapabilities._meta` negotiation contract: once the agent advertises that namespace, each declared bare `_meta` key is sent only when its same-named flag is `true` (no declaration = never gated).
 - **`PermissionResolver`** — async human-in-the-loop permission resolution for runner-wide or interactive sessions.
 - **`clientCapabilitiesFor` + the `ClientHandlers` / `FsHandlers` / `TerminalHandlers` / `AcpSessionContext` types** — the client-side fs/terminal interposition surface (see above).
 - **`negotiateCapabilities` / `adaptPromptContent` / `gateCustomMeta` / `unsupportedMcpServer` + `NegotiatedCapabilities`** — the `initialize` capability-negotiation primitives; the negotiated record for a live connection is exposed on `PooledConnection.capabilities`.
+- **`AGENT_METHOD_COVERAGE` / `CLIENT_METHOD_COVERAGE`** — manifests classifying the installed ACP SDK method surface; enforced by tests so SDK bumps cannot silently drift.
 - **`toJsonSchema(schema)` / `toStrictJsonSchema(schema)`** — turn a typebox schema into the on-the-wire shapes: a plain JSON Schema for Claude `outputFormat`, and an OpenAI-strict-normalized schema for Codex `outputSchema`.
 
 Also exported: `AcpAgentPool` / `resolvePoolSize`, `PooledConnection` / `SessionHandle`, `decidePermission`, `UsageAccumulator`, `resolveStructuredOutput` / `extractValidated` / `findJsonBlock` / `validateValue`, `errorText` / `mapThrownError`, and the event surface `TypedEventEmitter` / `AcpRunnerEventMap` / `AcpEventName` / `AcpEventListener` / `AcpEventContext` / `AcpSessionUpdate` (+ the per-event payload types, including `AcpPermissionPendingEvent`), plus their associated types.

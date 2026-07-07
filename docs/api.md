@@ -59,6 +59,7 @@ manager.stop(runId);            // or manager.pause(runId), or await manager.res
 | `concurrency` | 8 | Max concurrent agents per run. |
 | `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and startup stale-run recovery is skipped entirely. |
 | `persistenceRoot` | `AGENTPRISM_PERSISTENCE_ROOT` env, else `~/.agentprism/workflows` | Absolute root for run state/logs. Relative paths throw. |
+| `persistence` | filesystem persistence | Custom `RunPersistence` implementation. Omit it for the default `createRunPersistence(cwd, ..., { persistenceRoot })` path. |
 | `defaultAgentTimeoutMs` | `null` (none) | Per-agent timeout default. |
 | `defaultAgentRetries` | 0 | Retries after *recoverable* agent failures. |
 | `mainModel` | — | Session main model (`provider/id`) used to auto-tier explore-style agents. |
@@ -114,6 +115,7 @@ A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused
 | `agentStart` | `label`, `phase`, `prompt`, `model?` |
 | `agentEnd` | `label`, `phase`, `result` (`null` on error), `tokens`, `error?`, `errorCode?`, `recoverable?`, `model?`, `worktree?` |
 | `agentHistory` | `label`, `history` (message/tool-call entries) |
+| `journal` | `entry` (`JournalEntry`) — live journal append observations, including when file journaling is disabled |
 | `tokenUsage` | `usage` (cumulative input/output/total/cost/cache) |
 | `complete` | `result` (the composed `WorkflowRunResult`) |
 | `paused` | `reason` (e.g. `"usage_limit"`), `error`, `resetHint?` |
@@ -339,6 +341,6 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, mcpServers?, images?, agentType? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
 
 See the [README](../README.md#writing-workflow-scripts) for authoring guidance and examples, and [`design-notes.md`](design-notes.md) for the protocol-level design.
