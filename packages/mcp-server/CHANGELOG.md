@@ -1,5 +1,13 @@
 # @automatalabs/mcp-server
 
+## 0.3.15
+
+### Patch Changes
+
+- Updated dependencies [b94b824]
+  - @automatalabs/shared-types@0.11.0
+  - @automatalabs/workflows@0.17.0
+
 ## 0.3.14
 
 ### Patch Changes
