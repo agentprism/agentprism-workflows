@@ -27,6 +27,7 @@ process.on("exit", () => {
 
 // Import EXCLUSIVELY from the SDK barrel — this is the facade under test.
 import {
+  AcpAgentRunner,
   createAcpRunner,
   WorkflowManager,
   runWorkflow,
@@ -144,6 +145,11 @@ const ONE_AGENT_SCRIPT = [
   "return r;",
 ].join("\n");
 
+const NO_AGENT_SCRIPT = [
+  'export const meta = { name: "no-agent", description: "no subagents" };',
+  "return 42;",
+].join("\n");
+
 test("facade re-exports the public surface", () => {
   assert.equal(typeof createAcpRunner, "function");
   assert.equal(typeof WorkflowManager, "function");
@@ -208,6 +214,33 @@ test("runDynamicWorkflow runs a 1-agent script through a stub runner", async () 
   assert.equal(result.agentCount, 1);
   // The stub echoes `stub:<prompt>`; the script returns the single agent() result verbatim.
   assert.equal(result.result, "stub:hello");
+});
+
+test("runDynamicWorkflow disposes the ACP runner it creates internally", async (t) => {
+  const originalDispose = AcpAgentRunner.prototype.dispose;
+  const dispose = t.mock.method(AcpAgentRunner.prototype, "dispose", function (this: AcpAgentRunner) {
+    return originalDispose.call(this);
+  });
+
+  const result = await runDynamicWorkflow(NO_AGENT_SCRIPT);
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.result, 42);
+  assert.equal(dispose.mock.callCount(), 1, "owned default runner should be disposed after the run");
+});
+
+test("runDynamicWorkflow does not dispose a caller-supplied runner", async () => {
+  let disposeCalls = 0;
+  const runner = Object.assign(okRunner(), {
+    async dispose() {
+      disposeCalls++;
+    },
+  });
+
+  const result = await runDynamicWorkflow(ONE_AGENT_SCRIPT, { runner });
+
+  assert.equal(result.status, "completed");
+  assert.equal(disposeCalls, 0, "caller retains ownership of an injected runner");
 });
 
 test("runDynamicWorkflow threads opts.cwd through to every agent session", async () => {
