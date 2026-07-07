@@ -29,6 +29,9 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   RequestError,
+  type AuthenticateRequest,
+  type AuthenticateResponse,
+  type AuthMethod,
   type ClientConnection,
   type CompleteElicitationNotification,
   type ConnectMcpRequest,
@@ -47,12 +50,18 @@ import {
   type KillTerminalResponse,
   type DeleteSessionRequest,
   type DeleteSessionResponse,
+  type DisableProviderRequest,
+  type DisableProviderResponse,
   type DisconnectMcpRequest,
   type DisconnectMcpResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type ListProvidersRequest,
+  type ListProvidersResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type LogoutRequest,
+  type LogoutResponse,
   type McpConnectionId,
   type MessageMcpNotification,
   type MessageMcpRequest,
@@ -74,6 +83,8 @@ import {
   type SessionConfigSelectOptions,
   type SessionModeState,
   type SessionNotification,
+  type SetProviderRequest,
+  type SetProviderResponse,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
@@ -96,6 +107,7 @@ import {
 import type { Backend, BackendId, StructuredSource } from "./backend.js";
 import {
   adaptPromptContent,
+  describeAuthProviderAdvertisement,
   describeLifecycleAdvertisement,
   gateCustomMeta,
   isSupportedProtocolVersion,
@@ -727,6 +739,39 @@ function lifecycleCapabilityError(
   );
 }
 
+function authProviderCapabilityError(
+  backendId: BackendId,
+  method: string,
+  capabilities: NegotiatedCapabilities | undefined,
+  label: string | undefined,
+): WorkflowError {
+  const advertised = capabilities
+    ? describeAuthProviderAdvertisement(capabilities.agent, capabilities.authMethods)
+    : "initialize did not complete";
+  return new WorkflowError(
+    `ACP agent (${backendId}) does not advertise ${method}; advertised auth/provider capabilities: ${advertised}`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label },
+  );
+}
+
+function isMethodNotFound(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === -32601);
+}
+
+function agentMethodNotFoundError(
+  backendId: BackendId,
+  method: string,
+  label: string | undefined,
+  cause: unknown,
+): WorkflowError {
+  return new WorkflowError(
+    `ACP agent (${backendId}) does not implement ${method}: ${thrownMessage(cause)}`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label, details: cause },
+  );
+}
+
 function thrownMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -1061,6 +1106,19 @@ export class PooledConnection {
     throw lifecycleCapabilityError(this.backendId, method, this.negotiated, label);
   }
 
+  private assertAuthProviderSupported(method: string, label: string | undefined): void {
+    const supported =
+      method === AGENT_METHODS.logout
+        ? this.negotiated?.supportsLogout
+        : method === AGENT_METHODS.providers_list ||
+            method === AGENT_METHODS.providers_set ||
+            method === AGENT_METHODS.providers_disable
+          ? this.negotiated?.supportsProviders
+          : true;
+    if (supported) return;
+    throw authProviderCapabilityError(this.backendId, method, this.negotiated, label);
+  }
+
   /** Mark this connection dead exactly once, then ask the pool to evict it. Idempotent. */
   private die(error: Error): void {
     if (!this._alive) return;
@@ -1208,9 +1266,10 @@ export class PooledConnection {
   }
 
   private rawAgentRequest<Response, Params>(method: string, params: Params): Promise<Response> {
-    // SDK 1.2.0 still maps session/load through emptyObjectResponse in ClientContext.request(),
-    // but both supported adapters return configOptions/modes there and the driven wrapper must
-    // adopt them. This bypasses only the SDK response mapper, not JSON-RPC validation/racing.
+    // Some SDK ClientContext convenience methods collapse responses through emptyObjectResponse
+    // (session/load in 1.2.0, plus auth/provider methods with optional _meta). Driven wrappers
+    // need the wire response as-is. This bypasses only the SDK response mapper, not JSON-RPC
+    // validation/racing.
     const agent = this.connection.agent as unknown as RawAgentRequestContext;
     return this.race(agent.sendRequest<Response, Params>(method, params));
   }
@@ -1287,6 +1346,85 @@ export class PooledConnection {
     await this.race(
       this.connection.agent.request(AGENT_METHODS.session_delete, request) as Promise<DeleteSessionResponse>,
     );
+  }
+
+  /** Authentication methods advertised in initialize, available without opening a session. */
+  async authMethods(): Promise<AuthMethod[]> {
+    await this.ready;
+    return [...(this.negotiated?.authMethods ?? [])];
+  }
+
+  /** authenticate has no AgentCapabilities gate; authMethods advertises choices, not method support. */
+  async authenticate(request: AuthenticateRequest, label?: string): Promise<AuthenticateResponse | void> {
+    await this.ready;
+    try {
+      return await this.rawAgentRequest<AuthenticateResponse | void, AuthenticateRequest>(
+        AGENT_METHODS.authenticate,
+        request,
+      );
+    } catch (error) {
+      if (isMethodNotFound(error)) throw agentMethodNotFoundError(this.backendId, AGENT_METHODS.authenticate, label, error);
+      throw error;
+    }
+  }
+
+  /** providers/list on a dedicated connection, gated on the unstable providers advertisement. */
+  async listProviders(request: ListProvidersRequest, label?: string): Promise<ListProvidersResponse> {
+    await this.ready;
+    this.assertAuthProviderSupported(AGENT_METHODS.providers_list, label);
+    try {
+      return await this.rawAgentRequest<ListProvidersResponse, ListProvidersRequest>(
+        AGENT_METHODS.providers_list,
+        request,
+      );
+    } catch (error) {
+      if (isMethodNotFound(error)) throw agentMethodNotFoundError(this.backendId, AGENT_METHODS.providers_list, label, error);
+      throw error;
+    }
+  }
+
+  /** providers/set on a dedicated connection, gated on the unstable providers advertisement. */
+  async setProvider(request: SetProviderRequest, label?: string): Promise<SetProviderResponse | void> {
+    await this.ready;
+    this.assertAuthProviderSupported(AGENT_METHODS.providers_set, label);
+    try {
+      return await this.rawAgentRequest<SetProviderResponse | void, SetProviderRequest>(
+        AGENT_METHODS.providers_set,
+        request,
+      );
+    } catch (error) {
+      if (isMethodNotFound(error)) throw agentMethodNotFoundError(this.backendId, AGENT_METHODS.providers_set, label, error);
+      throw error;
+    }
+  }
+
+  /** providers/disable on a dedicated connection, gated on the unstable providers advertisement. */
+  async disableProvider(request: DisableProviderRequest, label?: string): Promise<DisableProviderResponse | void> {
+    await this.ready;
+    this.assertAuthProviderSupported(AGENT_METHODS.providers_disable, label);
+    try {
+      return await this.rawAgentRequest<DisableProviderResponse | void, DisableProviderRequest>(
+        AGENT_METHODS.providers_disable,
+        request,
+      );
+    } catch (error) {
+      if (isMethodNotFound(error)) {
+        throw agentMethodNotFoundError(this.backendId, AGENT_METHODS.providers_disable, label, error);
+      }
+      throw error;
+    }
+  }
+
+  /** logout on a dedicated connection, gated on agentCapabilities.auth.logout. */
+  async logout(request: LogoutRequest, label?: string): Promise<LogoutResponse | void> {
+    await this.ready;
+    this.assertAuthProviderSupported(AGENT_METHODS.logout, label);
+    try {
+      return await this.rawAgentRequest<LogoutResponse | void, LogoutRequest>(AGENT_METHODS.logout, request);
+    } catch (error) {
+      if (isMethodNotFound(error)) throw agentMethodNotFoundError(this.backendId, AGENT_METHODS.logout, label, error);
+      throw error;
+    }
   }
 
   /** session/prompt on this connection, raced against process death. */
@@ -1459,6 +1597,11 @@ export class SessionHandle implements StructuredSource {
   /** Agent-advertised session mode catalog plus the currently active mode, if supported. */
   get modes(): SessionModeState | null | undefined {
     return this.state.modes;
+  }
+
+  /** The connection-level initialize response parsed before this session was opened. */
+  get capabilities(): NegotiatedCapabilities | undefined {
+    return this.pooled.capabilities;
   }
 
   /**

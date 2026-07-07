@@ -19,6 +19,7 @@
 import {
   PROTOCOL_VERSION,
   type AgentCapabilities,
+  type AuthMethod,
   type ContentBlock,
   type Implementation,
   type InitializeResponse,
@@ -56,6 +57,10 @@ export interface NegotiatedCapabilities {
   agent: AgentCapabilities;
   /** The agent's self-identification, when it sent agentInfo. */
   agentInfo: Implementation | undefined;
+  /** Authentication methods advertised by the agent in initialize, defaulting to [] when absent. */
+  authMethods: AuthMethod[];
+  /** Initialize-response `_meta`, when the agent sent it. */
+  initializeMeta: InitializeResponse["_meta"] | undefined;
   /** Whether session/close is advertised (gates the best-effort release-time close). */
   supportsClose: boolean;
   /** Whether session/load is advertised. The current SDK keeps this as the legacy top-level
@@ -67,6 +72,10 @@ export interface NegotiatedCapabilities {
   supportsDeleteSession: boolean;
   /** Whether session/resume is advertised. */
   supportsResumeSession: boolean;
+  /** Whether logout is advertised under agentCapabilities.auth.logout. */
+  supportsLogout: boolean;
+  /** Whether the unstable provider-configuration block is advertised. */
+  supportsProviders: boolean;
   /** The parsed backend-declared custom-capability block (the namespaced `_meta` object), or
    *  undefined when the backend declared none or the agent did not advertise it — passthrough. */
   customMetaSupport: Record<string, unknown> | undefined;
@@ -86,12 +95,16 @@ export function negotiateCapabilities(
     protocolVersion: response.protocolVersion,
     agent,
     agentInfo: response.agentInfo ?? undefined,
+    authMethods: response.authMethods ?? [],
+    initializeMeta: response._meta ?? undefined,
     supportsClose: advertised(sessionCapabilities?.close),
     supportsLoadSession:
       agent.loadSession === true || advertised((sessionCapabilities as Record<string, unknown> | undefined)?.load),
     supportsListSessions: advertised(sessionCapabilities?.list),
     supportsDeleteSession: advertised(sessionCapabilities?.delete),
     supportsResumeSession: advertised(sessionCapabilities?.resume),
+    supportsLogout: advertised(agent.auth?.logout),
+    supportsProviders: advertised(agent.providers),
     customMetaSupport: customCapabilities
       ? readCustomNamespace(agent._meta, customCapabilities.namespace)
       : undefined,
@@ -120,6 +133,19 @@ export function describeLifecycleAdvertisement(agent: AgentCapabilities): string
   return [
     `loadSession=${agent.loadSession === true ? "true" : "false"}`,
     `sessionCapabilities=${session.length > 0 ? session.join(", ") : "none"}`,
+  ].join("; ");
+}
+
+/** Human-readable auth/provider advertisement summary for strict wrapper gate errors. */
+export function describeAuthProviderAdvertisement(
+  agent: AgentCapabilities,
+  authMethods: readonly AuthMethod[] = [],
+): string {
+  const methodIds = authMethods.map((method) => method.id).filter(Boolean);
+  return [
+    `authMethods=${methodIds.length > 0 ? methodIds.join(", ") : "none"}`,
+    `auth.logout=${advertised(agent.auth?.logout) ? "true" : "false"}`,
+    `providers=${advertised(agent.providers) ? "true" : "false"}`,
   ].join("; ");
 }
 

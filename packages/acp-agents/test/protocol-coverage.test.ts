@@ -24,4 +24,16 @@ test("client method coverage classifies every installed SDK client method", () =
 
 test("agent method coverage classifies every installed SDK agent method", () => {
   assertSameSet(Object.keys(AGENT_METHOD_COVERAGE), Object.values(AGENT_METHODS), "agent method");
+  assert.equal(
+    Object.entries(AGENT_METHOD_COVERAGE).filter(
+      ([method, coverage]) => method !== AGENT_METHODS.initialize && coverage === "driven",
+    ).length,
+    15,
+    "agent driven count excluding initialize should match docs",
+  );
+  assert.equal(
+    Object.values(AGENT_METHOD_COVERAGE).filter((coverage) => coverage === "guarded").length,
+    1,
+    "agent guarded count should match docs",
+  );
 });
