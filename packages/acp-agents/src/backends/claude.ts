@@ -9,7 +9,7 @@ import type { TSchema } from "typebox";
 import type { ClaudeCodeSessionMeta } from "@automatalabs/shared-types";
 import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { toJsonSchema } from "../schema-strict.js";
+import { toAnthropicJsonSchema } from "../schema-strict.js";
 
 const require = createRequire(import.meta.url);
 
@@ -36,10 +36,14 @@ export class ClaudeBackend implements Backend {
     // Claude has no analog to Codex's base/developer instruction overrides, so it ignores the
     // optional SessionMetaInputs (the seam still accepts them via the Backend interface).
     if (!schema) return undefined;
+    // Anthropic structured outputs accept only a JSON-Schema subset (additionalProperties:false
+    // required on every object; numeric/string/array constraints rejected). Normalize the wire
+    // copy so the native constraint always engages — an incompatible schema would fail the SDK
+    // constraint and silently degrade the run to unconstrained text + the repair ladder.
     const meta: ClaudeCodeSessionMeta = {
       claudeCode: {
         options: {
-          outputFormat: { type: "json_schema", schema: toJsonSchema(schema) },
+          outputFormat: { type: "json_schema", schema: toAnthropicJsonSchema(schema) },
         },
         emitRawSDKMessages: true,
       },

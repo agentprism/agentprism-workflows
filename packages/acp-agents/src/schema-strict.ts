@@ -7,9 +7,139 @@
 // touch the copy. The original opts.schema reference is never written to.
 import type { TSchema } from "typebox";
 
-/** Deep-clone a typebox schema into a plain JSON Schema object (Claude `outputFormat.schema`). */
+/** Deep-clone a typebox schema into a plain JSON Schema object (prompt embedding / MCP tool
+ *  inputSchema — surfaces with no provider-side keyword restrictions). */
 export function toJsonSchema(schema: TSchema): Record<string, unknown> {
   return JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
+}
+
+// JSON-Schema keywords Anthropic structured outputs REJECTS with a 400 (numeric/string/array
+// constraints, composition/annotation keywords outside its supported subset). Stripped on the
+// COPY sent as Claude's `outputFormat.schema`; the ORIGINAL schema still backs the client-side
+// typebox validation, so a stripped constraint is enforced there instead of on the wire.
+const ANTHROPIC_UNSUPPORTED_KEYWORDS = new Set<string>([
+  "$schema",
+  "$id",
+  "title",
+  "examples",
+  "minLength",
+  "maxLength",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "maxItems",
+  "uniqueItems",
+  "contains",
+  "minContains",
+  "maxContains",
+  "minProperties",
+  "maxProperties",
+  "contentEncoding",
+  "contentMediaType",
+  "patternProperties",
+  "additionalItems",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "dependencies",
+  "dependentRequired",
+  "dependentSchemas",
+  "propertyNames",
+  "if",
+  "then",
+  "else",
+  "not",
+  "readOnly",
+  "writeOnly",
+  "deprecated",
+]);
+
+// The only `format` values Anthropic structured outputs accepts; any other value is a 400.
+const ANTHROPIC_SUPPORTED_FORMATS = new Set<string>([
+  "date-time",
+  "time",
+  "date",
+  "duration",
+  "email",
+  "hostname",
+  "uri",
+  "ipv4",
+  "ipv6",
+  "uuid",
+]);
+
+// Regex features Anthropic's `pattern` support excludes: backreferences, lookaround, word
+// boundaries. A pattern using any of these is dropped from the wire copy (typebox still
+// enforces it client-side) rather than risking a 400 that silently disables the constraint.
+const ANTHROPIC_UNSUPPORTED_REGEX = /\\[1-9]|\(\?<?[=!]|\\[bB]/;
+
+/** Keys whose value is a NAME -> subschema map: the names are data, not JSON-Schema keywords,
+ *  so keyword filtering must not apply to them (a property literally named "format" survives). */
+const SCHEMA_MAP_KEYS = new Set<string>(["properties", "$defs", "definitions"]);
+
+function normalizeSchemaMap(value: unknown, normalize: (node: unknown) => unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [name, sub] of Object.entries(value as Record<string, unknown>)) {
+    out[name] = normalize(sub);
+  }
+  return out;
+}
+
+function normalizeAnthropicNode(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(normalizeAnthropicNode);
+  if (node === null || typeof node !== "object") return node;
+
+  const input = node as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (SCHEMA_MAP_KEYS.has(key)) {
+      out[key] = normalizeSchemaMap(value, normalizeAnthropicNode);
+      continue;
+    }
+    if (ANTHROPIC_UNSUPPORTED_KEYWORDS.has(key)) continue;
+    if (key === "minItems") {
+      // Supported only for the values 0 and 1; anything larger is a 400.
+      if (value === 0 || value === 1) out[key] = value;
+      continue;
+    }
+    if (key === "format") {
+      if (typeof value === "string" && ANTHROPIC_SUPPORTED_FORMATS.has(value)) out[key] = value;
+      continue;
+    }
+    if (key === "pattern") {
+      if (typeof value === "string" && !ANTHROPIC_UNSUPPORTED_REGEX.test(value)) out[key] = value;
+      continue;
+    }
+    // `oneOf` is not in Anthropic's supported subset; its branches are an exclusive subset of
+    // anyOf, so mapping over only widens acceptance — typebox re-narrows client-side.
+    const targetKey = key === "oneOf" ? "anyOf" : key;
+    out[targetKey] = normalizeAnthropicNode(value);
+  }
+
+  // Anthropic REQUIRES additionalProperties:false on EVERY object (true / a subschema / absent
+  // are all 400s). Unlike OpenAI strict, `required` is left as authored — Anthropic allows
+  // optional properties, so no all-required forcing and no null-widening here.
+  const properties = out["properties"];
+  const isObjectSchema =
+    out["type"] === "object" || (out["type"] === undefined && properties !== undefined);
+  if (isObjectSchema) out["additionalProperties"] = false;
+  return out;
+}
+
+/**
+ * Deep-clone a typebox schema and normalize it to the subset Anthropic structured outputs
+ * accepts (Claude `outputFormat.schema`): additionalProperties:false on every object,
+ * unsupported validation keywords / formats / regex features stripped, oneOf -> anyOf.
+ * Authored `required` is preserved (optional properties stay optional). Without this, an
+ * Anthropic-incompatible schema makes the SDK's native constraint fail and the run silently
+ * degrades to unconstrained text + the repair ladder. Operates on the clone only — the schema
+ * that feeds hashAgentCall is never mutated.
+ */
+export function toAnthropicJsonSchema(schema: TSchema): Record<string, unknown> {
+  const clone = JSON.parse(JSON.stringify(schema)) as unknown;
+  return normalizeAnthropicNode(clone) as Record<string, unknown>;
 }
 
 // JSON-Schema keywords OpenAI strict structured output does NOT accept. Stripped on the
@@ -68,6 +198,12 @@ function normalizeStrictNode(node: unknown): unknown {
 
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
+    if (SCHEMA_MAP_KEYS.has(key)) {
+      // name -> subschema maps: the names are data, never keyword-filtered (a property
+      // literally named "format" or "title" must survive).
+      out[key] = normalizeSchemaMap(value, normalizeStrictNode);
+      continue;
+    }
     if (STRICT_UNSUPPORTED_KEYWORDS.has(key)) continue;
     // OpenAI strict accepts `anyOf` but not `oneOf` — map it over (its branches are an
     // exclusive subset of anyOf, so this only widens acceptance, never the validated set
