@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 // Adapted import: AgentUsage is part of the frozen seam contract, which now lives in
 // @automatalabs/shared-types (pi imported it from "../src/agent.js"). The engine re-exports
@@ -358,6 +361,8 @@ test("runWorkflow routes models: explicit opts.model > phase model > default", a
 test("runWorkflow plumbs opts.tier through to the agent with correct precedence", async () => {
   // Regression guard: tier must reach WorkflowAgent.run() (it was previously
   // dropped). Precedence: explicit model > tier > phase model.
+  const previousHome = process.env.HOME;
+  const emptyHome = mkdtempSync(join(tmpdir(), "agentprism-empty-tier-home-"));
   const seen: Array<{ model?: string; tier?: string }> = [];
   const capturingAgent = {
     async run(_prompt: string, options: { model?: string; tier?: string }) {
@@ -375,7 +380,14 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
   await agent('explicit beats tier', { label: 'e', tier: 'small', model: 'explicit-model' })
   return {}`;
 
-  await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+  try {
+    process.env.HOME = emptyHome;
+    await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(emptyHome, { recursive: true, force: true });
+  }
 
   // 1) tier set, no explicit model: model is left undefined so the tier (resolved
   //    inside run()) wins over the phase model; tier is forwarded.

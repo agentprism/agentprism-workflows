@@ -27,6 +27,7 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { errorMessage, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { loadModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { registerRunTripwire } from "./rejection-tripwire.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
@@ -323,6 +324,9 @@ export async function runWorkflow<T = unknown>(
   }
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
+  // Snapshot tier routing once per run. A missing/unparseable file preserves the
+  // historical runner-default behavior unless a tier falls through to mainModel.
+  const modelTierConfig = loadModelTierConfig();
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
@@ -460,13 +464,18 @@ export async function runWorkflow<T = unknown>(
       log(`unknown agentType "${agentOptions.agentType}"; using default tools/model`);
     }
 
-    // Model precedence: explicit agentOptions.model > agentType.model > tier > phase model.
-    // The "explicit-level" model is opts.model, else the definition's model — either
-    // beats tier/phase. When only a tier is set, pass undefined here so the tier (not
-    // the phase model) decides inside the runner.
+    // Model precedence: explicit agentOptions.model > agentType.model > resolved tier >
+    // mainModel tier fallback > historical behavior. A tier suppresses phase routing; when
+    // it has no configured model and no mainModel fallback, leave model undefined and pass
+    // the raw tier through so the runner's default/fallback signaling stays intact.
     const explicitModel = agentOptions.model ?? agentDef?.model;
+    const tierModel =
+      !explicitModel && agentOptions.tier && modelTierConfig
+        ? resolveTierModel(agentOptions.tier, modelTierConfig)
+        : undefined;
     const modelSpec =
-      explicitModel ?? (agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig));
+      explicitModel ??
+      (agentOptions.tier ? tierModel || options.mainModel : resolveModelForPhase(assignedPhase, routingConfig));
     // For display in /workflows: the model this agent runs on — its explicit/phase
     // spec, else the session's main model. The real resolved id overrides this via
     // onModelResolved once the subagent session is created.
@@ -572,7 +581,13 @@ export async function runWorkflow<T = unknown>(
                 label,
                 schema: agentOptions.schema,
                 signal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
+                instructions: buildAgentInstructions(
+                  options.instructions,
+                  assignedPhase,
+                  agentOptions,
+                  agentDef,
+                  resolvedIsolation,
+                ),
                 model: modelSpec,
                 mode: agentOptions.mode,
                 tier: agentOptions.tier,
@@ -1269,12 +1284,14 @@ function hashAgentCall(
 }
 
 function buildAgentInstructions(
+  runInstructions: string | undefined,
   phase: string | undefined,
   options: AgentOptions,
   def: AgentDefinition | undefined,
   resolvedIsolation?: "worktree",
 ): string | undefined {
   const lines: string[] = [];
+  if (runInstructions) lines.push(runInstructions);
   // A resolved agentType binds a real role prompt (the definition body). Only
   // fall back to the prose hint when the agentType named no known definition.
   if (def?.prompt) lines.push(def.prompt);

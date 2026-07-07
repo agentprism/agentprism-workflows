@@ -19,6 +19,7 @@
 // server.elicitInput with a headless fallback when the host cannot elicit.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 
 import { parseWorkflowScript, WorkflowManager } from "@automatalabs/workflows";
 import type {
@@ -38,12 +39,14 @@ const SERVER_NAME = "agentprism-workflow";
 const SERVER_VERSION = "0.0.0";
 
 /**
- * The checkpoint metadata the engine forwards to `confirm` (workflow.ts checkpoint()). Only
- * `default` is consumed by the shell (the headless reply is `default ?? true`); any other
- * fields the engine attaches are carried opaquely.
+ * The checkpoint metadata the engine forwards to `confirm` (workflow.ts checkpoint()).
  */
 export interface WorkflowCheckpointOptions {
   default?: unknown;
+  headless?: "default" | "abort";
+  kind?: "confirm" | "input" | "select";
+  choices?: string[];
+  timeoutMs?: number;
   [key: string]: unknown;
 }
 
@@ -62,16 +65,145 @@ function readCheckpointDefault(options: unknown): unknown {
   return undefined;
 }
 
+function readCheckpointKind(options: unknown): "confirm" | "input" | "select" {
+  if (options && typeof options === "object") {
+    const kind = (options as WorkflowCheckpointOptions).kind;
+    if (kind === "input" || kind === "select") return kind;
+  }
+  return "confirm";
+}
+
+function readCheckpointChoices(options: unknown): string[] {
+  if (options && typeof options === "object") {
+    const choices = (options as WorkflowCheckpointOptions).choices;
+    if (Array.isArray(choices)) return choices.filter((choice): choice is string => typeof choice === "string");
+  }
+  return [];
+}
+
+function readCheckpointTimeoutMs(options: unknown): number | undefined {
+  if (options && typeof options === "object") {
+    const timeoutMs = (options as WorkflowCheckpointOptions).timeoutMs;
+    if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs >= 0) return timeoutMs;
+  }
+  return undefined;
+}
+
+function createCheckpointElicitation(
+  prompt: string,
+  options: unknown,
+): ElicitRequestFormParams | undefined {
+  const kind = readCheckpointKind(options);
+  const defaultValue = readCheckpointDefault(options);
+
+  if (kind === "input") {
+    return {
+      mode: "form",
+      message: prompt,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "string",
+            title: "Response",
+            description: "Response for this checkpoint.",
+            ...(typeof defaultValue === "string" ? { default: defaultValue } : {}),
+          },
+        },
+        required: ["value"],
+      },
+    };
+  }
+
+  if (kind === "select") {
+    const choices = readCheckpointChoices(options);
+    if (choices.length === 0) return undefined;
+    return {
+      mode: "form",
+      message: prompt,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          choice: {
+            type: "string",
+            title: "Choice",
+            description: "Select one option for this checkpoint.",
+            enum: choices,
+            ...(typeof defaultValue === "string" && choices.includes(defaultValue) ? { default: defaultValue } : {}),
+          },
+        },
+        required: ["choice"],
+      },
+    };
+  }
+
+  return {
+    mode: "form",
+    message: prompt,
+    requestedSchema: {
+      type: "object",
+      properties: {
+        approve: {
+          type: "boolean",
+          title: "Approve",
+          description: "Approve this checkpoint to let the workflow continue.",
+        },
+      },
+      required: ["approve"],
+    },
+  };
+}
+
+function acceptedCheckpointReply(
+  content: Record<string, unknown> | undefined,
+  options: unknown,
+  headlessReply: () => unknown,
+): unknown {
+  const kind = readCheckpointKind(options);
+  if (kind === "input") {
+    const value = content?.value;
+    return typeof value === "string" ? value : headlessReply();
+  }
+  if (kind === "select") {
+    const choice = content?.choice;
+    return typeof choice === "string" && readCheckpointChoices(options).includes(choice) ? choice : headlessReply();
+  }
+  const approve = content?.approve;
+  return typeof approve === "boolean" ? approve : headlessReply();
+}
+
+const CHECKPOINT_TIMEOUT = Symbol("checkpoint-timeout");
+
+async function elicitCheckpoint(
+  server: Server,
+  params: ElicitRequestFormParams,
+  timeoutMs: number | undefined,
+): Promise<Awaited<ReturnType<Server["elicitInput"]>> | typeof CHECKPOINT_TIMEOUT> {
+  if (timeoutMs === undefined) return await server.elicitInput(params);
+
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<typeof CHECKPOINT_TIMEOUT>((resolve) => {
+    timer = setTimeout(() => resolve(CHECKPOINT_TIMEOUT), timeoutMs);
+  });
+  try {
+    return await Promise.race([server.elicitInput(params), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
- * Wire the engine's checkpoint `confirm` hook to MCP elicitation. If the connected host
- * advertises elicitation, request a one-field `approve` boolean via server.elicitInput and
- * map the tri-state result; otherwise (or if the form request throws because the host cannot
- * satisfy it) apply the headless default `default ?? true`. This is server->client and gated
- * on host capability, so the catch is the contract, not a guard against bugs.
+ * Wire the engine's checkpoint `confirm` hook to MCP form elicitation. If the connected
+ * host advertises elicitation, request a kind-specific one-field form and map the tri-state
+ * result; otherwise (or if the form request throws because the host cannot satisfy it) apply
+ * the headless default `default ?? true`. This is server->client and gated on host capability,
+ * so the catch is the contract, not a guard against bugs.
  */
 function createConfirm(server: Server): WorkflowConfirmCallback {
   return async (prompt, options) => {
     const headlessReply = (): unknown => readCheckpointDefault(options) ?? true;
+    const params = createCheckpointElicitation(prompt, options);
+    if (!params) return headlessReply();
 
     // No elicitation capability advertised -> cannot prompt the human; reply headlessly.
     if (!server.getClientCapabilities()?.elicitation) {
@@ -79,23 +211,10 @@ function createConfirm(server: Server): WorkflowConfirmCallback {
     }
 
     try {
-      const elicited = await server.elicitInput({
-        message: prompt,
-        requestedSchema: {
-          type: "object",
-          properties: {
-            approve: {
-              type: "boolean",
-              title: "Approve",
-              description: "Approve this checkpoint to let the workflow continue.",
-            },
-          },
-          required: ["approve"],
-        },
-      });
+      const elicited = await elicitCheckpoint(server, params, readCheckpointTimeoutMs(options));
+      if (elicited === CHECKPOINT_TIMEOUT) return headlessReply();
       if (elicited.action === "accept") {
-        const approve = elicited.content?.approve;
-        return typeof approve === "boolean" ? approve : headlessReply();
+        return acceptedCheckpointReply(elicited.content, options, headlessReply);
       }
       // "decline" / "cancel": the human explicitly did not approve -> do not proceed.
       return false;

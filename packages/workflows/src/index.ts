@@ -21,6 +21,8 @@ import type { AcpEventListener, AcpEventName, AcpRunnerEventMap, AcpUpdateKind }
 import type { ExecOptions, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
 import type { AgentRunner, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 
+type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
+
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
 export { runWorkflow, parseWorkflowScript } from "@automatalabs/workflow-engine";
@@ -438,11 +440,14 @@ export async function runDynamicWorkflow(
   if (declared && Object.keys(declared).length > 0) {
     exec = { ...(exec ?? {}), scriptBackends: await approveScriptBackends(declared, opts.allowScriptBackends) };
   }
-  const manager = new WorkflowManager({ agent: opts.runner ?? createAcpRunner(), cwd: opts.cwd });
+  const owned = opts.runner === undefined;
+  const runner = opts.runner ?? createAcpRunner();
+  const manager = new WorkflowManager({ agent: runner, cwd: opts.cwd });
   try {
     return await manager.runSync(script, opts.args, exec);
   } finally {
     manager.dispose();
+    if (owned) await (runner as OwnedAcpRunner).dispose();
   }
 }
 
