@@ -440,7 +440,7 @@ WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistenceOptions,
 AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
-ClientHandlers, FsHandlers, TerminalHandlers, AcpSessionContext, NegotiatedCapabilities,
+ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,
 // ACP events: the runner.on(...) surface
 AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext,
 AcpSessionUpdate, AcpUpdateKind, AcpPermissionPendingEvent, AcpPermissionEvent,

@@ -22,10 +22,14 @@ export type {
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
   CompleteElicitationNotification,
+  ConnectMcpRequest,
+  ConnectMcpResponse,
   CreateElicitationRequest,
   CreateElicitationResponse,
   DeleteSessionRequest,
   DeleteSessionResponse,
+  DisconnectMcpRequest,
+  DisconnectMcpResponse,
   ElicitationAcceptAction,
   ElicitationCapabilities,
   ElicitationContentValue,
@@ -43,6 +47,12 @@ export type {
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  McpConnectionId,
+  McpServerAcp,
+  McpServerAcpId,
+  MessageMcpNotification,
+  MessageMcpRequest,
+  MessageMcpResponse,
   ResumeSessionRequest,
   ResumeSessionResponse,
   SessionMode,
@@ -83,6 +93,7 @@ export type {
   ClientCapabilityOptions,
   ClientHandlers,
   FsHandlers,
+  McpHandlers,
   TerminalHandlers,
 } from "./client-handlers.js";
 
@@ -121,6 +132,8 @@ export { decidePermission } from "./permissions.js";
 export type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 
 export { UsageAccumulator } from "./usage.js";
+
+export type { McpAcpServerConfig, McpServerConfig } from "@automatalabs/shared-types";
 
 export { toJsonSchema, toStrictJsonSchema } from "./schema-strict.js";
 

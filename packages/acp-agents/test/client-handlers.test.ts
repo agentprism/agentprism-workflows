@@ -2,7 +2,7 @@
 // validation catches JavaScript partial terminal objects before any ACP process can be spawned.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AcpAgentRunner, clientCapabilitiesFor, type TerminalHandlers } from "../src/index.js";
+import { AcpAgentRunner, clientCapabilitiesFor, type McpHandlers, type TerminalHandlers } from "../src/index.js";
 
 const TERMINAL_HANDLERS: TerminalHandlers = {
   createTerminal: () => ({ terminalId: "term-1" }),
@@ -10,6 +10,12 @@ const TERMINAL_HANDLERS: TerminalHandlers = {
   waitForTerminalExit: () => ({ exitCode: 0 }),
   killTerminal: () => undefined,
   releaseTerminal: () => undefined,
+};
+
+const MCP_HANDLERS: McpHandlers = {
+  connect: () => ({ connectionId: "mcp-1" }),
+  message: () => ({ ok: true }),
+  disconnect: () => undefined,
 };
 
 /** Advertised regardless of handlers: SessionHandle handles boolean config options natively. */
@@ -65,6 +71,10 @@ test("clientCapabilitiesFor: terminal is advertised only with the full handler s
   );
 });
 
+test("clientCapabilitiesFor: mcp handlers do not invent a non-SDK initialize capability", () => {
+  assert.deepEqual(clientCapabilitiesFor({ mcp: MCP_HANDLERS }), BASE_CAPABILITIES);
+});
+
 test("AcpAgentRunner rejects partial terminal handlers at construction", () => {
   assert.throws(
     () =>
@@ -82,6 +92,26 @@ test("AcpAgentRunner rejects partial terminal handlers at construction", () => {
       assert.match(error.message, /waitForTerminalExit/);
       assert.match(error.message, /killTerminal/);
       assert.match(error.message, /releaseTerminal/);
+      return true;
+    },
+  );
+});
+
+test("AcpAgentRunner rejects partial mcp handlers at construction", () => {
+  assert.throws(
+    () =>
+      new AcpAgentRunner({
+        clientHandlers: {
+          mcp: {
+            connect: () => ({ connectionId: "mcp-1" }),
+            message: () => ({}),
+          } as never,
+        },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /clientHandlers\.mcp/);
+      assert.match(error.message, /disconnect/);
       return true;
     },
   );

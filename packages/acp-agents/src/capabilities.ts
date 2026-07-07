@@ -222,23 +222,30 @@ function unsupportedPromptBlockNote(
   }
 }
 
-/** The first client-provided MCP server whose transport the agent did NOT advertise, or undefined
- *  when every server is serviceable. stdio is ALWAYS serviceable (the baseline transport); http/sse
- *  are gated on mcpCapabilities.{http,sse}. Lenient for legacy agents: when the agent advertised no
- *  mcpCapabilities at all we cannot know its transports, so we do not gate (preserving today's
- *  send-and-let-the-agent-decide behavior for minimal/custom servers). */
+/** The first client-provided MCP server whose transport cannot be served, or undefined when every
+ *  server is serviceable. stdio is ALWAYS serviceable (the baseline transport); http/sse keep the
+ *  legacy leniency and gate only after any mcpCapabilities block exists. ACP transport is stricter:
+ *  both sides must be explicit because the client is the MCP server host and an unwired declaration
+ *  would otherwise spend tokens before failing at mcp/connect. */
 export function unsupportedMcpServer(
   servers: McpServerConfig[] | undefined,
   agent: AgentCapabilities,
-): { name: string; transport: "http" | "sse" } | undefined {
+  options: { clientCanServeAcp?: boolean } = {},
+): { name: string; transport: "http" | "sse" | "acp"; reason?: "client" } | undefined {
   const mcp = agent.mcpCapabilities;
-  if (!mcp || !servers) return undefined;
+  if (!servers) return undefined;
   for (const server of servers) {
-    if ("type" in server && server.type === "http" && mcp.http !== true) {
+    if ("type" in server && server.type === "http" && mcp && mcp.http !== true) {
       return { name: server.name, transport: "http" };
     }
-    if ("type" in server && server.type === "sse" && mcp.sse !== true) {
+    if ("type" in server && server.type === "sse" && mcp && mcp.sse !== true) {
       return { name: server.name, transport: "sse" };
+    }
+    if ("type" in server && server.type === "acp" && mcp?.acp !== true) {
+      return { name: server.name, transport: "acp" };
+    }
+    if ("type" in server && server.type === "acp" && options.clientCanServeAcp !== true) {
+      return { name: server.name, transport: "acp", reason: "client" };
     }
   }
   return undefined;

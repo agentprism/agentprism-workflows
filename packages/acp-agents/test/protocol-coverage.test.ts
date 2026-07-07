@@ -17,7 +17,7 @@ test("client method coverage classifies every installed SDK client method", () =
   assertSameSet(Object.keys(CLIENT_METHOD_COVERAGE), Object.values(CLIENT_METHODS), "client method");
   assert.equal(
     Object.values(CLIENT_METHOD_COVERAGE).filter((coverage) => coverage === "served").length,
-    11,
+    14,
     "client served count should match docs",
   );
 });

@@ -21,9 +21,9 @@ export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> 
   [CLIENT_METHODS.terminal_release]: "served",
   [CLIENT_METHODS.terminal_wait_for_exit]: "served",
   [CLIENT_METHODS.terminal_kill]: "served",
-  [CLIENT_METHODS.mcp_connect]: "pending",
-  [CLIENT_METHODS.mcp_message]: "pending",
-  [CLIENT_METHODS.mcp_disconnect]: "pending",
+  [CLIENT_METHODS.mcp_connect]: "served",
+  [CLIENT_METHODS.mcp_message]: "served",
+  [CLIENT_METHODS.mcp_disconnect]: "served",
   [CLIENT_METHODS.elicitation_create]: "served",
   [CLIENT_METHODS.elicitation_complete]: "served",
 };

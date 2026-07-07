@@ -165,6 +165,7 @@ test("GATED_CUSTOM_META_KEYS are exactly the fork's three bare wire keys", () =>
 
 const HTTP_SERVER: McpServerConfig = { type: "http", name: "http-mcp", url: "https://x", headers: [] };
 const SSE_SERVER: McpServerConfig = { type: "sse", name: "sse-mcp", url: "https://x", headers: [] };
+const ACP_SERVER: McpServerConfig = { type: "acp", name: "acp-mcp", serverId: "acp-server" };
 const STDIO_SERVER: McpServerConfig = { name: "stdio-mcp", command: "srv", args: [], env: [] };
 
 test("unsupportedMcpServer: gates http/sse on mcpCapabilities; stdio is always serviceable", () => {
@@ -178,6 +179,26 @@ test("unsupportedMcpServer: gates http/sse on mcpCapabilities; stdio is always s
 
 test("unsupportedMcpServer: no advertised mcpCapabilities => legacy, gate nothing", () => {
   assert.equal(unsupportedMcpServer([SSE_SERVER, HTTP_SERVER], {}), undefined);
+});
+
+test("unsupportedMcpServer: acp requires agent support and complete client handlers", () => {
+  assert.deepEqual(unsupportedMcpServer([ACP_SERVER], {}), { name: "acp-mcp", transport: "acp" });
+  assert.deepEqual(unsupportedMcpServer([ACP_SERVER], { mcpCapabilities: { acp: false } }), {
+    name: "acp-mcp",
+    transport: "acp",
+  });
+  assert.deepEqual(
+    unsupportedMcpServer([ACP_SERVER], { mcpCapabilities: { acp: true } }, { clientCanServeAcp: false }),
+    {
+      name: "acp-mcp",
+      transport: "acp",
+      reason: "client",
+    },
+  );
+  assert.equal(
+    unsupportedMcpServer([ACP_SERVER], { mcpCapabilities: { acp: true } }, { clientCanServeAcp: true }),
+    undefined,
+  );
 });
 
 test("unsupportedMcpServer: undefined/empty server list is serviceable", () => {

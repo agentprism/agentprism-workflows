@@ -194,7 +194,7 @@ Prefer named wrappers (`prompt()`, `setMode()`, `openSession()`, etc.) when they
 
 Raw `request()` rejects the session-stateful methods that would create or reopen sessions outside the router: `session/new` (use `openSession()`), `session/load` (use `loadSession()`), `session/resume` (use `resumeSession()`), and `session/fork` (no driven wrapper yet). Those raw sessions are unregistered: updates do not fold into an accumulator, permission requests auto-cancel, and fs/terminal dispatch fails for unknown sessions.
 
-`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. Client methods are currently 11/14 served; the remaining pending methods are the `mcp/*` bridge methods. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
+`AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means raw passthrough is intentionally blocked because the method is session-stateful and not safely routable through an escape hatch. Client methods are currently 14/14 served. A tripwire test compares those manifests against `AGENT_METHODS` / `CLIENT_METHODS`, so SDK bumps cannot silently add or remove protocol surface.
 
 ### <a name="runner-events"></a>Events (`runner.on(name, listener)`)
 
@@ -231,7 +231,37 @@ Lifecycle methods are capability-gated after initialize. Missing support throws 
 
 ### Capabilities
 
-The one-time `initialize` handshake negotiates per-connection capabilities, readable as `NegotiatedCapabilities` (exported). Prompt-content flags are **booleans**: `capabilities.agent.promptCapabilities?.image === true` etc. You rarely need to gate manually — `adaptPromptContent` already degrades unsupported `image`/`audio`/`resource` blocks to a bracketed text note naming the backend. The client truthfully advertises: `fs`/`terminal` only when you registered handlers, plus `session.configOptions.boolean` always (boolean config options are handled natively).
+The one-time `initialize` handshake negotiates per-connection capabilities, readable as `NegotiatedCapabilities` (exported). Prompt-content flags are **booleans**: `capabilities.agent.promptCapabilities?.image === true` etc. You rarely need to gate manually — `adaptPromptContent` already degrades unsupported `image`/`audio`/`resource` blocks to a bracketed text note naming the backend. The client truthfully advertises: `fs`/`terminal` only when you registered handlers, plus `session.configOptions.boolean` always (boolean config options are handled natively). The installed ACP SDK has no `ClientCapabilities` field for MCP-over-ACP; the real declaration is a `session/new` MCP server entry `{ type: "acp", name, serverId }`, gated before the session is opened.
+
+### MCP-over-ACP client handlers
+
+`clientHandlers.mcp` serves client-hosted MCP servers over ACP. The consumer owns the MCP implementation and this library only routes opaque payloads with session context:
+
+```ts
+const runner = createAcpRunner({
+  clientHandlers: {
+    mcp: {
+      connect: async (params, ctx) => ({ connectionId: `mcp:${params.serverId}` }),
+      message: async (params, ctx) => ({ ok: true, echo: params }),
+      disconnect: async (params, ctx) => {},
+    },
+  },
+});
+
+await runner.run("use my local tool", {
+  cwd,
+  mcpServers: [{ type: "acp", name: "local", serverId: "local-acp-mcp" }],
+});
+```
+
+All three `mcp` methods are required together. Partial objects throw at runner construction. `mcp/connect` receives the SDK shape `{ serverId, _meta? }`; the client allocates and returns `{ connectionId }`. Later `mcp/message` and `mcp/disconnect` carry only `connectionId`, so the runner maps `serverId -> sessionId` from `mcpServers` and `connectionId -> sessionId` from the connect response. On session release or connection death, every live MCP connection for that session gets a best-effort `disconnect` callback.
+
+Two gates run before any prompt tokens are spent:
+
+- The agent must advertise `agentCapabilities.mcpCapabilities.acp === true`; otherwise the ACP server config fails with non-recoverable `SCRIPT_VALIDATION_ERROR`.
+- The runner must have a complete `clientHandlers.mcp`; declaring `{ type: "acp" }` without a handler is also a non-recoverable config error.
+
+Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.56.0` advertises `http`/`sse` MCP support but no `acp`, and `@automatalabs/codex-acp@1.4.0` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally. Current MCP-over-ACP integration tests therefore use the repository fake agent fixture.
 
 ---
 
