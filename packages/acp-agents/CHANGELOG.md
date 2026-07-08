@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 0.20.4
+
+### Patch Changes
+
+- e1339e0: Bump the bundled `@agentclientprotocol/claude-agent-acp` adapter 0.56.0 → 0.57.0
+  (release-policy currency bump; advertised capabilities verified unchanged — auth.logout,
+  loadSession, session lifecycle, HTTP/SSE MCP, no providers/\*).
+
 ## 0.20.3
 
 ### Patch Changes

@@ -1,5 +1,49 @@
 # @automatalabs/workflows
 
+## 0.21.0
+
+### Minor Changes
+
+- e1339e0: Add token-free workflow-script validation: the new package bin `agentprism-workflows`
+  (`npx @automatalabs/workflows validate <file>`) statically parses a script (meta literal,
+  syntax, determinism blocklist) and then dry-runs it in the real engine realm against an
+  in-process mock AgentRunner that fabricates schema-conforming results — no ACP process is
+  spawned, no tokens are spent, and no backend auth is needed. Checkpoints resolve to their
+  headless defaults, script-declared `meta.backends` are treated as approved (with a warning
+  that real runs require approval), and the report lists every agent call with backend
+  attribution plus warnings (phase mismatches, `headless: "abort"` checkpoints, agent-less
+  scripts). Exit codes: 0 valid, 1 parse failure, 2 dry-run failure, 3 usage error.
+
+  Programmatic API: `validateWorkflowScript(script, { args, dryRun, cwd, tokenBudget,
+maxAgents, timeoutMs })` plus `fabricateFromSchema`, `formatValidateReport`,
+  `MOCK_TOKENS_PER_AGENT`, and the `ValidateWorkflowOptions` / `ValidateWorkflowReport` /
+  `ValidatedAgentCall` / `ValidatedCheckpoint` types.
+
+- e1339e0: Add `openWorkflowDir` — a read-only, per-call-fresh view over folders of versioned
+  workflow scripts, for integrators who keep their workflows in a directory instead of
+  hand-rolling `readFileSync` plumbing. Construction does no I/O; every method reads the
+  filesystem at call time so the view always reflects the current working tree. The
+  filename stem is the workflow name (`review-pr.workflow.js` ⇒ `review-pr`; first dir
+  wins across dirs, `.workflow.js` beats `.js` within one). Surface: `dirs`, `list()`
+  (parsed `meta` per file), `read(name)` (throws with searched dirs + did-you-mean), and
+  `resolve(name)` — the exact `loadSavedWorkflow` contract, with strict name-shape
+  validation so inline nested scripts fall through and path traversal is impossible.
+
+  `runDynamicWorkflow` gains a `workflows` option (a `WorkflowDir` view or dir path(s)):
+  the first argument may then be a workflow NAME, and nested `workflow("<name>")` calls
+  resolve from the same view — previously impossible through the one-shot path, which
+  never wired `loadSavedWorkflow`. The validator gains the same power via
+  `ValidateWorkflowOptions.workflows` and `agentprism-workflows validate <file-or-name>
+--workflows-dir <dir>` (repeatable); without it, a dry-run failure caused by a nested
+  bare name now carries a warning naming the fix.
+
+### Patch Changes
+
+- Updated dependencies [e1339e0]
+- Updated dependencies [e1339e0]
+  - @automatalabs/acp-agents@0.20.4
+  - @automatalabs/workflow-engine@0.10.0
+
 ## 0.20.3
 
 ### Patch Changes
