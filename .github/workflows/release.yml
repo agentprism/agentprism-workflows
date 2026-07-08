@@ -45,7 +45,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           # registry-url writes the .npmrc the publish step reads; required for
           # provenance / OIDC trusted publishing to target the public registry.
