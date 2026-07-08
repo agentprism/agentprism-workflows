@@ -12,13 +12,14 @@
 
 import { ACP_CROSS_CUTTING_EVENT_NAMES, createAcpRunner } from "@automatalabs/acp-agents";
 import {
+  openWorkflowDir,
   parseWorkflowScript,
   WorkflowError,
   WorkflowErrorCode,
   WorkflowManager as EngineWorkflowManager,
 } from "@automatalabs/workflow-engine";
 import type { AcpEventListener, AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
-import type { ExecOptions, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
+import type { ExecOptions, WorkflowDir, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
 import type { AgentRunner, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 
 type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
@@ -26,6 +27,28 @@ type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
 export { runWorkflow, parseWorkflowScript } from "@automatalabs/workflow-engine";
+
+// ── Workflow directory view: openWorkflowDir("./workflows") binds a read-only,
+//    per-call-fresh view over folders of versioned workflow scripts (name = filename
+//    stem). `view.resolve` IS a loadSavedWorkflow resolver; runDynamicWorkflow accepts
+//    the view (or dir paths) via `workflows` to serve top-level names AND nested
+//    workflow("<name>") calls. ──
+export {
+  openWorkflowDir,
+  type WorkflowDir,
+  type WorkflowDirEntry,
+  type OpenWorkflowDirOptions,
+} from "@automatalabs/workflow-engine";
+
+// ── Token-free script validation: static parse + mock-runner dry run. Also the core of
+//    the `agentprism-workflows validate` CLI (./cli.ts). ──
+export { validateWorkflowScript, fabricateFromSchema, formatValidateReport, MOCK_TOKENS_PER_AGENT } from "./validate.js";
+export type {
+  ValidateWorkflowOptions,
+  ValidateWorkflowReport,
+  ValidatedAgentCall,
+  ValidatedCheckpoint,
+} from "./validate.js";
 export type {
   WorkflowRunOptions,
   AgentOptions,
@@ -412,6 +435,14 @@ export interface RunDynamicWorkflowOptions {
   exec?: ExecOptions;
   /** Approval policy for script-declared `meta.backends` (see {@link ScriptBackendApproval}). */
   allowScriptBackends?: ScriptBackendApproval;
+  /**
+   * A workflow directory view (or dir path(s) to open one over) serving saved workflows
+   * by name. When set, the first argument may be a workflow NAME instead of a script
+   * (resolver first, verbatim-script fallback — the engine's own nested-workflow rule),
+   * and nested `workflow("<name>")` calls resolve from the same view (it is wired into
+   * the run's `loadSavedWorkflow`).
+   */
+  workflows?: string | string[] | WorkflowDir;
 }
 
 /**
@@ -428,12 +459,24 @@ export async function runDynamicWorkflow(
   script: string,
   opts: RunDynamicWorkflowOptions = {},
 ): Promise<WorkflowRunResult> {
+  // Saved-workflow view: `script` may be a workflow NAME when `workflows` is set. A real
+  // script always contains the mandatory `export const meta` head, so anything without it
+  // is treated as a name and resolved via read() — which throws a diagnosable error
+  // (searched dirs + closest matches) instead of the engine's parse error on a bare name.
+  const flows =
+    opts.workflows === undefined
+      ? undefined
+      : typeof opts.workflows === "string" || Array.isArray(opts.workflows)
+        ? openWorkflowDir(opts.workflows, { cwd: opts.cwd })
+        : opts.workflows;
+  const resolvedScript = flows !== undefined && !script.includes("export const meta") ? flows.read(script) : script;
+
   // Script-declared backends need explicit approval BEFORE the run. A malformed script is
   // deliberately not diagnosed here — runSync re-parses and throws the engine's own parse
   // error (its pre-existing contract), so the approval gate never masks a parse message.
   let declared: Record<string, WorkflowBackendConfig> | undefined;
   try {
-    declared = parseWorkflowScript(script).meta.backends;
+    declared = parseWorkflowScript(resolvedScript).meta.backends;
   } catch {
     declared = undefined;
   }
@@ -443,9 +486,9 @@ export async function runDynamicWorkflow(
   }
   const owned = opts.runner === undefined;
   const runner = opts.runner ?? createAcpRunner();
-  const manager = new WorkflowManager({ agent: runner, cwd: opts.cwd });
+  const manager = new WorkflowManager({ agent: runner, cwd: opts.cwd, loadSavedWorkflow: flows?.resolve });
   try {
-    return await manager.runSync(script, opts.args, exec);
+    return await manager.runSync(resolvedScript, opts.args, exec);
   } finally {
     manager.dispose();
     if (owned) await (runner as OwnedAcpRunner).dispose();

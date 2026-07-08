@@ -13,6 +13,9 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./src/index.ts",
+  "bin": {
+    "agentprism-workflows": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",

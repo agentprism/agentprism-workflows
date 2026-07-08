@@ -84,6 +84,14 @@ export {
   type AgentRegistry,
 } from "./agent-registry.js";
 
+// ── Workflow directory view (folders of versioned workflow scripts) ──
+export {
+  openWorkflowDir,
+  type WorkflowDir,
+  type WorkflowDirEntry,
+  type OpenWorkflowDirOptions,
+} from "./workflow-dir.js";
+
 // ── Frontmatter parser (engine-local; replaces Pi's parseFrontmatter) ──
 export { parseFrontmatter } from "./frontmatter.js";
 
