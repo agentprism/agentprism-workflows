@@ -7,6 +7,8 @@ import type { TSchema } from "typebox";
 import type {
   AgentHistoryEntry,
   AgentRunner,
+  AgentSessionRecord,
+  AgentSessionRef,
   AgentUsage,
   JournalEntry,
   McpServerConfig,
@@ -152,6 +154,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+    /** The call's ACP session re-attach record (live or journal-replayed), when one exists. */
+    session?: AgentSessionRecord;
   }) => void;
   onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onTokenUsage?: (usage: {
@@ -235,6 +239,15 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * schema is set) win on conflict. ADDITIVE: NOT part of the resume identity hash.
    */
   promptMeta?: Record<string, unknown>;
+  /**
+   * Keep this agent's ACP session re-openable after the run: the runner skips the
+   * release-time best-effort `session/close`, and the session's re-attach record lands in
+   * `WorkflowRunResult.agentSessions` (and the journal) either way. Re-open later from the
+   * HOST via `runner.loadSession()`/`resumeSession()` — scripts themselves never re-attach.
+   * ADDITIVE: it shapes session disposal, not the logical call, so it is intentionally NOT
+   * part of the resume identity hash (hashAgentCall).
+   */
+  keepSession?: boolean;
 }
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
@@ -271,6 +284,9 @@ interface RuntimeState {
    * callIndex < firstMiss; once a call misses, it AND everything after run live.
    */
   firstMiss: number;
+  /** Re-attach records for every ACP session the run observed (live via onSessionOpen,
+   *  replayed via JournalEntry.session), in completion order -> result.agentSessions. */
+  agentSessions: AgentSessionRecord[];
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -361,6 +377,7 @@ export async function runWorkflow<T = unknown>(
     phaseBudgets: new Map(),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
+    agentSessions: [],
   };
 
   const agentRunner = options.agent;
@@ -510,8 +527,19 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+      // A replayed call re-surfaces its journaled session record verbatim: the session was
+      // opened by the ORIGINAL run, and re-attachability is a property of the agent's store,
+      // not of this process — so the ref stays valid across resume exactly like the result.
+      if (cached.session) state.agentSessions.push(cached.session);
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      options.onAgentEnd?.({
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+        model: displayModel,
+        session: cached.session,
+      });
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
@@ -553,6 +581,19 @@ export async function runWorkflow<T = unknown>(
       // estimate when the provider reports no usage (total === 0). Usage is reset
       // per retry attempt so a failed attempt does not double-count the next one.
       let usage: AgentUsage | undefined;
+      // The attempt's ACP session identity (onSessionOpen); reset per retry so a failed
+      // attempt's session is never attributed to the attempt that replaced it.
+      let sessionRef: AgentSessionRef | undefined;
+      const sessionRecord = (): AgentSessionRecord | undefined =>
+        sessionRef
+          ? {
+              ...sessionRef,
+              callIndex,
+              label,
+              phase: assignedPhase,
+              keptOpen: agentOptions.keepSession === true,
+            }
+          : undefined;
       const recordTokens = (result: unknown): number => {
         const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
         if (usage) {
@@ -570,6 +611,7 @@ export async function runWorkflow<T = unknown>(
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           usage = undefined;
+          sessionRef = undefined;
           try {
             throwIfAborted();
 
@@ -608,6 +650,12 @@ export async function runWorkflow<T = unknown>(
                 // Engine run id as an end-to-end correlation stamp on the ACP session/new _meta.
                 // Additive telemetry, NOT part of the resume identity (hashAgentCall).
                 runId,
+                // Session hand-off pair: capture the re-attach ref, optionally skip the
+                // release-time close. Additive, NOT part of the resume identity (hashAgentCall).
+                keepSession: agentOptions.keepSession,
+                onSessionOpen: (ref: AgentSessionRef) => {
+                  sessionRef = ref;
+                },
                 onModelResolved: (id: string) => {
                   displayModel = id;
                 },
@@ -635,7 +683,9 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            if (journaling) options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+            const session = sessionRecord();
+            if (session) state.agentSessions.push(session);
+            if (journaling) options.onAgentJournal?.({ index: callIndex, hash: callHash, result, session });
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
@@ -643,6 +693,7 @@ export async function runWorkflow<T = unknown>(
               tokens,
               worktree: runCwd,
               model: displayModel,
+              session,
             });
             return result;
           } catch (error) {
@@ -659,6 +710,11 @@ export async function runWorkflow<T = unknown>(
               continue;
             }
 
+            // A failed call's session record is still surfaced (result.agentSessions +
+            // event): loading the session afterward is a first-class way to debug what
+            // the agent actually did before it failed.
+            const failedSession = sessionRecord();
+            if (failedSession) state.agentSessions.push(failedSession);
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
@@ -669,6 +725,7 @@ export async function runWorkflow<T = unknown>(
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
+              session: failedSession,
             });
 
             if (workflowError.recoverable) {
@@ -1066,6 +1123,7 @@ export async function runWorkflow<T = unknown>(
     durationMs: Date.now() - started,
     runId,
     tokenUsage: shared.tokenUsage,
+    agentSessions: state.agentSessions,
   };
 }
 

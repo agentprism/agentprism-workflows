@@ -22,6 +22,7 @@ import {
   WorkflowErrorCode,
   type AgentResult,
   type AgentRunner,
+  type AgentSessionRef,
   type RunOptions,
 } from "@automatalabs/shared-types";
 import type {
@@ -554,6 +555,16 @@ export class AcpAgentRunner implements AgentRunner {
       );
       const activeSession = session;
       opts.signal?.throwIfAborted();
+      // Hand the host the re-attach identity BEFORE any turn runs: the session id plus the
+      // agent-advertised reopen surface (session/load|resume|list). Best-effort observer —
+      // a throwing host callback never fails the run.
+      if (opts.onSessionOpen) {
+        try {
+          opts.onSessionOpen(sessionRefFor(activeSession, prepared.backend.id, cwd));
+        } catch {
+          // observer only; the run result never depends on it.
+        }
+      }
       // For a CUSTOM backend chosen by its registered name, the name itself is routing, not a
       // model id: "browser" selects nothing; "browser/foo" selects "foo". Built-ins get the
       // full spec unchanged (their catalogs match provider-prefixed and bare ids).
@@ -627,8 +638,9 @@ export class AcpAgentRunner implements AgentRunner {
             // history is diagnostic only.
           }
           // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
+          // keepSession skips the close so the agent-persisted session stays re-openable.
           try {
-            await session.release();
+            await session.release({ keepOpen: opts.keepSession === true });
           } catch {
             // release is best-effort (session already untracked); never mask the real result/error.
           }
@@ -717,6 +729,8 @@ export class AcpAgentRunner implements AgentRunner {
         onRelease: (self) => this.interactiveSessions.delete(self),
         signal: opts.signal,
         label: opts.label,
+        cwd: opts.cwd,
+        keepSession: opts.keepSession === true,
       });
       this.interactiveSessions.set(interactive, connection);
       return interactive;
@@ -929,6 +943,23 @@ function innerModelSpec(spec: string | undefined, backend: Backend): string | un
   if (lower === backend.id) return undefined;
   if (lower.startsWith(`${backend.id}/`)) return spec.slice(backend.id.length + 1) || undefined;
   return spec;
+}
+
+/** The re-attach handle for an open session: id + backend routing name + cwd + the
+ *  agent-advertised reopen surface. Contains no secrets; JSON-round-trippable. `backendId`
+ *  doubles as the `model` routing spec for loadSession/resumeSession/listSessions. */
+function sessionRefFor(session: SessionHandle, backendId: string, cwd: string): AgentSessionRef {
+  const caps = session.capabilities;
+  return {
+    sessionId: session.sessionId,
+    backendId,
+    cwd,
+    reopen: {
+      load: caps?.supportsLoadSession === true,
+      resume: caps?.supportsResumeSession === true,
+      list: caps?.supportsListSessions === true,
+    },
+  };
 }
 
 /** Interactive sessions are public and long-lived, so fail before spawning a dedicated process

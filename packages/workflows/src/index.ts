@@ -223,7 +223,7 @@ export type {
   AgentResult,
   AgentUsage,
 } from "@automatalabs/shared-types";
-export type { JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
+export type { AgentSessionRecord, AgentSessionRef, JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
 
 /** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */
 type ManagerAcpCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;

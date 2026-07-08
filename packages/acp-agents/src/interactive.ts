@@ -12,7 +12,7 @@ import type {
   SessionModeState,
   StopReason,
 } from "@agentclientprotocol/sdk";
-import type { AgentHistoryEntry, McpServerConfig, PromptImage } from "@automatalabs/shared-types";
+import type { AgentHistoryEntry, AgentSessionRef, McpServerConfig, PromptImage } from "@automatalabs/shared-types";
 import type { RunOptions } from "@automatalabs/shared-types";
 import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
@@ -65,6 +65,10 @@ export interface InteractiveSessionOptions {
   mcpServers?: McpServerConfig[];
   /** Keep accumulated text/history after each prompt turn; default false for held-open sessions. */
   retainSessionLog?: boolean;
+  /** Skip the release-time best-effort ACP `session/close` so the agent-persisted session stays
+   *  re-openable later (`loadSession`/`resumeSession` with this session's `sessionRef`). The
+   *  dedicated process is disposed either way. Default false (close when advertised). */
+  keepSession?: boolean;
   /** Host-owned cancellation. Aborting releases this interactive session. */
   signal?: AbortSignal;
 }
@@ -88,6 +92,8 @@ interface InteractiveSessionDeps {
   readonly onRelease: (self: InteractiveSession) => void;
   readonly signal?: AbortSignal;
   readonly label?: string;
+  readonly cwd: string;
+  readonly keepSession: boolean;
 }
 
 /** A held-open multi-turn ACP session backed by a dedicated agent process. Only one prompt may
@@ -110,6 +116,8 @@ export class InteractiveSession {
   private readonly signal: AbortSignal | undefined;
   private readonly label: string | undefined;
   private readonly subscriptions = new Set<() => void>();
+  private readonly cwd: string;
+  private readonly keepSession: boolean;
   private removeAbort: (() => void) | undefined;
   private promptInFlight = false;
   private releasePromise: Promise<void> | undefined;
@@ -125,6 +133,8 @@ export class InteractiveSession {
     this.onReleaseCallback = deps.onRelease;
     this.signal = deps.signal;
     this.label = deps.label;
+    this.cwd = deps.cwd;
+    this.keepSession = deps.keepSession;
     this.sessionId = deps.session.sessionId;
     this.backendId = deps.connection.backendId;
 
@@ -260,11 +270,29 @@ export class InteractiveSession {
     return this.releasePromise;
   }
 
+  /** The re-attach handle for this session — persist it, then re-open later with
+   *  `runner.loadSession()`/`resumeSession()` (`backendId` doubles as the `model` routing spec).
+   *  Reopen flags mirror the connected agent's advertised persistence; an agent that persists
+   *  nothing leaves them all false and this ref is a tombstone once released. */
+  get sessionRef(): AgentSessionRef {
+    const caps = this.connection.capabilities;
+    return {
+      sessionId: this.sessionId,
+      backendId: this.backendId,
+      cwd: this.cwd,
+      reopen: {
+        load: caps?.supportsLoadSession === true,
+        resume: caps?.supportsResumeSession === true,
+        list: caps?.supportsListSessions === true,
+      },
+    };
+  }
+
   private async doRelease(): Promise<void> {
     this.removeAbort?.();
     this.removeAbort = undefined;
     try {
-      await this.session.release();
+      await this.session.release({ keepOpen: this.keepSession });
     } catch {
       // best-effort: release must still dispose the dedicated process and unregister.
     }

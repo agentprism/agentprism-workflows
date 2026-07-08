@@ -164,7 +164,7 @@ export type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./perm
 
 export { UsageAccumulator } from "./usage.js";
 
-export type { McpAcpServerConfig, McpServerConfig } from "@automatalabs/shared-types";
+export type { AgentSessionRef, McpAcpServerConfig, McpServerConfig } from "@automatalabs/shared-types";
 
 export { toAnthropicJsonSchema, toJsonSchema, toStrictJsonSchema } from "./schema-strict.js";
 

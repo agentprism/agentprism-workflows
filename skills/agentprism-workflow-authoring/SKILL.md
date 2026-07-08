@@ -232,6 +232,7 @@ Guard budget-driven loops on `budget.total` being set — with no budget, `remai
 - `mcpServers: [{ name, command, args: [], env: [] }]` attaches MCP servers to that agent's session — the portable way to hand any backend a capability (image generation, a browser, a ticket system). The agent sees the server's tools natively. Note `env` is a list of `{ name, value }` pairs (ACP shape), not an object map; HTTP/SSE servers use `{ type: "http", name, url, headers: [] }`.
 - `images: [...]` appends base64 image blocks to the prompt (backends without image support receive a bracketed text note instead).
 - `meta` / `promptMeta` pass generic ACP `_meta` through to `session/new` / `session/prompt` — the escape hatch for driving a custom agent's extension surface.
+- `keepSession: true` keeps the agent's ACP session re-openable after the run: the re-attach record (sessionId, backend, cwd, reopen capabilities) lands in `WorkflowRunResult.agentSessions`, and the HOST can continue that agent's conversation later via `runner.loadSession()`. Scripts themselves never re-attach — hand the record to the host through the run result.
 
 ### Custom ACP backends
 

@@ -2,7 +2,7 @@
 import type { Static, TSchema } from "typebox";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { McpServerConfig } from "./mcp-config.js";
-import type { WorkflowBackendConfig } from "./workflow-result.js";
+import type { AgentSessionRef, WorkflowBackendConfig } from "./workflow-result.js";
 
 /** Real token/cost usage for ONE subagent run. Delivered OUT-OF-BAND via
  *  RunOptions.onUsage — NEVER via run()'s return value. Fires on BOTH the success
@@ -48,7 +48,8 @@ export interface PromptImage {
  * onUsage, onHistory. Plus ADDITIVE run inputs that wire infrastructure / shape the backend,
  * NOT the logical call, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
- * backend registry `backends`, and the Codex-only `baseInstructions` / `developerInstructions`.
+ * backend registry `backends`, the Codex-only `baseInstructions` / `developerInstructions`,
+ * and the session hand-off pair `keepSession` / `onSessionOpen`.
  * `maxSchemaRetries` is runner-internal (the engine never passes it). Pi's
  * `tools?: ToolDefinition[]` is DROPPED — a pi-coding-agent type with no ACP analog (ACP
  * injects tools via session/new mcpServers, not this field) and never passed by the engine.
@@ -154,6 +155,18 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  bracketed text note (never an error, never silently dropped) per the ACP rule that the client
    *  adapts content to the agent's advertised prompt capabilities. */
   images?: readonly PromptImage[];
+  /** Skip the release-time best-effort ACP `session/close` so the agent-persisted session is
+   *  guaranteed untouched for a later re-open (`runner.loadSession`/`resumeSession` with the
+   *  onSessionOpen ref). The pooled process is still released either way. ADDITIVE and NOT part
+   *  of the resume identity hash (hashAgentCall) — it shapes session disposal, not the logical
+   *  call. Omitted/false => today's behavior (close when the agent advertises it). */
+  keepSession?: boolean;
+  /** The run's ACP session identity, fired ONCE right after `session/new` (before the first
+   *  prompt) with the re-attach handle — sessionId, backend, cwd, and the agent-advertised
+   *  reopen capabilities. Best-effort observer (a throwing callback is isolated, never fails
+   *  the run) and, like every on* callback, OUT-OF-BAND: run()'s return value stays the bare
+   *  AgentResult. NOT part of the resume identity hash. */
+  onSessionOpen?: (session: AgentSessionRef) => void;
 }
 
 /** The result side of the seam: schema => the validated object, no schema => text.
