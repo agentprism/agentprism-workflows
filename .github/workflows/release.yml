@@ -51,12 +51,12 @@ jobs:
           # provenance / OIDC trusted publishing to target the public registry.
           registry-url: https://registry.npmjs.org
 
-      # npm OIDC trusted publishing needs the npm CLI >= 11.5.1 to do the token
-      # exchange. Node 22 ships npm 10, which fails the publish with a misleading
-      # E404 ("is not in this registry") even with id-token + a configured trusted
-      # publisher. `changeset publish` performs the OIDC exchange through this npm.
-      - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@latest
+      # npm OIDC trusted publishing needs the npm CLI >= 11.5.1 for the token
+      # exchange — Node 24's BUNDLED npm satisfies that natively. Do NOT re-add an
+      # `npm install -g npm@latest` step here: overwriting the toolcache npm left a
+      # hybrid install missing its `sigstore` module, failing every provenance
+      # publish with MODULE_NOT_FOUND (runs 28982178371 / 28982372216). The
+      # codex-acp fork publishes with the stock bundled npm — same here.
 
       # Same frozen install as CI: restores the exact dependency tree (incl. the
       # @automatalabs/codex-acp fork) and fetches the linux-x64 native binaries
