@@ -263,6 +263,47 @@ testable without a live agent — pass a stub runner.
 
 ---
 
+## Loading workflows from folders — `openWorkflowDir`
+
+Integrators who keep a versioned folder of workflow scripts don't need to hand-roll
+`readFileSync` plumbing or a `loadSavedWorkflow` resolver:
+
+```ts
+import { openWorkflowDir, runDynamicWorkflow } from "@automatalabs/workflows";
+
+const flows = openWorkflowDir("./workflows");        // or ["./workflows", teamDir] — first hit wins
+
+flows.list();               // [{ name, file, meta }] — meta parsed per call, browsable by a UI
+flows.read("review-pr");    // name → script string; throws with searched dirs + did-you-mean
+flows.resolve;              // (name) => string | undefined — IS a loadSavedWorkflow resolver
+
+const run = await runDynamicWorkflow("review-pr", {  // a NAME works when `workflows` is set
+  workflows: flows,                                  // also accepts "./workflows" or [dir, dir]
+  args: { pr: 42 },
+});
+```
+
+Semantics worth knowing:
+
+- **Construction does no I/O** — nothing is created, nothing is scanned or cached. Every method
+  reads the filesystem at call time, so a long-lived view always reflects the current working
+  tree (a cached scan would serve stale scripts after a `git checkout`/pull/save). Missing
+  directories simply contribute nothing.
+- **The filename stem is the name** (`review-pr.workflow.js` or `review-pr.js` ⇒ `review-pr`),
+  mirroring the agentType registry convention; across dirs the first hit wins, within a dir
+  `.workflow.js` beats `.js`.
+- **`workflows` also wires nested calls**: with the option set, `workflow("<name>")` inside the
+  script resolves from the same view. (Without it, `runDynamicWorkflow` has no saved-workflow
+  resolver and nested names cannot resolve.) A top-level string containing `export const meta`
+  is always treated as a verbatim script, never a name.
+- **Versioning is git's job.** A run persists its script content, so `resume()` replays the exact
+  script that started the run even if the file changed since; an edited file simply cache-misses
+  from the first changed call on the next fresh run.
+- **`resolve()` validates name shape strictly** (one flat path segment) — inline nested scripts
+  fall through to verbatim parsing, and path traversal out of the configured dirs is impossible.
+
+---
+
 ## Listening in on the live ACP stream (events)
 
 `createAcpRunner()` returns an `AcpAgentRunner` with a **typed event bus**. Subscribe with
@@ -353,6 +394,42 @@ promises — `parallel([() => agent("a"), () => agent("b")])`, not `parallel([ag
 
 ---
 
+## Validating scripts — `agentprism-workflows validate`
+
+The package ships a bin that validates a workflow script **without spending tokens or spawning
+any agent process** — no backend auth needed:
+
+```bash
+npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
+```
+
+Two passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a
+**dry run** — the script executes in the real engine realm while every `agent()` call is served
+by an in-process mock `AgentRunner` that fabricates schema-conforming results. The dry run
+catches what a parse can't: thunk-vs-promise mistakes, reference errors, broken plumbing between
+calls. Checkpoints take their headless defaults; script-declared `meta.backends` are treated as
+approved (with a warning that real runs require approval). The report lists every agent call with
+its backend attribution, every checkpoint, and warnings; exit codes are `0` valid, `1` parse
+failure, `2` dry-run failure, `3` usage error.
+
+Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
+NAME and resolve nested `workflow("<name>")` calls from your folder), `--parse-only`,
+`--cwd <dir>`, `--token-budget <n>` (exercise `budget`-guarded paths; the mock reports 1000
+tokens per call), `--max-agents <n>`, `--timeout-ms <n>`, `--json`.
+
+The same check is available programmatically — it never throws for an invalid script:
+
+```ts
+import { validateWorkflowScript } from "@automatalabs/workflows";
+
+const report = await validateWorkflowScript(script, { args: { target: "src/" } });
+report.ok;                 // parse ok AND dry run completed
+report.dryRun?.agentCalls; // [{ label, phase, model, backend, schema }, …]
+report.warnings;           // approval reminders, phase mismatches, headless-abort checkpoints, …
+```
+
+---
+
 ## Structured output
 
 Pass a JSON Schema to `agent({ schema })` (in a script) or `runner.run(prompt, { schema })` (direct)
@@ -422,6 +499,10 @@ Within a provider, the model spec selects the concrete model through ACP session
 runDynamicWorkflow,           // (script, { args?, runner?, exec? }) => Promise<WorkflowRunResult>
 runWorkflow,                  // the bare engine run (no status trio)
 parseWorkflowScript,          // parse a script's meta + body
+validateWorkflowScript,       // token-free parse + mock-runner dry run (the `validate` CLI's core)
+fabricateFromSchema,          // the dry run's JSON-Schema value fabricator
+formatValidateReport,         // render a ValidateWorkflowReport as CLI text
+openWorkflowDir,              // read-only view over folders of workflow scripts (name = filename stem)
 WorkflowManager,              // stateful / resumable run manager
 
 // ── ACP backend ──
@@ -442,6 +523,7 @@ AGENTPRISM_PERSISTENCE_ROOT_ENV,
 
 // ── Types ──
 RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
+ValidateWorkflowOptions, ValidateWorkflowReport, ValidatedAgentCall, ValidatedCheckpoint,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
@@ -456,6 +538,25 @@ AcpRawMessageEvent, AcpBackendErrorEvent,
 
 (The DSL globals — `agent`, `parallel`, `pipeline`, … — are **not** exported; they are realm
 globals documented by the ambient `dsl.d.ts`.)
+
+---
+
+## Skill for AI agents that write workflows
+
+The repository publishes an **agent skill** — a self-contained, backend-agnostic authoring guide
+in the standard `SKILL.md` format — at
+[`skills/agentprism-workflow-authoring/`](https://github.com/VikashLoomba/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring).
+Install it into whatever coding agent you use (Claude Code, Codex, Cursor, OpenCode, …) with the
+[skills](https://skills.sh) CLI:
+
+```bash
+npx skills add VikashLoomba/agentprism-workflows
+```
+
+It teaches the full script DSL: routing each `agent()` call to a different ACP backend inside one
+script, structured outputs across all backends, `checkpoint()` gates, budgets, worktree
+isolation, and the determinism rules that make runs resumable. `reference.md` alongside it holds
+the exhaustive option tables.
 
 ---
 

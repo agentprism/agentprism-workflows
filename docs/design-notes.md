@@ -181,7 +181,7 @@ All versions below were verified locally (cloned + `npm install`) on 2026-06-29.
   client/connection helpers). This is what your orchestrator uses to *speak ACP as a client*.
   Ref: https://agentclientprotocol.com · https://github.com/agentclientprotocol
 
-- **`@agentclientprotocol/claude-agent-acp@0.56.0`** — ACP server wrapping Claude.
+- **`@agentclientprotocol/claude-agent-acp@0.57.0`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
   Wraps **`@anthropic-ai/claude-agent-sdk@0.3.195`**.
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
@@ -420,7 +420,7 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.56.0` → `@anthropic-ai/claude-agent-sdk@0.3.195`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.57.0` → `@anthropic-ai/claude-agent-sdk@0.3.195`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
@@ -663,7 +663,7 @@ the unchanged engine.
 ## 8. Caveats / version pins / things to design around
 
 - **Version-specific (Claude):** the structured-output path is verified for
-  `claude-agent-acp@0.56.0` / `@anthropic-ai/claude-agent-sdk@0.3.195`. The `_meta.claudeCode`
+  `claude-agent-acp@0.57.0` / `@anthropic-ai/claude-agent-sdk@0.3.195`. The `_meta.claudeCode`
   channel and `emitRawSDKMessages` are vendor extensions, not standard ACP — pin versions and
   isolate behind the backend adapter.
 - **`emitRawSDKMessages` is mandatory** to read `structured_output` on the Claude path; filter
@@ -702,7 +702,7 @@ the unchanged engine.
 **Packages (verified versions, 2026-06-29):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.0.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.56.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.195`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@agentclientprotocol/claude-agent-acp@0.57.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.195`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp@1.4.0` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
 - OpenCode (`opencode acp`) — https://opencode.ai
 

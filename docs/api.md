@@ -30,7 +30,13 @@ const run = await runDynamicWorkflow(script, {
 // Never throws for ordinary outcomes — read run.status: "completed" | "paused" | "failed" | "aborted"
 ```
 
-Options (`RunDynamicWorkflowOptions`): `runner?` (custom `AgentRunner`; defaults to `createAcpRunner()`), `cwd?`, `args?`, `exec?` (an [`ExecOptions`](#execoptions--per-run)), `allowScriptBackends?` (approval policy for script-declared `meta.backends`).
+Options (`RunDynamicWorkflowOptions`): `runner?` (custom `AgentRunner`; defaults to `createAcpRunner()`), `cwd?`, `args?`, `exec?` (an [`ExecOptions`](#execoptions--per-run)), `allowScriptBackends?` (approval policy for script-declared `meta.backends`), `workflows?` (a [`WorkflowDir`](#workflow-directories--openworkflowdir) view or dir path(s): the first argument may then be a workflow NAME — any string without the mandatory `export const meta` head is resolved via the view's `read()`, throwing a diagnosable searched-dirs/did-you-mean error on a miss — and nested `workflow("<name>")` calls resolve from the same view).
+
+### <a name="workflow-directories--openworkflowdir"></a>Workflow directories — `openWorkflowDir`
+
+`openWorkflowDir(dir | dirs, { cwd? })` binds a read-only view over folders of versioned workflow scripts. Construction does **no I/O** (nothing created, scanned, or cached); every method reads the filesystem at call time so the view always reflects the current working tree, and missing dirs contribute nothing. The filename stem is the name (`review-pr.workflow.js` / `review-pr.js` ⇒ `review-pr`; across dirs first hit wins, within a dir `.workflow.js` beats `.js`; also `.mjs` variants). Surface: `dirs` (absolute, precedence order), `list()` (`[{ name, file, meta?, error? }]`, meta parsed per call, sorted), `read(name)` (script text; throws with searched dirs + closest matches), and `resolve(name)` — `(name) => string | undefined`, deliberately the exact `loadSavedWorkflow` contract, with strict name-shape validation (one flat path segment) so inline nested scripts fall through and path traversal is impossible. Exported by both `@automatalabs/workflow-engine` and the facade.
+
+**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, determinism blocklist) plus a dry run over an in-process mock `AgentRunner` that fabricates schema-conforming results — no ACP process, no tokens, checkpoints take their headless defaults, script-declared backends are treated as approved (with a warning). It never throws for an invalid script; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run failure). `ValidateWorkflowOptions`: `args?`, `workflows?` (a `WorkflowDir` view or dir path(s) so nested `workflow("<name>")` calls resolve during the dry run), `dryRun?` (`false` = parse only), `cwd?` (default: a throwaway temp dir so `isolation:"worktree"` no-ops), `tokenBudget?` (the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 tokens per call), `maxAgents?`, `timeoutMs?` (default 30 000). The report lists every agent call (`label`, `phase`, `model`, `tier`, `mode`, `backend` attribution via the real router, `schema` flag), every checkpoint with the default reply taken, visited phases, logs, the composed result, and warnings. Helpers `fabricateFromSchema(schema)` and `formatValidateReport(report)` are exported too. The same check ships as the package bin: `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--token-budget <n>] [--max-agents <n>] [--timeout-ms <n>] [--json]` (exit `3` = usage error). With `--workflows-dir` the positional may be a workflow NAME and nested `workflow("<name>")` calls resolve; without it, nested bare names fail the dry run (the report warns and names the fix) while inline nested scripts always validate.
 
 **Host-embedded (manager):** long-lived, evented, resumable.
 
@@ -65,7 +71,7 @@ manager.stop(runId);            // or manager.pause(runId), or await manager.res
 | `mainModel` | — | Session main model (`provider/id`) used to auto-tier explore-style agents. |
 | `sessionId` | — | Tag for new runs; `listRuns()` filters by it (`listAllRuns()` doesn't). Update via `setSessionId()`. |
 | `agentsDir` | project + user agent dirs | Override the directory scanned for `agentType` definitions. |
-| `loadSavedWorkflow` | — | `(name) => script` resolver enabling nested `workflow("name")` in scripts. |
+| `loadSavedWorkflow` | — | `(name) => script` resolver enabling nested `workflow("name")` in scripts. `openWorkflowDir(dir).resolve` is a ready-made one. |
 
 On construction, a journaling manager reconciles orphaned `"running"` runs from dead processes to `"paused"` (journal preserved for resume). A `journaling: false` manager never touches persisted state.
 
@@ -230,7 +236,7 @@ await runner.logout({ model: "codex" });
 
 Installed adapter status from the bundled dists:
 
-- `@agentclientprotocol/claude-agent-acp@0.56.0`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. It does not advertise or register `providers/*`.
+- `@agentclientprotocol/claude-agent-acp@0.57.0`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. It does not advertise or register `providers/*`.
 - `@automatalabs/codex-acp@1.4.0`: advertises `auth.logout`, implements `authenticate` (`api-key`, `chat-gpt`, and `gateway` when gateway support is advertised), and implements `logout`. It does not advertise or register `providers/*`.
 
 ### Protocol passthrough & coverage
@@ -280,7 +286,7 @@ const resumed = await runner.resumeSession({ sessionId, cwd: "/abs/dir" });
 
 `listSessions()` returns the SDK `ListSessionsResponse` (`sessions: SessionInfo[]`, plus `nextCursor?`); `deleteSession()` resolves to `void`. `loadSession()` and `resumeSession()` return live `InteractiveSession`s tracked and released like `openSession()` sessions. They accept the same session-scoped fields as `openSession()` plus the required `sessionId`; `mcpServers` defaults to `[]` on the wire. `loadSession()` registers the caller-supplied id before sending `session/load`, so replayed `session/update` history is accumulated and permissions during replay are routed. After it resolves, replay is visible in `session.text` / `session.history`. `resumeSession()` reattaches without replay. Both adopt response `configOptions`/`modes`, so model config selection is applied only when the reopened session advertises it, and `mode` is applied strictly from the response mode catalog.
 
-Lifecycle methods are capability-gated after initialize. Missing support throws a non-recoverable `WorkflowError` naming the backend, method, and advertised lifecycle capabilities. The installed `@agentclientprotocol/claude-agent-acp@0.56.0` and `@automatalabs/codex-acp@1.4.0` both advertise `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close. OpenCode advertises load/list/resume/close/fork; unsupported lifecycle methods still fail through the same gate.
+Lifecycle methods are capability-gated after initialize. Missing support throws a non-recoverable `WorkflowError` naming the backend, method, and advertised lifecycle capabilities. The installed `@agentclientprotocol/claude-agent-acp@0.57.0` and `@automatalabs/codex-acp@1.4.0` both advertise `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close. OpenCode advertises load/list/resume/close/fork; unsupported lifecycle methods still fail through the same gate.
 
 ### Capabilities
 
@@ -314,7 +320,7 @@ Two gates run before any prompt tokens are spent:
 - The agent must advertise `agentCapabilities.mcpCapabilities.acp === true`; otherwise the ACP server config fails with non-recoverable `SCRIPT_VALIDATION_ERROR`.
 - The runner must have a complete `clientHandlers.mcp`; declaring `{ type: "acp" }` without a handler is also a non-recoverable config error.
 
-Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.56.0` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp@1.4.0` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, and OpenCode advertises HTTP/SSE MCP support. Current MCP-over-ACP integration tests therefore use the repository fake agent fixture.
+Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.57.0` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp@1.4.0` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, and OpenCode advertises HTTP/SSE MCP support. Current MCP-over-ACP integration tests therefore use the repository fake agent fixture.
 
 ---
 

@@ -238,6 +238,22 @@ A script is plain JavaScript whose **first statement** is the `meta` literal. In
 
 Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so a killed run **resumes** from its journal with a cache-hit on the unchanged prefix.
 
+> **Writing scripts with an AI agent?** This repo publishes a backend-agnostic authoring skill —
+> [`skills/agentprism-workflow-authoring`](skills/agentprism-workflow-authoring/SKILL.md) — in the standard
+> `SKILL.md` format. Install it into your coding agent (Claude Code, Codex, Cursor, OpenCode, …) with the
+> [skills.sh](https://skills.sh) CLI:
+>
+> ```bash
+> npx skills add VikashLoomba/agentprism-workflows
+> ```
+>
+> It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, budgets, isolation,
+> and the determinism rules.
+
+Validate a script **without spending tokens** (static parse + a dry run over a mock agent backend — no
+ACP process, no auth needed): `npx @automatalabs/workflows validate <file> --args '<json>'`. Exit codes:
+`0` valid, `1` parse failure, `2` dry-run failure.
+
 ---
 
 ## Structured output
@@ -325,6 +341,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 - [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. the `agentEvent` token-level stream), `ExecOptions` (incl. per-run `cwd` for worktree-per-run hosts), the runner surface (`run()`, model routing, event bus, interactive sessions, capabilities), backend resolution + every environment variable, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
+- [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add VikashLoomba/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
 - [Agent Client Protocol](https://agentclientprotocol.com) · [Model Context Protocol](https://modelcontextprotocol.io)
 
