@@ -190,7 +190,9 @@ const runner = createAcpRunner({
 
 One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (native/tool-captured structured output + validate-and-re-prompt). Key `RunOptions`:
 
-`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), callbacks `onUsage`, `onHistory`, `onModelResolved`, `onModelFallback`.
+`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), callbacks `onUsage`, `onHistory`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
+
+**Session hand-off.** `run()`'s return value is always the bare result, so the ACP session identity travels out-of-band: `onSessionOpen` fires once right after `session/new` (before the first prompt) with an `AgentSessionRef` — `{ sessionId, backendId, cwd, reopen: { load, resume, list } }`. The `reopen` flags mirror the connected agent's advertised persistence (`loadSession` / `sessionCapabilities.resume` / `.list`); `backendId` doubles as the `model` routing spec for the reattach calls below. Pair it with `keepSession: true` when you intend to re-open: the runner then leaves the agent-persisted session untouched at release (the pooled process is released either way). The ref contains no secrets and is JSON-round-trippable.
 
 **Structured output channels.** Claude and Codex keep their native schema channels authoritative and unchanged. OpenCode and custom ACP backends use the client-hosted MCP path: when `RunOptions.schema` is set, the backend opts in, and the negotiated initialize response advertises `agentCapabilities.mcpCapabilities.http === true`, the runner appends a client-hosted HTTP MCP server to `session/new.mcpServers`. The injected server is named `structured_output` (or `structured_output_2`, etc. on name collision), runs on `127.0.0.1` with an unguessable token path, and exposes one tool named `StructuredOutput`; agents may show it namespaced, for example `structured_output_StructuredOutput`. The tool input schema is the requested JSON Schema, and a valid call captures the result. Injected-tool schema runs are **serialized per pooled connection**: agents with instance-global, name-keyed MCP registries (OpenCode) expose every registered tool to every live session on the process, so overlapping injected sessions would leak one session's capture into another; the constant server name makes each registration replace the previous, and the per-connection turn guarantees the single live registration belongs to the active run. Scale schema-run parallelism with `AGENTPRISM_ACP_POOL_SIZE` (one registry per process), not concurrent sessions. If any gate fails, or a custom backend sets `structuredOutputTool:false`, behavior falls back to the existing prompt-embedded schema plus final-text JSON parse ladder. OpenCode also receives the generic `_meta.outputSchema` forward for future compatibility, but current OpenCode structured output depends on the injected tool. User-provided `mcpServers` are preserved and are not part of the resume hash.
 
@@ -272,7 +274,7 @@ await session.cancel();                                     // cancel the active
 await session.release();                                    // end session; pooled process survives
 ```
 
-`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `onElicitation` (session-scoped, wins over runner-wide but cannot affect initialize-time capability advertisement), `mcpServers`, `meta`, `retainSessionLog` (default `false` for held-open sessions; set `true` when the host wants the runner to keep the full transcript). `session.text` / `session.history` expose the retained assistant text and message/tool history; `session.modes` exposes the advertised catalog and current mode.
+`InteractiveSessionOptions`: `cwd` (required, absolute), `model`/`tier`, `mode` (strict ACP session mode), `toolNames`/`disallowedToolNames`, `onPermissionRequest` (session-scoped, wins over runner-wide), `onElicitation` (session-scoped, wins over runner-wide but cannot affect initialize-time capability advertisement), `mcpServers`, `meta`, `retainSessionLog` (default `false` for held-open sessions; set `true` when the host wants the runner to keep the full transcript), `keepSession` (skip the release-time `session/close` so the session stays re-openable after `release()`). `session.text` / `session.history` expose the retained assistant text and message/tool history; `session.modes` exposes the advertised catalog and current mode; `session.sessionRef` is the re-attach handle (same `AgentSessionRef` shape as `onSessionOpen`) to persist before releasing.
 
 **Session lifecycle (reattach)**:
 
@@ -285,6 +287,23 @@ const resumed = await runner.resumeSession({ sessionId, cwd: "/abs/dir" });
 ```
 
 `listSessions()` returns the SDK `ListSessionsResponse` (`sessions: SessionInfo[]`, plus `nextCursor?`); `deleteSession()` resolves to `void`. `loadSession()` and `resumeSession()` return live `InteractiveSession`s tracked and released like `openSession()` sessions. They accept the same session-scoped fields as `openSession()` plus the required `sessionId`; `mcpServers` defaults to `[]` on the wire. `loadSession()` registers the caller-supplied id before sending `session/load`, so replayed `session/update` history is accumulated and permissions during replay are routed. After it resolves, replay is visible in `session.text` / `session.history`. `resumeSession()` reattaches without replay. Both adopt response `configOptions`/`modes`, so model config selection is applied only when the reopened session advertises it, and `mode` is applied strictly from the response mode catalog.
+
+Where does `sessionId` come from? Three sources: `listSessions()`, an `InteractiveSession.sessionRef` you persisted, or — for one-shot workflow agents — `WorkflowRunResult.agentSessions`. Every `agent()` call that opened a live session lands one `AgentSessionRecord` (`AgentSessionRef` + `callIndex`/`label`/`phase`/`keptOpen`) on the run result (even with `journaling: false` — it rides the result, not the journal), in the journal entry (so resume replays it), and on the `agentEnd` event/snapshot. The one-shot-plan round trip:
+
+```ts
+const run = await manager.runSync(planScript, args);        // plan produced one-shot
+await planStore.save({ plan: run.result, session: run.agentSessions?.[0] });
+// later — "discuss this plan" with the agent's full context:
+const saved = await planStore.load(id);
+const chat = await runner.loadSession({
+  sessionId: saved.session.sessionId,
+  cwd: saved.session.cwd,
+  model: saved.session.backendId,
+});
+await chat.prompt("Revise section 3 — the user wants X.");
+```
+
+Set `agent(prompt, { keepSession: true })` in the script (or `RunOptions.keepSession` on direct `run()` calls) when you intend to re-open: it skips the release-time best-effort `session/close`, guaranteeing the agent-persisted session is untouched. Without it the record is still surfaced, and the three first-class agents keep closed sessions loadable — but `keepSession` is the explicit, agent-agnostic contract. Check `reopen.load`/`reopen.resume` before offering re-attach in UI: an agent that persists nothing advertises neither, and its sessions are reachable only while held open (`openSession`).
 
 Lifecycle methods are capability-gated after initialize. Missing support throws a non-recoverable `WorkflowError` naming the backend, method, and advertised lifecycle capabilities. The installed `@agentclientprotocol/claude-agent-acp@0.57.0` and `@automatalabs/codex-acp@1.4.1` both advertise `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close. OpenCode advertises load/list/resume/close/fork; unsupported lifecycle methods still fail through the same gate.
 

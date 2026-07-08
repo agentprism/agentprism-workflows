@@ -6,7 +6,7 @@
  * the pure, theme-optional text renderers are kept so the WorkflowManager can build
  * and project live run state without any Pi/UI dependency.
  */
-import type { AgentHistoryEntry, WorkflowMeta } from "@automatalabs/shared-types";
+import type { AgentHistoryEntry, AgentSessionRecord, WorkflowMeta } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
@@ -26,6 +26,8 @@ export interface WorkflowAgentSnapshot {
   tokens?: number;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** The agent's ACP session re-attach record (live or journal-replayed), when one exists. */
+  session?: AgentSessionRecord;
 }
 
 export interface WorkflowSnapshot {

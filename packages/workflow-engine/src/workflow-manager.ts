@@ -466,6 +466,11 @@ export class WorkflowManager extends EventEmitter {
       logs: engineResult?.logs ?? managed.snapshot.logs,
       reason,
       resetHint: usageLimit ? error?.resetHint : undefined,
+      // Fall back to the snapshot's per-agent records when the engine returned no result
+      // (pause/failure mid-run) so re-attach handles survive an interrupted run.
+      agentSessions:
+        engineResult?.agentSessions ??
+        managed.snapshot.agents.map((a) => a.session).filter((s): s is NonNullable<typeof s> => s != null),
     };
   }
 
@@ -576,6 +581,7 @@ export class WorkflowManager extends EventEmitter {
             agentSnapshot.recoverable = event.recoverable;
             agentSnapshot.tokens = event.tokens;
             if (event.model) agentSnapshot.model = event.model;
+            if (event.session) agentSnapshot.session = event.session;
           }
           this.emit("agentEnd", { runId: managed.runId, ...event });
           progress();

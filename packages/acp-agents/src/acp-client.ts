@@ -1521,10 +1521,12 @@ export class PooledConnection {
    * session/close on the wire (capability-gated, bounded, never fatal). The PROCESS is NOT
    * killed — it returns to the pool for the next agent() call.
    */
-  async releaseSession(sessionId: string): Promise<void> {
+  async releaseSession(sessionId: string, keepOpen = false): Promise<void> {
     this.client.unregister(sessionId);
     if (this._activeSessions > 0) this._activeSessions -= 1;
-    if (!this.negotiated?.supportsClose || !this._alive) return;
+    // keepOpen: the caller intends to re-open this session later (session/load|resume), so the
+    // agent-persisted session must be left untouched — skip the best-effort close entirely.
+    if (keepOpen || !this.negotiated?.supportsClose || !this._alive) return;
     try {
       await this.race(
         withTimeout(
@@ -1811,13 +1813,15 @@ export class SessionHandle implements StructuredSource {
     await this.pooled.cancelSession(this.sessionId);
   }
 
-  /** Let go of this session WITHOUT killing the pooled process; idempotent. */
-  async release(): Promise<void> {
+  /** Let go of this session WITHOUT killing the pooled process; idempotent.
+   *  `keepOpen` skips the release-time best-effort `session/close` so an agent-persisted
+   *  session stays re-openable via session/load|resume (RunOptions.keepSession). */
+  async release(options: { keepOpen?: boolean } = {}): Promise<void> {
     if (this.released) return;
     this.released = true;
     this.removeAbort?.();
     this.removeAbort = undefined;
-    await this.pooled.releaseSession(this.sessionId);
+    await this.pooled.releaseSession(this.sessionId, options.keepOpen === true);
   }
 }
 

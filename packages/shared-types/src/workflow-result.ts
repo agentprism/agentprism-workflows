@@ -52,6 +52,48 @@ export interface WorkflowMeta {
   backends?: Record<string, WorkflowBackendConfig>;
 }
 
+/**
+ * The re-attach handle for ONE ACP session opened by a run — the identity a host needs to
+ * re-open the agent's persisted conversation later via `runner.loadSession()` /
+ * `runner.resumeSession()`. Delivered OUT-OF-BAND via RunOptions.onSessionOpen (never via
+ * run()'s return value — AgentResult is the bare payload by contract). Contains NO secrets
+ * and is JSON-round-trippable (it rides journal entries and run results).
+ *
+ * Re-openability is AGENT-persistence-gated: the `reopen` flags mirror what the connected
+ * agent advertised at initialize (loadSession / sessionCapabilities.resume / .list). An agent
+ * that persists nothing advertises none of them — for those, a session is only reachable
+ * while held open (InteractiveSession), and this ref is a tombstone once released.
+ */
+export interface AgentSessionRef {
+  /** The ACP session id assigned at `session/new`. */
+  sessionId: string;
+  /** The backend that owns the session (built-in id or registered custom name). */
+  backendId: string;
+  /** ABSOLUTE working directory the session was opened with. Sessions are cwd-scoped on
+   *  agents that key their stores by workspace — pass this back when re-opening. */
+  cwd: string;
+  /** Which re-open paths the agent advertised at initialize (NegotiatedCapabilities). */
+  reopen: {
+    /** `session/load` — re-open WITH history replay (`runner.loadSession`). */
+    load: boolean;
+    /** `session/resume` — re-open WITHOUT replay (`runner.resumeSession`). */
+    resume: boolean;
+    /** `session/list` — enumerable via `runner.listSessions`. */
+    list: boolean;
+  };
+}
+
+/** One run's session ref PLUS its workflow-call context — what lands in JournalEntry.session,
+ *  the agent snapshot, and WorkflowRunResult.agentSessions. `keptOpen` records whether the
+ *  release-time best-effort `session/close` was SKIPPED (agent({ keepSession: true })). */
+export interface AgentSessionRecord extends AgentSessionRef {
+  /** The owning agent() call's deterministic index (same key as JournalEntry.index). */
+  callIndex: number;
+  label: string;
+  phase?: string;
+  keptOpen: boolean;
+}
+
 /** One cached agent()/checkpoint() result, keyed by its deterministic call index
  *  (PersistedRunState.journal, run-persistence.ts). The frozen AgentResult MUST
  *  round-trip through this JSON unchanged for resume. */
@@ -60,6 +102,9 @@ export interface JournalEntry {
   /** sha256 of the call identity (prompt + model + tier + phase + agentType + agentDef + schema). */
   hash: string;
   result: unknown;
+  /** The call's ACP session record, when one was opened live. ADDITIVE: absent on
+   *  pre-session-ref journals and on checkpoint entries; replay restores it as-is. */
+  session?: AgentSessionRecord;
 }
 
 /** Persisted run lifecycle (run-persistence.ts:11). A host-facing WorkflowRunResult
@@ -101,4 +146,8 @@ export interface WorkflowRunResult<T = unknown> {
   reason?: string;
   /** Provider reset hint for a usage-limit pause (verbatim, e.g. "Resets in ~3h"). */
   resetHint?: string;
+  /** Re-attach records for every ACP session the run opened (live + journal-replayed),
+   *  in call order. The host's hand-off to `runner.loadSession()`/`resumeSession()` —
+   *  present even when journaling is off (it rides the result, not the journal). */
+  agentSessions?: AgentSessionRecord[];
 }
