@@ -1272,3 +1272,151 @@ test(
     }
   }),
 );
+
+// ─── PR4 (§2.12/§2.13): auth-pause persistence + disk-backed cold-resume re-arm ───────────────
+
+const oneAgentAuthScript = `export const meta = { name: 'auth_persist_demo', description: 'auth persist demo' }
+const a = await agent('first', { label: 'first' })
+return { a }`;
+
+const authPersistContext = {
+  backendId: "codex",
+  methods: [
+    { id: "api-key", type: "agent" as const, name: "API Key" },
+    { id: "chat-gpt", type: "agent" as const, name: "ChatGPT" },
+  ],
+};
+
+test(
+  "PersistedRunState.authContext round-trips through the real fs persistence layer (§2.12)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = generateRunId();
+    const now = new Date().toISOString();
+    rp.save({
+      runId,
+      workflowName: "auth_persist_demo",
+      script: oneAgentAuthScript,
+      status: "paused",
+      pauseReason: "auth_required",
+      authContext: authPersistContext,
+      phases: [],
+      agents: [],
+      logs: [],
+      journal: [],
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    const loaded = rp.load(runId);
+    assert.equal(loaded?.status, "paused");
+    assert.equal(loaded?.pauseReason, "auth_required");
+    assert.equal(loaded?.resetHint, undefined);
+    assert.deepEqual(loaded?.authContext, authPersistContext, "the non-secret authContext survives save/load");
+  }),
+);
+
+test(
+  "auth pause persists 'auth_required' + authContext to real disk; a COLD manager re-pauses when canResume is false (§2.13)",
+  withTempCwd(async (cwd) => {
+    // Manager 1: an AUTH_REQUIRED fault checkpoints the run as paused and writes it to disk.
+    const manager1 = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("Authentication required for codex", WorkflowErrorCode.AUTH_REQUIRED, {
+            recoverable: false,
+            authContext: authPersistContext,
+          });
+        },
+      },
+    });
+    const paused = await manager1.runSync(oneAgentAuthScript);
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.reason, "auth_required");
+
+    // The persisted file on disk carries pauseReason + authContext (no reset hint).
+    const rp = createRunPersistence(cwd);
+    const onDisk = rp.load(paused.runId);
+    assert.equal(onDisk?.pauseReason, "auth_required");
+    assert.deepEqual(onDisk?.authContext, authPersistContext);
+
+    // Manager 2 = a fresh ("cold") process: its runner's in-process/spawn-env intent is gone, so
+    // auth.canResume returns false → resume re-pauses instead of re-running into the same wall.
+    let runCalls = 0;
+    const consulted: string[] = [];
+    const manager2 = new WorkflowManager({
+      cwd,
+      agent: {
+        auth: {
+          canResume(backendId: string): boolean {
+            consulted.push(backendId);
+            return false;
+          },
+        },
+        async run(prompt: string) {
+          runCalls++;
+          return `ok:${prompt}`;
+        },
+      },
+    });
+    let rePause: { reason?: string; error?: WorkflowError; authContext?: unknown } | undefined;
+    manager2.on("paused", (ev: typeof rePause) => {
+      rePause = ev;
+    });
+
+    const ok = await manager2.resume(paused.runId);
+    assert.equal(ok, true, "resume handled the run by re-pausing");
+    assert.deepEqual(consulted, ["codex"], "the cold runner's auth.canResume was consulted with the persisted backendId");
+    assert.equal(runCalls, 0, "the lost in-process intent means the agent is never re-executed");
+    assert.equal(rePause?.reason, "auth_required");
+    assert.match(rePause?.error?.message ?? "", /re-supply credentials for codex via runner auth before resuming/);
+    assert.deepEqual(rePause?.authContext, authPersistContext);
+  }),
+);
+
+test(
+  "a disk-backed auth pause cold-resumes to completion when canResume is true (§2.13)",
+  withTempCwd(async (cwd) => {
+    const manager1 = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("Authentication required for codex", WorkflowErrorCode.AUTH_REQUIRED, {
+            recoverable: false,
+            authContext: authPersistContext,
+          });
+        },
+      },
+    });
+    const paused = await manager1.runSync(oneAgentAuthScript);
+    assert.equal(paused.status, "paused");
+
+    // Manager 2: a disk-backed intent (native store / env re-read by the fresh spawn) survives, so
+    // canResume is true and the run proceeds — the fresh runner re-executes and completes clean.
+    let runCalls = 0;
+    const manager2 = new WorkflowManager({
+      cwd,
+      agent: {
+        auth: {
+          canResume(): boolean {
+            return true;
+          },
+        },
+        async run(prompt: string) {
+          runCalls++;
+          return `ok:${prompt}`;
+        },
+      },
+    });
+
+    const ok = await manager2.resume(paused.runId);
+    assert.equal(ok, true);
+    const deadline = Date.now() + 5_000;
+    while (manager2.getRun(paused.runId)?.status === "running" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(manager2.getRun(paused.runId)?.status, "completed", "the disk-backed run resumed to completion");
+    assert.ok(runCalls >= 1, "the fresh runner re-executed the run live");
+  }),
+);
