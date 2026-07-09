@@ -1199,6 +1199,21 @@ export class PooledConnection {
     return this.authStore?.machineFor(this.backend.poolKey ?? this.backend.id, this.backend.authProfile);
   }
 
+  /** The client `auth` advertisement for THIS connection (§1.2), refined per-backend by the pure-data
+   *  `AuthProfile.clientAuthCapabilities` (§3.1). When the host advertised nothing (default-OFF) the
+   *  key is omitted verbatim — no profile is consulted, so behavior stays byte-identical. When the
+   *  host opted in, the backend's profile maps the host affordances (`onAuth` ⇐ gateway desired,
+   *  `terminal` ⇐ host TTY) onto the method TYPES this backend can actually service (e.g. codex never
+   *  advertises terminal; opencode never advertises gateway). A custom backend has NO profile → the
+   *  host's advertisement passes through unchanged (conformance-by-absence, §3.5). */
+  private effectiveAuthCapabilities(): { terminal?: boolean; gateway?: boolean } | undefined {
+    const base = this.authCapabilities;
+    if (!base) return undefined; // default-OFF: omit `auth` entirely (byte-identical baseline)
+    const profile = this.backend.authProfile;
+    if (!profile) return base;
+    return profile.clientAuthCapabilities({ onAuth: Boolean(base.gateway), terminal: Boolean(base.terminal) });
+  }
+
   /** Mark this connection current against `generation` (nothing more to apply). */
   private stampApplied(generation: number): void {
     this.authStamp = { appliedGeneration: generation, applied: true, trippedAuthRequired: false };
@@ -1301,7 +1316,8 @@ export class PooledConnection {
             // this runner. Omitted flags are unsupported; false flags are never sent deliberately.
             clientCapabilities: clientCapabilitiesFor(this.clientHandlers, {
               elicitation: this.advertiseElicitation,
-              auth: this.authCapabilities, // undefined => no `auth` key emitted (default-OFF)
+              // Per-backend profile refinement (§1.2/§3.1); undefined => no `auth` key emitted (default-OFF).
+              auth: this.effectiveAuthCapabilities(),
             }),
             clientInfo: { ...CLIENT_INFO },
           }),

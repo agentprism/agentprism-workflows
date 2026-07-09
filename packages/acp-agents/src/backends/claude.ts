@@ -9,12 +9,15 @@ import type { TSchema } from "typebox";
 import type { ClaudeCodeSessionMeta } from "@automatalabs/shared-types";
 import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
 import { splitArgs } from "../backend.js";
+import { claudeAuthProfile } from "../auth/auth-profiles.js";
 import { toAnthropicJsonSchema } from "../schema-strict.js";
 
 const require = createRequire(import.meta.url);
 
 export class ClaudeBackend implements Backend {
   readonly id = "claude" as const;
+  /** Pure-data claude auth profile (§3.2): terminal follows the host TTY, gateway follows `onAuth`. */
+  readonly authProfile = claudeAuthProfile;
 
   spawnConfig(): SpawnConfig {
     const env = process.env;
