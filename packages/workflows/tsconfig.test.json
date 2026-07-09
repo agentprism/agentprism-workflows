@@ -1,0 +1,14 @@
+{
+  // Type-checks src AND test — the config behind the facade compile-gate (sdk.test.ts spawns
+  // `tsc -p` on it) and the package `typecheck` script. The build tsconfig.json stays src-only:
+  // composite/declaration emit must never include test files in dist.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*", "test/**/*"]
+}

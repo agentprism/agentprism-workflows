@@ -8,9 +8,12 @@
 // (~/.agentprism/workflows/projects/<key>/runs) writes into a throwaway temp dir.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Redirect run-state persistence into a disposable home BEFORE any WorkflowManager is
 // constructed (runDynamicWorkflow builds one per call, deriving the runs dir from $HOME
@@ -138,10 +141,10 @@ function eventedAgent(runner: EventedRunner): AgentRunner {
   return runner as unknown as AgentRunner;
 }
 
-function deferred<T = void>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = () => r();
   });
   return { promise, resolve };
 }
@@ -216,8 +219,11 @@ test("facade re-exports isAuthRequired as a value alongside isProviderUsageLimit
 });
 
 // Compile-gate for the §4.2 runner-facing auth TYPE re-exports (surfaced through the facade
-// with PR5). If any re-export were dropped or renamed, referencing it here fails `tsc`; the
-// runtime assertion is trivially true — the value is the type wiring compiling at all.
+// with PR5). If any re-export were dropped or renamed, referencing it here fails `tsc` — and
+// the spawned "tsc type-checks this suite" test below is what makes that bite: the build
+// tsconfig is src-only and tsx strips types, so without it a broken re-export would still
+// pass the suite. The runtime assertions here are trivially true — the value is the type
+// wiring compiling at all.
 test("facade re-exports the §4.2 runner-facing auth types", () => {
   const descriptor: AuthMethodDescriptor = {
     type: "env_var",
@@ -482,4 +488,19 @@ test("WorkflowManager isolates throwing agentEvent listeners from sibling observ
     runner.emit("session_open", { sessionId: "session-throw", backendId: "claude", label: "l", runId: "r" });
   });
   assert.deepEqual(seen, ["session_open"]);
+});
+
+// The gate behind every compile-gate above: actually type-check this suite. The build
+// tsconfig.json is src-only and tsx never type-checks, so this spawned `tsc -p
+// tsconfig.test.json` is the ONLY thing that makes a dropped/renamed facade re-export fail
+// `pnpm test` (locally and in CI's `pnpm -r test`).
+test("tsc type-checks the test suite (tsconfig.test.json) so the facade compile-gates are real", () => {
+  const require = createRequire(import.meta.url);
+  const tsc = require.resolve("typescript/lib/tsc.js");
+  const pkgDir = fileURLToPath(new URL("..", import.meta.url));
+  const result = spawnSync(process.execPath, [tsc, "-p", join(pkgDir, "tsconfig.test.json"), "--noEmit"], {
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  assert.equal(result.status, 0, `tsc found type errors:\n${result.stdout}${result.stderr}`);
 });
