@@ -11,9 +11,16 @@
 // the engine retries). WorkflowErrors raised inside the ladder (SCHEMA_NONCOMPLIANCE,
 // AGENT_EMPTY_OUTPUT) pass through unchanged.
 import { classifyProviderLimit, isWorkflowError, WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
+import type { AuthErrorContext } from "@automatalabs/shared-types";
 import type { AuthMethod } from "@agentclientprotocol/sdk";
 
 export const ACP_AUTH_REQUIRED_ERROR_CODE = -32000;
+
+// JSON-RPC codes the SDK reserves for NON-auth failures (jsonrpc.js:764-829). A different reserved
+// code that merely mentions the auth phrase must NEVER mis-route to pause-for-auth. -32000 is
+// deliberately EXCLUDED — it is the primary auth code (reserved exclusively for authRequired,
+// jsonrpc.js:818-823) and is matched code-only above the fallback.
+const OTHER_RESERVED = new Set([-32700, -32600, -32601, -32602, -32603, -32800, -32002]);
 
 export interface ErrorMapContext {
   label?: string;
@@ -44,9 +51,19 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
   const context = typeof labelOrContext === "string" ? { label: labelOrContext } : (labelOrContext ?? {});
   const message = errorText(error);
   if (isAcpAuthRequired(error, message)) {
+    // authContext sources ONLY agent-advertised AuthMethod fields (ids/types/names) — never our
+    // sent _meta/env values (Principle 9). This is the machine-readable contract every downstream
+    // host reads; the enriched message is human-readable only.
+    const methods: AuthErrorContext["methods"] = (context.authMethods ?? []).map((m) => ({
+      id: m.id,
+      // AuthMethodAgent carries no `type` field (the SDK treats a missing discriminant as "agent").
+      type: ("type" in m ? m.type : undefined) ?? "agent",
+      name: m.name,
+    }));
     return new WorkflowError(authRequiredMessage(message, context), WorkflowErrorCode.AUTH_REQUIRED, {
       recoverable: false,
       agentLabel: context.label,
+      authContext: { backendId: context.backendId, methods },
       details: error,
     });
   }
@@ -68,10 +85,16 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
 }
 
 function isAcpAuthRequired(error: unknown, message: string): boolean {
-  return (
-    Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === ACP_AUTH_REQUIRED_ERROR_CODE) &&
-    /^Authentication required\b/i.test(message)
-  );
+  const code = (error as { code?: unknown } | null)?.code;
+  // PRIMARY (spec-faithful): -32000 is reserved EXCLUSIVELY for authRequired (jsonrpc.js:818-823;
+  // no other constructor in jsonrpc.js:764-829 emits it). Code alone, ANY message — this unblocks
+  // conformant agents that localize or rephrase the text.
+  if (code === ACP_AUTH_REQUIRED_ERROR_CODE) return true;
+  // FALLBACK: a non-conformant agent that signals auth in prose without the reserved code. A
+  // DIFFERENT reserved code that merely mentions the phrase must NEVER mis-route to pause-for-auth.
+  return typeof code === "number"
+    ? !OTHER_RESERVED.has(code) && /\bauthentication required\b/i.test(message)
+    : /\bauthentication required\b/i.test(message);
 }
 
 function authRequiredMessage(message: string, context: ErrorMapContext): string {

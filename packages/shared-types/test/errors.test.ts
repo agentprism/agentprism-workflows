@@ -7,9 +7,11 @@ import { describe, it } from "node:test";
 // engine-core, so its describe block (and its import) are intentionally NOT ported here.
 import {
   classifyProviderLimit,
+  isAuthRequired,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
+  type AuthErrorContext,
 } from "../src/errors.js";
 
 describe("classifyProviderLimit", () => {
@@ -80,6 +82,49 @@ describe("isProviderUsageLimit", () => {
     assert.equal(isProviderUsageLimit(new Error("usage limit")), false);
     assert.equal(isProviderUsageLimit(undefined), false);
     assert.equal(isProviderUsageLimit("usage limit"), false);
+  });
+});
+
+describe("isAuthRequired", () => {
+  it("is true only for an AUTH_REQUIRED WorkflowError", () => {
+    assert.equal(
+      isAuthRequired(new WorkflowError("x", WorkflowErrorCode.AUTH_REQUIRED, { recoverable: false })),
+      true,
+    );
+    assert.equal(isAuthRequired(new WorkflowError("x", WorkflowErrorCode.PROVIDER_USAGE_LIMIT)), false);
+    assert.equal(isAuthRequired(new WorkflowError("x", WorkflowErrorCode.AGENT_EXECUTION_ERROR)), false);
+    assert.equal(isAuthRequired(new Error("authentication required")), false);
+    assert.equal(isAuthRequired(undefined), false);
+    assert.equal(isAuthRequired("authentication required"), false);
+  });
+});
+
+describe("WorkflowError.authContext", () => {
+  it("round-trips the structured AuthErrorContext from options onto the readonly field", () => {
+    const authContext: AuthErrorContext = {
+      backendId: "codex",
+      methods: [
+        { id: "api-key", type: "env_var", name: "API Key" },
+        { id: "chat-gpt", type: "agent", name: "ChatGPT" },
+        { id: "claude-login", type: "terminal" },
+      ],
+    };
+    const e = new WorkflowError("ACP agent (codex) requires authentication", WorkflowErrorCode.AUTH_REQUIRED, {
+      recoverable: false,
+      authContext,
+    });
+    assert.equal(e.code, WorkflowErrorCode.AUTH_REQUIRED);
+    assert.deepEqual(e.authContext, authContext);
+    // The three method type discriminants are exactly the allowed union values.
+    assert.deepEqual(
+      e.authContext?.methods.map((m) => m.type),
+      ["env_var", "agent", "terminal"],
+    );
+  });
+
+  it("leaves authContext undefined when the option is omitted", () => {
+    const e = new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(e.authContext, undefined);
   });
 });
 
