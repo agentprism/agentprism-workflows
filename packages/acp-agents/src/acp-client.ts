@@ -130,6 +130,12 @@ import {
   type ClientHandlers,
   type TerminalHandlers,
 } from "./client-handlers.js";
+import {
+  redactSecrets,
+  type AuthStore,
+  type BackendAuthMachine,
+  type ConnectionAuthStamp,
+} from "./auth/auth-store.js";
 
 /** A benign client identity. NOT JetBrains/IntelliJ 2026.1 — that exact identity makes
  *  codex-acp disable session config options (our model/effort routing channel). */
@@ -160,6 +166,9 @@ interface RawResultSuccess {
   subtype: string;
   structured_output?: unknown;
 }
+
+/** Monotonic seq for process-unique PooledConnection ids (auth-machine event tagging, §2.3). */
+let nextConnectionSeq = 0;
 
 interface SessionTombstone {
   readonly cwd: string;
@@ -890,6 +899,11 @@ export interface PooledConnectionDeps {
   /** Initialize-time client auth advertisement (§1.2); fixed per connection like elicitation.
    *  Undefined (the default) omits the `auth` capability entirely — the default-OFF baseline. */
   authCapabilities?: { terminal?: boolean; gateway?: boolean };
+  /** The runner's single auth store (§2). When present, this connection reconciles to the current
+   *  intent at the end of `initialize` (replay for in-process creds), overlays the spawn env with
+   *  collected `env_var` values, and carries a generation stamp the pool gates selection on.
+   *  Undefined => no auth wiring, byte-identical to the pre-auth baseline (default-OFF). */
+  authStore?: AuthStore;
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
 }
@@ -910,6 +924,8 @@ interface RawAgentRequestContext {
  */
 export class PooledConnection {
   readonly backendId: BackendId;
+  /** Process-unique connection id, used only to tag `BackendAuthMachine` events (§2.3). */
+  readonly id: string = `conn-${(nextConnectionSeq += 1)}`;
   /** The held ACP connection (fluent client() app); session/* calls go through its
    *  `agent` ClientContext via the typed wrappers below. */
   private readonly connection: ClientConnection;
@@ -922,6 +938,13 @@ export class PooledConnection {
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly advertiseElicitation: boolean;
   private readonly authCapabilities: { terminal?: boolean; gateway?: boolean } | undefined;
+  private readonly authStore: AuthStore | undefined;
+  /** Which intent-generation THIS process reflects (§2.4). Starts at -1/false so a connection with
+   *  no applied intent is stale against a machine that has ever advanced past generation 0. */
+  authStamp: ConnectionAuthStamp = { appliedGeneration: -1, applied: false, trippedAuthRequired: false };
+  /** Set by the pool when a busy stale connection must be recycled once it drains (§2.6). While set,
+   *  the connection is never handed a new session and is disposed-and-dropped on release. */
+  recyclePending = false;
   /** Set true at the start of dispose() so the graceful-shutdown death is NOT reported as a crash. */
   private disposing = false;
   /** Resolves once `initialize` completed (or rejects if the process died first). */
@@ -945,6 +968,7 @@ export class PooledConnection {
     this.clientHandlers = deps.clientHandlers;
     this.advertiseElicitation = deps.advertiseElicitation ?? Boolean(deps.elicitationResolver);
     this.authCapabilities = deps.authCapabilities;
+    this.authStore = deps.authStore;
     this.client = new MultiplexClient(
       this.backendId,
       this.onEvent,
@@ -954,9 +978,16 @@ export class PooledConnection {
     );
 
     const { command, args, env } = backend.spawnConfig();
+    // Spawn-env auth overlay (§2.8): host-collected `env_var` values (and, for a profiled backend,
+    // its `spawnAuthEnv` contribution) stacked ABOVE the backend's own env. Undefined when nothing is
+    // held — byte-identical to today. Passed straight to spawn; never logged (§2.14, Principle 9).
+    const authOverlay = this.authStore?.spawnEnvFor(backend.poolKey ?? backend.id);
     // NOTE: deliberately NO `cwd` here. cwd is per-SESSION (session/new), so one pooled process
     // serves runs in different worktrees without losing isolation.
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], env });
+    const child = spawn(command, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: authOverlay ? { ...env, ...authOverlay } : env,
+    });
     this.child = child;
 
     if (!child.stdin || !child.stdout) {
@@ -1145,6 +1176,8 @@ export class PooledConnection {
     this.client.settleAllPendingPermissions();
     this.client.settleAllPendingElicitations();
     this.client.disconnectAllMcpConnections();
+    // The dying connection's stamp is dropped with it; the machine's auth state is unchanged (§2.3).
+    this.authStore?.existing(this.backend.poolKey ?? this.backend.id)?.send({ t: "process_death", connectionId: this.id });
     // A crash (not a graceful dispose) is worth surfacing for observability; the engine still
     // handles it by retrying the run on a fresh process. Best-effort, after death is recorded.
     if (this.onEvent && !this.disposing) {
@@ -1154,8 +1187,79 @@ export class PooledConnection {
   }
 
   private stderrSuffix(): string {
-    const tail = this.stderrTail.trim();
+    // Redact credential-shaped substrings before the tail can appear in any error suffix (§2.14):
+    // a spawned agent that echoes an injected env var to stderr must not leak it into an error.
+    const tail = redactSecrets(this.stderrTail).trim();
     return tail ? `\n${tail}` : "";
+  }
+
+  /** Resolve this connection's `BackendAuthMachine` from the runner's store, or undefined when no
+   *  store is wired (default-OFF) — the machine is keyed by the backend's poolKey (§2.3). */
+  private authMachine(): BackendAuthMachine | undefined {
+    return this.authStore?.machineFor(this.backend.poolKey ?? this.backend.id, this.backend.authProfile);
+  }
+
+  /** Mark this connection current against `generation` (nothing more to apply). */
+  private stampApplied(generation: number): void {
+    this.authStamp = { appliedGeneration: generation, applied: true, trippedAuthRequired: false };
+  }
+
+  /** true iff the current intent is an in-process (gateway) cred, so an idle connection can be
+   *  re-primed with an authenticate RPC replay instead of being recycled (§2.6). */
+  canLiveReapply(machine: BackendAuthMachine): boolean {
+    return machine.currentKlassIsInProcess();
+  }
+
+  /** Reconcile this connection to the current intent at the end of `initialize` (§2.5). For an
+   *  in-process cred, replay `authenticate({methodId,_meta})`; for disk/spawn-env a fresh process
+   *  already carries the credential, so only stamp it current. */
+  private async applyAuthIntent(machine: BackendAuthMachine): Promise<void> {
+    if (machine.state !== "credentials_held" && machine.state !== "authenticated") {
+      this.stampApplied(machine.generation); // nothing to apply; mark current
+      return;
+    }
+    const intent = machine.intentView();
+    if (intent?.klass !== "in-process") {
+      // disk (native store) + spawn-env (env at spawn) need no RPC — a fresh process already has them.
+      this.stampApplied(machine.generation);
+      return;
+    }
+    const meta = machine.applyMeta();
+    try {
+      await this.rawAgentRequest<AuthenticateResponse | void, AuthenticateRequest>(AGENT_METHODS.authenticate, {
+        methodId: intent.methodId,
+        ...(meta ? { _meta: meta } : {}),
+      });
+      this.stampApplied(machine.generation);
+      machine.send({ t: "apply_ok", connectionId: this.id, generation: machine.generation });
+    } catch (err) {
+      machine.send({ t: "apply_failed", connectionId: this.id, generation: machine.generation, error: err });
+      throw err; // -> AUTH_REQUIRED via §1.5; connection unusable
+    }
+  }
+
+  /** Idle in-process connection: re-send `authenticate` and re-stamp so the next session opens under
+   *  the current gateway cred without a process recycle (§2.6). Returns true iff a re-apply ran. */
+  async reapplyAuthIfStale(machine: BackendAuthMachine): Promise<boolean> {
+    if (!machine.isStale(this.authStamp) || !this.canLiveReapply(machine)) return false;
+    await this.ready;
+    await this.applyAuthIntent(machine);
+    return true;
+  }
+
+  /** Fire-and-forget idle live re-apply (§2.6). Any failure disposes the connection so the pool
+   *  respawns a fresh process rather than serving a session under a failed replay. */
+  scheduleReapply(machine: BackendAuthMachine): void {
+    void this.reapplyAuthIfStale(machine).catch(() => {
+      this.recyclePending = true;
+      void this.dispose();
+    });
+  }
+
+  /** Mark a BUSY stale connection for recycle once it drains (§2.6): finish in-flight prompts under
+   *  the auth they started with, then dispose-and-drop on release. */
+  markForRecycleWhenIdle(_machine: BackendAuthMachine): void {
+    this.recyclePending = true;
   }
 
   /** Race a wire call against process death so a crash surfaces a clear error instead of hanging
@@ -1221,6 +1325,15 @@ export class PooledConnection {
         );
       }
       this.negotiated = negotiated;
+      // Reconcile this connection to the current auth intent (§2.5). Runs identically on pooled,
+      // dedicated, and interactive connections — the intent is durable in the AuthStore, so a fresh
+      // process always re-primes an in-process (gateway) credential here, which is the direct fix
+      // for the dispose-after-authenticate bug (gap 3). Disk/spawn-env intents are only stamped.
+      const machine = this.authMachine();
+      if (machine) {
+        machine.send({ t: "initialize_ok", connectionId: this.id, advertised: negotiated.authMethods });
+        await this.applyAuthIntent(machine);
+      }
     } finally {
       clearTimeout(timer);
     }
@@ -1530,6 +1643,14 @@ export class PooledConnection {
   async releaseSession(sessionId: string, keepOpen = false): Promise<void> {
     this.client.unregister(sessionId);
     if (this._activeSessions > 0) this._activeSessions -= 1;
+    // Generation-gated recycle (§2.6): a stale connection marked for recycle while busy is
+    // disposed-and-dropped the moment it drains, instead of returning to the pool, so the next
+    // acquire lands on a fresh process that primes the current intent at initialize. dispose()
+    // drops it via the onDead path.
+    if (this.recyclePending && this._activeSessions === 0 && this._alive) {
+      void this.dispose();
+      return;
+    }
     // keepOpen: the caller intends to re-open this session later (session/load|resume), so the
     // agent-persisted session must be left untouched — skip the best-effort close entirely.
     if (keepOpen || !this.negotiated?.supportsClose || !this._alive) return;

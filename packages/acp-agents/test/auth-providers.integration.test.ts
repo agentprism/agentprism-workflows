@@ -61,21 +61,25 @@ test("runner.authMethods returns [] when none are advertised", async () => {
   assert.deepEqual(await makeRunner().authMethods({ model: "claude" }), []);
 });
 
-test("authenticate round-trips methodId and _meta on the wire", async () => {
-  const { readLog } = configure({
-    authMethods: AUTH_METHODS,
-    authenticate: { response: { _meta: { ok: true } } },
+test("authenticate records the credential into the AuthStore and REPLAYS it after initialize (§2.5/§2.9)", async () => {
+  // REBUILT off dispose-after-authenticate: a method carrying `_meta` (gateway-shaped => in-process)
+  // records a durable intent instead of a fire-and-dispose RPC, and the credential is replayed on the
+  // next pooled connection's initialize (the gap-3 fix) rather than lost with a disposed connection.
+  const { cwd, readLog } = configure({
+    authMethods: [{ id: "gateway", name: "Gateway", _meta: { gateway: {} } }],
+    authenticate: { response: {} },
+    turns: [{ text: "done" }],
   });
-  const response = await makeRunner().authenticate({
-    model: "claude",
-    methodId: "api-key",
-    meta: { source: "test" },
-  });
+  const runner = makeRunner();
+  await runner.authenticate({ model: "claude", methodId: "gateway", meta: { gateway: { token: "secret" } } });
 
-  assert.deepEqual(response, { _meta: { ok: true } });
+  // The replay lands when a pooled process initializes for the next run().
+  const result = await runner.run("go", { model: "claude", cwd, label: "gw" });
+  assert.equal(result, "done");
+
   const call = readLog().find((entry) => entry.method === "authenticate");
-  assert.equal(call?.params?.methodId, "api-key");
-  assert.deepEqual(call?.params?._meta, { source: "test" });
+  assert.equal(call?.params?.methodId, "gateway");
+  assert.deepEqual(call?.params?._meta, { gateway: { token: "secret" } });
 });
 
 test("providers list/set/disable and logout round-trip through the selected backend", async () => {
@@ -149,6 +153,33 @@ test("auth-required on session/new maps to non-recoverable AUTH_REQUIRED without
     },
   );
   assert.equal(count(readLog(), "newSession"), 1);
+});
+
+test("with onAuth, a -32000 resolves-and-retries EXACTLY once then propagates AUTH_REQUIRED (§2.11)", async () => {
+  const { cwd, readLog } = configure({
+    authMethods: AUTH_METHODS,
+    authRequiredOnNewSession: true, // the fixture -32000s on EVERY newSession
+    turns: [{ text: "unused" }],
+  });
+  let calls = 0;
+  const runner = harness.makeRunner({
+    onAuth: () => {
+      calls += 1;
+      return { outcome: "completed" };
+    },
+  });
+
+  await assert.rejects(
+    () => runner.run("hi", { model: "claude", cwd, label: "needs-auth" }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      assert.equal(error.code, WorkflowErrorCode.AUTH_REQUIRED);
+      return true;
+    },
+  );
+  // The resolver ran once and the acquire retried once: exactly two newSession attempts, no loop.
+  assert.equal(calls, 1);
+  assert.equal(count(readLog(), "newSession"), 2);
 });
 
 test("ungated authenticate surfaces method-not-found with backend and method context", async () => {
