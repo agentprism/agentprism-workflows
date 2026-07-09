@@ -1,5 +1,33 @@
 # @automatalabs/shared-types
 
+## 0.14.0
+
+### Minor Changes
+
+- b70293b: Error taxonomy for ACP auth: classify `AUTH_REQUIRED` code-first on `-32000` (reserved
+  exclusively for `authRequired`) so localized/rephrased auth messages no longer misroute
+  into the retry ladder, plus a guarded prose fallback for non-conformant agents (a different
+  reserved code that merely mentions the phrase never mis-routes). Adds a structured,
+  non-secret `AuthErrorContext` (`backendId` + advertised method `{id,type,name}[]`) carried on
+  `WorkflowError.authContext`, and an `isAuthRequired` type guard re-exported through
+  `@automatalabs/workflow-engine`. Behavior-preserving for the three first-class agents.
+- fecf517: Engine pause-for-auth + cold-resume re-arm. `WorkflowManager` generalizes the
+  `PROVIDER_USAGE_LIMIT` pause branch so an `AUTH_REQUIRED` fault **checkpoints the run as
+  paused** (`reason: "auth_required"`) instead of failing it — the journal is preserved and
+  `resume()` can finish once the host completes auth. The pause persists the structured,
+  non-secret `authContext` (`backendId` + advertised method `{id,type,name}[]`) and carries it
+  on the `paused` event and the composed `WorkflowRunResult`; the intent's secret payload
+  (`authenticateMeta`/`envValues`) is never journaled, logged, or emitted (Principle 9).
+  `resume()` re-arms cold: for an `"auth_required"` pause it consults the injected runner's
+  `runner.auth.canResume(backendId)` (duck-typed — no package import) and immediately re-pauses
+  with `re-supply credentials for <backend> via runner auth before resuming` when an in-process
+  (gateway) / spawn-env intent was lost to a fresh process, while disk-backed intents (and warm
+  same-process resume) proceed. `WorkflowRunResult.authContext` and
+  `PersistedRunState.authContext` are added (both non-secret); `pauseReason` is already
+  free-form so no migration. Default-off is preserved: a run that never hits `AUTH_REQUIRED`
+  sees byte-identical behavior, and a runner with no `auth` controller re-pauses rather than
+  re-running into the same wall.
+
 ## 0.13.0
 
 ### Minor Changes
