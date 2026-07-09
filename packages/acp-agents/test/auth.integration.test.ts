@@ -59,6 +59,18 @@ function newSessions(log: LogEntry[]): LogEntry[] {
   return log.filter((e) => e.method === "newSession");
 }
 
+/** Deterministic settle signal for the fire-and-forget live re-apply (§2.6): `host_authenticate`
+ *  resets the machine to "credentials_held", and `apply_ok` — sent only AFTER the connection stamp
+ *  — flips it back to "authenticated", so the redacted status is safe to poll. */
+async function waitForApplied(runner: AcpAgentRunner, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (runner.auth.status({ backend: "claude" })[0]?.state === "authenticated") return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.fail("timed out waiting for the live re-apply to settle (machine never reached 'authenticated')");
+}
+
 afterEach(async () => {
   await Promise.all(runners.splice(0).map((r) => r.dispose()));
   for (const key of ENV_KEYS) delete process.env[key];
@@ -198,6 +210,44 @@ test("generation staleness: a mid-life completeAuth drains the stale process; no
   const pidB = authedPids.at(-1);
   assert.ok(pidA && pidB);
   assert.notEqual(pidA, pidB); // the second run landed on a FRESH process, never the stale one
+});
+
+test("generation staleness, in-process half: a mid-life gateway re-auth live-reapplies on the SAME idle process (§2.6, no recycle)", async () => {
+  const { cwd, readLog } = setup();
+  const runner = makeRunner({ authCapabilities: { gateway: true } });
+  await runner.auth.authenticate({
+    model: "claude",
+    methodId: "gateway",
+    resolution: { outcome: "meta", methodId: "gateway", meta: { gateway: { baseUrl: "https://gw-a.test" } } },
+  });
+  const r1 = await runner.run("one", { model: "claude", cwd });
+  assert.equal(r1, "ok");
+  const pidA = newSessions(readLog()).find((e) => e.authed)?.pid;
+  assert.ok(pidA);
+
+  // Re-authenticate with a NEW gateway credential while the process idles. The in-process klass
+  // takes the live-reapply branch (an authenticate replay on the live connection) — the
+  // complement of the drained half above, where the spawn-env process is disposed instead.
+  await runner.auth.authenticate({
+    model: "claude",
+    methodId: "gateway",
+    resolution: { outcome: "meta", methodId: "gateway", meta: { gateway: { baseUrl: "https://gw-b.test" } } },
+  });
+  await waitForApplied(runner);
+
+  const r2 = await runner.run("two", { model: "claude", cwd });
+  assert.equal(r2, "ok");
+
+  const log = readLog();
+  // Both runs were served by the ONE original process: the stale idle connection was re-primed
+  // live, never recycled.
+  const authedPids = new Set(newSessions(log).filter((e) => e.authed).map((e) => e.pid));
+  assert.deepEqual([...authedPids], [pidA]);
+  // The re-apply is visible on the wire: a SECOND authenticate on the same pid carrying cred B.
+  const replays = log.filter((e) => e.method === "authenticate" && e.params?.methodId === "gateway" && e.pid === pidA);
+  assert.equal(replays.length, 2);
+  const gw = (replays.at(-1)?.params?._meta as { gateway?: { baseUrl?: string } } | undefined)?.gateway;
+  assert.equal(gw?.baseUrl, "https://gw-b.test");
 });
 
 test("interactive openSession on a dedicated connection replays the in-process credential", async () => {
