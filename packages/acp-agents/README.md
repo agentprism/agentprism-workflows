@@ -1,20 +1,23 @@
 # @automatalabs/acp-agents
 
-Low-level building block: the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) client plus Claude and Codex backends that implement the `AgentRunner` seam from `@automatalabs/shared-types`. It spawns `claude-agent-acp` / `codex-acp` as child processes, drives one subagent turn to completion over ACP, and returns structured output or text.
+Low-level building block: the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) client plus Claude, Codex, OpenCode, and custom backends that implement the `AgentRunner` seam from `@automatalabs/shared-types`. It spawns an ACP server as a child process, drives one subagent turn to completion, and returns structured output or text.
 
 This is the layer `@automatalabs/workflows` and `@automatalabs/mcp-server` are built on.
 
 ## Most users want `@automatalabs/workflows`
 
-If you are orchestrating a workflow, use [`@automatalabs/workflows`](../workflows) instead — it re-exports `createAcpRunner` and wires it into the engine for you. Reach for this package directly only when you want to drive a **single** Claude/Codex agent over ACP yourself.
+If you are orchestrating a workflow, use [`@automatalabs/workflows`](../workflows) instead — it re-exports `createAcpRunner` and wires it into the engine for you. Reach for this package directly only when you want to drive a **single** ACP agent yourself or need the low-level auth/session lifecycle APIs.
 
 ```bash
 npm install @automatalabs/acp-agents
 ```
 
+Claude and Codex adapters are dependencies of this package. OpenCode is resolved from an
+`opencode-ai` installation or an `opencode` executable on `PATH` only when selected.
+
 ## Standalone use: drive one agent
 
-`createAcpRunner().run(prompt, options)` runs a single agent to completion. Pass a [typebox](https://github.com/sinclairzx81/typebox) `schema` to get a validated object back (typed as `Static<typeof schema>`); omit it to get the final assistant text as a `string`. The backend (Claude vs Codex) is selected from `model` / `tier`. Whoever constructs the runner owns it: call `dispose()` (or use `await using`) when you're done to tear down the pooled child processes.
+`createAcpRunner().run(prompt, options)` runs a single agent to completion. Pass a [typebox](https://github.com/sinclairzx81/typebox) `schema` to get a validated object back (typed as `Static<typeof schema>`); omit it to get the final assistant text as a `string`. The Claude, Codex, OpenCode, or registered custom backend is selected from `model` / `tier`. Whoever constructs the runner owns it: call `dispose()` (or use `await using`) when you're done to tear down the pooled child processes.
 
 ```ts
 import { createAcpRunner } from "@automatalabs/acp-agents";
@@ -45,7 +48,7 @@ try {
 }
 ```
 
-`run()` accepts the full `RunOptions` seam: `schema`, `model`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `mcpServers`, `images` (see below), `runId`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `onUsage`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
+`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, `onSessionOpen`, `onUsage`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
 
 ### Image attachments (`images`)
 
@@ -69,7 +72,7 @@ They ride ACP `session/new` `_meta` as bare keys and are threaded into the Codex
 
 ```ts
 await runner.run("Cut the release.", {
-  model: "openai/gpt-5-codex",
+  model: "openai/gpt-5.5",
   cwd: "/abs/path/to/worktree",
   baseInstructions: "You are a release bot. Only touch CHANGELOG.md.",
   developerInstructions: "Prefer conventional-commit summaries.",
@@ -131,6 +134,28 @@ try {
 }
 ```
 
+## Authentication lifecycle
+
+The built-in runner is auth-capable without widening the minimal `AgentRunner` interface.
+`describeAuthMethods()` returns normalized `agent` / `terminal` / `env_var` descriptors;
+`completeAuth()` applies a host resolution; and `runner.auth.status()`, `.authenticate()`, and
+`.logout()` provide the controller form. Construct the runner with `authCapabilities` to advertise
+what the host can complete and `onAuth` to resolve an `AuthContext` inline.
+
+Without an inline resolver, an ACP `-32000` signal becomes a non-recoverable
+`WorkflowError { code: "AUTH_REQUIRED", authContext }`. The workflow manager recognizes that code
+and pauses managed runs, but a direct `runner.run()` caller receives the error and decides how to
+authenticate/retry. Credential env/meta payloads remain in the in-memory `AuthStore`, are redacted
+from errors and events, and are zeroized on logout.
+
+## Session handoff
+
+Use `onSessionOpen` to capture the backend/session/cwd re-attach handle. Set `keepSession: true`
+when the backend supports persistence and the host intends to call `loadSession()` or
+`resumeSession()` later; this skips the release-time best-effort `session/close`. The runner also
+exposes `listSessions()` and `deleteSession()` where advertised. Re-attach support is capability
+gated, so inspect the handle's `reopen` flags rather than assuming every ACP agent persists state.
+
 ## Listening in: live ACP events
 
 `AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions, elicitations). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId? }` context envelope (a pooled runner multiplexes many runs at once). `permission_pending` / `elicitation_pending` are resolver-only and carry `{ request }` before the host resolver is invoked; `permission_request` / `elicitation_request` fire exactly once with the final `{ request, outcome }` returned to the agent; `elicitation_complete` carries `{ notification }` for URL completions. `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
@@ -152,13 +177,14 @@ From [`src/index.ts`](./src/index.ts):
 
 - **`createAcpRunner(options?)`** — factory returning an `AcpAgentRunner` (this is what `@automatalabs/workflows` injects into the engine).
 - **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `openSession(options)`, `dispose()`, and `[Symbol.asyncDispose]()` for `await using`. The caller that constructs a runner owns its lifecycle.
-- **Auth/provider lifecycle methods** — `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support.
+- **Auth/provider lifecycle methods** — `describeAuthMethods()`, `completeAuth()`, `runner.auth`, `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support.
 - **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, and `resumeSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
 - **`AcpRunnerOptions.onElicitation`** — runner-wide ACP elicitation responder; sessions can override with `InteractiveSessionOptions.onElicitation`.
 - **`selectBackend({ model, tier }, registry?)`** — the cross-provider routing rule: which backend a spec maps to (registered custom names match first, exact or `name/<inner-model>`).
-- **`ClaudeBackend` / `CodexBackend`** — the two built-in backend strategies (spawn config + per-backend schema wiring).
-- **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, customCapabilities? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; `claude`/`codex` reserved). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. `customCapabilities: { namespace, gatedKeys }` declares the agent's `agentCapabilities._meta` negotiation contract: once the agent advertises that namespace, each declared bare `_meta` key is sent only when its same-named flag is `true` (no declaration = never gated).
+- **`ClaudeBackend` / `CodexBackend` / `OpenCodeBackend`** — the three built-in backend strategies (spawn config + per-backend schema/auth wiring). OpenCode is host-resolved rather than bundled.
+- **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, customCapabilities? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; `claude`/`codex`/`opencode` reserved). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. `customCapabilities: { namespace, gatedKeys }` declares the agent's `agentCapabilities._meta` negotiation contract: once the agent advertises that namespace, each declared bare `_meta` key is sent only when its same-named flag is `true` (no declaration = never gated).
+- **Auth contracts and lifecycle** — `AuthStore`, `BackendAuthMachine`, `buildAuthDescriptors`, the built-in auth profiles, and the `AuthContext` / `AuthResolution` / `AuthMethodDescriptor` / `AuthCapableRunner` types.
 - **`PermissionResolver`** — async human-in-the-loop permission resolution for runner-wide or interactive sessions.
 - **`clientCapabilitiesFor` + the `ClientHandlers` / `FsHandlers` / `TerminalHandlers` / `AcpSessionContext` types** — the client-side fs/terminal interposition surface (see above).
 - **`negotiateCapabilities` / `adaptPromptContent` / `gateCustomMeta` / `unsupportedMcpServer` + `NegotiatedCapabilities`** — the `initialize` capability-negotiation primitives; the negotiated record for a live connection is exposed on `PooledConnection.capabilities`.
@@ -178,6 +204,7 @@ Also exported: `AcpAgentPool` / `resolvePoolSize`, `PooledConnection` / `Session
 | `AGENTPRISM_CLAUDE_ACP_CMD` / `AGENTPRISM_CLAUDE_ACP_ARGS` | Override the command (and args) used to spawn the Claude ACP server. |
 | `AGENTPRISM_CODEX_ACP_CMD` / `AGENTPRISM_CODEX_ACP_ARGS` | Override the command (and args) used to spawn the Codex ACP server. |
 | `AGENTPRISM_CODEX_ACP_BIN` | Override only the resolved Codex ACP bin path (keeps the default node launcher). |
+| `AGENTPRISM_OPENCODE_ACP_CMD` / `AGENTPRISM_OPENCODE_ACP_ARGS` | Override the command (and args) used to spawn the OpenCode ACP server. |
 
 ## License
 

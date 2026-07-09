@@ -37,6 +37,10 @@ Contract, in brief:
   engine's job (it races a timeout and passes `options.signal`); the runner should honor the
   signal but must not implement its own timeout.
 
+The manager has two intentional exceptions to ordinary non-recoverable failure: it converts
+`PROVIDER_USAGE_LIMIT` and `AUTH_REQUIRED` into persisted, resumable `paused` results. Direct
+`AgentRunner` consumers still receive the thrown error.
+
 A minimal custom backend:
 
 ```ts
@@ -72,21 +76,26 @@ From [`src/index.ts`](./src/index.ts):
 **The seam**
 - `AgentRunner` — the `run(prompt, options) => result` interface above.
 - `RunOptions<S>` — the options bag: `label`, `schema`, `instructions`, `signal`, `model`,
-  `tier`, `cwd`, `toolNames`, `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `runId`,
-  the Codex-only `baseInstructions` / `developerInstructions`, and the out-of-band callbacks
-  `onUsage`, `onModelResolved`, `onModelFallback`, `onHistory`.
+  `mode`, `tier`, `cwd`, `toolNames`, `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`,
+  `images`, `runId`, `backends`, `meta`, `promptMeta`, the Codex-only `baseInstructions` /
+  `developerInstructions`, `keepSession`, and the out-of-band callbacks `onUsage`,
+  `onModelResolved`, `onModelFallback`, `onHistory`, `onSessionOpen`.
 - `AgentResult<S>` — `S extends TSchema ? Static<S> : string`.
 - `AgentUsage` — per-run token/cost: `input`, `output`, `cacheRead`, `cacheWrite`, `total`, `cost`.
 - `AgentRunOptions` / `AgentRunResult` — lift-compat aliases for `RunOptions` / `AgentResult`.
 
 **Errors** (runtime, not just types)
 - `WorkflowError` (class) + `WorkflowErrorCode` (enum) + `WorkflowErrorOptions`.
-- `isWorkflowError`, `isProviderUsageLimit`, `classifyProviderLimit` (guards / classifier).
+- `AuthErrorContext` — the non-secret backend/method summary carried by `AUTH_REQUIRED`.
+- `isWorkflowError`, `isProviderUsageLimit`, `isAuthRequired`, `classifyProviderLimit`
+  (guards / classifier).
 
 **Workflow result**
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,
-  `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`).
-- `RunStatus`, `WorkflowMeta`, `WorkflowMetaPhase`, `TokenUsage`, `JournalEntry`.
+  `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`,
+  `authContext?`, `agentSessions?`).
+- `RunStatus`, `WorkflowMeta`, `WorkflowMetaPhase`, `WorkflowBackendConfig`, `TokenUsage`,
+  `JournalEntry`, `AgentSessionRef`, `AgentSessionRecord`.
 
 **MCP config**
 - `McpServerConfig` (union) + `McpStdioServerConfig`, `McpHttpServerConfig`,

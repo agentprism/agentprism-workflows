@@ -1,67 +1,55 @@
-# ACP+MCP orchestrator — build runbook
+# Historical ACP + MCP build-orchestration runbook
 
-Phased, human-gated build of the Pi-independent ACP+MCP workflow orchestrator described in `../README.md`.
-Each phase is a saved Workflow under `../.claude/workflows/`. Run them **in order**, and **read each phase's
-handoff JSON before launching the next** — the gate is deliberate.
+This directory is retained as provenance for the workflows that built, integrated, verified, hardened, and prepared this repository for publication. It is **not** the normal development or release procedure. The saved handoffs and workflow prompts contain frozen source snapshots, absolute paths, dependency versions, branch names, and worktree assumptions from their original runs; do not rerun them blindly against a current checkout.
 
-## Phases
+For current development, use the repository commands documented in [`CONTRIBUTING.md`](../CONTRIBUTING.md). In particular, run `pnpm typecheck` and `pnpm test` before merging. Live backend checks are opt-in and require the credentials described there.
 
-| Phase | Workflow name | Reads | Writes (handoff) |
+## Historical workflow chain
+
+The workflows live in [`.claude/workflows`](../.claude/workflows). Their durable handoffs live beside this runbook.
+
+| Stage | Workflow file | Durable handoff | Historical purpose |
 |---|---|---|---|
-| 0 · ground truth | *(done)* | pinned source | `ground-truth.json` (+ `corrections` overlay) |
-| 1 · freeze + scaffold | `acp-build-phase1-freeze` | `ground-truth.json`, `../README.md` | `phase1-contract.json`, scaffold commit |
-| 2 · implement | `acp-build-phase2-implement` | `phase1-contract.json`, staged source | `phase2-modules.json`, 3 branches |
-| 3 · integrate | `acp-build-phase3-integrate` | `phase2-modules.json` | `phase3-integration.json`, merge commit |
-| 4 · verify | `acp-build-phase4-verify` | `phase3-integration.json` | `phase4-verify.json` |
+| 0 | *(manual ground truth)* | `ground-truth.json` | Freeze source evidence and corrections. |
+| 1 | `acp-build-phase1-freeze.js` | `phase1-contract.json` | Freeze contracts and scaffold packages. |
+| 2 | `acp-build-phase2-implement.js` | `phase2-modules.json` | Implement modules in isolated worktrees. |
+| 3 | `acp-build-phase3-integrate.js` | `phase3-integration.json` | Merge module branches and reconcile dependencies. |
+| 3b | `acp-build-phase3b-tests.js` | `phase3b-tests.json` | Expand integration coverage. |
+| 4 | `acp-build-phase4-verify.js` | *(no committed handoff)* | Verify builds and real-backend smoke behavior. |
+| 5 | `acp-build-phase5-completeness.js` | `phase5-completeness.json` | Audit API and feature completeness. |
+| 6 | `acp-build-phase6-harden.js` | `phase6-harden.json` | Harden failure paths and release quality. |
+| Publish | `publish-prep.js` | `publish-prep.json` | Prepare the package set for publication. |
+| Auth | `acp-auth-implementation.js` | *(run journal only)* | Implement the authentication design recorded in `docs/specs/acp-auth-spec.md`. |
 
-`ground-truth.json` is the authoritative Phase-0 input — its top-level **`corrections`** block WINS over
-`findings`/`readiness` on any conflict (Codex structured-output is verified end-to-end; all README citation
-discrepancies are fixed; MCP bounds clamp-not-reject).
+`ground-truth.json` was authoritative for the initial build; its top-level `corrections` block overrode conflicting `findings` or `readiness` entries. It should not be treated as a current package inventory or dependency manifest.
 
-## Run a phase
+## Inspecting or replaying a historical workflow
 
-By name (resolves from `.claude/workflows/`):
+Validate a script before any replay:
 
-    Workflow({ name: "acp-build-phase1-freeze" })
+```bash
+npx @automatalabs/workflows validate .claude/workflows/acp-build-phase1-freeze.js --args '{}'
+```
 
-…or by path:
+The MCP `workflow` tool accepts the **raw JavaScript source** in its `script` input. It does not resolve a saved workflow name. SDK callers may read a saved file themselves, call `openWorkflowDir(".claude/workflows").read(name)`, or pass the directory view to `runDynamicWorkflow(name, { workflows: view })`.
 
-    Workflow({ scriptPath: "<repo>/.claude/workflows/acp-build-phase1-freeze.js" })
+Runs return a `runId`. A paused run can be resumed with the same script plus `resumeFromRunId`; completed agents are recovered from the persisted journal when their deterministic definitions still match. Authentication pauses return `reason: "auth_required"` (persisted as the run's pause reason): inspect status, complete authentication through the runner or MCP auth tools, then resume the original `runId`.
 
-Each returns a `runId`. To resume after a pause/edit:
-`Workflow({ scriptPath: "…", resumeFromRunId: "<runId>" })` (completed agents return cached results).
+Before replaying any script, review and update:
 
-## Prerequisites
+- absolute repository, source, SDK, and worktree paths;
+- pinned commits and package versions;
+- expected branches, handoffs, and already-completed stages;
+- backend availability and authentication requirements;
+- write scopes in every agent prompt.
 
-- `node` (v24 used), `pnpm`, `git`, `npm`.
-- **Staged source** (Phase 2 reads it): run `./stage-sources.sh` to (re)create `./sources` + `./sdks`.
-  Already present in this checkout; re-run only if missing or in a fresh session.
-- **Pi engine source** at `/home/vikash/pi-dynamic-workflows/src` @ `1b0291ab` (lifted by Phase 2).
-- **Phase 4 smoke** needs real backends: `claude-agent-acp` (Anthropic auth) and the patched
-  `codex-acp` (OpenAI/Codex auth). If a backend can't auth here, Phase 4 reports it rather than passing.
+## Historical worktree model
 
-## How worktrees are used + integrated (Phase 2 → 3)
+Phase 2 created self-managed git worktrees outside the repository, one per module branch, all cut from the scaffold commit recorded in `phase1-contract.json`. Phase 3 merged those branches by commit SHA, ran one dependency install in the main checkout, and removed the temporary worktrees after successful integration. This build-time arrangement is separate from the workflow engine's runtime `isolation: "worktree"` feature.
 
-The parallel module work is isolated with **self-managed git worktrees**, not the harness `isolation` flag,
-so the merge contract is concrete:
+## State and cleanup
 
-1. **Phase 2 · Prepare** creates three worktrees OUTSIDE the repo at `/home/vikash/agentprism-worktrees/<module>`,
-   each on branch `phase2/<module>` cut from the **exact scaffold commit** (`phase1-contract.json.scaffoldCommitSha`).
-   They share the main repo's object store + refs, so the branches are visible/mergeable from the main repo.
-2. **Phase 2 · Implement** runs the three module agents concurrently, each confined to its own worktree and to
-   `packages/<module>/` only. Hard rule: **never commit root files or `pnpm-lock.yaml`** (each module adds deps to
-   its own `package.json`; the lockfile is regenerated once in Phase 3). This is what keeps the three branches
-   conflict-free.
-3. **Phase 3 · Integrate** merges **by commit SHA** (`git merge --no-ff <sha>`) — robust to branch-name quirks —
-   then runs a **single `pnpm install`** to reconcile the lockfile, builds, and loops fix→rebuild until green. A
-   merge conflict here is a signal that a module escaped its package dir → it stops rather than force-resolving.
-   On success it removes the worktrees (branches remain in history).
-
-Note: the *engine's own* `worktree.ts` (the product feature that isolates subagents at runtime) is a separate
-thing — it's lifted in Phase 2 and exercised in Phase 4, unrelated to how we build the system.
-
-## State / cleanup
-
-- Handoffs (`phase*.json`) + `ground-truth.json` are the durable chain; safe to inspect/diff between phases.
-- `sources/`, `sdks/`, `worktrees/` are gitignored (re-creatable).
-- To restart a phase clean: delete its handoff JSON and the branches/worktrees it created, then re-run.
+- The committed JSON handoffs are historical records and safe to inspect or diff.
+- `sources/`, `sdks/`, and temporary worktrees are recreatable and ignored by git.
+- A replay writes normal persisted run state under the configured AgentPrism persistence root (see `AGENTPRISM_PERSISTENCE_ROOT`).
+- Do not delete historical handoffs merely to restart current development; they are provenance, not active build state.

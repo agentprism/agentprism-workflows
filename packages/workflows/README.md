@@ -6,17 +6,19 @@ The programmatic **SDK** for AgentPrism — run dynamic, multi-agent **workflow 
 
 You author a small JavaScript **script** (a string), the engine runs it in a deterministic,
 journaled, resumable realm, and every `agent()` call inside it is fanned out to a pooled ACP
-backend — **Claude** (`claude-agent-acp`) or **Codex** (`codex-acp`) — driving the actual agent
-subprocess to completion.
+backend — **Claude** (`claude-agent-acp`), **Codex** (`codex-acp`), **OpenCode** (`opencode acp`),
+or a registered custom ACP agent — driving the actual subprocess to completion.
 
 This package is the **canonical SDK** that the stdio MCP server
 [`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server) is built on.
 If you want to expose a `workflow` tool to an MCP host (Claude Code, Zed, …), use that package; if
 you want to embed the runner in your own program, use this one.
 
-It is a **pure library**: it pulls in neither `@modelcontextprotocol/sdk` nor `zod`. It is a thin
-facade that re-exports the clean public surface of the engine + ACP packages and adds one
-convenience helper, `runDynamicWorkflow`, which defaults the agent backend to ACP.
+It is a **programmatic library**, not an MCP stdio server. It is a thin facade over the engine +
+ACP packages and adds one convenience helper, `runDynamicWorkflow`, which defaults the agent
+backend to ACP. The ACP layer does use `@modelcontextprotocol/sdk` internally when it hosts the
+optional StructuredOutput tool for eligible agents; consumers still interact through this SDK's
+workflow/runner APIs rather than MCP server schemas.
 
 ---
 
@@ -26,8 +28,9 @@ convenience helper, `runDynamicWorkflow`, which defaults the agent backend to AC
 pnpm add @automatalabs/workflows
 ```
 
-> The backend ACP servers ship as transitive dependencies and are spawned for you on demand; you
-> do not install or start them separately.
+> The Claude and Codex ACP servers ship as transitive dependencies and are spawned on demand.
+> OpenCode is host-resolved: install `opencode-ai` or make `opencode` available on `PATH` before
+> routing a call to it.
 
 ---
 
@@ -39,6 +42,7 @@ pnpm add @automatalabs/workflows
   - **Claude** — a logged-in Claude Code install (`~/.claude`) **or** `ANTHROPIC_API_KEY` in the
     environment.
   - **Codex** — a logged-in Codex install (`~/.codex`).
+  - **OpenCode** — credentials configured for the provider OpenCode will use.
 
 You only need auth for the backend(s) your scripts actually route to. The default backend is
 Claude (override with `AGENTPRISM_DEFAULT_BACKEND`; see [Backend selection](#backend-selection)).
@@ -94,6 +98,8 @@ Options (`RunDynamicWorkflowOptions`):
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
 | `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, … |
+| `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
+| `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
 ```ts
 const run = await runDynamicWorkflow(script, {
@@ -126,7 +132,7 @@ try {
       type: "object", additionalProperties: false,
       required: ["summary"], properties: { summary: { type: "string" } },
     },
-    model: "opus",          // routes to Claude; e.g. "gpt-5-codex" routes to Codex
+    model: "opus",          // routes to Claude; e.g. "gpt-5.5" routes to Codex
     cwd: process.cwd(),     // absolute working dir for the agent's session
   });
   // data is the schema-validated object (not text)
@@ -137,13 +143,13 @@ try {
 }
 ```
 
-`run(prompt, options?)` accepts the seam's `RunOptions`: `schema`, `model`, `tier`, `cwd`,
-`instructions`, `label`, `toolNames` / `disallowedToolNames`, `signal`, `mcpServers`,
-`meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
-`session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), and the out-of-band
-telemetry callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `onHistory`. Token/cost
-usage is delivered via `onUsage` (it may never fire — ACP usage is experimental), never via the
-return value.
+`run(prompt, options?)` accepts the seam's `RunOptions`: `schema`, `maxSchemaRetries`, `model`, `mode`, `tier`, `cwd`,
+`instructions`, `label`, `toolNames` / `disallowedToolNames`, `signal`, `mcpServers`, `images`,
+`backends`, `meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
+`session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), `keepSession`, and
+the out-of-band callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `onHistory` /
+`onSessionOpen`. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
+experimental), never via the return value.
 
 > **Codex session instructions.** When the run routes to the Codex backend, `baseInstructions`
 > **replaces** Codex's built-in base system prompt and `developerInstructions` adds developer-role
@@ -153,7 +159,7 @@ return value.
 >
 > ```ts
 > await runner.run("Cut the release.", {
->   model: "gpt-5-codex",
+>   model: "gpt-5.5",
 >   baseInstructions: "You are a release bot. Only touch CHANGELOG.md.",
 >   developerInstructions: "Prefer conventional-commit summaries.",
 > });
@@ -175,9 +181,10 @@ return value.
 >
 > `model: "browser/vision-large"` additionally selects `vision-large` from the agent's config-option
 > catalog. The same registry can be declared via `AGENTPRISM_BACKENDS` (JSON env var; the
-> programmatic option wins per name). A `schema` is forwarded to custom backends as turn-level
-> `_meta.outputSchema` and the result is JSON-parsed off the final message — agents that ignore the
-> schema channel still work via the validate/re-prompt ladder.
+> programmatic option wins per name). A `schema` is forwarded as turn-level `_meta.outputSchema`
+> and embedded in the prompt. Eligible HTTP-MCP agents also receive the client-hosted
+> `StructuredOutput` capture tool; otherwise the result is JSON-parsed from the final message.
+> Every path still goes through the validate/re-prompt ladder.
 >
 > A workflow **script** can also declare backends itself via `meta.backends` (same config shape,
 > keyed by name). Because script-declared backends spawn commands on your machine, they are inert
@@ -186,6 +193,20 @@ return value.
 > throws with guidance, and a declined backend aborts the run (it would otherwise silently reroute
 > its `agent()` calls to the default backend). Host-registered names always win over script
 > declarations. Lower-level callers can thread a pre-approved registry via `exec.scriptBackends`.
+
+#### Authentication lifecycle
+
+`createAcpRunner()` is auth-capable. It exposes `describeAuthMethods()` / `completeAuth()` and the
+`runner.auth` controller (`status`, `authenticate`, `logout`) while preserving the minimal
+`AgentRunner.run()` seam. Existing environment variables and backend-native credential stores are
+used normally. A direct `runner.run()` throws `WorkflowError { code: "AUTH_REQUIRED" }` when no
+resolver can satisfy the backend; a `WorkflowManager` catches that code and returns a resumable
+`paused` result with redacted `authContext`.
+
+Pass `onAuth` and `authCapabilities` to `createAcpRunner()` when the embedding host can collect
+credentials inline. Secret env/meta resolutions live in the runner's in-memory auth store, are
+redacted from events/errors, and are cleared on logout. Browser/TTY methods still require a host
+that can actually complete them.
 
 ### c) `WorkflowManager` — stateful / resumable runs
 
@@ -200,18 +221,18 @@ const manager = new WorkflowManager({ agent: createAcpRunner() });
 const run = await manager.runSync(script, { repo: "agentprism" }, { tokenBudget: 200_000 });
 
 if (run.status === "paused") {
-  // A pause carries a journal of every completed agent() call. Re-hydrate it and re-run the
-  // SAME script: the unchanged prefix is replayed from the journal, the rest runs live.
-  const persisted = manager.getPersistence().load(run.runId);
-  const resumeJournal = new Map(persisted?.journal?.map((e) => [e.index, e]) ?? []);
-  const finished = await manager.runSync(script, { repo: "agentprism" }, { resumeJournal });
-  console.log(finished.status); // "completed", typically
+  // resume() reloads the original script, args, cwd, and journal under the SAME runId,
+  // then continues in the background. Observe manager events or getRun(runId) for status.
+  const accepted = await manager.resume(run.runId);
+  console.log(accepted); // true when the paused run was accepted for resume
 }
 ```
 
 `runSync(script, args?, exec?)` always resolves to a terminal `WorkflowRunResult`. A run **pauses**
-(rather than fails) on a provider usage limit or a headless `checkpoint()`; both are resumable as
-above. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
+(rather than fails) on a provider usage limit or ACP authentication requirement; both are
+resumable as above. A headless `checkpoint()` applies its configured default or abort behavior.
+An auth pause carries `reason: "auth_required"` plus a non-secret `authContext`; complete auth on
+an auth-capable runner before resuming. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
@@ -228,6 +249,12 @@ names.
 ```ts
 manager.on("agentEvent", ({ runId, label, name }) => console.error(runId, label, name));
 ```
+
+Every live ACP-backed `agent()` call records a non-secret re-attach handle in
+`run.agentSessions`. Set `agent(..., { keepSession: true })` to skip release-time `session/close`,
+then use the runner's `loadSession()` or `resumeSession()` host API with that record. Session
+handles are additive and are also preserved in journals; they do not change the deterministic
+resume identity.
 
 ### d) Bring your own backend — implement the `AgentRunner` seam
 
@@ -434,8 +461,8 @@ report.warnings;           // approval reminders, phase mismatches, headless-abo
 
 Pass a JSON Schema to `agent({ schema })` (in a script) or `runner.run(prompt, { schema })` (direct)
 and the result is a **validated object** instead of text. The backend constrains output natively
-(Claude `outputFormat`; Codex strict `outputSchema`), then the value is coerced and validated
-client-side (typebox `Convert` → `Check`); on a miss the runner re-prompts a bounded number of
+(Claude `outputFormat`; Codex strict `outputSchema`; prompt/tool-assisted JSON for OpenCode and
+custom agents), then the value is coerced and validated client-side (typebox `Convert` → `Check`); on a miss the runner re-prompts a bounded number of
 times before failing with a non-recoverable `SCHEMA_NONCOMPLIANCE`.
 
 A **plain JSON Schema object literal** works everywhere (this is the only option inside a script —
@@ -473,16 +500,17 @@ toStrictJsonSchema(schema);  // OpenAI-strict-normalized (Codex outputSchema)
 The backend for each agent is chosen from its `model` (preferred) or `tier` string:
 
 - **Provider prefix** — `anthropic/…` or `claude/…` ⇒ Claude; `openai/…` or `codex/…` ⇒ Codex.
+- **OpenCode prefix or id** — `opencode/…` or `opencode` ⇒ OpenCode.
 - **Bare id** — matched by pattern: `codex` / `gpt` / `openai` / `o<digit>` ⇒ Codex;
   `claude` / `opus` / `sonnet` / `haiku` / `anthropic` ⇒ Claude.
 - **No match / no spec** — the default backend: `AGENTPRISM_DEFAULT_BACKEND` (`claude`, `codex`,
-  or any registered custom backend name; default `claude`).
+  `opencode`, or any registered custom backend name; default `claude`).
 
 ```ts
 import { selectBackend } from "@automatalabs/workflows";
 
 selectBackend({ model: "opus" }).id;          // "claude"
-selectBackend({ model: "gpt-5-codex" }).id;    // "codex"
+selectBackend({ model: "gpt-5.5" }).id;          // "codex"
 selectBackend({ model: "anthropic/claude-sonnet" }).id; // "claude"
 ```
 
@@ -509,14 +537,16 @@ WorkflowManager,              // stateful / resumable run manager
 createAcpRunner,              // () => AcpAgentRunner (the default AgentRunner; has .on(...) events)
 AcpAgentRunner,               // class — implements AgentRunner over ACP
 InteractiveSession,           // held-open multi-turn ACP session returned by openSession()
-selectBackend,                // pick Claude vs Codex from a model/tier spec
-ClaudeBackend, CodexBackend,  // the concrete backends
+selectBackend,                // pick a built-in/custom backend from a model/tier spec
+ClaudeBackend, CodexBackend, CustomAcpBackend,
+resolveBackendRegistry, BACKENDS_ENV,
+AGENT_METHODS, CLIENT_METHODS, ACP_AUTH_REQUIRED_ERROR_CODE,
 clientCapabilitiesFor, adaptPromptContent,
 toJsonSchema, toStrictJsonSchema,
 TypedEventEmitter,            // the tiny typed emitter backing runner.on(...)
 
 // ── Errors ──
-WorkflowError, WorkflowErrorCode, isWorkflowError, isProviderUsageLimit,
+WorkflowError, WorkflowErrorCode, isWorkflowError, isProviderUsageLimit, isAuthRequired,
 
 // ── Persistence paths ──
 AGENTPRISM_PERSISTENCE_ROOT_ENV,
@@ -526,8 +556,10 @@ RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidatedAgentCall, ValidatedCheckpoint,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
-AcpPoolOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
+AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
+AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig,
 InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
+AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
 ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,
 // ACP events: the runner.on(...) surface
 AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext,
@@ -563,8 +595,8 @@ the exhaustive option tables.
 ## See also
 
 - **[`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server)** — the
-  stdio MCP server built on this SDK. It wraps the same engine + ACP backend behind a single
-  `workflow` tool (bin: `agentprism-workflow`) for any MCP host. Use it when you want the
+  stdio MCP server built on this SDK. It wraps the same engine + ACP backend behind `workflow`
+  and conditional auth tools (bin: `agentprism-workflow`) for any MCP host. Use it when you want the
   **MCP-tool route** instead of embedding the runner in code.
 
 ## License

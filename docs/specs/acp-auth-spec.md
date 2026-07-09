@@ -1,40 +1,43 @@
-# ACP Authentication — Full End-to-End Implementation Spec
+# ACP Authentication — Implemented End-to-End Design Record
 
-## Motivation and current state
+## Status and original motivation
 
-AgentPrism drives ACP agents (Claude Code, Codex, OpenCode, and any spec-conformant
-custom agent) but has no working authentication story: today the runner can *ask* an
-agent for its auth methods and *call* `authenticate`, yet every credential the agent
-stores dies the moment we use it, `AUTH_REQUIRED` hard-fails runs, and MCP hosts have no
-auth surface at all. This spec closes that gap end-to-end — from the on-the-wire protocol
-contract, through the connection/pool/session lifecycle, per-agent integration profiles,
-and every host surface (runner API, `@automatalabs/workflows` SDK, MCP server,
-plus forward notes for the web app and local runner) — as a single frozen contract with
-no deferred work.
+AgentPrism's ACP authentication lifecycle is **implemented and shipped**. This document is the
+frozen design record that drove the seven-PR auth train; it remains the normative explanation of
+credential classes, capability advertisement, pool replay/recycle, host hooks, pause/resume, and
+secret handling.
 
-**Verified current state (2026-07-08, paths repo-relative to `/home/vikash/agentprism-workflows`).**
+**Verified implementation state (2026-07-09).**
 
-- `negotiateCapabilities` stores `authMethods` (default `[]`) and `NegotiatedCapabilities.authMethods` exists (`packages/acp-agents/src/capabilities.ts:60,98`), with `describeAuthProviderAdvertisement` at `:140`.
-- `clientCapabilitiesFor` (`packages/acp-agents/src/client-handlers.ts:120-136`) sets `session.configOptions`, `elicitation`, `fs`, and `terminal` capabilities but **never** sets `auth` — so `claude-agent-acp` hides all its (client-auth-gated) methods, `codex-acp` hides its gateway method, and only codex `api-key`/`chat-gpt` remain visible.
-- `runner.authMethods()/authenticate()/listProviders()/setProvider()/disableProvider()/logout()` (`packages/acp-agents/src/runner.ts:299-421`) each open a dedicated connection and dispose it in `finally`, so any in-process credential the agent stored is lost; the `run()` path (`:521`) never authenticates automatically.
-- The pool (`packages/acp-agents/src/pool.ts`) keeps per-backend long-lived processes (default 1, `AGENTPRISM_ACP_POOL_SIZE`), multiplexes sessions, and evicts only on process death — no recycle or re-auth hook.
-- `isAcpAuthRequired` (`packages/acp-agents/src/errors-map.ts:70-75`) requires `code === -32000` **and** `/^Authentication required\b/i`, so a conformant agent emitting `-32000` with different text is misclassified as recoverable and retried.
-- `WorkflowManager` pause/persist/resume exists **only** for `PROVIDER_USAGE_LIMIT` (`packages/workflow-engine/src/workflow-manager.ts:621,693`); `AUTH_REQUIRED` hard-fails.
-- The MCP server registers exactly one tool (`workflow`, `packages/mcp-server/src/server.ts:401`); hosts cannot list or complete auth.
-- Built-in backends pass raw `process.env` with no injection API; custom merges `config.env` over `process.env`.
-- SDK ground truth is `@agentclientprotocol/sdk` 1.2.1; `ClientCapabilities.auth` / `AuthCapabilities` are UNSTABLE (`@experimental`); `RequestError.authRequired` is reserved for `-32000`.
+- `@agentclientprotocol/sdk` 1.2.1 is the protocol ground truth; `ClientCapabilities.auth` remains
+  UNSTABLE/experimental and `RequestError.authRequired` exclusively reserves `-32000`.
+- `AcpRunnerOptions.authCapabilities` advertises only the auth method types a host can complete;
+  leaving both it and `onAuth` unset keeps the wire behavior default-off.
+- `AuthStore` / `BackendAuthMachine` retain credential intent per runner, replay it after every
+  initialize, generation-gate connection selection, recycle stale pools, and redact/zeroize secrets.
+- `describeAuthMethods`, `completeAuth`, legacy auth/provider methods, and the `runner.auth`
+  controller are live. `onAuth` resolves a `-32000` inline and retries exactly once.
+- `AUTH_REQUIRED` is code-first, carries non-secret `authContext`, and pauses a managed workflow
+  with `reason:"auth_required"`; cold resume re-arms via `runner.auth.canResume`.
+- The default MCP server registers `workflow_auth_status` and `workflow_authenticate` alongside
+  `workflow`; `AGENTPRISM_MCP_INLINE_AUTH=1` optionally adds masked elicitation collection.
+- Claude, Codex, and OpenCode profiles plus the profile-less custom-agent fixture are implemented,
+  with executable `_meta`/method drift tripwires and credential-gated live suites.
 
-**The five known gaps (2026-07-08 audit):** (1) no client auth capability advertisement;
-(2) no client-side handling for `terminal`/`env_var` method types, incl. no env-injection API
-for built-in backends; (3) dispose-after-`authenticate` loses in-process credentials and the
-pool is never recycled/re-primed; (4) `AUTH_REQUIRED` hard-fails runs (no pause-for-auth) and
-MCP hosts have no auth surface; (5) the `-32000` matcher is over-anchored on English text.
+The original five gaps were: no client auth advertisement, no type-dispatched terminal/env
+handling, dispose-after-authenticate credential loss, no managed auth pause/MCP surface, and an
+English-text-dependent `-32000` matcher. All five are closed by the implementation described here.
 
-This spec is written against nine non-negotiable design principles — equal first-class
-integrations (Codex, OpenCode, Claude, and custom agents), base-spec-first, full `_meta`
-capability support, no deferred work, headless-library host hooks, the codex-acp fork as a
-constraint (not a priority ranking), resume/pool safety, engine pause-for-auth, and strict
-secret hygiene. Every section is held to identical depth across the three first-class agents.
+Sections 1–3 describe the implemented architecture. Sections 4.6–4.7 preserve the completed test
+and PR delivery plan for provenance; their future-tense wording should be read as the sequence that
+was executed. File paths and symbol names are authoritative. Numeric source offsets in the agent
+dist investigations are snapshot evidence from the 2026-07-08 design freeze and are intentionally
+not navigation pointers into today's edited source.
+
+The design is held to nine non-negotiable principles — equal first-class integrations (Codex,
+OpenCode, Claude, and custom agents), base-spec-first, full `_meta` capability support, no deferred
+work, headless-library host hooks, the codex-acp fork as a constraint (not a priority ranking),
+resume/pool safety, engine pause-for-auth, and strict secret hygiene.
 
 ## Table of contents
 
@@ -62,7 +65,7 @@ secret hygiene. Every section is held to identical depth across the three first-
 3. **Integration profiles**
    - 3.1 The `AuthProfile` seam
    - 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.57.0
-   - 3.3 Codex — `@automatalabs/codex-acp` 1.4.0 (our fork)
+   - 3.3 Codex — `@automatalabs/codex-acp` 1.5.2 (our fork)
    - 3.4 OpenCode — `opencode-ai` 1.17.14
    - 3.5 Custom agent conformance profile
    - 3.6 Full `_meta` capability support matrix
@@ -72,8 +75,8 @@ secret hygiene. Every section is held to identical depth across the three first-
    - 4.3 MCP server auth tools
    - 4.4 Native-TTY CLI hosts (non-normative)
    - 4.5 Forward notes — web app + local runner
-   - 4.6 Test plan
-   - 4.7 PR sequencing
+   - 4.6 Implemented test matrix (historical plan)
+   - 4.7 Completed PR sequencing (historical)
 
 ## Glossary
 
@@ -175,7 +178,7 @@ clientCapabilities: clientCapabilitiesFor(this.clientHandlers, {
 }),
 ```
 
-**Why this exact split (grounded in the three agents).** claude 0.57.0 reveals its `terminal`-type login methods (`claude-ai-login`/`console-login`/`claude-login`) when `clientCapabilities.auth.terminal === true` **or** `clientCapabilities._meta["terminal-auth"] === true` (reads at acp-agent.js:317/:338/:339); its `gateway`/`gateway-bedrock` `agent`-type methods gate on `clientCapabilities.auth._meta.gateway === true` (the advertised `authMethods[]._meta.gateway.protocol` block is emitted at acp-agent.js:322). codex-acp 1.4.0 gates its `gateway` method on `clientCapabilities.auth._meta.gateway === true` (read at index.js:24188; the method's `_meta.gateway {protocol,restartRequired}` is emitted at index.js:24176) while `api-key`/`chat-gpt` are always visible (index.js:24161). opencode 1.17.14 reads its terminal launch hint under `clientCapabilities._meta["terminal-auth"]` (service.ts:100-101). Lighting `auth.terminal` and the top-level `_meta["terminal-auth"]` together, plus `auth._meta.gateway`, unblocks all three. `agent`-type methods that carry no `_meta` (e.g. codex `api-key`) need no client capability and work with nothing advertised — base-spec-first (Principle 2).
+**Why this exact split (grounded in the three agents).** claude 0.57.0 reveals its `terminal`-type login methods (`claude-ai-login`/`console-login`/`claude-login`) when `clientCapabilities.auth.terminal === true` **or** `clientCapabilities._meta["terminal-auth"] === true` (reads at acp-agent.js:317/:338/:339); its `gateway`/`gateway-bedrock` `agent`-type methods gate on `clientCapabilities.auth._meta.gateway === true` (the advertised `authMethods[]._meta.gateway.protocol` block is emitted at acp-agent.js:322). codex-acp 1.5.2 gates its `gateway` method on `clientCapabilities.auth._meta.gateway === true` (read at the snapshot offset index.js:24188; the method's `_meta.gateway {protocol,restartRequired}` block is at index.js:24176) while `api-key`/`chat-gpt` are always visible in that snapshot (index.js:24161). opencode 1.17.14 reads its terminal launch hint under `clientCapabilities._meta["terminal-auth"]` (service.ts:100-101). Lighting `auth.terminal` and the top-level `_meta["terminal-auth"]` together, plus `auth._meta.gateway`, unblocks all three. `agent`-type methods that carry no `_meta` (e.g. codex `api-key`) need no client capability and work with nothing advertised — base-spec-first (Principle 2).
 
 **No typed `env_var` gate exists.** In SDK 1.2.1 `AuthCapabilities = { terminal?: boolean; _meta? }` (`schema/types.gen.d.ts:4318-4335`) — there is no `envVar` boolean. So `env_var` methods are always visible on the wire; they are serviced not by an advertisement but by the presence of an `AuthResolver` that returns `{ outcome: "env" }` (§1.3, §1.5). We do not synthesize a non-standard `_meta` gate for `env_var`.
 
@@ -753,7 +756,7 @@ Credential material — API keys, gateway headers, `authenticate` `_meta` payloa
 
 ## 3. Integration profiles
 
-This section fixes the per-agent behavior of the three first-class ACP servers — Claude Code (`@agentclientprotocol/claude-agent-acp` 0.57.0), Codex (`@automatalabs/codex-acp` 1.4.0, our fork), and OpenCode (`opencode-ai` 1.17.14) — plus the custom-agent conformance profile and the complete `_meta` support matrix. Every profile is **pure data layered on top of the type-driven base flow**; a profile may enrich, label, or contribute a spawn overlay, but it **never gates the flow** (Principle 1). Conformance is defined by the *absence* of a profile.
+This section records the per-agent behavior of the three first-class ACP servers — Claude Code (`@agentclientprotocol/claude-agent-acp` 0.57.0), Codex (`@automatalabs/codex-acp` 1.5.2, our fork), and OpenCode (`opencode-ai` 1.17.14) — plus the custom-agent conformance profile and the complete `_meta` support matrix. Every profile is **pure data layered on top of the type-driven base flow**; a profile may enrich, label, or contribute a spawn overlay, but it **never gates the flow** (Principle 1). Conformance is defined by the *absence* of a profile.
 
 Each of the three agent profiles below uses the identical six-facet structure — **advertised methods + gates**, **per-method completion path**, **persistence semantics**, **logout**, **spawn-time auth**, **quirks** — with equal depth.
 
@@ -859,9 +862,9 @@ No advertised `env_var` method, but the child `@anthropic-ai/claude-agent-sdk` s
 
 ---
 
-### 3.3 Codex — `@automatalabs/codex-acp` 1.4.0 (our fork)
+### 3.3 Codex — `@automatalabs/codex-acp` 1.5.2 (our fork)
 
-`protocolVersion: 1` (codex-acp `dist/index.js:3744,27335`). Persistence delegated to the bundled `@openai/codex@0.142.5` Rust app-server, spawned `codex app-server` (`:21703-21706`). Auth-required factory `-32000` (`:20628-20632`).
+The installed fork version is 1.5.2. The detailed offsets in this subsection were originally captured against 1.4.0 and are retained as snapshot evidence; the current dependency is additionally covered by the executable dist probes and live tests described in §4.6. `protocolVersion: 1` (snapshot `dist/index.js:3744,27335`). Persistence is delegated to the bundled `@openai/codex@0.142.5` Rust app-server, spawned as `codex app-server` (`:21703-21706`). The auth-required factory uses `-32000` (`:20628-20632`).
 
 **Lever note (Principle 6).** codex-acp is *our* maintained fork; agent-side changes are in scope and are specced here. The fork's raison d'être is turn-level `_meta["outputSchema"]` forwarding (`:25467-25471`, the only Automata patch marker). The `DEFAULT_AUTH_REQUEST` spawn channel (`:29587-29588,27386-27391`) and the `gateway` method present as upstream behavior; because we own the fork, `codexAuthProfile.spawnAuthEnv` (below) is a maintained lever we rely on, whereas Claude/OpenCode receive only client-side adaptation. This is a constraint difference, not a priority ranking.
 
@@ -1286,9 +1289,9 @@ No library change beyond the PR3 lifecycle work (§2). The **local runner** is l
 
 ---
 
-### 4.6 Test plan
+### 4.6 Implemented test matrix (historical plan)
 
-Runner: `tsx --test "test/**/*.test.ts"` (node:test + `node:assert/strict`) per package (`packages/acp-agents/package.json:41`, `packages/mcp-server/package.json:47`). Default `pnpm test` stays deterministic and credential-free; live-e2e is env-gated.
+The following plan was implemented across the package test suites. It remains here as a traceability map from design obligation to executable coverage, so file descriptions use the original delivery language. Runner: `tsx --test "test/**/*.test.ts"` (node:test + `node:assert/strict`) per package. Default `pnpm test` stays deterministic and credential-free; live-e2e is env-gated.
 
 #### 4.6.1 Unit
 
@@ -1342,9 +1345,9 @@ New **`packages/acp-agents/test/auth-secrets.test.ts`** (Principle 9). Assert, a
 
 ---
 
-### 4.7 PR sequencing
+### 4.7 Completed PR sequencing (historical)
 
-Seven PRs, error-taxonomy-first, each independently green and shippable (unset `onAuth`/`authCapabilities` ⇒ byte-identical runtime behavior to today until a host opts in). Every release that touches these PRs also bumps `@agentclientprotocol/sdk` and the ACP deps and merges upstream into the codex-acp fork (per the bump-at-release policy), gated by the §4.6.4 tripwire.
+The implementation was delivered as seven PR-sized stages, error-taxonomy-first, each independently green and shippable. The table is historical sequencing, not a list of outstanding work. The compatibility rule remains current: unset `onAuth`/`authCapabilities` preserves the default-off behavior, while ACP dependency bumps remain gated by the §4.6.4 tripwire.
 
 | PR | Scope (spec §) | Key files | Why green in isolation |
 |----|----------------|-----------|------------------------|

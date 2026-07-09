@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-A **stdio [MCP](https://modelcontextprotocol.io) server** that exposes a single tool — **`workflow`** — for running dynamic, multi-agent workflow scripts from any MCP host (Claude Code, Zed, Cursor, …).
+A **stdio [MCP](https://modelcontextprotocol.io) server** for running dynamic, multi-agent workflow scripts from any MCP host (Claude Code, Zed, Cursor, …). Its default ACP runner exposes **`workflow`** plus the conditional **`workflow_auth_status`** and **`workflow_authenticate`** tools used to recover authentication-paused runs.
 
 This package is a **thin MCP adapter**. All of the real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool, and serves it over stdin/stdout.
 
@@ -18,14 +18,14 @@ This package is a **thin MCP adapter**. All of the real work — parsing the wor
         ▼
 ┌────────────────────────────────────────────────────┐
 │  agentprism-workflow  (this package)               │
-│   • registers ONE tool: "workflow"                  │
+│   • registers "workflow" + ACP auth tools           │
 │   • createAcpRunner()  →  injected into the engine  │
 │   • WorkflowManager.runSync(script, args, exec)     │
 └────────────────────────────────────────────────────┘
         │   session/new, session/prompt … (ACP over stdio)
         ▼
-   claude-agent-acp / codex-acp   (pooled agent subprocesses)
-        │  → real Claude / Codex agents, one session per agent() call
+   claude-agent-acp / codex-acp / opencode acp
+        │  → real Claude / Codex / OpenCode agents
 ```
 
 One `tools/call` to `workflow` runs a complete workflow **synchronously** (see [Run model](#run-model)). `stdout` is reserved for JSON-RPC framing — every diagnostic the server emits goes to `stderr`.
@@ -44,7 +44,7 @@ npm i @automatalabs/mcp-server
 
 Installing the package provides the executable **`agentprism-workflow`** (declared as the package's `bin`, pointing at the built `dist/index.js`). You usually don't run it by hand — your MCP host launches it (see [Register it in an MCP host](#register-it-in-an-mcp-host)).
 
-You also need at least one **agent backend** installed and authenticated — `@agentclientprotocol/claude-agent-acp` (Claude) and/or `@automatalabs/codex-acp` (Codex). See [Backends & auth](#backends--auth).
+You also need a backend used by your scripts: Claude and Codex adapters are installed transitively; OpenCode is resolved from an `opencode-ai` installation or an `opencode` executable on `PATH`. Authenticate only the backends you route to. See [Backends & auth](#backends--auth).
 
 ---
 
@@ -94,7 +94,7 @@ If the bin isn't on the host's `PATH`, launch it through `npx` instead:
 }
 ```
 
-`env` here is inherited by the server process **and** by every agent subprocess it spawns (see [Backends & auth](#backends--auth)), so it's where you put `AGENTPRISM_*` settings and any credentials the agent CLIs need. Set `AGENTPRISM_DEFAULT_BACKEND` to `claude` (the default) or `codex` to choose which agent backend an `agent()` call uses when its `model`/`tier` doesn't pin a provider.
+`env` here is inherited by the server process **and** by every agent subprocess it spawns (see [Backends & auth](#backends--auth)), so it is where you put `AGENTPRISM_*` settings and any credentials the agent CLIs need. Set `AGENTPRISM_DEFAULT_BACKEND` to `claude` (the default), `codex`, `opencode`, or a registered custom backend name to choose the backend used when an `agent()` call's `model`/`tier` does not pin a provider.
 
 After your host reloads, the `workflow` tool appears in its tool list.
 
@@ -108,7 +108,7 @@ The tool's input schema (validated by the MCP SDK before the handler runs). Nume
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `script` | string (non-empty) | **yes** | — | Raw JavaScript workflow script (no Markdown fences). The first statement **must** be `export const meta = { name, description, phases? }`, and the script **must** call `agent()` at least once. |
+| `script` | string (non-empty) | **yes** | — | Raw JavaScript workflow script (no Markdown fences). The first statement **must** be `export const meta = { name, description, phases? }`. Agentless scripts are valid; validation warns only when the script has neither `agent()` nor `checkpoint()`. Saved workflow names are not resolved by this MCP input. |
 | `args` | any JSON value | no | — | Optional value exposed to the script as the global `args`. |
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
 | `concurrency` | integer > 0 | no | engine default | Max concurrent agents. **Clamped to 16** (the runtime max) by the engine — never rejected. |
@@ -121,7 +121,7 @@ Example call arguments:
 
 ```json
 {
-  "script": "export const meta = { name: 'review', description: 'review a diff' };\nconst r = await agent('Review this diff and summarize risks:\\n' + args.diff);\nreturn r.text;",
+  "script": "export const meta = { name: 'review', description: 'review a diff' };\nconst r = await agent('Review this diff and summarize risks:\\n' + args.diff);\nreturn r;",
   "args": { "diff": "diff --git a/x b/x\n+console.log(1)" },
   "concurrency": 4,
   "tokenBudget": 200000
@@ -158,23 +158,26 @@ interface WorkflowToolResult {
 - **Synchronous.** One `tools/call` to `workflow` is one full run, awaited to completion (the tool is a plain handler — background tasks are not used). When the call resolves, the run has reached a terminal state.
 - **Progress notifications.** When the host includes a `progressToken` with the call, the server streams `notifications/progress` as agents settle (it reports `settled / total` agents plus the current phase). With no `progressToken`, progress is a no-op.
 - **Terminal status, not exceptions.** An ordinary pause/fail/abort does **not** throw — the run resolves to a `WorkflowRunResult` with `status` already stamped (`completed | paused | failed | aborted`) plus an optional `reason`/`resetHint`. Only a malformed script (which fails before a run exists) surfaces as an MCP tool error.
-- **Explicit resume.** A run can pause (e.g. a provider usage limit, or a headless checkpoint). Its journal is persisted under the returned `runId`. To continue, call the `workflow` tool again with the **same `script`** plus `resumeFromRunId: "<that runId>"`; the engine re-hydrates the persisted journal, replays the unchanged prefix deterministically, and runs the remainder live.
+- **Explicit resume.** A run can pause for a provider usage limit or missing authentication. Its journal is persisted under the returned `runId`. To continue, call `workflow` again with the **same `script`** plus `resumeFromRunId: "<that runId>"`; the engine re-hydrates the journal, replays the unchanged prefix deterministically, and runs the remainder live. A headless `checkpoint()` does not persist a pause: it applies its configured headless behavior.
 - **Checkpoints.** A script's `checkpoint()` gate is wired to MCP **elicitation**: if the connected host advertises elicitation, the server requests a one-field `approve` boolean via `elicitInput`. If the host can't elicit, the checkpoint falls back to its headless default (`default ?? true`) rather than blocking.
 
 ---
 
 ## Backends & auth
 
-Each `agent()` call is dispatched to an **ACP agent server** chosen by the call's `model`/`tier`, falling back to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). The two built-in backends:
+Each `agent()` call is dispatched to an **ACP agent server** chosen by the call's `model`/`tier`, falling back to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). The three built-in backends are:
 
 - **Claude** → `@agentclientprotocol/claude-agent-acp` (the Claude Agent SDK over ACP). By default the server resolves that package's bin and runs it under the current Node; if it can't be resolved, it falls back to `npx -y @agentclientprotocol/claude-agent-acp`.
 - **Codex** → `@automatalabs/codex-acp` (a published fork that bakes in the structured-output patch). By default the server resolves that package and runs it under the current Node.
+- **OpenCode** → `opencode acp`. `opencode-ai` is intentionally not bundled; install it in the host environment or put `opencode` on `PATH`.
 
 Beyond the built-ins, **any ACP agent** can be registered as a named backend via `AGENTPRISM_BACKENDS` (see the table below) and routed to with `agent(p, { model: "<name>" })` — or `"<name>/<inner-model>"` to also select a model from the agent's catalog. Scripts can pass arbitrary session/turn `_meta` to such agents with `agent(p, { meta, promptMeta })`.
 
 A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config (approvals stick for the session); otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
 
-**Auth is environment-inherited.** Agent subprocesses are spawned with the MCP server's own `process.env`. There is no separate credential channel — whatever the underlying agent CLIs read for auth (an Anthropic key / Claude subscription auth for `claude-agent-acp`; OpenAI/Codex auth for `codex-acp`) must be present in the environment the host launches `agentprism-workflow` with. Put those vars in the `env` block of your `mcpServers` config (alongside the `AGENTPRISM_*` settings), or export them in the shell that starts the host. Refer to each backend project's docs for its exact auth variables.
+**Authentication has a pause-and-resume path.** Credentials already available in the inherited environment or a backend's native credential store continue to work without an extra step. If a backend returns ACP `AUTH_REQUIRED`, the managed run pauses with `reason: "auth_required"` and a non-secret method summary. Call `workflow_auth_status` to inspect redacted backend state and methods, complete a supported method with `workflow_authenticate`, then call `workflow` with the original script and `resumeFromRunId`.
+
+The default is deliberately headless: browser/TTY-only methods must be completed on a capable surface, and secrets passed to `workflow_authenticate` are never echoed or journaled. Setting `AGENTPRISM_MCP_INLINE_AUTH=1` opts into masked MCP elicitation for env-var and gateway methods when the host supports elicitation; otherwise authentication still pauses normally. When `createWorkflowServer()` receives a plain `AgentRunner` rather than the auth-capable ACP runner, only `workflow` is registered.
 
 ---
 
@@ -184,8 +187,8 @@ All settings are read from the environment of the `agentprism-workflow` process 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend used when an `agent()` call's `model`/`tier` doesn't pin a provider: `codex`, a registered custom backend name, or anything else for Claude (all case-insensitive). |
-| `AGENTPRISM_BACKENDS` | — | Custom ACP backends as a JSON object: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Registered names route `model`/`tier` specs **before** the built-in heuristics; `claude`/`codex` are reserved. |
+| `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend used when an `agent()` call's `model`/`tier` does not pin a provider: `claude`, `codex`, `opencode`, or a registered custom backend name. Unknown values fall back to Claude. |
+| `AGENTPRISM_BACKENDS` | — | Custom ACP backends as a JSON object: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Registered names route `model`/`tier` specs **before** built-in heuristics; `claude`/`codex`/`opencode` are reserved. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | — | `1`/`true` approves **script-declared** `meta.backends` headlessly. Only needed for clients without elicitation support — eliciting clients are prompted per spawn config instead. Understand the risk: this lets any workflow script spawn arbitrary commands. |
 | `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | `60000` | Deadline for a backend's one-time ACP `initialize` handshake; a command that is not an ACP server fails fast with a clear error instead of hanging. |
 | `AGENTPRISM_ACP_POOL_SIZE` | `1` | Long-lived ACP server processes to keep **per backend**. Each pooled process multiplexes many concurrent sessions; raise it to spread concurrent load across processes. Clamped to ≥ 1. |
@@ -194,12 +197,16 @@ All settings are read from the environment of the `agentprism-workflow` process 
 | `AGENTPRISM_CODEX_ACP_CMD` | — | Override the command used to launch the Codex ACP server. When set, the default bin resolution is bypassed. |
 | `AGENTPRISM_CODEX_ACP_ARGS` | — | Whitespace-separated argv passed to `AGENTPRISM_CODEX_ACP_CMD`. |
 | `AGENTPRISM_CODEX_ACP_BIN` | resolved `@automatalabs/codex-acp` main | Override the resolved Codex ACP bin path (used only when `AGENTPRISM_CODEX_ACP_CMD` is **not** set). |
+| `AGENTPRISM_OPENCODE_ACP_CMD` | resolved `opencode-ai` bin or `opencode` | Override the command used to launch OpenCode ACP. |
+| `AGENTPRISM_OPENCODE_ACP_ARGS` | — | Whitespace-separated argv passed to `AGENTPRISM_OPENCODE_ACP_CMD`. The automatic launcher uses `opencode acp`; a command override receives only the args supplied here. |
+| `AGENTPRISM_MCP_INLINE_AUTH` | — | `1`/`true` enables the opt-in MCP elicitation bridge for headlessly collectable auth methods. Default behavior is pause-and-resume. |
+| `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run journals and logs used by resume. |
 
 ---
 
 ## Programmatic use
 
-For embedding the orchestrator in your own program, use **[`@automatalabs/workflows`](../workflows)** — it's the canonical, dependency-light SDK (no MCP SDK, no zod):
+For embedding the orchestrator in your own program, use **[`@automatalabs/workflows`](../workflows)** — it is the canonical programmatic SDK:
 
 ```ts
 import { runDynamicWorkflow } from "@automatalabs/workflows";
@@ -207,7 +214,7 @@ import { runDynamicWorkflow } from "@automatalabs/workflows";
 const run = await runDynamicWorkflow(
   `export const meta = { name: "demo", description: "one agent" };
    const r = await agent("Say hello in one word.");
-   return r.text;`,
+   return r;`,
   { exec: { concurrency: 4, tokenBudget: 100_000 } },
 );
 
@@ -225,7 +232,7 @@ const server = createWorkflowServer(createAcpRunner());
 await server.connect(new StdioServerTransport());
 ```
 
-Other exports include `workflowToolInputShape` / `clampWorkflowInput` (the input schema + clamp), `workflowToolOutputShape` / `toWorkflowToolResult` (the output schema + projector), `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond hosting the tool itself, prefer `@automatalabs/workflows`.
+Other exports include `workflowToolInputShape` / `clampWorkflowInput` (the input schema + clamp), `workflowToolOutputShape` / `toWorkflowToolResult` (the output schema + projector), the auth-tool shapes/projections and `createDeferredMcpAuthResolver`, `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond hosting these tools, prefer `@automatalabs/workflows`.
 
 ---
 

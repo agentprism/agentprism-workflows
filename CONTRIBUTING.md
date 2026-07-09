@@ -1,6 +1,6 @@
 # Contributing
 
-This is a **pnpm workspace** (monorepo) of five packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the protocol-level design is in [`docs/design-notes.md`](docs/design-notes.md).
+This is a **pnpm workspace** (monorepo) of six packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the protocol-level design is in [`docs/design-notes.md`](docs/design-notes.md).
 
 ## Prerequisites
 
@@ -28,11 +28,12 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 |---|---|
 | `packages/shared-types` | The `AgentRunner` seam + shared types. |
 | `packages/workflow-engine` | The deterministic engine (realm, parallel/pipeline, journal/resume, budget, worktree). |
-| `packages/acp-agents` | ACP client + Claude/Codex backends (the `AgentRunner` implementation, pooling). |
-| `packages/mcp-server` | The stdio MCP server / composition root (bin `agentprism-workflow`). |
+| `packages/acp-agents` | ACP client + Claude/Codex/OpenCode/custom backends (the `AgentRunner` implementation, pooling, auth/session lifecycle). |
+| `packages/mcp-server` | The stdio MCP server / composition root (bin `agentprism-workflow`; workflow + auth tools). |
 | `packages/workflows` | The importable SDK facade. |
+| `packages/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` events. |
 
-`workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`. So the dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }`.
+`workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`. So the primary dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }`. `agentprism-otel` is an independent leaf with an `@opentelemetry/api` peer dependency; it observes the manager structurally and is not in that runtime chain.
 
 ### Conventions
 
@@ -42,9 +43,12 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 ## Testing
 
-`pnpm test` runs the full suite; everything except one file uses in-memory/fake ACP agents, so no credentials are needed.
+`pnpm test` runs the full deterministic suite without credentials. Two files contain live tests, and both are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
 
-The one exception is the **live-backend e2e** (`packages/mcp-server/test/live-backend.e2e.test.ts`), which drives the real Claude + Codex backends end-to-end. It is **skipped by default** and only runs when you opt in with real auth:
+- `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, and OpenCode structured-output/pooling paths.
+- `packages/acp-agents/test/auth.live.e2e.test.ts` drives the three first-class auth profiles; individual cases have additional credential/gateway gates.
+
+Run the MCP live suite explicitly with real auth:
 
 ```bash
 AGENTPRISM_LIVE_E2E=1 pnpm --filter @automatalabs/mcp-server test
@@ -52,7 +56,7 @@ AGENTPRISM_LIVE_E2E=1 pnpm --filter @automatalabs/mcp-server test
 
 CI must leave `AGENTPRISM_LIVE_E2E` unset.
 
-Because CI can never run the live e2e, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) runs it on every `git push` from a dev machine — the only place with real agent auth. It builds the workspace and drives both real backends (~30–60s, spends real tokens). Bypass a single push with `git push --no-verify` or `AGENTPRISM_SKIP_LIVE_E2E=1 git push`; CI pushes are exempt automatically (`CI` env guard).
+Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) runs the MCP live suite on every `git push` from a dev machine. It builds the workspace and drives Claude, Codex, and OpenCode (~60–120s, spends real tokens). The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. Bypass a single push with `git push --no-verify` or `AGENTPRISM_SKIP_LIVE_E2E=1 git push`; CI pushes are exempt automatically (`CI` env guard).
 
 ## Releasing
 

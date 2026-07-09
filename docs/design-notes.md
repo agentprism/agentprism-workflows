@@ -6,7 +6,7 @@ package-specific API references (field/method names, file:line, versions). For i
 usage, start with the README; read this when you need the protocol-level mechanics (ACP lifecycle,
 the structured-output crux, model/permission/usage wiring, the engine lineage).
 
-> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in five
+> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in six
 > `@automatalabs/*` packages — see [§2](#2-codebase--module-structure). The Pi `src/…` citations
 > throughout are provenance for the lifted engine, not paths in this repo.
 
@@ -28,9 +28,9 @@ unchanged** from `pi-dynamic-workflows` — only the *leaf* (how one subagent ru
 *shell* (how the tool is exposed) change.
 
 This is built as a **new, standalone codebase** that *lifts* the reused pieces (copy + adapt the
-source) rather than modifying the Pi extension; nothing imports Pi at runtime. It is split into
-three modules so the agent logic and the engine are each usable on their own, independent of the
-MCP server — see §2 for the module layout.
+source) rather than modifying the Pi extension; nothing imports Pi at runtime. Three core layers
+(`shared-types`, `workflow-engine`, `acp-agents`) stay independently usable, while the SDK facade,
+MCP shell, and optional OTel leaf compose them for hosts — see §2 for the package layout.
 
 ### The core inversion
 
@@ -63,28 +63,29 @@ This is a **new, greenfield codebase** — not a fork, a patch, or a runtime dep
 extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (copy + adapt the
 source) and write the rest fresh. Nothing imports Pi at runtime.
 
-The code is split into **three modules** with a one-way dependency direction, so each lower layer
-is usable on its own — in particular, the ACP agent logic and the workflow engine are both usable
-**with no MCP server at all**.
+The code is published as **six packages** with a one-way dependency direction. The three lower
+layers remain independently usable — in particular, the ACP agent logic and workflow engine both
+work **with no MCP server at all** — while the facade and integration leaves stay thin.
 
 ```
-                 ┌────────────────────────────────────────────────┐
-                 │  mcp-server   (the shell / one entrypoint)      │
-                 │   • the `workflow` TOOL DEFINITION + handler    │
-                 │   • stdio MCP transport, progress, resume param │
-                 └───────────────┬────────────────┬───────────────┘
-                       composes …  │                │
-                 ┌───────────────▼───────┐  ┌──────▼────────────────────────┐
-                 │  workflow-engine      │  │  acp-agents                   │
-                 │   vm runtime,         │  │   ACP client + built-in       │
-                 │   parallel/pipeline,  │  │   backends (Claude/Codex/     │
-                 │   journal, budget,    │  │   OpenCode), structured       │
-                 │   resume, worktree    │  │   output, model select,       │
-                 │                       │  │   permissions, usage, cancel  │
-                 └───────────┬───────────┘  └──────────┬────────────────────┘
-                             │   meet at the AgentRunner interface (DI)
-                             └──────────────┬──────────┘
-                                   run(prompt, opts) → result
+ ┌──────────────────────────┐       ┌──────────────────────────┐
+ │ mcp-server               │       │ agentprism-otel          │
+ │ stdio tools + auth       │       │ observes manager events  │
+ └────────────┬─────────────┘       └────────────┬─────────────┘
+              │ depends on                          │ structural attach
+              ▼                                     ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ workflows — public SDK facade + ACP event bridge            │
+ └────────────────┬───────────────────────┬────────────────────┘
+                  ▼                       ▼
+ ┌──────────────────────────┐  ┌───────────────────────────────┐
+ │ workflow-engine          │  │ acp-agents                    │
+ │ vm, journal, budgets,    │  │ pooled Claude/Codex/OpenCode │
+ │ resume, worktrees        │  │ + custom ACP, auth, sessions │
+ └────────────┬─────────────┘  └──────────────┬────────────────┘
+              └──────────────┬────────────────┘
+                             ▼
+                shared-types — AgentRunner seam
 ```
 
 `workflow-engine` and `acp-agents` are **siblings**: neither imports the other. They meet only at
@@ -94,11 +95,14 @@ engine never names a concrete backend; the agents module never knows it's inside
 ### `acp-agents` — *the internal ACP backend (an `AgentRunner`), not the public SDK*
 
 All the logic for actually using the ACP agents: opening and holding ACP client connections to
-`claude-agent-acp` / `codex-acp`, the `ClaudeBackend` / `CodexBackend`, model selection (§5.4),
-permission allow/deny (§5.5), usage extraction (§5.6), cancellation (§5.7), and the
-structured-output vendor wiring (§6). It exposes one method — `run(prompt, opts): Promise<result>`
-— satisfying the `AgentRunner` interface. Its runtime deps are `@agentclientprotocol/sdk`,
-`@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`, `typebox`, and `@automatalabs/shared-types`.
+`claude-agent-acp` / `codex-acp` / `opencode acp`, the `ClaudeBackend` / `CodexBackend` /
+`OpenCodeBackend` / `CustomAcpBackend`, model selection (§5.4), permission allow/deny (§5.5),
+usage extraction (§5.6), cancellation (§5.7), auth, session lifecycle, and structured-output
+vendor wiring (§6). It implements the one-method `AgentRunner` seam (`run(prompt, opts)`) and adds
+host-facing event, auth, and interactive/reattach APIs. Its runtime deps are
+`@agentclientprotocol/sdk`, `@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`,
+`@modelcontextprotocol/sdk`, `typebox`, and `@automatalabs/shared-types`; OpenCode is resolved from
+the host and deliberately is not bundled.
 
 The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.5.2` — a
 published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `outputSchema` forward
@@ -125,20 +129,33 @@ await runner.dispose();
 budgets, the limiter, the run manager + persistence, and the worktree helper. It depends on an
 **injected `AgentRunner`** — *not* on `acp-agents` — so it runs against a real ACP runner, a mock,
 or any other backend (exactly how the Pi tests drive it today via `options.agent`). The seam:
-`runWorkflow` accepts `options.agent?: AgentRunner` and only ever calls
+`runWorkflow` requires `options.agent: AgentRunner` and only ever calls
 `agentRunner.run(prompt, opts)` (today `Pick<WorkflowAgent,"run">`, [`src/workflow.ts:59`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L59), bound at [`:283`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L283), called at [`:465`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L465)).
 
 ### `mcp-server` — the shell / composition root
 
-Owns the **`workflow` tool definition** (input schema + handler) and the stdio MCP transport;
-streams progress via MCP `notifications/progress`; exposes the `resumeFromRunId` param. It wires
-an `acp-agents` runner into `workflow-engine` and registers the tool. It is just **one** consumer
-— the engine + agents could equally be driven by a CLI, a test harness, or another server, with no
-MCP involved.
+Owns the **`workflow` tool definition** (input schema + handler), the two conditional auth tools,
+and the stdio MCP transport; streams progress via MCP `notifications/progress`; exposes the
+`resumeFromRunId` param. It depends on `@automatalabs/workflows`, constructs the ACP runner, and
+injects it into the facade manager. It is just **one** consumer — the engine + agents can equally
+be driven by a CLI, a test harness, or another server, with no MCP involved.
 
-> Packaging (as implemented): a pnpm monorepo of **five** published packages —
+### `workflows` — the public SDK facade
+
+The canonical programmatic entry point. It composes `workflow-engine` and `acp-agents`, re-exports
+the supported host surface, adds `runDynamicWorkflow`, validation/folder helpers, and bridges the
+runner's live ACP events onto `WorkflowManager.agentEvent`.
+
+### `agentprism-otel` — optional observability leaf
+
+Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events to OpenTelemetry
+spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
+outside the engine/runner dependency chain.
+
+> Packaging (as implemented): a pnpm monorepo of **six** published packages —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
-> `@automatalabs/mcp-server` (the bin), and `@automatalabs/workflows` (the importable SDK facade).
+> `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade), and
+> `@automatalabs/agentprism-otel` (the optional telemetry bridge).
 > The dependency direction and the `AgentRunner` seam are the contract.
 
 ### Lifted from `pi-dynamic-workflows` → `workflow-engine` (copied/adapted, mostly unchanged)
@@ -158,15 +175,17 @@ MCP involved.
 
 | Module | Piece | Replaces (Pi) | New |
 |---|---|---|---|
-| `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives `claude-agent-acp` / `codex-acp` over ACP |
-| `mcp-server` | **Shell** — expose the tool | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering the `workflow` tool; progress via MCP notifications |
+| `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives Claude, Codex, OpenCode, or custom ACP agents |
+| `workflows` | **Facade** — compose + validate | no Pi equivalent | public SDK, one-shot helper, workflow folders/validator, manager ACP-event bridge |
+| `mcp-server` | **Shell** — expose tools | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering `workflow` plus conditional auth tools; progress via MCP notifications |
+| `agentprism-otel` | **Observability** | no Pi equivalent | OTel trace/metric mapping over manager events |
 | `acp-agents` | **Structured output** | injected `structured_output` tool ([`src/structured-output.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/structured-output.ts)) | native backend schema constraint for Claude/Codex plus client-hosted StructuredOutput MCP capture for eligible custom ACP backends (§6) |
 
 ---
 
 ## 3. Libraries & packages
 
-All versions below were verified locally (cloned + `npm install`) on 2026-06-29.
+All versions below were re-verified from the installed workspace dependency graph on 2026-07-09.
 
 ### Tool exposure (MCP server)
 
@@ -177,13 +196,13 @@ All versions below were verified locally (cloned + `npm install`) on 2026-06-29.
 
 ### Agent backends (ACP)
 
-- **`@agentclientprotocol/sdk@1.0.0`** — the ACP protocol SDK (JSON-RPC-over-stdio types +
+- **`@agentclientprotocol/sdk@1.2.1`** — the ACP protocol SDK (JSON-RPC-over-stdio types +
   client/connection helpers). This is what your orchestrator uses to *speak ACP as a client*.
   Ref: https://agentclientprotocol.com · https://github.com/agentclientprotocol
 
 - **`@agentclientprotocol/claude-agent-acp@0.57.0`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
-  Wraps **`@anthropic-ai/claude-agent-sdk@0.3.195`**.
+  Wraps **`@anthropic-ai/claude-agent-sdk@0.3.202`**.
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
 
@@ -211,7 +230,8 @@ The `workflow` tool keeps essentially the same input contract as today
 ([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)), exposed via the MCP server instead of `defineTool`:
 
 - `script` (**required** string) — raw JS; must start with
-  `export const meta = { name, description, phases? }` and call `agent()` at least once.
+  `export const meta = { name, description, phases? }`. Agent-less deterministic scripts are valid;
+  the validator warns when a script has neither `agent()` nor `checkpoint()`.
 - `args` (optional) — exposed to the script as global `args`.
 - `maxAgents` (optional, default 1000), `concurrency` (optional, clamped to 16),
   `agentRetries` (optional, ≤3), `agentTimeoutMs` (optional, default none),
@@ -221,12 +241,19 @@ The `workflow` tool keeps essentially the same input contract as today
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
   `MAX_AGENT_RETRIES` 3), so defer to it and keep the "clamped" semantics above (matches Pi).
 
-**One semantic changes vs. Pi.** MCP tool calls are request/response within the caller's turn;
+**One semantic change vs. Pi.** MCP tool calls are request/response within the caller's turn;
 there is no "return immediately, deliver the result into a *later* turn" mechanism (that was a
 Pi-extension affordance, `installResultDelivery`). So the MCP `workflow` tool runs
 **synchronously**: execute to completion, stream progress via MCP **`notifications/progress`**,
 return the final result. This is exactly the existing `background:false` / `runSync` path
 ([`src/workflow-tool.ts:223`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L223)) — make it the default and drop `startInBackground`.
+
+The shipped server's default ACP runner is auth-capable, so two additive tools register alongside
+`workflow`: `workflow_auth_status` (read-only/redacted discovery) and `workflow_authenticate`
+(secret input, redacted output). A plain injected `AgentRunner` still gets only `workflow`.
+`AUTH_REQUIRED` pauses a run; the headless recovery sequence is authenticate, then re-call
+`workflow` with `resumeFromRunId`. `AGENTPRISM_MCP_INLINE_AUTH=1` optionally enables masked MCP
+elicitation for env/gateway credentials.
 
 Resume is **not lost**, it becomes **explicit**: expose a `resumeFromRunId` tool parameter; the
 host calls `workflow` again to continue from the persisted journal (the engine already supports
@@ -405,7 +432,7 @@ ACP is a *unified* protocol — nothing about the runner is backend-specific exc
 *vendor channel* used to reach it. ACP **core** models none of it — only an open `_meta`
 extension point — so each backend tunnels its native support through a vendor-specific path.
 
-### 6.1 ACP core (`@agentclientprotocol/sdk@1.0.0`) — no native structured output
+### 6.1 ACP core (`@agentclientprotocol/sdk@1.2.1`) — no native structured output
 
 Verified by exhaustive grep (zero matches for `outputSchema|structuredContent|json_schema|…`).
 
@@ -420,7 +447,7 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.57.0` → `@anthropic-ai/claude-agent-sdk@0.3.195`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.57.0` → `@anthropic-ai/claude-agent-sdk@0.3.202`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
@@ -530,8 +557,9 @@ outputSchema?: JsonValue | null;
 
 > Source (codex-acp): [`TurnStartParams.ts:43-46`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/v2/TurnStartParams.ts#L43-L46). These TS types are **generated from the codex binary** (`codex app-server generate-ts`).
 
-**The shipped binary honors it.** codex-acp ships `@openai/codex@^0.142.4`; verified at tag
-`rust-v0.142.4` (SHA `d0fd966`), the App Server threads `turn/start.outputSchema` all the way into
+**The shipped binary honors it.** codex-acp currently ships `@openai/codex@^0.142.5`. The forward
+was source-verified at tag `rust-v0.142.4` (SHA `d0fd966`) and remains covered end-to-end: the App
+Server threads `turn/start.outputSchema` all the way into
 the OpenAI Responses API as a **strict** structured-output constraint:
 
 ```
@@ -663,15 +691,15 @@ the unchanged engine.
 ## 8. Caveats / version pins / things to design around
 
 - **Version-specific (Claude):** the structured-output path is verified for
-  `claude-agent-acp@0.57.0` / `@anthropic-ai/claude-agent-sdk@0.3.195`. The `_meta.claudeCode`
+  `claude-agent-acp@0.57.0` / `@anthropic-ai/claude-agent-sdk@0.3.202`. The `_meta.claudeCode`
   channel and `emitRawSDKMessages` are vendor extensions, not standard ACP — pin versions and
   isolate behind the backend adapter.
 - **`emitRawSDKMessages` is mandatory** to read `structured_output` on the Claude path; filter
   the raw stream to just the `type:"result"` message.
 - **Schema scope (Claude) is per-session** → spin up a fresh ACP session per `agent()` call (or
   per distinct schema). The engine already does one session per call.
-- **Codex structured output needs a codex-acp forward:** the shipped binary (`@openai/codex@0.142.4`,
-  verified at `rust-v0.142.4`) honors `turn/start.outputSchema`, but the stock adapter never forwards
+- **Codex structured output needs a codex-acp forward:** the shipped binary (`@openai/codex@0.142.5`;
+  the field was source-verified at `rust-v0.142.4`) honors `turn/start.outputSchema`, but the stock adapter never forwards
   it — the ~1-line `_meta` → `runTurn` forward (§6.3) is **baked into the published fork
   `@automatalabs/codex-acp@1.5.2`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
   consumers, unlike a pnpm `patchedDependencies` transform). `CodexBackend` also normalizes schemas
@@ -699,10 +727,10 @@ the unchanged engine.
 
 ## 9. References
 
-**Packages (verified versions, 2026-06-29):**
+**Packages (verified versions, 2026-07-09):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
-- `@agentclientprotocol/sdk@1.0.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.57.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.195`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@agentclientprotocol/sdk@1.2.1` — https://github.com/agentclientprotocol
+- `@agentclientprotocol/claude-agent-acp@0.57.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.202`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp@1.5.2` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
 - OpenCode (`opencode acp`) — https://opencode.ai
 

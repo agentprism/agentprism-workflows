@@ -68,12 +68,12 @@ The backend is selected **per `agent()` call** from its `model` string. This is 
 
 - **Omit `model` entirely** for maximum portability — the call runs on whatever default backend the host configured (`AGENTPRISM_DEFAULT_BACKEND`, or the host's session model). A script with no model specs anywhere runs unchanged on any backend.
 - **Name a model to route**: `opus`, `sonnet`, `haiku`, `claude`, `anthropic/…` → the Claude backend; `gpt-…`, `codex`, `o3`/`o4`, `openai/…` → the Codex backend; `opencode/<provider>/<model>` → OpenCode (the `opencode/` prefix is stripped, the rest selects the model — a bare `glm-5.2` does **not** route to OpenCode); a registered custom backend's name → that backend, with `name/<inner-model>` selecting a model from its catalog.
-- **Bracket modifiers** tune backend-native knobs: `gpt-5.5-codex[high]` sets reasoning effort; `[high fast]` also enables the backend's fast mode; `opencode/zai/glm-5.2[high]` maps to that agent's thought-level option.
+- **Bracket modifiers** tune backend-native knobs: `gpt-5.5[high]` sets reasoning effort; `[high fast]` also enables the backend's fast mode; `opencode/zai/glm-5.2[high]` maps to that agent's thought-level option.
 - **`tier`** (`"small" | "medium" | "big"`) is a coarse alternative resolved from the host's tier config — use it when you want "a cheap model" without naming a vendor.
 
 ```js
 const plan   = await agent(PLAN_PROMPT,          { label: "plan",      model: "opencode/zai/glm-5.2", schema: PLAN });
-const impl   = await agent(implPrompt(plan),     { label: "implement", model: "gpt-5.5-codex[high]" });
+const impl   = await agent(implPrompt(plan),     { label: "implement", model: "gpt-5.5[high]" });
 const review = await agent(reviewPrompt(impl),   { label: "review",    model: "opus", schema: REVIEW });
 ```
 
@@ -151,8 +151,8 @@ The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` 
 ## Failure semantics — design for `null`
 
 - A **recoverable** failure (timeout, empty output, transient execution error) is retried per the call's `retries` (default 0), then the call **resolves to `null`** — inside `parallel`/`pipeline` *and* as a bare `await agent(...)`. Null-check anything load-bearing, and set `retries: 1–2` on steps you can't afford to lose.
-- A **non-recoverable** failure (schema never validated, auth missing, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle.
-- A **provider quota wall pauses the run instead of failing it** — the journal checkpoints and the host can resume after the budget refills. You don't need to code around rate limits.
+- A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle.
+- A **provider quota wall or missing backend authentication pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills or authentication completes. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
 - Per-call knobs: `timeoutMs` (a step allowed to run long: `timeoutMs: null` disables the clock), `retries`.
 
 ## Built-in quality loops
@@ -175,7 +175,7 @@ const outcome = await gate(
   (feedback, attempt) => agent(
     `Implement the fix described here:\n${JSON.stringify(plan)}\n` +
     (feedback ? `\nA reviewer rejected attempt ${attempt}: ${feedback}\nAddress every point.` : ""),
-    { label: `fix:${attempt + 1}`, model: "gpt-5.5-codex" },
+    { label: `fix:${attempt + 1}`, model: "gpt-5.5" },
   ),
   (result) => agent(
     `Run the test suite and review this change summary:\n${result}\n` +
@@ -268,7 +268,7 @@ Structured output works on custom backends through the same injected-tool/fallba
 Runs are journaled: every `agent()` and `checkpoint()` result is recorded under a deterministic call index, and a paused/killed run **resumes by replaying the completed prefix from the journal at zero token cost**, executing only what never ran. Authoring rules that keep this working:
 
 - `Date.now()`, `Math.random()`, and no-arg `new Date()` **throw inside the realm** (`new Date(isoString)` is fine). Need a timestamp or a random seed? Pass it in via `args`.
-- A call's replay identity hashes its prompt, `model`, `tier`, `phase`, `agentType`, and `schema`. Resume replays the **longest unchanged prefix** — editing an early prompt re-runs everything from there, while `label`, `cwd`, `mcpServers`, `images`, and `meta`/`promptMeta` are deliberately *not* hashed and can change freely between resume attempts.
+- A call's replay identity hashes its prompt, `model`, `mode` (when set), `tier`, `phase`, `agentType`, and `schema`. Resume replays the **longest unchanged prefix** — editing an early prompt re-runs everything from there, while `label`, `cwd`, `mcpServers`, `images`, `meta`/`promptMeta`, and `keepSession` are deliberately *not* hashed and can change freely between resume attempts.
 - Keep call order deterministic: same `args` in, same sequence of calls out. Derive iteration from `args` and prior agent results, never from ambient state.
 
 ## Worked example — cross-vendor build with every major primitive
@@ -306,7 +306,7 @@ const outcome = await gate(
     `Implement: ${args.feature}\nPlan:\n- ${plan.steps.join("\n- ")}\n` +
     `Run the project's tests before finishing and report results.` +
     (feedback ? `\n\nReviewer feedback on attempt ${attempt}:\n${feedback}\nAddress every point.` : ""),
-    { label: `implement:${attempt + 1}`, model: "gpt-5.5-codex[high]", retries: 1 },
+    { label: `implement:${attempt + 1}`, model: "gpt-5.5[high]", retries: 1 },
   ),
   async (report) => {
     if (!report) return { ok: false, feedback: "implementation agent produced no result" };

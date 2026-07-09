@@ -1,16 +1,17 @@
 # API reference
 
-The integrator-facing surface of the `@automatalabs/*` packages, in one place. Everything here is published API; if a symbol is not documented here or in the [README](../README.md), treat it as internal. Version references are as of `workflow-engine` 0.7 / `acp-agents` 0.11.
+The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.23.1, `acp-agents` 0.22.1, `workflow-engine` 0.12.0, `shared-types` 0.14.0, `mcp-server` 0.4.1, and `agentprism-otel` 0.1.0.
 
 Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 
 | Package | What it is | Depend on it when |
 |---|---|---|
-| `@automatalabs/workflows` | Facade re-exporting the full public surface (`runDynamicWorkflow`, `createAcpRunner`, `WorkflowManager`, types) | You want the SDK. **Start here.** |
+| `@automatalabs/workflows` | Facade re-exporting the supported orchestration surface (`runDynamicWorkflow`, `createAcpRunner`, `WorkflowManager`, auth/session types) | You want the SDK. **Start here.** |
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
-| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing one `workflow` tool | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing `workflow` plus two auth tools when the runner is auth-capable | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
 
 ---
@@ -186,7 +187,7 @@ const runner = createAcpRunner({
 });
 ```
 
-`AcpRunnerOptions`: `size?`, `clientHandlers?`, `onPermissionRequest?` (runner-wide async human-in-the-loop resolver; replaces the synchronous `ToolPolicy` auto-decision wherever set — pending resolvers are settled as `cancelled` on session teardown so a turn can never hang), `onElicitation?` (runner-wide ACP `elicitation/create` responder; see below), `authCapabilities?` (`{ terminal?, gateway? }` — which auth method **types** this host can complete; advertised at `initialize`, see below), `backends?` (custom ACP backends, merged over env `AGENTPRISM_BACKENDS`; names are case-insensitive, `claude`/`codex`/`opencode` reserved).
+`AcpRunnerOptions`: `size?`, `clientHandlers?`, `onPermissionRequest?` (runner-wide async human-in-the-loop resolver; replaces the synchronous `ToolPolicy` auto-decision wherever set — pending resolvers are settled as `cancelled` on session teardown so a turn can never hang), `onElicitation?` (runner-wide ACP `elicitation/create` responder; see below), `authCapabilities?` (`{ terminal?, gateway? }` — which auth method **types** this host can complete; advertised at `initialize`, see below), `onAuth?` (inline `AuthResolver`; resolve-and-retry once instead of pausing, and derives gateway auth capability unless explicitly overridden), `backends?` (custom ACP backends, merged over env `AGENTPRISM_BACKENDS`; names are case-insensitive, `claude`/`codex`/`opencode` reserved).
 
 ### `run(prompt, opts)` — the AgentRunner seam
 
@@ -198,7 +199,7 @@ One agent call per invocation; returns the assistant text, or the **validated ob
 
 **Structured output channels.** Claude and Codex keep their native schema channels authoritative and unchanged. OpenCode and custom ACP backends use the client-hosted MCP path: when `RunOptions.schema` is set, the backend opts in, and the negotiated initialize response advertises `agentCapabilities.mcpCapabilities.http === true`, the runner appends a client-hosted HTTP MCP server to `session/new.mcpServers`. The injected server is named `structured_output` (or `structured_output_2`, etc. on name collision), runs on `127.0.0.1` with an unguessable token path, and exposes one tool named `StructuredOutput`; agents may show it namespaced, for example `structured_output_StructuredOutput`. The tool input schema is the requested JSON Schema, and a valid call captures the result. Injected-tool schema runs are **serialized per pooled connection**: agents with instance-global, name-keyed MCP registries (OpenCode) expose every registered tool to every live session on the process, so overlapping injected sessions would leak one session's capture into another; the constant server name makes each registration replace the previous, and the per-connection turn guarantees the single live registration belongs to the active run. Scale schema-run parallelism with `AGENTPRISM_ACP_POOL_SIZE` (one registry per process), not concurrent sessions. If any gate fails, or a custom backend sets `structuredOutputTool:false`, behavior falls back to the existing prompt-embedded schema plus final-text JSON parse ladder. OpenCode also receives the generic `_meta.outputSchema` forward for future compatibility, but current OpenCode structured output depends on the injected tool. User-provided `mcpServers` are preserved and are not part of the resume hash.
 
-**Model specs**: `provider/modelId`, bare id, or tier word; a trailing bracket drives sibling config options — `gpt-5.1-codex[high]` sets `reasoning_effort`, `[high fast]` also enables Fast mode (boolean-typed or legacy select shape — both supported; the client advertises `session.configOptions.boolean`). Routing: `claude|opus|sonnet|haiku` → Claude; `gpt|codex|o3|o4` → Codex; `opencode` / `opencode/<provider/model>` → OpenCode; registered custom-backend names route to their process first. OpenCode and custom backends strip their routing prefix before model selection, so `opencode/zai/glm-5.2[high]` selects `zai/glm-5.2` and applies `high` to a `thought_level`/effort option; Claude/Codex provider specs pass through whole. A bare `glm-5.2` does not route to OpenCode. An unmatched model/modifier fires `onModelFallback` (observable, never a throw) and the session default runs.
+**Model specs**: `provider/modelId`, bare id, or tier word; a trailing bracket drives sibling config options — `gpt-5.5[high]` sets `reasoning_effort`, `[high fast]` also enables Fast mode (boolean-typed or legacy select shape — both supported; the client advertises `session.configOptions.boolean`). Routing: `claude|opus|sonnet|haiku` → Claude; `gpt|codex|o3|o4` → Codex; `opencode` / `opencode/<provider/model>` → OpenCode; registered custom-backend names route to their process first. OpenCode and custom backends strip their routing prefix before model selection, so `opencode/zai/glm-5.2[high]` selects `zai/glm-5.2` and applies `high` to a `thought_level`/effort option; Claude/Codex provider specs pass through whole. A bare `glm-5.2` does not route to OpenCode. An unmatched model/modifier fires `onModelFallback` (observable, never a throw) and the session default runs.
 
 **Session modes (confinement)**: `mode` is an agent-advertised ACP session mode id. Claude-family agents commonly advertise `default`, `plan`, `acceptEdits`, `bypassPermissions`; Codex-family agents commonly advertise `read-only`, `agent`, `agent-full-access`; OpenCode exposes modes as a `configOptions` select with `category:"mode"` / `id:"mode"`. This is strict: if the backend advertises neither `modes` nor a mode config-option catalog, does not list the requested id, or rejects the wire call, the run fails before any prompt is sent. When `modes` is present, the runner validates it and calls `session/set_mode`; when `modes` is absent but a mode config option is present, it validates against that option and applies `session/set_config_option`.
 
@@ -266,6 +267,7 @@ Installed adapter status from the bundled dists:
 
 - `@agentclientprotocol/claude-agent-acp@0.57.0`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. It does not advertise or register `providers/*`.
 - `@automatalabs/codex-acp@1.5.2`: advertises `auth.logout`, implements `authenticate` (`api-key`, `chat-gpt`, and `gateway` when gateway support is advertised), and implements `logout`. It does not advertise or register `providers/*`.
+- Host-resolved OpenCode (`opencode-ai` 1.17.14 in the verified profile): advertises the `opencode-login` terminal-style method when the client advertises terminal auth, acknowledges `authenticate`, and relies on its provider credential store; it does not advertise logout. The credential-gated live suite verifies the installed executable because OpenCode is not bundled.
 
 ### Protocol passthrough & coverage
 
@@ -382,13 +384,13 @@ Long-lived ACP server processes are pool-managed (spawned once, sessions multipl
 
 Workflow scripts may *declare* backends via `meta.backends`, but declarations are inert until the composition root approves them (`allowScriptBackends` / `ExecOptions.scriptBackends` / `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`).
 
-**Environment variables**: `AGENTPRISM_ACP_POOL_SIZE` (processes per backend, default 1), `AGENTPRISM_ACP_INIT_TIMEOUT_MS` (initialize handshake deadline, default 60s), `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex` | `opencode` | custom name), `AGENTPRISM_PERSISTENCE_ROOT`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_OPENCODE_E2E_MODEL` (live e2e only; default `opencode/zai/glm-5.2`), plus the per-backend `*_CMD`/`_ARGS`/`_BIN` above.
+**Environment variables**: `AGENTPRISM_ACP_POOL_SIZE` (processes per backend, default 1), `AGENTPRISM_ACP_INIT_TIMEOUT_MS` (initialize handshake deadline, default 60s), `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex` | `opencode` | custom name), `AGENTPRISM_BACKENDS` (host custom-backend registry JSON), `AGENTPRISM_PERSISTENCE_ROOT`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_MCP_INLINE_AUTH` (MCP binary only; opt-in elicitation resolver), `AGENTPRISM_OPENCODE_E2E_MODEL` (live e2e only; default `opencode/zai/glm-5.2`), plus the per-backend `*_CMD`/`_ARGS`/`_BIN` above.
 
 ---
 
 ## Errors — `WorkflowError`
 
-One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds across packages) with `.code`, `.recoverable`, `.agentLabel?`, `.resetHint?`. Recoverable agent failures retry up to `agentRetries`, then resolve that agent to `null`; non-recoverable ones halt the run.
+One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds across packages) with `.code`, `.recoverable`, `.agentLabel?`, `.resetHint?`, and `.authContext?`. Recoverable agent failures retry up to `agentRetries`, then resolve that agent to `null`; non-recoverable ones halt the run except the two manager-owned pause codes called out below.
 
 | Code | Recoverable | Meaning / engine behavior |
 |---|---|---|
@@ -410,7 +412,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes the tool named **`workflow`**: pass `script` (or a saved `name`) + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. Honors the same environment variables as the SDK.
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes the tool named **`workflow`**: pass a raw `script` + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir` feature. The server honors the same runtime environment variables as the SDK plus its MCP-only auth/approval switches.
 
 **Auth tools (§4.3).** When the injected runner is auth-capable — the default `createAcpRunner()` is — two additive tools register alongside `workflow` (a host that injects a plain `AgentRunner` gets `workflow` alone, so `createWorkflowServer(runner)` is unchanged and default behavior is byte-identical):
 
@@ -423,6 +425,8 @@ A run that paused with `reason:"auth_required"` surfaces a summary built from th
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+
+`keepSession:true` skips the release-time `session/close`; the resulting `AgentSessionRecord` is returned in `WorkflowRunResult.agentSessions` so the host can later call `runner.loadSession()` or `runner.resumeSession()`.
 
 See the [README](../README.md#writing-workflow-scripts) for authoring guidance and examples, and [`design-notes.md`](design-notes.md) for the protocol-level design.

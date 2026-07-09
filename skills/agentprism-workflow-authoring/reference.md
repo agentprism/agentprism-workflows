@@ -27,7 +27,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
 | `model` | `string` | Model spec; selects the backend **and** the model. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
-| `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Claude-family: `default`, `plan`, `acceptEdits`, `bypassPermissions`. Codex-family: `read-only`, `agent`, `agent-full-access`. OpenCode: its mode config option. |
+| `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Claude-family: `default`, `plan`, `acceptEdits`, `bypassPermissions`. Codex-family: `read-only`, `agent`, `agent-full-access`. OpenCode: its mode config option. Part of the resume hash when set. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
 | `cwd` | `string` | Per-session working directory; relative resolves against the run's base cwd. Overridden by worktree isolation. Not hashed. |
@@ -37,6 +37,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `images` | `PromptImage[]` | Base64 image blocks appended to the prompt; backends without image support get a bracketed text note. Not hashed. |
 | `meta` | `object` | ACP `_meta` merged into `session/new` — session-scoped extension passthrough (pairs with custom backends). Not hashed. |
 | `promptMeta` | `object` | ACP `_meta` merged into `session/prompt` — turn-scoped passthrough. Backend-computed keys win on conflict. Not hashed. |
+| `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Not hashed. |
 
 ## Model specs & routing
 
@@ -50,7 +51,7 @@ A `model` string selects the backend, then the concrete model within it:
 | `opencode` or `opencode/<provider>/<model>` | OpenCode backend | Prefix is stripped before model selection: `opencode/zai/glm-5.2` selects `zai/glm-5.2`. A bare `glm-5.2` does **not** route to OpenCode. |
 | `<custom-name>` or `<custom-name>/<inner-model>` | that registered custom backend | Names are case-insensitive; `claude`/`codex`/`opencode` are reserved. Registered names win over pattern matches. |
 
-**Bracket modifiers** (trailing `[…]`): `gpt-5.1-codex[high]` sets reasoning effort; `[high fast]` also enables the backend's fast mode; on OpenCode/custom backends the effort word maps to a thought-level/effort config option when one exists.
+**Bracket modifiers** (trailing `[…]`): `gpt-5.5[high]` sets reasoning effort; `[high fast]` also enables the backend's fast mode; on OpenCode/custom backends the effort word maps to a thought-level/effort config option when one exists.
 
 **Fallback is observable, never fatal**: an unmatched model or modifier logs `<label>: model "<spec>" unavailable — using the session default` to the run log and proceeds on the session default.
 
@@ -117,7 +118,7 @@ The host supplies the human channel (`ExecOptions.confirm` in the SDK; elicitati
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall — the run **pauses** (journaled, resumable), with the provider's reset hint. |
 | `TOKEN_BUDGET_EXHAUSTED` | no | Run (or phase) token cap hit; further `agent()` calls throw. |
 | `AGENT_LIMIT_EXCEEDED` | no | `maxAgents` cap hit. |
-| `AUTH_REQUIRED` | no | Backend needs authentication; the host must run `authenticate()`. |
+| `AUTH_REQUIRED` | no | Backend needs authentication. `WorkflowManager` returns a resumable pause with `reason: "auth_required"` and redacted `authContext`; a direct runner throws. The host completes auth before resuming/retrying. |
 | `SCRIPT_VALIDATION_ERROR` | no | Script failed parse/validation (bad meta, nondeterministic API, bad `meta.backends` shape). |
 | `SCRIPT_ERROR` | no | The script itself crashed (uncaught throw, floated rejection). |
 | `WORKFLOW_ABORTED` | — | Real cancellation (pause/stop/host signal) — never used for crashes. |
@@ -127,9 +128,9 @@ The host supplies the human channel (`ExecOptions.confirm` in the SDK; elicitati
 ## Determinism & the resume journal
 
 - Banned in the realm (they throw): `Date.now()`, `Math.random()`, no-arg `new Date()` / `Date()`. `new Date(value)` works. No `require`/`import`, no Node or network APIs — the realm is a determinism boundary, not a security sandbox.
-- Each `agent()` call journals its result under a monotonic call index plus an identity hash of `prompt + model + tier + phase + agentType + agent-definition + schema`.
+- Each `agent()` call journals its result under a monotonic call index plus an identity hash of `prompt + model + mode-when-set + tier + phase + agentType + agent-definition + schema`.
 - Resume replays the **longest unchanged prefix** as cache hits (zero tokens); the first changed/new call and everything after runs live. `retry`/`gate` chains cache-miss-cascade on resume by design (attempt N+1's prompt embeds attempt N's live result).
-- Additive options are **not** hashed and can differ across resumes: `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`.
+- Additive options are **not** hashed and can differ across resumes: `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`.
 - `checkpoint()` replies are journaled and replay on resume instead of re-asking.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
@@ -191,7 +192,7 @@ const run = await runDynamicWorkflow(script, {
 // run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
 ```
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts the same script + `args`, streams progress, resolves checkpoints via MCP elicitation, and supports `resumeFromRunId`. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`, streams progress, resolves checkpoints via MCP elicitation, and supports `resumeFromRunId`; unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. With the default ACP runner it also registers `workflow_auth_status` and `workflow_authenticate` for authentication pause-and-resume. `AGENTPRISM_MCP_INLINE_AUTH=1` opts into masked elicitation for headlessly collectable methods. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
 
 Backend auth comes from the machine the host runs on: Claude via a logged-in Claude Code install or `ANTHROPIC_API_KEY`; Codex via `~/.codex/auth.json`; OpenCode via `opencode auth login` (its CLI must be installed — it is not bundled). A script only needs auth for the backends it actually routes to.
 

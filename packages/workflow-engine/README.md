@@ -75,7 +75,7 @@ console.log(run.result, run.agentCount, run.durationMs);
 ```
 
 `runWorkflow` returns the `EngineRunResult` (meta / result / logs / phases / agentCount /
-durationMs / runId / tokenUsage). `WorkflowManager` stamps the terminal
+durationMs / runId / tokenUsage / optional `agentSessions`). `WorkflowManager` stamps the terminal
 `status` / `reason` / `resetHint` on top to produce a `WorkflowRunResult`.
 
 ## The script DSL
@@ -83,8 +83,9 @@ durationMs / runId / tokenUsage). `WorkflowManager` stamps the terminal
 Inside a workflow body these are available as globals (no imports):
 
 - `agent(prompt, opts?)` — run one subagent. `opts` includes `label`, `phase`, `schema`
-  (typebox → validated object), `model`, `tier`, `agentType`, `isolation: "worktree"`,
-  `mcpServers`, `timeoutMs`, `retries`. The single call into your `AgentRunner`.
+  (typebox → validated object), `model`, `mode`, `tier`, `agentType`,
+  `isolation: "worktree"`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`,
+  `keepSession`, `timeoutMs`, `retries`. The single call into your `AgentRunner`.
 - `parallel([() => agent(...), ...])` — run thunks concurrently (bounded by the run's
   concurrency limiter).
 - `pipeline(items, stage1, stage2, ...)` — map each item through ordered stages.
@@ -130,6 +131,17 @@ intentionally unavailable and rejects with `journaling disabled for this run` fo
 The manager-level `journal` event still emits live `{ runId, entry }` observations when file
 journaling is disabled.
 
+The manager treats `PROVIDER_USAGE_LIMIT` and `AUTH_REQUIRED` as resumable pause conditions rather
+than failed runs. An authentication pause uses `reason: "auth_required"` and carries only the
+non-secret `authContext` from the error. Complete authentication through the injected runner, then
+resume the same run journal. A headless `checkpoint()` instead takes its configured default or
+aborts; it is not an authentication-style persisted pause.
+
+When a runner reports `onSessionOpen`, the engine records the non-secret re-attach handle on the
+journal entry and in `WorkflowRunResult.agentSessions`. `agent({ keepSession: true })` is forwarded
+to the runner so an ACP implementation can skip release-time `session/close`; re-attaching is a
+host/runner responsibility, not an in-script DSL operation.
+
 ## Key exports
 
 From `@automatalabs/workflow-engine` (see `src/index.ts`):
@@ -140,8 +152,11 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
   `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
   `RunLease`, `RunStatus`, `PersistedRunState`, `PersistedAgentState`, `FsLayer`.
+- **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /
+  `OpenWorkflowDirOptions` types.
 - **Errors** — `WorkflowError`, `WorkflowErrorCode`, `isWorkflowError`, `wrapError`,
-  `isProviderUsageLimit`, `classifyProviderLimit`, `isAbortError`, `isTimeoutError`.
+  `isProviderUsageLimit`, `isAuthRequired`, `classifyProviderLimit`, `isAbortError`,
+  `isTimeoutError`, and `AuthErrorContext`.
 - **Config caps** — `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`,
   `DEFAULT_AGENT_TIMEOUT_MS`, `AGENTS_DIR`.
 - **Model routing / tiers** — `parseModelRoutingFromMeta`, `resolveModelForPhase`,
@@ -153,7 +168,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 - **Display / snapshots** — `preview`, `renderWorkflowText`, `renderWorkflowLines`,
   `createWorkflowSnapshot`, `recomputeWorkflowSnapshot`, `statusIcon`, `shorten`.
 - **Paths / logger / frontmatter** — `workflowProjectPaths`, `workflowHomeDir`,
-  `workflowUserSavedDir`, `workflowProjectKey`, `createWorkflowLogger`, `parseFrontmatter`.
+  `workflowUserSavedDir`, `workflowProjectKey`, `AGENTPRISM_PERSISTENCE_ROOT_ENV`,
+  `createWorkflowLogger`, `parseFrontmatter`.
 - **Seam re-exports** (from `@automatalabs/shared-types`) — `AgentRunner`, `RunOptions`,
   `AgentResult`, `AgentUsage`, `WorkflowMeta`, `WorkflowRunResult`, `JournalEntry`,
   `TokenUsage`, …

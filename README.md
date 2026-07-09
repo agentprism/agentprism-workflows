@@ -29,7 +29,7 @@ Each `agent()` call runs on a **shipped coding agent** — Claude Code, Codex, o
 
 ### Many agents, one workflow
 
-The backend is chosen **per `agent()` call**: an `opus` review step, a `gpt-5.5-codex` implementation step, an `opencode/zai/glm-5.2` planning step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
+The backend is chosen **per `agent()` call**: an `opus` review step, a `gpt-5.5` implementation step, an `opencode/zai/glm-5.2` planning step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
 
 ### Durable runs — resume without re-spending tokens
 
@@ -107,18 +107,24 @@ pnpm build        # tsc -b across all packages
 
 ## Packages
 
-Two packages are **user-facing** — start with one of these:
+Two packages are the primary **user-facing entry points** — start with one of these:
 
 | Package | What it is |
 |---|---|
-| **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the engine + backend surface. Start here. |
-| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing the `workflow` tool — built on `@automatalabs/workflows`. |
+| **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
+| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing `workflow` plus conditional auth tools — built on `@automatalabs/workflows`. |
 
-The other three are **internal building blocks**, composed by the SDK. You don't depend on them directly: `@automatalabs/workflows` is the public entry point for everything they export.
+One optional integration package attaches to the SDK's manager surface:
 
 | Package | What it is |
 |---|---|
-| **`@automatalabs/acp-agents`** | The ACP client + `Claude`/`Codex` backends (the `AgentRunner` implementation, connection pooling, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
+| **`@automatalabs/agentprism-otel`** | OpenTelemetry traces and metrics for a `WorkflowManager`; peer-depends only on `@opentelemetry/api` and no-ops when the host has no OTel SDK. |
+
+The other three are **internal building blocks**, composed by the SDK. You normally don't depend on them directly: `@automatalabs/workflows` is the public entry point for the supported orchestration surface.
+
+| Package | What it is |
+|---|---|
+| **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, budgets, worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/shared-types`** | The `AgentRunner` seam + shared types the others compose against. Internal — public entry is `@automatalabs/workflows`. |
 
@@ -175,7 +181,7 @@ const data = await runner.run("Summarize this repo as JSON {summary}.", {
     type: "object", additionalProperties: false,
     required: ["summary"], properties: { summary: { type: "string" } },
   },
-  model: "opus",          // routes to Claude; e.g. "gpt-5-codex" routes to Codex
+  model: "opus",          // routes to Claude; e.g. "gpt-5.5" routes to Codex
   cwd: process.cwd(),
 });
 // data is typed/validated against the schema (a plain object, not text)
@@ -218,7 +224,7 @@ From a source checkout, point at the built entry instead:
 
 | Param | Type | Notes |
 |---|---|---|
-| `script` | string (**required**) | Raw JS; first statement must be `export const meta = { name, description, phases? }`; must call `agent()` at least once. |
+| `script` | string (**required**) | Raw JS; first statement must be `export const meta = { name, description, phases? }`. Agent-less scripts are valid, though the validator warns when a script has neither `agent()` nor `checkpoint()`. |
 | `args` | any | Exposed to the script as the global `args`. |
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
@@ -229,13 +235,20 @@ From a source checkout, point at the built entry instead:
 
 The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`.
 
+With the default ACP runner, the server also registers two auth tools:
+
+- `workflow_auth_status` — read-only, redacted backend auth state + advertised methods.
+- `workflow_authenticate` — completes a selected method with secret `env`/`meta` input that is never echoed, journaled, or logged.
+
+An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"`. Call `workflow_auth_status`, then `workflow_authenticate`, then call `workflow` again with the paused `resumeFromRunId`. A host that injects a plain `AgentRunner` gets only `workflow`. `AGENTPRISM_MCP_INLINE_AUTH=1` optionally lets an elicitation-capable MCP client collect env/gateway credentials inline; it is off by default.
+
 ---
 
 ## Writing workflow scripts
 
 A script is plain JavaScript whose **first statement** is the `meta` literal. Inside it, these globals are available (injected into the run's realm — they are not importable functions; `@automatalabs/workflows` ships an ambient `.d.ts` so your editor knows them):
 
-- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`. (`meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt` — the protocol's extension surface for custom agent properties. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
+- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`. (`keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
 - `parallel([fn, …])` — run thunks concurrently; **barrier** (awaits all).
 - `pipeline(items, stage1, stage2, …)` — stream each item through stages independently (no inter-stage barrier).
 - `phase(title)`, `log(msg)` — progress grouping + narration.
@@ -334,6 +347,8 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 | `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| a registered custom name). |
 | `AGENTPRISM_BACKENDS` | (none) | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Programmatic `createAcpRunner({ backends })` wins per name. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | (unset) | MCP server only: `1`/`true` approves **script-declared** `meta.backends` headlessly (for clients without elicitation support). |
+| `AGENTPRISM_MCP_INLINE_AUTH` | (unset) | MCP server only: `1`/`true` enables the inline elicitation auth resolver. Default is pause → `workflow_authenticate` → resume. |
+| `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run state, logs, journals, and resume data. |
 | `AGENTPRISM_ACP_POOL_SIZE` | `1` | Long-lived processes held per backend. |
 | `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | `60000` | Deadline for a backend's one-time ACP `initialize` handshake (a non-ACP command fails fast instead of hanging). |
 | `AGENTPRISM_CLAUDE_ACP_CMD` / `…_ARGS` | (bundled) | Override the Claude ACP server command/args. |
@@ -345,7 +360,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 ## Documentation
 
-- [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. the `agentEvent` token-level stream), `ExecOptions` (incl. per-run `cwd` for worktree-per-run hosts), the runner surface (`run()`, model routing, event bus, interactive sessions, capabilities), backend resolution + every environment variable, and the full `WorkflowError` code table.
+- [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, MCP auth tools, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
 - [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add VikashLoomba/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
