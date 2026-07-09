@@ -192,6 +192,23 @@ export type {
   ClientMethodCoverage,
 } from "@automatalabs/acp-agents";
 
+// ── Type-driven auth surface (§4.2): the runner-facing auth contracts hosts consume through this
+//    facade. mcp-server imports these here (its only @automatalabs deps are `workflows` and
+//    `shared-types`), so the type re-exports land with PR5 — the MCP auth tools cannot compile
+//    without them. The `isAuthRequired` VALUE export lands with PR6. ──
+export type {
+  AuthResolver,
+  AuthContext,
+  AuthResolution,
+  AuthMethodDescriptor,
+  CompleteAuthOptions,
+  AuthOutcome,
+  AuthController,
+  AuthStatusSnapshot,
+  AuthCapableRunner,
+} from "@automatalabs/acp-agents";
+export type { AuthErrorContext } from "@automatalabs/shared-types"; // via workflow-engine re-export (§1.5)
+
 // ── Live ACP events: `createAcpRunner().on("tool_call", evt => …)` to listen in on the
 //    stream of a run. The event map keys are ACP `sessionUpdate` discriminants plus a few
 //    cross-cutting events; each payload carries a `{ sessionId, backendId, label?, runId? }`
