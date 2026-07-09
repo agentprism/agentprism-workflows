@@ -9,6 +9,11 @@ export type {
   AcpRunnerOptions,
   AuthenticateOptions,
   AuthMethodsOptions,
+  AuthCapableRunner,
+  AuthController,
+  AuthOutcome,
+  AuthStatusSnapshot,
+  CompleteAuthOptions,
   DisableProviderOptions,
   DeleteSessionOptions,
   ListProvidersOptions,
@@ -17,6 +22,27 @@ export type {
   ReattachSessionOptions,
   SetProviderOptions,
 } from "./runner.js";
+
+// Type-driven auth contracts (§1.3) and the AuthStore lifecycle spine (§2).
+export { buildAuthDescriptor, buildAuthDescriptors, isGatewayShapedMeta } from "./auth/auth-types.js";
+export type { AuthContext, AuthMethodDescriptor, AuthResolution, AuthResolver } from "./auth/auth-types.js";
+export {
+  AuthStore,
+  BackendAuthMachine,
+  classifyCredential,
+  redactSecrets,
+} from "./auth/auth-store.js";
+export type {
+  AuthEvent,
+  AuthIntent,
+  AuthMethodType,
+  AuthProfile,
+  BackendAuthState,
+  ConnectionAuthStamp,
+  CredentialClass,
+  RedactedIntent,
+  TerminalLaunch,
+} from "./auth/auth-store.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 

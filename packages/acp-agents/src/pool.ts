@@ -16,6 +16,7 @@ import { validateClientHandlers, type ClientHandlers } from "./client-handlers.j
 import { mapThrownError } from "./errors-map.js";
 import type { AcpEventSink } from "./events.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
+import type { AuthStore, BackendAuthMachine } from "./auth/auth-store.js";
 
 const DEFAULT_POOL_SIZE = 1;
 const POOL_SIZE_ENV = "AGENTPRISM_ACP_POOL_SIZE";
@@ -37,6 +38,10 @@ export interface AcpPoolDeps {
   /** Initialize-time client auth advertisement (§1.2), forwarded to every PooledConnection.
    *  Undefined omits the `auth` capability — the default-OFF baseline. */
   authCapabilities?: { terminal?: boolean; gateway?: boolean };
+  /** The runner's single auth store (§2). When present, connection selection is generation-gated:
+   *  no session is ever opened on a connection whose applied intent-generation is stale. Undefined
+   *  => no gating, byte-identical to the pre-auth baseline. */
+  authStore?: AuthStore;
 }
 
 /** Resolve the per-backend pool size: explicit option wins, else env, else 1. Clamped to >= 1. */
@@ -114,29 +119,67 @@ export class AcpAgentPool {
     // Pool identity: poolKey (id + spawn-config hash for custom backends) over bare id, so two
     // runs declaring the same NAME with different COMMANDS never share a process.
     const key = backend.poolKey ?? backend.id;
+    // Generation-gated selection (§2.6): reuse any idle live connection that is NOT stale,
+    // reconciling stale ones first. This is the mechanical proof that no session is served under
+    // stale auth. `existing` (not `machineFor`) so the default-OFF path never lazily creates a
+    // machine — undefined machine ⇒ nothing is ever stale, byte-identical to the pre-auth baseline.
+    const machine = this.deps.authStore?.existing(key);
     const connections = this.connectionsFor(key);
-    const live = connections.filter((c) => c.alive);
 
-    const idle = live.find((c) => c.activeSessions === 0);
+    if (machine) this.reconcileStale(key, machine);
+
+    const usable = connections.filter((c) => c.alive && !c.recyclePending && !machine?.isStale(c.authStamp));
+    const idle = usable.find((c) => c.activeSessions === 0);
     if (idle) return idle;
 
-    if (live.length < this.size) {
-      this.installExitHook();
-      const connection = PooledConnection.create(backend, {
-        onDead: (dead) => this.drop(key, dead),
-        onEvent: this.deps.onEvent,
-        permissionResolver: this.deps.permissionResolver,
-        elicitationResolver: this.deps.elicitationResolver,
-        advertiseElicitation: this.deps.advertiseElicitation,
-        authCapabilities: this.deps.authCapabilities,
-        clientHandlers: this.clientHandlers,
-      });
-      connections.push(connection);
-      return connection;
-    }
+    if (usable.length < this.size) return this.spawn(key, backend);
 
-    // At capacity with every connection busy: multiplex onto the least-loaded one.
-    return live.reduce((least, c) => (c.activeSessions < least.activeSessions ? c : least));
+    // At capacity with every usable connection busy: multiplex onto the least-loaded one.
+    return usable.length > 0
+      ? usable.reduce((least, c) => (c.activeSessions < least.activeSessions ? c : least))
+      : this.spawn(key, backend);
+  }
+
+  /** Reconcile every live connection for a key to the current generation (§2.6). Stale-but-busy
+   *  connections are DRAINED (recycled on release), not disposed synchronously, so in-flight prompts
+   *  finish under the auth they started with. Never blocks. */
+  private reconcileStale(key: string, machine: BackendAuthMachine): void {
+    for (const c of this.connectionsFor(key).filter((c) => c.alive)) {
+      if (!machine.isStale(c.authStamp)) continue;
+      if (c.canLiveReapply(machine) && c.activeSessions === 0) {
+        c.scheduleReapply(machine); // in-process: re-auth the idle connection live
+      } else if (c.activeSessions === 0) {
+        void c.dispose(); // disk/spawn-env: recycle the idle process now
+        this.drop(key, c);
+      } else {
+        c.markForRecycleWhenIdle(machine); // BUSY: drain, then recycle on release
+      }
+    }
+  }
+
+  /** Public: reconcile every live connection for a backend to the current generation (§2.6). Called
+   *  by the runner immediately after a host-completed auth so a subsequent run() lands current. */
+  recycle(poolKey: string): void {
+    if (this.disposed) return;
+    const machine = this.deps.authStore?.existing(poolKey);
+    if (machine) this.reconcileStale(poolKey, machine);
+  }
+
+  /** Spawn a fresh pooled connection (a fresh process primes the current intent at initialize). */
+  private spawn(key: string, backend: Backend): PooledConnection {
+    this.installExitHook();
+    const connection = PooledConnection.create(backend, {
+      onDead: (dead) => this.drop(key, dead),
+      onEvent: this.deps.onEvent,
+      permissionResolver: this.deps.permissionResolver,
+      elicitationResolver: this.deps.elicitationResolver,
+      advertiseElicitation: this.deps.advertiseElicitation,
+      authCapabilities: this.deps.authCapabilities,
+      authStore: this.deps.authStore,
+      clientHandlers: this.clientHandlers,
+    });
+    this.connectionsFor(key).push(connection);
+    return connection;
   }
 
   private connectionsFor(key: string): PooledConnection[] {

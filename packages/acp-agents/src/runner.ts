@@ -18,6 +18,7 @@
 // and re-throw on abort, but never implement our own timeout.
 import { isAbsolute } from "node:path";
 import {
+  isWorkflowError,
   WorkflowError,
   WorkflowErrorCode,
   type AgentResult,
@@ -65,6 +66,20 @@ import {
   type CustomBackendConfig,
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
+import {
+  buildAuthDescriptors,
+  type AuthContext,
+  type AuthMethodDescriptor,
+  type AuthResolution,
+  type AuthResolver,
+} from "./auth/auth-types.js";
+import {
+  AuthStore,
+  classifyCredential,
+  type AuthIntent,
+  type AuthMethodType,
+  type BackendAuthState,
+} from "./auth/auth-store.js";
 import type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 import {
@@ -194,6 +209,55 @@ type InteractiveAssemblyOptions = InteractiveSessionOptions & {
   readonly permissionResolver?: PermissionResolver;
 };
 
+/** Options for AcpAgentRunner.completeAuth() (§1.3, §4.1). */
+export interface CompleteAuthOptions extends AuthMethodsOptions {
+  /** A method id from describeAuthMethods(). */
+  methodId: string;
+  /** The host-collected resolution (env values / gateway meta / completed / cancelled) (§1.3). */
+  resolution: AuthResolution;
+  /** Event/telemetry label used in strict capability errors. */
+  label?: string;
+  signal?: AbortSignal;
+}
+
+/** The outcome of a host-completed auth step (§1.3, §4.1). Carries no secret. */
+export type AuthOutcome = { status: "authenticated" | "cancelled"; methodId: string; recycled: boolean };
+
+/** Redacted status view surfaced by the controller, MCP tool, and web (canonical shape; §2.14). */
+export interface AuthStatusSnapshot {
+  backendId: string;
+  poolKey: string;
+  state: BackendAuthState;
+  authenticated: boolean;
+  canResume: boolean;
+  methods: { id: string; type: AuthMethodType; name?: string }[];
+}
+
+/** The `runner.auth` controller — the auth verbs as one addressable object (§2.10, §4.1). */
+export interface AuthController {
+  /** Alias of describeAuthMethods(). */
+  methods(opts?: AuthMethodsOptions): Promise<AuthMethodDescriptor[]>;
+  /** Alias of completeAuth(). */
+  authenticate(opts: CompleteAuthOptions): Promise<AuthOutcome>;
+  /** Clears the AuthStore for the backend, zeroizes secrets (§2.14), and recycles the pool. */
+  logout(opts?: LogoutOptions): Promise<void>;
+  /** Redacted, synchronous snapshot — ids/types/names + state only, NEVER secrets (§2.14). */
+  status(opts?: { backend?: string }): AuthStatusSnapshot[];
+  /** Cold-resume re-arm predicate (§2.13): true iff state ∈ {authenticated,credentials_held} or diskBacked. */
+  canResume(backendId: string): boolean;
+}
+
+/** Structural capability interface the MCP composition root duck-types to register auth tools
+ *  without widening the frozen `AgentRunner` seam (§4.1). `AcpAgentRunner` implements it. */
+export interface AuthCapableRunner {
+  describeAuthMethods(opts?: AuthMethodsOptions): Promise<AuthMethodDescriptor[]>;
+  completeAuth(opts: CompleteAuthOptions): Promise<AuthOutcome>;
+  /** Ids of every configured backend (built-ins + AcpRunnerOptions.backends), whether or not it
+   *  yet has a BackendAuthMachine. */
+  listBackends(): string[];
+  readonly auth: AuthController;
+}
+
 /** Constructor options for the runner: pool sizing, client-side handlers, and the custom-backend
  *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
 export interface AcpRunnerOptions extends AcpPoolOptions {
@@ -208,10 +272,15 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   onElicitation?: ElicitationResolver;
   /** Which auth method TYPES this host can complete (§1.2). When set, initialize advertises the
    *  matching client auth capability (`auth.terminal` + top-level `_meta["terminal-auth"]`, and/or
-   *  `auth._meta.gateway`) on every connection, fixed for the connection lifetime. Unset omits the
-   *  `auth` capability entirely — the default-OFF, zero-behavior-change baseline. A native-TTY CLI
-   *  host passes `{ terminal: true, gateway: true }`; a generic programmatic host leaves it unset. */
+   *  `auth._meta.gateway`) on every connection, fixed for the connection lifetime. Unset (and
+   *  `onAuth` unset) omits the `auth` capability entirely — the default-OFF, zero-behavior-change
+   *  baseline. When `onAuth` is set but this is unset it derives to `{ terminal: false, gateway: true }`
+   *  (§1.2). A native-TTY CLI host passes `{ terminal: true, gateway: true }`. */
   authCapabilities?: { terminal?: boolean; gateway?: boolean };
+  /** Inline auth resolver (§1.3, §2.11). When set, a -32000 at session/new resolves-and-retries-once
+   *  and the run NEVER pauses; when unset, a -32000 run pauses with reason:"auth_required" (§2.12,
+   *  PR4). Mutually exclusive with pause by construction. */
+  onAuth?: AuthResolver;
 }
 
 /**
@@ -219,7 +288,7 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
  * pass it into managers/runs as needed, then call dispose() (or use `await using`) when that
  * owner is done with the pooled and dedicated backend processes.
  */
-export class AcpAgentRunner implements AgentRunner {
+export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
   private readonly pool: AcpAgentPool;
   /** The resolved custom-backend registry (env + option, validated at construction). */
   private readonly backends: BackendRegistry;
@@ -236,6 +305,15 @@ export class AcpAgentRunner implements AgentRunner {
   /** Client auth advertisement, derived ONCE at construction and fixed for every connection this
    *  runner opens (pooled and dedicated). Undefined => the `auth` capability is omitted (§1.2). */
   private readonly authCapabilities: { terminal?: boolean; gateway?: boolean } | undefined;
+  /** Inline auth resolver (§2.11). When set, run() resolves a -32000 and retries once instead of
+   *  surfacing AUTH_REQUIRED. Undefined => the (PR4) pause-and-resume path. */
+  private readonly onAuth: AuthResolver | undefined;
+  /** The single per-runner auth store (§2.2). Holds every backend's `BackendAuthMachine`; the only
+   *  home for credential material in the library. Threaded into the pool and every dedicated
+   *  connection so all connection types reconcile to the same intent. */
+  private readonly authStore = new AuthStore();
+  /** The auth verbs as one addressable object (§2.10). */
+  readonly auth: AuthController;
   private readonly structuredOutputTools = new StructuredOutputToolHost();
   /** FIFO turn queue per pooled connection for injected-tool schema runs (see the injection
    *  site for why concurrent injected sessions on one process cannot be isolated). */
@@ -252,18 +330,31 @@ export class AcpAgentRunner implements AgentRunner {
     this.clientHandlers = options.clientHandlers;
     this.permissionResolver = options.onPermissionRequest;
     this.elicitationResolver = options.onElicitation;
-    // PR2 (§1.2): only the explicit `authCapabilities` path + omit-when-unset. The `onAuth`-derived
-    // default (`{ terminal: false, gateway: true }`) lands with PR3 once `onAuth` exists; until then
-    // unset ⇒ omit `auth`, which is byte-identical to today's behavior.
-    this.authCapabilities = options.authCapabilities;
+    this.onAuth = options.onAuth;
+    // Default derivation (§1.2): explicit `authCapabilities` wins; else, when an `onAuth` resolver is
+    // present, derive `{ terminal: false, gateway: true }` (gateway is cheap and non-destructive;
+    // terminal needs a real TTY a generic programmatic host lacks); else omit `auth` entirely — the
+    // default-OFF, byte-identical baseline.
+    this.authCapabilities =
+      options.authCapabilities ?? (options.onAuth ? { terminal: false, gateway: true } : undefined);
     this.pool = new AcpAgentPool(options, {
       onEvent: this.emitEvent,
       permissionResolver: options.onPermissionRequest,
       elicitationResolver: options.onElicitation,
       advertiseElicitation: Boolean(options.onElicitation),
-      authCapabilities: options.authCapabilities,
+      authCapabilities: this.authCapabilities,
+      authStore: this.authStore,
     });
     this.backends = resolveBackendRegistry(options.backends);
+    this.auth = {
+      methods: (opts?: AuthMethodsOptions) => this.describeAuthMethods(opts),
+      authenticate: (opts: CompleteAuthOptions) => this.completeAuth(opts),
+      logout: async (opts?: LogoutOptions) => {
+        await this.logout(opts ?? {});
+      },
+      status: (opts?: { backend?: string }) => this.authStatus(opts),
+      canResume: (backendId: string) => this.canResume(backendId),
+    };
   }
 
   /**
@@ -324,26 +415,53 @@ export class AcpAgentRunner implements AgentRunner {
     }
   }
 
-  /** Drive ACP authenticate on the selected backend. */
+  /** Drive ACP authenticate on the selected backend. REBUILT off dispose-after-authenticate (§2.9):
+   *  instead of opening a dedicated connection and disposing it in `finally` — which lost any
+   *  in-process (gateway) credential the agent stored on that process (gap 3) — this records the
+   *  credential into the durable `AuthStore` and recycles the pool. A method with `_meta` records an
+   *  in-process/disk intent replayed on every pooled connection's initialize; a bare method with no
+   *  `_meta` fires the one-shot `agent-login` RPC so the agent runs its own login. */
   async authenticate(opts: AuthenticateOptions): Promise<AuthenticateResponse | void> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     validateRequiredString(opts.methodId, opts.label, "authenticate", "methodId");
     opts.signal?.throwIfAborted();
 
     const backend = selectBackend(opts, this.backends);
-    const connection = this.createDedicatedConnection(backend, () => undefined);
-    try {
-      const request: AuthenticateRequest = {
-        methodId: opts.methodId,
-        ...(opts.meta ? { _meta: opts.meta } : {}),
-      };
-      const response = await connection.authenticate(request, opts.label);
-      opts.signal?.throwIfAborted();
-      if (this.disposed) throw new Error("ACP agent runner is disposed");
-      return response;
-    } finally {
-      await disposeBestEffort(connection);
-    }
+    const { methods } = await this.probeAuthMethods(backend);
+    const resolution: AuthResolution = opts.meta
+      ? { outcome: "meta", methodId: opts.methodId, meta: opts.meta }
+      : { outcome: "agent-login", methodId: opts.methodId };
+    await this.applyResolution(backend, resolution, methods, opts.methodId, opts.label);
+    opts.signal?.throwIfAborted();
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    return;
+  }
+
+  /** Proactively enumerate the selected backend's advertised methods, already type-dispatched (§1.3).
+   *  A read-only probe: opens a dedicated connection, reads the initialize-advertised methods, runs
+   *  `buildAuthDescriptors`, and disposes. */
+  async describeAuthMethods(opts: AuthMethodsOptions = {}): Promise<AuthMethodDescriptor[]> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    const backend = selectBackend(opts, this.backends);
+    return (await this.probeAuthMethods(backend)).descriptors;
+  }
+
+  /** Record the host-collected resolution into the AuthStore, advance the generation, and recycle
+   *  the pool (§2.9/§2.6) so a subsequent run() always lands on a current connection. */
+  async completeAuth(opts: CompleteAuthOptions): Promise<AuthOutcome> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    validateRequiredString(opts.methodId, opts.label, "completeAuth", "methodId");
+    opts.signal?.throwIfAborted();
+    const backend = selectBackend(opts, this.backends);
+    const { methods } = await this.probeAuthMethods(backend);
+    return this.applyResolution(backend, opts.resolution, methods, opts.methodId, opts.label);
+  }
+
+  /** Ids of every configured backend (built-ins + AcpRunnerOptions.backends). */
+  listBackends(): string[] {
+    const ids = new Set<string>(["claude", "codex", "opencode"]);
+    for (const name of this.backends.keys()) ids.add(name);
+    return [...ids];
   }
 
   /** List configurable providers from the selected backend. */
@@ -415,14 +533,28 @@ export class AcpAgentRunner implements AgentRunner {
     }
   }
 
-  /** Logout through the selected backend. */
+  /** Logout through the selected backend. REBUILT (§2.9): first clear the AuthStore machine
+   *  (zeroizing `authenticateMeta`/`envValues`, §2.14) and recycle the pool so no pooled process
+   *  replays a stale gateway credential, THEN issue the agent `logout` RPC only where advertised
+   *  (gated on `supportsLogout`; opencode advertises none → store-clear + recycle, no RPC, §3.4). */
   async logout(opts: LogoutOptions = {}): Promise<LogoutResponse | void> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     opts.signal?.throwIfAborted();
 
     const backend = selectBackend(opts, this.backends);
+    const poolKey = backend.poolKey ?? backend.id;
+    this.authStore.machineFor(poolKey, backend.authProfile).send({ t: "logout" });
+    this.pool.recycle(poolKey);
+
     const connection = this.createDedicatedConnection(backend, () => undefined);
     try {
+      // await ready + negotiate before reading the logout advertisement.
+      await connection.authMethods();
+      if (!connection.capabilities?.supportsLogout) {
+        opts.signal?.throwIfAborted();
+        if (this.disposed) throw new Error("ACP agent runner is disposed");
+        return; // logout unadvertised — store already cleared + recycled, no RPC (§3.4)
+      }
       const request: LogoutRequest = {
         ...(opts.meta ? { _meta: opts.meta } : {}),
       };
@@ -533,40 +665,69 @@ export class AcpAgentRunner implements AgentRunner {
     let structuredToolActive = false;
     let releaseStructuredToolTurn: (() => void) | undefined;
     try {
-      session = await this.pool.acquirePrepared(
-        prepared.backend,
-        async (connection) => {
-          let sessionOptions = prepared.sessionOptions;
-          if (shouldInjectStructuredOutputTool(schema, prepared.backend, connection.capabilities)) {
-            // Injected runs are SERIALIZED per connection, and the server name stays CONSTANT.
-            // Agents with instance-global, name-keyed MCP registries (OpenCode) expose every
-            // registered tool to EVERY session on the process, so concurrent same-named
-            // registrations collide and concurrent unique-named ones are cross-visible — either
-            // way one session's model can call another session's tool and leak its capture.
-            // Same-name registration REPLACES the previous entry; holding this per-connection
-            // turn for the whole run guarantees the single live registration belongs to the
-            // active session. Scale schema-run parallelism with pool size (one registry per
-            // process), not sessions.
-            releaseStructuredToolTurn = await this.acquireStructuredToolTurn(connection);
-            structuredTool = await this.structuredOutputTools.register(schema);
-            structuredToolActive = true;
-            sessionOptions = {
-              ...sessionOptions,
-              mcpServers: [
-                ...(sessionOptions.mcpServers ?? []),
-                {
-                  type: "http",
-                  name: availableMcpServerName(STRUCTURED_OUTPUT_SERVER_NAME, sessionOptions.mcpServers),
-                  url: structuredTool.url,
-                  headers: [],
-                },
-              ],
-            };
+      const prepare = async (connection: PooledConnection): Promise<AcpSessionOptions> => {
+        let sessionOptions = prepared.sessionOptions;
+        if (shouldInjectStructuredOutputTool(schema, prepared.backend, connection.capabilities)) {
+          // Injected runs are SERIALIZED per connection, and the server name stays CONSTANT.
+          // Agents with instance-global, name-keyed MCP registries (OpenCode) expose every
+          // registered tool to EVERY session on the process, so concurrent same-named
+          // registrations collide and concurrent unique-named ones are cross-visible — either
+          // way one session's model can call another session's tool and leak its capture.
+          // Same-name registration REPLACES the previous entry; holding this per-connection
+          // turn for the whole run guarantees the single live registration belongs to the
+          // active session. Scale schema-run parallelism with pool size (one registry per
+          // process), not sessions.
+          releaseStructuredToolTurn = await this.acquireStructuredToolTurn(connection);
+          structuredTool = await this.structuredOutputTools.register(schema);
+          structuredToolActive = true;
+          sessionOptions = {
+            ...sessionOptions,
+            mcpServers: [
+              ...(sessionOptions.mcpServers ?? []),
+              {
+                type: "http",
+                name: availableMcpServerName(STRUCTURED_OUTPUT_SERVER_NAME, sessionOptions.mcpServers),
+                url: structuredTool.url,
+                headers: [],
+              },
+            ],
+          };
+        }
+        return sessionOptions;
+      };
+      // Inline resolve-and-retry-once (§2.11): when `onAuth` is set, a -32000 at session/new is
+      // resolved via the resolver and the acquire retried EXACTLY once — the run never pauses. A
+      // second -32000 propagates as AUTH_REQUIRED. When `onAuth` is unset this loop runs once and
+      // the error propagates unchanged (the PR4 pause-and-resume path), byte-identical to today.
+      let authRetried = false;
+      for (;;) {
+        try {
+          session = await this.pool.acquirePrepared(prepared.backend, prepare, {
+            signal: opts.signal,
+            label: opts.label,
+          });
+          break;
+        } catch (error) {
+          if (this.onAuth && !authRetried && !opts.signal?.aborted && isAuthRequiredError(error)) {
+            authRetried = true;
+            // Discard the failed attempt's partial structured-tool registration so the retry's
+            // prepare re-registers cleanly (the failure happened at session/new, after prepare ran).
+            releaseStructuredToolTurn?.();
+            releaseStructuredToolTurn = undefined;
+            try {
+              structuredTool?.release();
+            } catch {
+              // best-effort cleanup between attempts.
+            }
+            structuredTool = undefined;
+            structuredToolActive = false;
+            const resolved = await this.resolveInlineAuth(prepared.backend, opts, error);
+            if (!resolved) throw error; // cancelled/unresolved -> propagate AUTH_REQUIRED
+            continue;
           }
-          return sessionOptions;
-        },
-        { signal: opts.signal, label: opts.label },
-      );
+          throw error;
+        }
+      }
       const activeSession = session;
       opts.signal?.throwIfAborted();
       // Hand the host the re-attach identity BEFORE any turn runs: the session id plus the
@@ -772,8 +933,146 @@ export class AcpAgentRunner implements AgentRunner {
       elicitationResolver: this.elicitationResolver,
       advertiseElicitation: Boolean(this.elicitationResolver),
       authCapabilities: this.authCapabilities,
+      // Same store as the pool: a dedicated connection re-primes the durable intent at its own
+      // initialize (§2.5) — the direct fix for the dispose-after-authenticate bug (gap 3).
+      authStore: this.authStore,
       clientHandlers: this.clientHandlers,
     });
+  }
+
+  /** Read the selected backend's initialize-advertised auth methods on a dedicated connection and
+   *  build their type-dispatched descriptors (§1.3). A read-only probe; the connection is disposed. */
+  private async probeAuthMethods(
+    backend: Backend,
+  ): Promise<{ methods: AuthMethod[]; descriptors: AuthMethodDescriptor[] }> {
+    const connection = this.createDedicatedConnection(backend, () => undefined);
+    try {
+      const methods = await connection.authMethods();
+      return { methods, descriptors: buildAuthDescriptors(methods, backend.spawnConfig()) };
+    } finally {
+      await disposeBestEffort(connection);
+    }
+  }
+
+  /** The shared write path (§2.9) behind completeAuth, the inline resolver (§2.11), and the rebuilt
+   *  legacy authenticate(). Records the payload/methodType from the outcome but DERIVES `klass` from
+   *  the chosen method's type + `_meta` shape (§2.1) — never from the resolution outcome. */
+  private async applyResolution(
+    backend: Backend,
+    resolution: AuthResolution,
+    advertised: readonly AuthMethod[],
+    methodIdHint: string | undefined,
+    label: string | undefined,
+  ): Promise<AuthOutcome> {
+    const poolKey = backend.poolKey ?? backend.id;
+    const machine = this.authStore.machineFor(poolKey, backend.authProfile);
+
+    if (resolution.outcome === "cancelled") {
+      return { status: "cancelled", methodId: methodIdHint ?? "", recycled: false };
+    }
+
+    const methodId = resolutionMethodId(resolution) ?? methodIdHint ?? inferMethodId(resolution, advertised);
+    if (!methodId) {
+      throw new WorkflowError(
+        "completeAuth requires a methodId to record the resolution",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+    const chosen = advertised.find((m) => m.id === methodId);
+    const methodType: AuthMethodType = chosen ? authMethodType(chosen) : resolution.outcome === "env" ? "env_var" : "agent";
+    const advertisedMeta = chosen ? authMethodMeta(chosen) : undefined;
+
+    if (resolution.outcome === "agent-login") {
+      // The sole path from which the bare-`agent` login RPC ever fires (§2.9 step 3): the agent runs
+      // its own login on a live connection and persists to its native store, so every subsequent
+      // fresh initialize re-reads it and needs no replay.
+      const connection = this.createDedicatedConnection(backend, () => undefined);
+      try {
+        await connection.authenticate({ methodId }, label);
+      } catch (error) {
+        throw mapThrownError(error, { label, backendId: backend.id, authMethods: [...advertised] });
+      } finally {
+        await disposeBestEffort(connection);
+      }
+      const intent: AuthIntent = { backendId: backend.id, poolKey, methodId, methodType, klass: "disk", diskBacked: true };
+      machine.send({ t: "host_authenticate", intent });
+      machine.send({ t: "apply_ok", connectionId: "host", generation: machine.generation });
+      this.pool.recycle(poolKey);
+      return { status: "authenticated", methodId, recycled: true };
+    }
+
+    // meta / env / completed: derive klass from the chosen advertised method (§2.1), never the outcome.
+    const { klass, diskBacked } = classifyCredential(methodType, advertisedMeta);
+    const authenticateMeta = resolution.outcome === "meta" ? resolution.meta : undefined;
+    const envValues = resolution.outcome === "env" ? resolution.values : undefined;
+    const intent: AuthIntent = {
+      backendId: backend.id,
+      poolKey,
+      methodId,
+      methodType,
+      klass,
+      diskBacked,
+      ...(authenticateMeta ? { authenticateMeta } : {}),
+      ...(envValues ? { envValues } : {}),
+    };
+    machine.send({ t: "host_authenticate", intent });
+    this.pool.recycle(poolKey);
+    return { status: "authenticated", methodId, recycled: true };
+  }
+
+  /** Inline resolve-and-retry-once at the run() session-acquisition seam (§2.11). Builds the
+   *  AuthContext from the backend's advertised methods, invokes `onAuth`, and applies the result.
+   *  Returns false on a cancelled/absent resolution (the caller propagates AUTH_REQUIRED). */
+  private async resolveInlineAuth(backend: Backend, opts: AnyRunOptions, error: unknown): Promise<boolean> {
+    const { methods, descriptors } = await this.probeAuthMethods(backend);
+    // Mark the machine's authenticated->auth_required transition on the protocol signal (§2.3).
+    this.authStore
+      .machineFor(backend.poolKey ?? backend.id, backend.authProfile)
+      .send({ t: "auth_required_tripped", connectionId: "run", error });
+    const ctx: AuthContext = {
+      backendId: backend.id,
+      ...(opts.label ? { label: opts.label } : {}),
+      methods: descriptors,
+      cause: "required",
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    };
+    const resolution = await this.onAuth!(ctx);
+    if (resolution.outcome === "cancelled") return false;
+    await this.applyResolution(backend, resolution, methods, undefined, opts.label);
+    return true;
+  }
+
+  /** Redacted status snapshots (§2.10/§4.1). Enumerates every configured backend when `backend` is
+   *  omitted; never exposes secrets. */
+  private authStatus(opts?: { backend?: string }): AuthStatusSnapshot[] {
+    const ids = opts?.backend ? [opts.backend] : this.listBackends();
+    return ids.map((id) => this.snapshotFor(id));
+  }
+
+  private snapshotFor(backendId: string): AuthStatusSnapshot {
+    const backend = selectBackend({ model: backendId }, this.backends);
+    const poolKey = backend.poolKey ?? backend.id;
+    const machine = this.authStore.existing(poolKey);
+    const state: BackendAuthState = machine?.state ?? "unauthenticated";
+    return {
+      backendId: backend.id,
+      poolKey,
+      state,
+      authenticated: state === "authenticated",
+      canResume: machine?.canResume() ?? false,
+      methods: (machine?.advertised ?? []).map((m) => ({
+        id: m.id,
+        type: authMethodType(m),
+        ...(m.name ? { name: m.name } : {}),
+      })),
+    };
+  }
+
+  /** Cold-resume re-arm predicate (§2.13). */
+  canResume(backendId: string): boolean {
+    const backend = selectBackend({ model: backendId }, this.backends);
+    return this.authStore.existing(backend.poolKey ?? backend.id)?.canResume() ?? false;
   }
 
   /** Build the backend choice, model-selection spec, tool policy, and session/new options in one
@@ -1011,6 +1310,47 @@ function validateRequiredString(
       { recoverable: false, agentLabel: label },
     );
   }
+}
+
+/** The mapped run error is a WorkflowError; the auth-required classification already ran in the
+ *  pool via mapThrownError (§1.5), so the inline seam keys on the code, not the raw -32000. */
+function isAuthRequiredError(error: unknown): boolean {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.AUTH_REQUIRED;
+}
+
+/** The SDK types a missing `type` discriminant as `agent`. */
+function authMethodType(method: AuthMethod): AuthMethodType {
+  return (("type" in method ? method.type : undefined) ?? "agent") as AuthMethodType;
+}
+
+/** The advertised method's `_meta`, or undefined. This is agent-PUBLISHED metadata (e.g.
+ *  `gateway.protocol`), never a credential — the credential is only the resolver's payload. */
+function authMethodMeta(method: AuthMethod): Record<string, unknown> | undefined {
+  const meta = (method as { _meta?: Record<string, unknown> | null })._meta;
+  return meta ?? undefined;
+}
+
+/** A resolution that names its own method (meta / agent-login), else undefined. */
+function resolutionMethodId(resolution: AuthResolution): string | undefined {
+  if (resolution.outcome === "meta" || resolution.outcome === "agent-login") return resolution.methodId;
+  if (resolution.outcome === "env" || resolution.outcome === "completed") return resolution.methodId;
+  return undefined;
+}
+
+/** Infer the target method for an env/completed resolution that did not name one: match by outcome
+ *  against the advertised methods (there is typically exactly one env_var / terminal method). */
+function inferMethodId(resolution: AuthResolution, advertised: readonly AuthMethod[]): string | undefined {
+  if (resolution.outcome === "env") {
+    return advertised.find((m) => authMethodType(m) === "env_var")?.id ?? advertised.find((m) => authMethodType(m) === "agent")?.id;
+  }
+  if (resolution.outcome === "completed") {
+    return (
+      advertised.find((m) => authMethodType(m) === "terminal")?.id ??
+      advertised.find((m) => authMethodType(m) === "agent")?.id ??
+      advertised[0]?.id
+    );
+  }
+  return undefined;
 }
 
 async function disposeBestEffort(connection: PooledConnection): Promise<void> {
