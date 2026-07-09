@@ -1,5 +1,7 @@
 // ===== packages/shared-types/src/workflow-result.ts =====
 
+import type { AuthErrorContext } from "./errors.js";
+
 /** Aggregate token/cost usage for a whole run (engine-summed; matches the
  *  onTokenUsage shape at workflow.ts:112-119). */
 export interface TokenUsage {
@@ -142,10 +144,16 @@ export interface WorkflowRunResult<T = unknown> {
   tokenUsage?: TokenUsage;
   /** Captured log lines. */
   logs: string[];
-  /** Present when status !== "completed": human-readable cause (e.g. "usage_limit"). */
+  /** Present when status !== "completed": human-readable cause (e.g. "usage_limit",
+   *  "auth_required"). NOT the machine-readable contract — hosts branch on `reason` for the
+   *  coarse cause and read `authContext` for the structured auth surface (§2.12). */
   reason?: string;
   /** Provider reset hint for a usage-limit pause (verbatim, e.g. "Resets in ~3h"). */
   resetHint?: string;
+  /** Present when a run paused with reason "auth_required" (§2.12): the structured, NON-SECRET
+   *  auth surface (backendId + advertised method ids/types/names). Carries no credential
+   *  material (Principle 9). Hosts read this — never the `reason` message string. */
+  authContext?: AuthErrorContext;
   /** Re-attach records for every ACP session the run opened (live + journal-replayed),
    *  in call order. The host's hand-off to `runner.loadSession()`/`resumeSession()` —
    *  present even when journaling is off (it rides the result, not the journal). */

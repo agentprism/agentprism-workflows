@@ -110,6 +110,8 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 
 A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused**, not failed — the journal checkpoints and `resume()` picks up after the budget refills (`resetHint` carries the provider's "resets in…" text when present).
 
+A run that hits `AUTH_REQUIRED` is likewise **paused** (`reason: "auth_required"`), not failed: the journal checkpoints and the paused state persists the structured, non-secret `authContext` (`backendId` + advertised method `{ id, type, name }[]` — never credential material). `resume()` re-arms against the runner: for an `"auth_required"` pause it consults `runner.auth.canResume(backendId)` before re-executing. When the credential survived (warm resume in the same process, or a disk-backed method a fresh process re-reads from the native store/env) it proceeds; when an in-process (gateway) or spawn-env intent was lost to a cold process it **immediately re-pauses** with `re-supply credentials for <backend> via runner auth before resuming` rather than re-running into the same wall. A runner with no `auth` controller (the default-off host) cannot confirm resumability and re-pauses.
+
 ### Events
 
 `WorkflowManager` is an `EventEmitter`; **every payload carries `runId`** — route by it, no reverse index needed. Listeners are observability-only: a throwing listener is isolated and never affects the run.
@@ -124,7 +126,7 @@ A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused
 | `journal` | `entry` (`JournalEntry`) — live journal append observations, including when file journaling is disabled |
 | `tokenUsage` | `usage` (cumulative input/output/total/cost/cache) |
 | `complete` | `result` (the composed `WorkflowRunResult`) |
-| `paused` | `reason` (e.g. `"usage_limit"`), `error`, `resetHint?` |
+| `paused` | `reason` (`"usage_limit"` \| `"auth_required"`), `error`, `resetHint?` (usage-limit only), `authContext?` (`AuthErrorContext`, auth pause only) |
 | `stopped` / `resumed` | — |
 | `error` | `error` (`WorkflowError`) — emitted only when a listener exists, so an unheard `error` never masks the thrown one |
 | `agentEvent` | **The token-level streaming surface** (facade manager only — see below). |
@@ -243,7 +245,7 @@ Credentials live in exactly one place — the runner's per-instance `AuthStore` 
 
 `env`/`meta` payloads are **SECRET** and flow only through the resolver return value into the `AuthStore` and the spawn env — never into events, journals, logs, error messages, or `status()`. `logout()` clears the store (zeroizing the secret payload), recycles the pool, and issues the agent `logout` RPC only where advertised. Default-OFF: with neither `onAuth` nor `authCapabilities` set, the wire behavior is byte-identical to a host that never opted in.
 
-If `session/new` or `session/prompt` fails with ACP `RequestError.authRequired()` (JSON-RPC code `-32000`), the runner raises `WorkflowErrorCode.AUTH_REQUIRED` with `recoverable: false`. The SDK reserves `-32000` exclusively for `authRequired`, so the code alone classifies — any message text (including a localized or rephrased one) still routes to auth. As a guarded fallback for non-conformant agents, an error whose code is not a reserved JSON-RPC code (or which carries no code) but whose message matches `authentication required` also classifies; a *different* reserved code (e.g. `-32603` internal error) that merely mentions the phrase never mis-routes. The enriched `.message` names the backend and advertised method ids for readability, but the machine-readable surface hosts should read is `WorkflowError.authContext` (`AuthErrorContext`: `backendId` plus advertised method `{ id, type, name }[]`, sourced only from agent-advertised `AuthMethod`s — never credential material). The SDK re-exports `isAuthRequired(error)` for detecting this code. The engine does not retry this; retrying cannot succeed until the host completes auth.
+If `session/new` or `session/prompt` fails with ACP `RequestError.authRequired()` (JSON-RPC code `-32000`), the runner raises `WorkflowErrorCode.AUTH_REQUIRED` with `recoverable: false`. The SDK reserves `-32000` exclusively for `authRequired`, so the code alone classifies — any message text (including a localized or rephrased one) still routes to auth. As a guarded fallback for non-conformant agents, an error whose code is not a reserved JSON-RPC code (or which carries no code) but whose message matches `authentication required` also classifies; a *different* reserved code (e.g. `-32603` internal error) that merely mentions the phrase never mis-routes. The enriched `.message` names the backend and advertised method ids for readability, but the machine-readable surface hosts should read is `WorkflowError.authContext` (`AuthErrorContext`: `backendId` plus advertised method `{ id, type, name }[]`, sourced only from agent-advertised `AuthMethod`s — never credential material). The SDK re-exports `isAuthRequired(error)` for detecting this code. The engine does not retry this; retrying cannot succeed until the host completes auth. Under `WorkflowManager` the fault **pauses** the run (`reason: "auth_required"`) and persists the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume(backendId)` (see the pause/resume note above).
 
 Provider management mirrors the SDK request shapes:
 
@@ -393,6 +395,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `resetHint`. |
+| `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
 | `TOKEN_BUDGET_EXHAUSTED` / `AGENT_LIMIT_EXCEEDED` | no | Run caps hit. |
 | `AGENT_EXECUTION_ERROR` | yes | Other agent-level failure (refusal/truncation are non-recoverable variants). |
 | `PERSISTENCE_ERROR`, `UNKNOWN` | no | Storage / unexpected host-level failure. |

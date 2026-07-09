@@ -429,13 +429,16 @@ export class WorkflowManager extends EventEmitter {
     engineResult?: EngineRunResult,
   ): WorkflowRunResult {
     const usageLimit = error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+    const authRequired = error?.code === WorkflowErrorCode.AUTH_REQUIRED;
     const reason =
       managed.status === "completed"
         ? undefined
         : managed.status === "paused"
           ? usageLimit
             ? "usage_limit"
-            : error?.message
+            : authRequired
+              ? "auth_required"
+              : error?.message
           : error?.message;
     const snapshotUsage = managed.snapshot.tokenUsage;
     const tokenUsage: TokenUsage | undefined =
@@ -466,6 +469,9 @@ export class WorkflowManager extends EventEmitter {
       logs: engineResult?.logs ?? managed.snapshot.logs,
       reason,
       resetHint: usageLimit ? error?.resetHint : undefined,
+      // Structured, NON-SECRET auth surface for an auth pause (§2.12) — hosts read this,
+      // never the reason message. Absent on every other outcome.
+      authContext: authRequired ? error?.authContext : undefined,
       // Fall back to the snapshot's per-agent records when the engine returned no result
       // (pause/failure mid-run) so re-attach handles survive an interrupted run.
       agentSessions:
@@ -623,17 +629,22 @@ export class WorkflowManager extends EventEmitter {
           ? error
           : new WorkflowError(errorMessage(error), WorkflowErrorCode.UNKNOWN, { recoverable: false });
 
+      // Two recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
+      // so resume() replays the journaled prefix instead of restarting from scratch (§2.12):
+      //  - PROVIDER_USAGE_LIMIT: a provider quota refills over time.
+      //  - AUTH_REQUIRED: a host completes an auth step (both are recoverable:false, so the
+      //    retry ladder already skipped them — only the pause branch was missing).
+      const authPaused =
+        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.AUTH_REQUIRED;
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+      const paused = usageLimitPaused || authPaused;
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
         if (managed.status === "running") {
           managed.status = "aborted";
         }
-      } else if (usageLimitPaused) {
-        // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
-        // the persisted journal (completed agent results) is replayed by resume()
-        // once the budget refills — instead of the user starting from scratch.
+      } else if (paused) {
         managed.status = "paused";
       } else {
         managed.status = "failed";
@@ -646,12 +657,17 @@ export class WorkflowManager extends EventEmitter {
       this.persistRun(managed);
       this.releaseRunLease(managed);
 
-      if (usageLimitPaused) {
+      if (paused) {
+        // The emit is untyped (WorkflowManager extends EventEmitter with an untyped override
+        // emit); the payload is a bare literal. `reason` is a free-form string, so it just takes
+        // "auth_required"/"usage_limit". resetHint is usage-limit-only; authContext is the
+        // structured, NON-SECRET auth surface (§1.5) present only on the auth pause.
         this.emit("paused", {
           runId: managed.runId,
-          reason: "usage_limit",
+          reason: authPaused ? "auth_required" : "usage_limit",
           error: workflowError,
-          resetHint: workflowError.resetHint,
+          resetHint: authPaused ? undefined : workflowError.resetHint,
+          authContext: authPaused ? workflowError.authContext : undefined,
         });
       } else if (this.listenerCount("error") > 0) {
         // Only emit 'error' when someone is listening: an unheard 'error' would throw
@@ -693,15 +709,28 @@ export class WorkflowManager extends EventEmitter {
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
-        // Why a usage-limit pause happened, so the navigator / a future cold start
-        // can show it and (eventually) re-arm resume after the budget refills.
+        // Why a pause happened, so the navigator / a future cold start can show it and
+        // re-arm resume (§2.12). Selector switches on the paused run's error code:
+        // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit".
         pauseReason:
-          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-            ? "usage_limit"
+          managed.status === "paused"
+            ? managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
+              ? "auth_required"
+              : managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+                ? "usage_limit"
+                : undefined
             : undefined,
+        // resetHint stays usage-limit-only.
         resetHint:
           managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
             ? managed.error.resetHint
+            : undefined,
+        // The NON-SECRET auth surface for an auth pause — backendId + advertised method
+        // ids/types/names only (never authenticateMeta/envValues; Principle 9, §2.14). It
+        // arms resume()'s cold re-check (§2.13).
+        authContext:
+          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
+            ? managed.error.authContext
             : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
@@ -767,6 +796,43 @@ export class WorkflowManager extends EventEmitter {
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+
+    // Cold-resume re-arm (§2.13). An "auth_required" pause is resumable ONLY when the auth
+    // survived: warm resume (same process, credentials still in the runner's AuthStore) or a
+    // disk-backed intent (native store / env re-read by a fresh spawn). We consult the INJECTED
+    // runner's auth controller by DUCK-TYPING — `runner.auth.canResume(backendId)` — never a
+    // package import (the engine's AgentRunner seam knows nothing of auth). An in-process
+    // (gateway) / spawn-env intent is gone after a cold process, so canResume is false and we
+    // re-pause immediately with a re-supply message rather than re-running into the same wall.
+    // A runner with no auth controller (default-off host) cannot confirm resumability -> re-pause.
+    if (persisted.pauseReason === "auth_required") {
+      const agent = exec.agent ?? this.agent;
+      const authController = (
+        agent as { auth?: { canResume?: (backendId: string) => boolean } } | undefined
+      )?.auth;
+      const backendId = persisted.authContext?.backendId ?? "";
+      const canResume = typeof authController?.canResume === "function" && authController.canResume(backendId);
+      if (!canResume) {
+        const backendLabel = persisted.authContext?.backendId ?? "the backend";
+        const reSupplyError = new WorkflowError(
+          `re-supply credentials for ${backendLabel} via runner auth before resuming`,
+          WorkflowErrorCode.AUTH_REQUIRED,
+          { recoverable: false, authContext: persisted.authContext },
+        );
+        // The on-disk state is already a valid "auth_required" pause (journal + authContext
+        // intact), so we do NOT re-persist — that would risk clobbering the journal. We surface
+        // the re-supply cause on the "paused" event and release the lease we just took.
+        this.emit("paused", {
+          runId,
+          reason: "auth_required",
+          error: reSupplyError,
+          resetHint: undefined,
+          authContext: persisted.authContext,
+        });
+        this.persistence.releaseRunLease(lease);
+        return true;
+      }
+    }
 
     const controller = new AbortController();
     let meta: WorkflowMeta | undefined;
