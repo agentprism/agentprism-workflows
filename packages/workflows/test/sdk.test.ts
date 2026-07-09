@@ -169,6 +169,18 @@ const NO_AGENT_SCRIPT = [
   "return 42;",
 ].join("\n");
 
+async function createResumableRun(manager: WorkflowManager): Promise<string> {
+  const result = await manager.runSync(ONE_AGENT_SCRIPT, undefined, {
+    agent: makeRunner(() => {
+      throw new WorkflowError("provider usage limit", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+        recoverable: false,
+      });
+    }),
+  });
+  assert.equal(result.status, "paused", "fixture run should persist a resumable pause");
+  return result.runId;
+}
+
 test("facade re-exports the public surface", () => {
   assert.equal(typeof createAcpRunner, "function");
   assert.equal(typeof WorkflowManager, "function");
@@ -454,6 +466,111 @@ test("WorkflowManager keeps a shared exec runner bridge until concurrent runs se
   gates[1]?.resolve();
   assert.equal((await second).status, "completed");
   assert.equal(runner.listenerCount("session_update"), 0, "bridge is removed after the final release");
+  assert.equal(runner.listenerCount("session_open"), 0);
+});
+
+test("WorkflowManager.resume keeps the exec runner bridge until the resumed run settles", async () => {
+  const manager = new WorkflowManager();
+  const runId = await createResumableRun(manager);
+  const gate = deferred();
+  const runner = new EventedRunner({ waitForRun: () => gate.promise });
+  const seen: AgentEventPayload[] = [];
+  manager.on("agentEvent", (event: AgentEventPayload) => seen.push(event));
+
+  const accepted = await manager.resume(runId, { agent: eventedAgent(runner) });
+  assert.equal(accepted, true);
+  assert.equal(runner.listenerCount("session_update"), 1, "bridge remains after resume is accepted");
+  assert.equal(runner.listenerCount("session_open"), 1);
+
+  runner.emit("session_open", {
+    sessionId: "after-resume-return",
+    backendId: runner.backendId,
+    runId,
+  });
+  assert.equal(
+    seen.filter((event) => event.name === "session_open" && event.sessionId === "after-resume-return").length,
+    1,
+    "events emitted after resume returns are still forwarded",
+  );
+
+  gate.resolve();
+  await waitUntil(() => manager.getRun(runId)?.status === "completed", "resumed run should complete");
+  await waitUntil(
+    () => runner.listenerCount("session_update") === 0 && runner.listenerCount("session_open") === 0,
+    "bridge should release after the resumed run settles",
+  );
+
+  const forwardedBeforePostSettlementEvent = seen.length;
+  runner.emit("session_open", {
+    sessionId: "after-resume-settlement",
+    backendId: runner.backendId,
+    runId,
+  });
+  assert.equal(seen.length, forwardedBeforePostSettlementEvent, "settled resume no longer forwards runner events");
+});
+
+test("WorkflowManager.resume releases an exec runner bridge immediately when resume is rejected", async () => {
+  const manager = new WorkflowManager();
+  const runner = new EventedRunner();
+  const seen: AgentEventPayload[] = [];
+  manager.on("agentEvent", (event: AgentEventPayload) => seen.push(event));
+
+  const accepted = await manager.resume("unknown-run-id", { agent: eventedAgent(runner) });
+
+  assert.equal(accepted, false);
+  assert.equal(runner.listenerCount("session_update"), 0);
+  assert.equal(runner.listenerCount("session_open"), 0);
+  runner.emit("session_open", { sessionId: "rejected", backendId: runner.backendId });
+  assert.deepEqual(seen, [], "a rejected resume leaves no forwarding subscription behind");
+});
+
+test("WorkflowManager.resumeInBackground shares one bridge across overlapping resumes and releases every ref", async () => {
+  const manager = new WorkflowManager();
+  const firstRunId = await createResumableRun(manager);
+  const secondRunId = await createResumableRun(manager);
+  const gates: Array<ReturnType<typeof deferred>> = [];
+  const runner = new EventedRunner({
+    waitForRun: () => {
+      const gate = deferred();
+      gates.push(gate);
+      return gate.promise;
+    },
+  });
+  const agent = eventedAgent(runner);
+  const seen: AgentEventPayload[] = [];
+  manager.on("agentEvent", (event: AgentEventPayload) => seen.push(event));
+
+  const first = await manager.resumeInBackground(firstRunId, { agent });
+  if (!first.accepted) assert.fail("first paused run should resume");
+  await waitUntil(() => gates.length === 1, "first resume should reach the runner");
+
+  const duplicate = await manager.resumeInBackground(firstRunId, { agent });
+  assert.deepEqual(duplicate, { accepted: false }, "an already-running resume is rejected");
+  assert.equal(runner.listenerCount("session_update"), 1, "rejected overlap releases only its own ref");
+
+  const second = await manager.resumeInBackground(secondRunId, { agent });
+  if (!second.accepted) assert.fail("second paused run should resume");
+  await waitUntil(() => gates.length === 2, "second resume should reach the runner");
+
+  assert.equal(runner.listenerCount("session_update"), 1, "shared runner is subscribed once");
+  assert.equal(runner.listenerCount("session_open"), 1);
+  runner.emit("session_open", {
+    sessionId: "overlapping-resumes",
+    backendId: runner.backendId,
+  });
+  assert.equal(
+    seen.filter((event) => event.name === "session_open" && event.sessionId === "overlapping-resumes").length,
+    1,
+    "one runner emission is forwarded exactly once during overlap",
+  );
+
+  gates[0]?.resolve();
+  assert.equal((await first.promise).status, "completed");
+  assert.equal(runner.listenerCount("session_update"), 1, "second accepted resume retains the shared bridge");
+
+  gates[1]?.resolve();
+  assert.equal((await second.promise).status, "completed");
+  assert.equal(runner.listenerCount("session_update"), 0, "final settlement returns to the listener baseline");
   assert.equal(runner.listenerCount("session_open"), 0);
 });
 

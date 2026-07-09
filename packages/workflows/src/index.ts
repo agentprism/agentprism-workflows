@@ -328,13 +328,31 @@ export class WorkflowManager extends EngineWorkflowManager {
     }
   }
 
-  override async resume(runId: string, exec: ExecOptions = {}): Promise<boolean> {
+  override async resumeInBackground(
+    runId: string,
+    exec: ExecOptions = {},
+  ): Promise<
+    | { accepted: false; promise?: undefined }
+    | { accepted: true; promise: Promise<WorkflowRunResult> }
+  > {
     const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
     try {
-      return await super.resume(runId, exec);
-    } finally {
+      const resumed = await super.resumeInBackground(runId, exec);
+      if (!resumed.accepted) {
+        releaseBridge();
+        return resumed;
+      }
+      void resumed.promise.then(releaseBridge, releaseBridge);
+      return resumed;
+    } catch (error) {
       releaseBridge();
+      throw error;
     }
+  }
+
+  override async resume(runId: string, exec: ExecOptions = {}): Promise<boolean> {
+    const { accepted } = await this.resumeInBackground(runId, exec);
+    return accepted;
   }
 
   /** Detach manager-owned ACP event subscriptions. The manager does NOT dispose the runner: the
