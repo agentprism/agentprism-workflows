@@ -16,8 +16,9 @@ export const meta = {
   ],
 }
 
-const REPO = '/home/vikash/agentprism-workflows'
-const SPEC = `${REPO}/docs/specs/acp-auth-spec.md`
+// All paths are repo-relative: every agent starts in the repository root (worktree-isolated
+// agents in their own copy's root), so this workflow runs from any checkout location.
+const SPEC = 'docs/specs/acp-auth-spec.md'
 const MAX_FIX_ROUNDS = 2
 const EXPECTED_PKGS = ['shared-types', 'acp-agents', 'workflow-engine', 'workflows', 'mcp-server', 'agentprism-otel']
 
@@ -105,12 +106,13 @@ const looksPlaceholder = (s) => typeof s !== 'string' || s.trim().length < 20 ||
 // ---------- Preflight ----------
 phase('Preflight')
 const preflight = await agent(
-  `Preflight for the ACP auth implementation train in ${REPO}. READ-ONLY: run no state-changing git commands (fetch is fine; no pull/checkout/branch).\n` +
+  `Preflight for the ACP auth implementation train. Your working directory is the repository root. READ-ONLY: run no state-changing git commands (fetch is fine; no pull/checkout/branch).\n` +
   `Checks (ok=true requires ALL to hold; report every failure in blockers):\n` +
   `1. git status is CLEAN, the checkout is on main, and after \`git fetch origin\`, main == origin/main.\n` +
   `2. ${SPEC} exists and its §4.7 lists PR1..PR7.\n` +
-  `3. NO stale state from a prior partial run: no auth/pr* branches (local or origin), no packages/acp-agents/src/auth/ directory. Anything found goes in existingAuthBranches AND blockers (ok=false); do not delete anything.\n` +
-  `4. LINE-DRIFT MEMO (the memo field): the spec's file:line cites predate recent merges. For each load-bearing seam the spec names — clientCapabilitiesFor, negotiateCapabilities, PooledConnection initialize/releaseSession, pool selectConnection, runner run()/authenticate()/logout()/createDedicatedConnection, errors-map isAcpAuthRequired, workflow-manager PROVIDER_USAGE_LIMIT pause branch + resume(), run-persistence PersistedRunState, mcp-server registerTool — report its CURRENT file + line-range and one sentence on anything structurally different from how the spec describes it. The memo must be COMPLETE inside the memo field and fit comfortably in a single message — be tight.`,
+  `3. The toolchain is ready: node_modules exists (pnpm install has been run) and pnpm/tsx are invocable — a fresh clone without install is a blocker, not something later phases should discover.\n` +
+  `4. NO stale state from a prior partial run: no auth/pr* branches (local or origin), no packages/acp-agents/src/auth/ directory. Anything found goes in existingAuthBranches AND blockers (ok=false); do not delete anything.\n` +
+  `5. LINE-DRIFT MEMO (the memo field): the spec's file:line cites predate recent merges. For each load-bearing seam the spec names — clientCapabilitiesFor, negotiateCapabilities, PooledConnection initialize/releaseSession, pool selectConnection, runner run()/authenticate()/logout()/createDedicatedConnection, errors-map isAcpAuthRequired, workflow-manager PROVIDER_USAGE_LIMIT pause branch + resume(), run-persistence PersistedRunState, mcp-server registerTool — report its CURRENT file + line-range and one sentence on anything structurally different from how the spec describes it. The memo must be COMPLETE inside the memo field and fit comfortably in a single message — be tight.`,
   { label: 'preflight', phase: 'Preflight', model: 'opus', schema: PREFLIGHT_SCHEMA }
 )
 if (!preflight || !preflight.ok) throw new Error('preflight failed: ' + JSON.stringify(preflight ? preflight.blockers : 'preflight agent died'))
@@ -130,7 +132,7 @@ for (const pr of PR_DEFS) {
     `CONTRACT: read ${SPEC} sections ${pr.sections} IN FULL before writing code (Read the file; it is large — read the named sections completely, plus §1.1 and the glossary once for shared vocabulary, plus THIS PR's entries in §4.6: the test plan's mandated per-PR test matrices are part of the contract).\n\n` +
     `SCOPE ORIENTATION (spec is authoritative; this is the §4.7 distillation):\n${pr.scope}\n\n` +
     `LINE-DRIFT MEMO from preflight (current locations of the seams the spec cites):\n${preflight.memo}\n\n` +
-    `GIT: work in ${REPO}. git checkout ${baseBranch}, then git checkout -b ${pr.branch}. If ${pr.branch} already exists and you were given no re-implementation token, do NOT delete or reuse it — record it in deviations, set testsPass:false, and stop. All commits on ${pr.branch}.${implSalt}\n\n` +
+    `GIT: work in the repository root (your working directory). git checkout ${baseBranch}, then git checkout -b ${pr.branch}. If ${pr.branch} already exists and you were given no re-implementation token, do NOT delete or reuse it — record it in deviations, set testsPass:false, and stop. All commits on ${pr.branch}.${implSalt}\n\n` +
     PRINCIPLES + '\n\n' + DOD
   let latestReport = await agent(implPrompt, { label: `impl:${phaseTitle}`, phase: phaseTitle, model: 'opus', ...effort, schema: IMPL_SCHEMA })
   if (!latestReport) throw new Error(`${phaseTitle}: implementer died`)
@@ -141,7 +143,7 @@ for (const pr of PR_DEFS) {
   const salt = REVERIFY[phaseTitle] ? `\n(re-verify token: ${REVERIFY[phaseTitle]})` : ''
   const verifyCommon = () =>
     `Adversarially verify ${phaseTitle} (${pr.title}) of the ACP auth train.${salt}\n` +
-    `You are running in a THROWAWAY WORKTREE copy of the repo. First run: git checkout --detach ${pr.branch} (the branch itself is checked out in the main tree and cannot be checked out twice). You are REPORT-ONLY: never modify files, never commit, never touch branches, and NEVER run git commands against ${REPO} itself.\n` +
+    `You are running in a THROWAWAY WORKTREE copy of the repo. First run: git checkout --detach ${pr.branch} (the branch itself is checked out in the main tree and cannot be checked out twice). You are REPORT-ONLY: never modify files, never commit, never touch branches, and NEVER run git commands against the main repository checkout itself.\n` +
     `The diff: git diff ${baseBranch}..${pr.branch} (read it fully; also Read changed files for context).\n` +
     `The contract: the spec at docs/specs/acp-auth-spec.md, sections ${pr.sections}, PLUS this PR's entries in §4.6 (test plan) — the mandated test matrices are contract, not suggestion.\n` +
     `Implementer's latest report: ${JSON.stringify(latestReport)}\n` +
@@ -174,7 +176,7 @@ for (const pr of PR_DEFS) {
     if (round > MAX_FIX_ROUNDS) throw new Error(`${phaseTitle}: ${blocking.length} blocking issues after ${MAX_FIX_ROUNDS} fix rounds (recover: repair ${pr.branch} by hand, then resume with args {reverify:{"${phaseTitle}":"1"}}): ${blocking.map((i) => i.problem).join(' | ').slice(0, 800)}`)
     log(`${phaseTitle}: fixing ${blocking.length} blocking issues (round ${round})`)
     const fixed = await agent(
-      `Fix EVERY blocking issue below on branch ${pr.branch} in ${REPO} (verify each fix claim against the spec ${SPEC} ${pr.sections} before applying; if a "fix" is wrong, do the RIGHT fix and say so in notes). Re-run the touched packages' suites + pnpm -r build to green, commit on the branch.\n` +
+      `Fix EVERY blocking issue below on branch ${pr.branch} (working directory = repository root; verify each fix claim against the spec ${SPEC} ${pr.sections} before applying; if a "fix" is wrong, do the RIGHT fix and say so in notes). Re-run the touched packages' suites + pnpm -r build to green, commit on the branch.\n` +
       `ISSUES:\n${JSON.stringify(blocking, null, 2)}\n\n` + PRINCIPLES + '\n\n' + DOD,
       { label: `fix:${phaseTitle}:r${round}`, phase: phaseTitle, model: 'opus', effort: 'high', schema: IMPL_SCHEMA })
     if (!fixed || !fixed.testsPass || !fixed.workspaceBuildOk) throw new Error(`${phaseTitle} fix round ${round} not green`)
@@ -191,7 +193,7 @@ for (const pr of PR_DEFS) {
 // ---------- Integrate ----------
 phase('Integrate')
 const integ = await agent(
-  `Integration check of the full auth train in ${REPO}: checkout ${baseBranch} (the stacked tip).\n` +
+  `Integration check of the full auth train (working directory = repository root): checkout ${baseBranch} (the stacked tip).\n` +
   `1. pnpm -r build.\n2. Run EVERY package's test suite (${EXPECTED_PKGS.join(', ')}); report one suites[] entry per package.\n` +
   `3. Live e2e: if the environment has real agent auth (try the repo's env-gated live suite the way .githooks/pre-push does, plus the new auth.live.e2e.test.ts), run it once and report; if the env lacks agent auth, report "skipped-no-env" — do NOT fake it.\n` +
   `4. todoFree: scan the diff main..${baseBranch} for TODO/deferred-work language. changesetsOk: confirm every PR branch adds a changeset naming exactly the packages whose src/ changed.\n` +
@@ -215,7 +217,7 @@ if (A.deliver !== true) {
 }
 
 const deliver = await agent(
-  `Deliver the auth train from ${REPO}:\n` +
+  `Deliver the auth train (working directory = repository root):\n` +
   `1. Push all branches in ONE command so the pre-push gate runs once: git push origin ${PR_DEFS.map((p) => p.branch).join(' ')}\n` +
   `   The pre-push hook runs a live e2e against real agents (~2 min) — let it run. If it fails you MUST NOT retry with --no-verify or AGENTPRISM_SKIP_LIVE_E2E (even though the hook's own output suggests them): return pushed:false with the hook's failure tail in notes and stop.\n` +
   `2. Open 7 DRAFT PRs with gh, STACKED: PR1 base main; PR N base = PR N-1's branch. Title from the branch; body = a distilled summary of that phase's report (below) + "Implements docs/specs/acp-auth-spec.md " + that PR's sections field + a "Review notes" list of the phase's minorIssues (verifier notes worth a human eye) + the standard "🤖 Generated with [Claude Code](https://claude.com/claude-code)" footer.\n` +
