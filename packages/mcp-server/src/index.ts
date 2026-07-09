@@ -10,6 +10,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createAcpRunner } from "@automatalabs/workflows";
 
 import { createWorkflowServer } from "./server.js";
+import { createDeferredMcpAuthResolver } from "./auth-resolver.js";
 
 export { createWorkflowServer } from "./server.js";
 export type { WorkflowConfirmCallback, WorkflowCheckpointOptions } from "./server.js";
@@ -17,16 +18,57 @@ export { clampWorkflowInput, workflowToolInputShape } from "./workflow-tool-inpu
 export type { WorkflowToolInput } from "./workflow-tool-input.js";
 export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
 export type { WorkflowToolResult } from "./workflow-tool-output.js";
+export {
+  authStatusInputShape,
+  authStatusOutputShape,
+  authenticateInputShape,
+  authenticateOutputShape,
+  projectAuthMethod,
+  projectAuthStatusBackend,
+  mapAuthenticateResolution,
+  formatAuthStatusSummary,
+  formatAuthenticateSummary,
+} from "./auth-tool-io.js";
+export type {
+  AuthStatusToolMethod,
+  AuthStatusToolBackend,
+  AuthStatusToolResult,
+  AuthenticateToolResult,
+  AuthenticateMapping,
+} from "./auth-tool-io.js";
+export { createDeferredMcpAuthResolver } from "./auth-resolver.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
+
+/** Headless opt-in for the inline MCP auth resolver (§4.3). DEFAULT OFF: the clean, spec-faithful
+ *  headless behavior is pure pause-and-resume; setting this to 1/true wires the elicitation bridge. */
+const INLINE_AUTH_ENV = "AGENTPRISM_MCP_INLINE_AUTH";
+
+function inlineAuthEnabledByEnv(): boolean {
+  const value = process.env[INLINE_AUTH_ENV]?.trim().toLowerCase();
+  return value === "1" || value === "true";
+}
 
 /**
  * Bootstrap the MCP `workflow` server over stdio. Composition root: build the ACP-backed
  * AgentRunner, inject it into the workflow-engine via the server shell, and serve on stdin/stdout.
+ *
+ * When AGENTPRISM_MCP_INLINE_AUTH is set, build a DEFERRED inline auth resolver, construct the runner
+ * with it (`onAuth` — which derives `authCapabilities` to `{ terminal:false, gateway:true }`), then
+ * bind the resolver to the constructed server, breaking the runner⇄server construction cycle. Unset
+ * (the default) the runner takes no `onAuth`, so a -32000 pauses the run for the pause-and-resume path.
  */
 export async function main(): Promise<void> {
-  const runner = createAcpRunner();
-  const server = createWorkflowServer(runner);
+  let server;
+  if (inlineAuthEnabledByEnv()) {
+    const bridge = createDeferredMcpAuthResolver();
+    const runner = createAcpRunner({ authCapabilities: { gateway: true }, onAuth: bridge.resolver });
+    server = createWorkflowServer(runner);
+    bridge.bind(server.server);
+  } else {
+    const runner = createAcpRunner();
+    server = createWorkflowServer(runner);
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

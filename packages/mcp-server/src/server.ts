@@ -27,6 +27,8 @@ import type {
   ExecOptions,
   WorkflowSnapshot,
   AgentRunner,
+  AuthCapableRunner,
+  AuthMethodDescriptor,
   JournalEntry,
   WorkflowBackendConfig,
   WorkflowRunResult,
@@ -35,6 +37,19 @@ import type {
 import { clampWorkflowInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
 import { createProgressReporter } from "./progress.js";
+import {
+  authStatusInputShape,
+  authStatusOutputShape,
+  authenticateInputShape,
+  authenticateOutputShape,
+  projectAuthStatusBackend,
+  mapAuthenticateResolution,
+  formatAuthStatusSummary,
+  formatAuthenticateSummary,
+  type AuthStatusToolBackend,
+  type AuthStatusToolResult,
+  type AuthenticateToolResult,
+} from "./auth-tool-io.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
@@ -372,9 +387,22 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
     lines.push(`reset hint: ${run.resetHint}`);
   }
   if (run.status === "paused") {
-    lines.push(
-      `This run is resumable — call the workflow tool again with resumeFromRunId="${run.runId}" to continue from its journal.`,
-    );
+    // Read the STRUCTURED authContext (§2.12) — never the free-form `reason` message string.
+    if (run.reason === "auth_required" && run.authContext) {
+      const backendId = run.authContext.backendId ?? "?";
+      lines.push(`This run needs authentication for backend "${backendId}".`);
+      for (const m of run.authContext.methods) {
+        lines.push(`  - ${m.id} (${m.type})${m.name ? `: ${m.name}` : ""}`);
+      }
+      lines.push(
+        `Call workflow_authenticate { backend: "${backendId}", methodId: <one above>, ... }, ` +
+          `then re-call the workflow tool with resumeFromRunId="${run.runId}".`,
+      );
+    } else {
+      lines.push(
+        `This run is resumable — call the workflow tool again with resumeFromRunId="${run.runId}" to continue from its journal.`,
+      );
+    }
   }
   return lines.join("\n");
 }
@@ -384,10 +412,126 @@ function formatRunSummary(run: WorkflowRunResult): string {
 }
 
 /**
- * Build the MCP server with the single `workflow` tool registered. The AgentRunner is the
- * DI seam: it is injected here into a single WorkflowManager (so persistence — and therefore
- * resume — is shared across calls) and every run goes through manager.runSync. The returned
- * McpServer is not yet connected — the caller attaches a transport (see index.ts).
+ * Duck-type the injected runner as an `AuthCapableRunner` (§4.3). The frozen `AgentRunner` seam is
+ * not widened: the ACP-backed `createAcpRunner()` satisfies this structural shape, so the auth tools
+ * register; a plain `AgentRunner` stub in tests does not, and simply gets the `workflow` tool alone.
+ */
+function asAuthCapableRunner(runner: AgentRunner): AuthCapableRunner | undefined {
+  const r = runner as Partial<AuthCapableRunner>;
+  return typeof r.describeAuthMethods === "function" &&
+    typeof r.completeAuth === "function" &&
+    typeof r.listBackends === "function" &&
+    r.auth != null
+    ? (runner as unknown as AuthCapableRunner)
+    : undefined;
+}
+
+/**
+ * Register `workflow_auth_status` (read-only, redacted) and `workflow_authenticate` (action) on the
+ * server, sharing the injected auth-capable runner (§4.3). Called only when the runner duck-types as
+ * auth-capable, so a host with a plain `AgentRunner` never sees these tools.
+ */
+function registerAuthTools(mcp: McpServer, authRunner: AuthCapableRunner): void {
+  mcp.registerTool(
+    "workflow_auth_status",
+    {
+      title: "Inspect ACP backend authentication status",
+      description:
+        "Read-only. Report each ACP backend's auth state and its advertised auth methods (redacted — " +
+        "ids/types/names/labels/flags only, NEVER credential values). Pass `backend` to scope to one; " +
+        "omit it to enumerate every registered backend. Use this to discover a methodId for " +
+        "workflow_authenticate, and the `interactive` flag to skip browser/TTY-only methods.",
+      inputSchema: authStatusInputShape,
+      outputSchema: authStatusOutputShape,
+    },
+    async (args) => {
+      const backendArg = typeof args.backend === "string" && args.backend.length > 0 ? args.backend : undefined;
+      // A single `backend` scopes to it; omitting it enumerates every REGISTERED backend (built-ins +
+      // configured customs) via listBackends — not only those already carrying a machine (§4.3).
+      const ids = backendArg ? [backendArg] : authRunner.listBackends();
+      const backends: AuthStatusToolBackend[] = [];
+      for (const id of ids) {
+        // A backend that cannot be probed (binary absent, spawn failure) still reports its status —
+        // a read-only status tool never hard-fails on one unreachable backend.
+        let descriptors: AuthMethodDescriptor[] = [];
+        try {
+          descriptors = await authRunner.describeAuthMethods({ model: id });
+        } catch {
+          descriptors = [];
+        }
+        const snapshot = authRunner.auth.status({ backend: id })[0];
+        backends.push(projectAuthStatusBackend(id, descriptors, snapshot));
+      }
+      const structuredContent: AuthStatusToolResult = { backends };
+      return {
+        structuredContent: { ...structuredContent },
+        content: [{ type: "text", text: formatAuthStatusSummary(backends) }],
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "workflow_authenticate",
+    {
+      title: "Complete ACP backend authentication",
+      description:
+        "Complete auth for one backend method (a methodId from workflow_auth_status). `env` (env_var " +
+        "values) and `meta` (agent-type _meta, e.g. gateway { baseUrl, headers }) are SECRET — they are " +
+        "handed straight to the runner and NEVER echoed, journaled, or logged. Interactive browser/TTY-only " +
+        "methods return status:\"cancelled\" with an explanation rather than a no-op; complete those on a " +
+        "browser-capable host. After success, re-call the workflow tool with resumeFromRunId to continue.",
+      inputSchema: authenticateInputShape,
+      outputSchema: authenticateOutputShape,
+    },
+    async (args) => {
+      const input = { backend: args.backend, methodId: args.methodId, env: args.env, meta: args.meta };
+      // Consult the chosen descriptor so a browser/TTY-only method is never silently mapped to a
+      // no-op `completed` (§4.3). A probe failure leaves `descriptor` undefined — the mapping then
+      // routes any env/meta straight through, else cancels with an explanation.
+      let descriptor: AuthMethodDescriptor | undefined;
+      try {
+        const descriptors = await authRunner.describeAuthMethods({ model: input.backend });
+        descriptor = descriptors.find((d) => d.id === input.methodId);
+      } catch {
+        descriptor = undefined;
+      }
+
+      const mapping = mapAuthenticateResolution(input, descriptor);
+      if (mapping.kind === "cancelled") {
+        const result: AuthenticateToolResult = { status: "cancelled", methodId: input.methodId, recycled: false };
+        return {
+          structuredContent: { ...result },
+          content: [{ type: "text", text: mapping.explanation }],
+        };
+      }
+
+      // The SECRET env/meta ride ONLY inside `mapping.resolution` into completeAuth → the in-memory
+      // AuthStore. The returned outcome carries no secret; the content text is built solely from it.
+      const outcome = await authRunner.completeAuth({
+        model: input.backend,
+        methodId: input.methodId,
+        resolution: mapping.resolution,
+        label: `mcp:workflow_authenticate:${input.backend}`,
+      });
+      const result: AuthenticateToolResult = {
+        status: outcome.status,
+        methodId: outcome.methodId,
+        recycled: outcome.recycled,
+      };
+      return {
+        structuredContent: { ...result },
+        content: [{ type: "text", text: formatAuthenticateSummary(result) }],
+      };
+    },
+  );
+}
+
+/**
+ * Build the MCP server with the single `workflow` tool registered (plus the two auth tools when the
+ * injected runner is auth-capable). The AgentRunner is the DI seam: it is injected here into a single
+ * WorkflowManager (so persistence — and therefore resume — is shared across calls) and every run goes
+ * through manager.runSync. The returned McpServer is not yet connected — the caller attaches a
+ * transport (see index.ts).
  */
 export function createWorkflowServer(runner: AgentRunner): McpServer {
   const mcp = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
@@ -397,6 +541,13 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
   const manager = new WorkflowManager({ agent: runner });
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
+
+  // Auth tools register only when the injected runner duck-types as auth-capable (§4.3). A plain
+  // AgentRunner (e.g. a test stub, or a host's own minimal runner) gets the `workflow` tool alone.
+  const authRunner = asAuthCapableRunner(runner);
+  if (authRunner) {
+    registerAuthTools(mcp, authRunner);
+  }
 
   mcp.registerTool(
     "workflow",

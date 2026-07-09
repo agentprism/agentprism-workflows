@@ -406,7 +406,14 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes one tool named **`workflow`**: pass `script` (or a saved `name`) + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. Honors the same environment variables as the SDK.
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes the tool named **`workflow`**: pass `script` (or a saved `name`) + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. Honors the same environment variables as the SDK.
+
+**Auth tools (§4.3).** When the injected runner is auth-capable — the default `createAcpRunner()` is — two additive tools register alongside `workflow` (a host that injects a plain `AgentRunner` gets `workflow` alone, so `createWorkflowServer(runner)` is unchanged and default behavior is byte-identical):
+
+- **`workflow_auth_status`** — read-only. Reports each ACP backend's auth `state` and its advertised auth methods, **redacted**: ids / types / names / labels / flags only, never a credential value. Pass `backend` to scope to one; omit it to enumerate every registered backend (built-ins + configured customs). The per-method `interactive` flag marks a bare-`agent` login that needs a browser/TTY — a headless host skips those.
+- **`workflow_authenticate`** — action. Complete auth for one `{ backend, methodId }`. `env` (env_var values) and `meta` (agent-type `_meta`, e.g. gateway `{ baseUrl, headers }`) are **SECRET**: they map straight into an `AuthResolution` for the runner and are never echoed into the result, journaled, or logged. An interactive browser/TTY-only method returns `status:"cancelled"` with an explanation rather than a silent no-op. On success, re-call `workflow` with `resumeFromRunId` to continue a paused run.
+
+A run that paused with `reason:"auth_required"` surfaces a summary built from the structured, non-secret `authContext` (backend id + advertised method `{ id, type, name }[]`) pointing at `workflow_authenticate` then `resumeFromRunId` — never parsed from the error message. An **opt-in** inline elicitation resolver (`AGENTPRISM_MCP_INLINE_AUTH=1`) collects env/gateway values through masked forms in-band; **default OFF**, the headless path is pure pause-and-resume.
 
 ## Workflow script DSL
 
