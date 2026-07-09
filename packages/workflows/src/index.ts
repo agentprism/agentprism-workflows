@@ -67,6 +67,7 @@ export {
   WorkflowErrorCode,
   isWorkflowError,
   isProviderUsageLimit,
+  isAuthRequired,
 } from "@automatalabs/workflow-engine";
 
 // ── ACP backend: the default AgentRunner implementation, interactive sessions, backend

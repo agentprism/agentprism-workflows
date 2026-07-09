@@ -33,6 +33,9 @@ import {
   runWorkflow,
   runDynamicWorkflow,
   WorkflowError,
+  WorkflowErrorCode,
+  isAuthRequired,
+  isProviderUsageLimit,
   TypedEventEmitter,
   toJsonSchema,
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
@@ -47,6 +50,19 @@ import type {
   RunOptions,
   RunPersistenceOptions,
   WorkflowPathOptions,
+  // §4.2 type re-exports — the runner-facing auth surface the SDK facade re-exports.
+  // Imported here as a compile-gate: PR6's value export must resolve alongside these
+  // (which landed with PR5), and a broken facade re-export chain would fail to type-check.
+  AuthResolver,
+  AuthContext,
+  AuthResolution,
+  AuthMethodDescriptor,
+  CompleteAuthOptions,
+  AuthOutcome,
+  AuthController,
+  AuthStatusSnapshot,
+  AuthCapableRunner,
+  AuthErrorContext,
 } from "../src/index.js";
 
 /**
@@ -161,6 +177,82 @@ test("facade re-exports the public surface", () => {
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
   const runPersistenceOptions: RunPersistenceOptions = pathOptions;
   assert.equal(runPersistenceOptions.persistenceRoot, pathOptions.persistenceRoot);
+});
+
+// §4.2 SDK exports (PR6). The facade re-exports the `isAuthRequired` VALUE through the
+// @automatalabs/workflow-engine chain (threaded in PR1) so a host can classify an
+// AUTH_REQUIRED fault with the same one-liner it uses for isProviderUsageLimit — no new
+// behavior, just surface. The §4.2 TYPE re-exports (AuthResolver, AuthContext, …) landed
+// with PR5; they are compile-gated below so a broken facade chain fails type-checking.
+test("facade re-exports isAuthRequired as a value alongside isProviderUsageLimit (§4.2)", () => {
+  assert.equal(typeof isAuthRequired, "function");
+  assert.equal(typeof isProviderUsageLimit, "function");
+
+  // True ONLY for an AUTH_REQUIRED WorkflowError, and it narrows to WorkflowError so the
+  // caller can read `.authContext` (the non-secret structured surface) after the guard.
+  const authErr: unknown = new WorkflowError("authentication required", WorkflowErrorCode.AUTH_REQUIRED, {
+    authContext: { backendId: "claude", methods: [{ id: "gateway", type: "agent", name: "Gateway" }] },
+  });
+  assert.equal(isAuthRequired(authErr), true);
+  if (isAuthRequired(authErr)) {
+    assert.equal(authErr.code, WorkflowErrorCode.AUTH_REQUIRED);
+    assert.equal(authErr.authContext?.backendId, "claude");
+  } else {
+    assert.fail("isAuthRequired should narrow the AUTH_REQUIRED WorkflowError");
+  }
+
+  // A different WorkflowErrorCode must NOT classify as auth (and must not collide with the
+  // sibling usage-limit guard) — the two helpers partition disjoint faults.
+  const usageErr = new WorkflowError("usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(isAuthRequired(usageErr), false);
+  assert.equal(isProviderUsageLimit(usageErr), true);
+  assert.equal(isProviderUsageLimit(authErr), false);
+
+  // Non-WorkflowError values never classify.
+  assert.equal(isAuthRequired(new Error("authentication required")), false);
+  assert.equal(isAuthRequired({ code: WorkflowErrorCode.AUTH_REQUIRED }), false);
+  assert.equal(isAuthRequired(undefined), false);
+  assert.equal(isAuthRequired(null), false);
+});
+
+// Compile-gate for the §4.2 runner-facing auth TYPE re-exports (surfaced through the facade
+// with PR5). If any re-export were dropped or renamed, referencing it here fails `tsc`; the
+// runtime assertion is trivially true — the value is the type wiring compiling at all.
+test("facade re-exports the §4.2 runner-facing auth types", () => {
+  const descriptor: AuthMethodDescriptor = {
+    type: "env_var",
+    id: "openai",
+    name: "OpenAI",
+    vars: [{ name: "OPENAI_API_KEY", secret: true, optional: false }],
+  };
+  const resolution: AuthResolution = { outcome: "env", values: { OPENAI_API_KEY: "sk-x" }, methodId: "openai" };
+  const context: AuthContext = { backendId: "claude", methods: [descriptor], cause: "proactive" };
+  const completeOpts: CompleteAuthOptions = { methodId: "openai", resolution };
+  const outcome: AuthOutcome = { status: "authenticated", methodId: "openai", recycled: false };
+  const errorContext: AuthErrorContext = { methods: [{ id: "openai", type: "env_var" }] };
+  const snapshot: AuthStatusSnapshot = {
+    backendId: "claude",
+    poolKey: "claude",
+    state: "unauthenticated",
+    authenticated: false,
+    canResume: false,
+    methods: [{ id: "openai", type: "env_var", name: "OpenAI" }],
+  };
+  // Function/interface typedefs referenced purely as compile-gates through the facade barrel.
+  const resolver: AuthResolver = async () => resolution;
+  const controller: AuthController | undefined = undefined;
+  const capable: AuthCapableRunner | undefined = undefined;
+
+  assert.equal(descriptor.type, "env_var");
+  assert.equal(resolution.outcome, "env");
+  assert.equal(context.cause, "proactive");
+  assert.equal(completeOpts.methodId, "openai");
+  assert.equal(outcome.status, "authenticated");
+  assert.equal(errorContext.methods[0]?.type, "env_var");
+  assert.equal(snapshot.state, "unauthenticated");
+  assert.equal(typeof resolver, "function");
+  assert.equal(controller, undefined);
+  assert.equal(capable, undefined);
 });
 
 test("createAcpRunner exposes a typed ACP event bus (on/once/off/listenerCount) via the barrel", async () => {
