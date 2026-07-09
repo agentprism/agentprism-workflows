@@ -65,7 +65,7 @@ resume/pool safety, engine pause-for-auth, and strict secret hygiene.
 3. **Integration profiles**
    - 3.1 The `AuthProfile` seam
    - 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.57.0
-   - 3.3 Codex — `@automatalabs/codex-acp` 1.5.2 (our fork)
+   - 3.3 Codex — `@automatalabs/codex-acp` 1.5.3 (our fork)
    - 3.4 OpenCode — `opencode-ai` 1.17.14
    - 3.5 Custom agent conformance profile
    - 3.6 Full `_meta` capability support matrix
@@ -862,7 +862,7 @@ No advertised `env_var` method, but the child `@anthropic-ai/claude-agent-sdk` s
 
 ---
 
-### 3.3 Codex — `@automatalabs/codex-acp` 1.5.2 (our fork)
+### 3.3 Codex — `@automatalabs/codex-acp` 1.5.3 (our fork)
 
 The installed fork version is 1.5.2. The detailed offsets in this subsection were originally captured against 1.4.0 and are retained as snapshot evidence; the current dependency is additionally covered by the executable dist probes and live tests described in §4.6. `protocolVersion: 1` (snapshot `dist/index.js:3744,27335`). Persistence is delegated to the bundled `@openai/codex@0.142.5` Rust app-server, spawned as `codex app-server` (`:21703-21706`). The auth-required factory uses `-32000` (`:20628-20632`).
 
