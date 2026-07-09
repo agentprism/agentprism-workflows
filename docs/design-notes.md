@@ -104,7 +104,7 @@ host-facing event, auth, and interactive/reattach APIs. Its runtime deps are
 `@modelcontextprotocol/sdk`, `typebox`, and `@automatalabs/shared-types`; OpenCode is resolved from
 the host and deliberately is not bundled.
 
-The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.5.2` — a
+The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.5.3` — a
 published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `outputSchema` forward
 (§6.3) into its shipped dist. It's an exact-pinned dependency, so Codex ships on a clean
 `git clone && pnpm install && pnpm build` — no pnpm patch, no `patches/` file, no vendored tree.
@@ -206,7 +206,7 @@ All versions below were re-verified from the installed workspace dependency grap
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
 
-- **`@automatalabs/codex-acp@1.5.2`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
+- **`@automatalabs/codex-acp@1.5.3`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
   the **Codex App Server**). Bin: `codex-acp`. This is a **published fork** of
   `@agentclientprotocol/codex-acp` that bakes the `outputSchema` forward (§6.3) into its shipped
   dist; it is the package `acp-agents` exact-pins and consumes.
@@ -582,10 +582,10 @@ never sets `outputSchema`. The fork forwards it from the prompt's `_meta` (the a
 `runTurn → turnStart → sendRequest({ method: "turn/start", params })` passes it through verbatim;
 `TurnStartParams.outputSchema` already exists, so it's type-clean.
 
-**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.5.2` — its
+**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.5.3` — its
 build compiles the change into the shipped `dist/index.js`, so npm consumers get it directly (unlike
 a pnpm `patchedDependencies` transform, which is a workspace-root install step that never travels in
-a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.5.2`, so the forward is
+a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.5.3`, so the forward is
 present on a clean checkout with no vendoring and no postinstall hook. `CodexBackend` spawns the
 resolved package main (`require.resolve("@automatalabs/codex-acp")`) under the current node.
 
@@ -701,7 +701,7 @@ the unchanged engine.
 - **Codex structured output needs a codex-acp forward:** the shipped binary (`@openai/codex@0.142.5`;
   the field was source-verified at `rust-v0.142.4`) honors `turn/start.outputSchema`, but the stock adapter never forwards
   it — the ~1-line `_meta` → `runTurn` forward (§6.3) is **baked into the published fork
-  `@automatalabs/codex-acp@1.5.2`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
+  `@automatalabs/codex-acp@1.5.3`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
   consumers, unlike a pnpm `patchedDependencies` transform). `CodexBackend` also normalizes schemas
   to OpenAI **strict** rules. Output rides the normal message stream (no `emitRawSDKMessages` needed).
 - **MCP turn semantics:** no "deliver result into a later turn" — run the `workflow` tool
@@ -731,7 +731,7 @@ the unchanged engine.
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.2.1` — https://github.com/agentclientprotocol
 - `@agentclientprotocol/claude-agent-acp@0.57.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.202`) — https://github.com/agentclientprotocol/claude-agent-acp
-- `@automatalabs/codex-acp@1.5.2` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
+- `@automatalabs/codex-acp@1.5.3` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
 - OpenCode (`opencode acp`) — https://opencode.ai
 
 **ACP spec:**
