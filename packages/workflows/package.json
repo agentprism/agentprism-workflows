@@ -1,6 +1,6 @@
 {
   "name": "@automatalabs/workflows",
-  "version": "0.23.1",
+  "version": "0.23.2",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
