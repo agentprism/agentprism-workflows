@@ -184,7 +184,7 @@ const runner = createAcpRunner({
 });
 ```
 
-`AcpRunnerOptions`: `size?`, `clientHandlers?`, `onPermissionRequest?` (runner-wide async human-in-the-loop resolver; replaces the synchronous `ToolPolicy` auto-decision wherever set — pending resolvers are settled as `cancelled` on session teardown so a turn can never hang), `onElicitation?` (runner-wide ACP `elicitation/create` responder; see below), `backends?` (custom ACP backends, merged over env `AGENTPRISM_BACKENDS`; names are case-insensitive, `claude`/`codex`/`opencode` reserved).
+`AcpRunnerOptions`: `size?`, `clientHandlers?`, `onPermissionRequest?` (runner-wide async human-in-the-loop resolver; replaces the synchronous `ToolPolicy` auto-decision wherever set — pending resolvers are settled as `cancelled` on session teardown so a turn can never hang), `onElicitation?` (runner-wide ACP `elicitation/create` responder; see below), `authCapabilities?` (`{ terminal?, gateway? }` — which auth method **types** this host can complete; advertised at `initialize`, see below), `backends?` (custom ACP backends, merged over env `AGENTPRISM_BACKENDS`; names are case-insensitive, `claude`/`codex`/`opencode` reserved).
 
 ### `run(prompt, opts)` — the AgentRunner seam
 
@@ -211,6 +211,15 @@ Configure `createAcpRunner({ onElicitation })` to answer requests. A resolver re
 Capability advertisement is fixed at `initialize`: the client advertises `elicitation: { form: {}, url: {} }` only when a runner-wide `onElicitation` exists. A session-scoped `openSession({ onElicitation })`, `loadSession({ onElicitation })`, or `resumeSession({ onElicitation })` wins over the runner resolver for that session, but by itself cannot light up initialize-time capabilities on the connection. Agents on that connection may therefore never ask. A resolver may still decline modes it cannot render.
 
 Claude-family agents use this advertisement to enable `AskUserQuestion`, refusal-fallback dialogs, and MCP-elicitation forwarding. Advertising without a real responder would send those agent questions into a void, so this library never advertises elicitation for a stub auto-decline path.
+
+### Client auth capability advertisement
+
+The client tells the agent which authentication method **types** it can actually complete, so the agent only offers gates the host can finish. Like elicitation, this is fixed at `initialize` and derived once at runner construction (never per-session). `createAcpRunner({ authCapabilities })` takes `{ terminal?, gateway? }`:
+
+- `terminal: true` advertises `clientCapabilities.auth.terminal` **and** the top-level `clientCapabilities._meta["terminal-auth"]` channel (both are read by first-class agents — Claude reveals its terminal login methods on either, OpenCode reads the launch hint under the `_meta` channel).
+- `gateway: true` advertises `clientCapabilities.auth._meta.gateway` (the gate Claude and Codex use to reveal their gateway auth methods).
+
+**Default-OFF.** With `authCapabilities` unset, the `auth` capability is **omitted entirely** from `initialize` — which the ACP spec treats as "unsupported" — so behavior is byte-identical to a host that never opted in. There is no typed `env_var` gate in the SDK, so `env_var` methods are always visible on the wire regardless of this option. A native-TTY CLI host passes `{ terminal: true, gateway: true }`; a generic programmatic host leaves it unset. The `auth` surface is SDK-**UNSTABLE/@experimental**; a drift tripwire (`assertAuthCapabilityShape`) fails the build if a future SDK bump reshapes it.
 
 ### Auth & providers
 

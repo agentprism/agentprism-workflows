@@ -75,6 +75,66 @@ test("clientCapabilitiesFor: mcp handlers do not invent a non-SDK initialize cap
   assert.deepEqual(clientCapabilitiesFor({ mcp: MCP_HANDLERS }), BASE_CAPABILITIES);
 });
 
+// §1.2 client auth advertisement gating matrix. auth is host-declared (like elicitation), so it is
+// advertised regardless of fs/terminal/mcp handlers and OMITTED entirely when no gate is requested
+// — the default-OFF, spec-"unsupported" baseline.
+test("clientCapabilitiesFor: auth is omitted by default and when no gate is requested", () => {
+  // No auth option at all (default-OFF).
+  assert.equal("auth" in clientCapabilitiesFor(undefined), false);
+  assert.equal(clientCapabilitiesFor(undefined).auth, undefined);
+  // An all-false / empty auth object advertises nothing — the `auth` key never appears.
+  for (const auth of [{}, { terminal: false }, { gateway: false }, { terminal: false, gateway: false }]) {
+    const caps = clientCapabilitiesFor(undefined, { auth });
+    assert.equal("auth" in caps, false, `auth omitted for ${JSON.stringify(auth)}`);
+    assert.equal("_meta" in caps, false, `top-level _meta omitted for ${JSON.stringify(auth)}`);
+    assert.deepEqual(caps, BASE_CAPABILITIES);
+  }
+});
+
+test("clientCapabilitiesFor: terminal gate lights auth.terminal AND the top-level _meta channel", () => {
+  // Lighting auth.terminal also sets top-level _meta["terminal-auth"] — the channel claude reads at
+  // dist/acp-agent.js:339 and opencode at service.ts:100.
+  assert.deepEqual(clientCapabilitiesFor(undefined, { auth: { terminal: true } }), {
+    ...BASE_CAPABILITIES,
+    auth: { terminal: true },
+    _meta: { "terminal-auth": true },
+  });
+});
+
+test("clientCapabilitiesFor: gateway gate lights only auth._meta.gateway, no top-level _meta", () => {
+  const caps = clientCapabilitiesFor(undefined, { auth: { gateway: true } });
+  assert.deepEqual(caps, { ...BASE_CAPABILITIES, auth: { _meta: { gateway: true } } });
+  assert.equal("_meta" in caps, false, "gateway alone must not set the top-level terminal-auth channel");
+});
+
+test("clientCapabilitiesFor: both gates light terminal, gateway, and the terminal-auth channel", () => {
+  assert.deepEqual(clientCapabilitiesFor(undefined, { auth: { terminal: true, gateway: true } }), {
+    ...BASE_CAPABILITIES,
+    auth: { terminal: true, _meta: { gateway: true } },
+    _meta: { "terminal-auth": true },
+  });
+});
+
+test("clientCapabilitiesFor: auth advertisement is independent of fs/terminal handlers", () => {
+  // Host-declared, not handler-derived: the same auth block appears with or without handlers.
+  assert.deepEqual(
+    clientCapabilitiesFor({ terminal: TERMINAL_HANDLERS }, { auth: { gateway: true } }),
+    { ...BASE_CAPABILITIES, terminal: true, auth: { _meta: { gateway: true } } },
+  );
+});
+
+test("clientCapabilitiesFor: auth advertisement is a pure, connection-lifetime-fixed derivation", () => {
+  // Fixedness (§1.2): the advertisement is a pure function of its options — same inputs yield deeply
+  // equal but independent objects, so it is snapshotted once at initialize and never mutates in place.
+  const options = { auth: { terminal: true, gateway: true } } as const;
+  const first = clientCapabilitiesFor(undefined, options);
+  const second = clientCapabilitiesFor(undefined, options);
+  assert.deepEqual(first, second);
+  assert.notEqual(first.auth, second.auth, "each call returns its own object graph");
+  first.auth!.terminal = false;
+  assert.equal(second.auth!.terminal, true, "mutating one result never affects another");
+});
+
 test("AcpAgentRunner rejects partial terminal handlers at construction", () => {
   assert.throws(
     () =>

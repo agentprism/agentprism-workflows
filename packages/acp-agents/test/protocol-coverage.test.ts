@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
-import { AGENT_METHOD_COVERAGE, CLIENT_METHOD_COVERAGE } from "../src/index.js";
+import {
+  AGENT_METHOD_COVERAGE,
+  AUTH_CAPABILITY_KEYS,
+  CLIENT_METHOD_COVERAGE,
+  assertAuthCapabilityShape,
+  clientCapabilitiesFor,
+} from "../src/index.js";
 
 function sorted(values: Iterable<string>): string[] {
   return [...values].sort((a, b) => a.localeCompare(b));
@@ -35,5 +41,28 @@ test("agent method coverage classifies every installed SDK agent method", () => 
     Object.values(AGENT_METHOD_COVERAGE).filter((coverage) => coverage === "guarded").length,
     1,
     "agent guarded count should match docs",
+  );
+});
+
+// §4.6.4 item 1 — the client auth advertisement rides the SDK's UNSTABLE `AuthCapabilities` surface.
+// Pin the emitted shape so a `@agentclientprotocol/sdk` bump that reshapes it trips the build.
+test("clientCapabilitiesFor emits only the pinned SDK-1.2.1 AuthCapabilities keys", () => {
+  const caps = clientCapabilitiesFor(undefined, { auth: { terminal: true, gateway: true } });
+  assert.ok(caps.auth, "auth block advertised when a gate is requested");
+  // Exactly `{ terminal, _meta }` — no extra/renamed keys.
+  assert.deepEqual(Object.keys(caps.auth).sort(), [...AUTH_CAPABILITY_KEYS].sort());
+  assert.doesNotThrow(() => assertAuthCapabilityShape(caps.auth));
+  // The gateway-only and default-OFF shapes are also conformant (and null is vacuously fine).
+  assert.doesNotThrow(() =>
+    assertAuthCapabilityShape(clientCapabilitiesFor(undefined, { auth: { gateway: true } }).auth),
+  );
+  assert.doesNotThrow(() => assertAuthCapabilityShape(clientCapabilitiesFor(undefined).auth));
+  assert.doesNotThrow(() => assertAuthCapabilityShape(undefined));
+});
+
+test("assertAuthCapabilityShape trips on a drifted (unpinned) auth key", () => {
+  assert.throws(
+    () => assertAuthCapabilityShape({ terminal: true, envVar: true } as never),
+    /unpinned key "envVar"/,
   );
 });

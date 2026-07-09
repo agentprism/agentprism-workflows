@@ -206,6 +206,12 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Runner-wide ACP elicitation responder. When set, initialize advertises unstable
    *  elicitation form/url support on every connection; sessions may override the resolver. */
   onElicitation?: ElicitationResolver;
+  /** Which auth method TYPES this host can complete (§1.2). When set, initialize advertises the
+   *  matching client auth capability (`auth.terminal` + top-level `_meta["terminal-auth"]`, and/or
+   *  `auth._meta.gateway`) on every connection, fixed for the connection lifetime. Unset omits the
+   *  `auth` capability entirely — the default-OFF, zero-behavior-change baseline. A native-TTY CLI
+   *  host passes `{ terminal: true, gateway: true }`; a generic programmatic host leaves it unset. */
+  authCapabilities?: { terminal?: boolean; gateway?: boolean };
 }
 
 /**
@@ -227,6 +233,9 @@ export class AcpAgentRunner implements AgentRunner {
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly permissionResolver: PermissionResolver | undefined;
   private readonly elicitationResolver: ElicitationResolver | undefined;
+  /** Client auth advertisement, derived ONCE at construction and fixed for every connection this
+   *  runner opens (pooled and dedicated). Undefined => the `auth` capability is omitted (§1.2). */
+  private readonly authCapabilities: { terminal?: boolean; gateway?: boolean } | undefined;
   private readonly structuredOutputTools = new StructuredOutputToolHost();
   /** FIFO turn queue per pooled connection for injected-tool schema runs (see the injection
    *  site for why concurrent injected sessions on one process cannot be isolated). */
@@ -243,11 +252,16 @@ export class AcpAgentRunner implements AgentRunner {
     this.clientHandlers = options.clientHandlers;
     this.permissionResolver = options.onPermissionRequest;
     this.elicitationResolver = options.onElicitation;
+    // PR2 (§1.2): only the explicit `authCapabilities` path + omit-when-unset. The `onAuth`-derived
+    // default (`{ terminal: false, gateway: true }`) lands with PR3 once `onAuth` exists; until then
+    // unset ⇒ omit `auth`, which is byte-identical to today's behavior.
+    this.authCapabilities = options.authCapabilities;
     this.pool = new AcpAgentPool(options, {
       onEvent: this.emitEvent,
       permissionResolver: options.onPermissionRequest,
       elicitationResolver: options.onElicitation,
       advertiseElicitation: Boolean(options.onElicitation),
+      authCapabilities: options.authCapabilities,
     });
     this.backends = resolveBackendRegistry(options.backends);
   }
@@ -757,6 +771,7 @@ export class AcpAgentRunner implements AgentRunner {
       permissionResolver: this.permissionResolver,
       elicitationResolver: this.elicitationResolver,
       advertiseElicitation: Boolean(this.elicitationResolver),
+      authCapabilities: this.authCapabilities,
       clientHandlers: this.clientHandlers,
     });
   }

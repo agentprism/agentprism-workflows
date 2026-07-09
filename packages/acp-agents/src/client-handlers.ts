@@ -99,6 +99,12 @@ export interface ClientCapabilityOptions {
    *  responder. Initialize capabilities are fixed for the connection lifetime, so a later
    *  session-scoped responder alone cannot truthfully light this up. */
   elicitation?: boolean;
+  /** Which auth method TYPES this client can actually complete. Advertising a gate the host
+   *  cannot service would invite the agent to offer a method the host can't finish. FIXED for
+   *  the connection lifetime (same discipline as `elicitation`); derived once at runner
+   *  construction, never per-session. Unset (or all-false) => the `auth` key is omitted entirely,
+   *  which the ACP spec treats as "unsupported" — the default-OFF, zero-behavior-change baseline. */
+  auth?: { terminal?: boolean; gateway?: boolean };
 }
 
 const TERMINAL_HANDLER_METHODS = [
@@ -123,6 +129,21 @@ export function clientCapabilitiesFor(
 ): ClientCapabilities {
   const capabilities: ClientCapabilities = { session: { configOptions: { boolean: {} } } };
   if (options.elicitation) capabilities.elicitation = { form: {}, url: {} };
+  // Auth advertisement is host-declared, not handler-derived (like `elicitation`), so it is applied
+  // before the no-handlers early return. `auth` is OMITTED entirely unless a gate is requested —
+  // any capability absent from `initialize` MUST be treated as unsupported by the agent (§1.2).
+  if (options.auth?.terminal || options.auth?.gateway) {
+    const auth: NonNullable<ClientCapabilities["auth"]> = {};
+    if (options.auth.terminal) auth.terminal = true; // typed SDK field (schema/types.gen.d.ts AuthCapabilities.terminal)
+    if (options.auth.gateway) auth._meta = { gateway: true }; // claude+codex gateway gate
+    capabilities.auth = auth;
+    if (options.auth.terminal) {
+      // claude 0.57.0 (acp-agent.js:339) and opencode 1.17.14 (service.ts:100-101) ALSO read the
+      // top-level `_meta["terminal-auth"]` channel, which additionally carries the spawnable
+      // {command,args,label} launch hint. Light both so all three agents reveal terminal methods.
+      capabilities._meta = { ...(capabilities._meta ?? {}), "terminal-auth": true };
+    }
+  }
   if (!handlers) return capabilities;
 
   const fs = handlers.fs;

@@ -18,6 +18,8 @@ import {
   negotiateCapabilities,
   unsupportedMcpServer,
 } from "../src/index.js";
+// Module-internal diagnostic describer (mirrors describeAuthProviderAdvertisement's internal home).
+import { describeClientAuthAdvertisement } from "../src/capabilities.js";
 
 const CODEX_CUSTOM_CAPABILITIES = {
   namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
@@ -218,4 +220,26 @@ test("unsupportedMcpServer: acp requires agent support and complete client handl
 test("unsupportedMcpServer: undefined/empty server list is serviceable", () => {
   assert.equal(unsupportedMcpServer(undefined, { mcpCapabilities: { http: false, sse: false } }), undefined);
   assert.equal(unsupportedMcpServer([], { mcpCapabilities: { http: false, sse: false } }), undefined);
+});
+
+// §1.2 symmetric client-side describer for error/diagnostic text (counterpart to the agent-side
+// describeAuthProviderAdvertisement). Renders only the pinned boolean gates, never any secret.
+test("describeClientAuthAdvertisement: renders the lit gates and the terminal-auth channel", () => {
+  assert.equal(
+    describeClientAuthAdvertisement({ terminal: true, _meta: { gateway: true } }, { "terminal-auth": true }),
+    'auth.terminal=true; auth._meta.gateway=true; _meta["terminal-auth"]=true',
+  );
+  assert.equal(describeClientAuthAdvertisement({ _meta: { gateway: true } }, undefined), "auth._meta.gateway=true");
+  assert.equal(
+    describeClientAuthAdvertisement({ terminal: true }, { "terminal-auth": true }),
+    'auth.terminal=true; _meta["terminal-auth"]=true',
+  );
+});
+
+test("describeClientAuthAdvertisement: renders auth=none when nothing is advertised", () => {
+  assert.equal(describeClientAuthAdvertisement(undefined, undefined), "auth=none");
+  assert.equal(describeClientAuthAdvertisement(undefined, null), "auth=none");
+  assert.equal(describeClientAuthAdvertisement({}, {}), "auth=none");
+  // A non-gateway _meta or falsy gate value renders nothing (only `=== true` counts).
+  assert.equal(describeClientAuthAdvertisement({ terminal: false, _meta: { gateway: false } }, {}), "auth=none");
 });

@@ -887,6 +887,9 @@ export interface PooledConnectionDeps {
   /** Initialize-time elicitation advertisement; fixed per connection, so it is driven by the
    *  runner-wide resolver rather than session-scoped responders attached later. */
   advertiseElicitation?: boolean;
+  /** Initialize-time client auth advertisement (§1.2); fixed per connection like elicitation.
+   *  Undefined (the default) omits the `auth` capability entirely — the default-OFF baseline. */
+  authCapabilities?: { terminal?: boolean; gateway?: boolean };
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
 }
@@ -918,6 +921,7 @@ export class PooledConnection {
   private readonly onEvent: AcpEventSink | undefined;
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly advertiseElicitation: boolean;
+  private readonly authCapabilities: { terminal?: boolean; gateway?: boolean } | undefined;
   /** Set true at the start of dispose() so the graceful-shutdown death is NOT reported as a crash. */
   private disposing = false;
   /** Resolves once `initialize` completed (or rejects if the process died first). */
@@ -940,6 +944,7 @@ export class PooledConnection {
     this.onEvent = deps.onEvent;
     this.clientHandlers = deps.clientHandlers;
     this.advertiseElicitation = deps.advertiseElicitation ?? Boolean(deps.elicitationResolver);
+    this.authCapabilities = deps.authCapabilities;
     this.client = new MultiplexClient(
       this.backendId,
       this.onEvent,
@@ -1192,6 +1197,7 @@ export class PooledConnection {
             // this runner. Omitted flags are unsupported; false flags are never sent deliberately.
             clientCapabilities: clientCapabilitiesFor(this.clientHandlers, {
               elicitation: this.advertiseElicitation,
+              auth: this.authCapabilities, // undefined => no `auth` key emitted (default-OFF)
             }),
             clientInfo: { ...CLIENT_INFO },
           }),

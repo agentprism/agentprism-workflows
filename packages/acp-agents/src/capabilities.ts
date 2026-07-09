@@ -20,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   type AgentCapabilities,
   type AuthMethod,
+  type ClientCapabilities,
   type ContentBlock,
   type Implementation,
   type InitializeResponse,
@@ -147,6 +148,24 @@ export function describeAuthProviderAdvertisement(
     `auth.logout=${advertised(agent.auth?.logout) ? "true" : "false"}`,
     `providers=${advertised(agent.providers) ? "true" : "false"}`,
   ].join("; ");
+}
+
+/** Human-readable summary of the CLIENT-side auth advertisement this runner sends at initialize —
+ *  the symmetric counterpart to describeAuthProviderAdvertisement (the agent side). Used for
+ *  error/diagnostic text (§1.2); reads only the pinned boolean gates, never any secret. Renders
+ *  e.g. `auth.terminal=true; auth._meta.gateway=true; _meta["terminal-auth"]=true`, or `auth=none`
+ *  when nothing is advertised. */
+export function describeClientAuthAdvertisement(
+  auth: ClientCapabilities["auth"],
+  meta: ClientCapabilities["_meta"],
+): string {
+  const parts: string[] = [];
+  if (auth?.terminal === true) parts.push("auth.terminal=true");
+  const gateway = (auth?._meta as Record<string, unknown> | null | undefined)?.gateway;
+  if (gateway === true) parts.push("auth._meta.gateway=true");
+  const terminalAuth = (meta as Record<string, unknown> | null | undefined)?.["terminal-auth"];
+  if (terminalAuth === true) parts.push('_meta["terminal-auth"]=true');
+  return parts.length > 0 ? parts.join("; ") : "auth=none";
 }
 
 function readCustomNamespace(
