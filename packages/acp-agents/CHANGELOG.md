@@ -1,5 +1,80 @@
 # @automatalabs/acp-agents
 
+## 0.22.0
+
+### Minor Changes
+
+- b70293b: Error taxonomy for ACP auth: classify `AUTH_REQUIRED` code-first on `-32000` (reserved
+  exclusively for `authRequired`) so localized/rephrased auth messages no longer misroute
+  into the retry ladder, plus a guarded prose fallback for non-conformant agents (a different
+  reserved code that merely mentions the phrase never mis-routes). Adds a structured,
+  non-secret `AuthErrorContext` (`backendId` + advertised method `{id,type,name}[]`) carried on
+  `WorkflowError.authContext`, and an `isAuthRequired` type guard re-exported through
+  `@automatalabs/workflow-engine`. Behavior-preserving for the three first-class agents.
+- c746290: Client auth capability advertisement (§1.2), default-OFF. `AcpRunnerOptions` gains
+  `authCapabilities?: { terminal?; gateway? }`, threaded through the pool and every dedicated
+  connection into the one-time `initialize` handshake. When set, the client advertises
+  `clientCapabilities.auth.terminal` + the top-level `_meta["terminal-auth"]` channel (terminal
+  logins) and/or `auth._meta.gateway` (Claude/Codex gateway methods). When unset, the `auth`
+  capability is **omitted entirely** — spec-"unsupported" — so runtime behavior is byte-identical
+  to today until a host opts in. Adds a symmetric `describeClientAuthAdvertisement` diagnostic and a
+  build-time drift tripwire (`assertAuthCapabilityShape` + compile-time type pins) over the SDK's
+  UNSTABLE `AuthCapabilities` surface.
+- f489b17: Auth contracts + `AuthStore` lifecycle + resolver + runner auth API (§1.3, §2, §4.1) — the core
+  correctness PR (closes gap 3: the credential a `runner.authenticate()` stored on a dedicated
+  connection no longer dies when that connection is disposed).
+
+  New `packages/acp-agents/src/auth/{auth-types,auth-store}.ts`: the type-dispatched
+  `AuthMethodDescriptor`/`AuthResolution`/`AuthContext`/`AuthResolver` contracts and the pure,
+  agent-agnostic `buildAuthDescriptors` dispatcher (§1.3); the single per-runner `AuthStore`, its
+  per-`poolKey` generation-stamped `BackendAuthMachine`, and the immutable `AuthIntent` that is the
+  ONLY home for credential material (§2). Credentials live in the store, not on a connection: every
+  connection pulls the current intent at the end of `initialize` (in-process gateway creds are
+  replayed via `authenticate`; disk/spawn-env creds are only stamped), and the pool's
+  `selectConnection` is generation-gated so no session is ever opened under stale auth — stale-busy
+  connections drain, stale-idle ones recycle.
+
+  Runner API (§4.1): `AcpRunnerOptions.onAuth` (inline resolve-and-retry-once at the run seam; the
+  run never pauses when set), the `onAuth`-derived `authCapabilities` default `{ terminal:false,
+gateway:true }`, `describeAuthMethods`/`completeAuth`, the `runner.auth` controller
+  (`methods`/`authenticate`/`logout`/`status`/`canResume`), `listBackends`, and the
+  `AuthCapableRunner` detection interface. Legacy `authenticate()`/`logout()` are rebuilt off
+  dispose-after onto the `AuthStore` + pool recycle. A spawn-env overlay injects collected `env_var`
+  values at spawn, and `stderrTail` is run through a secret-redaction pass.
+
+  Default-OFF and byte-identical: a host that sets neither `onAuth` nor `authCapabilities` gets the
+  exact pre-auth wire behavior. Ships the profile-less conformant `fake-auth-agent.mjs` fixture (§3.5)
+  and its integration suite (the executable Principle-1 proof), plus descriptor/store/secret unit
+  tests. Per-agent `AuthProfile`s and the engine pause-for-auth path remain PR7/PR4.
+
+- 90b63bf: Per-agent auth profiles + codex spawn channel + `_meta` matrix tripwire + permission
+  `_meta.persist` (§3, §2.8, §3.6). Adds `packages/acp-agents/src/auth/auth-profiles.ts` with one
+  pure-data `AuthProfile` per built-in backend (`claudeAuthProfile`/`codexAuthProfile`/
+  `opencodeAuthProfile`); a custom backend supplies none and runs the type-driven base flow verbatim
+  (conformance-by-absence, §3.5). Each profile only refines client auth capabilities per backend
+  (`clientAuthCapabilities`), relabels descriptors (`describe`, identity for built-ins), and reshapes
+  the gateway payload (`buildMeta`, identity) — it never gates the flow (Principle 1). `codexAuthProfile`
+  additionally carries the `spawnAuthEnv` lever that emits `DEFAULT_AUTH_REQUEST` for `api-key`/`gateway`
+  intents, layered on top of the universal post-`initialize` replay (never required for correctness,
+  §2.8/§3.3). The runner consults `profile.describe`/`buildMeta` and the connection refines
+  `clientCapabilities.auth` through `profile.clientAuthCapabilities`; default-OFF stays byte-identical.
+
+  Widens the permission outcome with an optional Codex tool-approval persistence directive: new
+  `resolvePermission`/`withPersist` helpers and `PermissionResolution`/`PermissionPersist` types, plus
+  `ToolPolicy.persist`, echo `_meta.persist` on the `RequestPermission` response (agents without the
+  capability ignore it, Principle 3). Lands the full §3.6 `_meta` support matrix as executable
+  drift-tripwire data (`AUTH_META_MATRIX`, `HANDLED_AUTH_METHOD_TYPES`, `AUTH_META_CONVENTION_KEYS`,
+  `CODEX_SPAWN_AUTH_ENV`, `ACP_AUTH_REQUIRED_CODE_EXCLUSIVE`) with compile-time `AuthMethod`-union pins,
+  installed-dist probes, and a spec-§3.6 lockstep assertion, so an SDK/agent bump that moves a `_meta`
+  surface fails the build. Adds the env-gated `auth.live.e2e.test.ts` covering claude, codex, and
+  opencode with equal structural depth.
+
+### Patch Changes
+
+- Updated dependencies [b70293b]
+- Updated dependencies [fecf517]
+  - @automatalabs/shared-types@0.14.0
+
 ## 0.21.2
 
 ### Patch Changes
