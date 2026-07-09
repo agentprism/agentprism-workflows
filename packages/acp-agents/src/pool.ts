@@ -34,6 +34,9 @@ export interface AcpPoolDeps {
   permissionResolver?: PermissionResolver;
   elicitationResolver?: ElicitationResolver;
   advertiseElicitation?: boolean;
+  /** Initialize-time client auth advertisement (§1.2), forwarded to every PooledConnection.
+   *  Undefined omits the `auth` capability — the default-OFF baseline. */
+  authCapabilities?: { terminal?: boolean; gateway?: boolean };
 }
 
 /** Resolve the per-backend pool size: explicit option wins, else env, else 1. Clamped to >= 1. */
@@ -125,6 +128,7 @@ export class AcpAgentPool {
         permissionResolver: this.deps.permissionResolver,
         elicitationResolver: this.deps.elicitationResolver,
         advertiseElicitation: this.deps.advertiseElicitation,
+        authCapabilities: this.deps.authCapabilities,
         clientHandlers: this.clientHandlers,
       });
       connections.push(connection);

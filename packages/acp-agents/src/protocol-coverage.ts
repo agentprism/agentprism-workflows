@@ -1,4 +1,5 @@
 import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
+import type { AuthCapabilities, ClientCapabilities } from "@agentclientprotocol/sdk";
 
 type ValueOf<T> = T[keyof T];
 type ClientMethod = ValueOf<typeof CLIENT_METHODS>;
@@ -60,3 +61,43 @@ export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.document_did_save]: "passthrough",
   [AGENT_METHODS.document_did_focus]: "passthrough",
 };
+
+// ---------------------------------------------------------------------------------------------
+// Auth advertisement drift tripwire (§1.2 / §4.6.4). The client auth advertisement rides on the
+// SDK's UNSTABLE `@experimental` `ClientCapabilities.auth` (`AuthCapabilities`) surface. Pin it two
+// ways so a `@agentclientprotocol/sdk` bump that renames, removes, or reshapes it fails the build
+// BEFORE release (honoring the bump-ACP-deps-every-release policy), never silently:
+//   1. compile-time type-existence assertions (this pin fails `tsc`);
+//   2. a runtime shape assertion exercised by the coverage test.
+// ---------------------------------------------------------------------------------------------
+
+/** Compile-time assertion primitive: `Expect<T>` only accepts `true`, so a `false` (drifted) SDK
+ *  shape is a type error at build time. */
+type Expect<T extends true> = T;
+
+/** `ClientCapabilities.auth` still exists and is typed as `AuthCapabilities` (§1.2 UNSTABLE pin). */
+export type _AuthKeyExists = Expect<"auth" extends keyof ClientCapabilities ? true : false>;
+/** `AuthCapabilities.terminal` is still the typed boolean gate §1.2 assigns to (no `as` cast). */
+export type _AuthTerminalIsBoolean = Expect<
+  AuthCapabilities["terminal"] extends boolean | undefined ? true : false
+>;
+
+/** The exact property set SDK 1.2.1 types on `AuthCapabilities` (§1.2). The runtime tripwire below
+ *  asserts `clientCapabilitiesFor({ auth })` emits ONLY these keys, so a bump that widens/renames
+ *  the shape trips the coverage suite. */
+export const AUTH_CAPABILITY_KEYS: readonly string[] = ["terminal", "_meta"];
+
+/** Runtime drift assertion (§4.6.4 item 1): every key on the advertised `ClientCapabilities.auth`
+ *  block is a pinned SDK-1.2.1 `AuthCapabilities` key. Throws on drift, tripping the build. A
+ *  `null`/absent `auth` (the default-OFF baseline) is vacuously conformant. Reads only structural
+ *  keys — never any advertised value — so it is secret-free. */
+export function assertAuthCapabilityShape(auth: ClientCapabilities["auth"]): void {
+  if (auth == null) return;
+  for (const key of Object.keys(auth)) {
+    if (!AUTH_CAPABILITY_KEYS.includes(key)) {
+      throw new Error(
+        `ClientCapabilities.auth carries unpinned key "${key}" — the SDK AuthCapabilities shape drifted (§1.2/§4.6.4).`,
+      );
+    }
+  }
+}

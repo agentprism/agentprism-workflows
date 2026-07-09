@@ -98,7 +98,12 @@ export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./
 export { PooledConnection, SessionHandle } from "./acp-client.js";
 export type { AcpSessionOptions, PooledConnectionDeps } from "./acp-client.js";
 
-export { AGENT_METHOD_COVERAGE, CLIENT_METHOD_COVERAGE } from "./protocol-coverage.js";
+export {
+  AGENT_METHOD_COVERAGE,
+  AUTH_CAPABILITY_KEYS,
+  CLIENT_METHOD_COVERAGE,
+  assertAuthCapabilityShape,
+} from "./protocol-coverage.js";
 export type { AgentMethodCoverage, ClientMethodCoverage } from "./protocol-coverage.js";
 
 // ACP capability negotiation: parse/validate the initialize response and gate what the client
