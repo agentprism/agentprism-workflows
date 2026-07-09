@@ -8,9 +8,12 @@
 // (~/.agentprism/workflows/projects/<key>/runs) writes into a throwaway temp dir.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Redirect run-state persistence into a disposable home BEFORE any WorkflowManager is
 // constructed (runDynamicWorkflow builds one per call, deriving the runs dir from $HOME
@@ -33,6 +36,9 @@ import {
   runWorkflow,
   runDynamicWorkflow,
   WorkflowError,
+  WorkflowErrorCode,
+  isAuthRequired,
+  isProviderUsageLimit,
   TypedEventEmitter,
   toJsonSchema,
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
@@ -47,6 +53,19 @@ import type {
   RunOptions,
   RunPersistenceOptions,
   WorkflowPathOptions,
+  // §4.2 type re-exports — the runner-facing auth surface the SDK facade re-exports.
+  // Imported here as a compile-gate: PR6's value export must resolve alongside these
+  // (which landed with PR5), and a broken facade re-export chain would fail to type-check.
+  AuthResolver,
+  AuthContext,
+  AuthResolution,
+  AuthMethodDescriptor,
+  CompleteAuthOptions,
+  AuthOutcome,
+  AuthController,
+  AuthStatusSnapshot,
+  AuthCapableRunner,
+  AuthErrorContext,
 } from "../src/index.js";
 
 /**
@@ -122,10 +141,10 @@ function eventedAgent(runner: EventedRunner): AgentRunner {
   return runner as unknown as AgentRunner;
 }
 
-function deferred<T = void>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = () => r();
   });
   return { promise, resolve };
 }
@@ -161,6 +180,85 @@ test("facade re-exports the public surface", () => {
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
   const runPersistenceOptions: RunPersistenceOptions = pathOptions;
   assert.equal(runPersistenceOptions.persistenceRoot, pathOptions.persistenceRoot);
+});
+
+// §4.2 SDK exports (PR6). The facade re-exports the `isAuthRequired` VALUE through the
+// @automatalabs/workflow-engine chain (threaded in PR1) so a host can classify an
+// AUTH_REQUIRED fault with the same one-liner it uses for isProviderUsageLimit — no new
+// behavior, just surface. The §4.2 TYPE re-exports (AuthResolver, AuthContext, …) landed
+// with PR5; they are compile-gated below so a broken facade chain fails type-checking.
+test("facade re-exports isAuthRequired as a value alongside isProviderUsageLimit (§4.2)", () => {
+  assert.equal(typeof isAuthRequired, "function");
+  assert.equal(typeof isProviderUsageLimit, "function");
+
+  // True ONLY for an AUTH_REQUIRED WorkflowError, and it narrows to WorkflowError so the
+  // caller can read `.authContext` (the non-secret structured surface) after the guard.
+  const authErr: unknown = new WorkflowError("authentication required", WorkflowErrorCode.AUTH_REQUIRED, {
+    authContext: { backendId: "claude", methods: [{ id: "gateway", type: "agent", name: "Gateway" }] },
+  });
+  assert.equal(isAuthRequired(authErr), true);
+  if (isAuthRequired(authErr)) {
+    assert.equal(authErr.code, WorkflowErrorCode.AUTH_REQUIRED);
+    assert.equal(authErr.authContext?.backendId, "claude");
+  } else {
+    assert.fail("isAuthRequired should narrow the AUTH_REQUIRED WorkflowError");
+  }
+
+  // A different WorkflowErrorCode must NOT classify as auth (and must not collide with the
+  // sibling usage-limit guard) — the two helpers partition disjoint faults.
+  const usageErr = new WorkflowError("usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(isAuthRequired(usageErr), false);
+  assert.equal(isProviderUsageLimit(usageErr), true);
+  assert.equal(isProviderUsageLimit(authErr), false);
+
+  // Non-WorkflowError values never classify.
+  assert.equal(isAuthRequired(new Error("authentication required")), false);
+  assert.equal(isAuthRequired({ code: WorkflowErrorCode.AUTH_REQUIRED }), false);
+  assert.equal(isAuthRequired(undefined), false);
+  assert.equal(isAuthRequired(null), false);
+});
+
+// Compile-gate for the §4.2 runner-facing auth TYPE re-exports (surfaced through the facade
+// with PR5). If any re-export were dropped or renamed, referencing it here fails `tsc` — and
+// the spawned "tsc type-checks this suite" test below is what makes that bite: the build
+// tsconfig is src-only and tsx strips types, so without it a broken re-export would still
+// pass the suite. The runtime assertions here are trivially true — the value is the type
+// wiring compiling at all.
+test("facade re-exports the §4.2 runner-facing auth types", () => {
+  const descriptor: AuthMethodDescriptor = {
+    type: "env_var",
+    id: "openai",
+    name: "OpenAI",
+    vars: [{ name: "OPENAI_API_KEY", secret: true, optional: false }],
+  };
+  const resolution: AuthResolution = { outcome: "env", values: { OPENAI_API_KEY: "sk-x" }, methodId: "openai" };
+  const context: AuthContext = { backendId: "claude", methods: [descriptor], cause: "proactive" };
+  const completeOpts: CompleteAuthOptions = { methodId: "openai", resolution };
+  const outcome: AuthOutcome = { status: "authenticated", methodId: "openai", recycled: false };
+  const errorContext: AuthErrorContext = { methods: [{ id: "openai", type: "env_var" }] };
+  const snapshot: AuthStatusSnapshot = {
+    backendId: "claude",
+    poolKey: "claude",
+    state: "unauthenticated",
+    authenticated: false,
+    canResume: false,
+    methods: [{ id: "openai", type: "env_var", name: "OpenAI" }],
+  };
+  // Function/interface typedefs referenced purely as compile-gates through the facade barrel.
+  const resolver: AuthResolver = async () => resolution;
+  const controller: AuthController | undefined = undefined;
+  const capable: AuthCapableRunner | undefined = undefined;
+
+  assert.equal(descriptor.type, "env_var");
+  assert.equal(resolution.outcome, "env");
+  assert.equal(context.cause, "proactive");
+  assert.equal(completeOpts.methodId, "openai");
+  assert.equal(outcome.status, "authenticated");
+  assert.equal(errorContext.methods[0]?.type, "env_var");
+  assert.equal(snapshot.state, "unauthenticated");
+  assert.equal(typeof resolver, "function");
+  assert.equal(controller, undefined);
+  assert.equal(capable, undefined);
 });
 
 test("createAcpRunner exposes a typed ACP event bus (on/once/off/listenerCount) via the barrel", async () => {
@@ -390,4 +488,19 @@ test("WorkflowManager isolates throwing agentEvent listeners from sibling observ
     runner.emit("session_open", { sessionId: "session-throw", backendId: "claude", label: "l", runId: "r" });
   });
   assert.deepEqual(seen, ["session_open"]);
+});
+
+// The gate behind every compile-gate above: actually type-check this suite. The build
+// tsconfig.json is src-only and tsx never type-checks, so this spawned `tsc -p
+// tsconfig.test.json` is the ONLY thing that makes a dropped/renamed facade re-export fail
+// `pnpm test` (locally and in CI's `pnpm -r test`).
+test("tsc type-checks the test suite (tsconfig.test.json) so the facade compile-gates are real", () => {
+  const require = createRequire(import.meta.url);
+  const tsc = require.resolve("typescript/lib/tsc.js");
+  const pkgDir = fileURLToPath(new URL("..", import.meta.url));
+  const result = spawnSync(process.execPath, [tsc, "-p", join(pkgDir, "tsconfig.test.json"), "--noEmit"], {
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  assert.equal(result.status, 0, `tsc found type errors:\n${result.stdout}${result.stderr}`);
 });
