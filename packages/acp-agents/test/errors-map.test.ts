@@ -43,6 +43,73 @@ test("ACP auth-required RequestError => AUTH_REQUIRED, non-recoverable, with bac
   assert.match(mapped.message, /login first/);
 });
 
+test("-32000 with ANY message classifies as AUTH_REQUIRED (localized/rephrased text still auth)", () => {
+  // The SDK reserves -32000 exclusively for authRequired, so the code alone is authoritative —
+  // a conformant agent that localizes or rephrases the message must still route to pause-for-auth.
+  for (const message of [
+    "Authentication required: login first", // canonical English
+    "Authentifizierung erforderlich", // German — no English phrase at all
+    "认证是必需的", // Chinese
+    "please sign in to continue", // rephrased English, no "authentication required"
+    "", // empty message
+  ]) {
+    const mapped = mapThrownError({ code: ACP_AUTH_REQUIRED_ERROR_CODE, message });
+    assert.equal(mapped.code, WorkflowErrorCode.AUTH_REQUIRED, `-32000 + ${JSON.stringify(message)}`);
+    assert.equal(mapped.recoverable, false);
+  }
+});
+
+test("a NON-reserved code carrying the 'authentication required' phrase classifies as AUTH_REQUIRED", () => {
+  // Fallback path: a non-conformant agent that signals auth in prose without the reserved code.
+  const mapped = mapThrownError({ code: -31999, message: "Authentication required to proceed" });
+  assert.equal(mapped.code, WorkflowErrorCode.AUTH_REQUIRED);
+  assert.equal(mapped.recoverable, false);
+  // No `code` at all (plain Error) but the phrase present => still auth via the string fallback.
+  assert.equal(mapThrownError(new Error("authentication required")).code, WorkflowErrorCode.AUTH_REQUIRED);
+});
+
+test("a DIFFERENT reserved code that merely MENTIONS the auth phrase never mis-routes to auth", () => {
+  // -32603 (internal error) + the phrase must stay a recoverable AGENT_EXECUTION_ERROR, not auth.
+  const internal = mapThrownError({ code: -32603, message: "Internal error: authentication required upstream" });
+  assert.equal(internal.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  assert.equal(internal.recoverable, true);
+  // Every other reserved non-auth code is likewise immune to the phrase.
+  for (const code of [-32700, -32600, -32601, -32602, -32800, -32002]) {
+    const mapped = mapThrownError({ code, message: "authentication required" });
+    assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR, `reserved ${code} must not classify as auth`);
+  }
+});
+
+test("AUTH_REQUIRED authContext carries advertised method ids/types/names + backendId only", () => {
+  const mapped = mapThrownError(RequestError.authRequired(undefined, "login first"), {
+    label: "auth-agent",
+    backendId: "codex",
+    authMethods: [
+      { type: "env_var", id: "api-key", name: "API Key", vars: [] },
+      { id: "chat-gpt", name: "ChatGPT" }, // no `type` => defaults to "agent"
+      { type: "terminal", id: "claude-login", name: "Terminal Login" },
+    ],
+  });
+  assert.equal(mapped.code, WorkflowErrorCode.AUTH_REQUIRED);
+  assert.deepEqual(mapped.authContext, {
+    backendId: "codex",
+    methods: [
+      { id: "api-key", type: "env_var", name: "API Key" },
+      { id: "chat-gpt", type: "agent", name: "ChatGPT" },
+      { id: "claude-login", type: "terminal", name: "Terminal Login" },
+    ],
+  });
+  // No secret/_meta/env material leaks into the structured context (Principle 9).
+  assert.equal(JSON.stringify(mapped.authContext).includes("_meta"), false);
+});
+
+test("AUTH_REQUIRED with no advertised methods yields an empty methods array (backendId still carried)", () => {
+  const mapped = mapThrownError({ code: ACP_AUTH_REQUIRED_ERROR_CODE, message: "Authentication required" }, {
+    backendId: "custom",
+  });
+  assert.deepEqual(mapped.authContext, { backendId: "custom", methods: [] });
+});
+
 test("various provider-wall phrasings all classify as PROVIDER_USAGE_LIMIT", () => {
   for (const msg of [
     "429 Too Many Requests",

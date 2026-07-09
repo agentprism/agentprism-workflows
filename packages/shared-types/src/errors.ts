@@ -21,7 +21,10 @@ export enum WorkflowErrorCode {
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
   /** Provider subscription/usage/quota/rate limit. Non-recoverable => engine PAUSES (resumable), not failed. Carries resetHint. */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
-  /** The agent requires authentication. Non-recoverable: retrying cannot succeed until the host completes an auth flow via `runner.authenticate()`; the error message should name the advertised auth methods when known. */
+  /** The agent requires authentication. Non-recoverable: retrying cannot succeed until the host
+   *  completes an auth flow. The machine-readable surface is `WorkflowError.authContext`
+   *  (`AuthErrorContext`: advertised method ids/types/names + backendId) — hosts read that, never
+   *  the human message. The enriched `.message` is retained for readability only. */
   AUTH_REQUIRED = "AUTH_REQUIRED",
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** The workflow SCRIPT crashed at runtime: an uncaught throw or an unhandled promise
@@ -38,12 +41,26 @@ export enum WorkflowErrorCode {
   UNKNOWN = "UNKNOWN",
 }
 
+/**
+ * The machine-readable auth surface carried on an `AUTH_REQUIRED` `WorkflowError`. Sources ONLY
+ * agent-advertised `AuthMethod` fields (ids/types/names) and the backend id — never our sent
+ * `_meta`, env values, or any credential material (Principle 9). Every downstream host (engine
+ * pause path, MCP `auth_required` summary, SDK `isAuthRequired` helper) reads this structurally
+ * rather than parsing the enriched human message.
+ */
+export type AuthErrorContext = {
+  backendId?: string;
+  methods: { id: string; type: "agent" | "terminal" | "env_var"; name?: string }[];
+};
+
 export interface WorkflowErrorOptions {
   recoverable?: boolean;
   agentLabel?: string;
   details?: unknown;
   /** For PROVIDER_USAGE_LIMIT: the provider's human reset hint, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
+  /** For AUTH_REQUIRED: the structured, non-secret auth surface (advertised method ids/types/names). */
+  authContext?: AuthErrorContext;
 }
 
 export class WorkflowError extends Error {
@@ -52,6 +69,7 @@ export class WorkflowError extends Error {
   readonly agentLabel?: string;
   readonly details?: unknown;
   readonly resetHint?: string;
+  readonly authContext?: AuthErrorContext;
 
   constructor(message: string, code: WorkflowErrorCode, options: WorkflowErrorOptions = {}) {
     super(message);
@@ -61,6 +79,7 @@ export class WorkflowError extends Error {
     this.agentLabel = options.agentLabel;
     this.details = options.details;
     this.resetHint = options.resetHint;
+    this.authContext = options.authContext;
   }
 }
 
@@ -70,6 +89,10 @@ export function isWorkflowError(error: unknown): error is WorkflowError {
 
 export function isProviderUsageLimit(error: unknown): error is WorkflowError {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+}
+
+export function isAuthRequired(error: unknown): error is WorkflowError {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.AUTH_REQUIRED;
 }
 
 /**
