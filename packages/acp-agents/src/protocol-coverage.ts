@@ -1,5 +1,12 @@
 import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
-import type { AuthCapabilities, ClientCapabilities } from "@agentclientprotocol/sdk";
+import type {
+  AuthCapabilities,
+  AuthMethod,
+  AuthMethodAgent,
+  AuthMethodEnvVar,
+  AuthMethodTerminal,
+  ClientCapabilities,
+} from "@agentclientprotocol/sdk";
 
 type ValueOf<T> = T[keyof T];
 type ClientMethod = ValueOf<typeof CLIENT_METHODS>;
@@ -101,3 +108,81 @@ export function assertAuthCapabilityShape(auth: ClientCapabilities["auth"]): voi
     }
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Auth `AuthMethod.type` discriminant + cross-agent `_meta` convention drift tripwires
+// (§3.6 / §4.6.4 items 3–5). The base auth flow (§1) dispatches on `AuthMethod.type` plus a small,
+// fixed set of literal cross-agent `_meta` key names — NOT SDK schema fields. Pin both so a
+// `@agentclientprotocol/sdk` bump that widens the method union, or an agent bump that moves a `_meta`
+// surface, fails the build BEFORE release (bump-ACP-deps-every-release), never silently.
+// ---------------------------------------------------------------------------------------------
+
+/** The three `AuthMethod` variants the base dispatcher handles (`agent`/`terminal`/`env_var`, §1.3).
+ *  `agent` is the default when `type` is absent (`AuthMethodAgent` carries no `type`). */
+export const HANDLED_AUTH_METHOD_TYPES: readonly ["agent", "terminal", "env_var"] = ["agent", "terminal", "env_var"];
+
+/** §4.6.4 item 3 — the SDK `AuthMethod` union is EXACTLY the three variants the dispatcher handles;
+ *  a fourth variant (a widened union) makes this `false` and fails `tsc`. */
+export type _AuthMethodUnionPinned = Expect<
+  [AuthMethod] extends [AuthMethodAgent | AuthMethodTerminal | AuthMethodEnvVar] ? true : false
+>;
+/** The `terminal`/`env_var` discriminants are still the literals the dispatcher branches on: the SDK
+ *  intersects the bare method type with `{ type: "…" }` in the `AuthMethod` union, so a dropped
+ *  discriminant makes `Extract` collapse to `never` and fails `tsc`. */
+export type _AuthMethodTerminalDiscriminant = Expect<
+  [Extract<AuthMethod, { type: "terminal" }>] extends [never] ? false : true
+>;
+export type _AuthMethodEnvVarDiscriminant = Expect<
+  [Extract<AuthMethod, { type: "env_var" }>] extends [never] ? false : true
+>;
+
+/** The cross-agent `_meta` key conventions the base layer keys on (§1 intro; recognized by literal
+ *  name, NOT SDK schema fields). `gateway` ⇒ in-process classification; `terminal-auth` ⇒ terminal
+ *  launch hint; `api-key` ⇒ codex's disk api-key `_meta`. */
+export const AUTH_META_CONVENTION_KEYS = {
+  gateway: "gateway",
+  terminalAuth: "terminal-auth",
+  apiKey: "api-key",
+} as const;
+
+/** The codex startup pre-auth env channel delivered by `codexAuthProfile.spawnAuthEnv` (§2.8/§3.3). */
+export const CODEX_SPAWN_AUTH_ENV = "DEFAULT_AUTH_REQUEST" as const;
+
+/** JSON-RPC `-32000` is reserved EXCLUSIVELY for `authRequired` (SDK `jsonrpc.js:818-823`) — the
+ *  guarantee the code-only §1.5 matcher relies on (§4.6.4 item 5). */
+export const ACP_AUTH_REQUIRED_CODE_EXCLUSIVE = -32000 as const;
+
+/** One row of the §3.6 full `_meta` support matrix, landed as executable data (not prose) so an
+ *  SDK/agent bump that changes a `_meta` surface trips the drift suite (§4.6.4 item 4). */
+export interface AuthMetaMatrixRow {
+  readonly agent: "claude" | "codex" | "opencode" | "all";
+  /** A stable literal that MUST still be present in the cited artifact/spec — the drift anchor. */
+  readonly capability: string;
+  /** Wire direction: A→C agent→client, C→A client→agent, C↔A both, — none, agent-internal. */
+  readonly direction: "A→C" | "C→A" | "C↔A" | "—" | "agent-internal";
+  readonly status: "supported-today" | "work-item";
+  /** Owning §/PR for a work item; omitted for supported-today rows. */
+  readonly owner?: string;
+  /** When set, the literal is asserted present in this backend's INSTALLED dist (claude/codex only;
+   *  opencode ships a compiled binary with no consumable source — §3.4, grounded by live-e2e). */
+  readonly distProbe?: "claude" | "codex";
+}
+
+/** The §3.6 auth `_meta` matrix as executable rows — the exact surfaces §4.6.4 item 4 enumerates
+ *  (claude gateway/terminal-auth, codex api-key/gateway/DEFAULT_AUTH_REQUEST, opencode terminal-auth),
+ *  plus the codex tool-approval `persist` and the cross-agent provider-env passthrough. Each
+ *  `capability` is a literal that MUST appear in spec §3.6; `docs-drift.test.ts` asserts that lockstep,
+ *  and (where `distProbe` is set) `protocol-coverage.test.ts` asserts the literal is still present in
+ *  the installed agent dist — so neither the spec nor an agent bump can silently drift a `_meta`
+ *  surface. OpenCode ships a compiled binary with no consumable source (§3.4), so its row has no dist
+ *  probe (grounded instead by the §4.6.3 live-e2e). */
+export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = [
+  { agent: "claude", capability: "gateway", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "claude" },
+  { agent: "claude", capability: "terminal-auth", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "claude" },
+  { agent: "codex", capability: "api-key", direction: "A→C", status: "work-item", owner: "§1.3/PR3", distProbe: "codex" },
+  { agent: "codex", capability: "gateway", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "codex" },
+  { agent: "codex", capability: "DEFAULT_AUTH_REQUEST", direction: "C→A", status: "work-item", owner: "§3.3/PR7", distProbe: "codex" },
+  { agent: "codex", capability: "persist", direction: "C→A", status: "work-item", owner: "§3.6/PR7", distProbe: "codex" },
+  { agent: "opencode", capability: "terminal-auth", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3" },
+  { agent: "all", capability: "provider env keys", direction: "C→A", status: "work-item", owner: "§2.8/§3.4/PR3" },
+];

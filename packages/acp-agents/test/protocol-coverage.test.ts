@@ -1,10 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
 import {
+  ACP_AUTH_REQUIRED_CODE_EXCLUSIVE,
   AGENT_METHOD_COVERAGE,
   AUTH_CAPABILITY_KEYS,
+  AUTH_META_CONVENTION_KEYS,
+  AUTH_META_MATRIX,
   CLIENT_METHOD_COVERAGE,
+  CODEX_SPAWN_AUTH_ENV,
+  HANDLED_AUTH_METHOD_TYPES,
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
 } from "../src/index.js";
@@ -65,4 +72,52 @@ test("assertAuthCapabilityShape trips on a drifted (unpinned) auth key", () => {
     () => assertAuthCapabilityShape({ terminal: true, envVar: true } as never),
     /unpinned key "envVar"/,
   );
+});
+
+// §4.6.4 item 3 — the base dispatcher handles exactly the three SDK AuthMethod discriminants.
+test("HANDLED_AUTH_METHOD_TYPES is exactly agent/terminal/env_var", () => {
+  assert.deepEqual([...HANDLED_AUTH_METHOD_TYPES], ["agent", "terminal", "env_var"]);
+});
+
+// §4.6.4 items 4–5 — the cross-agent `_meta` convention surfaces the base layer keys on must still be
+// present in the INSTALLED agent dists (claude/codex; opencode ships a compiled binary, §3.4), so an
+// agent bump that moves a `_meta` surface fails the build BEFORE release, never silently.
+const requireAcp = createRequire(new URL("../package.json", import.meta.url));
+function readDist(spec: string): string {
+  return readFileSync(requireAcp.resolve(spec), "utf8");
+}
+const CLAUDE_DIST = readDist("@agentclientprotocol/claude-agent-acp/dist/acp-agent.js");
+const CODEX_DIST = readDist("@automatalabs/codex-acp");
+
+test("the cross-agent _meta convention keys are pinned and still present in the agent dists", () => {
+  // The literal key names the base layer keys on (§1 intro) — not SDK schema fields.
+  assert.deepEqual(AUTH_META_CONVENTION_KEYS, { gateway: "gateway", terminalAuth: "terminal-auth", apiKey: "api-key" });
+  assert.equal(CODEX_SPAWN_AUTH_ENV, "DEFAULT_AUTH_REQUEST");
+
+  // claude advertises the gateway `_meta` and the terminal-auth launch hint.
+  assert.ok(CLAUDE_DIST.includes(AUTH_META_CONVENTION_KEYS.gateway), "claude dist still emits `gateway`");
+  assert.ok(CLAUDE_DIST.includes(AUTH_META_CONVENTION_KEYS.terminalAuth), "claude dist still emits `terminal-auth`");
+
+  // codex advertises api-key/gateway `_meta` and reads the DEFAULT_AUTH_REQUEST startup channel.
+  assert.ok(CODEX_DIST.includes(AUTH_META_CONVENTION_KEYS.apiKey), "codex dist still emits `api-key`");
+  assert.ok(CODEX_DIST.includes(AUTH_META_CONVENTION_KEYS.gateway), "codex dist still emits `gateway`");
+  assert.ok(CODEX_DIST.includes(CODEX_SPAWN_AUTH_ENV), "codex dist still reads DEFAULT_AUTH_REQUEST");
+});
+
+test("every dist-probed AUTH_META_MATRIX row's capability literal is present in that agent's dist", () => {
+  for (const row of AUTH_META_MATRIX) {
+    if (row.distProbe === "claude") {
+      assert.ok(CLAUDE_DIST.includes(row.capability), `claude dist must still carry "${row.capability}" (§3.6)`);
+    } else if (row.distProbe === "codex") {
+      assert.ok(CODEX_DIST.includes(row.capability), `codex dist must still carry "${row.capability}" (§3.6)`);
+    }
+  }
+  // The matrix covers all four agent buckets and stays non-empty.
+  assert.ok(AUTH_META_MATRIX.length >= 8);
+  assert.ok(AUTH_META_MATRIX.some((r) => r.agent === "opencode"));
+});
+
+// §4.6.4 item 5 — the code-only matcher (§1.5) relies on `-32000` being auth-exclusive.
+test("the pinned auth-required code is the SDK's exclusively-reserved -32000", () => {
+  assert.equal(ACP_AUTH_REQUIRED_CODE_EXCLUSIVE, -32000);
 });

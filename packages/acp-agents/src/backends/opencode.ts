@@ -8,6 +8,7 @@ import type { TSchema } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
 import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
 import { splitArgs } from "../backend.js";
+import { opencodeAuthProfile } from "../auth/auth-profiles.js";
 import { toJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
 
@@ -15,6 +16,8 @@ const require = createRequire(import.meta.url);
 
 export class OpenCodeBackend implements Backend {
   readonly id = "opencode" as const;
+  /** Pure-data opencode auth profile (§3.4): terminal follows the host TTY; no gateway/logout. */
+  readonly authProfile = opencodeAuthProfile;
   readonly stripsRoutingPrefix = true;
   readonly embedSchemaInPrompt = true;
   readonly injectStructuredOutputTool = true;

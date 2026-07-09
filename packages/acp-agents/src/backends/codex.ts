@@ -11,6 +11,7 @@ import type { TSchema } from "typebox";
 import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
 import type { Backend, SessionMetaInputs, SpawnConfig, StructuredSource } from "../backend.js";
 import { splitArgs } from "../backend.js";
+import { codexAuthProfile } from "../auth/auth-profiles.js";
 import { GATED_CUSTOM_META_KEYS } from "../capabilities.js";
 import { toStrictJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
@@ -19,6 +20,9 @@ const require = createRequire(import.meta.url);
 
 export class CodexBackend implements Backend {
   readonly id = "codex" as const;
+  /** Pure-data codex auth profile (§3.3): no terminal, gateway follows `onAuth`, and the
+   *  `DEFAULT_AUTH_REQUEST` spawn-env lever for api-key/gateway intents. */
+  readonly authProfile = codexAuthProfile;
   readonly customCapabilities = {
     namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
     gatedKeys: GATED_CUSTOM_META_KEYS,

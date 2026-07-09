@@ -8,8 +8,7 @@
 // connection's stamp. `intentView()`/`AuthStatusSnapshot` expose only ids/types/klass — never the
 // secret `authenticateMeta`/`envValues` (§2.14, Principle 9).
 import type { AuthMethod } from "@agentclientprotocol/sdk";
-import type { ClientCapabilityOptions } from "../client-handlers.js";
-import type { AuthMethodDescriptor, AuthResolution } from "./auth-types.js";
+import type { AuthProfile } from "./auth-profiles.js";
 import { isGatewayShapedMeta } from "./auth-types.js";
 
 export type AuthMethodType = "agent" | "terminal" | "env_var";
@@ -184,32 +183,6 @@ export class BackendAuthMachine {
         return;
     }
   }
-}
-
-/** The launch descriptor a host runs in a TTY (mirror of the `terminal` descriptor `launch`, §3.1). */
-export interface TerminalLaunch {
-  command: string;
-  args: string[];
-  env?: Record<string, string>;
-  label?: string;
-}
-
-/** Per-agent auth adapter seam (§3.1). Every field is DATA/ENRICHMENT only — none gates the base
- *  flow. A backend with NO profile runs the base flow verbatim (conformance-by-absence). The
- *  concrete built-in profiles and backend wiring are delivered in PR7 (§4.7); PR3 ships this seam
- *  and consults `spawnAuthEnv`/`describe`/`buildMeta` when a profile is present (none is, yet). */
-export interface AuthProfile {
-  readonly backendId: string;
-  clientAuthCapabilities(host: { onAuth: boolean; terminal: boolean }): ClientCapabilityOptions["auth"];
-  describe(method: AuthMethod, base: AuthMethodDescriptor): AuthMethodDescriptor;
-  terminalLaunch?(method: Extract<AuthMethod, { type: "terminal" }>): TerminalLaunch;
-  buildMeta?(
-    method: AuthMethod,
-    resolution: Extract<AuthResolution, { outcome: "meta" }>,
-  ): Record<string, unknown>;
-  /** OPTIONAL spawn-env overlay contributed regardless of `klass` (§2.8, Principle 9). Codex only.
-   *  Secret; consumed inside `spawnEnvFor`, never logged. */
-  spawnAuthEnv?(intent: AuthIntent): Record<string, string> | undefined;
 }
 
 /** The single per-runner auth store. Owns one `BackendAuthMachine` per `poolKey` and records the

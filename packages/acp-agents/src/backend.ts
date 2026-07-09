@@ -8,7 +8,7 @@
 //   3. how to read the native structured result OUT (Claude: structured_output off the raw
 //      _claude/sdkMessage; Codex/OpenCode: JSON.parse the final assistant message off the stream).
 import type { TSchema } from "typebox";
-import type { AuthProfile } from "./auth/auth-store.js";
+import type { AuthProfile } from "./auth/auth-profiles.js";
 
 /** The built-in backends. Custom registry backends extend the id space beyond these. */
 export type BuiltinBackendId = "claude" | "codex" | "opencode";
@@ -65,10 +65,10 @@ export interface Backend {
    *  no custom-capability contract (its custom `_meta`, if any, is never gated). */
   readonly customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
   /** Per-agent auth adapter (§3.1). UNDEFINED for custom backends → the type-driven base auth flow
-   *  runs verbatim (conformance-by-absence, §1.4). The seam ships in PR3; the concrete built-in
-   *  profiles and their wiring are delivered in PR7 (§4.7), so every backend leaves this undefined
-   *  until then. The lifecycle spine (§2) reads it when computing `spawnEnvFor` and when the runner
-   *  derives client auth capabilities. */
+   *  runs verbatim (conformance-by-absence, §1.4). The three built-in backends wire their pure-data
+   *  profile (§3.2–§3.4); the lifecycle spine (§2) reads it when computing `spawnEnvFor` (§2.8), the
+   *  runner consults `profile.describe`/`buildMeta` (§1.3/§2.9), and the connection refines client
+   *  auth capabilities through `profile.clientAuthCapabilities` (§1.2). */
   readonly authProfile?: AuthProfile;
   /** How to launch this backend's ACP server over stdio. */
   spawnConfig(): SpawnConfig;

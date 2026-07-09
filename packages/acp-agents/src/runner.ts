@@ -67,7 +67,7 @@ import {
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
 import {
-  buildAuthDescriptors,
+  buildAuthDescriptor,
   type AuthContext,
   type AuthMethodDescriptor,
   type AuthResolution,
@@ -437,9 +437,10 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
     return;
   }
 
-  /** Proactively enumerate the selected backend's advertised methods, already type-dispatched (§1.3).
-   *  A read-only probe: opens a dedicated connection, reads the initialize-advertised methods, runs
-   *  `buildAuthDescriptors`, and disposes. */
+  /** Proactively enumerate the selected backend's advertised methods, already type-dispatched (§1.3)
+   *  and label-enriched by the backend's `AuthProfile.describe` (§3.1, identity for a profile-less
+   *  custom backend). A read-only probe: opens a dedicated connection, reads the initialize-advertised
+   *  methods, runs the base dispatcher through the profile seam, and disposes. */
   async describeAuthMethods(opts: AuthMethodsOptions = {}): Promise<AuthMethodDescriptor[]> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     const backend = selectBackend(opts, this.backends);
@@ -948,7 +949,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
     const connection = this.createDedicatedConnection(backend, () => undefined);
     try {
       const methods = await connection.authMethods();
-      return { methods, descriptors: buildAuthDescriptors(methods, backend.spawnConfig()) };
+      return { methods, descriptors: describeMethods(methods, backend) };
     } finally {
       await disposeBestEffort(connection);
     }
@@ -1004,7 +1005,16 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
 
     // meta / env / completed: derive klass from the chosen advertised method (§2.1), never the outcome.
     const { klass, diskBacked } = classifyCredential(methodType, advertisedMeta);
-    const authenticateMeta = resolution.outcome === "meta" ? resolution.meta : undefined;
+    // A `meta` payload passes through the backend's pure-data `AuthProfile.buildMeta` (§3.1) so the
+    // agent's expected authenticate `_meta` shape is honored; a custom backend (no profile), or one
+    // whose advertised method could not be matched, records the host-supplied `meta` verbatim
+    // (conformance-by-absence). buildMeta is SECRET-preserving — it only reshapes the payload, never
+    // logs it (§2.14/Principle 9).
+    let authenticateMeta: Record<string, unknown> | undefined;
+    if (resolution.outcome === "meta") {
+      const buildMeta = backend.authProfile?.buildMeta;
+      authenticateMeta = buildMeta && chosen ? buildMeta(chosen, resolution) : resolution.meta;
+    }
     const envValues = resolution.outcome === "env" ? resolution.values : undefined;
     const intent: AuthIntent = {
       backendId: backend.id,
@@ -1319,6 +1329,19 @@ function isAuthRequiredError(error: unknown): boolean {
 }
 
 /** The SDK types a missing `type` discriminant as `agent`. */
+/** Dispatch each advertised method through the base §1.3 dispatcher, then hand the result to the
+ *  backend's pure-data `AuthProfile.describe` (§3.1) for label enrichment. A custom backend has NO
+ *  profile, so the base descriptor is returned verbatim (conformance-by-absence, §3.5). The profile
+ *  may only relabel; it never changes the `type` discriminant the base dispatcher chose (§3.1). */
+function describeMethods(methods: readonly AuthMethod[], backend: Backend): AuthMethodDescriptor[] {
+  const spawn = backend.spawnConfig();
+  const profile = backend.authProfile;
+  return methods.map((method) => {
+    const base = buildAuthDescriptor(method, spawn);
+    return profile ? profile.describe(method, base) : base;
+  });
+}
+
 function authMethodType(method: AuthMethod): AuthMethodType {
   return (("type" in method ? method.type : undefined) ?? "agent") as AuthMethodType;
 }

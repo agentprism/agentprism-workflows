@@ -36,13 +36,15 @@ export type {
   AuthEvent,
   AuthIntent,
   AuthMethodType,
-  AuthProfile,
   BackendAuthState,
   ConnectionAuthStamp,
   CredentialClass,
   RedactedIntent,
-  TerminalLaunch,
 } from "./auth/auth-store.js";
+// Per-agent auth profiles (§3): the pure-data adapters wired onto the built-in backends. Custom
+// backends supply none (conformance-by-absence, §3.5).
+export { claudeAuthProfile, codexAuthProfile, opencodeAuthProfile } from "./auth/auth-profiles.js";
+export type { AuthProfile, TerminalLaunch } from "./auth/auth-profiles.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
@@ -126,11 +128,16 @@ export type { AcpSessionOptions, PooledConnectionDeps } from "./acp-client.js";
 
 export {
   AGENT_METHOD_COVERAGE,
+  ACP_AUTH_REQUIRED_CODE_EXCLUSIVE,
   AUTH_CAPABILITY_KEYS,
+  AUTH_META_CONVENTION_KEYS,
+  AUTH_META_MATRIX,
   CLIENT_METHOD_COVERAGE,
+  CODEX_SPAWN_AUTH_ENV,
+  HANDLED_AUTH_METHOD_TYPES,
   assertAuthCapabilityShape,
 } from "./protocol-coverage.js";
-export type { AgentMethodCoverage, ClientMethodCoverage } from "./protocol-coverage.js";
+export type { AgentMethodCoverage, AuthMetaMatrixRow, ClientMethodCoverage } from "./protocol-coverage.js";
 
 // ACP capability negotiation: parse/validate the initialize response and gate what the client
 // sends (custom `_meta` keys, MCP transports) on what the connected agent advertised.
@@ -190,8 +197,14 @@ export { CodexBackend } from "./backends/codex.js";
 export { OpenCodeBackend } from "./backends/opencode.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
-export { decidePermission } from "./permissions.js";
-export type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
+export { decidePermission, resolvePermission, withPersist } from "./permissions.js";
+export type {
+  ElicitationResolver,
+  PermissionPersist,
+  PermissionResolution,
+  PermissionResolver,
+  ToolPolicy,
+} from "./permissions.js";
 
 export { UsageAccumulator } from "./usage.js";
 

@@ -54,6 +54,22 @@ export type ElicitationResolver = (
   context: AcpEventContext,
 ) => Promise<CreateElicitationResponse> | CreateElicitationResponse;
 
+/** Codex tool-approval persistence directive (codex-acp `dist/index.js:23952-23975`, §3.6). A
+ *  permission decision may ask the agent to REMEMBER the approval for the rest of the session
+ *  ("session") or permanently ("always"). It is echoed as `_meta.persist` on the RequestPermission
+ *  response; an agent WITHOUT the capability ignores the extra `_meta` (Principle 3 — no silent
+ *  unsupported surface). */
+export type PermissionPersist = "session" | "always";
+
+/** High-level permission decision (§3.6). Mirrors the spec's `PermissionResolution`: a host says
+ *  allow/deny and, on allow, MAY request persistence. `resolvePermission` maps it onto a concrete ACP
+ *  `RequestPermissionResponse` (option selection + the `_meta.persist` echo), so a host can drive
+ *  `onPermissionRequest` at this altitude instead of hand-building the SDK response. */
+export interface PermissionResolution {
+  outcome: "allow" | "deny";
+  persist?: PermissionPersist;
+}
+
 export interface ToolPolicy {
   /** Allow-list (agentType `tools`). When non-empty, a tool that matches NOTHING is denied. */
   allow?: string[];
@@ -63,6 +79,10 @@ export interface ToolPolicy {
    *  behavior. Explicit ACP session modes set this to "deny" unless a permission resolver is
    *  present, otherwise read-only/plan confinement can be bypassed by auto-approved escalations. */
   defaultOutcome?: "allow" | "deny";
+  /** Codex tool-approval persistence (§3.6): when the auto-responder ALLOWS a tool, echo this as
+   *  `_meta.persist` on the response so a capable agent remembers the approval. Ignored on deny and by
+   *  agents without the capability. */
+  persist?: PermissionPersist;
 }
 
 const ALLOW_KIND_ORDER: PermissionOptionKind[] = ["allow_once", "allow_always"];
@@ -109,7 +129,35 @@ export function decidePermission(
     // remaining way to refuse a tool the server offers no reject option for.
     return { outcome: { outcome: "cancelled" } };
   }
-  return { outcome: { outcome: "selected", optionId: option.optionId } };
+  const response: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: option.optionId } };
+  // Echo the persistence directive (§3.6) only when the auto-responder ALLOWS; a denial persists nothing.
+  return wantAllow ? withPersist(response, policy.persist) : response;
+}
+
+/** Stamp a persistence directive onto a permission response's top-level `_meta.persist` (§3.6). A
+ *  cancelled response, or an absent directive, is returned unchanged. Never mutates the input; a
+ *  non-secret structural echo, so it is safe to emit in events. */
+export function withPersist(
+  response: RequestPermissionResponse,
+  persist: PermissionPersist | undefined,
+): RequestPermissionResponse {
+  if (!persist || response.outcome.outcome !== "selected") return response;
+  return { ...response, _meta: { ...(response._meta ?? {}), persist } };
+}
+
+/** Map a high-level `PermissionResolution` (§3.6) onto a concrete ACP `RequestPermissionResponse` for
+ *  `request`: pick an allow/reject option of the requested polarity and, on allow, echo `_meta.persist`.
+ *  Falls back to CANCELLING when the agent offers no option of the requested polarity (the only way to
+ *  refuse a tool with no reject option) — identical to the auto-responder's contract. */
+export function resolvePermission(
+  request: RequestPermissionRequest,
+  resolution: PermissionResolution,
+): RequestPermissionResponse {
+  const wantAllow = resolution.outcome === "allow";
+  const option = pickOption(request.options, wantAllow);
+  if (!option) return { outcome: { outcome: "cancelled" } };
+  const response: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: option.optionId } };
+  return wantAllow ? withPersist(response, resolution.persist) : response;
 }
 
 interface CandidateNames {
