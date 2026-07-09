@@ -1,13 +1,20 @@
-# Token-less release via npm OIDC trusted publishing + Changesets.
+# Token-less release via npm OIDC trusted publishing + Changesets — fully
+# hands-off: merging a changeset-bearing PR to main IS the release.
 #
 # On push to main, changesets/action either opens/updates a "Version Packages"
 # PR (while changesets are pending) or — once that PR is merged — publishes the
-# bumped packages. Publishing uses OIDC (id-token + NPM_CONFIG_PROVENANCE, no
-# npm token), which requires a trusted publisher configured on npmjs.com for
-# each @automatalabs package pointing at this repo + this workflow file
-# (.github/workflows/release.yml). With no pending changesets and all versions
-# already on the registry, the run is a safe no-op. workflow_dispatch is kept
-# for manual runs.
+# bumped packages. The Version PR is mechanical (bumps + changelogs derived
+# from already-reviewed changesets), so the final step below merges it
+# immediately and chain-dispatches this workflow to run the publish leg; no
+# human touches anything after the feature PR merges. Publishing uses OIDC
+# (id-token + NPM_CONFIG_PROVENANCE, no npm token), which requires a trusted
+# publisher configured on npmjs.com for each @automatalabs package pointing at
+# this repo + this workflow file (.github/workflows/release.yml). With no
+# pending changesets and all versions already on the registry, the run is a
+# safe no-op. workflow_dispatch is kept for manual runs (and is how the
+# auto-merge step re-enters: a merge performed with GITHUB_TOKEN does not
+# trigger push workflows — the Actions recursion guard — but workflow_dispatch
+# is the documented exception).
 
 name: Release
 
@@ -16,12 +23,14 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# Required for the Changesets release PR (contents + pull-requests) and for
-# npm provenance via OIDC trusted publishing (id-token).
+# Required for the Changesets release PR (contents + pull-requests), for npm
+# provenance via OIDC trusted publishing (id-token), and for the auto-merge
+# step's chain-dispatch of this workflow (actions).
 permissions:
   contents: write
   pull-requests: write
   id-token: write
+  actions: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -76,6 +85,7 @@ jobs:
       # NPM_CONFIG_PROVENANCE=true + the id-token permission emit npm provenance
       # via OIDC trusted publishing.
       - name: Create release PR / publish
+        id: changesets
         uses: changesets/action@v1
         with:
           version: pnpm run version
@@ -86,3 +96,17 @@ jobs:
           # OIDC trusted publishing needs no NPM token. If you instead publish
           # with a classic automation token, expose it here as:
           #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Merge-to-main = release. The Version PR only contains the mechanical
+      # output of already-merged changesets, so merge it right away and
+      # chain-dispatch this workflow: the merge itself (made with GITHUB_TOKEN)
+      # cannot trigger the push event, so the dispatch is what runs the publish
+      # leg. On that dispatched run no Version PR exists, this step is skipped,
+      # and the chain terminates.
+      - name: Auto-merge the Version PR and chain the publish
+        if: steps.changesets.outputs.pullRequestNumber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.changesets.outputs.pullRequestNumber }}" --squash
+          gh workflow run release.yml --ref main
