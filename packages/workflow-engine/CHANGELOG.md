@@ -1,5 +1,13 @@
 # @automatalabs/workflow-engine
 
+## 0.14.0
+
+### Minor Changes
+
+- 74623a9: Formalize persisted agent and journal session records and add `getPersistedAgentSessions` so hosts can depend on `AgentSessionRecord` surviving persistence for cold-restart session recovery.
+
+  Re-export the persisted run and agent state types from the workflows SDK facade.
+
 ## 0.13.0
 
 ### Minor Changes
