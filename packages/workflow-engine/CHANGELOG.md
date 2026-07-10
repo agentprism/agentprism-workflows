@@ -1,5 +1,13 @@
 # @automatalabs/workflow-engine
 
+## 0.13.0
+
+### Minor Changes
+
+- 5349c81: Add `resumeInBackground` so hosts can observe when an accepted resumed workflow actually settles.
+
+  Keep per-execution ACP events connected for the full lifetime of resumed SDK runs, then release the bridge after settlement.
+
 ## 0.12.0
 
 ### Minor Changes
