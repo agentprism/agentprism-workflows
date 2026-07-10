@@ -497,6 +497,52 @@ return { a, b }`;
 );
 
 test(
+  "resumeInBackground rejects unknown and completed runs without a completion promise",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+
+    const unknown = await manager.resumeInBackground("missing-run");
+    assert.deepEqual(unknown, { accepted: false });
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    const completed = await promise;
+    assert.equal(completed.status, "completed");
+
+    const alreadyCompleted = await manager.resumeInBackground(runId);
+    assert.deepEqual(alreadyCompleted, { accepted: false });
+    assert.equal(await manager.resume("another-missing-run"), false, "resume keeps its false return contract");
+  }),
+);
+
+test(
+  "resumeInBackground exposes the resumed run's terminal completion promise",
+  withTempCwd(async (cwd) => {
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    manager.on("error", () => {});
+
+    const { runId, promise: originalPromise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(manager.pause(runId), true);
+    agent.resolve(0, "original-finished-after-pause");
+    await originalPromise.catch(() => {});
+
+    const resumed = await manager.resumeInBackground(runId);
+    if (!resumed.accepted) assert.fail("paused run should be accepted for background resume");
+    assert.equal(manager.getRun(runId)?.status, "running");
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    agent.resolve(1, "resumed-done");
+    const result = await resumed.promise;
+
+    assert.equal(result.runId, runId);
+    assert.equal(result.status, "completed");
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.equal(manager.listRuns().find((run) => run.runId === runId)?.status, "completed");
+  }),
+);
+
+test(
   "resume returns false for completed run",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });

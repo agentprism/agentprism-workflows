@@ -104,6 +104,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
 | `stop(runId)` | `boolean` | Terminal abort. Not resumable. |
 | `resume(runId, exec?)` | `Promise<boolean>` | Restarts a paused/failed run in the background: the journaled prefix replays without spending tokens; only un-run steps execute. Runs in the run's original per-run `cwd` unless `exec.cwd` overrides. Requires journaling. |
+| `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
 | `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all). |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |

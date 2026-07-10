@@ -784,18 +784,36 @@ export class WorkflowManager extends EventEmitter {
    * and run the rest live. Returns false if there is nothing resumable.
    */
   async resume(runId: string, exec: ExecOptions = {}): Promise<boolean> {
+    const { accepted } = await this.resumeInBackground(runId, exec);
+    return accepted;
+  }
+
+  /**
+   * Resume an interrupted run while exposing the resumed execution's settlement.
+   * Rejected resumptions have no completion promise; accepted resumptions retain
+   * the same background result contract as startInBackground.
+   */
+  async resumeInBackground(
+    runId: string,
+    exec: ExecOptions = {},
+  ): Promise<
+    | { accepted: false; promise?: undefined }
+    | { accepted: true; promise: Promise<WorkflowRunResult> }
+  > {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
     if (active?.journaling === false) throw new Error("journaling disabled for this run");
     if (!this.resolveJournaling(exec)) throw new Error("journaling disabled for this run");
-    if (active?.status === "running") return false;
-    if (active?.status === "aborted") return false;
+    if (active?.status === "running") return { accepted: false };
+    if (active?.status === "aborted") return { accepted: false };
 
     const persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
+    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") {
+      return { accepted: false };
+    }
     const lease = this.persistence.acquireRunLease(runId);
-    if (!lease) return false;
+    if (!lease) return { accepted: false };
 
     // Cold-resume re-arm (§2.13). An "auth_required" pause is resumable ONLY when the auth
     // survived: warm resume (same process, credentials still in the runner's AuthStore) or a
@@ -830,7 +848,12 @@ export class WorkflowManager extends EventEmitter {
           authContext: persisted.authContext,
         });
         this.persistence.releaseRunLease(lease);
-        return true;
+        // A normal background execution that reaches a paused terminal state rejects
+        // with its WorkflowError. Match that settlement for this synchronous re-pause
+        // while handling the rejection internally just like startInBackground.
+        const promise = Promise.reject<WorkflowRunResult>(reSupplyError);
+        promise.catch(() => {});
+        return { accepted: true, promise };
       }
     }
 
@@ -874,8 +897,11 @@ export class WorkflowManager extends EventEmitter {
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
-    void this.executeRun(managed, persisted.script, persisted.args, { ...exec, resumeJournal }).catch(() => {});
-    return true;
+    // Preserve the original promise for callers while preventing an ignored resume
+    // from becoming an unhandled rejection.
+    const promise = this.executeRun(managed, persisted.script, persisted.args, { ...exec, resumeJournal });
+    promise.catch(() => {});
+    return { accepted: true, promise };
   }
 
   /**
