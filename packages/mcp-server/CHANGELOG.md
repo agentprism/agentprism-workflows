@@ -1,5 +1,19 @@
 # @automatalabs/mcp-server
 
+## 0.5.0
+
+### Minor Changes
+
+- b256305: Add durable paused checkpoints. Workflows can opt into `headless: "pause"`, expose a non-secret `checkpointContext`, and resume with a journaled `checkpointReplies` decision that survives cold restarts.
+
+  Expose the checkpoint context through the shared and workflows type barrels, persist and classify `CHECKPOINT_REQUIRED` runs in the engine, and add the MCP pause-and-resume wire flow for clients without elicitation.
+
+### Patch Changes
+
+- Updated dependencies [b256305]
+  - @automatalabs/shared-types@0.16.0
+  - @automatalabs/workflows@0.25.0
+
 ## 0.4.5
 
 ### Patch Changes
