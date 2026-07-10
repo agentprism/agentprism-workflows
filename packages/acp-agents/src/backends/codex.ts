@@ -1,11 +1,12 @@
 // CodexBackend — drives the installed npm dep @automatalabs/codex-acp, a published fork of
 // @agentclientprotocol/codex-acp that bakes in the outputSchema patch. The patch forwards
 // request._meta["outputSchema"] into the Codex App Server's turn/start.outputSchema,
-// which the shipped @openai/codex binary honors end-to-end as an OpenAI Responses-API STRICT
-// constraint on the final assistant message. So the schema rides per-PROMPT `_meta` (not
-// session/new), normalized to OpenAI strict rules first. Output needs no special channel: the
-// constrained final message flows back over the normal agent-message stream, so the backend
-// reads the final text and JSON.parses it.
+// which the shipped @openai/codex binary honors as an OpenAI Responses-API STRICT constraint —
+// applied to EVERY sampled assistant message in the turn (field-verified), not only the last:
+// intermediate progress messages between tool calls come back schema-shaped too. So the schema
+// rides per-PROMPT `_meta` (not session/new), normalized to OpenAI strict rules first, and
+// extraction reads ONLY the turn's final assistant message off the normal agent-message stream —
+// a whole-turn scan would pick up a progress object instead of the result.
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
@@ -62,7 +63,8 @@ export class CodexBackend implements Backend {
 
   nativeStructured(source: StructuredSource): unknown {
     // The constrained final message is pure JSON; parse it directly, with a balanced-block
-    // fallback if the turn also emitted leading prose.
-    return parseFinalJson(source.currentTurnText());
+    // fallback if the message also carried leading prose. Final message ONLY — the turn-wide
+    // constraint makes intermediate progress messages schema-shaped as well.
+    return parseFinalJson(source.finalMessageText());
   }
 }

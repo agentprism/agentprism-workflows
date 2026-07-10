@@ -46,7 +46,9 @@ export class OpenCodeBackend implements Backend {
   }
 
   nativeStructured(source: StructuredSource): unknown {
-    return parseFinalJson(source.currentTurnText());
+    // Final assistant message only — never the whole-turn concatenation (a schema-shaped
+    // progress message earlier in the turn must not win over the result).
+    return parseFinalJson(source.finalMessageText());
   }
 }
 

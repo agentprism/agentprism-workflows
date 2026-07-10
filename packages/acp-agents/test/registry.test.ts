@@ -22,8 +22,8 @@ function envWith(value?: string): NodeJS.ProcessEnv {
   return value === undefined ? {} : { [BACKENDS_ENV]: value };
 }
 
-function source(text: string): StructuredSource {
-  return { currentTurnText: () => text, rawStructuredOutput: () => undefined };
+function source(text: string, finalText = text): StructuredSource {
+  return { currentTurnText: () => text, finalMessageText: () => finalText, rawStructuredOutput: () => undefined };
 }
 
 // ---- resolveBackendRegistry ----------------------------------------------------------
@@ -229,7 +229,7 @@ test("selectBackend: registered names win over the built-in heuristics", () => {
   const registry = resolveBackendRegistry({ "gpt-runner": { command: "custom" } });
   assert.equal(selectBackend({ model: "gpt-runner" }, registry).id, "gpt-runner");
   // …while unregistered specs still route by heuristic.
-  assert.equal(selectBackend({ model: "gpt-5-codex" }, registry).id, "codex");
+  assert.equal(selectBackend({ model: "gpt-5.6-luna" }, registry).id, "codex");
   assert.equal(selectBackend({ model: "opus" }, registry).id, "claude");
 });
 

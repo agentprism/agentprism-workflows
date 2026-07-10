@@ -8,8 +8,8 @@ import type { StructuredSource } from "../src/index.js";
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
 const ENV_KEYS = ["AGENTPRISM_OPENCODE_ACP_CMD", "AGENTPRISM_OPENCODE_ACP_ARGS"] as const;
 
-function source(text: string): StructuredSource {
-  return { currentTurnText: () => text, rawStructuredOutput: () => undefined };
+function source(text: string, finalText = text): StructuredSource {
+  return { currentTurnText: () => text, finalMessageText: () => finalText, rawStructuredOutput: () => undefined };
 }
 
 function withEnv(overrides: Record<string, string | undefined>, fn: () => void): void {

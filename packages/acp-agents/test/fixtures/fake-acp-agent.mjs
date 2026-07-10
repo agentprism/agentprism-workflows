@@ -107,7 +107,7 @@ const defaultConfigOptions = [
     options: [
       { value: "claude-opus-4-1", name: "Claude Opus 4.1" },
       { value: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
-      { value: "gpt-5-codex[high]", name: "GPT-5 Codex (high)" },
+      { value: "gpt-5.6-luna[high]", name: "GPT-5.6 Luna (high)" },
       { value: "default-model", name: "Default" },
     ],
   },
@@ -541,6 +541,13 @@ class FakeAgent {
         sessionId: params.sessionId,
         update: { sessionUpdate: "current_mode_update", currentModeId },
       });
+    }
+    // 3.5) optional raw session updates emitted VERBATIM (in order) before the text chunks —
+    // lets a test interleave tool_call / thought / plan events with message chunks to exercise
+    // final-message segmentation (schema-shaped progress messages before the final answer).
+    const rawUpdates = Array.isArray(turn.updates) ? turn.updates : [];
+    for (const update of rawUpdates) {
+      await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
     }
     const texts = turn.echoPrompt
       ? [promptText(params)]

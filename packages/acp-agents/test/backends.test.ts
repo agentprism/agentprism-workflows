@@ -10,8 +10,8 @@ import type { Backend, StructuredSource } from "../src/index.js";
 
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
 
-function source(text: string, raw: unknown): StructuredSource {
-  return { currentTurnText: () => text, rawStructuredOutput: () => raw };
+function source(text: string, raw: unknown, finalText = text): StructuredSource {
+  return { currentTurnText: () => text, finalMessageText: () => finalText, rawStructuredOutput: () => raw };
 }
 
 // ---- Claude backend -----------------------------------------------------------------
@@ -113,6 +113,22 @@ test("CodexBackend.nativeStructured parses the constrained final message (pure J
   assert.equal(backend.nativeStructured(source("   ", undefined)), undefined);
 });
 
+test("CodexBackend.nativeStructured reads ONLY the final message — a schema-shaped progress message never wins", () => {
+  const backend = new CodexBackend();
+  // Codex's turn-wide constraint makes intermediate progress messages schema-shaped too. The
+  // whole-turn concatenation starts with the progress object; extraction must read the final
+  // message, never scan the turn for the first balanced JSON block.
+  const progress = '{"city":"progress-not-result","hot":false}';
+  const final = '{"city":"LA","hot":true}';
+  assert.deepEqual(backend.nativeStructured(source(progress + final, undefined, final)), {
+    city: "LA",
+    hot: true,
+  });
+  // turn ended on a tool call (no trailing message) => undefined, so the ladder re-prompts
+  // instead of resurrecting a progress object from earlier in the turn.
+  assert.equal(backend.nativeStructured(source(progress, undefined, "")), undefined);
+});
+
 // ---- OpenCode backend ---------------------------------------------------------------
 
 test("OpenCodeBackend is the third built-in backend", () => {
@@ -127,14 +143,14 @@ test("OpenCodeBackend is the third built-in backend", () => {
 
 test("selectBackend routes by provider prefix and bare model id", () => {
   // provider prefixes
-  assert.equal(selectBackend({ model: "openai/gpt-5-codex" }).id, "codex");
+  assert.equal(selectBackend({ model: "openai/gpt-5.6-luna" }).id, "codex");
   assert.equal(selectBackend({ model: "codex/whatever" }).id, "codex");
   assert.equal(selectBackend({ model: "opencode" }).id, "opencode");
   assert.equal(selectBackend({ model: "opencode/zai/glm-5.2" }).id, "opencode");
   assert.equal(selectBackend({ model: "anthropic/claude-opus-4-1" }).id, "claude");
   assert.equal(selectBackend({ model: "claude/sonnet" }).id, "claude");
   // bare model ids (no provider)
-  assert.equal(selectBackend({ model: "gpt-5" }).id, "codex");
+  assert.equal(selectBackend({ model: "gpt-5.6-luna" }).id, "codex");
   assert.equal(selectBackend({ model: "o3-mini" }).id, "codex");
   assert.notEqual(selectBackend({ model: "glm-5.2" }).id, "opencode");
   assert.equal(selectBackend({ model: "claude-3-5-sonnet" }).id, "claude");
@@ -143,7 +159,7 @@ test("selectBackend routes by provider prefix and bare model id", () => {
 
 test("selectBackend: model wins over tier; falls back to default (claude) when both unknown", () => {
   // a recognizable model overrides a tier that maps elsewhere
-  assert.equal(selectBackend({ model: "gpt-5", tier: "claude-ish" }).id, "codex");
+  assert.equal(selectBackend({ model: "gpt-5.6-luna", tier: "claude-ish" }).id, "codex");
   // unrecognized model but tier disambiguates
   assert.equal(selectBackend({ model: "mystery-model", tier: "openai/gpt" }).id, "codex");
   // nothing recognizable => default backend (claude)

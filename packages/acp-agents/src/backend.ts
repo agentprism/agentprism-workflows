@@ -24,8 +24,13 @@ export interface SpawnConfig {
 
 /** The slice of an active session a Backend reads to extract the native structured result. */
 export interface StructuredSource {
-  /** The latest turn's accumulated assistant text. */
+  /** The latest turn's accumulated assistant text (every message in the turn, concatenated). */
   currentTurnText(): string;
+  /** The latest turn's FINAL assistant message only: the text streamed after the last
+   *  tool/thought/plan event. Schema backends read this, never currentTurnText() — agents that
+   *  constrain sampling turn-wide (Codex) emit schema-shaped JSON for intermediate progress
+   *  messages too, and a first-JSON scan over the whole turn returns the wrong object. */
+  finalMessageText(): string;
   /** Claude only: `structured_output` from the latest `type:"result", subtype:"success"` raw message. */
   rawStructuredOutput(): unknown;
 }
