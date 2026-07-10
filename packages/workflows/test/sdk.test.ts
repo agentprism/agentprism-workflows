@@ -51,6 +51,8 @@ import type {
   AgentEventPayload,
   AgentRunner,
   RunOptions,
+  PersistedAgentState,
+  PersistedRunState,
   RunPersistenceOptions,
   WorkflowPathOptions,
   // §4.2 type re-exports — the runner-facing auth surface the SDK facade re-exports.
@@ -191,7 +193,25 @@ test("facade re-exports the public surface", () => {
   assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
   const runPersistenceOptions: RunPersistenceOptions = pathOptions;
+  const persistedAgent: PersistedAgentState = {
+    id: 1,
+    label: "persisted-agent",
+    prompt: "hello",
+    status: "done",
+  };
+  const persistedRun: PersistedRunState = {
+    runId: "persisted-run",
+    workflowName: "persisted-workflow",
+    script: NO_AGENT_SCRIPT,
+    status: "completed",
+    phases: [],
+    agents: [persistedAgent],
+    logs: [],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+  };
   assert.equal(runPersistenceOptions.persistenceRoot, pathOptions.persistenceRoot);
+  assert.equal(persistedRun.agents[0], persistedAgent);
 });
 
 // §4.2 SDK exports (PR6). The facade re-exports the `isAuthRequired` VALUE through the

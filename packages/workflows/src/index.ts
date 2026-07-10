@@ -60,6 +60,8 @@ export type {
   WorkflowPathOptions,
   RunPersistence,
   RunPersistenceOptions,
+  PersistedRunState,
+  PersistedAgentState,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,

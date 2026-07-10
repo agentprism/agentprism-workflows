@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { AgentSessionRecord, AgentSessionRef } from "@automatalabs/shared-types";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { createRunPersistence, generateRunId, type PersistedRunState, type RunPersistence } from "../src/run-persistence.js";
@@ -39,6 +40,14 @@ const loggingScript = `export const meta = { name: 'logging_demo', description: 
 log('root check')
 const a = await agent('first', { label: 'first' })
 return { a }`;
+
+const persistedSessionScript = `export const meta = { name: 'persisted_session', description: 'persisted session', phases: [{ title: 'Recovery' }] }
+phase('Recovery')
+const answer = await agent('persist this session', { label: 'recovery-agent', keepSession: true })
+return answer`;
+
+const noSessionScript = `export const meta = { name: 'no_session', description: 'no agent session' }
+return 'done'`;
 
 function deferredAgent() {
   let resolveRun: ((value: unknown) => void) | undefined;
@@ -596,6 +605,129 @@ test(
     assert.deepEqual(loaded?.journal?.[0].result, { ok: true });
   }),
 );
+
+test(
+  "WorkflowManager persists complete session records for cold restart and journal replay",
+  withTempCwd(async (cwd) => {
+    const ref: AgentSessionRef = {
+      sessionId: "session-cold-restart",
+      backendId: "custom-acp",
+      cwd,
+      reopen: { load: true, resume: false, list: true },
+    };
+    let liveCalls = 0;
+    const writer = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options: Record<string, any> = {}): Promise<string> {
+          liveCalls += 1;
+          options.onSessionOpen?.(ref);
+          return `live:${prompt}`;
+        },
+      },
+    });
+
+    const original = await writer.runSync(persistedSessionScript);
+    assert.equal(original.status, "completed");
+    assert.equal(liveCalls, 1);
+
+    let replayCalls = 0;
+    const fresh = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(): Promise<string> {
+          replayCalls += 1;
+          return "unexpected live replay";
+        },
+      },
+    });
+    const persisted = fresh.listRuns().find((run) => run.runId === original.runId);
+    assert.ok(persisted, "a fresh manager loads the completed run from persisted storage");
+
+    const expected: AgentSessionRecord = {
+      ...ref,
+      callIndex: 0,
+      label: "recovery-agent",
+      phase: "Recovery",
+      keptOpen: true,
+    };
+    const persistedAgentSession: AgentSessionRecord | undefined = persisted.agents[0]?.session;
+    const persistedJournalSession: AgentSessionRecord | undefined = persisted.journal?.[0]?.session;
+    assert.deepEqual(persistedAgentSession, expected, "the agent snapshot preserves every session field");
+    assert.deepEqual(persistedJournalSession, expected, "the journal preserves every session field");
+    assert.deepEqual(fresh.getPersistedAgentSessions(original.runId), [expected]);
+    assert.equal(fresh.getPersistedAgentSessions("unknown-run"), undefined);
+
+    const noSession = await writer.runSync(noSessionScript);
+    assert.equal(noSession.status, "completed");
+    assert.deepEqual(
+      fresh.getPersistedAgentSessions(noSession.runId),
+      [],
+      "legacy/no-session runs produce an empty hand-off",
+    );
+
+    assert.ok(persisted.journal);
+    const replayed = await fresh.runSync(persistedSessionScript, undefined, {
+      resumeJournal: new Map(persisted.journal.map((entry) => [entry.index, entry] as const)),
+    });
+    assert.equal(replayed.status, "completed");
+    assert.equal(replayCalls, 0, "a matching persisted journal prevents a live agent call");
+    assert.deepEqual(replayed.agentSessions, [expected], "journal replay restores the persisted session record as-is");
+  }),
+);
+
+test("WorkflowManager derives persisted sessions from agents first, then missing journal records", () => {
+  const store = memoryPersistence();
+  const agentSession: AgentSessionRecord = {
+    sessionId: "agent-session",
+    backendId: "claude",
+    cwd: "/work",
+    reopen: { load: true, resume: true, list: true },
+    callIndex: 2,
+    label: "agent-copy",
+    keptOpen: true,
+  };
+  const duplicateJournalSession: AgentSessionRecord = {
+    ...agentSession,
+    sessionId: "journal-duplicate",
+    label: "journal-copy",
+  };
+  const journalOnlySession: AgentSessionRecord = {
+    sessionId: "journal-only",
+    backendId: "codex",
+    cwd: "/work",
+    reopen: { load: true, resume: false, list: true },
+    callIndex: 0,
+    label: "journal-only",
+    keptOpen: false,
+  };
+  store.persistence.save({
+    runId: "session-merge",
+    workflowName: "session-merge",
+    script: "export const meta = { name: 'session-merge', description: 'session merge' }\nreturn null",
+    status: "completed",
+    phases: [],
+    agents: [
+      {
+        id: 1,
+        label: "agent-copy",
+        prompt: "agent",
+        status: "done",
+        session: agentSession,
+      },
+    ],
+    logs: [],
+    journal: [
+      { index: 2, hash: "duplicate", result: "agent", session: duplicateJournalSession },
+      { index: 0, hash: "journal-only", result: "journal", session: journalOnlySession },
+    ],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+  });
+
+  const manager = new WorkflowManager({ persistence: store.persistence });
+  assert.deepEqual(manager.getPersistedAgentSessions("session-merge"), [journalOnlySession, agentSession]);
+});
 
 test(
   "createRunPersistence save and load preserves token usage",
