@@ -61,3 +61,40 @@ test("non-elicitation client receives checkpointContext and resumes with checkpo
     await dispose();
   }
 });
+
+test("a fresh MCP server resumes a checkpoint paused by a previous server instance", async () => {
+  const pausingServer = await connect(okRunner(), { listTools: true });
+  let pausedRunId = "";
+  try {
+    const first = await pausingServer.client.callTool({
+      name: "workflow",
+      arguments: { script: SCRIPT },
+    });
+    const paused = structured(first);
+    assert.equal(first.isError, false);
+    assert.equal(paused?.status, "paused");
+    assert.equal(field(paused?.checkpointContext, "callIndex"), 0);
+    pausedRunId = String(paused?.runId);
+    assert.notEqual(pausedRunId, "");
+  } finally {
+    await pausingServer.dispose();
+  }
+
+  const resumingServer = await connect(okRunner(), { listTools: true });
+  try {
+    const second = await resumingServer.client.callTool({
+      name: "workflow",
+      arguments: {
+        script: SCRIPT,
+        resumeFromRunId: pausedRunId,
+        checkpointReplies: { "0": "ship" },
+      },
+    });
+    const completed = structured(second);
+    assert.equal(second.isError, false);
+    assert.equal(completed?.status, "completed");
+    assert.equal(field(completed?.result, "decision"), "ship");
+  } finally {
+    await resumingServer.dispose();
+  }
+});

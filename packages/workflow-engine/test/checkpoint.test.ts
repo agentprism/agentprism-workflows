@@ -87,6 +87,19 @@ function withTempPersistenceRoot(fn: (root: string) => Promise<void>) {
   };
 }
 
+function withTempPersistenceDirs(fn: (root: string, cwd: string) => Promise<void>) {
+  return async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentprism-durable-checkpoint-root-"));
+    const cwd = mkdtempSync(join(tmpdir(), "agentprism-durable-checkpoint-cwd-"));
+    try {
+      await fn(root, cwd);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+}
+
 function field(value: unknown, key: string): unknown {
   return value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
 }
@@ -279,6 +292,54 @@ test(
     assert.equal(replayed.status, "completed");
     assert.equal(field(replayed.result, "decision"), "ship");
     assert.deepEqual(replayAgent.prompts, [], "the third cold replay asks nothing and executes no agent");
+  }),
+);
+
+test(
+  "durable checkpoint: real filesystem persistence survives a fresh-manager reply resume",
+  withTempPersistenceDirs(async (persistenceRoot, cwd) => {
+    const firstAgent = recordingAgent();
+    const manager1 = new WorkflowManager({
+      agent: firstAgent.runner,
+      cwd,
+      persistenceRoot,
+    });
+
+    const paused = await manager1.runSync(DURABLE_SCRIPT);
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.reason, "checkpoint_required");
+    const context = paused.checkpointContext;
+    assert.ok(context, "the filesystem-persisted pause exposes its checkpoint context");
+    assert.deepEqual(firstAgent.prompts, ["before"]);
+    assert.equal(manager1.getPersistence().load(paused.runId)?.status, "paused");
+
+    const resumedAgent = recordingAgent();
+    const manager2 = new WorkflowManager({
+      agent: resumedAgent.runner,
+      cwd,
+      persistenceRoot,
+    });
+    const resumed = await manager2.resumeInBackground(paused.runId, {
+      checkpointReplies: { [context.callIndex]: "ship" },
+    });
+    assert.equal(resumed.accepted, true);
+    if (!resumed.accepted) assert.fail("the fresh manager should load and resume the on-disk pause");
+    const completed = await resumed.promise;
+
+    assert.equal(completed.status, "completed");
+    assert.equal(field(completed.result, "decision"), "ship");
+    assert.equal(field(completed.result, "after"), "agent:after:ship");
+    assert.deepEqual(resumedAgent.prompts, ["after:ship"]);
+
+    const listed = manager2.listRuns().find((run) => run.runId === paused.runId);
+    const loaded = manager2.getPersistence().load(paused.runId);
+    assert.equal(listed?.status, "completed", "the filesystem listing exposes the terminal state");
+    assert.equal(loaded?.status, "completed", "a direct filesystem load exposes the terminal state");
+    assert.deepEqual(
+      loaded?.journal?.find((entry) => entry.index === context.callIndex),
+      { index: context.callIndex, hash: context.hash, result: "ship" },
+      "the synthetic checkpoint reply is durably journaled on disk",
+    );
   }),
 );
 
