@@ -12,11 +12,12 @@
 //     aborted, carrying reason/resetHint) and does NOT throw on pause/fail/abort — so the
 //     shell does no status composition and needs no lifecycle try/catch.
 //   - resumeFromRunId is mapped to the engine's own persisted journal (manager persistence
-//     loads it) and handed back as exec.resumeJournal; the engine replays the unchanged
-//     prefix. The shell no longer owns/forges a runId.
+//     loads it) and handed back as exec.resumeJournal; checkpointReplies can add a pending
+//     durable-checkpoint answer before the engine replays the unchanged prefix. The shell
+//     no longer owns/forges a runId.
 // Mid-run progress streams via notifications/progress; extra.signal threads cancellation into
-// the engine; checkpoint() is driven by the engine's `confirm` hook, wired here to
-// server.elicitInput with a headless fallback when the host cannot elicit.
+// the engine; checkpoint() is driven by the engine's `confirm` hook only when the client
+// advertises elicitation. Otherwise the checkpoint's authored headless mode applies.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
@@ -60,7 +61,7 @@ const SERVER_VERSION = (require("../package.json") as { version: string }).versi
  */
 export interface WorkflowCheckpointOptions {
   default?: unknown;
-  headless?: "default" | "abort";
+  headless?: "default" | "abort" | "pause";
   kind?: "confirm" | "input" | "select";
   choices?: string[];
   timeoutMs?: number;
@@ -70,7 +71,7 @@ export interface WorkflowCheckpointOptions {
 /**
  * The engine's `confirm` hook (ExecOptions.confirm): `await confirm(promptText, options)`.
  * The resolved value is the human's reply (truthy => proceed). The shell maps an MCP
- * elicitation result onto it, or returns the headless default when the host cannot elicit.
+ * elicitation result onto it. Clients that cannot elicit receive no live callback.
  */
 export type WorkflowConfirmCallback = NonNullable<ExecOptions["confirm"]>;
 
@@ -210,11 +211,11 @@ async function elicitCheckpoint(
 }
 
 /**
- * Wire the engine's checkpoint `confirm` hook to MCP form elicitation. If the connected
- * host advertises elicitation, request a kind-specific one-field form and map the tri-state
- * result; otherwise (or if the form request throws because the host cannot satisfy it) apply
- * the headless default `default ?? true`. This is server->client and gated on host capability,
- * so the catch is the contract, not a guard against bugs.
+ * Wire the engine's checkpoint `confirm` hook to MCP form elicitation. The handler installs
+ * this callback only for clients that advertise elicitation, then requests a kind-specific
+ * one-field form and maps the tri-state result. A timeout or failed elicitation applies
+ * `default ?? true`; clients with no elicitation get no callback, so the authored headless
+ * mode remains visible to the engine.
  */
 function createConfirm(server: Server): WorkflowConfirmCallback {
   return async (prompt, options) => {
@@ -398,6 +399,14 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
         `Call workflow_authenticate { backend: "${backendId}", methodId: <one above>, ... }, ` +
           `then re-call the workflow tool with resumeFromRunId="${run.runId}".`,
       );
+    } else if (run.reason === "checkpoint_required" && run.checkpointContext) {
+      const checkpoint = run.checkpointContext;
+      lines.push(`This run awaits a ${checkpoint.kind} decision for: ${checkpoint.prompt}`);
+      if (checkpoint.choices?.length) lines.push(`choices: ${checkpoint.choices.join(", ")}`);
+      lines.push(
+        `Re-call the workflow tool with resumeFromRunId="${run.runId}" and ` +
+          `checkpointReplies={ "${checkpoint.callIndex}": <decision> }.`,
+      );
     } else {
       lines.push(
         `This run is resumable — call the workflow tool again with resumeFromRunId="${run.runId}" to continue from its journal.`,
@@ -557,7 +566,9 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
         "Execute a JavaScript workflow script to completion in a single synchronous call. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over the injected " +
         "ACP agent backend. Progress streams via notifications/progress when the client sends a " +
-        "progressToken; pass resumeFromRunId to continue a paused run from its persisted journal.",
+        "progressToken; pass resumeFromRunId to continue a paused run from its persisted journal. " +
+        "A checkpoint with headless:\"pause\" returns status \"paused\" plus checkpointContext. " +
+        "Elicitation-capable clients can answer it live on resume; other clients pass checkpointReplies.",
       inputSchema: workflowToolInputShape,
       outputSchema: workflowToolOutputShape,
     },
@@ -583,6 +594,7 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
         agentRetries: input.agentRetries,
         agentTimeoutMs: input.agentTimeoutMs,
         tokenBudget: input.tokenBudget,
+        checkpointReplies: input.checkpointReplies,
         // The engine drives progress with the live snapshot; project it onto the MCP wire
         // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
         onProgress: (snapshot: WorkflowSnapshot) => {
@@ -591,7 +603,10 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
           ).length;
           reporter(settled, snapshot.agents.length || undefined, snapshot.currentPhase);
         },
-        confirm: createConfirm(mcp.server),
+        // A callback is a LIVE channel and therefore wins over headless:"pause". Do not
+        // install a defaulting shim for non-elicitation clients; the authored headless mode
+        // must remain visible to the engine.
+        confirm: mcp.server.getClientCapabilities()?.elicitation ? createConfirm(mcp.server) : undefined,
       };
 
       // Resume: the engine owns run identity. The shell only re-hydrates the journal the
@@ -599,10 +614,23 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
       // replays the unchanged prefix and runs the rest live.
       if (input.resumeFromRunId) {
         const persisted = manager.getPersistence().load(input.resumeFromRunId);
-        if (persisted?.journal) {
+        if (persisted) {
           exec.resumeJournal = new Map<number, JournalEntry>(
-            persisted.journal.map((entry) => [entry.index, entry] as const),
+            (persisted.journal ?? []).map((entry) => [entry.index, entry] as const),
           );
+          const checkpoint =
+            persisted.pauseReason === "checkpoint_required" ? persisted.checkpointContext : undefined;
+          if (
+            checkpoint &&
+            input.checkpointReplies &&
+            Object.prototype.hasOwnProperty.call(input.checkpointReplies, checkpoint.callIndex)
+          ) {
+            exec.resumeJournal.set(checkpoint.callIndex, {
+              index: checkpoint.callIndex,
+              hash: checkpoint.hash,
+              result: input.checkpointReplies[checkpoint.callIndex],
+            });
+          }
         }
       }
 

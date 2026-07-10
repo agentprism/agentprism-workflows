@@ -152,7 +152,7 @@ The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` 
 
 - A **recoverable** failure (timeout, empty output, transient execution error) is retried per the call's `retries` (default 0), then the call **resolves to `null`** — inside `parallel`/`pipeline` *and* as a bare `await agent(...)`. Null-check anything load-bearing, and set `retries: 1–2` on steps you can't afford to lose.
 - A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle.
-- A **provider quota wall or missing backend authentication pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills or authentication completes. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
+- A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
 - Per-call knobs: `timeoutMs` (a step allowed to run long: `timeoutMs: null` disables the clock), `retries`.
 
 ## Built-in quality loops
@@ -190,18 +190,19 @@ if (!outcome.ok) log(`reviewer never approved after ${outcome.attempts} attempts
 
 ## Human gates: `checkpoint()`
 
-`checkpoint(promptText, options?)` pauses for a human decision, spends **zero tokens**, and is journaled — on resume the recorded reply replays instead of re-asking.
+`checkpoint(promptText, options?)` is a zero-token, journaled human gate. With a live SDK `confirm` callback or MCP elicitation it waits for that reply; without a live channel, its default mode takes `default ?? true` immediately, so detached runs never hang.
 
 ```js
 const proceed = await checkpoint(`Apply this plan?\n${JSON.stringify(plan, null, 2)}`, {
   kind: "confirm",          // "confirm" | "input" | "select"
-  default: false,           // headless runs take this (or true) …
-  // headless: "abort",     // … unless you demand a live human
+  default: false,           // default headless mode takes this (or true)
+  // headless: "abort",     // abort when no live human is attached
+  // headless: "pause",     // or persist a resumable human-decision pause
 });
 if (!proceed) return { applied: false, plan };
 ```
 
-`kind: "input"` resolves to free text, `kind: "select"` to one of `choices`. How the question reaches a human is the host's job (`ExecOptions.confirm` in the SDK; elicitation in the MCP server); a headless run takes `default` so a detached run never hangs. Put a checkpoint before anything hard to reverse — applying diffs, pushing, publishing.
+`kind: "input"` resolves to free text, `kind: "select"` to one of `choices`. How the question reaches a human is the host's job (`ExecOptions.confirm` in the SDK; elicitation in the MCP server). With no live channel, `headless: "default"` (the default) takes `default ?? true`, `"abort"` aborts, and `"pause"` returns a managed run with `reason: "checkpoint_required"` plus non-secret `checkpointContext`. Resume the last mode with `checkpointReplies: { [context.callIndex]: decision }` or a live confirm; the answer is journaled and replayed. Put a checkpoint before anything hard to reverse — applying diffs, pushing, publishing.
 
 ## Budgets and phases
 
@@ -385,7 +386,7 @@ The SDK ships a validator that costs **zero tokens** and spawns **no agent proce
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 ```
 
-It does two passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results. That catches the bugs a parse can't: thunks-vs-promises mistakes, reference errors, broken result plumbing between calls, schema shapes your own code then misreads. Checkpoints resolve to their headless defaults, script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
+It does two passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results. That catches the bugs a parse can't: thunks-vs-promises mistakes, reference errors, broken result plumbing between calls, schema shapes your own code then misreads. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
 
 Exit codes: `0` valid · `1` parse failure · `2` dry-run failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
 
@@ -400,7 +401,7 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.
 - [ ] Model specs only where a specific backend earns its keep; verification crosses vendors when stakes are high; remember unroutable specs degrade silently to the default.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
-- [ ] `checkpoint()` before irreversible actions, with a sane headless `default`.
+- [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.
 - [ ] `return` a compact, structured result — it is the run's `result`, not a transcript.
 - [ ] `npx @automatalabs/workflows validate <file> --args '<json>'` exits 0 with no surprising warnings.

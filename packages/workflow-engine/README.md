@@ -92,7 +92,8 @@ Inside a workflow body these are available as globals (no imports):
 - `workflow(nameOrScript, args?)` — run a saved/inline workflow inline (one level deep),
   sharing the parent run's caps and budget.
 - `checkpoint(prompt, opts?)` — a deterministic, journaled human-in-the-loop gate
-  (resolved via the host's `confirm`; takes its declared `default` when headless).
+  (resolved via the host's live `confirm`; headless defaults to `default ?? true`, can abort
+  with `headless: "abort"`, or durably pause with `headless: "pause"`).
 - Quality combinators built on the above: `verify`, `judgePanel`, `loopUntilDry`,
   `completenessCheck`, `retry`, `gate`.
 - `phase(title, { budget? })`, `log(msg)`, and the read-only `args`, `cwd`, `budget`.
@@ -131,11 +132,16 @@ intentionally unavailable and rejects with `journaling disabled for this run` fo
 The manager-level `journal` event still emits live `{ runId, entry }` observations when file
 journaling is disabled.
 
-The manager treats `PROVIDER_USAGE_LIMIT` and `AUTH_REQUIRED` as resumable pause conditions rather
-than failed runs. An authentication pause uses `reason: "auth_required"` and carries only the
-non-secret `authContext` from the error. Complete authentication through the injected runner, then
-resume the same run journal. A headless `checkpoint()` instead takes its configured default or
-aborts; it is not an authentication-style persisted pause.
+The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, and `CHECKPOINT_REQUIRED` as resumable
+pause conditions rather than failed runs. An authentication pause uses `reason: "auth_required"`
+and carries only the non-secret `authContext`; complete authentication through the injected runner,
+then resume the same journal. Checkpoints still default to non-blocking headless behavior: with no
+live `confirm`, they take `default ?? true`, while `headless: "abort"` aborts. The opt-in
+`headless: "pause"` mode instead persists `reason: "checkpoint_required"` plus the non-secret
+`checkpointContext`; resume with `ExecOptions.checkpointReplies[callIndex]`, or supply a live
+`confirm`. The reply is inserted into the journal and replayed, so later cold resumes do not ask
+again. A detached run therefore never hangs or pauses for a checkpoint unless its author explicitly
+chooses `headless: "pause"`.
 
 When a runner reports `onSessionOpen`, the engine records the non-secret re-attach handle on the
 journal entry and in `WorkflowRunResult.agentSessions`. `agent({ keepSession: true })` is forwarded
@@ -156,7 +162,7 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
   `OpenWorkflowDirOptions` types.
 - **Errors** — `WorkflowError`, `WorkflowErrorCode`, `isWorkflowError`, `wrapError`,
   `isProviderUsageLimit`, `isAuthRequired`, `classifyProviderLimit`, `isAbortError`,
-  `isTimeoutError`, and `AuthErrorContext`.
+  `isTimeoutError`, `AuthErrorContext`, and `CheckpointContext`.
 - **Config caps** — `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`,
   `DEFAULT_AGENT_TIMEOUT_MS`, `AGENTS_DIR`.
 - **Model routing / tiers** — `parseModelRoutingFromMeta`, `resolveModelForPhase`,

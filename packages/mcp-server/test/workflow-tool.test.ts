@@ -33,12 +33,13 @@ test("tool registration: single `workflow` tool, input requires only `script`, n
     const inputProps = Object.keys(tool.inputSchema.properties ?? {});
     assert.ok(!inputProps.includes("startInBackground"), "startInBackground is not advertised");
     assert.ok(inputProps.includes("resumeFromRunId"), "explicit resume knob is advertised");
+    assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
     assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
 
-    // The minimal machine-readable output core: runId/status/result/tokenUsage/logs.
+    // The machine-readable output core includes structured pause contexts.
     assert.ok(tool.outputSchema, "an output schema is declared");
     const outProps = Object.keys(field(tool.outputSchema, "properties") ?? {});
-    for (const k of ["runId", "status", "result", "tokenUsage", "logs"]) {
+    for (const k of ["runId", "status", "result", "tokenUsage", "logs", "authContext", "checkpointContext"]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
   } finally {

@@ -2,7 +2,7 @@
 // determinism blocklist) followed by an optional DRY RUN — the script executes for real
 // in the engine's deterministic realm, but every agent() call is served by an in-process
 // mock AgentRunner that fabricates schema-conforming results. No ACP process is spawned,
-// no tokens are spent, checkpoints resolve to their headless defaults, and run state is
+// no tokens are spent, a mock live confirm resolves checkpoints to their declared defaults, and run state is
 // journaled nowhere (journaling off + a throwaway persistence root for the run lease).
 //
 // This is the programmatic core behind `agentprism-workflows validate` (see ./cli.ts).
@@ -54,7 +54,7 @@ export interface ValidatedAgentCall {
 export interface ValidatedCheckpoint {
   prompt: string;
   kind: string;
-  /** The reply the dry run took (the checkpoint's headless default). */
+  /** The reply the dry-run mock confirm took (the checkpoint's declared default, else true). */
   reply: unknown;
 }
 

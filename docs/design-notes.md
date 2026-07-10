@@ -259,9 +259,11 @@ Resume is **not lost**, it becomes **explicit**: expose a `resumeFromRunId` tool
 host calls `workflow` again to continue from the persisted journal (the engine already supports
 this via `resumeJournal` in `runWorkflow`).
 
-Human-in-the-loop: `checkpoint()` relied on Pi's `ui.confirm`. Over MCP it falls back to the
-headless default (already handled at [`src/workflow.ts:828`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L828)), unless the MCP client supports
-**elicitation**, which you can wire `checkpoint()` to.
+Human-in-the-loop: `checkpoint()` relied on Pi's `ui.confirm`. Over MCP, elicitation-capable
+clients provide the live channel. Without elicitation, the authored headless mode applies:
+`"default"` takes `default ?? true`, `"abort"` aborts, and opt-in `"pause"` persists a
+`checkpoint_required` pause. The host resumes that pause with `resumeFromRunId` plus a decision in
+`checkpointReplies`; its `checkpointContext` supplies the call index and hash used to journal it.
 
 ---
 

@@ -1419,6 +1419,43 @@ const authPersistContext = {
   ],
 };
 
+const checkpointPersistContext = {
+  callIndex: 1,
+  hash: "checkpoint-hash",
+  prompt: "Ship this release?",
+  kind: "select" as const,
+  choices: ["ship", "hold"],
+  default: "hold",
+};
+
+test(
+  "PersistedRunState.checkpointContext round-trips through the real fs persistence layer",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const runId = generateRunId();
+    const now = new Date().toISOString();
+    persistence.save({
+      runId,
+      workflowName: "checkpoint_persist_demo",
+      script: oneAgentAuthScript,
+      status: "paused",
+      pauseReason: "checkpoint_required",
+      checkpointContext: checkpointPersistContext,
+      phases: [],
+      agents: [],
+      logs: [],
+      journal: [],
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    const loaded = persistence.load(runId);
+    assert.equal(loaded?.status, "paused");
+    assert.equal(loaded?.pauseReason, "checkpoint_required");
+    assert.deepEqual(loaded?.checkpointContext, checkpointPersistContext);
+  }),
+);
+
 test(
   "PersistedRunState.authContext round-trips through the real fs persistence layer (§2.12)",
   withTempCwd(async (cwd) => {

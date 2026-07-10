@@ -210,7 +210,7 @@ export type {
   AuthStatusSnapshot,
   AuthCapableRunner,
 } from "@automatalabs/acp-agents";
-export type { AuthErrorContext } from "@automatalabs/shared-types"; // via workflow-engine re-export (§1.5)
+export type { AuthErrorContext, CheckpointContext } from "@automatalabs/shared-types"; // via workflow-engine re-export (§1.5)
 
 // ── Live ACP events: `createAcpRunner().on("tool_call", evt => …)` to listen in on the
 //    stream of a run. The event map keys are ACP `sessionUpdate` discriminants plus a few

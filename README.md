@@ -45,7 +45,7 @@ Every client-side ACP method is served (`fs/*`, `terminal/*`, permission request
 
 ### Controls for unattended runs
 
-Hard token budgets (run-level caps, `budget.remaining()` in-script), per-call git **worktree isolation**, per-call timeouts and retries, and `checkpoint()` — a journaled human-approval gate that pauses the run until a decision arrives and replays it on resume. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
+Hard token budgets (run-level caps, `budget.remaining()` in-script), per-call git **worktree isolation**, per-call timeouts and retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
 
 ---
 
@@ -232,8 +232,9 @@ From a source checkout, point at the built entry instead:
 | `agentTimeoutMs` | number \| null | Per-agent timeout; omit for none. |
 | `tokenBudget` | number \| null | Hard total-token cap for the run; omit for none. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
+| `checkpointReplies` | object | With `resumeFromRunId`, map a paused `checkpointContext.callIndex` to its decision. JSON string keys are accepted and coerced to numbers. |
 
-The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`.
+The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`. For a durable `checkpoint(..., { headless: "pause" })`, an elicitation-capable client can answer live on resume; other clients also pass `checkpointReplies: { "<callIndex>": <decision> }` from the returned `checkpointContext`.
 
 With the default ACP runner, the server also registers two auth tools:
 

@@ -26,6 +26,9 @@ export enum WorkflowErrorCode {
    *  (`AuthErrorContext`: advertised method ids/types/names + backendId) — hosts read that, never
    *  the human message. The enriched `.message` is retained for readability only. */
   AUTH_REQUIRED = "AUTH_REQUIRED",
+  /** A durable checkpoint needs a human reply. The manager pauses the run and persists the
+   *  non-secret `checkpointContext` so a host can collect and journal the decision on resume. */
+  CHECKPOINT_REQUIRED = "CHECKPOINT_REQUIRED",
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** The workflow SCRIPT crashed at runtime: an uncaught throw or an unhandled promise
    *  rejection inside the script body. Distinct from WORKFLOW_ABORTED (someone cancelled the
@@ -53,6 +56,20 @@ export type AuthErrorContext = {
   methods: { id: string; type: "agent" | "terminal" | "env_var"; name?: string }[];
 };
 
+/**
+ * The structured, NON-SECRET surface of a pending durable checkpoint — persisted with a paused
+ * run and shown to the host so it can collect a decision; `hash`/`callIndex` let resume inject
+ * the reply as a journal entry.
+ */
+export interface CheckpointContext {
+  callIndex: number;
+  hash: string;
+  prompt: string;
+  kind: "confirm" | "input" | "select";
+  choices?: string[];
+  default?: unknown;
+}
+
 export interface WorkflowErrorOptions {
   recoverable?: boolean;
   agentLabel?: string;
@@ -61,6 +78,8 @@ export interface WorkflowErrorOptions {
   resetHint?: string;
   /** For AUTH_REQUIRED: the structured, non-secret auth surface (advertised method ids/types/names). */
   authContext?: AuthErrorContext;
+  /** For CHECKPOINT_REQUIRED: the structured, non-secret pending checkpoint surface. */
+  checkpointContext?: CheckpointContext;
 }
 
 export class WorkflowError extends Error {
@@ -70,6 +89,7 @@ export class WorkflowError extends Error {
   readonly details?: unknown;
   readonly resetHint?: string;
   readonly authContext?: AuthErrorContext;
+  readonly checkpointContext?: CheckpointContext;
 
   constructor(message: string, code: WorkflowErrorCode, options: WorkflowErrorOptions = {}) {
     super(message);
@@ -80,6 +100,7 @@ export class WorkflowError extends Error {
     this.details = options.details;
     this.resetHint = options.resetHint;
     this.authContext = options.authContext;
+    this.checkpointContext = options.checkpointContext;
   }
 }
 

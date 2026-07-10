@@ -20,7 +20,7 @@ Validates an AgentPrism workflow script without spending tokens:
   1. static parse — the meta literal, syntax, and the determinism blocklist
   2. dry run — the script executes against a mock agent backend that fabricates
      schema-conforming results; no ACP process is spawned, no tokens are spent,
-     and checkpoints resolve to their headless defaults
+     and a mock live confirm resolves checkpoints to their declared defaults
 
 Options:
   --args <json>          the script's \`args\` global for the dry run (a JSON value)

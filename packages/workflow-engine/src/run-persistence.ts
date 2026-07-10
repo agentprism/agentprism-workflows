@@ -8,6 +8,7 @@ import type {
   AgentHistoryEntry,
   AgentSessionRecord,
   AuthErrorContext,
+  CheckpointContext,
   JournalEntry,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
@@ -47,8 +48,8 @@ export interface PersistedRunState {
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
-  /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit,
-   *  "auth_required" when the agent demanded auth). Free-form string — no migration. */
+  /** Why a paused run is paused (e.g. "usage_limit", "auth_required", or
+   *  "checkpoint_required"). Free-form string — no migration. */
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
@@ -56,6 +57,9 @@ export interface PersistedRunState {
    *  (backendId + advertised method ids/types/names). NEVER the intent's secret payload —
    *  no `authenticateMeta`, no `envValues` (Principle 9). Read by resume()'s cold re-arm. */
   authContext?: AuthErrorContext;
+  /** For a "checkpoint_required" pause: the structured, NON-SECRET pending checkpoint
+   *  surface. Its call index and hash let resume journal the host-supplied decision. */
+  checkpointContext?: CheckpointContext;
   phases: string[];
   currentPhase?: string;
   agents: PersistedAgentState[];

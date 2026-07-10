@@ -101,7 +101,7 @@ declare function gate(
 
 /**
  * Deterministic, journaled, replayable human checkpoint. Spends no tokens. Headless
- * runs take `options.default` (or `true`) unless `options.headless === "abort"`.
+ * runs default immediately unless `options.headless` opts into "abort" or "pause".
  */
 declare function checkpoint(
   promptText: string,

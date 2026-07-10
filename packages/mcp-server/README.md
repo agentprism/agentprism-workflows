@@ -116,6 +116,7 @@ The tool's input schema (validated by the MCP SDK before the handler runs). Nume
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Per-agent timeout in ms. Omit or pass `null` for no hard timeout (the engine owns timeouts). |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
 | `resumeFromRunId` | string | no | — | Resume a prior run from its persisted journal (the engine replays the unchanged prefix and runs the rest live). See [Run model](#run-model). |
+| `checkpointReplies` | object | no | — | With `resumeFromRunId`, map `checkpointContext.callIndex` to the durable checkpoint decision. JSON string keys are coerced to numeric indexes. |
 
 Example call arguments:
 
@@ -146,6 +147,8 @@ interface WorkflowToolResult {
     cacheWrite?: number;
   };
   logs?: string[];
+  authContext?: AuthErrorContext;           // auth_required pauses only
+  checkpointContext?: CheckpointContext;   // checkpoint_required pauses only
 }
 ```
 
@@ -158,8 +161,8 @@ interface WorkflowToolResult {
 - **Synchronous.** One `tools/call` to `workflow` is one full run, awaited to completion (the tool is a plain handler — background tasks are not used). When the call resolves, the run has reached a terminal state.
 - **Progress notifications.** When the host includes a `progressToken` with the call, the server streams `notifications/progress` as agents settle (it reports `settled / total` agents plus the current phase). With no `progressToken`, progress is a no-op.
 - **Terminal status, not exceptions.** An ordinary pause/fail/abort does **not** throw — the run resolves to a `WorkflowRunResult` with `status` already stamped (`completed | paused | failed | aborted`) plus an optional `reason`/`resetHint`. Only a malformed script (which fails before a run exists) surfaces as an MCP tool error.
-- **Explicit resume.** A run can pause for a provider usage limit or missing authentication. Its journal is persisted under the returned `runId`. To continue, call `workflow` again with the **same `script`** plus `resumeFromRunId: "<that runId>"`; the engine re-hydrates the journal, replays the unchanged prefix deterministically, and runs the remainder live. A headless `checkpoint()` does not persist a pause: it applies its configured headless behavior.
-- **Checkpoints.** A script's `checkpoint()` gate is wired to MCP **elicitation**: if the connected host advertises elicitation, the server requests a one-field `approve` boolean via `elicitInput`. If the host can't elicit, the checkpoint falls back to its headless default (`default ?? true`) rather than blocking.
+- **Explicit resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint. Its journal is persisted under the returned `runId`. To continue, call `workflow` again with the **same `script`** plus `resumeFromRunId: "<that runId>"`; the engine re-hydrates the journal, replays the unchanged prefix deterministically, and runs the remainder live.
+- **Checkpoints.** A script's `checkpoint()` gate uses MCP **elicitation** as its live channel when the connected client advertises it. Without elicitation, the authored headless mode applies: the default remains `default ?? true`, `headless: "abort"` aborts, and only `headless: "pause"` durably pauses with `checkpointContext`. Resume that pause with `resumeFromRunId` plus `checkpointReplies: { "<callIndex>": <decision> }`; an elicitation-capable client may instead answer live on resume. The decision is journaled and replayed, so detached runs never pause for checkpoints unless the workflow author opts in.
 
 ---
 
