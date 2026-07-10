@@ -54,6 +54,8 @@ import {
   type DisableProviderResponse,
   type DisconnectMcpRequest,
   type DisconnectMcpResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
   type ListProvidersRequest,
@@ -155,10 +157,7 @@ const GUARDED_STATEFUL_REQUESTS = new Map<string, string>([
   [AGENT_METHODS.session_new, "use openSession()"],
   [AGENT_METHODS.session_load, "use loadSession()"],
   [AGENT_METHODS.session_resume, "use resumeSession()"],
-  [
-    AGENT_METHODS.session_fork,
-    "no driven wrapper yet; raw forked sessions cannot be routed (permissions auto-cancel)",
-  ],
+  [AGENT_METHODS.session_fork, "use forkSession()"],
 ]);
 
 interface RawResultSuccess {
@@ -1149,7 +1148,9 @@ export class PooledConnection {
             ? this.negotiated?.supportsDeleteSession
             : method === AGENT_METHODS.session_resume
               ? this.negotiated?.supportsResumeSession
-              : false;
+              : method === AGENT_METHODS.session_fork
+                ? this.negotiated?.supportsForkSession
+                : false;
     if (supported) return;
     throw lifecycleCapabilityError(this.backendId, method, this.negotiated, label);
   }
@@ -1430,6 +1431,53 @@ export class PooledConnection {
   /** Reopen an existing session without transcript replay. */
   resumeSession(sessionId: string, opts: AcpSessionOptions): Promise<SessionHandle> {
     return this.reattachSession(AGENT_METHODS.session_resume, sessionId, opts);
+  }
+
+  /** Create a new independent session seeded from an existing session's conversation context. */
+  async forkSession(sourceSessionId: string, opts: AcpSessionOptions): Promise<SessionHandle> {
+    this._activeSessions += 1;
+    let registeredSessionId: string | undefined;
+    const state = new SessionState(
+      opts.cwd,
+      opts.policy,
+      opts.permissionResolver,
+      opts.elicitationResolver,
+      opts.label,
+      opts.runId,
+      undefined,
+      acpMcpServerIds(opts.mcpServers),
+      opts.retainSessionLog ?? true,
+    );
+    try {
+      await this.ready;
+      this.assertLifecycleSupported(AGENT_METHODS.session_fork, opts.label);
+      this.assertSupportedMcpServers(opts);
+      const meta = this.sessionRequestMeta(opts);
+      const request = {
+        sessionId: sourceSessionId,
+        cwd: opts.cwd,
+        mcpServers: opts.mcpServers ?? [],
+        ...(meta ? { _meta: meta } : {}),
+      };
+      const forkRequest: ForkSessionRequest = request;
+      const response = await this.rawAgentRequest<ForkSessionResponse, ForkSessionRequest>(
+        AGENT_METHODS.session_fork,
+        forkRequest,
+      );
+      state.modes = response.modes;
+
+      // Unlike load/resume, the routable id exists only in the response, so registration must
+      // happen after the wire call. Updates arriving between send and response cannot be routed;
+      // that is acceptable for a freshly-forked session, which has no reason to emit before its
+      // creation response, and matches the same tradeoff made by session/new.
+      this.client.register(response.sessionId, state);
+      registeredSessionId = response.sessionId;
+      return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts);
+    } catch (error) {
+      if (registeredSessionId !== undefined) this.client.unregister(registeredSessionId);
+      this._activeSessions -= 1;
+      throw error;
+    }
   }
 
   private rawAgentRequest<Response, Params>(method: string, params: Params): Promise<Response> {

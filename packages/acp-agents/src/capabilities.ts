@@ -71,6 +71,8 @@ export interface NegotiatedCapabilities {
   supportsListSessions: boolean;
   /** Whether session/delete is advertised. */
   supportsDeleteSession: boolean;
+  /** Whether `session/fork` is advertised via `sessionCapabilities.fork`. UNSTABLE in the SDK. */
+  supportsForkSession: boolean;
   /** Whether session/resume is advertised. */
   supportsResumeSession: boolean;
   /** Whether logout is advertised under agentCapabilities.auth.logout. */
@@ -103,6 +105,7 @@ export function negotiateCapabilities(
       agent.loadSession === true || advertised((sessionCapabilities as Record<string, unknown> | undefined)?.load),
     supportsListSessions: advertised(sessionCapabilities?.list),
     supportsDeleteSession: advertised(sessionCapabilities?.delete),
+    supportsForkSession: advertised(sessionCapabilities?.fork),
     supportsResumeSession: advertised(sessionCapabilities?.resume),
     supportsLogout: advertised(agent.auth?.logout),
     supportsProviders: advertised(agent.providers),

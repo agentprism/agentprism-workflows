@@ -89,6 +89,8 @@ export type {
   ElicitationSessionScope,
   ElicitationUrlCapabilities,
   ElicitationUrlMode,
+  ForkSessionRequest,
+  ForkSessionResponse,
   ListProvidersRequest,
   ListProvidersResponse,
   ListSessionsRequest,

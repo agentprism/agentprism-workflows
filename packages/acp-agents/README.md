@@ -178,7 +178,7 @@ From [`src/index.ts`](./src/index.ts):
 - **`createAcpRunner(options?)`** — factory returning an `AcpAgentRunner` (this is what `@automatalabs/workflows` injects into the engine).
 - **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `openSession(options)`, `dispose()`, and `[Symbol.asyncDispose]()` for `await using`. The caller that constructs a runner owns its lifecycle.
 - **Auth/provider lifecycle methods** — `describeAuthMethods()`, `completeAuth()`, `runner.auth`, `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support.
-- **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, and `resumeSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
+- **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, `resumeSession()`, and `forkSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
 - **`AcpRunnerOptions.onElicitation`** — runner-wide ACP elicitation responder; sessions can override with `InteractiveSessionOptions.onElicitation`.
 - **`selectBackend({ model, tier }, registry?)`** — the cross-provider routing rule: which backend a spec maps to (registered custom names match first, exact or `name/<inner-model>`).

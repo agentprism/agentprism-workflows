@@ -220,7 +220,7 @@ class FakeAgent {
       return response;
     }
     const sessionCapabilities = hasLifecycleSupport
-      ? { close: {}, resume: {}, list: {}, delete: {}, additionalDirectories: {} }
+      ? { close: {}, fork: {}, resume: {}, list: {}, delete: {}, additionalDirectories: {} }
       : { close: {} };
     return {
       protocolVersion: PROTOCOL_VERSION,
@@ -315,6 +315,45 @@ class FakeAgent {
     const configOptions = scenarioConfigOptionsFor(resume, this.configOptions);
     this.configOptions = configOptions;
     return {
+      configOptions,
+      ...(modes ? { modes } : {}),
+    };
+  }
+
+  async unstable_forkSession(params) {
+    record({ method: "forkSession", params });
+    const fork = scenario.forkSession ?? {};
+
+    if (fork.permissionBeforeError) {
+      const toolCall = fork.permissionBeforeError;
+      const response = await this.conn.requestPermission({
+        sessionId: toolCall.sessionId ?? params.sessionId,
+        toolCall: {
+          toolCallId: "fork-tc-1",
+          title: toolCall.title ?? "Fork permission",
+          kind: toolCall.kind ?? "read",
+        },
+        options: toolCall.options ?? [
+          { optionId: "allow-1", name: "Allow", kind: "allow_once" },
+          { optionId: "reject-1", name: "Reject", kind: "reject_once" },
+        ],
+      });
+      record({ method: "permissionOutcome", phase: "fork", outcome: response.outcome });
+    }
+
+    if (fork.throw) throw new RequestError(fork.throwCode ?? -32603, fork.throw);
+
+    const sessionId =
+      typeof fork.sessionId === "string"
+        ? fork.sessionId
+        : `fake-fork-${process.pid}-${(this.sessionCounter += 1)}`;
+    const modes = scenarioModesFor(fork);
+    if (modes) this.modesBySession.set(sessionId, modes);
+    const configOptions = scenarioConfigOptionsFor(fork, this.configOptions);
+    this.configOptions = configOptions;
+    this.mcpServersBySession.set(sessionId, clone(params.mcpServers ?? []));
+    return {
+      sessionId,
       configOptions,
       ...(modes ? { modes } : {}),
     };

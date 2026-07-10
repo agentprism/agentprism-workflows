@@ -284,6 +284,7 @@ export class InteractiveSession {
         load: caps?.supportsLoadSession === true,
         resume: caps?.supportsResumeSession === true,
         list: caps?.supportsListSessions === true,
+        fork: caps?.supportsForkSession === true,
       },
     };
   }

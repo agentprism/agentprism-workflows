@@ -19,8 +19,9 @@ export type AgentMethodCoverage = "driven" | "passthrough" | "guarded";
 
 /** Enforceable definition of "full ACP spec support": every SDK method constant is classified
  *  here, and the tripwire test fails when an SDK bump silently widens or shrinks the protocol.
- *  Agent side: 15 operational methods are driven (plus initialize), 1 is guarded (session/fork),
- *  and the passthrough remainder is nes/*, document/*, and mcp/message. */
+ *  Agent side: 16 operational methods are driven (plus initialize), 0 are guarded, and the
+ *  passthrough remainder is nes/*, document/*, and mcp/message. The raw escape hatch remains
+ *  blocked for session-stateful new/load/resume/fork even though each has a driven wrapper. */
 export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> = {
   [CLIENT_METHODS.session_request_permission]: "served",
   [CLIENT_METHODS.session_update]: "served",
@@ -53,7 +54,7 @@ export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.mcp_message]: "passthrough",
   [AGENT_METHODS.session_list]: "driven",
   [AGENT_METHODS.session_delete]: "driven",
-  [AGENT_METHODS.session_fork]: "guarded",
+  [AGENT_METHODS.session_fork]: "driven",
   [AGENT_METHODS.session_resume]: "driven",
   [AGENT_METHODS.session_close]: "driven",
   [AGENT_METHODS.logout]: "driven",
