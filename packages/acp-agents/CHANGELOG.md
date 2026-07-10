@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.23.2
+
+### Patch Changes
+
+- 3241620: Bump the pinned `@agentclientprotocol/claude-agent-acp` to 0.58.1. The updated adapter now advertises `sessionCapabilities.fork`, so `runner.forkSession()` works live against Claude Code as well as OpenCode (verified: the forked session carries the source conversation's context).
+
 ## 0.23.1
 
 ### Patch Changes
