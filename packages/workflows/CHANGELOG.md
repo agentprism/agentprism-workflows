@@ -1,5 +1,14 @@
 # @automatalabs/workflows
 
+## 0.24.1
+
+### Patch Changes
+
+- Updated dependencies [754eaab]
+  - @automatalabs/acp-agents@0.23.0
+  - @automatalabs/shared-types@0.15.0
+  - @automatalabs/workflow-engine@0.14.1
+
 ## 0.24.0
 
 ### Minor Changes
