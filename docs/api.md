@@ -293,7 +293,7 @@ await runner.logout({ model: "codex" });
 
 Installed adapter status from the bundled dists:
 
-- `@agentclientprotocol/claude-agent-acp@0.57.0`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. It does not advertise or register `providers/*`.
+- `@agentclientprotocol/claude-agent-acp@0.58.1`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. It does not advertise or register `providers/*`.
 - `@automatalabs/codex-acp@1.5.3`: advertises `auth.logout`, implements `authenticate` (`api-key`, `chat-gpt`, and `gateway` when gateway support is advertised), and implements `logout`. It does not advertise or register `providers/*`.
 - Host-resolved OpenCode (`opencode-ai` 1.17.14 in the verified profile): advertises the `opencode-login` terminal-style method when the client advertises terminal auth, acknowledges `authenticate`, and relies on its provider credential store; it does not advertise logout. The credential-gated live suite verifies the installed executable because OpenCode is not bundled.
 
@@ -364,7 +364,7 @@ await chat.prompt("Revise section 3 — the user wants X.");
 
 Set `agent(prompt, { keepSession: true })` in the script (or `RunOptions.keepSession` on direct `run()` calls) when you intend to re-open: it skips the release-time best-effort `session/close`, guaranteeing the agent-persisted session is untouched. Without it the record is still surfaced, and the three first-class agents keep closed sessions loadable — but `keepSession` is the explicit, agent-agnostic contract. Check `reopen.load`/`reopen.resume` before offering re-attach and optional `reopen.fork` before offering a fork in UI: an agent that persists nothing advertises none of them, and its sessions are reachable only while held open (`openSession`). The fork flag is optional so records written before this field existed remain valid.
 
-Lifecycle methods are capability-gated after initialize. In particular, `forkSession()` requires `sessionCapabilities.fork`; when absent it throws a non-recoverable `WorkflowError` naming the backend and `session/fork` before any fork request is sent. The installed `@agentclientprotocol/claude-agent-acp@0.57.0` and `@automatalabs/codex-acp@1.5.3` both advertise `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close. OpenCode advertises load/list/resume/close/fork; unsupported lifecycle methods still fail through the same gate.
+Lifecycle methods are capability-gated after initialize. In particular, `forkSession()` requires `sessionCapabilities.fork`; when absent it throws a non-recoverable `WorkflowError` naming the backend and `session/fork` before any fork request is sent. The installed `@agentclientprotocol/claude-agent-acp@0.58.1` advertises `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close/fork (fork verified live: the forked session carries the source conversation's context). `@automatalabs/codex-acp@1.5.3` advertises `loadSession: true` plus list/delete/resume/close — no fork yet. OpenCode advertises load/list/resume/close/fork (also verified live); unsupported lifecycle methods still fail through the same gate.
 
 ### Capabilities
 
@@ -398,7 +398,7 @@ Two gates run before any prompt tokens are spent:
 - The agent must advertise `agentCapabilities.mcpCapabilities.acp === true`; otherwise the ACP server config fails with non-recoverable `SCRIPT_VALIDATION_ERROR`.
 - The runner must have a complete `clientHandlers.mcp`; declaring `{ type: "acp" }` without a handler is also a non-recoverable config error.
 
-Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.57.0` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp@1.5.3` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, and OpenCode advertises HTTP/SSE MCP support. Current MCP-over-ACP integration tests therefore use the repository fake agent fixture.
+Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.58.1` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp@1.5.3` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, and OpenCode advertises HTTP/SSE MCP support. Current MCP-over-ACP integration tests therefore use the repository fake agent fixture.
 
 ---
 
