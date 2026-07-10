@@ -41,12 +41,12 @@ test("agent method coverage classifies every installed SDK agent method", () => 
     Object.entries(AGENT_METHOD_COVERAGE).filter(
       ([method, coverage]) => method !== AGENT_METHODS.initialize && coverage === "driven",
     ).length,
-    15,
+    16,
     "agent driven count excluding initialize should match docs",
   );
   assert.equal(
     Object.values(AGENT_METHOD_COVERAGE).filter((coverage) => coverage === "guarded").length,
-    1,
+    0,
     "agent guarded count should match docs",
   );
 });

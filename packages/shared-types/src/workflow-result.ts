@@ -56,18 +56,19 @@ export interface WorkflowMeta {
 
 /**
  * The re-attach handle for ONE ACP session opened by a run — the identity a host needs to
- * re-open the agent's persisted conversation later via `runner.loadSession()` /
- * `runner.resumeSession()`. Delivered OUT-OF-BAND via RunOptions.onSessionOpen (never via
- * run()'s return value — AgentResult is the bare payload by contract). Contains NO secrets
+ * re-open or fork the agent's persisted conversation later via `runner.loadSession()` /
+ * `runner.resumeSession()` / `runner.forkSession()`. Delivered OUT-OF-BAND via
+ * RunOptions.onSessionOpen (never via run()'s return value — AgentResult is the bare payload
+ * by contract). Contains NO secrets
  * and is JSON-round-trippable (it rides journal entries and run results).
  *
  * Re-openability is AGENT-persistence-gated: the `reopen` flags mirror what the connected
- * agent advertised at initialize (loadSession / sessionCapabilities.resume / .list). An agent
- * that persists nothing advertises none of them — for those, a session is only reachable
- * while held open (InteractiveSession), and this ref is a tombstone once released.
+ * agent advertised at initialize (loadSession / sessionCapabilities.resume / .list / .fork).
+ * An agent that persists nothing advertises none of them — for those, a session is only
+ * reachable while held open (InteractiveSession), and this ref is a tombstone once released.
  */
 export interface AgentSessionRef {
-  /** The ACP session id assigned at `session/new`. */
+  /** The ACP session id assigned when this session was created or forked. */
   sessionId: string;
   /** The backend that owns the session (built-in id or registered custom name). */
   backendId: string;
@@ -82,6 +83,8 @@ export interface AgentSessionRef {
     resume: boolean;
     /** `session/list` — enumerable via `runner.listSessions`. */
     list: boolean;
+    /** `session/fork` — driven via `runner.forkSession()`; optional for pre-fork records. */
+    fork?: boolean;
   };
 }
 

@@ -197,9 +197,9 @@ export interface DisableProviderOptions extends AuthProviderRoutingOptions {
 /** Options for AcpAgentRunner.logout(). */
 export interface LogoutOptions extends AuthProviderRoutingOptions {}
 
-/** Options for AcpAgentRunner.loadSession() and resumeSession(). */
+/** Options for AcpAgentRunner.loadSession(), resumeSession(), and forkSession(). */
 export interface ReattachSessionOptions extends InteractiveSessionOptions {
-  /** Existing backend session id to route before the lifecycle request is sent. */
+  /** Existing backend session id to reattach, or the source session id for forkSession(). */
   sessionId: string;
   /** Alias for onPermissionRequest for hosts that name the resolver by role. */
   permissionResolver?: PermissionResolver;
@@ -626,6 +626,19 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
     );
   }
 
+  /**
+   * Fork an existing ACP session into a new independent session seeded with the source's context.
+   * The returned InteractiveSession and its sessionRef carry the NEW session id. This unstable SDK
+   * method is gated on sessionCapabilities.fork and fails before any session/fork wire request when
+   * the selected backend does not advertise it.
+   */
+  async forkSession(opts: ReattachSessionOptions): Promise<InteractiveSession> {
+    validateLifecycleSessionId(opts.sessionId, opts.label, "forkSession");
+    return this.createInteractiveSession(opts, "forkSession", (connection, prepared) =>
+      connection.forkSession(opts.sessionId, prepared.sessionOptions),
+    );
+  }
+
   /** Resume an existing ACP session without replay and return a live, routed InteractiveSession. */
   async resumeSession(opts: ReattachSessionOptions): Promise<InteractiveSession> {
     validateLifecycleSessionId(opts.sessionId, opts.label, "resumeSession");
@@ -863,7 +876,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
 
   private async createInteractiveSession(
     opts: InteractiveAssemblyOptions,
-    methodName: "openSession" | "loadSession" | "resumeSession",
+    methodName: "openSession" | "loadSession" | "forkSession" | "resumeSession",
     open: (connection: PooledConnection, prepared: PreparedSession) => Promise<SessionHandle>,
   ): Promise<InteractiveSession> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
@@ -1282,6 +1295,7 @@ function sessionRefFor(session: SessionHandle, backendId: string, cwd: string): 
       load: caps?.supportsLoadSession === true,
       resume: caps?.supportsResumeSession === true,
       list: caps?.supportsListSessions === true,
+      fork: caps?.supportsForkSession === true,
     },
   };
 }

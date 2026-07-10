@@ -46,8 +46,8 @@ test("onSessionOpen hands out the re-attach ref: real session id, backend, cwd, 
   assert.ok(ref, "onSessionOpen fired");
   assert.equal(ref.backendId, "claude");
   assert.equal(ref.cwd, cwd);
-  // lifecycleSupport advertises loadSession + sessionCapabilities.resume/.list -> all reopen paths.
-  assert.deepEqual(ref.reopen, { load: true, resume: true, list: true });
+  // lifecycleSupport advertises loadSession + sessionCapabilities.resume/.list/.fork -> every path.
+  assert.deepEqual(ref.reopen, { load: true, resume: true, list: true, fork: true });
   // The ref names the SAME session the runner then released — not an invented id.
   const closedIds = readLog()
     .filter((e) => e.method === "closeSession")
@@ -55,7 +55,7 @@ test("onSessionOpen hands out the re-attach ref: real session id, backend, cwd, 
   assert.deepEqual(closedIds, [ref.sessionId]);
 });
 
-test("reopen flags mirror a non-persisting agent: all false when load/resume/list are unadvertised", async () => {
+test("reopen flags mirror a non-persisting agent: all false when load/resume/list/fork are unadvertised", async () => {
   const { cwd } = configure({ turns: [{ text: "ok" }] }); // close-only advertisement
   const runner = makeRunner();
 
@@ -63,7 +63,7 @@ test("reopen flags mirror a non-persisting agent: all false when load/resume/lis
   await runner.run("hi", { cwd, onSessionOpen: (session) => (ref = session) });
 
   assert.ok(ref);
-  assert.deepEqual(ref.reopen, { load: false, resume: false, list: false });
+  assert.deepEqual(ref.reopen, { load: false, resume: false, list: false, fork: false });
 });
 
 test("keepSession: true skips the release-time session/close; the default still closes", async () => {
@@ -115,7 +115,7 @@ test("InteractiveSession exposes the same ref (sessionRef) and honors keepSessio
   assert.equal(kept.sessionRef.sessionId, kept.sessionId);
   assert.equal(kept.sessionRef.backendId, "claude");
   assert.equal(kept.sessionRef.cwd, cwd);
-  assert.deepEqual(kept.sessionRef.reopen, { load: true, resume: true, list: true });
+  assert.deepEqual(kept.sessionRef.reopen, { load: true, resume: true, list: true, fork: true });
   await kept.release();
   assert.equal(count(readLog(), "closeSession"), 0, "kept interactive session was NOT closed");
 

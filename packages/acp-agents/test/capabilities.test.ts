@@ -49,7 +49,7 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
       agentCapabilities: {
         auth: { logout: {} },
         providers: {},
-        sessionCapabilities: { close: {} },
+        sessionCapabilities: { close: {}, fork: {} },
         mcpCapabilities: { http: true, sse: false },
         _meta: {
           [CODEX_CUSTOM_CAPABILITY_NAMESPACE]: { outputSchema: true, baseInstructions: true, developerInstructions: true },
@@ -65,6 +65,7 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
   ]);
   assert.deepEqual(negotiated.initializeMeta, { source: "test" });
   assert.equal(negotiated.supportsClose, true);
+  assert.equal(negotiated.supportsForkSession, true);
   assert.equal(negotiated.supportsLogout, true);
   assert.equal(negotiated.supportsProviders, true);
   assert.deepEqual(negotiated.customMetaSupport, {
@@ -82,6 +83,7 @@ test("negotiateCapabilities: a minimal response yields no close support and no c
   assert.deepEqual(negotiated.authMethods, []);
   assert.equal(negotiated.initializeMeta, undefined);
   assert.equal(negotiated.supportsClose, false);
+  assert.equal(negotiated.supportsForkSession, false);
   assert.equal(negotiated.supportsLogout, false);
   assert.equal(negotiated.supportsProviders, false);
   assert.equal(negotiated.customMetaSupport, undefined, "no namespace advertised => legacy passthrough");
