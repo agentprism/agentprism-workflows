@@ -13,6 +13,7 @@
 import { EventEmitter } from "node:events";
 import type {
   AgentRunner,
+  AgentSessionRecord,
   JournalEntry,
   TokenUsage,
   WorkflowBackendConfig,
@@ -924,6 +925,28 @@ export class WorkflowManager extends EventEmitter {
    */
   getRun(runId: string): ManagedRun | undefined {
     return this.runs.get(runId);
+  }
+
+  /**
+   * Cold-restart counterpart of WorkflowRunResult.agentSessions: the hand-off a host
+   * feeds to runner.loadSession()/resumeSession(). Derived from persisted state, so it
+   * works on a fresh manager instance with no in-memory run.
+   */
+  getPersistedAgentSessions(runId: string): AgentSessionRecord[] | undefined {
+    const persisted = this.persistence.load(runId);
+    if (!persisted) return undefined;
+
+    const sessions = persisted.agents
+      .map((agent) => agent.session)
+      .filter((session): session is AgentSessionRecord => session != null);
+    const callIndexes = new Set(sessions.map((session) => session.callIndex));
+    for (const entry of persisted.journal ?? []) {
+      if (entry.session && !callIndexes.has(entry.session.callIndex)) {
+        sessions.push(entry.session);
+        callIndexes.add(entry.session.callIndex);
+      }
+    }
+    return sessions.sort((a, b) => a.callIndex - b.callIndex);
   }
 
   /**

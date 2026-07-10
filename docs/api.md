@@ -107,6 +107,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
 | `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all). |
+| `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |
 | `dispose()` / `close()` | — | Facade manager only: detach its `agentEvent` runner subscriptions. Never disposes the runner itself. |
 

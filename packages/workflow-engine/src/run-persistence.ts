@@ -4,7 +4,12 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentHistoryEntry, AuthErrorContext } from "@automatalabs/shared-types";
+import type {
+  AgentHistoryEntry,
+  AgentSessionRecord,
+  AuthErrorContext,
+  JournalEntry,
+} from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
@@ -21,6 +26,9 @@ export interface PersistedAgentState {
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
   history?: AgentHistoryEntry[];
+  /** The ACP re-attach record captured when this agent's call opened a session; absent
+   *  on pre-session-record persisted runs and agents that opened no session. */
+  session?: AgentSessionRecord;
   startedAt?: string;
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
@@ -66,7 +74,7 @@ export interface PersistedRunState {
     cacheWrite?: number;
   };
   /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
+  journal?: JournalEntry[];
 }
 
 export interface RunPersistence {
