@@ -2,6 +2,8 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type {
   ContentBlock,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   RequestPermissionResponse,
   SessionConfigOption,
   SessionModeState,
@@ -17,6 +19,10 @@ import {
 import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
+const ELICITATION_ACCEPT: CreateElicitationResponse = {
+  action: "accept",
+  content: { answer: "fork accepted" },
+};
 
 const MODES: SessionModeState = {
   currentModeId: "default",
@@ -30,6 +36,8 @@ interface LogEntry {
   method: string;
   phase?: string;
   outcome?: RequestPermissionResponse["outcome"];
+  request?: CreateElicitationRequest;
+  response?: CreateElicitationResponse;
   params?: {
     sessionId?: string;
     cwd?: string;
@@ -153,6 +161,79 @@ test("forkSession returns and routes a usable InteractiveSession under the new r
   await session.release();
 });
 
+test("forkSession routes turn permission resolution under the forked response id", async () => {
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    forkSession: {},
+    turns: [{ toolCall: { title: "Read from fork", kind: "read" }, text: "fork permission resolved" }],
+  });
+  const runner = makeRunner();
+  const resolved: Array<{ requestSessionId: string; contextSessionId: string }> = [];
+  const session = await runner.forkSession({
+    cwd,
+    sessionId: "permission-source",
+    onPermissionRequest: (request, context) => {
+      resolved.push({ requestSessionId: request.sessionId, contextSessionId: context.sessionId });
+      return ALLOW;
+    },
+  });
+
+  const turn = await session.prompt("continue with permission");
+
+  assert.equal(turn.text, "fork permission resolved");
+  assert.deepEqual(resolved, [
+    { requestSessionId: session.sessionId, contextSessionId: session.sessionId },
+  ]);
+  assert.deepEqual(permissionOutcomes(readLog()), [ALLOW.outcome]);
+  assert.equal(
+    readLog().find((entry) => entry.method === "prompt")?.params?.sessionId,
+    session.sessionId,
+  );
+  await session.release();
+});
+
+test("forkSession uses its session-scoped elicitation resolver under the forked response id", async () => {
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    forkSession: {},
+    turns: [
+      {
+        elicitation: {
+          mode: "form",
+          message: "Name this fork",
+          schema: {
+            type: "object",
+            properties: { answer: { type: "string", title: "Answer" } },
+            required: ["answer"],
+          },
+        },
+        text: "fork elicitation resolved",
+      },
+    ],
+  });
+  const runner = makeRunner();
+  const resolved: Array<{ requestSessionId: string; contextSessionId: string }> = [];
+  const session = await runner.forkSession({
+    cwd,
+    sessionId: "elicitation-source",
+    onElicitation: (request, context) => {
+      resolved.push({ requestSessionId: request.sessionId, contextSessionId: context.sessionId });
+      return ELICITATION_ACCEPT;
+    },
+  });
+
+  const turn = await session.prompt("continue with elicitation");
+
+  assert.equal(turn.text, "fork elicitation resolved");
+  assert.deepEqual(resolved, [
+    { requestSessionId: session.sessionId, contextSessionId: session.sessionId },
+  ]);
+  const outcome = readLog().find((entry) => entry.method === "elicitationOutcome");
+  assert.equal(outcome?.request?.sessionId, session.sessionId);
+  assert.deepEqual(outcome?.response, ELICITATION_ACCEPT);
+  await session.release();
+});
+
 test("forkSession adopts response modes and configOptions before applying selections", async () => {
   const forkConfigOptions: SessionConfigOption[] = [
     {
@@ -271,11 +352,12 @@ test("failed forkSession cleans routing, pending resolvers, and activeSessions o
   assert.equal(routedStates.size, 0);
 });
 
-test("forkSession keepSession releases without closing the new response id", async () => {
+test("forkSession keepSession remains loadable after release without closing the forked id", async () => {
   const { cwd, readLog } = configure({
     lifecycleSupport: true,
     forkSession: {},
-    turns: [{ text: "unused" }],
+    loadSession: {},
+    turns: [{ text: "loaded fork reply" }],
   });
   const runner = makeRunner();
   const session = await runner.forkSession({
@@ -294,6 +376,13 @@ test("forkSession keepSession releases without closing the new response id", asy
     ),
     false,
   );
+
+  const loaded = await runner.loadSession({ cwd, sessionId: forkedSessionId });
+  assert.equal(loaded.sessionId, forkedSessionId);
+  assert.equal((await loaded.prompt("continue kept fork")).text, "loaded fork reply");
+  const loadCall = readLog().find((entry) => entry.method === "loadSession");
+  assert.equal(loadCall?.params?.sessionId, forkedSessionId);
+  await loaded.release();
 });
 
 test("sessionRef.reopen.fork mirrors the initialize advertisement", async () => {

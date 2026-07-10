@@ -97,9 +97,11 @@ class EventedRunner {
   readonly sessionId = "session-1";
   readonly backendId = "claude";
   private readonly waitForRun: (() => Promise<void>) | undefined;
+  private readonly failWith: Error | undefined;
 
-  constructor(options: { waitForRun?: () => Promise<void> } = {}) {
+  constructor(options: { waitForRun?: () => Promise<void>; failWith?: Error } = {}) {
     this.waitForRun = options.waitForRun;
+    this.failWith = options.failWith;
   }
 
   on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void {
@@ -126,6 +128,7 @@ class EventedRunner {
     this.emit("agent_message_chunk", { ...ctx, ...update } as AcpRunnerEventMap["agent_message_chunk"]);
 
     await this.waitForRun?.();
+    if (this.failWith) throw this.failWith;
     this.emit("session_close", ctx);
     return `evented:${prompt}`;
   }
@@ -172,6 +175,13 @@ const NO_AGENT_SCRIPT = [
   "return 42;",
 ].join("\n");
 
+const CHECKPOINT_THEN_AGENT_SCRIPT = [
+  'export const meta = { name: "checkpoint-then-agent", description: "pause before one subagent" };',
+  'const decision = await checkpoint("q", { headless: "pause" });',
+  'const result = await agent("after:" + decision);',
+  "return { decision, result };",
+].join("\n");
+
 async function createResumableRun(manager: WorkflowManager): Promise<string> {
   const result = await manager.runSync(ONE_AGENT_SCRIPT, undefined, {
     agent: makeRunner(() => {
@@ -182,6 +192,19 @@ async function createResumableRun(manager: WorkflowManager): Promise<string> {
   });
   assert.equal(result.status, "paused", "fixture run should persist a resumable pause");
   return result.runId;
+}
+
+async function createCheckpointPausedRun(
+  manager: WorkflowManager,
+  runner: EventedRunner,
+): Promise<{ runId: string; context: CheckpointContext }> {
+  const result = await manager.runSync(CHECKPOINT_THEN_AGENT_SCRIPT, undefined, {
+    agent: eventedAgent(runner),
+  });
+  assert.equal(result.status, "paused", "fixture run should pause at the durable checkpoint");
+  const context = result.checkpointContext;
+  assert.ok(context, "fixture pause should expose checkpoint context");
+  return { runId: result.runId, context };
 }
 
 test("facade re-exports the public surface", () => {
@@ -535,6 +558,114 @@ test("WorkflowManager.resume keeps the exec runner bridge until the resumed run 
     runId,
   });
   assert.equal(seen.length, forwardedBeforePostSettlementEvent, "settled resume no longer forwards runner events");
+});
+
+test("WorkflowManager.resume releases the exec runner bridge when a durable checkpoint re-pauses", async () => {
+  const manager = new WorkflowManager();
+  const runner = new EventedRunner();
+  const { runId } = await createCheckpointPausedRun(manager, runner);
+  const seen: AgentEventPayload[] = [];
+  manager.on("agentEvent", (event: AgentEventPayload) => seen.push(event));
+  assert.equal(runner.listenerCount("session_update"), 0, "the fixture run released its exec bridge");
+  assert.equal(runner.listenerCount("session_open"), 0);
+
+  const accepted = await manager.resume(runId, { agent: eventedAgent(runner) });
+
+  assert.equal(accepted, true, "the reply-less checkpoint resume is accepted and re-pauses");
+  await waitUntil(
+    () => runner.listenerCount("session_update") === 0 && runner.listenerCount("session_open") === 0,
+    "the bridge should release after the re-pause rejection settles",
+  );
+  assert.equal(manager.getRun(runId)?.status, "paused");
+
+  const forwardedBeforePostSettlementEvent = seen.length;
+  runner.emit("session_open", { sessionId: "after-re-pause", backendId: runner.backendId, runId });
+  assert.equal(
+    seen.length,
+    forwardedBeforePostSettlementEvent,
+    "runner events are not forwarded after the re-pause settles",
+  );
+});
+
+test("WorkflowManager.resume releases the exec runner bridge when the resumed run fails", async () => {
+  const manager = new WorkflowManager();
+  manager.on("error", () => {});
+  const runner = new EventedRunner({
+    failWith: new WorkflowError("resumed runner failed", WorkflowErrorCode.SCRIPT_ERROR, {
+      recoverable: false,
+    }),
+  });
+  const { runId, context } = await createCheckpointPausedRun(manager, runner);
+  const seen: AgentEventPayload[] = [];
+  manager.on("agentEvent", (event: AgentEventPayload) => seen.push(event));
+
+  const accepted = await manager.resume(runId, {
+    agent: eventedAgent(runner),
+    checkpointReplies: { [context.callIndex]: "continue" },
+  });
+
+  assert.equal(accepted, true);
+  await waitUntil(() => manager.getRun(runId)?.status === "failed", "resumed run should fail");
+  await waitUntil(
+    () => runner.listenerCount("session_update") === 0 && runner.listenerCount("session_open") === 0,
+    "the bridge should release after the failed resume settles",
+  );
+  assert.equal(manager.getRun(runId)?.error?.code, WorkflowErrorCode.SCRIPT_ERROR);
+
+  const forwardedBeforePostSettlementEvent = seen.length;
+  runner.emit("session_open", { sessionId: "after-failed-resume", backendId: runner.backendId, runId });
+  assert.equal(
+    seen.length,
+    forwardedBeforePostSettlementEvent,
+    "runner events are not forwarded after the failed resume settles",
+  );
+});
+
+test("WorkflowManager.resume releases the exec runner bridge when the resumed run is stopped", async () => {
+  const manager = new WorkflowManager();
+  manager.on("error", () => {});
+  const gate = deferred();
+  let gateEntered = false;
+  const runner = new EventedRunner({
+    waitForRun: () => {
+      gateEntered = true;
+      return gate.promise;
+    },
+  });
+  const { runId, context } = await createCheckpointPausedRun(manager, runner);
+  const seen: AgentEventPayload[] = [];
+  manager.on("agentEvent", (event: AgentEventPayload) => seen.push(event));
+
+  const accepted = await manager.resume(runId, {
+    agent: eventedAgent(runner),
+    checkpointReplies: { [context.callIndex]: "continue" },
+  });
+  assert.equal(accepted, true);
+  await waitUntil(() => gateEntered, "the resumed agent should block on its gate");
+  assert.equal(runner.listenerCount("session_update"), 1, "the live resume retains its bridge");
+  assert.equal(runner.listenerCount("session_open"), 1);
+
+  assert.equal(manager.stop(runId), true);
+  assert.equal(manager.getRun(runId)?.status, "aborted");
+  assert.equal(runner.listenerCount("session_update"), 1, "the in-flight runner still owns the bridge");
+  gate.resolve();
+
+  await waitUntil(
+    () => manager.getRun(runId)?.error?.code === WorkflowErrorCode.WORKFLOW_ABORTED,
+    "the stopped resumed execution should settle as aborted",
+  );
+  await waitUntil(
+    () => runner.listenerCount("session_update") === 0 && runner.listenerCount("session_open") === 0,
+    "the bridge should release after the stopped resume settles",
+  );
+
+  const forwardedBeforePostSettlementEvent = seen.length;
+  runner.emit("session_open", { sessionId: "after-stopped-resume", backendId: runner.backendId, runId });
+  assert.equal(
+    seen.length,
+    forwardedBeforePostSettlementEvent,
+    "runner events are not forwarded after the stopped resume settles",
+  );
 });
 
 test("WorkflowManager.resume releases an exec runner bridge immediately when resume is rejected", async () => {
