@@ -64,7 +64,7 @@ resume/pool safety, engine pause-for-auth, and strict secret hygiene.
    - 2.14 Secret-handling rules
 3. **Integration profiles**
    - 3.1 The `AuthProfile` seam
-   - 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.57.0
+   - 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.58.1
    - 3.3 Codex — `@automatalabs/codex-acp` 1.5.3 (our fork)
    - 3.4 OpenCode — `opencode-ai` 1.17.14
    - 3.5 Custom agent conformance profile
@@ -822,7 +822,7 @@ Built-ins wire theirs with a single line each: `packages/acp-agents/src/backends
 
 ---
 
-### 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.57.0
+### 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.58.1
 
 Agent identity `{ name: "@agentclientprotocol/claude-agent-acp", title: "Claude Agent", version: "0.57.0" }`, peer name `"claude-code-acp"`, `protocolVersion: 1` (claude-agent-acp `dist/acp-agent.js:411,439-443,4181`). Auth-required factory is SDK `-32000` (`@agentclientprotocol/sdk@1.2.1 dist/jsonrpc.js:821-822`).
 
