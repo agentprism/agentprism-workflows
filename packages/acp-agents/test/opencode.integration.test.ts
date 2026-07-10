@@ -239,13 +239,13 @@ test("Claude and Codex provider specs still pass through unchanged to model sele
           name: "Model",
           category: "model",
           currentValue: "default",
-          options: [{ value: "openai/gpt-5-codex", name: "GPT-5 Codex" }],
+          options: [{ value: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna" }],
         },
       ],
       turns: [{ text: "ok" }],
     },
     { backends: ["codex"] },
   );
-  assert.equal(await makeRunner().run("hi", { model: "openai/gpt-5-codex", cwd: codex.cwd }), "ok");
-  assert.equal(configCalls(codex.readLog(), "model")[0]?.params?.value, "openai/gpt-5-codex");
+  assert.equal(await makeRunner().run("hi", { model: "openai/gpt-5.6-luna", cwd: codex.cwd }), "ok");
+  assert.equal(configCalls(codex.readLog(), "model")[0]?.params?.value, "openai/gpt-5.6-luna");
 });
