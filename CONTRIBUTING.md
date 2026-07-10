@@ -56,7 +56,16 @@ AGENTPRISM_LIVE_E2E=1 pnpm --filter @automatalabs/mcp-server test
 
 CI must leave `AGENTPRISM_LIVE_E2E` unset.
 
-Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) runs the MCP live suite on every `git push` from a dev machine. It builds the workspace and drives Claude, Codex, and OpenCode (~60–120s, spends real tokens). The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. Bypass a single push with `git push --no-verify` or `AGENTPRISM_SKIP_LIVE_E2E=1 git push`; CI pushes are exempt automatically (`CI` env guard).
+Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) gates every `git push` from a dev machine with two checks:
+
+1. **ACP dependency gate** (`node scripts/check-acp-deps.mjs`, also runnable standalone), two sub-checks:
+   - *npm freshness*: the ACP client/agent libraries (`@agentclientprotocol/*`, `@automatalabs/codex-acp`) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
+   - *fork git sync*: our codex-acp fork's published `main` must contain its upstream (`agentclientprotocol/codex-acp`) `main` — versions can't be compared because the fork's version line has diverged, so the check counts unmerged upstream commits. It prefers the local fork clone's `upstream` remote (`~/codex-acp`, override with `AGENTPRISM_CODEX_ACP_DIR`) and falls back to the GitHub compare API on machines without the clone (the hook passes `GITHUB_TOKEN` from `gh auth token`). On failure it prints the merge → push → `release-fork.yml` → bump sequence.
+
+   If the registry or GitHub API is unreachable the gate warns and passes, so being offline never blocks a push. Bypass a single push with `AGENTPRISM_SKIP_ACP_DEP_CHECK=1 git push`.
+2. **MCP live suite**: builds the workspace and drives Claude, Codex, and OpenCode (~60–120s, spends real tokens). The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. Bypass a single push with `AGENTPRISM_SKIP_LIVE_E2E=1 git push`.
+
+`git push --no-verify` skips both; CI pushes are exempt automatically (`CI` env guard).
 
 ## Releasing
 
