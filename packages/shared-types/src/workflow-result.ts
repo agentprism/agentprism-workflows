@@ -1,6 +1,6 @@
 // ===== packages/shared-types/src/workflow-result.ts =====
 
-import type { AuthErrorContext } from "./errors.js";
+import type { AuthErrorContext, CheckpointContext } from "./errors.js";
 
 /** Aggregate token/cost usage for a whole run (engine-summed; matches the
  *  onTokenUsage shape at workflow.ts:112-119). */
@@ -131,7 +131,7 @@ export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed
 export interface WorkflowRunResult<T = unknown> {
   /** Stable id; pass back as `resumeFromRunId` to continue a paused run from its journal. */
   runId: string;
-  /** Terminal status. "paused" => resumable (provider usage limit / headless checkpoint). */
+  /** Terminal status. "paused" => resumable (usage limit / auth / durable checkpoint). */
   status: RunStatus;
   /** The script's parsed `meta`. */
   meta: WorkflowMeta;
@@ -148,8 +148,8 @@ export interface WorkflowRunResult<T = unknown> {
   /** Captured log lines. */
   logs: string[];
   /** Present when status !== "completed": human-readable cause (e.g. "usage_limit",
-   *  "auth_required"). NOT the machine-readable contract — hosts branch on `reason` for the
-   *  coarse cause and read `authContext` for the structured auth surface (§2.12). */
+   *  "auth_required", "checkpoint_required"). NOT the machine-readable contract — hosts branch
+   *  on `reason`, then read the corresponding structured context when present. */
   reason?: string;
   /** Provider reset hint for a usage-limit pause (verbatim, e.g. "Resets in ~3h"). */
   resetHint?: string;
@@ -157,6 +157,9 @@ export interface WorkflowRunResult<T = unknown> {
    *  auth surface (backendId + advertised method ids/types/names). Carries no credential
    *  material (Principle 9). Hosts read this — never the `reason` message string. */
   authContext?: AuthErrorContext;
+  /** Present when status is "paused" with reason "checkpoint_required": the structured,
+   *  NON-SECRET pending checkpoint surface a host uses to collect and resume with a reply. */
+  checkpointContext?: CheckpointContext;
   /** Re-attach records for every ACP session the run opened (live + journal-replayed),
    *  in call order. The host's hand-off to `runner.loadSession()`/`resumeSession()` —
    *  present even when journaling is off (it rides the result, not the journal). */

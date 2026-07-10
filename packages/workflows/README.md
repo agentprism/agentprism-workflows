@@ -97,7 +97,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, … |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
@@ -229,10 +229,14 @@ if (run.status === "paused") {
 ```
 
 `runSync(script, args?, exec?)` always resolves to a terminal `WorkflowRunResult`. A run **pauses**
-(rather than fails) on a provider usage limit or ACP authentication requirement; both are
-resumable as above. A headless `checkpoint()` applies its configured default or abort behavior.
-An auth pause carries `reason: "auth_required"` plus a non-secret `authContext`; complete auth on
-an auth-capable runner before resuming. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
+(rather than fails) on a provider usage limit, ACP authentication requirement, or an explicitly
+durable checkpoint. An auth pause carries `reason: "auth_required"` plus a non-secret `authContext`;
+complete auth on an auth-capable runner before resuming. A checkpoint with a live `ExecOptions.confirm`
+resolves immediately; without one, the default mode still takes `default ?? true` and
+`headless: "abort"` aborts. Only `headless: "pause"` returns `reason: "checkpoint_required"` plus
+`checkpointContext`; resume with `checkpointReplies: { [context.callIndex]: decision }` (or a live
+`confirm`). The injected answer is journaled and replayed, so a detached run never pauses for a
+checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
@@ -410,7 +414,7 @@ ships no runtime code).
 | `completenessCheck(args, results)` | Ask a critic what is still missing. |
 | `retry(thunk, options?)` | Bounded retry until `until(result)` holds. |
 | `gate(thunk, validator, options?)` | Validate-and-feed-back loop until it passes. |
-| `checkpoint(text, options?)` | Deterministic, journaled human gate (headless takes a default). |
+| `checkpoint(text, options?)` | Deterministic, journaled human gate: live confirm, headless default/abort, or opt-in durable `headless: "pause"`. |
 | `phase(title, options?)` | Open a named phase (optional soft token sub-budget). |
 | `log(message)` | Append a line to the run log. |
 | `args` | The input bag passed in via `{ args }`. |
@@ -434,8 +438,10 @@ Two passes: a **static parse** (the `meta` literal, syntax, the determinism bloc
 **dry run** — the script executes in the real engine realm while every `agent()` call is served
 by an in-process mock `AgentRunner` that fabricates schema-conforming results. The dry run
 catches what a parse can't: thunk-vs-promise mistakes, reference errors, broken plumbing between
-calls. Checkpoints take their headless defaults; script-declared `meta.backends` are treated as
-approved (with a warning that real runs require approval). The report lists every agent call with
+calls. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"`
+dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort.
+Script-declared `meta.backends` are treated as approved (with a warning that real runs require
+approval). The report lists every agent call with
 its backend attribution, every checkpoint, and warnings; exit codes are `0` valid, `1` parse
 failure, `2` dry-run failure, `3` usage error.
 

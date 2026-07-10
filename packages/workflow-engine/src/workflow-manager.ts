@@ -87,6 +87,8 @@ export interface ExecOptions {
   cwd?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
+  /** Durable-checkpoint answer channel: pending checkpoint call index to the host's decision. */
+  checkpointReplies?: Record<number, unknown>;
   /**
    * Whether THIS run writes/reads the engine persistence journal. Default is the
    * manager setting. When false, no run-state/log files are written and resume
@@ -352,6 +354,12 @@ export class WorkflowManager extends EventEmitter {
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
     const managed = this.createManaged(script, args, this.resolveJournaling(exec), exec.cwd);
+    if (managed.journaling && exec.resumeJournal) {
+      // runSync is also the MCP shell's explicit-resume path. Replayed entries do not fire
+      // onAgentJournal, so carry the hydrated prefix into this new managed run up front; any
+      // synthetic checkpoint reply in the map must survive another cold resume from this run.
+      managed.journal = [...exec.resumeJournal.values()].sort((a, b) => a.index - b.index);
+    }
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -431,6 +439,7 @@ export class WorkflowManager extends EventEmitter {
   ): WorkflowRunResult {
     const usageLimit = error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
     const authRequired = error?.code === WorkflowErrorCode.AUTH_REQUIRED;
+    const checkpointRequired = error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED;
     const reason =
       managed.status === "completed"
         ? undefined
@@ -439,7 +448,9 @@ export class WorkflowManager extends EventEmitter {
             ? "usage_limit"
             : authRequired
               ? "auth_required"
-              : error?.message
+              : checkpointRequired
+                ? "checkpoint_required"
+                : error?.message
           : error?.message;
     const snapshotUsage = managed.snapshot.tokenUsage;
     const tokenUsage: TokenUsage | undefined =
@@ -473,6 +484,9 @@ export class WorkflowManager extends EventEmitter {
       // Structured, NON-SECRET auth surface for an auth pause (§2.12) — hosts read this,
       // never the reason message. Absent on every other outcome.
       authContext: authRequired ? error?.authContext : undefined,
+      // Structured, NON-SECRET pending durable checkpoint surface. Absent on every
+      // other outcome; hosts use it to collect a reply for checkpointReplies.
+      checkpointContext: checkpointRequired ? error?.checkpointContext : undefined,
       // Fall back to the snapshot's per-agent records when the engine returned no result
       // (pause/failure mid-run) so re-attach handles survive an interrupted run.
       agentSessions:
@@ -630,16 +644,19 @@ export class WorkflowManager extends EventEmitter {
           ? error
           : new WorkflowError(errorMessage(error), WorkflowErrorCode.UNKNOWN, { recoverable: false });
 
-      // Two recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
+      // Three recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
       // so resume() replays the journaled prefix instead of restarting from scratch (§2.12):
       //  - PROVIDER_USAGE_LIMIT: a provider quota refills over time.
-      //  - AUTH_REQUIRED: a host completes an auth step (both are recoverable:false, so the
-      //    retry ladder already skipped them — only the pause branch was missing).
+      //  - AUTH_REQUIRED: a host completes an auth step.
+      //  - CHECKPOINT_REQUIRED: a host supplies the pending durable checkpoint decision.
+      // All are recoverable:false, so the retry ladder skips them.
       const authPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.AUTH_REQUIRED;
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
-      const paused = usageLimitPaused || authPaused;
+      const checkpointPaused =
+        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.CHECKPOINT_REQUIRED;
+      const paused = usageLimitPaused || authPaused || checkpointPaused;
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
         if (managed.status === "running") {
@@ -661,14 +678,15 @@ export class WorkflowManager extends EventEmitter {
       if (paused) {
         // The emit is untyped (WorkflowManager extends EventEmitter with an untyped override
         // emit); the payload is a bare literal. `reason` is a free-form string, so it just takes
-        // "auth_required"/"usage_limit". resetHint is usage-limit-only; authContext is the
-        // structured, NON-SECRET auth surface (§1.5) present only on the auth pause.
+        // "auth_required"/"usage_limit"/"checkpoint_required". resetHint is usage-limit-only;
+        // each structured context is present only for its corresponding pause reason.
         this.emit("paused", {
           runId: managed.runId,
-          reason: authPaused ? "auth_required" : "usage_limit",
+          reason: authPaused ? "auth_required" : checkpointPaused ? "checkpoint_required" : "usage_limit",
           error: workflowError,
-          resetHint: authPaused ? undefined : workflowError.resetHint,
+          resetHint: usageLimitPaused ? workflowError.resetHint : undefined,
           authContext: authPaused ? workflowError.authContext : undefined,
+          checkpointContext: checkpointPaused ? workflowError.checkpointContext : undefined,
         });
       } else if (this.listenerCount("error") > 0) {
         // Only emit 'error' when someone is listening: an unheard 'error' would throw
@@ -712,14 +730,17 @@ export class WorkflowManager extends EventEmitter {
         status: managed.status,
         // Why a pause happened, so the navigator / a future cold start can show it and
         // re-arm resume (§2.12). Selector switches on the paused run's error code:
-        // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit".
+        // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit",
+        // CHECKPOINT_REQUIRED -> "checkpoint_required".
         pauseReason:
           managed.status === "paused"
             ? managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
               ? "auth_required"
               : managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
                 ? "usage_limit"
-                : undefined
+                : managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
+                  ? "checkpoint_required"
+                  : undefined
             : undefined,
         // resetHint stays usage-limit-only.
         resetHint:
@@ -732,6 +753,12 @@ export class WorkflowManager extends EventEmitter {
         authContext:
           managed.status === "paused" && managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
             ? managed.error.authContext
+            : undefined,
+        // The NON-SECRET pending durable checkpoint surface. Its callIndex/hash pair arms
+        // resume() to inject the host's decision as a deterministic journal entry.
+        checkpointContext:
+          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
+            ? managed.error.checkpointContext
             : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
@@ -816,6 +843,13 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return { accepted: false };
 
+    const checkpointContext =
+      persisted.pauseReason === "checkpoint_required" ? persisted.checkpointContext : undefined;
+    const hasCheckpointReply =
+      checkpointContext !== undefined &&
+      exec.checkpointReplies !== undefined &&
+      Object.prototype.hasOwnProperty.call(exec.checkpointReplies, checkpointContext.callIndex);
+
     // Cold-resume re-arm (§2.13). An "auth_required" pause is resumable ONLY when the auth
     // survived: warm resume (same process, credentials still in the runner's AuthStore) or a
     // disk-backed intent (native store / env re-read by a fresh spawn). We consult the INJECTED
@@ -858,6 +892,29 @@ export class WorkflowManager extends EventEmitter {
       }
     }
 
+    // Durable checkpoint cold-resume gate. A keyed checkpointReplies value is the explicit
+    // out-of-band answer channel; a real confirm callback is the live answer channel. With
+    // neither, preserve the exact persisted pause without re-running any agent or script code.
+    if (persisted.pauseReason === "checkpoint_required" && !hasCheckpointReply && !exec.confirm) {
+      const checkpointError = new WorkflowError(
+        `checkpoint "${checkpointContext?.prompt ?? "pending checkpoint"}" awaits a human decision`,
+        WorkflowErrorCode.CHECKPOINT_REQUIRED,
+        { recoverable: false, checkpointContext },
+      );
+      this.emit("paused", {
+        runId,
+        reason: "checkpoint_required",
+        error: checkpointError,
+        resetHint: undefined,
+        authContext: undefined,
+        checkpointContext,
+      });
+      this.persistence.releaseRunLease(lease);
+      const promise = Promise.reject<WorkflowRunResult>(checkpointError);
+      promise.catch(() => {});
+      return { accepted: true, promise };
+    }
+
     const controller = new AbortController();
     let meta: WorkflowMeta | undefined;
     try {
@@ -896,6 +953,19 @@ export class WorkflowManager extends EventEmitter {
     this.runs.set(runId, managed);
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
+    if (checkpointContext && hasCheckpointReply) {
+      const syntheticEntry: JournalEntry = {
+        index: checkpointContext.callIndex,
+        hash: checkpointContext.hash,
+        result: exec.checkpointReplies?.[checkpointContext.callIndex],
+      };
+      resumeJournal.set(syntheticEntry.index, syntheticEntry);
+      // Cached entries are replayed without firing onAgentJournal, so seed and persist this
+      // synthetic answer now. A crash or later cold replay must never re-ask this checkpoint.
+      managed.journal = managed.journal.filter((entry) => entry.index !== syntheticEntry.index);
+      managed.journal.push(syntheticEntry);
+      this.persistRun(managed);
+    }
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // Preserve the original promise for callers while preventing an ignored resume

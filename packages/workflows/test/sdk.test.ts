@@ -68,6 +68,7 @@ import type {
   AuthStatusSnapshot,
   AuthCapableRunner,
   AuthErrorContext,
+  CheckpointContext,
 } from "../src/index.js";
 
 /**
@@ -212,6 +213,13 @@ test("facade re-exports the public surface", () => {
   };
   assert.equal(runPersistenceOptions.persistenceRoot, pathOptions.persistenceRoot);
   assert.equal(persistedRun.agents[0], persistedAgent);
+  const checkpointContext: CheckpointContext = {
+    callIndex: 1,
+    hash: "hash",
+    prompt: "Continue?",
+    kind: "confirm",
+  };
+  assert.equal(checkpointContext.callIndex, 1);
 });
 
 // §4.2 SDK exports (PR6). The facade re-exports the `isAuthRequired` VALUE through the

@@ -37,7 +37,7 @@ Options (`RunDynamicWorkflowOptions`): `runner?` (custom `AgentRunner`; defaults
 
 `openWorkflowDir(dir | dirs, { cwd? })` binds a read-only view over folders of versioned workflow scripts. Construction does **no I/O** (nothing created, scanned, or cached); every method reads the filesystem at call time so the view always reflects the current working tree, and missing dirs contribute nothing. The filename stem is the name (`review-pr.workflow.js` / `review-pr.js` ⇒ `review-pr`; across dirs first hit wins, within a dir `.workflow.js` beats `.js`; also `.mjs` variants). Surface: `dirs` (absolute, precedence order), `list()` (`[{ name, file, meta?, error? }]`, meta parsed per call, sorted), `read(name)` (script text; throws with searched dirs + closest matches), and `resolve(name)` — `(name) => string | undefined`, deliberately the exact `loadSavedWorkflow` contract, with strict name-shape validation (one flat path segment) so inline nested scripts fall through and path traversal is impossible. Exported by both `@automatalabs/workflow-engine` and the facade.
 
-**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, determinism blocklist) plus a dry run over an in-process mock `AgentRunner` that fabricates schema-conforming results — no ACP process, no tokens, checkpoints take their headless defaults, script-declared backends are treated as approved (with a warning). It never throws for an invalid script; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run failure). `ValidateWorkflowOptions`: `args?`, `workflows?` (a `WorkflowDir` view or dir path(s) so nested `workflow("<name>")` calls resolve during the dry run), `dryRun?` (`false` = parse only), `cwd?` (default: a throwaway temp dir so `isolation:"worktree"` no-ops), `tokenBudget?` (the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 tokens per call), `maxAgents?`, `timeoutMs?` (default 30 000). The report lists every agent call (`label`, `phase`, `model`, `tier`, `mode`, `backend` attribution via the real router, `schema` flag), every checkpoint with the default reply taken, visited phases, logs, the composed result, and warnings. Helpers `fabricateFromSchema(schema)` and `formatValidateReport(report)` are exported too. The same check ships as the package bin: `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--token-budget <n>] [--max-agents <n>] [--timeout-ms <n>] [--json]` (exit `3` = usage error). With `--workflows-dir` the positional may be a workflow NAME and nested `workflow("<name>")` calls resolve; without it, nested bare names fail the dry run (the report warns and names the fix) while inline nested scripts always validate.
+**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, determinism blocklist) plus a dry run over an in-process mock `AgentRunner` that fabricates schema-conforming results — no ACP process and no tokens. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort. Script-declared backends are treated as approved (with a warning). It never throws for an invalid script; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run failure). `ValidateWorkflowOptions`: `args?`, `workflows?` (a `WorkflowDir` view or dir path(s) so nested `workflow("<name>")` calls resolve during the dry run), `dryRun?` (`false` = parse only), `cwd?` (default: a throwaway temp dir so `isolation:"worktree"` no-ops), `tokenBudget?` (the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 tokens per call), `maxAgents?`, `timeoutMs?` (default 30 000). The report lists every agent call (`label`, `phase`, `model`, `tier`, `mode`, `backend` attribution via the real router, `schema` flag), every checkpoint with the mock reply taken, visited phases, logs, the composed result, and warnings. Helpers `fabricateFromSchema(schema)` and `formatValidateReport(report)` are exported too. The same check ships as the package bin: `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--token-budget <n>] [--max-agents <n>] [--timeout-ms <n>] [--json]` (exit `3` = usage error). With `--workflows-dir` the positional may be a workflow NAME and nested `workflow("<name>")` calls resolve; without it, nested bare names fail the dry run (the report warns and names the fix) while inline nested scripts always validate.
 
 **Host-embedded (manager):** long-lived, evented, resumable.
 
@@ -90,10 +90,28 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `maxAgents` | Cap on total agent calls for the run. |
 | `agentTimeoutMs` | Per-agent timeout (`null` = none). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
-| `confirm` | `(promptText, options) => Promise<reply>` — resolves script `checkpoint()` calls with a human reply. Headless runs without it take the checkpoint's declared default. |
+| `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
+| `checkpointReplies` | Durable-checkpoint answer channel for `resume()`: `{ [callIndex]: decision }`. The manager injects the matching persisted `checkpointContext` hash/index as a journal entry before replay. |
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
 | `resumeJournal` | Internal resume channel (set by `resume()`; don't pass manually). |
+
+### `CheckpointOptions` — in-script human gates
+
+`checkpoint(promptText, options?)` is deterministic, spends no tokens, and journals every resolved
+reply. `kind` is `"confirm" | "input" | "select"` (default `"confirm"`); `choices?: string[]` supplies
+the select options; `default?: unknown` is the headless reply (`true` when omitted); and `timeoutMs?`
+sets the live prompt deadline. `headless` has three modes:
+
+- `"default"` (the default): with no live `ExecOptions.confirm`, take `default ?? true` immediately.
+- `"abort"`: with no live channel, throw `WORKFLOW_ABORTED`.
+- `"pause"`: with no live channel, pause durably with `reason: "checkpoint_required"` and a
+  non-secret `checkpointContext` (`callIndex`, hash, prompt, kind, choices/default). Resume with
+  `checkpointReplies: { [context.callIndex]: decision }`, or attach a live `confirm` callback.
+
+The injected decision is persisted as the checkpoint's journal entry and replayed on future cold
+resumes. A detached run therefore never hangs or pauses at a checkpoint unless the workflow author
+explicitly selects `headless: "pause"`.
 
 ### Lifecycle
 
@@ -115,6 +133,14 @@ A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused
 
 A run that hits `AUTH_REQUIRED` is likewise **paused** (`reason: "auth_required"`), not failed: the journal checkpoints and the paused state persists the structured, non-secret `authContext` (`backendId` + advertised method `{ id, type, name }[]` — never credential material). `resume()` re-arms against the runner: for an `"auth_required"` pause it consults `runner.auth.canResume(backendId)` before re-executing. When the credential survived (warm resume in the same process, or a disk-backed method a fresh process re-reads from the native store/env) it proceeds; when an in-process (gateway) or spawn-env intent was lost to a cold process it **immediately re-pauses** with `re-supply credentials for <backend> via runner auth before resuming` rather than re-running into the same wall. A runner with no `auth` controller (the default-off host) cannot confirm resumability and re-pauses.
 
+A checkpoint authored with `headless: "pause"` is the third persisted pause class. With no live
+`confirm`, the run pauses with `reason: "checkpoint_required"` and the non-secret
+`checkpointContext`. `resume()` accepts the decision through `ExecOptions.checkpointReplies`; the
+manager writes the synthetic reply into the journal before execution, then replay returns it without
+re-asking. If resume has neither that indexed reply nor a live `confirm`, it re-pauses immediately
+with the same context and executes no script or agent calls. The default checkpoint mode remains
+headless-default, so detached runs do not pause unless the author opts in.
+
 ### Events
 
 `WorkflowManager` is an `EventEmitter`; **every payload carries `runId`** — route by it, no reverse index needed. Listeners are observability-only: a throwing listener is isolated and never affects the run.
@@ -129,7 +155,7 @@ A run that hits `AUTH_REQUIRED` is likewise **paused** (`reason: "auth_required"
 | `journal` | `entry` (`JournalEntry`) — live journal append observations, including when file journaling is disabled |
 | `tokenUsage` | `usage` (cumulative input/output/total/cost/cache) |
 | `complete` | `result` (the composed `WorkflowRunResult`) |
-| `paused` | `reason` (`"usage_limit"` \| `"auth_required"`), `error`, `resetHint?` (usage-limit only), `authContext?` (`AuthErrorContext`, auth pause only) |
+| `paused` | `reason` (`"usage_limit"` \| `"auth_required"` \| `"checkpoint_required"`), `error`, `resetHint?` (usage-limit only), `authContext?` (auth only), `checkpointContext?` (durable checkpoint only) |
 | `stopped` / `resumed` | — |
 | `error` | `error` (`WorkflowError`) — emitted only when a listener exists, so an unheard `error` never masks the thrown one |
 | `agentEvent` | **The token-level streaming surface** (facade manager only — see below). |
@@ -395,7 +421,7 @@ Workflow scripts may *declare* backends via `meta.backends`, but declarations ar
 
 ## Errors — `WorkflowError`
 
-One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds across packages) with `.code`, `.recoverable`, `.agentLabel?`, `.resetHint?`, and `.authContext?`. Recoverable agent failures retry up to `agentRetries`, then resolve that agent to `null`; non-recoverable ones halt the run except the two manager-owned pause codes called out below.
+One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds across packages) with `.code`, `.recoverable`, `.agentLabel?`, `.resetHint?`, `.authContext?`, and `.checkpointContext?`. Recoverable agent failures retry up to `agentRetries`, then resolve that agent to `null`; non-recoverable ones halt the run except the three manager-owned pause codes called out below.
 
 | Code | Recoverable | Meaning / engine behavior |
 |---|---|---|
@@ -407,6 +433,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `resetHint`. |
 | `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
+| `CHECKPOINT_REQUIRED` | no | `checkpoint(..., { headless: "pause" })` has no live channel → the run **pauses** with non-secret `checkpointContext`; resume with `checkpointReplies` or a live `confirm`. |
 | `TOKEN_BUDGET_EXHAUSTED` / `AGENT_LIMIT_EXCEEDED` | no | Run caps hit. |
 | `AGENT_EXECUTION_ERROR` | yes | Other agent-level failure (refusal/truncation are non-recoverable variants). |
 | `PERSISTENCE_ERROR`, `UNKNOWN` | no | Storage / unexpected host-level failure. |
@@ -417,7 +444,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes the tool named **`workflow`**: pass a raw `script` + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir` feature. The server honors the same runtime environment variables as the SDK plus its MCP-only auth/approval switches.
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes the tool named **`workflow`**: pass a raw `script` + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. For `headless: "pause"`, non-elicitation clients receive structured `checkpointContext` and resume with `checkpointReplies`; elicitation-capable clients use the live `confirm` channel, including on resume. The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir` feature. The server honors the same runtime environment variables as the SDK plus its MCP-only auth/approval switches.
 
 **Auth tools (§4.3).** When the injected runner is auth-capable — the default `createAcpRunner()` is — two additive tools register alongside `workflow` (a host that injects a plain `AgentRunner` gets `workflow` alone, so `createWorkflowServer(runner)` is unchanged and default behavior is byte-identical):
 
@@ -430,7 +457,7 @@ A run that paused with `reason:"auth_required"` surfaces a summary built from th
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
 
 `keepSession:true` skips the release-time `session/close`; the resulting `AgentSessionRecord` is returned in `WorkflowRunResult.agentSessions` so the host can later call `runner.loadSession()` or `runner.resumeSession()`.
 

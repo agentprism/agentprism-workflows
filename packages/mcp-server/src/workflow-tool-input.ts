@@ -7,12 +7,26 @@
 // (normalizeConcurrency -> MAX_CONCURRENCY 16; normalizeAgentRetries -> MAX_AGENT_RETRIES 3),
 // NOT rejected. This is a behavioral contract (ground-truth corrections item 3, README §4):
 // keep ONLY type + positivity in Zod; never add .max(). These mirror WorkflowManager.runSync
-// ExecOptions { resumeJournal, maxAgents, tokenBudget, concurrency, agentRetries, confirm, onProgress }.
+// ExecOptions { resumeJournal, checkpointReplies, maxAgents, tokenBudget, concurrency,
+// agentRetries, confirm, onProgress }.
 //
 // One semantic change vs Pi: the run is SYNCHRONOUS (one tools/call == one full run, awaited
 // to completion; taskSupport:'forbidden'), so background/startInBackground are DROPPED. Resume
 // is no longer lost — it becomes EXPLICIT via `resumeFromRunId`.
 import { z } from "zod";
+
+const checkpointRepliesSchema = z
+  .record(
+    z.string().regex(/^(0|[1-9]\d*)$/, "checkpoint reply keys must be non-negative integer call indexes"),
+    z.unknown(),
+  )
+  .transform(
+    (replies) =>
+      Object.fromEntries(Object.entries(replies).map(([callIndex, reply]) => [Number(callIndex), reply])) as Record<
+        number,
+        unknown
+      >,
+  );
 
 export const workflowToolInputShape = {
   script: z
@@ -62,6 +76,11 @@ export const workflowToolInputShape = {
     .describe(
       "Resume a prior run from its persisted journal (the shell loads the journal by runId and passes it to the engine as resumeJournal). Replaces Pi's background result-delivery: resume is now EXPLICIT.",
     ),
+  checkpointReplies: checkpointRepliesSchema
+    .optional()
+    .describe(
+      "With resumeFromRunId, decisions for durable checkpoints keyed by checkpointContext.callIndex. JSON string keys are coerced to numeric call indexes and journaled before replay.",
+    ),
 } as const;
 
 /** z.infer<z.ZodObject<typeof workflowToolInputShape>> — the handler's validated input. */
@@ -74,6 +93,7 @@ export interface WorkflowToolInput {
   agentTimeoutMs?: number | null;
   tokenBudget?: number | null;
   resumeFromRunId?: string;
+  checkpointReplies?: Record<number, unknown>;
 }
 
 /**

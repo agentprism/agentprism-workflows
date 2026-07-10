@@ -46,6 +46,7 @@ export {
   isTimeoutError,
   type WorkflowErrorOptions,
   type AuthErrorContext,
+  type CheckpointContext,
 } from "./errors.js";
 
 // ── Config caps ──

@@ -137,8 +137,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   scriptBackends?: Record<string, WorkflowBackendConfig>;
   /**
    * Ask the human a checkpoint() question and resolve to their reply. Threaded from
-   * a UI-bearing tool context. Absent => headless: checkpoint() takes its declared
-   * default (and journals it), so a detached/background run never hangs.
+   * a UI-bearing tool context. Absent => the checkpoint's headless mode applies:
+   * default (declared default/true), abort, or the opt-in durable pause.
    */
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
@@ -252,10 +252,10 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
 export interface CheckpointOptions {
-  /** Reply used when no UI is available (headless/background) and headless != "abort". */
+  /** Reply used when no UI is available and `headless` is "default" (the default mode). */
   default?: unknown;
-  /** Headless behavior: "default" (take `default`/true) or "abort" (throw). Default "default". */
-  headless?: "default" | "abort";
+  /** Headless behavior: take `default`/true, abort, or durably pause. Default "default". */
+  headless?: "default" | "abort" | "pause";
   /** Confirm | free-text input | pick-one. Affects the hash and the UI widget. */
   kind?: "confirm" | "input" | "select";
   /** For kind "select". */
@@ -992,8 +992,8 @@ export async function runWorkflow<T = unknown>(
   // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it
   // is gated on the agent counter + abort (not budget). On resume the human's reply
   // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
-  // whose steering is in-session only. Headless (no UI threaded in): takes the
-  // declared default and journals THAT, so a detached/background run never hangs.
+  // whose steering is in-session only. Headless defaults remain non-blocking; authors
+  // can opt into a persisted pause with headless:"pause".
   const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
     throwIfAborted();
     if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
@@ -1022,6 +1022,22 @@ export async function runWorkflow<T = unknown>(
         `checkpoint "${promptText}" needs human input but none is available (headless run)`,
         WorkflowErrorCode.WORKFLOW_ABORTED,
         { recoverable: false },
+      );
+    } else if (checkpointOptions.headless === "pause") {
+      throw new WorkflowError(
+        `checkpoint "${promptText}" awaits a human decision`,
+        WorkflowErrorCode.CHECKPOINT_REQUIRED,
+        {
+          recoverable: false,
+          checkpointContext: {
+            callIndex,
+            hash: callHash,
+            prompt: promptText,
+            kind: checkpointOptions.kind ?? "confirm",
+            choices: checkpointOptions.choices,
+            default: checkpointOptions.default,
+          },
+        },
       );
     } else {
       reply = checkpointOptions.default ?? true;

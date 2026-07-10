@@ -34,6 +34,7 @@ test("input shape: there is NO startInBackground field (sync run model dropped i
       "agentRetries",
       "agentTimeoutMs",
       "args",
+      "checkpointReplies",
       "concurrency",
       "maxAgents",
       "resumeFromRunId",
@@ -41,6 +42,23 @@ test("input shape: there is NO startInBackground field (sync run model dropped i
       "tokenBudget",
     ],
     "the exact wire input fields (no background; resume is explicit via resumeFromRunId)",
+  );
+});
+
+test("input shape: checkpointReplies accepts JSON string indexes and coerces them to numeric keys", () => {
+  const parsed = Schema.parse({
+    script: "x",
+    resumeFromRunId: "run-1",
+    checkpointReplies: { "0": true, "12": "ship" },
+  });
+  assert.deepEqual(parsed.checkpointReplies, { 0: true, 12: "ship" });
+  assert.throws(
+    () => Schema.parse({ script: "x", resumeFromRunId: "run-1", checkpointReplies: { nope: true } }),
+    "non-numeric call indexes are rejected",
+  );
+  assert.throws(
+    () => Schema.parse({ script: "x", resumeFromRunId: "run-1", checkpointReplies: { "-1": true } }),
+    "negative call indexes are rejected",
   );
 });
 

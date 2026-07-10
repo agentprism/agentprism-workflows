@@ -163,6 +163,20 @@ test("checkpoint headless:abort is warned about (the dry-run confirm still answe
   assert.match(report.warnings.join("\n"), /headless: "abort"/);
 });
 
+test("checkpoint headless:pause dry-runs through the mock confirm without a warning", async () => {
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "v", description: "d" };',
+      'const decision = await checkpoint("ship?", { headless: "pause", default: "hold" });',
+      'return { decision };',
+    ].join("\n"),
+  );
+
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.dryRun?.checkpoints, [{ prompt: "ship?", kind: "confirm", reply: "hold" }]);
+  assert.doesNotMatch(report.warnings.join("\n"), /headless: "pause"/);
+});
+
 test("fabricateFromSchema covers the portable-schema subset", () => {
   assert.equal(fabricateFromSchema({ type: "string", enum: ["a", "b"] }), "a");
   assert.equal(fabricateFromSchema({ const: 42 }), 42);

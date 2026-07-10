@@ -12,6 +12,7 @@ import {
   WorkflowError,
   WorkflowErrorCode,
   type AuthErrorContext,
+  type CheckpointContext,
 } from "../src/errors.js";
 
 describe("classifyProviderLimit", () => {
@@ -125,6 +126,32 @@ describe("WorkflowError.authContext", () => {
   it("leaves authContext undefined when the option is omitted", () => {
     const e = new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR);
     assert.equal(e.authContext, undefined);
+  });
+});
+
+describe("WorkflowError.checkpointContext", () => {
+  it("round-trips the structured CheckpointContext from options onto the readonly field", () => {
+    const checkpointContext: CheckpointContext = {
+      callIndex: 2,
+      hash: "abc123",
+      prompt: "Ship this release?",
+      kind: "select",
+      choices: ["ship", "hold"],
+      default: "hold",
+    };
+    const error = new WorkflowError(
+      'checkpoint "Ship this release?" awaits a human decision',
+      WorkflowErrorCode.CHECKPOINT_REQUIRED,
+      { recoverable: false, checkpointContext },
+    );
+
+    assert.equal(error.code, WorkflowErrorCode.CHECKPOINT_REQUIRED);
+    assert.deepEqual(error.checkpointContext, checkpointContext);
+  });
+
+  it("leaves checkpointContext undefined when the option is omitted", () => {
+    const error = new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(error.checkpointContext, undefined);
   });
 });
 

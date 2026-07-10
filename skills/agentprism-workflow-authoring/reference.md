@@ -101,11 +101,11 @@ budget.total | budget.spent() | budget.remaining()
 |---|---|---|
 | `kind` | `"confirm" \| "input" \| "select"` | Reply shape: boolean-ish / free text / one of `choices`. Affects the journal hash and the host UI widget. |
 | `choices` | `string[]` | For `kind: "select"`. |
-| `default` | `unknown` | Reply taken when no human is attached (headless) — journaled like a real reply. Defaults to `true`. |
-| `headless` | `"default" \| "abort"` | `"abort"` throws instead of taking the default when no human is attached. |
+| `default` | `unknown` | Reply taken in the default headless mode — journaled like a real reply. Defaults to `true`. |
+| `headless` | `"default" \| "abort" \| "pause"` | No live channel: `"default"` takes `default ?? true`, `"abort"` aborts, and `"pause"` creates a persisted `checkpoint_required` pause. Default `"default"`. |
 | `timeoutMs` | `number` | Deadline for the interactive prompt. |
 
-The host supplies the human channel (`ExecOptions.confirm` in the SDK; elicitation in the MCP server). Replies replay from the journal on resume.
+The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elicitation in the MCP server), and that channel wins even when `headless: "pause"` is declared. A durable pause carries non-secret `checkpointContext`; resume with `ExecOptions.checkpointReplies: { [context.callIndex]: decision }` or attach a live channel. The decision is injected into the journal and replays on later resumes. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
 
 ## Error codes (`WorkflowError.code`)
 
@@ -119,6 +119,7 @@ The host supplies the human channel (`ExecOptions.confirm` in the SDK; elicitati
 | `TOKEN_BUDGET_EXHAUSTED` | no | Run (or phase) token cap hit; further `agent()` calls throw. |
 | `AGENT_LIMIT_EXCEEDED` | no | `maxAgents` cap hit. |
 | `AUTH_REQUIRED` | no | Backend needs authentication. `WorkflowManager` returns a resumable pause with `reason: "auth_required"` and redacted `authContext`; a direct runner throws. The host completes auth before resuming/retrying. |
+| `CHECKPOINT_REQUIRED` | no | `headless: "pause"` reached without a live channel. `WorkflowManager` returns `reason: "checkpoint_required"` plus non-secret `checkpointContext`; resume with `checkpointReplies` or live confirm. |
 | `SCRIPT_VALIDATION_ERROR` | no | Script failed parse/validation (bad meta, nondeterministic API, bad `meta.backends` shape). |
 | `SCRIPT_ERROR` | no | The script itself crashed (uncaught throw, floated rejection). |
 | `WORKFLOW_ABORTED` | — | Real cancellation (pause/stop/host signal) — never used for crashes. |
@@ -131,7 +132,7 @@ The host supplies the human channel (`ExecOptions.confirm` in the SDK; elicitati
 - Each `agent()` call journals its result under a monotonic call index plus an identity hash of `prompt + model + mode-when-set + tier + phase + agentType + agent-definition + schema`.
 - Resume replays the **longest unchanged prefix** as cache hits (zero tokens); the first changed/new call and everything after runs live. `retry`/`gate` chains cache-miss-cascade on resume by design (attempt N+1's prompt embeds attempt N's live result).
 - Additive options are **not** hashed and can differ across resumes: `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`.
-- `checkpoint()` replies are journaled and replay on resume instead of re-asking.
+- `checkpoint()` replies — including synthetic `checkpointReplies` answers — are journaled and replay on resume instead of re-asking.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 
@@ -184,7 +185,8 @@ const run = await runDynamicWorkflow(script, {
     concurrency: 8,                 // concurrent agents (default 8)
     agentTimeoutMs: 600_000,
     agentRetries: 1,                // default retries for recoverable failures
-    confirm: async (text, opts) => true,   // resolves checkpoint(); omit = headless defaults
+    confirm: async (text, opts) => true,   // live checkpoint channel; omit = authored headless mode
+    checkpointReplies: { 2: true },        // resume-only durable checkpoint answers by call index
     onProgress: (snapshot) => {},
   },
 });
@@ -192,7 +194,7 @@ const run = await runDynamicWorkflow(script, {
 // run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
 ```
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`, streams progress, resolves checkpoints via MCP elicitation, and supports `resumeFromRunId`; unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. With the default ACP runner it also registers `workflow_auth_status` and `workflow_authenticate` for authentication pause-and-resume. `AGENTPRISM_MCP_INLINE_AUTH=1` opts into masked elicitation for headlessly collectable methods. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`, streams progress, resolves checkpoints live for elicitation-capable clients, and supports `resumeFromRunId`. Non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from the returned `checkpointContext`; unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. With the default ACP runner it also registers `workflow_auth_status` and `workflow_authenticate` for authentication pause-and-resume. `AGENTPRISM_MCP_INLINE_AUTH=1` opts into masked elicitation for headlessly collectable methods. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
 
 Backend auth comes from the machine the host runs on: Claude via a logged-in Claude Code install or `ANTHROPIC_API_KEY`; Codex via `~/.codex/auth.json`; OpenCode via `opencode auth login` (its CLI must be installed — it is not bundled). A script only needs auth for the backends it actually routes to.
 
@@ -215,7 +217,7 @@ Zero tokens, no ACP processes: a static parse (meta literal, syntax, determinism
 | `--timeout-ms <n>` | dry-run wall-clock limit (default 30000) |
 | `--json` | machine-readable `ValidateWorkflowReport` on stdout |
 
-Exit codes: `0` valid · `1` parse/static failure · `2` dry-run failure · `3` usage error. The report lists every agent call (label, phase, model spec, backend attribution, schema flag), every checkpoint with the default reply the dry run took, and warnings: script-declared backends (approval reminder), declared-but-unused / used-but-undeclared phases, `headless: "abort"` checkpoints, agent-less scripts. Checkpoints resolve exactly like a headless run (`default ?? true`). Limits: `workflow("<saved-name>")` fails without `--workflows-dir` (the report warns and names the fix); the mock's all-success answers can't exercise failure-handling branches — `null`-path handling still needs your own reading.
+Exit codes: `0` valid · `1` parse/static failure · `2` dry-run failure · `3` usage error. The report lists every agent call (label, phase, model spec, backend attribution, schema flag), every checkpoint with the reply the mock confirm took (`default ?? true`), and warnings: script-declared backends (approval reminder), declared-but-unused / used-but-undeclared phases, `headless: "abort"` checkpoints, agent-less scripts. Because validation supplies that mock live channel, `headless: "pause"` dry-runs cleanly; the abort warning remains because a truly unattended run would abort. Limits: `workflow("<saved-name>")` fails without `--workflows-dir` (the report warns and names the fix); the mock's all-success answers can't exercise failure-handling branches — `null`-path handling still needs your own reading.
 
 Programmatic: `validateWorkflowScript(script, { args, workflows, dryRun, cwd, tokenBudget, maxAgents, timeoutMs })` from `@automatalabs/workflows` returns the same report object and never throws for an invalid script.
 

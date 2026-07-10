@@ -22,7 +22,7 @@ export {
   isAuthRequired,
   classifyProviderLimit,
 } from "@automatalabs/shared-types";
-export type { WorkflowErrorOptions, AuthErrorContext } from "@automatalabs/shared-types";
+export type { WorkflowErrorOptions, AuthErrorContext, CheckpointContext } from "@automatalabs/shared-types";
 
 export function isAbortError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
