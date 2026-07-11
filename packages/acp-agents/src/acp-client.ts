@@ -194,6 +194,7 @@ class SessionState {
   rawResultSuccess: RawResultSuccess | undefined;
   modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
+  private finalMessageStartIndex = 0;
 
   /** `label`/`runId` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
@@ -223,11 +224,20 @@ class SessionState {
       this.history.length = 0;
       this.turnStartIndex = 0;
     }
+    this.finalMessageStartIndex = this.turnStartIndex;
     this.rawResultSuccess = undefined;
   }
 
   currentTurnText(): string {
     return this.textChunks.slice(this.turnStartIndex).join("");
+  }
+
+  /** The turn's FINAL assistant message: only the chunks streamed after the last content event
+   *  that isn't an assistant message chunk (tool call, thought, plan). A backend whose schema
+   *  constraint applies turn-wide (Codex) emits schema-shaped intermediate progress messages;
+   *  structured extraction must read this, never the whole-turn concatenation. */
+  finalMessageText(): string {
+    return this.textChunks.slice(this.finalMessageStartIndex).join("");
   }
 
   applyUpdate(update: SessionNotification["update"]): void {
@@ -245,6 +255,7 @@ class SessionState {
         break;
       }
       case "tool_call": {
+        this.finalMessageStartIndex = this.textChunks.length;
         this.history.push({
           role: "tool",
           kind: "toolCall",
@@ -252,6 +263,15 @@ class SessionState {
           toolName: toolNameFromMeta(update._meta) ?? update.kind,
           timestamp: Date.now(),
         });
+        break;
+      }
+      // Any other CONTENT event also ends the in-flight assistant message — text streamed after
+      // it belongs to a new message. Bookkeeping updates (usage, mode) never break a message.
+      case "user_message_chunk":
+      case "agent_thought_chunk":
+      case "tool_call_update":
+      case "plan": {
+        this.finalMessageStartIndex = this.textChunks.length;
         break;
       }
       case "usage_update": {
@@ -1992,6 +2012,11 @@ export class SessionHandle implements StructuredSource {
   /** StructuredSource — the latest turn's assistant text. */
   currentTurnText(): string {
     return this.state.currentTurnText();
+  }
+
+  /** StructuredSource — the latest turn's FINAL assistant message (see SessionState). */
+  finalMessageText(): string {
+    return this.state.finalMessageText();
   }
 
   /** StructuredSource — Claude's raw structured_output for the latest turn, if any. */

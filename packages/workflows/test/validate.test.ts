@@ -29,7 +29,7 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
     'phase("Fan");',
     "const pair = await parallel([",
     '  () => agent("a", { label: "claude-side", model: "opus", schema: S }),',
-    '  () => agent("b", { label: "codex-side", model: "gpt-5-codex[high]" }),',
+    '  () => agent("b", { label: "codex-side", model: "gpt-5.6-luna[high]" }),',
     "]);",
     'phase("Judge");',
     'const go = await checkpoint("proceed?", { kind: "confirm", default: false });',

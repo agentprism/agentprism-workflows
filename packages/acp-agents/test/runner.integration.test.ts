@@ -126,7 +126,7 @@ test("(4) schema never satisfied after the ladder => SCHEMA_NONCOMPLIANCE (non-r
   await assert.rejects(
     () =>
       makeRunner().run("give me json", {
-        model: "openai/gpt-5-codex",
+        model: "openai/gpt-5.6-luna",
         schema: SCHEMA,
         cwd,
         maxSchemaRetries: 0, // no repair turns -> fail fast after the first turn
@@ -151,7 +151,7 @@ test("(2b) Codex forwards the strict schema via _meta[outputSchema] into the tur
     turns: [{ text: JSON.stringify({ city: "NYC", hot: true }) }],
   });
   const out = await makeRunner().run("weather?", {
-    model: "openai/gpt-5-codex",
+    model: "openai/gpt-5.6-luna",
     schema: SCHEMA,
     cwd,
   });
@@ -169,6 +169,32 @@ test("(2b) Codex forwards the strict schema via _meta[outputSchema] into the tur
   });
   // Codex carries NOTHING at session/new (schema rides the turn)
   assert.equal(entries.find((e) => e.method === "newSession")?.params?._meta ?? undefined, undefined);
+});
+
+test("(2b) schema result is the FINAL assistant message — a schema-shaped progress message never wins", async () => {
+  // Codex's turn-wide Responses constraint makes intermediate progress messages conform to the
+  // schema too (field report). The turn below streams: progress JSON -> tool call -> final JSON.
+  // Extraction must return the final object; a whole-turn first-JSON scan would return progress.
+  const progress = JSON.stringify({ city: "progress-not-result", hot: false });
+  const final = JSON.stringify({ city: "LA", hot: true });
+  const { cwd } = configure({
+    turns: [
+      {
+        updates: [
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: progress } },
+          { sessionUpdate: "tool_call", toolCallId: "tc-seg-1", title: "search the codebase", kind: "search", status: "in_progress" },
+          { sessionUpdate: "tool_call_update", toolCallId: "tc-seg-1", status: "completed" },
+        ],
+        text: final,
+      },
+    ],
+  });
+  const out = await makeRunner().run("structured please", {
+    model: "openai/gpt-5.6-luna",
+    schema: SCHEMA,
+    cwd,
+  });
+  assert.deepEqual(out, { city: "LA", hot: true });
 });
 
 // ---- (3b) Claude schema channel + structured_output read ----------------------------
@@ -311,7 +337,7 @@ test("(#2) refusal on a SCHEMA run is NOT burned through the repair ladder into 
   await assert.rejects(
     () =>
       makeRunner().run("give me json", {
-        model: "openai/gpt-5-codex",
+        model: "openai/gpt-5.6-luna",
         schema: SCHEMA,
         cwd,
         maxSchemaRetries: 3, // 3 repair turns WOULD fire if we entered the ladder
@@ -336,7 +362,7 @@ test("(#2) stopReason 'max_tokens' => distinct 'output truncated' failure, even 
   await assert.rejects(
     () =>
       makeRunner().run("weather?", {
-        model: "openai/gpt-5-codex",
+        model: "openai/gpt-5.6-luna",
         schema: SCHEMA,
         cwd,
         maxSchemaRetries: 3,
@@ -397,8 +423,8 @@ test("(#3) a model[effort] spec drives the reasoning_effort config option via se
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "reasoning_effort",
@@ -417,14 +443,14 @@ test("(#3) a model[effort] spec drives the reasoning_effort config option via se
   });
   const resolved: string[] = [];
   const out = await makeRunner().run("hi", {
-    model: "openai/gpt-5.1-codex[high]",
+    model: "openai/gpt-5.6-luna[high]",
     cwd,
     onModelResolved: (m) => resolved.push(m),
   });
   assert.equal(out, "ok");
   // The bracket strips off for the model select (matches the bare base id); the effort rides
   // the separate reasoning_effort option.
-  assert.deepEqual(resolved, ["gpt-5.1-codex"]);
+  assert.deepEqual(resolved, ["gpt-5.6-luna"]);
 
   const effortSet = readLog().find(
     (e) => e.method === "setSessionConfigOption" && e.params?.configId === "reasoning_effort",
@@ -441,8 +467,8 @@ test("(#3) a `fast` bracket token turns the advertised Fast-mode option on", asy
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "fast-mode",
@@ -458,7 +484,7 @@ test("(#3) a `fast` bracket token turns the advertised Fast-mode option on", asy
     ],
     turns: [{ text: "ok" }],
   });
-  await makeRunner().run("hi", { model: "openai/gpt-5.1-codex[high fast]", cwd });
+  await makeRunner().run("hi", { model: "openai/gpt-5.6-luna[high fast]", cwd });
   const fastSet = readLog().find(
     (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
   );
@@ -476,8 +502,8 @@ test("(#3) a `fast` bracket token turns a BOOLEAN-typed Fast-mode option on", as
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "fast-mode",
@@ -491,7 +517,7 @@ test("(#3) a `fast` bracket token turns a BOOLEAN-typed Fast-mode option on", as
   });
   const fallbacks: string[] = [];
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.1-codex[fast]",
+    model: "openai/gpt-5.6-luna[fast]",
     cwd,
     onModelFallback: (s) => fallbacks.push(s),
   });
@@ -512,8 +538,8 @@ test("(#3) a boolean Fast-mode option already ON is left untouched", async () =>
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "fast-mode",
@@ -525,7 +551,7 @@ test("(#3) a boolean Fast-mode option already ON is left untouched", async () =>
     ],
     turns: [{ text: "ok" }],
   });
-  await makeRunner().run("hi", { model: "openai/gpt-5.1-codex[fast]", cwd });
+  await makeRunner().run("hi", { model: "openai/gpt-5.6-luna[fast]", cwd });
   const fastSet = readLog().find(
     (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
   );
@@ -540,8 +566,8 @@ test("(#3) a plain effort spec does NOT touch a Fast-mode option that is adverti
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "fast-mode",
@@ -557,7 +583,7 @@ test("(#3) a plain effort spec does NOT touch a Fast-mode option that is adverti
     ],
     turns: [{ text: "ok" }],
   });
-  await makeRunner().run("hi", { model: "openai/gpt-5.1-codex[high]", cwd });
+  await makeRunner().run("hi", { model: "openai/gpt-5.6-luna[high]", cwd });
   const fastSet = readLog().find(
     (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
   );
@@ -574,8 +600,8 @@ test("(#4) a model[high] whose 'high' effort is NOT advertised fires onModelFall
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "reasoning_effort",
@@ -595,14 +621,14 @@ test("(#4) a model[high] whose 'high' effort is NOT advertised fires onModelFall
   const resolved: string[] = [];
   const fallbacks: string[] = [];
   const out = await makeRunner().run("hi", {
-    model: "openai/gpt-5.1-codex[high]",
+    model: "openai/gpt-5.6-luna[high]",
     cwd,
     onModelResolved: (m) => resolved.push(m),
     onModelFallback: (s) => fallbacks.push(s),
   });
   assert.equal(out, "ok");
   // The MODEL still resolved (the bare base id matched); only the effort tier could not apply.
-  assert.deepEqual(resolved, ["gpt-5.1-codex"]);
+  assert.deepEqual(resolved, ["gpt-5.6-luna"]);
   // The unmet effort is surfaced on the same channel model fallback uses — exactly once.
   assert.equal(fallbacks.length, 1, "the unadvertised 'high' effort fires onModelFallback once");
   assert.match(fallbacks[0], /reasoning_effort/i);
@@ -622,8 +648,8 @@ test("(#4) an ADVERTISED effort applies cleanly and does NOT fire onModelFallbac
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "reasoning_effort",
@@ -642,7 +668,7 @@ test("(#4) an ADVERTISED effort applies cleanly and does NOT fire onModelFallbac
   });
   const fallbacks: string[] = [];
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.1-codex[high]",
+    model: "openai/gpt-5.6-luna[high]",
     cwd,
     onModelFallback: (s) => fallbacks.push(s),
   });
@@ -662,8 +688,8 @@ test("(#4) an unadvertised Fast mode also surfaces on the fallback channel", asy
         type: "select",
         name: "Model",
         category: "model",
-        currentValue: "gpt-5.1-codex",
-        options: [{ value: "gpt-5.1-codex", name: "GPT-5.1 Codex" }],
+        currentValue: "gpt-5.6-luna",
+        options: [{ value: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
       },
       {
         id: "reasoning_effort",
@@ -683,7 +709,7 @@ test("(#4) an unadvertised Fast mode also surfaces on the fallback channel", asy
   });
   const fallbacks: string[] = [];
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.1-codex[high fast]",
+    model: "openai/gpt-5.6-luna[high fast]",
     cwd,
     onModelFallback: (s) => fallbacks.push(s),
   });
@@ -754,7 +780,7 @@ test("(#5b) Codex session/new carries the runId _meta even though the schema rid
     turns: [{ text: JSON.stringify({ city: "NYC", hot: true }) }],
   });
   await makeRunner().run("weather?", {
-    model: "openai/gpt-5-codex",
+    model: "openai/gpt-5.6-luna",
     schema: SCHEMA,
     cwd,
     runId: "run-codex-1",
@@ -773,7 +799,7 @@ test("(#5b) Codex session/new carries the runId _meta even though the schema rid
 test("(#instr) RunOptions base/developerInstructions reach Codex session/new _meta (bare keys)", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   await makeRunner().run("hi", {
-    model: "openai/gpt-5-codex",
+    model: "openai/gpt-5.6-luna",
     cwd,
     baseInstructions: "You only write Rust.",
     developerInstructions: "Prefer iterators.",
@@ -791,7 +817,7 @@ test("(#instr) RunOptions base/developerInstructions reach Codex session/new _me
 test("(#instr) instructions coexist with the runId stamp at Codex session/new", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   await makeRunner().run("hi", {
-    model: "openai/gpt-5-codex",
+    model: "openai/gpt-5.6-luna",
     cwd,
     runId: "run-xyz",
     baseInstructions: "BASE",

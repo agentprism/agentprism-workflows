@@ -782,7 +782,9 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
             // instead of silently continuing the ladder.
             assertNormalStopReason(repromptResponse.stopReason, opts.label);
           },
-          lastText: () => activeSession.currentTurnText(),
+          // Final message only, matching nativeStructured: prose extraction over the whole turn
+          // would resurrect the first-JSON-wins bug for schema-shaped progress messages.
+          lastText: () => activeSession.finalMessageText(),
           tryCaptured: structuredTool ? () => structuredTool?.tryCaptured() : undefined,
           tryNative: () => prepared.backend.nativeStructured(activeSession),
         };

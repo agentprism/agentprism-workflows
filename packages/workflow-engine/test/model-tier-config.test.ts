@@ -83,11 +83,11 @@ describe("model-tier-config", () => {
     it("returns the model for a valid tier", async () => {
       const { resolveTierModel } = await loadModule();
       const config = {
-        tiers: { small: "openai/gpt-4.1-mini", medium: "openai/gpt-4.1", big: "openai/gpt-5" },
+        tiers: { small: "openai/gpt-4.1-mini", medium: "openai/gpt-4.1", big: "openai/gpt-5.6-luna" },
       };
       assert.equal(resolveTierModel("small", config), "openai/gpt-4.1-mini");
       assert.equal(resolveTierModel("medium", config), "openai/gpt-4.1");
-      assert.equal(resolveTierModel("big", config), "openai/gpt-5");
+      assert.equal(resolveTierModel("big", config), "openai/gpt-5.6-luna");
     });
 
     it("returns undefined for unknown tier name", async () => {
@@ -107,7 +107,7 @@ describe("model-tier-config", () => {
       const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
       const cfgPath = join(tmpDir, "model-tiers.json");
       const config = {
-        tiers: { small: "gpt-4.1-mini", medium: "gpt-4.1", big: "gpt-5" },
+        tiers: { small: "gpt-4.1-mini", medium: "gpt-4.1", big: "gpt-5.6-luna" },
       };
       saveModelTierConfig(config, cfgPath);
       const loaded = loadModelTierConfig(cfgPath);
@@ -170,13 +170,13 @@ describe("model-tier-config", () => {
   describe("sortedTierNames", () => {
     it("returns names sorted: small < medium < big", async () => {
       const { sortedTierNames } = await loadModule();
-      const config = { tiers: { big: "gpt-5", small: "gpt-4.1-mini", medium: "gpt-4.1" } };
+      const config = { tiers: { big: "gpt-5.6-luna", small: "gpt-4.1-mini", medium: "gpt-4.1" } };
       assert.deepEqual(sortedTierNames(config), ["small", "medium", "big"]);
     });
 
     it("places custom tier names alphabetically after the standard ones", async () => {
       const { sortedTierNames } = await loadModule();
-      const config = { tiers: { xlarge: "gpt-5", medium: "gpt-4.1", small: "gpt-4.1-mini" } };
+      const config = { tiers: { xlarge: "gpt-5.6-luna", medium: "gpt-4.1", small: "gpt-4.1-mini" } };
       assert.deepEqual(sortedTierNames(config), ["small", "medium", "xlarge"]);
     });
   });
