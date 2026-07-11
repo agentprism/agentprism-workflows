@@ -2159,8 +2159,10 @@ function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfi
 
 /**
  * Best-effort match of a model spec (`provider/modelId`, a bare `modelId`, or a tier word)
- * against the agent's catalog. Tries, in priority order: exact spec, exact id-after-slash,
- * the bare base id (with the `[effort]` bracket stripped, so `gpt-5.1-codex[high]` matches a
+ * against the agent's catalog. Tries, in priority order: exact spec, the exact spec with its
+ * `[effort]` bracket stripped (so `zai/glm-5.2[max]` matches its own provider's `zai/glm-5.2`
+ * before any cross-provider lookalike), exact id-after-slash, the bare base id (bracket
+ * stripped, so `gpt-5.1-codex[high]` matches a
  * bare `gpt-5.1-codex` model value while the bracket separately drives reasoning_effort), the
  * Codex `base[effort]` encoding, exact option name, then substring fallbacks. The effort
  * bracket itself is applied via applyModelModifiers, not folded into the model select.
@@ -2171,10 +2173,16 @@ function matchModelValue(
 ): SessionConfigSelectOption | undefined {
   const afterSlash = spec.includes("/") ? spec.slice(spec.indexOf("/") + 1) : spec;
   const fullLower = spec.toLowerCase();
+  const fullBaseLower = stripEffortBracket(fullLower);
   const idLower = afterSlash.toLowerCase();
   const baseLower = stripEffortBracket(afterSlash).toLowerCase();
   const tests: Array<(value: SessionConfigSelectOption) => boolean> = [
     (value) => value.value.toLowerCase() === fullLower,
+    // The provider-prefixed spec with the bracket stripped ("zai/glm-5.2[max]" ->
+    // "zai/glm-5.2") — without this, a bracketed spec whose provider serves a model
+    // that OTHER providers also list never exact-matches and falls through to the
+    // substring tests, which can pick a different provider's entry for the same model.
+    (value) => value.value.toLowerCase() === fullBaseLower,
     (value) => value.value.toLowerCase() === idLower,
     (value) => value.value.toLowerCase() === baseLower,
     (value) => value.value.toLowerCase().startsWith(`${baseLower}[`),

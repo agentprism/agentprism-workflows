@@ -601,6 +601,10 @@ the exhaustive option tables.
 
 ## See also
 
+- **[`examples/`](examples/)** — runnable examples: `repo-triage`, a complete standalone
+  project (own `package.json`, TypeScript host, external workflow scripts) running an
+  autonomous cross-vendor triage; and `image-gate`, a single gated script with an
+  MCP-wired image producer.
 - **[`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server)** — the
   stdio MCP server built on this SDK. It wraps the same engine + ACP backend behind `workflow`
   and conditional auth tools (bin: `agentprism-workflow`) for any MCP host. Use it when you want the

@@ -1,0 +1,24 @@
+{
+  "name": "agentprism-example-repo-triage",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Standalone example project: an autonomous cross-vendor repo triage built on the @automatalabs/workflows SDK",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "validate": "agentprism-workflows validate repo-triage --workflows-dir workflows && agentprism-workflows validate quick-wins --workflows-dir workflows"
+  },
+  "dependencies": {
+    "@automatalabs/workflows": "^0.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.0"
+  }
+}
