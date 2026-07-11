@@ -80,6 +80,7 @@ import {
   type AuthMethodType,
   type BackendAuthState,
 } from "./auth/auth-store.js";
+import { ProviderStore } from "./provider-store.js";
 import type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 import {
@@ -258,6 +259,19 @@ export interface AuthCapableRunner {
   readonly auth: AuthController;
 }
 
+/** Structural capability interface the MCP composition root duck-types to register the provider
+ *  tools, symmetric to AuthCapableRunner and equally seam-preserving. `AcpAgentRunner` implements
+ *  it. This is the GENERIC base-spec `providers/*` surface: every method is advertise-gated per
+ *  backend (`agentCapabilities.providers`), so any spec-conformant agent that advertises the
+ *  unstable providers block is served with zero agent-specific code. */
+export interface ProviderCapableRunner {
+  listProviders(opts?: ListProvidersOptions): Promise<ListProvidersResponse>;
+  setProvider(opts: SetProviderOptions): Promise<SetProviderResponse | void>;
+  disableProvider(opts: DisableProviderOptions): Promise<DisableProviderResponse | void>;
+  /** Ids of every configured backend (built-ins + AcpRunnerOptions.backends). */
+  listBackends(): string[];
+}
+
 /** Constructor options for the runner: pool sizing, client-side handlers, and the custom-backend
  *  registry. `backends` merges over (and wins against) env-declared AGENTPRISM_BACKENDS entries. */
 export interface AcpRunnerOptions extends AcpPoolOptions {
@@ -288,7 +302,7 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
  * pass it into managers/runs as needed, then call dispose() (or use `await using`) when that
  * owner is done with the pooled and dedicated backend processes.
  */
-export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
+export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderCapableRunner {
   private readonly pool: AcpAgentPool;
   /** The resolved custom-backend registry (env + option, validated at construction). */
   private readonly backends: BackendRegistry;
@@ -312,6 +326,11 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
    *  home for credential material in the library. Threaded into the pool and every dedicated
    *  connection so all connection types reconcile to the same intent. */
   private readonly authStore = new AuthStore();
+  /** The single per-runner provider-intent store — the providers/* sibling of the AuthStore.
+   *  setProvider records here after the wire call succeeds; every connection (pooled and
+   *  dedicated) replays the recorded routing at initialize, so client-configured providers
+   *  survive pool recycles and dispose-after-use dedicated connections. */
+  private readonly providerStore = new ProviderStore();
   /** The auth verbs as one addressable object (§2.10). */
   readonly auth: AuthController;
   private readonly structuredOutputTools = new StructuredOutputToolHost();
@@ -344,6 +363,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
       advertiseElicitation: Boolean(options.onElicitation),
       authCapabilities: this.authCapabilities,
       authStore: this.authStore,
+      providerStore: this.providerStore,
     });
     this.backends = resolveBackendRegistry(options.backends);
     this.auth = {
@@ -485,7 +505,13 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
     }
   }
 
-  /** Configure one provider on the selected backend. */
+  /** Configure one provider on the selected backend. The wire call validates against the live
+   *  agent (unknown providerId/apiType errors surface immediately); on success the routing is
+   *  recorded as a durable intent — provider config is in-process agent state for e.g. codex-acp,
+   *  so without the record this dedicated connection's dispose would silently discard it (the
+   *  providers/* sibling of the dispose-after-authenticate bug). Every later connection replays
+   *  the intent at initialize, and the pool recycles so no session runs under stale routing.
+   *  The request-scoped `meta` passthrough rides the immediate call only; it is not replayed. */
   async setProvider(opts: SetProviderOptions): Promise<SetProviderResponse | void> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     validateRequiredString(opts.providerId, opts.label, "setProvider", "providerId");
@@ -504,6 +530,13 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
         ...(opts.meta ? { _meta: opts.meta } : {}),
       };
       const response = await connection.setProvider(request, opts.label);
+      this.providerStore.record(backend.poolKey ?? backend.id, {
+        providerId: opts.providerId,
+        apiType: opts.apiType,
+        baseUrl: opts.baseUrl,
+        ...(opts.headers ? { headers: opts.headers } : {}),
+      });
+      this.pool.recycle(backend.poolKey ?? backend.id);
       opts.signal?.throwIfAborted();
       if (this.disposed) throw new Error("ACP agent runner is disposed");
       return response;
@@ -512,7 +545,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
     }
   }
 
-  /** Disable one provider on the selected backend. */
+  /** Disable one provider on the selected backend, drop its recorded routing intent, and recycle
+   *  the pool so no future session replays it. Idempotent like the wire method. */
   async disableProvider(opts: DisableProviderOptions): Promise<DisableProviderResponse | void> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     validateRequiredString(opts.providerId, opts.label, "disableProvider", "providerId");
@@ -526,6 +560,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
         ...(opts.meta ? { _meta: opts.meta } : {}),
       };
       const response = await connection.disableProvider(request, opts.label);
+      this.providerStore.remove(backend.poolKey ?? backend.id, opts.providerId);
+      this.pool.recycle(backend.poolKey ?? backend.id);
       opts.signal?.throwIfAborted();
       if (this.disposed) throw new Error("ACP agent runner is disposed");
       return response;
@@ -949,9 +985,11 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner {
       elicitationResolver: this.elicitationResolver,
       advertiseElicitation: Boolean(this.elicitationResolver),
       authCapabilities: this.authCapabilities,
-      // Same store as the pool: a dedicated connection re-primes the durable intent at its own
-      // initialize (§2.5) — the direct fix for the dispose-after-authenticate bug (gap 3).
+      // Same stores as the pool: a dedicated connection re-primes the durable auth intent AND the
+      // recorded provider routing at its own initialize (§2.5) — the direct fix for the
+      // dispose-after-authenticate bug (gap 3) and its providers/* sibling.
       authStore: this.authStore,
+      providerStore: this.providerStore,
       clientHandlers: this.clientHandlers,
     });
   }

@@ -432,10 +432,12 @@ test("(#3) a model[effort] spec drives the reasoning_effort config option via se
         name: "Reasoning effort",
         category: "thought_level",
         currentValue: "medium",
+        // codex-acp 1.6.0 capitalizes the display NAMES while the wire VALUES stay lowercase;
+        // effort matching keys on value only, so the bracket token still lands.
         options: [
-          { value: "low", name: "low" },
-          { value: "medium", name: "medium" },
-          { value: "high", name: "high" },
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
         ],
       },
     ],

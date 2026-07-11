@@ -566,6 +566,7 @@ AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsa
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig,
 InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
+ProviderCapableRunner,        // duck-type gate for the MCP provider tools (providers/list|set|disable)
 ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,
 // ACP events: the runner.on(...) surface
 AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext,

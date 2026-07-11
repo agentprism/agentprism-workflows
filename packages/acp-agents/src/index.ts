@@ -19,6 +19,7 @@ export type {
   ListProvidersOptions,
   ListSessionsOptions,
   LogoutOptions,
+  ProviderCapableRunner,
   ReattachSessionOptions,
   SetProviderOptions,
 } from "./runner.js";
@@ -41,6 +42,10 @@ export type {
   CredentialClass,
   RedactedIntent,
 } from "./auth/auth-store.js";
+// The provider-routing intent store — the providers/* sibling of the AuthStore: recorded on a
+// successful setProvider, replayed on every connection's initialize, generation-gated by the pool.
+export { ProviderStore } from "./provider-store.js";
+export type { ProviderIntent } from "./provider-store.js";
 // Per-agent auth profiles (§3): the pure-data adapters wired onto the built-in backends. Custom
 // backends supply none (conformance-by-absence, §3.5).
 export { claudeAuthProfile, codexAuthProfile, opencodeAuthProfile } from "./auth/auth-profiles.js";

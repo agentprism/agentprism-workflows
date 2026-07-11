@@ -36,6 +36,25 @@ export type {
   AuthenticateToolResult,
   AuthenticateMapping,
 } from "./auth-tool-io.js";
+export {
+  providersInputShape,
+  providersOutputShape,
+  setProviderInputShape,
+  setProviderOutputShape,
+  disableProviderInputShape,
+  disableProviderOutputShape,
+  projectProviderInfo,
+  formatProvidersSummary,
+  formatSetProviderSummary,
+  formatDisableProviderSummary,
+} from "./provider-tool-io.js";
+export type {
+  ProvidersToolProvider,
+  ProvidersToolBackend,
+  ProvidersToolResult,
+  SetProviderToolResult,
+  DisableProviderToolResult,
+} from "./provider-tool-io.js";
 export { createDeferredMcpAuthResolver } from "./auth-resolver.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";

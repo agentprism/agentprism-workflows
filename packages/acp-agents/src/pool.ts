@@ -17,6 +17,7 @@ import { mapThrownError } from "./errors-map.js";
 import type { AcpEventSink } from "./events.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 import type { AuthStore, BackendAuthMachine } from "./auth/auth-store.js";
+import type { ProviderStore } from "./provider-store.js";
 
 const DEFAULT_POOL_SIZE = 1;
 const POOL_SIZE_ENV = "AGENTPRISM_ACP_POOL_SIZE";
@@ -42,6 +43,11 @@ export interface AcpPoolDeps {
    *  no session is ever opened on a connection whose applied intent-generation is stale. Undefined
    *  => no gating, byte-identical to the pre-auth baseline. */
   authStore?: AuthStore;
+  /** The runner's single provider-intent store. When present, connection selection is also gated
+   *  on the provider-routing generation, so no session is ever opened on a process still running
+   *  under stale (or missing) client-configured provider routing. Undefined or never-recorded =>
+   *  no gating, byte-identical baseline. */
+  providerStore?: ProviderStore;
 }
 
 /** Resolve the per-backend pool size: explicit option wins, else env, else 1. Clamped to >= 1. */
@@ -127,8 +133,15 @@ export class AcpAgentPool {
     const connections = this.connectionsFor(key);
 
     if (machine) this.reconcileStale(key, machine);
+    this.reconcileProviderStale(key);
 
-    const usable = connections.filter((c) => c.alive && !c.recyclePending && !machine?.isStale(c.authStamp));
+    const usable = connections.filter(
+      (c) =>
+        c.alive &&
+        !c.recyclePending &&
+        !machine?.isStale(c.authStamp) &&
+        !this.deps.providerStore?.isStale(key, c.providerStamp),
+    );
     const idle = usable.find((c) => c.activeSessions === 0);
     if (idle) return idle;
 
@@ -157,12 +170,32 @@ export class AcpAgentPool {
     }
   }
 
+  /** Reconcile every live connection for a key to the current provider-routing generation. There
+   *  is no live re-apply lane here (provider changes are rare host-level config): an idle stale
+   *  process is recycled now, a busy one drains and recycles on release — mirroring the
+   *  disk/spawn-env branches of reconcileStale. Never blocks. */
+  private reconcileProviderStale(key: string): void {
+    const store = this.deps.providerStore;
+    if (!store) return;
+    for (const c of this.connectionsFor(key).filter((c) => c.alive)) {
+      if (!store.isStale(key, c.providerStamp)) continue;
+      if (c.activeSessions === 0) {
+        void c.dispose();
+        this.drop(key, c);
+      } else {
+        c.recyclePending = true; // BUSY: drain, then dispose-and-drop on release
+      }
+    }
+  }
+
   /** Public: reconcile every live connection for a backend to the current generation (§2.6). Called
-   *  by the runner immediately after a host-completed auth so a subsequent run() lands current. */
+   *  by the runner immediately after a host-completed auth — or a provider-routing change — so a
+   *  subsequent run() lands current. */
   recycle(poolKey: string): void {
     if (this.disposed) return;
     const machine = this.deps.authStore?.existing(poolKey);
     if (machine) this.reconcileStale(poolKey, machine);
+    this.reconcileProviderStale(poolKey);
   }
 
   /** Spawn a fresh pooled connection (a fresh process primes the current intent at initialize). */
@@ -176,6 +209,7 @@ export class AcpAgentPool {
       advertiseElicitation: this.deps.advertiseElicitation,
       authCapabilities: this.deps.authCapabilities,
       authStore: this.deps.authStore,
+      providerStore: this.deps.providerStore,
       clientHandlers: this.clientHandlers,
     });
     this.connectionsFor(key).push(connection);

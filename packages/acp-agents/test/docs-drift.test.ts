@@ -113,11 +113,19 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   for (const contract of [
     "`workflow_auth_status`",
     "`workflow_authenticate`",
+    "`workflow_providers`",
+    "`workflow_set_provider`",
+    "`workflow_disable_provider`",
     "OpenCode",
     "`AGENTPRISM_MCP_INLINE_AUTH`",
     "`AGENTPRISM_PERSISTENCE_ROOT`",
   ]) {
     assert.ok(mcpReadme.includes(contract), `MCP README must document ${contract}`);
+  }
+  // The provider tools are documented in the central API reference too.
+  const apiDocs = readRepoFile("docs/api.md");
+  for (const tool of ["`workflow_providers`", "`workflow_set_provider`", "`workflow_disable_provider`"]) {
+    assert.ok(apiDocs.includes(tool), `docs/api.md must document ${tool}`);
   }
   assert.ok(!mcpReadme.includes("return r.text"), "schema-less MCP examples return a string directly");
 
