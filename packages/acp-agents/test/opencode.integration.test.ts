@@ -127,6 +127,37 @@ test("OpenCode bracket modifier rides the stripped inner spec into the effort co
   assert.equal(configCalls(readLog(), "effort")[0]?.params?.value, "high");
 });
 
+test("a bracketed provider-prefixed spec exact-matches its own provider's entry, never a cross-provider lookalike", async () => {
+  const { cwd, readLog } = configure({
+    turns: [{ text: "ok" }],
+    configOptions: [
+      {
+        id: "model",
+        type: "select",
+        name: "Model",
+        category: "model",
+        currentValue: "opencode/big-pickle",
+        options: [
+          // Ordered like OpenCode's real catalog: cross-provider entries serving the same
+          // model name sort BEFORE the provider the spec names. The substring fallback
+          // would pick the first of them; the bracket-stripped exact test must win.
+          { value: "huggingface/zai-org/GLM-5.2", name: "Hugging Face/GLM-5.2" },
+          { value: "openrouter/z-ai/glm-5.2", name: "OpenRouter/GLM-5.2" },
+          { value: "opencode/big-pickle", name: "Big Pickle" },
+          { value: "zai/glm-5.2", name: "Z.AI/GLM-5.2" },
+        ],
+      },
+      OPENCODE_CONFIG_OPTIONS[1],
+      OPENCODE_CONFIG_OPTIONS[2],
+    ],
+  });
+
+  assert.equal(await makeRunner().run("hi", { model: "opencode/zai/glm-5.2[high]", cwd }), "ok");
+
+  assert.equal(configCalls(readLog(), "model")[0]?.params?.value, "zai/glm-5.2");
+  assert.equal(configCalls(readLog(), "effort")[0]?.params?.value, "high");
+});
+
 test("OpenCode config-option mode catalog applies mode via session/set_config_option", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "planned" }] });
 
