@@ -138,6 +138,7 @@ import {
   type BackendAuthMachine,
   type ConnectionAuthStamp,
 } from "./auth/auth-store.js";
+import type { ProviderStore } from "./provider-store.js";
 
 /** A benign client identity. NOT JetBrains/IntelliJ 2026.1 — that exact identity makes
  *  codex-acp disable session config options (our model/effort routing channel). */
@@ -923,6 +924,11 @@ export interface PooledConnectionDeps {
    *  collected `env_var` values, and carries a generation stamp the pool gates selection on.
    *  Undefined => no auth wiring, byte-identical to the pre-auth baseline (default-OFF). */
   authStore?: AuthStore;
+  /** The runner's single provider-intent store. When present, this connection replays the recorded
+   *  `providers/set` intents at the end of `initialize` (provider routing is in-process agent state
+   *  for e.g. codex-acp — the same dispose-after-configure class as auth gap 3) and carries a
+   *  generation stamp the pool gates selection on. Undefined or empty => byte-identical baseline. */
+  providerStore?: ProviderStore;
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
 }
@@ -958,9 +964,14 @@ export class PooledConnection {
   private readonly advertiseElicitation: boolean;
   private readonly authCapabilities: { terminal?: boolean; gateway?: boolean } | undefined;
   private readonly authStore: AuthStore | undefined;
+  private readonly providerStore: ProviderStore | undefined;
   /** Which intent-generation THIS process reflects (§2.4). Starts at -1/false so a connection with
    *  no applied intent is stale against a machine that has ever advanced past generation 0. */
   authStamp: ConnectionAuthStamp = { appliedGeneration: -1, applied: false, trippedAuthRequired: false };
+  /** Which provider-store generation THIS process replayed at initialize. Starts at 0 (== the
+   *  store's empty-pool generation), so the pre-provider baseline is never stale; the first
+   *  recorded intent advances the store past it and recycles older processes. */
+  providerStamp = 0;
   /** Set by the pool when a busy stale connection must be recycled once it drains (§2.6). While set,
    *  the connection is never handed a new session and is disposed-and-dropped on release. */
   recyclePending = false;
@@ -988,6 +999,7 @@ export class PooledConnection {
     this.advertiseElicitation = deps.advertiseElicitation ?? Boolean(deps.elicitationResolver);
     this.authCapabilities = deps.authCapabilities;
     this.authStore = deps.authStore;
+    this.providerStore = deps.providerStore;
     this.client = new MultiplexClient(
       this.backendId,
       this.onEvent,
@@ -1371,9 +1383,38 @@ export class PooledConnection {
         machine.send({ t: "initialize_ok", connectionId: this.id, advertised: negotiated.authMethods });
         await this.applyAuthIntent(machine);
       }
+      // Replay recorded provider-routing intents (the providers/* sibling of the auth replay
+      // above): provider config is in-process agent state for e.g. codex-acp, so every fresh
+      // process must be re-routed here or its sessions would silently run on default routing.
+      await this.applyProviderIntents();
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /** Replay the recorded `providers/set` intents at the end of `initialize`, then stamp the
+   *  generation this process reflects. Advertise-gated: an agent that does not advertise the
+   *  unstable providers block gets no replay (an intent can only have been recorded against an
+   *  advertising agent, so a skip here means the agent surface changed under us — the stamp still
+   *  marks this process current because no better state is reachable). A replay FAILURE throws,
+   *  failing the connection loudly: silently opening sessions without the host-configured gateway
+   *  routing would mis-route traffic. */
+  private async applyProviderIntents(): Promise<void> {
+    const store = this.providerStore;
+    if (!store) return;
+    const poolKey = this.backend.poolKey ?? this.backend.id;
+    const generation = store.generation(poolKey);
+    if (this.negotiated?.supportsProviders === true) {
+      for (const intent of store.intentsFor(poolKey)) {
+        await this.rawAgentRequest<SetProviderResponse | void, SetProviderRequest>(AGENT_METHODS.providers_set, {
+          providerId: intent.providerId,
+          apiType: intent.apiType,
+          baseUrl: intent.baseUrl,
+          ...(intent.headers ? { headers: intent.headers } : {}),
+        });
+      }
+    }
+    this.providerStamp = generation;
   }
 
   /**

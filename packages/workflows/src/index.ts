@@ -195,10 +195,11 @@ export type {
   ClientMethodCoverage,
 } from "@automatalabs/acp-agents";
 
-// ── Type-driven auth surface (§4.2): the runner-facing auth contracts hosts consume through this
-//    facade. mcp-server imports these here (its only @automatalabs deps are `workflows` and
-//    `shared-types`), so the type re-exports land with PR5 — the MCP auth tools cannot compile
-//    without them. The `isAuthRequired` VALUE export lands with PR6. ──
+// ── Type-driven auth surface (§4.2) + the providers surface: the runner-facing contracts hosts
+//    consume through this facade. mcp-server imports these here (its only @automatalabs deps are
+//    `workflows` and `shared-types`), so the type re-exports land with PR5 — the MCP auth tools
+//    cannot compile without them. The `isAuthRequired` VALUE export lands with PR6.
+//    `ProviderCapableRunner` is the symmetric duck-type gate for the MCP provider tools. ──
 export type {
   AuthResolver,
   AuthContext,
@@ -209,6 +210,7 @@ export type {
   AuthController,
   AuthStatusSnapshot,
   AuthCapableRunner,
+  ProviderCapableRunner,
 } from "@automatalabs/acp-agents";
 export type { AuthErrorContext, CheckpointContext } from "@automatalabs/shared-types"; // via workflow-engine re-export (§1.5)
 

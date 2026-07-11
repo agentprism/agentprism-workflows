@@ -31,6 +31,8 @@ import type {
   AuthCapableRunner,
   AuthMethodDescriptor,
   JournalEntry,
+  ProviderCapableRunner,
+  ProviderInfo,
   WorkflowBackendConfig,
   WorkflowRunResult,
 } from "@automatalabs/workflows";
@@ -51,6 +53,22 @@ import {
   type AuthStatusToolResult,
   type AuthenticateToolResult,
 } from "./auth-tool-io.js";
+import {
+  providersInputShape,
+  providersOutputShape,
+  setProviderInputShape,
+  setProviderOutputShape,
+  disableProviderInputShape,
+  disableProviderOutputShape,
+  projectProviderInfo,
+  formatProvidersSummary,
+  formatSetProviderSummary,
+  formatDisableProviderSummary,
+  type ProvidersToolBackend,
+  type ProvidersToolResult,
+  type SetProviderToolResult,
+  type DisableProviderToolResult,
+} from "./provider-tool-io.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
@@ -436,6 +454,125 @@ function asAuthCapableRunner(runner: AgentRunner): AuthCapableRunner | undefined
 }
 
 /**
+ * Duck-type the injected runner as a `ProviderCapableRunner`, symmetric to asAuthCapableRunner:
+ * the frozen `AgentRunner` seam is not widened, `createAcpRunner()` satisfies the structural
+ * shape, and a plain stub simply does not get the provider tools.
+ */
+function asProviderCapableRunner(runner: AgentRunner): ProviderCapableRunner | undefined {
+  const r = runner as Partial<ProviderCapableRunner>;
+  return typeof r.listProviders === "function" &&
+    typeof r.setProvider === "function" &&
+    typeof r.disableProvider === "function" &&
+    typeof r.listBackends === "function"
+    ? (runner as unknown as ProviderCapableRunner)
+    : undefined;
+}
+
+/**
+ * Register the three provider tools on the server, sharing the injected provider-capable runner.
+ * `providers/*` is a GENERIC base-spec ACP surface: per backend the runner gates each call on the
+ * initialize-advertised `agentCapabilities.providers`, so ANY agent that advertises it (built-in
+ * or custom) is served with zero agent-specific code here.
+ */
+function registerProviderTools(mcp: McpServer, providerRunner: ProviderCapableRunner): void {
+  mcp.registerTool(
+    "workflow_providers",
+    {
+      title: "List configurable ACP backend LLM providers",
+      description:
+        "Read-only. List each ACP backend's client-configurable LLM providers (providers/list), " +
+        "redacted to non-secret routing: providerId, supported protocols, required flag, and the " +
+        "current { apiType, baseUrl } — NEVER headers or credentials. Backends that do not advertise " +
+        "the providers capability report providersSupported:false instead of failing the call. Pass " +
+        "`backend` to scope to one; omit it to enumerate every registered backend.",
+      inputSchema: providersInputShape,
+      outputSchema: providersOutputShape,
+    },
+    async (args) => {
+      const backendArg = typeof args.backend === "string" && args.backend.length > 0 ? args.backend : undefined;
+      const ids = backendArg ? [backendArg] : providerRunner.listBackends();
+      const backends: ProvidersToolBackend[] = [];
+      for (const id of ids) {
+        // A backend that does not advertise providers (capability-gate error) or cannot be probed
+        // still reports its row — a read-only tool never hard-fails on one backend.
+        try {
+          const response = await providerRunner.listProviders({ model: id, label: `mcp:workflow_providers:${id}` });
+          backends.push({
+            backendId: id,
+            providersSupported: true,
+            providers: response.providers.map((info: ProviderInfo) => projectProviderInfo(info)),
+          });
+        } catch {
+          backends.push({ backendId: id, providersSupported: false, providers: [] });
+        }
+      }
+      const structuredContent: ProvidersToolResult = { backends };
+      return {
+        structuredContent: { ...structuredContent },
+        content: [{ type: "text", text: formatProvidersSummary(backends) }],
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "workflow_set_provider",
+    {
+      title: "Configure an ACP backend LLM provider",
+      description:
+        "Configure one client-configurable provider on a backend (providers/set): route it through a " +
+        "gateway at `baseUrl` speaking `apiType` (a protocol from that provider's `supported` list). " +
+        "`headers` is SECRET (e.g. Authorization) — handed straight to the agent and NEVER echoed, " +
+        "journaled, or logged. Replaces the provider's full configuration; the agent applies it to " +
+        "sessions it creates from then on. Fails when the backend does not advertise the providers " +
+        "capability or rejects the providerId/apiType.",
+      inputSchema: setProviderInputShape,
+      outputSchema: setProviderOutputShape,
+    },
+    async (args) => {
+      // The SECRET headers ride ONLY inside the runner call; the result echoes backend/providerId.
+      await providerRunner.setProvider({
+        model: args.backend,
+        providerId: args.providerId,
+        apiType: args.apiType,
+        baseUrl: args.baseUrl,
+        ...(args.headers ? { headers: args.headers } : {}),
+        label: `mcp:workflow_set_provider:${args.backend}`,
+      });
+      const result: SetProviderToolResult = { backend: args.backend, providerId: args.providerId, status: "configured" };
+      return {
+        structuredContent: { ...result },
+        content: [{ type: "text", text: formatSetProviderSummary(result) }],
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "workflow_disable_provider",
+    {
+      title: "Disable an ACP backend LLM provider",
+      description:
+        "Disable one client-configurable provider on a backend (providers/disable), clearing its " +
+        "gateway routing. Idempotent per the providers RFD: disabling an unknown or already-disabled " +
+        "providerId succeeds. Fails only when the backend does not advertise the providers capability.",
+      inputSchema: disableProviderInputShape,
+      outputSchema: disableProviderOutputShape,
+    },
+    async (args) => {
+      await providerRunner.disableProvider({
+        model: args.backend,
+        providerId: args.providerId,
+        label: `mcp:workflow_disable_provider:${args.backend}`,
+      });
+      const result: DisableProviderToolResult = { backend: args.backend, providerId: args.providerId, status: "disabled" };
+      return {
+        structuredContent: { ...result },
+        content: [{ type: "text", text: formatDisableProviderSummary(result) }],
+      };
+    },
+  );
+}
+
+/**
  * Register `workflow_auth_status` (read-only, redacted) and `workflow_authenticate` (action) on the
  * server, sharing the injected auth-capable runner (§4.3). Called only when the runner duck-types as
  * auth-capable, so a host with a plain `AgentRunner` never sees these tools.
@@ -537,7 +674,8 @@ function registerAuthTools(mcp: McpServer, authRunner: AuthCapableRunner): void 
 
 /**
  * Build the MCP server with the single `workflow` tool registered (plus the two auth tools when the
- * injected runner is auth-capable). The AgentRunner is the DI seam: it is injected here into a single
+ * injected runner is auth-capable, and the three provider tools when it is provider-capable). The
+ * AgentRunner is the DI seam: it is injected here into a single
  * WorkflowManager (so persistence — and therefore resume — is shared across calls) and every run goes
  * through manager.runSync. The returned McpServer is not yet connected — the caller attaches a
  * transport (see index.ts).
@@ -551,11 +689,16 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
 
-  // Auth tools register only when the injected runner duck-types as auth-capable (§4.3). A plain
-  // AgentRunner (e.g. a test stub, or a host's own minimal runner) gets the `workflow` tool alone.
+  // Auth and provider tools register only when the injected runner duck-types as capable (§4.3).
+  // A plain AgentRunner (e.g. a test stub, or a host's own minimal runner) gets `workflow` alone;
+  // the two capability gates are independent.
   const authRunner = asAuthCapableRunner(runner);
   if (authRunner) {
     registerAuthTools(mcp, authRunner);
+  }
+  const providerRunner = asProviderCapableRunner(runner);
+  if (providerRunner) {
+    registerProviderTools(mcp, providerRunner);
   }
 
   mcp.registerTool(

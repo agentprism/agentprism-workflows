@@ -131,6 +131,105 @@ test("providers list/set/disable and logout round-trip through the selected back
   assert.deepEqual(logoutCall?.params?._meta, { source: "logout" });
 });
 
+// ── Durable provider routing: record → recycle → replay (the providers/* sibling of the
+//    dispose-after-authenticate fix). Provider config is in-process agent state (codex-acp keeps
+//    its custom gateway in memory), so a set that only reached a disposed dedicated connection
+//    would leave every pooled run silently unrouted. ──
+
+test("setProvider records durable routing: the pool recycles and a fresh connection replays providers/set at initialize", async () => {
+  const { cwd, readLog } = configure({
+    providersSupport: true,
+    providers: { set: {} },
+    turns: [{ text: "routed" }, { text: "routed" }],
+  });
+  const runner = makeRunner();
+  // Seed a pooled process BEFORE the routing change, so a stale reuse-without-replay would show.
+  assert.equal(await runner.run("one", { model: "claude", cwd }), "routed");
+
+  await runner.setProvider({
+    model: "claude",
+    providerId: "custom-gateway",
+    apiType: "openai",
+    baseUrl: "https://gw.test/v1",
+    headers: { Authorization: "Bearer replay-secret" },
+    meta: { source: "explicit" },
+  });
+
+  assert.equal(await runner.run("two", { model: "claude", cwd }), "routed");
+
+  const log = readLog();
+  const sets = log.filter((entry) => entry.method === "setProvider");
+  assert.equal(sets.length, 2, "the explicit set + exactly one replay on the fresh pooled connection");
+  for (const set of sets) {
+    assert.equal(set.params?.providerId, "custom-gateway");
+    assert.equal(set.params?.apiType, "openai");
+    assert.equal(set.params?.baseUrl, "https://gw.test/v1");
+    assert.deepEqual(set.params?.headers, { Authorization: "Bearer replay-secret" });
+  }
+  // The request-scoped `_meta` rides the explicit call only — the durable intent never replays it.
+  assert.deepEqual(sets[0]?.params?._meta, { source: "explicit" });
+  assert.equal(sets[1]?.params?._meta, undefined);
+
+  const methods = log.map((entry) => entry.method);
+  assert.ok(
+    methods.lastIndexOf("setProvider") < methods.lastIndexOf("newSession"),
+    "the replay lands at initialize, before the recycled pool serves the next session",
+  );
+  // Three processes total: the seeded pooled one (recycled as stale), the dedicated set
+  // connection, and the fresh pooled one that replayed.
+  assert.equal(count(log, "__start"), 3);
+});
+
+test("disableProvider drops the recorded routing: later connections do not replay it", async () => {
+  const { cwd, readLog } = configure({
+    providersSupport: true,
+    providers: { set: {}, disable: {} },
+    turns: [{ text: "unrouted" }],
+  });
+  const runner = makeRunner();
+  await runner.setProvider({
+    model: "claude",
+    providerId: "custom-gateway",
+    apiType: "openai",
+    baseUrl: "https://gw.test/v1",
+  });
+  await runner.disableProvider({ model: "claude", providerId: "custom-gateway" });
+  assert.equal(await runner.run("go", { model: "claude", cwd }), "unrouted");
+
+  const log = readLog();
+  const disableIndex = log.findIndex((entry) => entry.method === "disableProvider");
+  assert.ok(disableIndex >= 0, "the explicit disable reached the agent");
+  const after = log.slice(disableIndex + 1).map((entry) => entry.method);
+  assert.ok(after.includes("newSession"), "the run landed after the disable");
+  assert.ok(!after.includes("setProvider"), "no replay once the intent was dropped");
+});
+
+test("a provider replay failure at initialize fails the run loudly (never a silently unrouted session)", async () => {
+  configure({ providersSupport: true, providers: { set: {} } });
+  const runner = makeRunner();
+  await runner.setProvider({
+    model: "claude",
+    providerId: "custom-gateway",
+    apiType: "openai",
+    baseUrl: "https://gw.test/v1",
+  });
+
+  // Newly spawned agent processes now reject providers/set: the replay on the next pooled
+  // connection must fail the run rather than opening sessions without the configured routing.
+  const { cwd } = configure({
+    providersSupport: true,
+    providers: { setHandler: false },
+    turns: [{ text: "unreachable" }],
+  });
+  await assert.rejects(
+    () => runner.run("go", { model: "claude", cwd, label: "replay-fail" }),
+    (error: unknown) => {
+      assert.match(String(error instanceof Error ? error.message : error), /providers\/set|method not found/i);
+      return true;
+    },
+  );
+});
+
 test("auth-required on session/new maps to non-recoverable AUTH_REQUIRED without retrying", async () => {
   const { cwd, readLog } = configure({
     authMethods: AUTH_METHODS,

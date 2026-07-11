@@ -66,7 +66,8 @@ export const claudeAuthProfile: AuthProfile = {
   buildMeta: (_method, resolution) => resolution.meta,
 };
 
-/** Codex — `@automatalabs/codex-acp` 1.4.x, our fork (§3.3). Advertises no `terminal` method (its
+/** Codex — `@automatalabs/codex-acp`, our fork (§3.3; the spec heading tracks the installed
+ *  version). Advertises no `terminal` method (its
  *  `api-key` reads env internally and `chat-gpt`/`gateway` are `agent`-type), so terminal is always
  *  false; `gateway` follows an `onAuth` resolver. The `spawnAuthEnv` lever emits `DEFAULT_AUTH_REQUEST`
  *  for `api-key`/`gateway` intents so a freshly recycled process pre-authenticates before its first
