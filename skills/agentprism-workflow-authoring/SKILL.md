@@ -41,7 +41,7 @@ const run = await runDynamicWorkflow(script, { cwd: "/abs/project", args: { path
 // run.status: "completed" | "paused" | "failed" | "aborted"; run.result: the script's return value
 ```
 
-— or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global.
+— or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes (`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
 
 ## The `meta` header
 
@@ -151,7 +151,7 @@ The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` 
 ## Failure semantics — design for `null`
 
 - A **recoverable** failure (timeout, empty output, transient execution error) is retried per the call's `retries` (default 0), then the call **resolves to `null`** — inside `parallel`/`pipeline` *and* as a bare `await agent(...)`. Null-check anything load-bearing, and set `retries: 1–2` on steps you can't afford to lose.
-- A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle.
+- A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle. In particular, **always rethrow pause-class errors** (`err.code === "PROVIDER_USAGE_LIMIT"` or `"AUTH_REQUIRED"`): they must propagate out of the script so the engine can pause the run resumably — swallowing one converts that pause into a fake, lossy completion.
 - A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
 - Per-call knobs: `timeoutMs` (a step allowed to run long: `timeoutMs: null` disables the clock), `retries`.
 
@@ -377,6 +377,15 @@ const gaps = await completenessCheck(args, confirmed);
 log(`${confirmed.length}/${candidates.length} confirmed; complete=${gaps.complete}`);
 return { confirmed, missing: gaps.missing ?? [] };
 ```
+
+## Full-scale example scripts
+
+When the inline examples above aren't enough, study the complete, validated scripts in [`examples/`](examples/) (same directory as this file):
+
+- [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous, unattended cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor adversarial verification panel, `gate()` where writer and reviewer are always different vendors, nesting a saved workflow by name, `completenessCheck()`, budget headroom reservation, string-form `args` hardening, placeholder/path guards on schema outputs, and pause-class error rethrow.
+- [`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js) — a small hunter that runs standalone *or* nested: `loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an in-round budget floor (nested runs share the parent's budget).
+
+[`examples/README.md`](examples/README.md) maps each script to what it teaches.
 
 ## Validate before you run
 
