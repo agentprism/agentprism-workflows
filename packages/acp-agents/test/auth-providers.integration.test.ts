@@ -230,6 +230,65 @@ test("a provider replay failure at initialize fails the run loudly (never a sile
   );
 });
 
+test("a capability regression (a fresh process stops advertising providers while routing is configured) fails the run loudly and non-recoverably", async () => {
+  // Record routing against a process that DOES advertise providers.
+  configure({ providersSupport: true, providers: { set: {} } });
+  const runner = makeRunner();
+  await runner.setProvider({
+    model: "claude",
+    providerId: "custom-gateway",
+    apiType: "openai",
+    baseUrl: "https://gw.test/v1",
+  });
+
+  // The next fresh pooled process NO LONGER advertises `providers` (npx-resolved backend version
+  // change, command override/wrapper, startup-dependent advertisement). Stamping it current would
+  // silently send traffic direct-to-provider, so applyProviderIntents must FAIL LOUDLY at
+  // initialize — before any session opens — rather than skip-and-stamp.
+  const { cwd } = configure({ turns: [{ text: "must-not-run" }] });
+  await assert.rejects(
+    () => runner.run("go", { model: "claude", cwd, label: "cap-regression" }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      // Non-recoverable so the engine does not retry-loop respawning identically-failing processes.
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.equal(error.recoverable, false);
+      assert.match(error.message, /claude/); // names the backend
+      assert.match(error.message, /no longer advertises the .?providers.? capability/); // names the lost capability
+      assert.match(error.message, /workflow_disable_provider/); // MCP operator exit
+      assert.match(error.message, /disableProvider/); // embedded-SDK operator exit
+      return true;
+    },
+  );
+});
+
+test("after disabling the provider, a fresh non-advertising process serves sessions normally (the operator exit works)", async () => {
+  configure({ providersSupport: true, providers: { set: {}, disable: {} } });
+  const runner = makeRunner();
+  await runner.setProvider({
+    model: "claude",
+    providerId: "custom-gateway",
+    apiType: "openai",
+    baseUrl: "https://gw.test/v1",
+  });
+  // The operator's exit: disable drops the intent (and advances the generation).
+  await runner.disableProvider({ model: "claude", providerId: "custom-gateway" });
+
+  // Routing is now off (intents emptied, generation > 0). A fresh process that no longer advertises
+  // `providers` has nothing to replay, so it must serve normally — the empty-intents gate means the
+  // capability-loss throw does NOT fire after a disable.
+  const { cwd } = configure({ turns: [{ text: "served" }] });
+  assert.equal(await runner.run("go", { model: "claude", cwd }), "served");
+});
+
+test("baseline: a non-advertising agent with no recorded routing does not throw (byte-identical to the default-OFF baseline)", async () => {
+  // No provider intent is ever recorded, so intentsFor(poolKey) is empty and the capability-loss
+  // gate never trips even though the agent does not advertise providers.
+  const { cwd } = configure({ turns: [{ text: "ok" }] });
+  const runner = makeRunner();
+  assert.equal(await runner.run("go", { model: "claude", cwd }), "ok");
+});
+
 test("auth-required on session/new maps to non-recoverable AUTH_REQUIRED without retrying", async () => {
   const { cwd, readLog } = configure({
     authMethods: AUTH_METHODS,
