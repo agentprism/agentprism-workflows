@@ -29,6 +29,19 @@ export interface ErrorMapContext {
 }
 
 export function errorText(error: unknown): string {
+  const base = baseErrorText(error);
+  // A JSON-RPC RequestError can carry only a generic channel label in `.message` ("Internal error")
+  // while the provider's real text lives in the structured `.data` (codex-acp's usageLimitExceeded
+  // wraps the quota/reset text as RequestError.internalError({ message }) => code -32603, message
+  // "Internal error", text in `.data.message`). That `.data` is still the ERROR channel — a rejected
+  // request's payload, never task output — so fold its `message`/`details` into the classifiable
+  // text. Backend-generic: any ACP agent that stuffs detail into `.data` benefits.
+  const detail = errorDataText(error);
+  if (detail && !base.includes(detail)) return base ? `${base}: ${detail}` : detail;
+  return base;
+}
+
+function baseErrorText(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   if (error && typeof error === "object") {
@@ -41,6 +54,18 @@ export function errorText(error: unknown): string {
     }
   }
   return String(error);
+}
+
+function errorDataText(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  const data = (error as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return "";
+  const parts: string[] = [];
+  for (const key of ["message", "details"] as const) {
+    const value = (data as Record<string, unknown>)[key];
+    if (typeof value === "string" && value.trim()) parts.push(value.trim());
+  }
+  return parts.join(": ");
 }
 
 /** Map any thrown error from the run path onto a seam-level WorkflowError. */
