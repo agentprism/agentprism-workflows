@@ -25,6 +25,54 @@ test("provider wall => PROVIDER_USAGE_LIMIT, non-recoverable, with resetHint pre
   assert.equal(mapped.details instanceof Error, true);
 });
 
+test("codex-acp usageLimitExceeded RequestError (text in .data.message) => PROVIDER_USAGE_LIMIT + resetHint", () => {
+  // Exact reconstructed shape from @automatalabs/codex-acp@1.6.1: usageLimitExceeded wraps the
+  // provider text as RequestError.internalError(createTurnErrorData(...)) — code -32603, message
+  // "Internal error", the real quota/reset text only in `.data.message`. The ACP SDK client
+  // reconstructs it identically via `new RequestError(code, message, data)` (jsonrpc.js), so
+  // RequestError.internalError({ message }) reproduces the on-client object faithfully.
+  const wall = RequestError.internalError({ message: "You've hit your usage limit. Resets in 2 hours 30 minutes." });
+  assert.equal(wall.code, -32603);
+  assert.equal(wall.message, "Internal error");
+  const mapped = mapThrownError(wall, { label: "codex-agent", backendId: "codex" });
+  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(mapped.recoverable, false);
+  assert.equal(mapped.resetHint, "Resets in 2 hours 30 minutes");
+  assert.equal(mapped.agentLabel, "codex-agent");
+  assert.match(mapped.message, /usage limit/i); // provider text surfaced, not just "Internal error"
+});
+
+test("codex-acp usageLimitExceeded RequestError with no reset time => PROVIDER_USAGE_LIMIT, resetHint undefined", () => {
+  const wall = RequestError.internalError({ message: "You have exceeded your current quota." });
+  const mapped = mapThrownError(wall, "codex-agent");
+  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(mapped.recoverable, false);
+  assert.equal(mapped.resetHint, undefined);
+});
+
+test("provider text in RequestError .data.details also classifies (backend-generic, no codex special-casing)", () => {
+  const wall = new RequestError(-32603, "Internal error", { details: "rate limit exceeded, resets at 5pm UTC" });
+  const mapped = mapThrownError(wall);
+  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(mapped.recoverable, false);
+  assert.equal(mapped.resetHint, "resets at 5pm UTC");
+});
+
+test("regression: plain-message provider wall (Claude path, no .data) still => PROVIDER_USAGE_LIMIT", () => {
+  // Claude fails the active turn with the provider text directly on the Error message (no `.data`).
+  const mapped = mapThrownError(new Error("Usage limit reached. Resets at 9:00 AM."), "claude-agent");
+  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(mapped.recoverable, false);
+  assert.equal(mapped.resetHint, "Resets at 9:00 AM");
+  assert.equal(mapped.message, "Usage limit reached. Resets at 9:00 AM.");
+});
+
+test("errorText folds RequestError .data text in for classification; leaves non-text data alone", () => {
+  assert.match(errorText(RequestError.internalError({ message: "quota exceeded" })), /quota exceeded/);
+  // A `.data` with no message/details string adds nothing (e.g. methodNotFound's `{ method }`).
+  assert.equal(errorText(RequestError.methodNotFound("session/foo")), `"Method not found": session/foo`);
+});
+
 test("ACP auth-required RequestError => AUTH_REQUIRED, non-recoverable, with backend and method hint", () => {
   const mapped = mapThrownError(RequestError.authRequired(undefined, "login first"), {
     label: "auth-agent",
