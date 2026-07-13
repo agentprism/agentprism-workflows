@@ -42,7 +42,7 @@ npm i -g @automatalabs/mcp-server
 npm i @automatalabs/mcp-server
 ```
 
-Installing the package provides the executable **`agentprism-workflow`** (declared as the package's `bin`, pointing at the built `dist/index.js`). You usually don't run it by hand — your MCP host launches it (see [Register it in an MCP host](#register-it-in-an-mcp-host)).
+Installing the package provides the executable **`agentprism-workflow`** (declared as the package's `bin`, pointing at the built `dist/cli.js`). You usually don't run it by hand — your MCP host launches it (see [Register it in an MCP host](#register-it-in-an-mcp-host)).
 
 You also need a backend used by your scripts: Claude and Codex adapters are installed transitively; OpenCode is resolved from an `opencode-ai` installation or an `opencode` executable on `PATH`. Authenticate only the backends you route to. See [Backends & auth](#backends--auth).
 
@@ -54,7 +54,7 @@ The package ships one executable:
 
 | bin | entry |
 | --- | --- |
-| `agentprism-workflow` | `dist/index.js` |
+| `agentprism-workflow` | `dist/cli.js` |
 
 Running it starts the MCP server on stdio: it builds an ACP-backed `AgentRunner`, injects it into a `WorkflowManager`, registers the `workflow` tool, and connects a `StdioServerTransport`. It speaks the MCP protocol — it is not an interactive CLI. Launch it from an MCP host, or pipe JSON-RPC to it yourself for testing.
 

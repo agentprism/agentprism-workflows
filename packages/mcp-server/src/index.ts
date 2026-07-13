@@ -4,6 +4,7 @@
 // AgentRunner and the WorkflowManager engine. The runner is injected into the engine
 // (createWorkflowServer(createAcpRunner())) and the resulting MCP server is connected over
 // stdio. stdout is RESERVED for JSON-RPC framing — every diagnostic goes to stderr.
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -92,10 +93,22 @@ export async function main(): Promise<void> {
   await server.connect(transport);
 }
 
-// Run as the `agentprism-workflow` executable, but stay import-safe as a library: only start
-// the stdio server when this module is the process entry point.
-const invokedPath = process.argv[1];
-if (invokedPath !== undefined && import.meta.url === pathToFileURL(invokedPath).href) {
+// Back-compat: `node dist/index.js` was the documented registration path before the dedicated
+// ./cli.js bin entry existed, so keep this module runnable while staying import-safe as a
+// library. npm/pnpm bin shims are symlinks and Node realpath-resolves the ESM entry module, so
+// argv[1] must be realpath'd before comparing — matching the raw shim path would silently skip
+// main() and the MCP client would see the connection close before the initialize response.
+function isProcessEntryPoint(): boolean {
+  const invokedPath = process.argv[1];
+  if (invokedPath === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invokedPath)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isProcessEntryPoint()) {
   main().catch((error: unknown) => {
     console.error("[agentprism-workflow] fatal error during startup:", error);
     process.exitCode = 1;

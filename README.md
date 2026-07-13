@@ -214,7 +214,7 @@ From a source checkout, point at the built entry instead:
   "mcpServers": {
     "agentprism-workflow": {
       "command": "node",
-      "args": ["/abs/path/to/agentprism-workflows/packages/mcp-server/dist/index.js"]
+      "args": ["/abs/path/to/agentprism-workflows/packages/mcp-server/dist/cli.js"]
     }
   }
 }

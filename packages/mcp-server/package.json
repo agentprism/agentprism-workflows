@@ -14,7 +14,7 @@
   "main": "./dist/index.js",
   "types": "./src/index.ts",
   "bin": {
-    "agentprism-workflow": "./dist/index.js"
+    "agentprism-workflow": "./dist/cli.js"
   },
   "exports": {
     ".": {
@@ -31,7 +31,7 @@
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "bin": {
-      "agentprism-workflow": "./dist/index.js"
+      "agentprism-workflow": "./dist/cli.js"
     },
     "exports": {
       ".": {
