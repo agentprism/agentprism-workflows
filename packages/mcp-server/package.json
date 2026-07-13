@@ -1,6 +1,6 @@
 {
   "name": "@automatalabs/mcp-server",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
