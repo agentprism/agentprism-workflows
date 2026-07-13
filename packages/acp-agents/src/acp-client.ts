@@ -1393,19 +1393,26 @@ export class PooledConnection {
   }
 
   /** Replay the recorded `providers/set` intents at the end of `initialize`, then stamp the
-   *  generation this process reflects. Advertise-gated: an agent that does not advertise the
-   *  unstable providers block gets no replay (an intent can only have been recorded against an
-   *  advertising agent, so a skip here means the agent surface changed under us — the stamp still
-   *  marks this process current because no better state is reachable). A replay FAILURE throws,
-   *  failing the connection loudly: silently opening sessions without the host-configured gateway
-   *  routing would mis-route traffic. */
+   *  generation this process reflects. Advertise-gated: an agent that advertises the unstable
+   *  providers block replays every recorded intent; a replay FAILURE throws, failing the connection
+   *  loudly because silently opening sessions without the host-configured gateway routing would
+   *  mis-route traffic. A fresh process that does NOT advertise providers WHILE routing is still
+   *  configured (`intentsFor` non-empty) hits the same wall from the other side — an intent can only
+   *  have been recorded against an advertising agent, so a lost advertisement means the agent surface
+   *  regressed under us (an npx-resolved backend version change, a command override/wrapper, a custom
+   *  backend whose advertisement depends on startup state). Stamping it current would silently route
+   *  every later session direct-to-provider instead of through the gateway, so we FAIL LOUDLY here
+   *  too, non-recoverably, with both operator exits named. With no recorded intent — the default-OFF
+   *  baseline, or after a `disable` emptied the intents — there is nothing to route, so a
+   *  non-advertising process is stamped current, byte-identical to the pre-provider baseline. */
   private async applyProviderIntents(): Promise<void> {
     const store = this.providerStore;
     if (!store) return;
     const poolKey = this.backend.poolKey ?? this.backend.id;
     const generation = store.generation(poolKey);
+    const intents = store.intentsFor(poolKey);
     if (this.negotiated?.supportsProviders === true) {
-      for (const intent of store.intentsFor(poolKey)) {
+      for (const intent of intents) {
         await this.rawAgentRequest<SetProviderResponse | void, SetProviderRequest>(AGENT_METHODS.providers_set, {
           providerId: intent.providerId,
           apiType: intent.apiType,
@@ -1413,6 +1420,18 @@ export class PooledConnection {
           ...(intent.headers ? { headers: intent.headers } : {}),
         });
       }
+    } else if (intents.length > 0) {
+      throw new WorkflowError(
+        `ACP agent (${this.backendId}) has host-configured gateway provider routing (pool key "${poolKey}", ` +
+          `${intents.length} provider${intents.length === 1 ? "" : "s"} recorded), but this freshly started agent ` +
+          `process no longer advertises the \`providers\` capability, so the recorded routing cannot be replayed — ` +
+          `refusing to open sessions that would silently run direct-to-provider instead of through the configured ` +
+          `gateway. Restore or fix the backend so it advertises \`providers\` again, or disable the configured ` +
+          `provider to accept direct-to-provider traffic (\`workflow_disable_provider\` via the MCP server, or the ` +
+          `runner's disableProvider API when embedding the SDK).${this.stderrSuffix()}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
     }
     this.providerStamp = generation;
   }
