@@ -160,5 +160,8 @@ export type {
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
   WorkflowRunResult,
+  WorkflowRunFallback,
+  WorkflowCheckpointSource,
+  WorkflowCheckpointTaken,
   TokenUsage,
 } from "@automatalabs/shared-types";

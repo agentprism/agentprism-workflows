@@ -118,6 +118,10 @@ return { ok, name }`;
   assert.equal(res.result.ok, true);
   assert.equal(res.result.name, "fallback");
   assert.equal(journal.length, 2, "both checkpoints journaled");
+  assert.deepEqual(res.checkpointsTaken, [
+    { callIndex: 0, kind: "confirm", decision: true, source: "headless-default" },
+    { callIndex: 1, kind: "confirm", decision: "fallback", source: "headless-default" },
+  ]);
 });
 
 test("checkpoint(): headless 'abort' throws when no UI is threaded in", async () => {
@@ -141,6 +145,9 @@ return await checkpoint('Proceed?', { kind: 'confirm' })`;
   });
   assert.equal(res.result, "yes");
   assert.equal(asked, "Proceed?");
+  assert.deepEqual(res.checkpointsTaken, [
+    { callIndex: 0, kind: "confirm", decision: "yes", source: "live" },
+  ]);
 });
 
 test("checkpoint(): headless 'pause' still uses a live confirm when one is threaded", async () => {
@@ -185,6 +192,9 @@ return { r }`;
   });
   assert.equal(second.result.r, "approved", "reply replays from the journal");
   assert.equal(calledAgain, false, "confirm is not called again on resume");
+  assert.deepEqual(second.checkpointsTaken, [
+    { callIndex: 0, kind: "confirm", decision: "approved", source: "journal-replay" },
+  ]);
 });
 
 test("checkpoint(): counts against maxAgents (no tokens, but bounded)", async () => {
@@ -230,6 +240,7 @@ test(
     assert.equal(context.default, "hold");
     assert.equal(paused.authContext, undefined);
     assert.equal(paused.resetHint, undefined);
+    assert.equal(paused.checkpointsTaken, undefined, "a checkpoint that pauses has not resolved");
     assert.equal(pausedEvent?.reason, "checkpoint_required");
     assert.deepEqual(pausedEvent?.checkpointContext, context);
     assert.equal(pausedEvent?.authContext, undefined);
@@ -264,6 +275,9 @@ test(
     const completed = await resumed.promise;
 
     assert.equal(completed.status, "completed");
+    assert.deepEqual(completed.checkpointsTaken, [
+      { callIndex: context.callIndex, kind: "select", decision: "ship", source: "injected" },
+    ]);
     assert.equal(field(completed.result, "prefix"), "agent:before");
     assert.equal(field(completed.result, "decision"), "ship");
     assert.equal(field(completed.result, "after"), "agent:after:ship");
@@ -279,6 +293,7 @@ test(
       "the synthetic decision is in the final persisted journal",
     );
     assert.deepEqual(replyEntry?.call, { kind: "checkpoint", label: "checkpoint", phase: undefined });
+    assert.deepEqual(finalState?.checkpointsTaken, completed.checkpointsTaken);
 
     // A third, cold manager can hydrate that final journal and complete with no reply or
     // confirm channel at all. Every call replays, proving the synthetic answer is durable.
@@ -293,6 +308,9 @@ test(
     assert.equal(replayed.status, "completed");
     assert.equal(field(replayed.result, "decision"), "ship");
     assert.deepEqual(replayAgent.prompts, [], "the third cold replay asks nothing and executes no agent");
+    assert.deepEqual(replayed.checkpointsTaken, [
+      { callIndex: context.callIndex, kind: "select", decision: "ship", source: "journal-replay" },
+    ]);
   }),
 );
 
@@ -429,6 +447,9 @@ test(
     assert.equal(completed.status, "completed");
     assert.equal(field(completed.result, "decision"), "hold");
     assert.equal(asks, 1);
+    assert.deepEqual(completed.checkpointsTaken, [
+      { callIndex: first.checkpointContext?.callIndex, kind: "select", decision: "hold", source: "live" },
+    ]);
     assert.deepEqual(liveAgent.prompts, ["after:hold"]);
     const context = first.checkpointContext;
     assert.ok(context);

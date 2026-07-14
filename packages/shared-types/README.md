@@ -93,9 +93,14 @@ From [`src/index.ts`](./src/index.ts):
 **Workflow result**
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,
   `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`,
-  `authContext?`, `agentSessions?`). Paused, failed, and aborted results additionally carry the
+  `authContext?`, `agentSessions?`, `fallbacks?`, `checkpointsTaken?`). Paused, failed, and aborted results additionally carry the
   optional redacted final-20 `logTail`; completed results omit it and `logs` remains the full
   compatibility array.
+- `WorkflowRunFallback` — `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?,
+  kind: "model" | "modifier", message }` for a live model-selection degrade.
+- `WorkflowCheckpointTaken` / `WorkflowCheckpointSource` — a resolved checkpoint's call index,
+  kind, journaled decision, and provable source (`live`, `headless-default`, `journal-replay`, or
+  `injected`). These result-only arrays are absent when empty and never widen `WorkflowRunStatus`.
 - `RunStatus`, `WorkflowMeta`, `WorkflowMetaPhase`, `WorkflowBackendConfig`, `TokenUsage`,
   `JournalEntry`, `AgentSessionRef`, `AgentSessionRecord`.
 - `JournalCallMetadata` and optional `JournalEntry.call` — replay-neutral agent/checkpoint

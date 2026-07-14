@@ -172,7 +172,7 @@ console.log(run.result);   // [{ repo: "...", fileCount: 123 }, …] — schema-
 console.log(run.tokenUsage, run.runId);
 ```
 
-`runDynamicWorkflow` resolves to a **terminal** `WorkflowRunResult` even on pause/fail/abort — read `run.status` instead of catching. To swap the backend (or stub it in tests), pass your own runner: `runDynamicWorkflow(script, { runner })`. For lower-level control, use `WorkflowManager` / `runWorkflow` (also re-exported from the SDK).
+`runDynamicWorkflow` resolves to a **terminal** `WorkflowRunResult` even on pause/fail/abort — read `run.status` instead of catching. The result's optional `fallbacks` records live model/modifier degrades with call/model/backend attribution, and `checkpointsTaken` records every checkpoint resolved in that execution with its decision source (`live`, `headless-default`, `journal-replay`, or `injected`). Both fields are absent when empty and do not affect routing or replay identity. To swap the backend (or stub it in tests), pass your own runner: `runDynamicWorkflow(script, { runner })`. For lower-level control, use `WorkflowManager` / `runWorkflow` (also re-exported from the SDK).
 
 ### Run a single agent directly
 

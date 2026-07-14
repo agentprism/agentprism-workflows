@@ -10,6 +10,8 @@ import type {
   AuthErrorContext,
   CheckpointContext,
   JournalEntry,
+  WorkflowCheckpointTaken,
+  WorkflowRunFallback,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
@@ -83,6 +85,9 @@ export interface PersistedRunState {
   };
   /** Cached agent results for resume, keyed by deterministic call index. */
   journal?: JournalEntry[];
+  /** Additive terminal observability; absent on legacy runs and when no event occurred. */
+  fallbacks?: WorkflowRunFallback[];
+  checkpointsTaken?: WorkflowCheckpointTaken[];
 }
 
 export interface RunPersistence {

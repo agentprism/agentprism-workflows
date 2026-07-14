@@ -192,6 +192,8 @@ interface WorkflowExecutionToolResult {
   logTail?: WorkflowLogTail;               // paused/failed/aborted only
   authContext?: AuthErrorContext;           // auth_required pauses only
   checkpointContext?: CheckpointContext;   // checkpoint_required pauses only
+  fallbacks?: WorkflowRunFallback[];       // live model/modifier degrades; absent when empty
+  checkpointsTaken?: WorkflowCheckpointTaken[]; // resolved checkpoints; absent when empty
 }
 
 interface WorkflowBackgroundAccepted {
@@ -217,6 +219,15 @@ type WorkflowToolResult =
   | WorkflowRunStatus
   | WorkflowRunAwaitResult;
 ```
+
+| Execution output field | Shape | Notes |
+| --- | --- | --- |
+| `fallbacks` | `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }[]` | `kind` is `"model"` or `"modifier"`; live calls only; absent when empty. |
+| `checkpointsTaken` | `{ callIndex, kind, decision, source }[]` | `source` is `"live"`, `"headless-default"`, `"journal-replay"`, or `"injected"`; paused checkpoints are omitted; absent when empty. |
+
+These fields appear on foreground execution results and terminal await `outcome` objects. They are
+persisted for cold await, but never copied onto the bounded top-level `WorkflowRunStatus` returned by
+inspect/await.
 
 `status` lets a host distinguish a `completed` run from a `paused` one (resumable via `resumeFromRunId`) without parsing logs. The tool result is flagged `isError` when `status` is `failed` or `aborted`. A `result` field is only present when `status === "completed"`.
 
@@ -261,7 +272,8 @@ Before terminal state, optional `tokenUsage` is the cumulative live work observe
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
 the authored `result` and full `logs` remain raw and unbounded, and are not duplicated into text.
 Top-level and outcome token usage are identical. Paused outcomes carry the existing non-secret
-`authContext` or `checkpointContext` used for CLI-login/resume or checkpoint-reply handling.
+`authContext` or `checkpointContext` used for CLI-login/resume or checkpoint-reply handling. Result
+observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `outcome`.
 
 ---
 

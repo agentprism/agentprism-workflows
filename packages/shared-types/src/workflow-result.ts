@@ -99,6 +99,36 @@ export interface AgentSessionRecord extends AgentSessionRef {
   keptOpen: boolean;
 }
 
+/** One model-selection degrade observed while serving an agent() call. */
+export interface WorkflowRunFallback {
+  /** The owning agent() call's deterministic index. */
+  callIndex: number;
+  label: string;
+  phase?: string;
+  /** The model/tier spec the engine asked the runner to serve. */
+  requestedSpec: string;
+  /** Concrete model selected by the runner, when it reported one. */
+  resolvedModel?: string;
+  /** Actual backend that opened the session, when the runner reported one. */
+  backendId?: string;
+  /** Whole-model fallback, or a bracket modifier that could not be applied. */
+  kind: "model" | "modifier";
+  /** The human-readable line emitted to the workflow log. */
+  message: string;
+}
+
+/** How a checkpoint() decision was obtained in this execution. */
+export type WorkflowCheckpointSource = "live" | "headless-default" | "journal-replay" | "injected";
+
+/** One checkpoint() call that resolved during a workflow execution. */
+export interface WorkflowCheckpointTaken {
+  callIndex: number;
+  kind: "confirm" | "input" | "select";
+  /** The exact decision value stored in (or replayed from) the journal. */
+  decision: unknown;
+  source: WorkflowCheckpointSource;
+}
+
 /** One cached agent()/checkpoint() result, keyed by its deterministic call index
  *  (PersistedRunState.journal, run-persistence.ts). The frozen AgentResult MUST
  *  round-trip through this JSON unchanged for resume. */
@@ -243,4 +273,8 @@ export interface WorkflowRunResult<T = unknown> {
    *  in call order. The host's hand-off to `runner.loadSession()`/`resumeSession()` —
    *  present even when journaling is off (it rides the result, not the journal). */
   agentSessions?: AgentSessionRecord[];
+  /** Model-selection degrades observed on live agent calls. Absent when none occurred. */
+  fallbacks?: WorkflowRunFallback[];
+  /** Checkpoint calls resolved in this execution. Absent when none resolved. */
+  checkpointsTaken?: WorkflowCheckpointTaken[];
 }

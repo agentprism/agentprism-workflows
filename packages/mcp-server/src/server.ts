@@ -516,6 +516,8 @@ function persistedOutcome(
     ...(status.status === "completed" ? {} : { logTail: status.logTail }),
     authContext: persisted.authContext,
     checkpointContext: persisted.checkpointContext,
+    ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
+    ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
   };
 }
 

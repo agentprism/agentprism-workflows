@@ -77,6 +77,9 @@ import type {
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
   WorkflowRunResult,
+  WorkflowRunFallback,
+  WorkflowCheckpointSource,
+  WorkflowCheckpointTaken,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -334,7 +337,23 @@ test("facade re-exports the public surface", () => {
     filter: { lastN: inspectionOptions.lastN ?? 20, logLines: inspectionOptions.logLines ?? 20 },
     truncation,
   };
+  const checkpointSource: WorkflowCheckpointSource = "injected";
+  const fallback: WorkflowRunFallback = {
+    callIndex: 0,
+    label: "review",
+    requestedSpec: "gpt-example[high]",
+    kind: "modifier",
+    message: "modifier unavailable",
+  };
+  const checkpointTaken: WorkflowCheckpointTaken = {
+    callIndex: 1,
+    kind: "confirm",
+    decision: true,
+    source: checkpointSource,
+  };
   assert.equal(callMetadata.label, status.calls[0]?.label);
+  assert.equal(fallback.kind, "modifier");
+  assert.equal(checkpointTaken.source, "injected");
 });
 
 test("facade WorkflowManager exposes inspectRun and shared status without engine imports", async () => {
