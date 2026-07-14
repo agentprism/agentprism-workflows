@@ -630,6 +630,12 @@ Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new
 
 `agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
 
+`gate()` validators may return `{ ok: boolean, feedback?: string, ... }`, a bare boolean, or
+`null`. A fulfilled gate returns exactly `{ ok, value, verdict, attempts }`: `value` is the final
+producer result and `verdict` is the exact last completed validator return (`null` is retained;
+an unsupported explicit `undefined` is normalized to `null`). Bare `true` passes, while `false`
+and `null` reject without feedback.
+
 `keepSession:true` skips the release-time `session/close`; the resulting `AgentSessionRecord` is returned in `WorkflowRunResult.agentSessions` so the host can later call `runner.loadSession()` or `runner.resumeSession()`.
 
 See the [README](../README.md#writing-workflow-scripts) for authoring guidance and examples, and [`design-notes.md`](design-notes.md) for the protocol-level design.

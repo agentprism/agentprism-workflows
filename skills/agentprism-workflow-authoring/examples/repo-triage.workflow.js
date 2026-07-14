@@ -262,7 +262,7 @@ let writerIdx = 0;
 // Best-effort: the findings are the run's real product, so a Report-stage failure
 // (say, the token budget running dry mid-gate) is logged and degraded — the run still
 // returns everything it confirmed.
-let gated = { ok: false, value: null, attempts: 0 };
+let gated = { ok: false, value: null, verdict: null, attempts: 0 };
 try {
   gated = await gate(
     (feedback, attempt) => {
@@ -328,5 +328,6 @@ return {
   unverified,
   quickWins,
   report: typeof gated.value === "string" ? gated.value : null,
+  reportVerdict: gated.verdict,
   completeness,
 };

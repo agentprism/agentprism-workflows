@@ -17,7 +17,7 @@ A runnable example of the `gate()` DSL combinator, fronted by a repo-aware brief
 │  against the brief + exact-text spelling           │
 └────────────────────────┬───────────────────────────┘
                          ▼ ok=true (or attempts exhausted)
-   { accepted, attempts, imagePath, concept, exactText }
+   { accepted, attempts, imagePath, verdict, concept, exactText }
 ```
 
 - The **brief** agent explores the repo (`args.repoRoot`) with its own tools, then returns a
@@ -30,7 +30,8 @@ A runnable example of the `gate()` DSL combinator, fronted by a repo-aware brief
   return `{ imagePath }`.
 - The **validator** agent reads the image file with its own file-reading tool (Claude renders
   images) and returns `{ ok, feedback }` — rejecting for any misspelled/garbled required text.
-  When `ok` is false, `gate()` hands `feedback` to the next producer attempt.
+  When `ok` is false, `gate()` hands `feedback` to the next producer attempt. The final
+  structured validator return is also exposed unchanged as the result's `verdict`.
 - Each round is a **fresh agent** — no session memory — so the script carries the previous
   image path in a closure and threads it into the retry prompt.
 

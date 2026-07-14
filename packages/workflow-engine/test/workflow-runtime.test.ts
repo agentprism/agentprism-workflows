@@ -866,6 +866,284 @@ return 1`;
   assert.ok(Array.isArray(result.logs), "result.logs should be an array");
 });
 
+test("gate returns the structured first-pass verdict with extra fields intact", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'gate_structured', description: 'structured verdict' }
+const expected = { ok: true, commitSha: '9f4c2e17d8a6', scores: { correctness: 1, coverage: 0.96 } }
+const outcome = await gate(
+  () => ({ branch: 'issue-131', tests: 148 }),
+  () => expected,
+)
+return { outcome, sameVerdict: outcome.verdict === expected }`,
+    { agent: noopAgent, persistLogs: false },
+  );
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    outcome: {
+      ok: true,
+      value: { branch: "issue-131", tests: 148 },
+      verdict: {
+        ok: true,
+        commitSha: "9f4c2e17d8a6",
+        scores: { correctness: 1, coverage: 0.96 },
+      },
+      attempts: 1,
+    },
+    sameVerdict: true,
+  });
+});
+
+test("gate threads rejection feedback and returns the third passing attempt", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'gate_feedback', description: 'feedback threading' }
+const feedbackSeen = []
+const outcome = await gate(
+  (feedback, attempt) => {
+    feedbackSeen.push(feedback === undefined ? null : feedback)
+    return { revision: attempt + 1, appliedFeedback: feedback ?? null }
+  },
+  (value) => value.revision < 3
+    ? { ok: false, feedback: 'fix revision ' + value.revision, rejectedRevision: value.revision }
+    : { ok: true, commitSha: 'third-pass', reviewedRevision: value.revision },
+  { attempts: 5 },
+)
+return { outcome, feedbackSeen }`,
+    { agent: noopAgent, persistLogs: false },
+  );
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    outcome: {
+      ok: true,
+      value: { revision: 3, appliedFeedback: "fix revision 2" },
+      verdict: { ok: true, commitSha: "third-pass", reviewedRevision: 3 },
+      attempts: 3,
+    },
+    feedbackSeen: [null, "fix revision 1", "fix revision 2"],
+  });
+});
+
+test("gate exhaustion returns only the final producer value and rejection verdict", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'gate_exhaustion', description: 'final rejection' }
+return await gate(
+  (_feedback, attempt) => ({ revision: attempt + 1 }),
+  (value) => ({ ok: false, feedback: 'reject ' + value.revision, rejectionCode: 'R' + value.revision }),
+  { attempts: 2 },
+)`,
+    { agent: noopAgent, persistLogs: false },
+  );
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    ok: false,
+    value: { revision: 2 },
+    verdict: { ok: false, feedback: "reject 2", rejectionCode: "R2" },
+    attempts: 2,
+  });
+});
+
+test("gate accepts bare true and exhausts bare false without feedback", async () => {
+  const passing = await runWorkflow(
+    `export const meta = { name: 'gate_true', description: 'boolean pass' }
+return await gate(() => 'accepted', () => true)`,
+    { agent: noopAgent, persistLogs: false },
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(passing.result)), {
+    ok: true,
+    value: "accepted",
+    verdict: true,
+    attempts: 1,
+  });
+
+  const rejecting = await runWorkflow(
+    `export const meta = { name: 'gate_false', description: 'boolean rejection' }
+const feedbackSeen = []
+const outcome = await gate((feedback, attempt) => {
+  feedbackSeen.push(feedback === undefined)
+  return attempt
+}, () => false)
+return { outcome, feedbackSeen }`,
+    { agent: noopAgent, persistLogs: false },
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(rejecting.result)), {
+    outcome: { ok: false, value: 2, verdict: false, attempts: 3 },
+    feedbackSeen: [true, true, true],
+  });
+});
+
+test("gate validates a null producer and preserves its structured rejection", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'gate_null_value', description: 'null producer' }
+let validatorSawNull = false
+const outcome = await gate(
+  () => null,
+  (value) => {
+    validatorSawNull = value === null
+    return { ok: false, feedback: 'The producer returned no result.' }
+  },
+  { attempts: 0 },
+)
+return { outcome, validatorSawNull }`,
+    { agent: noopAgent, persistLogs: false },
+  );
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    outcome: {
+      ok: false,
+      value: null,
+      verdict: { ok: false, feedback: "The producer returned no result." },
+      attempts: 1,
+    },
+    validatorSawNull: true,
+  });
+});
+
+test("gate returns null when the validator returns null or undefined", async () => {
+  const nullResult = await runWorkflow(
+    `export const meta = { name: 'gate_null_verdict', description: 'null verdict' }
+return await gate((_feedback, attempt) => attempt, () => null, { attempts: 2 })`,
+    { agent: noopAgent, persistLogs: false },
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(nullResult.result)), {
+    ok: false,
+    value: 1,
+    verdict: null,
+    attempts: 2,
+  });
+
+  const undefinedResult = await runWorkflow(
+    `export const meta = { name: 'gate_undefined_verdict', description: 'undefined verdict' }
+return await gate(() => 'value', () => undefined, { attempts: 1 })`,
+    { agent: noopAgent, persistLogs: false },
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(undefinedResult.result)), {
+    ok: false,
+    value: "value",
+    verdict: null,
+    attempts: 1,
+  });
+});
+
+test("gate propagates producer and validator failures without running later callbacks", async () => {
+  let validatorAgentCalls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'gate_producer_throw', description: 'producer throw' }
+return await gate(
+  () => { throw new Error('producer boom') },
+  () => agent('validator should not run'),
+)`,
+        {
+          agent: {
+            async run() {
+              validatorAgentCalls++;
+              return true;
+            },
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.SCRIPT_ERROR &&
+      error.message === "producer boom",
+  );
+  assert.equal(validatorAgentCalls, 0);
+
+  const validatorError = new WorkflowError("validator stopped", WorkflowErrorCode.AUTH_REQUIRED, {
+    recoverable: false,
+  });
+  let runnerCalls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'gate_validator_throw', description: 'validator throw' }
+return await gate(
+  (feedback, attempt) => agent('producer:' + attempt + ':' + String(feedback)),
+  () => agent('validator'),
+  { attempts: 3 },
+)`,
+        {
+          agent: {
+            async run(prompt: string) {
+              runnerCalls++;
+              if (prompt === "validator") throw validatorError;
+              return { attempt: runnerCalls };
+            },
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => error === validatorError,
+  );
+  assert.equal(runnerCalls, 2, "the producer and validator run once before the original error escapes");
+});
+
+test("gate retains unsupported legacy object verdicts with truthy ok fields", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'gate_legacy', description: 'legacy object behavior' }
+return await gate(
+  () => ({ artifact: 'kept' }),
+  () => ({ ok: 'legacy-truthy', evidence: { source: 'existing-script' } }),
+)`,
+    { agent: noopAgent, persistLogs: false },
+  );
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    ok: true,
+    value: { artifact: "kept" },
+    verdict: { ok: "legacy-truthy", evidence: { source: "existing-script" } },
+    attempts: 1,
+  });
+});
+
+test("gate replay journals only producer and validator agents and recomputes the verdict", async () => {
+  const script = `export const meta = { name: 'gate_replay', description: 'gate replay' }
+return await gate(
+  () => agent('produce', { label: 'producer' }),
+  (value) => agent('validate:' + value.branch, { label: 'validator' }),
+)`;
+  const journal: JournalEntry[] = [];
+  const first = await runWorkflow(script, {
+    agent: {
+      async run(prompt: string) {
+        if (prompt === "produce") return { branch: "issue-131", tests: 148 };
+        return { ok: true, commitSha: "9f4c2e17d8a6", scores: { correctness: 1 } };
+      },
+    },
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  assert.equal(journal.length, 2, "gate itself must not allocate a journal entry");
+  assert.deepEqual(
+    journal.map((entry) => entry.index),
+    [0, 1],
+  );
+  assert.ok(journal.every((entry) => /^[a-f0-9]{64}$/.test(entry.hash)));
+  assert.deepEqual(JSON.parse(JSON.stringify(first.result)), {
+    ok: true,
+    value: { branch: "issue-131", tests: 148 },
+    verdict: { ok: true, commitSha: "9f4c2e17d8a6", scores: { correctness: 1 } },
+    attempts: 1,
+  });
+
+  let liveCalls = 0;
+  const replayed = await runWorkflow(script, {
+    agent: {
+      async run() {
+        liveCalls++;
+        throw new Error("replay called the live runner");
+      },
+    },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+
+  assert.equal(liveCalls, 0);
+  assert.equal(JSON.stringify(replayed.result), JSON.stringify(first.result));
+});
+
 // ─── Runtime determinism hardening (P0-5) ───────────────────────────────────────
 
 const noopAgent = {

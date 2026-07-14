@@ -48,7 +48,7 @@ would put a `checkpoint()` before the irreversible step — see the SDK README.)
 | **Read-only session modes** (`mode: "plan"` / `"read-only"`) on pinned calls | the vendor pool in both scripts |
 | `pipeline()` (barrier-less multi-stage flow) + `parallel()` (verification panel) | `repo-triage.workflow.js` |
 | Structured output via `schema`, placeholder guards in script code | both scripts |
-| `gate()` produce-until-approved loop | Report stage |
+| `gate()` produce-until-approved loop and exposed terminal `reportVerdict` | Report stage |
 | `workflow()` nesting a saved sibling script by name | Hunt stage |
 | `loopUntilDry()` unknown-size discovery | `quick-wins.workflow.js` |
 | `completenessCheck()` final gap critic | Report stage |
@@ -98,8 +98,9 @@ npm start -- --workflow quick-wins               # run the nested hunter standal
 ```
 
 All flags are documented at the top of `src/main.ts`. The confirmed findings, quick
-wins, and stats print to stdout; the gated report lands in `triage-report.md`
-(override with `--out`). Exit code 0 = the run completed.
+wins, and stats print to stdout; the gated report lands in `triage-report.md` (override
+with `--out`). The run result also exposes the terminal review as `reportVerdict`.
+Exit code 0 = the run completed.
 
 Runs are **unbounded by default** — an autonomous triage should finish, not die at an
 arbitrary cap. Pass `--budget <tokens>` to set a hard cap and watch the budget support

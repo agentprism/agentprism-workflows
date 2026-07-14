@@ -447,7 +447,7 @@ ships no runtime code).
 | `loopUntilDry(options)` | Repeat a round, collecting deduped new items until it dries up. |
 | `completenessCheck(args, results)` | Ask a critic what is still missing. |
 | `retry(thunk, options?)` | Bounded retry until `until(result)` holds. |
-| `gate(thunk, validator, options?)` | Validate-and-feed-back loop until it passes. |
+| `gate(thunk, validator, options?)` | Validate-and-feed-back loop returning `{ ok, value, verdict, attempts }`; `verdict` is the raw last validator return on either pass or exhaustion. |
 | `checkpoint(text, options?)` | Deterministic, journaled human gate: live confirm, headless default/abort, or opt-in durable `headless: "pause"`. |
 | `phase(title, options?)` | Open a named phase (optional soft token sub-budget). |
 | `log(message)` | Append a line to the run log. |

@@ -93,11 +93,22 @@ declare function retry(
  * Validation gate: call `thunk(feedback, attempt)`, validate it, and feed the
  * validator's feedback into the next attempt until it passes or `attempts` run out.
  */
-declare function gate(
-  thunk: (feedback: string | undefined, attempt: number) => Promise<unknown> | unknown,
-  validator: (result: unknown) => Promise<{ ok: boolean; feedback?: string }> | { ok: boolean; feedback?: string },
+declare function gate<
+  TValue = unknown,
+  TVerdict extends boolean | { ok: boolean; feedback?: string } | null = {
+    ok: boolean;
+    feedback?: string;
+  },
+>(
+  thunk: (feedback: string | undefined, attempt: number) => Promise<TValue> | TValue,
+  validator: (result: TValue) => Promise<TVerdict> | TVerdict,
   options?: { attempts?: number },
-): Promise<{ ok: boolean; value: unknown; attempts: number }>;
+): Promise<{
+  ok: boolean;
+  value: TValue;
+  verdict: TVerdict | null;
+  attempts: number;
+}>;
 
 /**
  * Deterministic, journaled, replayable human checkpoint. Spends no tokens. Headless
