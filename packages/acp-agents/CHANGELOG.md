@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.24.7
+
+### Patch Changes
+
+- 346671d: Bump `@automatalabs/codex-acp` to 1.6.3 (fork release carrying the upstream codex 0.144.4 bump).
+
 ## 0.24.6
 
 ### Patch Changes
