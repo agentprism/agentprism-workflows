@@ -1,5 +1,16 @@
 # @automatalabs/workflow-engine
 
+## 0.16.0
+
+### Minor Changes
+
+- a4a5397: Add shared workflow run inspection, log-tail, truncation, and journal-attribution contracts; implement the safe engine projector and persisted terminal causes; publish the SDK facade surface; and add the MCP `action: "inspect"` branch with terminal log-tail rendering.
+
+### Patch Changes
+
+- Updated dependencies [a4a5397]
+  - @automatalabs/shared-types@0.17.0
+
 ## 0.15.0
 
 ### Minor Changes
