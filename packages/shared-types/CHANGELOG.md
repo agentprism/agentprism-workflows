@@ -1,5 +1,12 @@
 # @automatalabs/shared-types
 
+## 0.18.0
+
+### Minor Changes
+
+- f0f30ad: Add replay-neutral `fallbacks` and `checkpointsTaken` observability to terminal workflow results,
+  persist both audit trails for cold reads, and expose them in foreground and await MCP outcomes.
+
 ## 0.17.0
 
 ### Minor Changes

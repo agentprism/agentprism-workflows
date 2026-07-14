@@ -1,5 +1,17 @@
 # @automatalabs/workflow-engine
 
+## 0.19.0
+
+### Minor Changes
+
+- f0f30ad: Add replay-neutral `fallbacks` and `checkpointsTaken` observability to terminal workflow results,
+  persist both audit trails for cold reads, and expose them in foreground and await MCP outcomes.
+
+### Patch Changes
+
+- Updated dependencies [f0f30ad]
+  - @automatalabs/shared-types@0.18.0
+
 ## 0.18.0
 
 ### Minor Changes
