@@ -282,6 +282,19 @@ still unclear, call the same single `workflow` tool with
 label glob and latest-N tail to identify the last relevant work before deciding whether to resume,
 edit, or stop. `resumeFromRunId` executes a new run; inspection does not.
 
+Choose `background: true` for work that may outlive one MCP request. The start call returns exactly
+`{ runId, status: "running" }` after durable admission; retain that new ID and normally collect with
+20-second bounded calls: `{ action: "await", runId, waitMs: 20000 }`. A timeout is progress, not
+failure: it returns the newest safe status and cumulative usage, so call await again. Use
+`action:"inspect"` (or `waitMs:0`) when you need an immediate filtered diagnostic instead of waiting.
+At terminal status await adds `outcome`, the foreground-equivalent authored result/pause context.
+
+Background is detached from the initiating request, not from the MCP server process; a stdio child
+exit can stop in-flight work. It has no progress token or live checkpoint elicitation, so authored
+headless checkpoint modes apply. Resume only a paused durable journal: submit a new run with the
+script, `resumeFromRunId`, and any `checkpointReplies`. That execution gets a new run ID and durably
+inherits the complete replay prefix. Await and inspect are read-only and never resume anything.
+
 ## Worked example — cross-vendor build with every major primitive
 
 ```js

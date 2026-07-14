@@ -12,12 +12,23 @@ import { createAcpRunner } from "@automatalabs/workflows";
 
 import { createWorkflowServer } from "./server.js";
 
-export { createWorkflowServer } from "./server.js";
+export { createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
 export type { WorkflowConfirmCallback, WorkflowCheckpointOptions } from "./server.js";
 export { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
-export type { WorkflowExecuteToolInput, WorkflowInspectToolInput, WorkflowToolInput } from "./workflow-tool-input.js";
+export type {
+  WorkflowAwaitToolInput,
+  WorkflowExecuteToolInput,
+  WorkflowInspectToolInput,
+  WorkflowToolInput,
+} from "./workflow-tool-input.js";
 export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
-export type { WorkflowExecutionToolResult, WorkflowToolResult } from "./workflow-tool-output.js";
+export type {
+  WorkflowAwaitMetadata,
+  WorkflowBackgroundAccepted,
+  WorkflowExecutionToolResult,
+  WorkflowRunAwaitResult,
+  WorkflowToolResult,
+} from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";

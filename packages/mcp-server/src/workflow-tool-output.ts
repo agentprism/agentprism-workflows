@@ -1,3 +1,4 @@
+import type { TokenUsage } from "@automatalabs/shared-types";
 import type { WorkflowRunResult, WorkflowRunStatus } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -11,40 +12,51 @@ const logTailSchema = z.object({
 
 const countSchema = z.object({ total: z.number().int().nonnegative(), returned: z.number().int().nonnegative() });
 
+const tokenUsageSchema = z.object({
+  input: z.number(),
+  output: z.number(),
+  total: z.number(),
+  cost: z.number(),
+  cacheRead: z.number().optional(),
+  cacheWrite: z.number().optional(),
+});
+
+const authContextSchema = z.object({
+  backendId: z.string().optional(),
+  methods: z.array(
+    z.object({ id: z.string(), type: z.enum(["agent", "terminal", "env_var"]), name: z.string().optional() }),
+  ),
+});
+
+const checkpointContextSchema = z.object({
+  callIndex: z.number().int().nonnegative(),
+  hash: z.string(),
+  prompt: z.string(),
+  kind: z.enum(["confirm", "input", "select"]),
+  choices: z.array(z.string()).optional(),
+  default: z.unknown().optional(),
+});
+
+const executionResultSchema = z.object({
+  runId: z.string(),
+  status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
+  result: z.unknown().optional(),
+  tokenUsage: tokenUsageSchema.optional(),
+  logs: z.array(z.string()).optional(),
+  logTail: logTailSchema.optional(),
+  authContext: authContextSchema.optional(),
+  checkpointContext: checkpointContextSchema.optional(),
+});
+
 /** Common MCP output schema for legacy execution results and exact inspection statuses. */
 export const workflowToolOutputShape = {
   runId: z.string(),
   status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
   result: z.unknown().optional(),
-  tokenUsage: z
-    .object({
-      input: z.number(),
-      output: z.number(),
-      total: z.number(),
-      cost: z.number(),
-      cacheRead: z.number().optional(),
-      cacheWrite: z.number().optional(),
-    })
-    .optional(),
+  tokenUsage: tokenUsageSchema.optional(),
   logs: z.array(z.string()).optional(),
-  authContext: z
-    .object({
-      backendId: z.string().optional(),
-      methods: z.array(
-        z.object({ id: z.string(), type: z.enum(["agent", "terminal", "env_var"]), name: z.string().optional() }),
-      ),
-    })
-    .optional(),
-  checkpointContext: z
-    .object({
-      callIndex: z.number().int().nonnegative(),
-      hash: z.string(),
-      prompt: z.string(),
-      kind: z.enum(["confirm", "input", "select"]),
-      choices: z.array(z.string()).optional(),
-      default: z.unknown().optional(),
-    })
-    .optional(),
+  authContext: authContextSchema.optional(),
+  checkpointContext: checkpointContextSchema.optional(),
   workflowName: z.string().optional(),
   phases: z.array(z.string()).optional(),
   currentPhase: z.string().optional(),
@@ -86,6 +98,14 @@ export const workflowToolOutputShape = {
       }),
     })
     .optional(),
+  wait: z
+    .object({
+      requestedMs: z.number().int().nonnegative(),
+      elapsedMs: z.number().int().nonnegative(),
+      returnedBecause: z.enum(["terminal", "timeout", "immediate"]),
+    })
+    .optional(),
+  outcome: executionResultSchema.optional(),
 } as const;
 
 export interface WorkflowExecutionToolResult<T = unknown> {
@@ -99,7 +119,30 @@ export interface WorkflowExecutionToolResult<T = unknown> {
   checkpointContext?: WorkflowRunResult["checkpointContext"];
 }
 
-export type WorkflowToolResult<T = unknown> = WorkflowExecutionToolResult<T> | WorkflowRunStatus;
+export interface WorkflowBackgroundAccepted {
+  runId: string;
+  status: "running";
+}
+
+export interface WorkflowAwaitMetadata {
+  requestedMs: number;
+  elapsedMs: number;
+  returnedBecause: "terminal" | "timeout" | "immediate";
+}
+
+export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
+  wait: WorkflowAwaitMetadata;
+  /** Cumulative usage observed for live calls in this execution; absent before any is known. */
+  tokenUsage?: TokenUsage;
+  /** Present exactly when status is paused/completed/failed/aborted. */
+  outcome?: WorkflowExecutionToolResult<T>;
+}
+
+export type WorkflowToolResult<T = unknown> =
+  | WorkflowExecutionToolResult<T>
+  | WorkflowBackgroundAccepted
+  | WorkflowRunStatus
+  | WorkflowRunAwaitResult<T>;
 
 export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExecutionToolResult<T> {
   return {

@@ -19,7 +19,10 @@ const checkpointRepliesSchema = z
   );
 
 export const workflowToolInputShape = {
-  action: z.enum(["run", "inspect"]).optional().describe("Operation. Omit or use run to execute; inspect reads a run."),
+  action: z
+    .enum(["run", "inspect", "await"])
+    .optional()
+    .describe("Operation. Omit or use run to execute; inspect reads immediately; await waits for terminal status."),
   script: z
     .string()
     .min(1)
@@ -67,6 +70,10 @@ export const workflowToolInputShape = {
   checkpointReplies: checkpointRepliesSchema
     .optional()
     .describe("With resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),
+  background: z
+    .boolean()
+    .optional()
+    .describe("Default false. True acknowledges after admission and executes in this server process."),
   runId: z
     .string()
     .max(128)
@@ -82,6 +89,13 @@ export const workflowToolInputShape = {
     .optional()
     .describe("Case-sensitive whole-label glob using *, ?, and backslash escaping."),
   logLines: z.number().int().min(0).max(50).optional().describe("Latest run-log lines. Default 20; range 0..50."),
+  waitMs: z
+    .number()
+    .int()
+    .min(0)
+    .max(25_000)
+    .optional()
+    .describe("Await duration in milliseconds. Default 20000; range 0..25000. Zero reads without blocking."),
 } as const;
 
 export interface WorkflowExecuteToolInput {
@@ -95,7 +109,10 @@ export interface WorkflowExecuteToolInput {
   tokenBudget?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
+  /** Default false. True acknowledges after admission and executes in this server process. */
+  background?: boolean;
   runId?: never;
+  waitMs?: never;
   lastN?: never;
   labelGlob?: never;
   logLines?: never;
@@ -105,12 +122,25 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   action: "inspect";
   runId: string;
   script?: never;
+  background?: never;
+  waitMs?: never;
 }
 
-export type WorkflowToolInput = WorkflowExecuteToolInput | WorkflowInspectToolInput;
+export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
+  action: "await";
+  runId: string;
+  /** Default 20_000; integer range 0..25_000. Zero is a non-blocking status read. */
+  waitMs?: number;
+  script?: never;
+  background?: never;
+  resumeFromRunId?: never;
+  checkpointReplies?: never;
+}
+
+export type WorkflowToolInput = WorkflowExecuteToolInput | WorkflowInspectToolInput | WorkflowAwaitToolInput;
 
 interface RawWorkflowToolInput {
-  action?: "run" | "inspect";
+  action?: "run" | "inspect" | "await";
   script?: string;
   args?: unknown;
   maxAgents?: number;
@@ -120,10 +150,12 @@ interface RawWorkflowToolInput {
   tokenBudget?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
+  background?: boolean;
   runId?: string;
   lastN?: number;
   labelGlob?: string;
   logLines?: number;
+  waitMs?: number;
 }
 
 function invalid(message: string): never {
@@ -143,7 +175,9 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
       raw.agentTimeoutMs !== undefined ||
       raw.tokenBudget !== undefined ||
       raw.resumeFromRunId !== undefined ||
-      raw.checkpointReplies !== undefined
+      raw.checkpointReplies !== undefined ||
+      raw.background !== undefined ||
+      raw.waitMs !== undefined
     ) {
       invalid('action="inspect" cannot include execution fields');
     }
@@ -156,7 +190,39 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
     };
   }
 
-  if (raw.runId !== undefined || raw.lastN !== undefined || raw.labelGlob !== undefined || raw.logLines !== undefined) {
+  if (raw.action === "await") {
+    if (!raw.runId) invalid('action="await" requires runId');
+    if (
+      raw.script !== undefined ||
+      raw.args !== undefined ||
+      raw.maxAgents !== undefined ||
+      raw.concurrency !== undefined ||
+      raw.agentRetries !== undefined ||
+      raw.agentTimeoutMs !== undefined ||
+      raw.tokenBudget !== undefined ||
+      raw.resumeFromRunId !== undefined ||
+      raw.checkpointReplies !== undefined ||
+      raw.background !== undefined
+    ) {
+      invalid('action="await" cannot include execution fields');
+    }
+    return {
+      action: "await",
+      runId: raw.runId,
+      waitMs: raw.waitMs ?? 20_000,
+      lastN: raw.lastN,
+      labelGlob: raw.labelGlob,
+      logLines: raw.logLines,
+    };
+  }
+
+  if (
+    raw.runId !== undefined ||
+    raw.waitMs !== undefined ||
+    raw.lastN !== undefined ||
+    raw.labelGlob !== undefined ||
+    raw.logLines !== undefined
+  ) {
     invalid("run inputs cannot include inspection fields");
   }
   if (!raw.script) invalid(raw.action === "run" ? 'action="run" requires script' : "script or an explicit action is required");
@@ -171,6 +237,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
     tokenBudget: raw.tokenBudget,
     resumeFromRunId: raw.resumeFromRunId,
     checkpointReplies: raw.checkpointReplies,
+    background: raw.background ?? false,
   };
 }
 

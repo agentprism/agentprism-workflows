@@ -44,3 +44,66 @@ For the nested quick-wins hunt, narrow the same run journal to its round labels:
 If a run paused or failed, read the execution response's immediate final-20 `logTail` first, then
 use inspection for attributed compact results. Host MCP actions stay outside workflow scripts; the
 shipped `.workflow.js` files call only DSL globals.
+
+## Complete background host-call transcript
+
+Start the shipped `repo-triage.workflow.js` by passing its file contents as `script` (the workflow
+script does not call MCP actions itself):
+
+```json
+{
+  "script": "<contents of repo-triage.workflow.js>",
+  "args": { "target": "." },
+  "background": true,
+  "tokenBudget": 500000
+}
+```
+
+```json
+{ "runId": "mabc1234-k9x2pq", "status": "running" }
+```
+
+The host retains that ID and waits in bounded 20-second calls. A first timeout returns status rather
+than failing the workflow:
+
+```json
+{ "action": "await", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
+```
+
+```json
+{
+  "runId": "mabc1234-k9x2pq",
+  "status": "running",
+  "workflowName": "repo-triage",
+  "phases": ["Discover", "Review"],
+  "logTail": { "lines": ["review wave started"], "totalLines": 1, "omittedLines": 0, "truncatedLines": 0, "redactedLines": 0 },
+  "calls": [],
+  "filter": { "lastN": 20, "logLines": 20 },
+  "truncation": { "maxStructuredBytes": 24576, "byteCapApplied": false, "phases": { "total": 2, "returned": 2, "shortened": 0 }, "logs": { "total": 1, "returned": 1, "shortened": 0, "redacted": 0 }, "calls": { "total": 0, "matched": 0, "returned": 0, "shortenedResults": 0, "redactedResults": 0 } },
+  "wait": { "requestedMs": 20000, "elapsedMs": 20003, "returnedBecause": "timeout" }
+}
+```
+
+Call the same await again until `returnedBecause:"terminal"`; then `outcome.result` is the complete
+authored result and `outcome.logs` the foreground-equivalent full logs.
+
+For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal await returns
+`outcome.checkpointContext.callIndex`. Resume through a second background run:
+
+```json
+{
+  "script": "<the same workflow source>",
+  "args": { "target": "." },
+  "background": true,
+  "resumeFromRunId": "mabc1234-k9x2pq",
+  "checkpointReplies": { "11": true }
+}
+```
+
+```json
+{ "runId": "mabc5678-z1n4rs", "status": "running" }
+```
+
+The second ID is intentional: resume executes a new run. Retain it and await it in turn. Before its
+acknowledgement, the new record already contains the inherited call prefix and checkpoint answer, so
+another pause/crash can resume from `mabc5678-z1n4rs` without re-running that prefix.

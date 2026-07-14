@@ -10,7 +10,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
-| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing one `workflow` tool for run, resume, and inspect | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, bounded await, resume, and inspect | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
 
@@ -117,7 +117,7 @@ explicitly selects `headless: "pause"`.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `startInBackground(script, args?, exec?)` | `{ runId, promise }` | Returns immediately. The promise rejects on failure (a side-channel catch prevents host unhandled rejections if you don't await it). |
+| `startInBackground(script, args?, exec?)` | `{ runId, promise }` | Process-lifetime execution. Returns after lease acquisition and fail-fast initial persistence. A supplied `resumeJournal` is sorted and copied into the child run before that save, so replayed prefixes and synthetic checkpoint answers survive later resume hops under the new run ID. The promise rejects on pause/failure/abort (a side-channel catch prevents host unhandled rejections if ignored). |
 | `runSync(script, args?, exec?)` | `Promise<WorkflowRunResult>` | Blocks; always resolves to a **terminal** result (`completed \| paused \| failed \| aborted`) — never throws for ordinary outcomes. |
 | `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, read-only, live-first safe projection; falls back to the manager's project-scoped persistence. Never leases, saves, or changes status. |
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
@@ -129,6 +129,14 @@ explicitly selects `headless: "pause"`.
 | `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |
 | `dispose()` / `close()` | — | Facade manager only: detach its `agentEvent` runner subscriptions. Never disposes the runner itself. |
+
+`WorkflowRunOptions.onTokenUsage` and the manager's `tokenUsage` event are cumulative snapshots.
+They fire after every live attempt—including failed retries and pause/failure attempts—using
+provider usage when supplied and the existing estimate fallback otherwise. Replayed journal calls
+emit/add nothing. The unchanged successful final total is still emitted, so an observer may receive
+it twice. The latest snapshot is persisted at journal and settlement points and survives cold load.
+If a process dies, stale persisted `running` runs recover to `paused`; the durable prefix can then
+seed a new execution. An in-flight call without a journal result runs again.
 
 ### Run inspection and terminal log tails
 
@@ -512,7 +520,97 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface. Omitted `action` or `action:"run"` requires a non-empty raw `script` and accepts the existing execution knobs (`args`, `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `tokenBudget`, `resumeFromRunId`, `checkpointReplies`). `action:"inspect"` requires an engine-shaped `runId` and accepts only `lastN`, `labelGlob`, and `logLines`. Mixed/missing branches, invalid run IDs, and invalid inspection bounds are MCP Invalid Params (`-32602`). Execution runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`; inspection is read-only and never parses a script, invokes a runner, approves a backend, elicits, reports progress, or acquires a lease. For `headless: "pause"`, non-elicitation clients receive structured `checkpointContext` and resume with `checkpointReplies`; elicitation-capable clients use the live `confirm` channel, including on resume. The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir` feature. The server honors the same runtime environment variables as the SDK plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface. Its input is this union:
+
+```ts
+interface WorkflowExecuteToolInput {
+  action?: "run";
+  script: string;
+  args?: unknown;
+  maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+  tokenBudget?: number | null;
+  resumeFromRunId?: string;
+  checkpointReplies?: Record<number, unknown>;
+  background?: boolean; // default false
+}
+
+interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
+  action: "inspect";
+  runId: string;
+}
+
+interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
+  action: "await";
+  runId: string;
+  waitMs?: number; // default 20_000; integer 0..25_000
+}
+```
+
+Mixed/missing branches, invalid run IDs, invalid inspection bounds, and `waitMs` outside 0–25,000
+are MCP Invalid Params (`-32602`). Omitted action/background preserves foreground execution byte for
+byte: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
+`WorkflowExecutionToolResult<T>`. `action:"inspect"` remains immediate and returns exactly the safe
+`WorkflowRunStatus`; it never parses a script, invokes a runner, approves a backend, elicits, reports
+progress, or acquires a lease.
+
+`background:true` reserves one of four process-local active-or-starting slots, performs parsing,
+script-backend approval, lease acquisition, and the durable initial save, then returns:
+
+```ts
+interface WorkflowBackgroundAccepted {
+  runId: string;
+  status: "running";
+}
+```
+
+It does not await script/agent completion. The run has no initiating request signal, progress token,
+or live checkpoint `confirm`; checkpoints use authored headless behavior. Cancelling the accepted
+call cannot abort it. A fifth run fails with
+`Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
+Foreground, inspect, and await do not consume slots. A background `resumeFromRunId` creates a new run
+ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
+run's initial durable record, preserving multi-hop resume safety.
+
+```ts
+interface WorkflowAwaitMetadata {
+  requestedMs: number;
+  elapsedMs: number;
+  returnedBecause: "terminal" | "timeout" | "immediate";
+}
+
+interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
+  wait: WorkflowAwaitMetadata;
+  tokenUsage?: TokenUsage;
+  outcome?: WorkflowExecutionToolResult<T>; // present exactly at terminal status
+}
+```
+
+Await returns immediately for terminal runs, is a non-blocking read at `waitMs:0`, and otherwise
+waits only for terminal lifecycle state for at most the requested duration. It uses the local
+settlement promise when available and 250-ms project-store polling after restart. Await cancellation
+ends only that request and returns
+`Workflow await for runId "<runId>" was cancelled; the workflow was not cancelled.` with no
+structured content. Await is a successful read even for failed/aborted lifecycle status. Partial
+`tokenUsage` is cumulative live work in this execution only; cached replay adds zero. At terminal,
+top-level and `outcome.tokenUsage` are identical.
+
+Terminal `outcome` is live-first and reconstructed from project-scoped persistence after restart,
+normalizing legacy missing `cost` to zero. Completed outcomes contain the exact authored result and
+raw full logs; paused outcomes carry existing non-secret `authContext`/`checkpointContext` and resume
+guidance. Retrieval has no TTL and remains available until SDK/manual deletion, corruption, or store
+loss. The inherited status portion retains its 24,576-byte/redaction budget and await text its
+8,192-byte cap; raw terminal `outcome` intentionally has no new envelope cap and is never duplicated
+into text.
+
+Background means detached from one request, not from the server process. Stdio-host exit, SIGTERM,
+crash, or machine shutdown can stop in-flight work; there is no daemon/worker handoff. The initial
+record and completed call prefix remain durable, later writes are best effort, and the next manager
+recovers an orphaned `running` record to `paused` for an explicit new `resumeFromRunId` execution.
+The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
+feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
 Inspect returns exactly `WorkflowRunStatus`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.

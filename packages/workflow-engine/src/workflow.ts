@@ -605,6 +605,7 @@ export async function runWorkflow<T = unknown>(
         }
         shared.tokenUsage.total += tokens;
         shared.spent += tokens;
+        options.onTokenUsage?.({ ...shared.tokenUsage });
         return tokens;
       };
 

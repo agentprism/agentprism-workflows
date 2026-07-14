@@ -31,7 +31,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises run and inspect fields without detached-run fields", () => {
+test("input shape: one tool advertises the exact run, inspect, and await field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -40,6 +40,7 @@ test("input shape: one tool advertises run and inspect fields without detached-r
       "agentRetries",
       "agentTimeoutMs",
       "args",
+      "background",
       "checkpointReplies",
       "concurrency",
       "labelGlob",
@@ -50,9 +51,32 @@ test("input shape: one tool advertises run and inspect fields without detached-r
       "runId",
       "script",
       "tokenBudget",
+      "waitMs",
     ],
-    "the exact run/inspect wire fields (background and await belong to the sibling spec)",
+    "the exact run/inspect/await wire fields",
   );
+});
+
+test("background defaults false and accepts explicit false or true on run only", () => {
+  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x" })).background, false);
+  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: false })).background, false);
+  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: true })).background, true);
+});
+
+test("await applies its default and accepts the exact wait bounds", () => {
+  assert.deepEqual(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b" })), {
+    action: "await",
+    runId: "a-b",
+    waitMs: 20_000,
+    lastN: undefined,
+    labelGlob: undefined,
+    logLines: undefined,
+  });
+  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b", waitMs: 0 })).waitMs, 0);
+  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b", waitMs: 25_000 })).waitMs, 25_000);
+  for (const waitMs of [-1, 25_001, 1.5]) {
+    assert.throws(() => Schema.parse({ action: "await", runId: "a-b", waitMs }));
+  }
 });
 
 test("inspection accepts defaults and exact bounds, and rejects invalid IDs/globs/ranges", () => {
@@ -86,7 +110,7 @@ test("inspection accepts defaults and exact bounds, and rejects invalid IDs/glob
   }
 });
 
-test("the discriminator rejects every missing or mixed run/inspect branch", () => {
+test("the discriminator rejects every missing or mixed run/inspect/await branch", () => {
   for (const input of [
     { action: "run" },
     { action: "inspect" },
@@ -96,7 +120,21 @@ test("the discriminator rejects every missing or mixed run/inspect branch", () =
     { action: "inspect", runId: "a-b", concurrency: 2 },
     { action: "inspect", runId: "a-b", resumeFromRunId: "c-d" },
     { action: "inspect", runId: "a-b", checkpointReplies: { 0: true } },
+    { action: "inspect", runId: "a-b", background: false },
+    { action: "inspect", runId: "a-b", waitMs: 0 },
+    { action: "await" },
+    { action: "await", runId: "a-b", script: "x" },
+    { action: "await", runId: "a-b", args: {} },
+    { action: "await", runId: "a-b", maxAgents: 1 },
+    { action: "await", runId: "a-b", concurrency: 1 },
+    { action: "await", runId: "a-b", agentRetries: 1 },
+    { action: "await", runId: "a-b", agentTimeoutMs: 1 },
+    { action: "await", runId: "a-b", tokenBudget: 1 },
+    { action: "await", runId: "a-b", resumeFromRunId: "c-d" },
+    { action: "await", runId: "a-b", checkpointReplies: { 0: true } },
+    { action: "await", runId: "a-b", background: true },
     { script: "x", runId: "a-b" },
+    { script: "x", waitMs: 0 },
     { action: "run", script: "x", lastN: 1 },
     { action: "run", script: "x", labelGlob: "*" },
     { action: "run", script: "x", logLines: 0 },

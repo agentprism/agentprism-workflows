@@ -317,6 +317,10 @@ export class WorkflowManager extends EventEmitter {
       lease: lease ?? undefined,
     };
 
+    if (managed.journaling && exec.resumeJournal) {
+      managed.journal = [...exec.resumeJournal.values()].sort((a, b) => a.index - b.index);
+    }
+
     this.runs.set(runId, managed);
 
     try {
@@ -330,6 +334,7 @@ export class WorkflowManager extends EventEmitter {
           cwd: exec.cwd,
           sessionId: this.sessionId,
           status: "running",
+          journal: managed.journal,
           phases: managed.snapshot.phases,
           agents: [],
           logs: [],
@@ -672,6 +677,7 @@ export class WorkflowManager extends EventEmitter {
         managed.status = "failed";
       }
       managed.error = workflowError;
+      managed.result = this.composeResult(managed, workflowError);
 
       // Persist final state + release the lease BEFORE emitting, so a consumer that did not
       // subscribe to 'error' (EventEmitter throws ERR_UNHANDLED_ERROR on an unheard 'error')

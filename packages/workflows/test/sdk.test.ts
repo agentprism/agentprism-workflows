@@ -49,6 +49,7 @@ import type {
   AcpEventName,
   AcpRunnerEventMap,
   AgentEventPayload,
+  AgentUsage,
   AgentRunner,
   RunOptions,
   PersistedAgentState,
@@ -75,6 +76,7 @@ import type {
   WorkflowRunInspectionOptions,
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
+  WorkflowRunResult,
 } from "../src/index.js";
 
 /**
@@ -104,10 +106,12 @@ class EventedRunner {
   readonly backendId = "claude";
   private readonly waitForRun: (() => Promise<void>) | undefined;
   private readonly failWith: Error | undefined;
+  private readonly usage: AgentUsage | undefined;
 
-  constructor(options: { waitForRun?: () => Promise<void>; failWith?: Error } = {}) {
+  constructor(options: { waitForRun?: () => Promise<void>; failWith?: Error; usage?: AgentUsage } = {}) {
     this.waitForRun = options.waitForRun;
     this.failWith = options.failWith;
+    this.usage = options.usage;
   }
 
   on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void {
@@ -132,6 +136,7 @@ class EventedRunner {
     } as AcpRunnerEventMap["session_update"]["update"];
     this.emit("session_update", { ...ctx, update });
     this.emit("agent_message_chunk", { ...ctx, ...update } as AcpRunnerEventMap["agent_message_chunk"]);
+    if (this.usage) options?.onUsage?.(this.usage);
 
     await this.waitForRun?.();
     if (this.failWith) throw this.failWith;
@@ -541,6 +546,59 @@ test("WorkflowManager removes exec runner bridge after runSync settles", async (
   assert.equal(result.status, "completed");
   assert.equal(runner.listenerCount("session_update"), 0);
   assert.equal(runner.listenerCount("session_open"), 0);
+});
+
+test("WorkflowManager.startInBackground preserves its public handle, live usage, ACP bridge, and replay prefix", async () => {
+  const script = [
+    'export const meta = { name: "facade-background", description: "facade background" };',
+    'const values = [];',
+    'for (let i = 0; i < args.count; i++) values.push(await agent(`call-${i}`, { label: `call-${i}` }));',
+    'if (args.pause) await checkpoint("continue?", { headless: "pause" });',
+    "return values;",
+  ].join("\n");
+  const manager = new WorkflowManager({ agent: okRunner() });
+  const source = await manager.runSync(script, { count: 1, pause: false });
+  const prefix = manager.getPersistence().load(source.runId)?.journal ?? [];
+  assert.deepEqual(prefix.map((entry) => entry.index), [0]);
+
+  const gates: Array<ReturnType<typeof deferred>> = [];
+  const runner = new EventedRunner({
+    waitForRun: () => {
+      const gate = deferred();
+      gates.push(gate);
+      return gate.promise;
+    },
+    usage: { input: 5, output: 4, total: 9, cost: 0.09, cacheRead: 1, cacheWrite: 0 },
+  });
+  const usageEvents: number[] = [];
+  manager.on("tokenUsage", (event: { usage: { total: number } }) => usageEvents.push(event.usage.total));
+  const started: { runId: string; promise: Promise<WorkflowRunResult> } = manager.startInBackground(
+    script,
+    { count: 3, pause: true },
+    {
+      agent: eventedAgent(runner),
+      resumeJournal: new Map(prefix.map((entry) => [entry.index, entry] as const)),
+    },
+  );
+  assert.deepEqual(manager.getPersistence().load(started.runId)?.journal?.map((entry) => entry.index), [0]);
+  await waitUntil(() => gates.length === 1, "the first live suffix call should reach the ACP runner");
+  assert.equal(runner.listenerCount("session_update"), 1, "the facade bridge stays installed while background work runs");
+
+  gates[0]?.resolve();
+  await waitUntil(() => gates.length === 2, "the second live suffix call should remain blocked");
+  assert.deepEqual(usageEvents, [9]);
+  assert.equal(manager.getSnapshot(started.runId)?.tokenUsage?.total, 9);
+  assert.deepEqual(manager.getPersistence().load(started.runId)?.journal?.map((entry) => entry.index), [0, 1]);
+  assert.equal(runner.listenerCount("session_update"), 1);
+
+  gates[1]?.resolve();
+  await assert.rejects(started.promise, (error: unknown) => {
+    return error instanceof WorkflowError && error.code === WorkflowErrorCode.CHECKPOINT_REQUIRED;
+  });
+  assert.deepEqual(usageEvents, [9, 18]);
+  assert.equal(manager.getSnapshot(started.runId)?.tokenUsage?.total, 18);
+  assert.deepEqual(manager.getPersistence().load(started.runId)?.journal?.map((entry) => entry.index), [0, 1, 2]);
+  assert.equal(runner.listenerCount("session_update"), 0, "the facade releases its bridge when the promise rejects");
 });
 
 test("WorkflowManager keeps a shared exec runner bridge until concurrent runs settle", async () => {

@@ -112,7 +112,7 @@ Two packages are the primary **user-facing entry points** — start with one of 
 | Package | What it is |
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
-| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing one `workflow` tool for run, resume, and inspect — built on `@automatalabs/workflows`. |
+| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, await, resume, and inspect — built on `@automatalabs/workflows`. |
 
 One optional integration package attaches to the SDK's manager surface:
 
@@ -192,8 +192,10 @@ await runner.dispose();   // closes pooled backend processes
 
 ## Quickstart — MCP server
 
-The single `workflow` tool runs or resumes a script synchronously and can safely inspect any known
-project-scoped run by ID. Execution streams `notifications/progress` and returns the structured result.
+The single `workflow` tool runs in the foreground by default, can acknowledge long work with
+`background: true`, waits for it with bounded `action: "await"` calls, and safely inspects any known
+project-scoped run by ID. Foreground execution streams `notifications/progress` and returns the
+terminal structured result.
 
 Register the stdio server in your MCP host's config:
 
@@ -225,8 +227,9 @@ From a source checkout, point at the built entry instead:
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"run" \| "inspect"` | Omit for the legacy run form. `"inspect"` selects a read-only status lookup. |
-| `script` | string (required for run) | Raw JS; first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect. |
+| `action` | `"run" \| "inspect" \| "await"` | Omit for the legacy run form. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state. |
+| `script` | string (required for run) | Raw JS; first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await. |
+| `background` | boolean | Run only; default `false`. `true` returns `{ runId, status: "running" }` after durable admission. |
 | `args` | any | Exposed to the script as the global `args`. |
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
@@ -235,12 +238,31 @@ From a source checkout, point at the built entry instead:
 | `tokenBudget` | number \| null | Hard total-token cap for the run; omit for none. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `checkpointReplies` | object | With `resumeFromRunId`, map a paused `checkpointContext.callIndex` to its decision. JSON string keys are accepted and coerced to numbers. |
-| `runId` | string | Required for inspect; the project-scoped run capability returned by execution. |
-| `lastN` | integer | Inspect only: latest matching calls, default 20, range 1–50. |
-| `labelGlob` | string | Inspect only: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
-| `logLines` | integer | Inspect only: latest log lines, default 20, range 0–50. |
+| `runId` | string | Required for inspect/await; the project-scoped run capability returned by execution. |
+| `waitMs` | integer | Await only: default 20,000, range 0–25,000; zero is a non-blocking status read. |
+| `lastN` | integer | Inspect/await: latest matching calls, default 20, range 1–50. |
+| `labelGlob` | string | Inspect/await: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
+| `logLines` | integer | Inspect/await: latest log lines, default 20, range 0–50. |
 
-The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`. For a durable `checkpoint(..., { headless: "pause" })`, an elicitation-capable client can answer live on resume; other clients also pass `checkpointReplies: { "<callIndex>": <decision> }` from the returned `checkpointContext`.
+Foreground remains the default. For long work, start it and retain the new run ID:
+
+```json
+{ "script": "export const meta = { name: 'review', description: 'review' }; return await agent('Review the repo');", "background": true }
+```
+
+Then long-poll in ordinary bounded tool calls until `outcome` appears:
+
+```json
+{ "action": "await", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
+```
+
+A timeout returns the freshest bounded status and partial cumulative token usage; terminal await
+adds the same raw result/log projection a foreground call returns. At most four background runs may
+be active or starting per server process. Background means detached from the initiating MCP request,
+not from the stdio server process: process exit can stop in-flight work, while the durable journal
+prefix remains resumable. Background runs send no request progress and use authored headless
+checkpoint behavior. Resume after a pause/crash by starting a new run with `resumeFromRunId`; each
+new background run durably inherits the replay prefix under its new run ID before acknowledgement.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, inspect its safe log and
 call tail:
