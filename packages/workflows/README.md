@@ -220,6 +220,10 @@ const manager = new WorkflowManager({ agent: createAcpRunner() });
 
 const run = await manager.runSync(script, { repo: "agentprism" }, { tokenBudget: 200_000 });
 
+const background = manager.startInBackground(script, { repo: "agentprism" }, { tokenBudget: 200_000 });
+console.log(background.runId, manager.getSnapshot(background.runId));
+// background.promise resolves only on completion and rejects on pause/failure/abort.
+
 const status = manager.inspectRun(run.runId, {
   lastN: 10,
   labelGlob: "review-*",
@@ -246,6 +250,19 @@ resolves immediately; without one, the default mode still takes `default ?? true
 checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
+
+`startInBackground(script, args?, exec?)` is detached only for the lifetime of this process and
+returns `{ runId, promise: Promise<WorkflowRunResult> }`. The facade keeps an ACP event bridge for a
+per-execution `exec.agent` until that promise settles, including rejection. Read live state with
+`getRun()`, `getSnapshot()`, or `inspectRun()`, and subscribe to cumulative `tokenUsage` events while
+work is running. Live attempts update `snapshot.tokenUsage` monotonically; replayed calls add zero.
+
+When `exec.resumeJournal` is preloaded, the underlying manager sorts and copies the inherited prefix
+into the child run before its fail-fast initial persistence. Cached replay does not re-emit journal
+events, but every subsequent live suffix write persists the complete prefix. This makes each new
+background run ID independently resumable across multiple pause/resume hops. Process loss can stop
+in-flight work; the next manager recovers a stale durable `running` record to `paused`, and an
+unjournaled in-flight call may run again.
 
 `inspectRun(runId, options?)` is inherited through this facade and returns the shared
 `WorkflowRunStatus` without importing `@automatalabs/workflow-engine`. It reads the freshest live

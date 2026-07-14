@@ -1,14 +1,14 @@
 // packages/mcp-server/src/server.ts
 //
-// The MCP shell: constructs an McpServer, registers the single SYNCHRONOUS `workflow` tool
+// The MCP shell: constructs an McpServer, registers the single `workflow` tool
 // (plus the user-controlled `author-workflow` prompt — see authoring-prompt.ts), and is the
 // composition root where all three packages meet — the injected acp-agents
 // AgentRunner is wired into a workflow-engine WorkflowManager (DI) and every tool call runs
 // through WorkflowManager.runSync.
 //
-// Run model (frozen contract + ground-truth finding 5): one tools/call == one full run,
-// awaited to completion (taskSupport:'forbidden' — a plain ToolCallback, never a task
-// handler). The engine OWNS run identity, status stamping, and resume:
+// Run model: foreground remains one tools/call awaited to completion; background admission
+// acknowledges a process-local run and bounded await/inspect calls read it later. This stays a
+// plain ToolCallback, never an MCP task handler. The engine OWNS run identity/status/resume:
 //   - runSync RESOLVES to a TERMINAL WorkflowRunResult (status completed|paused|failed|
 //     aborted, carrying reason/resetHint) and does NOT throw on pause/fail/abort — so the
 //     shell does no status composition and needs no lifecycle try/catch.
@@ -27,6 +27,7 @@ import { createRequire } from "node:module";
 import { parseWorkflowScript, redactText, truncateUtf8, WorkflowManager } from "@automatalabs/workflows";
 import type {
   ExecOptions,
+  PersistedRunState,
   WorkflowSnapshot,
   AgentRunner,
   JournalEntry,
@@ -34,15 +35,53 @@ import type {
   WorkflowRunResult,
   WorkflowRunStatus,
 } from "@automatalabs/workflows";
+import type { TokenUsage } from "@automatalabs/shared-types";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
+import type { WorkflowExecutionToolResult, WorkflowRunAwaitResult } from "./workflow-tool-output.js";
 import { createProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
 const SERVER_VERSION = (require("../package.json") as { version: string }).version;
+
+export const MAX_BACKGROUND_RUNS = 4;
+
+const TERMINAL_STATUSES = new Set(["paused", "completed", "failed", "aborted"]);
+
+function isTerminalStatus(status: WorkflowRunStatus["status"]): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
+class BackgroundRunRegistry {
+  private starting = 0;
+  private readonly active = new Map<string, Promise<WorkflowRunResult>>();
+
+  reserve(): boolean {
+    if (this.starting + this.active.size >= MAX_BACKGROUND_RUNS) return false;
+    this.starting++;
+    return true;
+  }
+
+  releaseReservation(): void {
+    if (this.starting > 0) this.starting--;
+  }
+
+  track(runId: string, promise: Promise<WorkflowRunResult>): void {
+    this.releaseReservation();
+    this.active.set(runId, promise);
+    void promise.then(
+      () => this.active.delete(runId),
+      () => this.active.delete(runId),
+    );
+  }
+
+  get(runId: string): Promise<WorkflowRunResult> | undefined {
+    return this.active.get(runId);
+  }
+}
 
 /**
  * The checkpoint metadata the engine forwards to `confirm` (workflow.ts checkpoint()).
@@ -413,8 +452,7 @@ function formatRunSummary(run: WorkflowRunResult): string {
   return run.status === "completed" ? formatCompletedSummary(run) : formatTerminalSummary(run);
 }
 
-/** Human-readable inspection text generated only from the bounded safe status payload. */
-function formatInspectionSummary(status: WorkflowRunStatus): string {
+function inspectionSummaryLines(status: WorkflowRunStatus): string[] {
   const lines = [`Workflow "${status.workflowName}" is ${status.status}.`, `runId: ${status.runId}`];
   if (status.phases.length > 0) lines.push(`phases: ${status.phases.join(", ")}`);
   if (status.currentPhase) lines.push(`current phase: ${status.currentPhase}`);
@@ -428,6 +466,147 @@ function formatInspectionSummary(status: WorkflowRunStatus): string {
     const phase = call.phase ? ` in ${call.phase}` : "";
     lines.push(`  [${call.index}] ${attribution}${phase}: ${call.resultPreview}`);
   }
+  return lines;
+}
+
+/** Human-readable inspection text generated only from the bounded safe status payload. */
+function formatInspectionSummary(status: WorkflowRunStatus): string {
+  return truncateUtf8(inspectionSummaryLines(status).join("\n"), 8_192, "…[text truncated]");
+}
+
+function normalizeTokenUsage(
+  usage:
+    | {
+        input: number;
+        output: number;
+        total: number;
+        cost?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+      }
+    | undefined,
+): TokenUsage | undefined {
+  if (!usage) return undefined;
+  return {
+    input: usage.input,
+    output: usage.output,
+    total: usage.total,
+    cost: usage.cost ?? 0,
+    ...(usage.cacheRead === undefined ? {} : { cacheRead: usage.cacheRead }),
+    ...(usage.cacheWrite === undefined ? {} : { cacheWrite: usage.cacheWrite }),
+  };
+}
+
+function currentTokenUsage(manager: WorkflowManager, runId: string): TokenUsage | undefined {
+  const live = normalizeTokenUsage(manager.getRun(runId)?.snapshot.tokenUsage);
+  if (live) return live;
+  return normalizeTokenUsage(manager.getPersistence().load(runId)?.tokenUsage);
+}
+
+function persistedOutcome(
+  persisted: PersistedRunState,
+  status: WorkflowRunStatus,
+): WorkflowExecutionToolResult {
+  return {
+    runId: persisted.runId,
+    status: status.status,
+    ...(status.status === "completed" && persisted.result !== undefined ? { result: persisted.result } : {}),
+    tokenUsage: normalizeTokenUsage(persisted.tokenUsage),
+    logs: persisted.logs,
+    ...(status.status === "completed" ? {} : { logTail: status.logTail }),
+    authContext: persisted.authContext,
+    checkpointContext: persisted.checkpointContext,
+  };
+}
+
+function terminalOutcome(
+  manager: WorkflowManager,
+  runId: string,
+  status: WorkflowRunStatus,
+): WorkflowExecutionToolResult | undefined {
+  const live = manager.getRun(runId)?.result;
+  if (live) return toWorkflowToolResult(live);
+  const persisted = manager.getPersistence().load(runId);
+  return persisted ? persistedOutcome(persisted, status) : undefined;
+}
+
+const AWAIT_CANCELLED = Symbol("await-cancelled");
+
+async function waitForTerminal(
+  manager: WorkflowManager,
+  runId: string,
+  waitMs: number,
+  signal: AbortSignal,
+  localPromise: Promise<WorkflowRunResult> | undefined,
+): Promise<"settled" | "timeout" | typeof AWAIT_CANCELLED> {
+  return await new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    let poller: NodeJS.Timeout | undefined;
+    let done = false;
+
+    const finish = (result: "settled" | "timeout" | typeof AWAIT_CANCELLED) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      if (poller) clearInterval(poller);
+      signal.removeEventListener("abort", cancelled);
+      resolve(result);
+    };
+    const cancelled = () => finish(AWAIT_CANCELLED);
+
+    signal.addEventListener("abort", cancelled, { once: true });
+    if (signal.aborted) {
+      finish(AWAIT_CANCELLED);
+      return;
+    }
+
+    timer = setTimeout(() => finish("timeout"), waitMs);
+    if (localPromise) {
+      void localPromise.then(
+        () => finish("settled"),
+        () => finish("settled"),
+      );
+      return;
+    }
+
+    poller = setInterval(() => {
+      const status = manager.inspectRun(runId, { lastN: 1, logLines: 0 });
+      if (status && isTerminalStatus(status.status)) finish("settled");
+    }, 250);
+  });
+}
+
+function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
+  const [heading, runId, ...diagnostics] = inspectionSummaryLines(result);
+  const lines = [heading, runId];
+  lines.push(
+    `wait: ${result.wait.returnedBecause} after ${result.wait.elapsedMs}ms (requested ${result.wait.requestedMs}ms)`,
+  );
+  if (result.status === "paused" && result.outcome) {
+    if (result.reason === "auth_required" && result.outcome.authContext) {
+      const backendId = result.outcome.authContext.backendId ?? "?";
+      lines.push(`This run needs authentication for backend "${backendId}".`);
+      for (const method of result.outcome.authContext.methods) {
+        lines.push(`  - ${method.id} (${method.type})${method.name ? `: ${method.name}` : ""}`);
+      }
+      lines.push(
+        `Agents authenticate from their own CLI credentials: log that backend's CLI in on this ` +
+          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`), then start a new ` +
+          `workflow run with resumeFromRunId="${result.runId}".`,
+      );
+    } else if (result.reason === "checkpoint_required" && result.outcome.checkpointContext) {
+      const checkpoint = result.outcome.checkpointContext;
+      lines.push(`This run awaits a ${checkpoint.kind} decision for: ${checkpoint.prompt}`);
+      if (checkpoint.choices?.length) lines.push(`choices: ${checkpoint.choices.join(", ")}`);
+      lines.push(
+        `Start a new workflow run with resumeFromRunId="${result.runId}" and ` +
+          `checkpointReplies={ "${checkpoint.callIndex}": <decision> }.`,
+      );
+    } else {
+      lines.push(`Start a new workflow run with resumeFromRunId="${result.runId}" to continue from its journal.`);
+    }
+  }
+  lines.push(...diagnostics);
   return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
 
@@ -439,7 +618,7 @@ function formatInspectionSummary(status: WorkflowRunStatus): string {
  * genuinely hits AUTH_REQUIRED pauses with authContext and resumes after an out-of-band CLI
  * login. The AgentRunner is the DI seam: it is injected here into a single
  * WorkflowManager (so persistence — and therefore resume — is shared across calls) and every run goes
- * through manager.runSync. The returned McpServer is not yet connected — the caller attaches a
+ * through manager.runSync or startInBackground. The returned McpServer is not yet connected — the caller attaches a
  * transport (see index.ts).
  */
 export function createWorkflowServer(runner: AgentRunner): McpServer {
@@ -448,6 +627,7 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
   // Composition root: the ACP-backed AgentRunner is injected into the engine here. The
   // manager owns run lifecycle, status stamping, and the persisted journal used by resume.
   const manager = new WorkflowManager({ agent: runner });
+  const backgroundRuns = new BackgroundRunRegistry();
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
 
@@ -456,15 +636,16 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
   mcp.registerTool(
     "workflow",
     {
-      title: "Run a dynamic agent workflow",
+      title: "Run or inspect a dynamic agent workflow",
       description:
-        "Run, resume, or inspect a JavaScript agent workflow through one project-scoped tool. The " +
+        "Run, resume, inspect, or await a JavaScript agent workflow through one project-scoped tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over the injected " +
-        "ACP agent backend. Progress streams via notifications/progress when the client sends a " +
-        "progressToken; pass resumeFromRunId to continue a paused run from its persisted journal. " +
+        "ACP agent backend. Foreground is the default and streams progress; background:true returns " +
+        "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +
+        "run from a prior journal prefix. " +
         'Use action:"inspect" with a runId for a safe bounded status, log tail, and attributed call previews. ' +
-        "A checkpoint with headless:\"pause\" returns status \"paused\" plus checkpointContext. " +
-        "Elicitation-capable clients can answer it live on resume; other clients pass checkpointReplies.",
+        "Background is tied to this server process, capped at four active/starting runs, and uses " +
+        "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
       inputSchema: workflowToolInputShape,
       outputSchema: workflowToolOutputShape,
     },
@@ -494,81 +675,216 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
         };
       }
 
-      const input = clampWorkflowInput(parsedInput);
-      const reporter = createProgressReporter(extra);
+      if (parsedInput.action === "await") {
+        if (extra.signal.aborted) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Workflow await for runId "${parsedInput.runId}" was cancelled; the workflow was not cancelled.`,
+              },
+            ],
+            isError: true,
+          };
+        }
 
-      // Trust gate for script-declared meta.backends — BEFORE any run exists. A refusal is an
-      // informative tool error (never a silent drop, never a hang on a non-eliciting client).
-      const backendsGate = await resolveScriptBackends(mcp.server, input.script, backendApprovals);
-      if (!backendsGate.ok) {
+        const inspectionOptions = {
+          lastN: parsedInput.lastN,
+          labelGlob: parsedInput.labelGlob,
+          logLines: parsedInput.logLines,
+        };
+        const startedAt = Date.now();
+        let status = manager.inspectRun(parsedInput.runId, inspectionOptions);
+        if (!status) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        let returnedBecause: WorkflowRunAwaitResult["wait"]["returnedBecause"];
+        if (isTerminalStatus(status.status)) {
+          returnedBecause = "terminal";
+        } else if (parsedInput.waitMs === 0) {
+          returnedBecause = "immediate";
+        } else {
+          const waited = await waitForTerminal(
+            manager,
+            parsedInput.runId,
+            parsedInput.waitMs ?? 20_000,
+            extra.signal,
+            backgroundRuns.get(parsedInput.runId),
+          );
+          if (waited === AWAIT_CANCELLED) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Workflow await for runId "${parsedInput.runId}" was cancelled; the workflow was not cancelled.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          status = manager.inspectRun(parsedInput.runId, inspectionOptions);
+          if (!status) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          returnedBecause = isTerminalStatus(status.status) ? "terminal" : "timeout";
+        }
+
+        const tokenUsage = currentTokenUsage(manager, parsedInput.runId);
+        const outcome = isTerminalStatus(status.status)
+          ? terminalOutcome(manager, parsedInput.runId, status)
+          : undefined;
+        const result: WorkflowRunAwaitResult = {
+          ...status,
+          wait: {
+            requestedMs: parsedInput.waitMs ?? 20_000,
+            elapsedMs: Math.max(0, Date.now() - startedAt),
+            returnedBecause,
+          },
+          ...(tokenUsage === undefined ? {} : { tokenUsage }),
+          ...(outcome === undefined ? {} : { outcome }),
+        };
         return {
-          content: [{ type: "text", text: backendsGate.message }],
-          isError: true,
+          structuredContent: { ...result },
+          content: [{ type: "text", text: formatAwaitSummary(result) }],
+          isError: false,
         };
       }
 
-      const exec: ExecOptions = {
-        scriptBackends: backendsGate.backends,
-        signal: extra.signal,
-        maxAgents: input.maxAgents,
-        concurrency: input.concurrency,
-        agentRetries: input.agentRetries,
-        agentTimeoutMs: input.agentTimeoutMs,
-        tokenBudget: input.tokenBudget,
-        checkpointReplies: input.checkpointReplies,
-        // The engine drives progress with the live snapshot; project it onto the MCP wire
-        // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
-        onProgress: (snapshot: WorkflowSnapshot) => {
-          const settled = snapshot.agents.filter(
-            (a) => a.status === "done" || a.status === "error" || a.status === "skipped",
-          ).length;
-          reporter(settled, snapshot.agents.length || undefined, snapshot.currentPhase);
-        },
-        // A callback is a LIVE channel and therefore wins over headless:"pause". Do not
-        // install a defaulting shim for non-elicitation clients; the authored headless mode
-        // must remain visible to the engine.
-        confirm: mcp.server.getClientCapabilities()?.elicitation ? createConfirm(mcp.server) : undefined,
-      };
-
-      // Resume: the engine owns run identity. The shell only re-hydrates the journal the
-      // engine persisted for the prior runId and hands it back as resumeJournal; the engine
-      // replays the unchanged prefix and runs the rest live.
-      if (input.resumeFromRunId) {
-        const persisted = manager.getPersistence().load(input.resumeFromRunId);
-        if (persisted) {
-          exec.resumeJournal = new Map<number, JournalEntry>(
-            (persisted.journal ?? []).map((entry) => [entry.index, entry] as const),
-          );
-          const checkpoint =
-            persisted.pauseReason === "checkpoint_required" ? persisted.checkpointContext : undefined;
-          if (
-            checkpoint &&
-            input.checkpointReplies &&
-            Object.prototype.hasOwnProperty.call(input.checkpointReplies, checkpoint.callIndex)
-          ) {
-            exec.resumeJournal.set(checkpoint.callIndex, {
-              index: checkpoint.callIndex,
-              hash: checkpoint.hash,
-              result: input.checkpointReplies[checkpoint.callIndex],
-              call: { kind: "checkpoint", label: "checkpoint", phase: persisted.currentPhase },
-            });
-          }
+      const input = clampWorkflowInput(parsedInput);
+      let backgroundReservation = false;
+      if (input.background) {
+        if (!backgroundRuns.reserve()) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Background workflow limit reached (4 active or starting runs). Await an existing run and retry.",
+              },
+            ],
+            isError: true,
+          };
         }
+        backgroundReservation = true;
       }
 
-      // runSync RESOLVES to a terminal WorkflowRunResult (status already stamped); it does not
-      // throw on pause/fail/abort, so there is no shell-side status composition. A malformed
-      // script throws BEFORE a run exists (no runId) — that propagates to the SDK, which
-      // surfaces it as a tool error.
-      const run = await manager.runSync(input.script, input.args, exec);
+      try {
+        // Trust gate for script-declared meta.backends — BEFORE any run exists. A refusal is an
+        // informative tool error (never a silent drop, never a hang on a non-eliciting client).
+        const backendsGate = await resolveScriptBackends(mcp.server, input.script, backendApprovals);
+        if (!backendsGate.ok) {
+          return {
+            content: [{ type: "text", text: backendsGate.message }],
+            isError: true,
+          };
+        }
 
-      const structuredContent = toWorkflowToolResult(run);
-      const isError = run.status === "failed" || run.status === "aborted";
-      return {
-        structuredContent: { ...structuredContent },
-        content: [{ type: "text", text: formatRunSummary(run) }],
-        isError,
-      };
+        const exec: ExecOptions = {
+          scriptBackends: backendsGate.backends,
+          maxAgents: input.maxAgents,
+          concurrency: input.concurrency,
+          agentRetries: input.agentRetries,
+          agentTimeoutMs: input.agentTimeoutMs,
+          tokenBudget: input.tokenBudget,
+          checkpointReplies: input.checkpointReplies,
+        };
+
+        if (!input.background) {
+          const reporter = createProgressReporter(extra);
+          exec.signal = extra.signal;
+          // The engine drives progress with the live snapshot; project it onto the MCP wire
+          // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
+          exec.onProgress = (snapshot: WorkflowSnapshot) => {
+            const settled = snapshot.agents.filter(
+              (a) => a.status === "done" || a.status === "error" || a.status === "skipped",
+            ).length;
+            reporter(settled, snapshot.agents.length || undefined, snapshot.currentPhase);
+          };
+          // A callback is a LIVE channel and therefore wins over headless:"pause". Do not
+          // install a defaulting shim for non-elicitation clients; the authored headless mode
+          // must remain visible to the engine.
+          exec.confirm = mcp.server.getClientCapabilities()?.elicitation ? createConfirm(mcp.server) : undefined;
+        }
+
+        // Resume: the engine owns run identity. The shell only re-hydrates the journal the
+        // engine persisted for the prior runId and hands it back as resumeJournal; the engine
+        // replays the unchanged prefix and runs the rest live.
+        if (input.resumeFromRunId) {
+          const persisted = manager.getPersistence().load(input.resumeFromRunId);
+          if (persisted) {
+            exec.resumeJournal = new Map<number, JournalEntry>(
+              (persisted.journal ?? []).map((entry) => [entry.index, entry] as const),
+            );
+            const checkpoint =
+              persisted.pauseReason === "checkpoint_required" ? persisted.checkpointContext : undefined;
+            if (
+              checkpoint &&
+              input.checkpointReplies &&
+              Object.prototype.hasOwnProperty.call(input.checkpointReplies, checkpoint.callIndex)
+            ) {
+              exec.resumeJournal.set(checkpoint.callIndex, {
+                index: checkpoint.callIndex,
+                hash: checkpoint.hash,
+                result: input.checkpointReplies[checkpoint.callIndex],
+                call: { kind: "checkpoint", label: "checkpoint", phase: persisted.currentPhase },
+              });
+            }
+          }
+        }
+
+        if (input.background) {
+          const started = manager.startInBackground(input.script, input.args, exec);
+          const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
+          backgroundRuns.track(started.runId, started.promise);
+          backgroundReservation = false;
+          return {
+            structuredContent: { runId: started.runId, status: "running" as const },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Workflow "${workflowName}" started in the background.\n` +
+                  `runId: ${started.runId}\n` +
+                  `Call workflow with action="await" and this runId to wait for its result, or ` +
+                  `action="inspect" for an immediate status snapshot.`,
+              },
+            ],
+            isError: false,
+          };
+        }
+
+        // runSync RESOLVES to a terminal WorkflowRunResult (status already stamped); it does not
+        // throw on pause/fail/abort, so there is no shell-side status composition. A malformed
+        // script throws BEFORE a run exists (no runId) — that propagates to the SDK, which
+        // surfaces it as a tool error.
+        const run = await manager.runSync(input.script, input.args, exec);
+
+        const structuredContent = toWorkflowToolResult(run);
+        const isError = run.status === "failed" || run.status === "aborted";
+        return {
+          structuredContent: { ...structuredContent },
+          content: [{ type: "text", text: formatRunSummary(run) }],
+          isError,
+        };
+      } finally {
+        if (backgroundReservation) backgroundRuns.releaseReservation();
+      }
     },
   );
 

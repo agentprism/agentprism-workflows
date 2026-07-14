@@ -194,7 +194,70 @@ const run = await runDynamicWorkflow(script, {
 // run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
 ```
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`, streams progress, resolves checkpoints live for elicitation-capable clients, and supports `resumeFromRunId`. Non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from the returned `checkpointContext`; unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — run/resume and read-only inspection are action branches, not separate tools. A run that pauses with `reason: "auth_required"` resumes via `resumeFromRunId` after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`. Foreground is the default and streams progress/resolves checkpoints live; long work uses `background:true` plus bounded `action:"await"`. It supports `resumeFromRunId`, and non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from terminal `outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — run/resume/inspect/await are action branches, not separate tools. A run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+
+Exact detached host types:
+
+```ts
+interface WorkflowExecuteToolInput {
+  action?: "run";
+  script: string;
+  args?: unknown;
+  maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+  tokenBudget?: number | null;
+  resumeFromRunId?: string;
+  checkpointReplies?: Record<number, unknown>;
+  background?: boolean; // default false
+}
+
+interface WorkflowAwaitToolInput {
+  action: "await";
+  runId: string;
+  waitMs?: number;      // default 20_000; integer 0..25_000
+  lastN?: number;       // default 20; integer 1..50
+  labelGlob?: string;   // same whole-label glob as inspect
+  logLines?: number;    // default 20; integer 0..50
+}
+
+interface WorkflowBackgroundAccepted {
+  runId: string;
+  status: "running";
+}
+
+interface WorkflowAwaitMetadata {
+  requestedMs: number;
+  elapsedMs: number;
+  returnedBecause: "terminal" | "timeout" | "immediate";
+}
+
+interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
+  wait: WorkflowAwaitMetadata;
+  tokenUsage?: TokenUsage;
+  outcome?: WorkflowExecutionToolResult<T>; // present exactly when lifecycle is terminal
+}
+```
+
+At most four background runs may be active or starting per server instance. Foreground, inspect,
+and await consume no slot. A timeout returns the freshest status and partial cumulative usage; replay
+hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
+project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
+structured bytes and 8,192 text bytes. Terminal `outcome` preserves the raw authored result/full
+logs and has no new total cap, but it is never copied into text.
+
+Background has no request signal, progress token, or live checkpoint channel. Headless checkpoint
+default continues, abort fails with `WORKFLOW_ABORTED`, and pause returns `checkpoint_required` plus
+`outcome.checkpointContext`. Auth pauses return non-secret `outcome.authContext`; log the backend CLI
+in before resume. Background is process-lifetime, not daemon execution: process death can interrupt
+an in-flight call, and stale durable `running` state recovers to `paused`.
+
+`action:"await"` and `action:"inspect"` are read-only: they never replay the script, spend tokens,
+or acquire the run lease. `resumeFromRunId` executes a new run with the caller's current script/args
+and a new run ID. Every resumed background run durably seeds its inherited prefix (including a
+synthetic checkpoint answer) beneath that new ID before acknowledgement, so later resume hops remain
+self-contained.
 
 Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
 

@@ -22,7 +22,7 @@ function field(value: unknown, key: string): unknown {
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
 const RUN_ID = /^[a-z0-9]+-[a-z0-9]+$/;
 
-test("tool registration: one `workflow` tool advertises the run/inspect union", async () => {
+test("tool registration: one `workflow` tool advertises the run/inspect/await union", async () => {
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
@@ -35,6 +35,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect union", 
     assert.ok(!inputProps.includes("startInBackground"), "startInBackground is not advertised");
     assert.ok(inputProps.includes("resumeFromRunId"), "explicit resume knob is advertised");
     assert.ok(inputProps.includes("action") && inputProps.includes("runId"), "inspection action fields are advertised");
+    assert.ok(inputProps.includes("background") && inputProps.includes("waitMs"), "detached lifecycle fields are advertised");
     assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
     assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
     assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
@@ -56,6 +57,8 @@ test("tool registration: one `workflow` tool advertises the run/inspect union", 
       "calls",
       "filter",
       "truncation",
+      "wait",
+      "outcome",
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }

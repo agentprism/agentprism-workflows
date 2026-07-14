@@ -65,6 +65,22 @@ const result = await manager.runSync(script, { topic: "otters" });
 console.log(result.status, result.result, result.tokenUsage);
 ```
 
+For process-lifetime background execution, use the returned settlement handle:
+
+```ts
+const { runId, promise } = manager.startInBackground(script, { topic: "otters" });
+console.log(manager.getSnapshot(runId)?.tokenUsage); // cumulative live usage when known
+const terminal = await promise; // rejects for pause, failure, or abort
+```
+
+`startInBackground()` returns only after lease acquisition and its fail-fast initial save; it is
+detached from the caller, not from the Node process. If `ExecOptions.resumeJournal` is supplied, the
+manager sorts and copies the exact entries—including synthetic checkpoint replies—into the new run
+before that save. Replay hits do not emit journal callbacks, so this seeding is what makes the child
+run independently resumable after a second pause or process loss. Each later live journal append
+persists the complete inherited prefix plus suffix. After a crash, stale persisted `running` runs
+recover to `paused`; in-flight unjournaled work may execute again on resume.
+
 Inspect a run without executing or leasing it:
 
 ```ts
@@ -156,6 +172,14 @@ cross-process leases, and listing of persisted runs written by other executions;
 intentionally unavailable and rejects with `journaling disabled for this run` for those runs.
 The manager-level `journal` event still emits live `{ runId, entry }` observations when file
 journaling is disabled.
+
+Token accounting is observable before settlement. `WorkflowRunOptions.onTokenUsage`, the manager's
+`tokenUsage` event, and `snapshot.tokenUsage` receive fresh cumulative totals after every live agent
+attempt, including retry failures and terminal pause/failure attempts. Provider usage fields are
+reported when available; `total` uses the established prompt/result estimate fallback otherwise.
+Replayed calls emit/add nothing. Successful completion keeps the final callback, so an unchanged
+last value may be emitted twice, and persistence records the latest cumulative snapshot at journal
+and terminal writes.
 
 Successful journal writes now include optional replay-neutral `JournalEntry.call` attribution.
 Agent entries record the final label/phase/resolved model/actual backend; checkpoint and synthetic

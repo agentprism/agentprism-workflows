@@ -9,7 +9,7 @@
 //   - HOME isolation so WorkflowManager run persistence (which lives under
 //     ~/.agentprism/workflows/projects/<key>/runs, see workflow-paths.ts) writes into
 //     a throwaway temp dir instead of the developer's real home.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,7 +25,7 @@ import { createWorkflowServer } from "../src/index.js";
 // the runs dir from it at manager-construction time (inside createWorkflowServer), so
 // setting it here at module load — before any test creates a server — fully isolates
 // the suite's on-disk runs (and lets resume load them back) without touching real $HOME.
-const TEST_HOME = mkdtempSync(join(tmpdir(), "agentprism-mcp-test-home-"));
+export const TEST_HOME = mkdtempSync(join(tmpdir(), "agentprism-mcp-test-home-"));
 process.env.HOME = TEST_HOME;
 process.on("exit", () => {
   try {
@@ -122,6 +122,30 @@ export function textOf(res: ToolCallResult): string {
   const blocks = (res.content as TextBlock[] | undefined) ?? [];
   const block = blocks.find((c) => c.type === "text");
   return typeof block?.text === "string" ? block.text : "";
+}
+
+/** Locate one isolated persisted run fixture without exposing a production persistence path. */
+export function persistedRunFile(runId: string): string | undefined {
+  const root = join(TEST_HOME, ".agentprism", "workflows");
+  const visit = (dir: string): string | undefined => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const found = visit(path);
+        if (found) return found;
+      } else if (entry.name === `${runId}.json`) {
+        return path;
+      }
+    }
+    return undefined;
+  };
+  return visit(root);
 }
 
 /** Valid one-agent script: meta first, exactly one agent() call, returns its result. */
