@@ -9,7 +9,7 @@
 # (.github/workflows/release.yml). With no pending changesets and all versions
 # already on the registry, the run is a safe no-op.
 #
-# The Version PR rides a GITHUB APP TOKEN (RELEASE_APP_ID +
+# The Version PR rides a GITHUB APP TOKEN (RELEASE_APP_CLIENT_ID +
 # RELEASE_APP_PRIVATE_KEY secrets), the changesets-documented pattern for
 # repos whose main requires status checks: only same-repo GITHUB_TOKEN events
 # are recursion-guarded, so an app-pushed version branch triggers pull_request
@@ -46,14 +46,14 @@ jobs:
     timeout-minutes: 30
     # Secrets are not readable inside step `if:` expressions — surface presence via env.
     env:
-      RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
     steps:
       - name: Mint the release app token
         id: app-token
-        if: env.RELEASE_APP_ID != ''
+        if: env.RELEASE_APP_CLIENT_ID != ''
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.RELEASE_APP_ID }}
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - name: Checkout
@@ -127,4 +127,4 @@ jobs:
       - name: Note the manual-merge fallback
         if: steps.changesets.outputs.pullRequestNumber && !steps.app-token.outputs.token
         run: |
-          echo "::warning::Version PR #${{ steps.changesets.outputs.pullRequestNumber }} awaits a manual merge — release app secrets (RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY) are not configured. A user-performed merge satisfies the CI gate (rerun the pending pull_request run if needed) and triggers the publish leg."
+          echo "::warning::Version PR #${{ steps.changesets.outputs.pullRequestNumber }} awaits a manual merge — release app secrets (RELEASE_APP_CLIENT_ID / RELEASE_APP_PRIVATE_KEY) are not configured. A user-performed merge satisfies the CI gate (rerun the pending pull_request run if needed) and triggers the publish leg."
