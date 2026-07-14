@@ -81,8 +81,8 @@ Publishing runs from [`.github/workflows/release.yml`](.github/workflows/release
 
 1. Check/bump the ACP protocol deps (`@agentclientprotocol/sdk`, `@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`) to current before cutting a release.
 2. Add a changeset (`pnpm changeset`) in your PR describing the change + bump levels, and merge it to `main`.
-3. That's it — the pipeline does the rest: Changesets opens the mechanical **"Version Packages"** PR (bumps + changelogs), the workflow merges it immediately and chain-dispatches itself, and the dispatched run publishes the bumped packages via `changeset publish`. Merging a changeset-bearing PR to `main` IS the release.
+3. That's it — the pipeline does the rest: Changesets opens the mechanical **"Version Packages"** PR (bumps + changelogs) with the release app token, queues auto-merge on it, GitHub lands it the moment the required `Build & test` check passes, and the merge push runs the publish leg via `changeset publish`. Merging a changeset-bearing PR to `main` IS the release. (Without the `RELEASE_APP_ID`/`RELEASE_APP_PRIVATE_KEY` secrets the Version PR is still created but awaits a manual merge.)
 
 The Codex `outputSchema` forward lives in the published `@automatalabs/codex-acp` fork (exact-pinned by `acp-agents`), so a change to that wire key is a **coordinated release**: publish the fork first, then bump the pinned dep. The repo is licensed Apache-2.0 (`LICENSE`).
 
-CI (`.github/workflows/ci.yml`) runs on every PR and push: frozen install → `tsc -b` → `tsc --noEmit` → `pnpm -r test` on Node 22 / pnpm 10.
+CI (`.github/workflows/ci.yml`) runs on every PR and push: frozen install → `tsc -b` → `tsc --noEmit` → `pnpm -r test` on Node 24 / pnpm 10. `main` has an active ruleset requiring the `Build & test` check on every merge.

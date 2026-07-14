@@ -1,20 +1,24 @@
-# Token-less release via npm OIDC trusted publishing + Changesets — fully
+# Token-less publish via npm OIDC trusted publishing + Changesets — fully
 # hands-off: merging a changeset-bearing PR to main IS the release.
 #
 # On push to main, changesets/action either opens/updates a "Version Packages"
 # PR (while changesets are pending) or — once that PR is merged — publishes the
-# bumped packages. The Version PR is mechanical (bumps + changelogs derived
-# from already-reviewed changesets), so the final step below merges it
-# immediately and chain-dispatches this workflow to run the publish leg; no
-# human touches anything after the feature PR merges. Publishing uses OIDC
-# (id-token + NPM_CONFIG_PROVENANCE, no npm token), which requires a trusted
-# publisher configured on npmjs.com for each @automatalabs package pointing at
-# this repo + this workflow file (.github/workflows/release.yml). With no
-# pending changesets and all versions already on the registry, the run is a
-# safe no-op. workflow_dispatch is kept for manual runs (and is how the
-# auto-merge step re-enters: a merge performed with GITHUB_TOKEN does not
-# trigger push workflows — the Actions recursion guard — but workflow_dispatch
-# is the documented exception).
+# bumped packages. Publishing uses OIDC (id-token + NPM_CONFIG_PROVENANCE, no
+# npm token), which requires a trusted publisher configured on npmjs.com for
+# each @automatalabs package pointing at this repo + this workflow file
+# (.github/workflows/release.yml). With no pending changesets and all versions
+# already on the registry, the run is a safe no-op.
+#
+# The Version PR rides a GITHUB APP TOKEN (RELEASE_APP_ID +
+# RELEASE_APP_PRIVATE_KEY secrets), the changesets-documented pattern for
+# repos whose main requires status checks: only same-repo GITHUB_TOKEN events
+# are recursion-guarded, so an app-pushed version branch triggers pull_request
+# CI natively, the queued auto-merge lands the PR the moment the required
+# check passes, and the app's merge push triggers this workflow's publish leg
+# — event-driven end to end, no dispatching or polling. When the app secrets
+# are absent the flow degrades gracefully: the Version PR is still created
+# (GITHUB_TOKEN) and a human merge both satisfies the ruleset and triggers the
+# publish leg.
 
 name: Release
 
@@ -23,14 +27,13 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# Required for the Changesets release PR (contents + pull-requests), for npm
-# provenance via OIDC trusted publishing (id-token), and for the auto-merge
-# step's chain-dispatch of this workflow (actions).
+# Fallback-path Changesets release PR (contents + pull-requests) and npm
+# provenance via OIDC trusted publishing (id-token). The app-token path
+# carries its own permissions.
 permissions:
   contents: write
   pull-requests: write
   id-token: write
-  actions: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -40,10 +43,19 @@ jobs:
   release:
     name: Version / publish (@automatalabs)
     runs-on: ubuntu-latest
-    # Bounds the CI-gate wait on the Version PR — a failed dispatch must fail
-    # the run visibly, not idle for the 6h default.
     timeout-minutes: 30
+    # Secrets are not readable inside step `if:` expressions — surface presence via env.
+    env:
+      RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
     steps:
+      - name: Mint the release app token
+        id: app-token
+        if: env.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -94,32 +106,25 @@ jobs:
           version: pnpm run version
           publish: pnpm release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # App token when configured (version branch/PR trigger CI natively);
+          # GITHUB_TOKEN fallback still creates the PR, for a human to merge.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
           # OIDC trusted publishing needs no NPM token. If you instead publish
           # with a classic automation token, expose it here as:
           #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # Merge-to-main = release. The Version PR only contains the mechanical
-      # output of already-merged changesets, but main's ruleset requires the
-      # "Build & test" check on every merge — and a PR pushed with GITHUB_TOKEN
-      # gets no pull_request CI run (the Actions recursion guard). So dispatch
-      # CI onto the changeset branch (its check runs attach to the head SHA and
-      # satisfy the ruleset), wait for green, then merge and chain-dispatch this
-      # workflow: the merge itself (made with GITHUB_TOKEN) cannot trigger the
-      # push event, so the dispatch is what runs the publish leg. On that
-      # dispatched run no Version PR exists, this step is skipped, and the
-      # chain terminates.
-      - name: Gate the Version PR on CI, then merge and chain the publish
-        if: steps.changesets.outputs.pullRequestNumber
+      # The Version PR is mechanical (bumps + changelogs derived from
+      # already-reviewed changesets): queue auto-merge and exit. GitHub merges
+      # it the moment the ruleset's required check passes; the app-authored
+      # merge push re-triggers this workflow, which then runs the publish leg.
+      - name: Queue auto-merge on the Version PR
+        if: steps.changesets.outputs.pullRequestNumber && steps.app-token.outputs.token
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh pr merge "${{ steps.changesets.outputs.pullRequestNumber }}" --auto --squash
+
+      - name: Note the manual-merge fallback
+        if: steps.changesets.outputs.pullRequestNumber && !steps.app-token.outputs.token
         run: |
-          PR="${{ steps.changesets.outputs.pullRequestNumber }}"
-          gh workflow run ci.yml --ref changeset-release/main
-          # The dispatch is async and `gh pr checks` errors while zero check
-          # runs exist — poll until the run registers, then watch it to green.
-          until [ -n "$(gh pr checks "$PR" 2>/dev/null)" ]; do sleep 5; done
-          gh pr checks "$PR" --watch --interval 20 --fail-fast
-          gh pr merge "$PR" --squash
-          gh workflow run release.yml --ref main
+          echo "::warning::Version PR #${{ steps.changesets.outputs.pullRequestNumber }} awaits a manual merge — release app secrets (RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY) are not configured. A user-performed merge satisfies the CI gate (rerun the pending pull_request run if needed) and triggers the publish leg."
