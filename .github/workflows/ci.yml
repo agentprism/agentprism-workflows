@@ -1,9 +1,14 @@
 name: CI
 
+# workflow_dispatch exists for the release flow: the Version Packages PR is pushed with
+# GITHUB_TOKEN, so no pull_request run triggers on it (the Actions recursion guard).
+# release.yml dispatches this workflow onto the changeset branch instead — the check runs
+# attach to the head SHA and satisfy the main ruleset's required "Build & test" check.
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch: {}
 
 jobs:
   build-and-test:

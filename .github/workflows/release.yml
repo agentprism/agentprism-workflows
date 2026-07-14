@@ -40,6 +40,9 @@ jobs:
   release:
     name: Version / publish (@automatalabs)
     runs-on: ubuntu-latest
+    # Bounds the CI-gate wait on the Version PR — a failed dispatch must fail
+    # the run visibly, not idle for the 6h default.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,15 +101,25 @@ jobs:
           #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Merge-to-main = release. The Version PR only contains the mechanical
-      # output of already-merged changesets, so merge it right away and
-      # chain-dispatch this workflow: the merge itself (made with GITHUB_TOKEN)
-      # cannot trigger the push event, so the dispatch is what runs the publish
-      # leg. On that dispatched run no Version PR exists, this step is skipped,
-      # and the chain terminates.
-      - name: Auto-merge the Version PR and chain the publish
+      # output of already-merged changesets, but main's ruleset requires the
+      # "Build & test" check on every merge — and a PR pushed with GITHUB_TOKEN
+      # gets no pull_request CI run (the Actions recursion guard). So dispatch
+      # CI onto the changeset branch (its check runs attach to the head SHA and
+      # satisfy the ruleset), wait for green, then merge and chain-dispatch this
+      # workflow: the merge itself (made with GITHUB_TOKEN) cannot trigger the
+      # push event, so the dispatch is what runs the publish leg. On that
+      # dispatched run no Version PR exists, this step is skipped, and the
+      # chain terminates.
+      - name: Gate the Version PR on CI, then merge and chain the publish
         if: steps.changesets.outputs.pullRequestNumber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr merge "${{ steps.changesets.outputs.pullRequestNumber }}" --squash
+          PR="${{ steps.changesets.outputs.pullRequestNumber }}"
+          gh workflow run ci.yml --ref changeset-release/main
+          # The dispatch is async and `gh pr checks` errors while zero check
+          # runs exist — poll until the run registers, then watch it to green.
+          until [ -n "$(gh pr checks "$PR" 2>/dev/null)" ]; do sleep 5; done
+          gh pr checks "$PR" --watch --interval 20 --fail-fast
+          gh pr merge "$PR" --squash
           gh workflow run release.yml --ref main
