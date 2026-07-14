@@ -1,5 +1,16 @@
 # @automatalabs/mcp-server
 
+## 0.10.0
+
+### Minor Changes
+
+- 7172960: Emit cumulative token-usage snapshots after live attempts and seed background runs with their complete replay journal before initial persistence; carry the replay-safe background lifecycle through the SDK facade; and add MCP background admission, bounded await, terminal outcome reconstruction, and the four-run process-local cap.
+
+### Patch Changes
+
+- Updated dependencies [7172960]
+  - @automatalabs/workflows@0.27.1
+
 ## 0.9.0
 
 ### Minor Changes
