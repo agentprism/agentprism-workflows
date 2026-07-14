@@ -1427,8 +1427,7 @@ export class PooledConnection {
           `process no longer advertises the \`providers\` capability, so the recorded routing cannot be replayed — ` +
           `refusing to open sessions that would silently run direct-to-provider instead of through the configured ` +
           `gateway. Restore or fix the backend so it advertises \`providers\` again, or disable the configured ` +
-          `provider to accept direct-to-provider traffic (\`workflow_disable_provider\` via the MCP server, or the ` +
-          `runner's disableProvider API when embedding the SDK).${this.stderrSuffix()}`,
+          `provider to accept direct-to-provider traffic (the runner's \`disableProvider\` API).${this.stderrSuffix()}`,
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false },
       );

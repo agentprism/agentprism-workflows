@@ -248,12 +248,14 @@ Pi-extension affordance, `installResultDelivery`). So the MCP `workflow` tool ru
 return the final result. This is exactly the existing `background:false` / `runSync` path
 ([`src/workflow-tool.ts:223`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L223)) — make it the default and drop `startInBackground`.
 
-The shipped server's default ACP runner is auth-capable, so two additive tools register alongside
-`workflow`: `workflow_auth_status` (read-only/redacted discovery) and `workflow_authenticate`
-(secret input, redacted output). A plain injected `AgentRunner` still gets only `workflow`.
-`AUTH_REQUIRED` pauses a run; the headless recovery sequence is authenticate, then re-call
-`workflow` with `resumeFromRunId`. `AGENTPRISM_MCP_INLINE_AUTH=1` optionally enables masked MCP
-elicitation for env/gateway credentials.
+The shipped server registers `workflow` alone — its whole tool surface. Backend auth belongs to
+the agents' own CLI credential stores, and the server deliberately exposes no auth state for a
+host to inspect: agents that self-authenticate from disk are invisible to any host-side auth
+bookkeeping, so an auth-status surface could only report "unauthenticated" on fully logged-in
+machines — an LLM host reads that as a blocker. `AUTH_REQUIRED` pauses a run with the
+non-secret `authContext`; the recovery sequence is an out-of-band CLI login, then re-call
+`workflow` with `resumeFromRunId`. Programmatic credential injection stays in the SDK's
+auth-capable runner APIs for embedding hosts.
 
 Resume is **not lost**, it becomes **explicit**: expose a `resumeFromRunId` tool parameter; the
 host calls `workflow` again to continue from the persisted journal (the engine already supports

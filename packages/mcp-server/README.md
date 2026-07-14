@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-A **stdio [MCP](https://modelcontextprotocol.io) server** for running dynamic, multi-agent workflow scripts from any MCP host (Claude Code, Zed, Cursor, …). Its default ACP runner exposes **`workflow`** plus the conditional **`workflow_auth_status`** and **`workflow_authenticate`** tools used to recover authentication-paused runs, and the conditional **`workflow_providers`** / **`workflow_set_provider`** / **`workflow_disable_provider`** tools for backends that advertise the ACP `providers` capability.
+A **stdio [MCP](https://modelcontextprotocol.io) server** for running dynamic, multi-agent workflow scripts from any MCP host (Claude Code, Zed, Cursor, …). Its whole tool surface is the single **`workflow`** tool: agent backends authenticate from their own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits an expired/missing login pauses with `authContext` and resumes (`resumeFromRunId`) after you log the backend's CLI in. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. All of the real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool, and serves it over stdin/stdout.
 
@@ -18,7 +18,7 @@ This package is a **thin MCP adapter**. All of the real work — parsing the wor
         ▼
 ┌────────────────────────────────────────────────────┐
 │  agentprism-workflow  (this package)               │
-│   • registers "workflow" + ACP auth tools           │
+│   • registers the single "workflow" tool            │
 │   • createAcpRunner()  →  injected into the engine  │
 │   • WorkflowManager.runSync(script, args, exec)     │
 └────────────────────────────────────────────────────┘
@@ -178,11 +178,7 @@ Beyond the built-ins, **any ACP agent** can be registered as a named backend via
 
 A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config (approvals stick for the session); otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
 
-**Authentication has a pause-and-resume path.** Credentials already available in the inherited environment or a backend's native credential store continue to work without an extra step. If a backend returns ACP `AUTH_REQUIRED`, the managed run pauses with `reason: "auth_required"` and a non-secret method summary. Call `workflow_auth_status` to inspect redacted backend state and methods, complete a supported method with `workflow_authenticate`, then call `workflow` with the original script and `resumeFromRunId`.
-
-The default is deliberately headless: browser/TTY-only methods must be completed on a capable surface, and secrets passed to `workflow_authenticate` are never echoed or journaled. Setting `AGENTPRISM_MCP_INLINE_AUTH=1` opts into masked MCP elicitation for env-var and gateway methods when the host supports elicitation; otherwise authentication still pauses normally. When `createWorkflowServer()` receives a plain `AgentRunner` rather than the auth-capable ACP runner, only `workflow` is registered.
-
-**Configurable LLM providers.** Backends that advertise the (unstable) ACP `providers` capability — the bundled `@automatalabs/codex-acp` does, exposing a single client-configurable `custom-gateway` provider; the surface is base-spec generic, so any custom backend advertising it works identically — can be inspected and routed through a gateway with three tools: `workflow_providers` (read-only; lists each backend's providers redacted to `providerId` / `supported` protocols / `required` / current `{ apiType, baseUrl }`, reporting `providersSupported: false` for backends without the capability), `workflow_set_provider` (configure `{ backend, providerId, apiType, baseUrl, headers? }` — `headers` is **SECRET** and never echoed or journaled), and `workflow_disable_provider` (idempotent). A successful `workflow_set_provider` is durable for the server's lifetime: the runner records the routing intent, recycles pooled agent processes, and replays `providers/set` on every fresh agent process, so subsequent `workflow` runs actually route through the configured gateway. If a fresh agent process stops advertising the `providers` capability while routing is still configured (for example a backend version change or command override), the run fails **loudly** rather than silently routing direct-to-provider — call `workflow_disable_provider` to accept direct routing, or restore the backend. These tools register whenever the injected runner is provider-capable (independent of the auth-tool gate); a plain `AgentRunner` gets neither.
+**Authentication belongs to the agents, not this server.** Each backend authenticates from its own CLI credential store — log in once with `claude /login`, `codex login`, or `opencode auth login` on the machine that runs this server, and workflows just run; there is no separate auth step here, and no auth state for an MCP host to inspect or manage. If a run genuinely hits an expired/missing login, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend: complete that backend's CLI login out-of-band, then call `workflow` again with the original script and `resumeFromRunId` — the run continues from its journal. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
 
 ---
 
@@ -204,7 +200,6 @@ All settings are read from the environment of the `agentprism-workflow` process 
 | `AGENTPRISM_CODEX_ACP_BIN` | resolved `@automatalabs/codex-acp` main | Override the resolved Codex ACP bin path (used only when `AGENTPRISM_CODEX_ACP_CMD` is **not** set). |
 | `AGENTPRISM_OPENCODE_ACP_CMD` | resolved `opencode-ai` bin or `opencode` | Override the command used to launch OpenCode ACP. |
 | `AGENTPRISM_OPENCODE_ACP_ARGS` | — | Whitespace-separated argv passed to `AGENTPRISM_OPENCODE_ACP_CMD`. The automatic launcher uses `opencode acp`; a command override receives only the args supplied here. |
-| `AGENTPRISM_MCP_INLINE_AUTH` | — | `1`/`true` enables the opt-in MCP elicitation bridge for headlessly collectable auth methods. Default behavior is pause-and-resume. |
 | `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run journals and logs used by resume. |
 
 ---
@@ -237,7 +232,7 @@ const server = createWorkflowServer(createAcpRunner());
 await server.connect(new StdioServerTransport());
 ```
 
-Other exports include `workflowToolInputShape` / `clampWorkflowInput` (the input schema + clamp), `workflowToolOutputShape` / `toWorkflowToolResult` (the output schema + projector), the auth-tool shapes/projections and `createDeferredMcpAuthResolver`, `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond hosting these tools, prefer `@automatalabs/workflows`.
+Other exports include `workflowToolInputShape` / `clampWorkflowInput` (the input schema + clamp), `workflowToolOutputShape` / `toWorkflowToolResult` (the output schema + projector), `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond hosting this tool, prefer `@automatalabs/workflows`.
 
 ---
 

@@ -236,12 +236,7 @@ From a source checkout, point at the built entry instead:
 
 The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`. For a durable `checkpoint(..., { headless: "pause" })`, an elicitation-capable client can answer live on resume; other clients also pass `checkpointReplies: { "<callIndex>": <decision> }` from the returned `checkpointContext`.
 
-With the default ACP runner, the server also registers two auth tools:
-
-- `workflow_auth_status` — read-only, redacted backend auth state + advertised methods.
-- `workflow_authenticate` — completes a selected method with secret `env`/`meta` input that is never echoed, journaled, or logged.
-
-An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"`. Call `workflow_auth_status`, then `workflow_authenticate`, then call `workflow` again with the paused `resumeFromRunId`. A host that injects a plain `AgentRunner` gets only `workflow`. `AGENTPRISM_MCP_INLINE_AUTH=1` optionally lets an elicitation-capable MCP client collect env/gateway credentials inline; it is off by default.
+The `workflow` tool is the server's whole surface. Backend auth belongs to the agents' own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`) — logged-in CLIs need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; log that CLI in out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -348,7 +343,6 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 | `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| a registered custom name). |
 | `AGENTPRISM_BACKENDS` | (none) | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Programmatic `createAcpRunner({ backends })` wins per name. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | (unset) | MCP server only: `1`/`true` approves **script-declared** `meta.backends` headlessly (for clients without elicitation support). |
-| `AGENTPRISM_MCP_INLINE_AUTH` | (unset) | MCP server only: `1`/`true` enables the inline elicitation auth resolver. Default is pause → `workflow_authenticate` → resume. |
 | `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run state, logs, journals, and resume data. |
 | `AGENTPRISM_ACP_POOL_SIZE` | `1` | Long-lived processes held per backend. |
 | `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | `60000` | Deadline for a backend's one-time ACP `initialize` handshake (a non-ACP command fails fast instead of hanging). |

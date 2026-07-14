@@ -255,8 +255,7 @@ test("a capability regression (a fresh process stops advertising providers while
       assert.equal(error.recoverable, false);
       assert.match(error.message, /claude/); // names the backend
       assert.match(error.message, /no longer advertises the .?providers.? capability/); // names the lost capability
-      assert.match(error.message, /workflow_disable_provider/); // MCP operator exit
-      assert.match(error.message, /disableProvider/); // embedded-SDK operator exit
+      assert.match(error.message, /disableProvider/); // the runner-API operator exit
       return true;
     },
   );
