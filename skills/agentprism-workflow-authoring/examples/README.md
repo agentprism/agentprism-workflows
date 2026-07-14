@@ -15,3 +15,32 @@ Validate either one for free (zero tokens, no agent processes):
 ```bash
 npx @automatalabs/workflows validate repo-triage --workflows-dir <this directory>
 ```
+
+After running either script through MCP, retain the returned `runId`. Inspect the most recent
+triage workers without re-running anything:
+
+```json
+{
+  "action": "inspect",
+  "runId": "mabc1234-k9x2pq",
+  "lastN": 10,
+  "labelGlob": "verify:*",
+  "logLines": 20
+}
+```
+
+For the nested quick-wins hunt, narrow the same run journal to its round labels:
+
+```json
+{
+  "action": "inspect",
+  "runId": "mabc1234-k9x2pq",
+  "lastN": 20,
+  "labelGlob": "hunt:*",
+  "logLines": 10
+}
+```
+
+If a run paused or failed, read the execution response's immediate final-20 `logTail` first, then
+use inspection for attributed compact results. Host MCP actions stay outside workflow scripts; the
+shipped `.workflow.js` files call only DSL globals.

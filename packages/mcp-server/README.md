@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-A **stdio [MCP](https://modelcontextprotocol.io) server** for running dynamic, multi-agent workflow scripts from any MCP host (Claude Code, Zed, Cursor, …). Its whole tool surface is the single **`workflow`** tool: agent backends authenticate from their own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits an expired/missing login pauses with `authContext` and resumes (`resumeFromRunId`) after you log the backend's CLI in. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+A **stdio [MCP](https://modelcontextprotocol.io) server** for running and safely inspecting dynamic, multi-agent workflow scripts from any MCP host (Claude Code, Zed, Cursor, …). Its whole tool surface is the single **`workflow`** tool, with run/resume/inspect action branches: agent backends authenticate from their own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits an expired/missing login pauses with `authContext` and resumes (`resumeFromRunId`) after you log the backend's CLI in. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. All of the real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool, and serves it over stdin/stdout.
 
@@ -104,11 +104,13 @@ After your host reloads, the `workflow` tool appears in its tool list.
 
 ### Input parameters
 
-The tool's input schema (validated by the MCP SDK before the handler runs). Numeric **bounds are not encoded in the schema** — out-of-range values are **clamped**, not rejected, so a host can pass aggressive knobs without getting a `-32602`.
+The tool uses a run/inspect union. Execution resource maxima remain runtime clamps; inspection
+limits are contract bounds and invalid values are rejected as MCP Invalid Params (`-32602`).
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `script` | string (non-empty) | **yes** | — | Raw JavaScript workflow script (no Markdown fences). The first statement **must** be `export const meta = { name, description, phases? }`. Agentless scripts are valid; validation warns only when the script has neither `agent()` nor `checkpoint()`. Saved workflow names are not resolved by this MCP input. |
+| `action` | `"run" \| "inspect"` | no | run | Omit for every legacy execution request. `"inspect"` selects the read-only branch. |
+| `script` | string (non-empty) | run only | — | Raw JavaScript workflow script (no Markdown fences). The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect. |
 | `args` | any JSON value | no | — | Optional value exposed to the script as the global `args`. |
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
 | `concurrency` | integer > 0 | no | engine default | Max concurrent agents. **Clamped to 16** (the runtime max) by the engine — never rejected. |
@@ -117,6 +119,10 @@ The tool's input schema (validated by the MCP SDK before the handler runs). Nume
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
 | `resumeFromRunId` | string | no | — | Resume a prior run from its persisted journal (the engine replays the unchanged prefix and runs the rest live). See [Run model](#run-model). |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map `checkpointContext.callIndex` to the durable checkpoint decision. JSON string keys are coerced to numeric indexes. |
+| `runId` | engine run ID | inspect only | — | Required for inspect; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
+| `lastN` | integer 1–50 | inspect only | `20` | Latest matching journal calls. Filtering happens before this selection. |
+| `labelGlob` | string | inspect only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
+| `logLines` | integer 0–50 | inspect only | `20` | Latest run-log lines. |
 
 Example call arguments:
 
@@ -129,12 +135,24 @@ Example call arguments:
 }
 ```
 
+Inspection example:
+
+```json
+{
+  "action": "inspect",
+  "runId": "mabc1234-k9x2pq",
+  "lastN": 10,
+  "labelGlob": "plan-review-*",
+  "logLines": 20
+}
+```
+
 ### Output
 
 The tool returns both machine-readable `structuredContent` and a human-readable text block. The structured shape pins the durable core of the engine's run result:
 
 ```ts
-interface WorkflowToolResult {
+interface WorkflowExecutionToolResult {
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
   result?: unknown; // present only on a completed run — the script's resolved value
@@ -147,20 +165,66 @@ interface WorkflowToolResult {
     cacheWrite?: number;
   };
   logs?: string[];
+  logTail?: WorkflowLogTail;               // paused/failed/aborted only
   authContext?: AuthErrorContext;           // auth_required pauses only
   checkpointContext?: CheckpointContext;   // checkpoint_required pauses only
 }
+
+type WorkflowToolResult = WorkflowExecutionToolResult | WorkflowRunStatus;
 ```
 
 `status` lets a host distinguish a `completed` run from a `paused` one (resumable via `resumeFromRunId`) without parsing logs. The tool result is flagged `isError` when `status` is `failed` or `aborted`. A `result` field is only present when `status === "completed"`.
+
+An inspect response is exactly the shared `WorkflowRunStatus`:
+
+```ts
+interface WorkflowRunStatus {
+  runId: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  workflowName: string;
+  phases: string[];
+  currentPhase?: string;
+  reason?: string;
+  errorCode?: WorkflowErrorCode;
+  logTail: WorkflowLogTail;
+  calls: WorkflowRunCallStatus[];
+  filter: { lastN: number; logLines: number; labelGlob?: string };
+  truncation: WorkflowRunStatusTruncation;
+}
+```
+
+Each call has its deterministic index, known agent/checkpoint attribution, a compact JSON
+`resultPreview`, and redaction/truncation flags. Inspection never returns script, args, prompts,
+histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
+keys and credential-shaped strings are redacted before results are structurally compacted; every
+text scalar and preview is at most 512 UTF-8 bytes. The entire structured status is at most 24,576
+bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The accompanying
+text is formatted from that bounded status and capped at 8,192 bytes.
+
+An unknown, corrupt, or unreadable run returns `isError: true`, no `structuredContent`, and:
+
+```text
+No workflow run found for runId "<runId>" in this server's project-scoped run store.
+```
+
+Inspecting an existing failed/aborted run is still a successful read (`isError: false`); branch on
+the payload `status`.
 
 ---
 
 ## Run model
 
 - **Synchronous.** One `tools/call` to `workflow` is one full run, awaited to completion (the tool is a plain handler — background tasks are not used). When the call resolves, the run has reached a terminal state.
+- **Read-only inspection.** `action: "inspect"` reads the manager's freshest in-memory snapshot,
+  then its project-scoped persisted store. It never parses/runs a script, invokes an agent, asks
+  for backend approval, sends progress, elicits, or acquires a run lease. Run ID possession is the
+  capability; UI `sessionId` listing filters do not apply.
 - **Progress notifications.** When the host includes a `progressToken` with the call, the server streams `notifications/progress` as agents settle (it reports `settled / total` agents plus the current phase). With no `progressToken`, progress is a no-op.
 - **Terminal status, not exceptions.** An ordinary pause/fail/abort does **not** throw — the run resolves to a `WorkflowRunResult` with `status` already stamped (`completed | paused | failed | aborted`) plus an optional `reason`/`resetHint`. Only a malformed script (which fails before a run exists) surfaces as an MCP tool error.
+- **Immediate terminal diagnostics.** Paused, failed, and aborted execution results contain a
+  redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
+  Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
+  omit this extra tail and preserve the existing full `logs` field.
 - **Explicit resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint. Its journal is persisted under the returned `runId`. To continue, call `workflow` again with the **same `script`** plus `resumeFromRunId: "<that runId>"`; the engine re-hydrates the journal, replays the unchanged prefix deterministically, and runs the remainder live.
 - **Checkpoints.** A script's `checkpoint()` gate uses MCP **elicitation** as its live channel when the connected client advertises it. Without elicitation, the authored headless mode applies: the default remains `default ?? true`, `headless: "abort"` aborts, and only `headless: "pause"` durably pauses with `checkpointContext`. Resume that pause with `resumeFromRunId` plus `checkpointReplies: { "<callIndex>": <decision> }`; an elicitation-capable client may instead answer live on resume. The decision is journaled and replayed, so detached runs never pause for checkpoints unless the workflow author opts in.
 
@@ -242,7 +306,12 @@ const server = createWorkflowServer(createAcpRunner());
 await server.connect(new StdioServerTransport());
 ```
 
-Other exports include `workflowToolInputShape` / `clampWorkflowInput` (the input schema + clamp), `workflowToolOutputShape` / `toWorkflowToolResult` (the output schema + projector), `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond hosting this tool, prefer `@automatalabs/workflows`.
+Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
+`clampWorkflowInput` (primitive schema, action discriminator, execution clamp),
+`WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowExecutionToolResult`,
+`WorkflowToolResult`, `workflowToolOutputShape` / `toWorkflowToolResult`,
+`createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond
+hosting this tool, prefer `@automatalabs/workflows`.
 
 ---
 

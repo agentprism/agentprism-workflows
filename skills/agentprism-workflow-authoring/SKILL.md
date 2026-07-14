@@ -271,6 +271,16 @@ Runs are journaled: every `agent()` and `checkpoint()` result is recorded under 
 - `Date.now()`, `Math.random()`, and no-arg `new Date()` **throw inside the realm** (`new Date(isoString)` is fine). Need a timestamp or a random seed? Pass it in via `args`.
 - A call's replay identity hashes its prompt, `model`, `mode` (when set), `tier`, `phase`, `agentType`, and `schema`. Resume replays the **longest unchanged prefix** — editing an early prompt re-runs everything from there, while `label`, `cwd`, `mcpServers`, `images`, `meta`/`promptMeta`, and `keepSession` are deliberately *not* hashed and can change freely between resume attempts.
 - Keep call order deterministic: same `args` in, same sequence of calls out. Derive iteration from `args` and prior agent results, never from ambient state.
+- Narrate decisions and round summaries with `log()`, and give repeated calls stable, descriptive
+  labels. MCP hosts can safely retrieve the latest log lines and compact results by label after a
+  pause or failure; useful narration turns that inspection into a diagnosis instead of a guess.
+
+When you run through MCP, always retain the returned `runId`. A paused, failed, or aborted response
+already includes a redacted final-20 `logTail`; read it before changing the script. If the cause is
+still unclear, call the same single `workflow` tool with
+`{ action: "inspect", runId, lastN, labelGlob?, logLines }`. Inspection is read-only: use a narrow
+label glob and latest-N tail to identify the last relevant work before deciding whether to resume,
+edit, or stop. `resumeFromRunId` executes a new run; inspection does not.
 
 ## Worked example — cross-vendor build with every major primitive
 

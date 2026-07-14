@@ -26,7 +26,7 @@ type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
-export { runWorkflow, parseWorkflowScript } from "@automatalabs/workflow-engine";
+export { runWorkflow, parseWorkflowScript, redactText, truncateUtf8 } from "@automatalabs/workflow-engine";
 
 // ── Workflow directory view: openWorkflowDir("./workflows") binds a read-only,
 //    per-call-fresh view over folders of versioned workflow scripts (name = filename
@@ -62,6 +62,11 @@ export type {
   RunPersistenceOptions,
   PersistedRunState,
   PersistedAgentState,
+  WorkflowLogTail,
+  WorkflowRunCallStatus,
+  WorkflowRunInspectionOptions,
+  WorkflowRunStatus,
+  WorkflowRunStatusTruncation,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
@@ -245,7 +250,14 @@ export type {
   AgentResult,
   AgentUsage,
 } from "@automatalabs/shared-types";
-export type { AgentSessionRecord, AgentSessionRef, JournalEntry, WorkflowBackendConfig, WorkflowMeta } from "@automatalabs/shared-types";
+export type {
+  AgentSessionRecord,
+  AgentSessionRef,
+  JournalCallMetadata,
+  JournalEntry,
+  WorkflowBackendConfig,
+  WorkflowMeta,
+} from "@automatalabs/shared-types";
 
 /** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */
 type ManagerAcpCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;

@@ -48,6 +48,10 @@ export interface PersistedRunState {
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
+  /** Safe run-level terminal explanation retained for cold inspection. */
+  reason?: string;
+  /** Machine-readable terminal error retained for cold inspection. */
+  errorCode?: WorkflowErrorCode;
   /** Why a paused run is paused (e.g. "usage_limit", "auth_required", or
    *  "checkpoint_required"). Free-form string — no migration. */
   pauseReason?: string;

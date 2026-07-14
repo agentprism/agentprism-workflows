@@ -194,7 +194,82 @@ const run = await runDynamicWorkflow(script, {
 // run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
 ```
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`, streams progress, resolves checkpoints live for elicitation-capable clients, and supports `resumeFromRunId`. Non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from the returned `checkpointContext`; unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — a run that pauses with `reason: "auth_required"` resumes via `resumeFromRunId` after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`, streams progress, resolves checkpoints live for elicitation-capable clients, and supports `resumeFromRunId`. Non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from the returned `checkpointContext`; unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — run/resume and read-only inspection are action branches, not separate tools. A run that pauses with `reason: "auth_required"` resumes via `resumeFromRunId` after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+
+Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
+
+```ts
+interface WorkflowInspectToolInput {
+  action: "inspect";
+  runId: string;       // /^[a-z0-9]+-[a-z0-9]+$/, at most 128 characters
+  lastN?: number;      // default 20; integer 1..50
+  labelGlob?: string;  // non-empty; at most 128 Unicode code points
+  logLines?: number;   // default 20; integer 0..50
+  script?: never;
+}
+```
+
+`labelGlob` matches the whole raw agent label case-sensitively: `*` is zero or more Unicode code
+points, `?` is exactly one, and backslash escapes the next character (a trailing backslash is
+literal). Checkpoints and unknown legacy calls are excluded when a glob is present. Filtering
+happens before `lastN`; selected calls return in ascending call-index order.
+
+```ts
+interface WorkflowLogTail {
+  lines: string[];
+  totalLines: number;
+  omittedLines: number;
+  truncatedLines: number;
+  redactedLines: number;
+}
+
+interface WorkflowRunCallStatus {
+  index: number;
+  kind: "agent" | "checkpoint" | "unknown";
+  label?: string;
+  phase?: string;
+  model?: string;
+  backendId?: string;
+  resultPreview: string;
+  resultRedacted: boolean;
+  resultTruncated: boolean;
+}
+
+interface WorkflowRunStatus {
+  runId: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  workflowName: string;
+  phases: string[];
+  currentPhase?: string;
+  reason?: string;
+  errorCode?: string;
+  logTail: WorkflowLogTail;
+  calls: WorkflowRunCallStatus[];
+  filter: { lastN: number; logLines: number; labelGlob?: string };
+  truncation: {
+    maxStructuredBytes: number;
+    byteCapApplied: boolean;
+    phases: { total: number; returned: number; shortened: number };
+    logs: { total: number; returned: number; shortened: number; redacted: number };
+    calls: {
+      total: number;
+      matched: number;
+      returned: number;
+      shortenedResults: number;
+      redactedResults: number;
+    };
+  };
+}
+```
+
+Inspection returns only this allowlisted projection: never raw script, args, prompts, histories,
+hashes, session IDs, cwd, checkpoint/auth details, or raw results. Credential-shaped data is
+redacted, results are structurally compacted, every outward text scalar/preview is capped at 512
+UTF-8 bytes, structured JSON at 24,576 bytes, and inspection text at 8,192 bytes. An unknown ID is
+a tool error with no structured content; reading an existing failed run succeeds and reports
+`status:"failed"`. Every paused, failed, or aborted execution result also carries a redacted
+final-20 `logTail` (present when empty) and renders it in the immediate terminal text. Completed
+execution results omit that extra field while retaining their full `logs` array.
 
 Backend auth comes from the machine the host runs on: Claude via a logged-in Claude Code install or `ANTHROPIC_API_KEY`; Codex via `~/.codex/auth.json`; OpenCode via `opencode auth login` (its CLI must be installed — it is not bundled). A script only needs auth for the backends it actually routes to.
 

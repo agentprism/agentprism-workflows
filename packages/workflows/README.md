@@ -220,6 +220,13 @@ const manager = new WorkflowManager({ agent: createAcpRunner() });
 
 const run = await manager.runSync(script, { repo: "agentprism" }, { tokenBudget: 200_000 });
 
+const status = manager.inspectRun(run.runId, {
+  lastN: 10,
+  labelGlob: "review-*",
+  logLines: 20,
+});
+console.log(status?.status, status?.logTail, status?.calls);
+
 if (run.status === "paused") {
   // resume() reloads the original script, args, cwd, and journal under the SAME runId,
   // then continues in the background. Observe manager events or getRun(runId) for status.
@@ -239,6 +246,16 @@ resolves immediately; without one, the default mode still takes `default ?? true
 checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
+
+`inspectRun(runId, options?)` is inherited through this facade and returns the shared
+`WorkflowRunStatus` without importing `@automatalabs/workflow-engine`. It reads the freshest live
+snapshot first and project-scoped persistence second, never executes the script or acquires a run
+lease, and returns `undefined` for an unknown/unreadable ID. The facade also re-exports
+`WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
+`WorkflowRunStatusTruncation`, `WorkflowRunStatus`, and `JournalCallMetadata`. Inspection defaults
+to 20 calls and 20 log lines, supports case-sensitive whole-label `*`/`?`/backslash globs, redacts
+and compacts previews, and enforces the shared 24,576-byte structured cap. Non-completed terminal
+execution results carry an immediate redacted final-20 `logTail`; completed results omit it.
 
 Manager events are Node `EventEmitter` notifications: `agentStart`, `agentEnd`, `agentHistory`,
 `journal`, `tokenUsage`, `log`, `phase`, `complete`, `paused`, `resumed`, `stopped`, `error`,

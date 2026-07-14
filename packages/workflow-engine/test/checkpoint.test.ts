@@ -274,10 +274,11 @@ test(
     assert.equal(finalState?.status, "completed");
     const replyEntry = finalState?.journal?.find((entry) => entry.index === context.callIndex);
     assert.deepEqual(
-      replyEntry,
+      { index: replyEntry?.index, hash: replyEntry?.hash, result: replyEntry?.result },
       { index: context.callIndex, hash: context.hash, result: "ship" },
       "the synthetic decision is in the final persisted journal",
     );
+    assert.deepEqual(replyEntry?.call, { kind: "checkpoint", label: "checkpoint", phase: undefined });
 
     // A third, cold manager can hydrate that final journal and complete with no reply or
     // confirm channel at all. Every call replays, proving the synthetic answer is durable.
@@ -335,11 +336,13 @@ test(
     const loaded = manager2.getPersistence().load(paused.runId);
     assert.equal(listed?.status, "completed", "the filesystem listing exposes the terminal state");
     assert.equal(loaded?.status, "completed", "a direct filesystem load exposes the terminal state");
+    const replyEntry = loaded?.journal?.find((entry) => entry.index === context.callIndex);
     assert.deepEqual(
-      loaded?.journal?.find((entry) => entry.index === context.callIndex),
+      { index: replyEntry?.index, hash: replyEntry?.hash, result: replyEntry?.result },
       { index: context.callIndex, hash: context.hash, result: "ship" },
       "the synthetic checkpoint reply is durably journaled on disk",
     );
+    assert.deepEqual(replyEntry?.call, { kind: "checkpoint", label: "checkpoint" });
   }),
 );
 

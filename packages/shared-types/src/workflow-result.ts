@@ -1,6 +1,6 @@
 // ===== packages/shared-types/src/workflow-result.ts =====
 
-import type { AuthErrorContext, CheckpointContext } from "./errors.js";
+import type { AuthErrorContext, CheckpointContext, WorkflowErrorCode } from "./errors.js";
 
 /** Aggregate token/cost usage for a whole run (engine-summed; matches the
  *  onTokenUsage shape at workflow.ts:112-119). */
@@ -102,6 +102,22 @@ export interface AgentSessionRecord extends AgentSessionRef {
 /** One cached agent()/checkpoint() result, keyed by its deterministic call index
  *  (PersistedRunState.journal, run-persistence.ts). The frozen AgentResult MUST
  *  round-trip through this JSON unchanged for resume. */
+export type JournalCallMetadata =
+  | {
+      kind: "agent";
+      label: string;
+      phase?: string;
+      /** Resolved model when the runner reported one; otherwise the engine's best-known spec. */
+      model?: string;
+      /** Actual backend from onSessionOpen; absent when the runner supplied no session ref. */
+      backendId?: string;
+    }
+  | {
+      kind: "checkpoint";
+      label: "checkpoint";
+      phase?: string;
+    };
+
 export interface JournalEntry {
   index: number;
   /** sha256 of the call identity (prompt + model + tier + phase + agentType + agentDef + schema). */
@@ -110,6 +126,67 @@ export interface JournalEntry {
   /** The call's ACP session record, when one was opened live. ADDITIVE: absent on
    *  pre-session-ref journals and on checkpoint entries; replay restores it as-is. */
   session?: AgentSessionRecord;
+  /** Additive diagnostic metadata; it is not part of replay identity. */
+  call?: JournalCallMetadata;
+}
+
+export interface WorkflowRunInspectionOptions {
+  /** Latest matching journal entries. Default 20; valid range 1..50. */
+  lastN?: number;
+  /** Case-sensitive whole-label glob. Omitted means all call kinds. */
+  labelGlob?: string;
+  /** Latest run-log lines. Default 20; valid range 0..50. */
+  logLines?: number;
+}
+
+export interface WorkflowLogTail {
+  lines: string[];
+  totalLines: number;
+  omittedLines: number;
+  truncatedLines: number;
+  redactedLines: number;
+}
+
+export interface WorkflowRunCallStatus {
+  index: number;
+  kind: "agent" | "checkpoint" | "unknown";
+  label?: string;
+  phase?: string;
+  model?: string;
+  backendId?: string;
+  /** Compact JSON text after structural compaction and redaction; never the raw result. */
+  resultPreview: string;
+  resultRedacted: boolean;
+  resultTruncated: boolean;
+}
+
+export interface WorkflowRunStatusTruncation {
+  maxStructuredBytes: number;
+  byteCapApplied: boolean;
+  phases: { total: number; returned: number; shortened: number };
+  logs: { total: number; returned: number; shortened: number; redacted: number };
+  calls: {
+    total: number;
+    matched: number;
+    returned: number;
+    shortenedResults: number;
+    redactedResults: number;
+  };
+}
+
+/** Safe, bounded, point-in-time status used by every run-inspection/polling host. */
+export interface WorkflowRunStatus {
+  runId: string;
+  status: RunStatus;
+  workflowName: string;
+  phases: string[];
+  currentPhase?: string;
+  reason?: string;
+  errorCode?: WorkflowErrorCode;
+  logTail: WorkflowLogTail;
+  calls: WorkflowRunCallStatus[];
+  filter: { lastN: number; logLines: number; labelGlob?: string };
+  truncation: WorkflowRunStatusTruncation;
 }
 
 /** Persisted run lifecycle (run-persistence.ts:11). A host-facing WorkflowRunResult
@@ -147,6 +224,8 @@ export interface WorkflowRunResult<T = unknown> {
   tokenUsage?: TokenUsage;
   /** Captured log lines. */
   logs: string[];
+  /** Redacted final log lines for a paused, failed, or aborted run. */
+  logTail?: WorkflowLogTail;
   /** Present when status !== "completed": human-readable cause (e.g. "usage_limit",
    *  "auth_required", "checkpoint_required"). NOT the machine-readable contract — hosts branch
    *  on `reason`, then read the corresponding structured context when present. */

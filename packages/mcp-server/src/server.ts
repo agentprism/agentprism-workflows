@@ -24,7 +24,7 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 import { createRequire } from "node:module";
 
-import { parseWorkflowScript, WorkflowManager } from "@automatalabs/workflows";
+import { parseWorkflowScript, redactText, truncateUtf8, WorkflowManager } from "@automatalabs/workflows";
 import type {
   ExecOptions,
   WorkflowSnapshot,
@@ -32,9 +32,10 @@ import type {
   JournalEntry,
   WorkflowBackendConfig,
   WorkflowRunResult,
+  WorkflowRunStatus,
 } from "@automatalabs/workflows";
 
-import { clampWorkflowInput, workflowToolInputShape } from "./workflow-tool-input.js";
+import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
 import { createProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
@@ -369,10 +370,14 @@ function formatCompletedSummary(run: WorkflowRunResult): string {
 function formatTerminalSummary(run: WorkflowRunResult): string {
   const lines: string[] = [`Workflow run ${run.status}.`, `runId: ${run.runId}`];
   if (run.reason) {
-    lines.push(`reason: ${run.reason}`);
+    lines.push(`reason: ${truncateUtf8(redactText(run.reason).value, 512)}`);
   }
   if (run.resetHint) {
-    lines.push(`reset hint: ${run.resetHint}`);
+    lines.push(`reset hint: ${truncateUtf8(redactText(run.resetHint).value, 512)}`);
+  }
+  if (run.logTail) {
+    lines.push(`recent run log (last ${run.logTail.lines.length} of ${run.logTail.totalLines}):`);
+    for (const line of run.logTail.lines) lines.push(`  ${line}`);
   }
   if (run.status === "paused") {
     // Read the STRUCTURED authContext (§2.12) — never the free-form `reason` message string.
@@ -401,11 +406,29 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
       );
     }
   }
-  return lines.join("\n");
+  return truncateUtf8(lines.join("\n"), 12_288, "…[text truncated]");
 }
 
 function formatRunSummary(run: WorkflowRunResult): string {
   return run.status === "completed" ? formatCompletedSummary(run) : formatTerminalSummary(run);
+}
+
+/** Human-readable inspection text generated only from the bounded safe status payload. */
+function formatInspectionSummary(status: WorkflowRunStatus): string {
+  const lines = [`Workflow "${status.workflowName}" is ${status.status}.`, `runId: ${status.runId}`];
+  if (status.phases.length > 0) lines.push(`phases: ${status.phases.join(", ")}`);
+  if (status.currentPhase) lines.push(`current phase: ${status.currentPhase}`);
+  if (status.reason) lines.push(`reason: ${status.reason}`);
+  if (status.errorCode) lines.push(`error code: ${status.errorCode}`);
+  lines.push(`recent run log (last ${status.logTail.lines.length} of ${status.logTail.totalLines}):`);
+  for (const line of status.logTail.lines) lines.push(`  ${line}`);
+  lines.push(`recent calls (${status.calls.length} of ${status.truncation.calls.matched} matching):`);
+  for (const call of status.calls) {
+    const attribution = call.label ? `${call.kind} "${call.label}"` : call.kind;
+    const phase = call.phase ? ` in ${call.phase}` : "";
+    lines.push(`  [${call.index}] ${attribution}${phase}: ${call.resultPreview}`);
+  }
+  return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
 
 /**
@@ -435,17 +458,43 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
     {
       title: "Run a dynamic agent workflow",
       description:
-        "Execute a JavaScript workflow script to completion in a single synchronous call. The " +
+        "Run, resume, or inspect a JavaScript agent workflow through one project-scoped tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over the injected " +
         "ACP agent backend. Progress streams via notifications/progress when the client sends a " +
         "progressToken; pass resumeFromRunId to continue a paused run from its persisted journal. " +
+        'Use action:"inspect" with a runId for a safe bounded status, log tail, and attributed call previews. ' +
         "A checkpoint with headless:\"pause\" returns status \"paused\" plus checkpointContext. " +
         "Elicitation-capable clients can answer it live on resume; other clients pass checkpointReplies.",
       inputSchema: workflowToolInputShape,
       outputSchema: workflowToolOutputShape,
     },
     async (args, extra) => {
-      const input = clampWorkflowInput(args);
+      const parsedInput = parseWorkflowToolInput(args);
+      if (parsedInput.action === "inspect") {
+        const status = manager.inspectRun(parsedInput.runId, {
+          lastN: parsedInput.lastN,
+          labelGlob: parsedInput.labelGlob,
+          logLines: parsedInput.logLines,
+        });
+        if (!status) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          structuredContent: { ...status },
+          content: [{ type: "text", text: formatInspectionSummary(status) }],
+          isError: false,
+        };
+      }
+
+      const input = clampWorkflowInput(parsedInput);
       const reporter = createProgressReporter(extra);
 
       // Trust gate for script-declared meta.backends — BEFORE any run exists. A refusal is an
@@ -501,6 +550,7 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
               index: checkpoint.callIndex,
               hash: checkpoint.hash,
               result: input.checkpointReplies[checkpoint.callIndex],
+              call: { kind: "checkpoint", label: "checkpoint", phase: persisted.currentPhase },
             });
           }
         }

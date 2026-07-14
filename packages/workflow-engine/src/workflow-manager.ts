@@ -18,7 +18,9 @@ import type {
   TokenUsage,
   WorkflowBackendConfig,
   WorkflowMeta,
+  WorkflowRunInspectionOptions,
   WorkflowRunResult,
+  WorkflowRunStatus,
 } from "@automatalabs/shared-types";
 import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
@@ -32,6 +34,7 @@ import {
 } from "./run-persistence.js";
 import { workflowHomeDir } from "./workflow-paths.js";
 import { type EngineRunResult, parseWorkflowScript, runWorkflow } from "./workflow.js";
+import { createWorkflowLogTail, projectWorkflowRunStatus } from "./run-observability.js";
 
 export interface ManagedRun {
   runId: string;
@@ -155,6 +158,15 @@ export interface WorkflowManagerOptions {
   persistence?: RunPersistence;
   /** Default journaling policy for runs created by this manager. Default true. */
   journaling?: boolean;
+}
+
+function runReason(status: RunStatus, error: WorkflowError | undefined): string | undefined {
+  if (status === "completed" || status === "pending" || status === "running") return undefined;
+  if (status !== "paused") return error?.message;
+  if (error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) return "usage_limit";
+  if (error?.code === WorkflowErrorCode.AUTH_REQUIRED) return "auth_required";
+  if (error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED) return "checkpoint_required";
+  return error?.message;
 }
 
 /**
@@ -440,18 +452,7 @@ export class WorkflowManager extends EventEmitter {
     const usageLimit = error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
     const authRequired = error?.code === WorkflowErrorCode.AUTH_REQUIRED;
     const checkpointRequired = error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED;
-    const reason =
-      managed.status === "completed"
-        ? undefined
-        : managed.status === "paused"
-          ? usageLimit
-            ? "usage_limit"
-            : authRequired
-              ? "auth_required"
-              : checkpointRequired
-                ? "checkpoint_required"
-                : error?.message
-          : error?.message;
+    const reason = runReason(managed.status, error);
     const snapshotUsage = managed.snapshot.tokenUsage;
     const tokenUsage: TokenUsage | undefined =
       engineResult?.tokenUsage ??
@@ -479,6 +480,9 @@ export class WorkflowManager extends EventEmitter {
       durationMs: engineResult?.durationMs ?? Date.now() - managed.startedAt.getTime(),
       tokenUsage,
       logs: engineResult?.logs ?? managed.snapshot.logs,
+      ...(managed.status === "completed"
+        ? {}
+        : { logTail: createWorkflowLogTail(engineResult?.logs ?? managed.snapshot.logs, 20) }),
       reason,
       resetHint: usageLimit ? error?.resetHint : undefined,
       // Structured, NON-SECRET auth surface for an auth pause (§2.12) — hosts read this,
@@ -728,6 +732,8 @@ export class WorkflowManager extends EventEmitter {
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
+        reason: runReason(managed.status, managed.error),
+        errorCode: managed.error?.code,
         // Why a pause happened, so the navigator / a future cold start can show it and
         // re-arm resume (§2.12). Selector switches on the paused run's error code:
         // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit",
@@ -958,6 +964,7 @@ export class WorkflowManager extends EventEmitter {
         index: checkpointContext.callIndex,
         hash: checkpointContext.hash,
         result: exec.checkpointReplies?.[checkpointContext.callIndex],
+        call: { kind: "checkpoint", label: "checkpoint", phase: persisted.currentPhase },
       };
       resumeJournal.set(syntheticEntry.index, syntheticEntry);
       // Cached entries are replayed without firing onAgentJournal, so seed and persist this
@@ -995,6 +1002,44 @@ export class WorkflowManager extends EventEmitter {
    */
   getRun(runId: string): ManagedRun | undefined {
     return this.runs.get(runId);
+  }
+
+  /** Return a safe, bounded, live-first point-in-time run projection. */
+  inspectRun(runId: string, options?: WorkflowRunInspectionOptions): WorkflowRunStatus | undefined {
+    const managed = this.runs.get(runId);
+    if (managed) {
+      return projectWorkflowRunStatus(
+        {
+          runId: managed.runId,
+          status: managed.status,
+          workflowName: managed.snapshot.name,
+          phases: managed.snapshot.phases,
+          currentPhase: managed.snapshot.currentPhase,
+          reason: runReason(managed.status, managed.error),
+          errorCode: managed.error?.code,
+          logs: managed.snapshot.logs,
+          journal: managed.journal,
+        },
+        options,
+      );
+    }
+
+    const persisted = this.persistence.load(runId);
+    if (!persisted) return undefined;
+    return projectWorkflowRunStatus(
+      {
+        runId: persisted.runId,
+        status: persisted.status,
+        workflowName: persisted.workflowName,
+        phases: persisted.phases ?? [],
+        currentPhase: persisted.currentPhase,
+        reason: persisted.reason ?? persisted.pauseReason,
+        errorCode: persisted.errorCode,
+        logs: persisted.logs ?? [],
+        journal: persisted.journal ?? [],
+      },
+      options,
+    );
   }
 
   /**

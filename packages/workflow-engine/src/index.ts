@@ -129,6 +129,17 @@ export {
   type WorkflowPathOptions,
 } from "./workflow-paths.js";
 export { createWorkflowLogger, type WorkflowLogger, type WorkflowLoggerOptions } from "./logger.js";
+export {
+  MAX_OBSERVABILITY_SCALAR_BYTES,
+  MAX_STRUCTURED_STATUS_BYTES,
+  createWorkflowLogTail,
+  matchesLabelGlob,
+  normalizeInspectionOptions,
+  projectWorkflowRunStatus,
+  redactText,
+  truncateUtf8,
+  type RunObservabilitySource,
+} from "./run-observability.js";
 
 // ── Convenience re-exports of the shared seam + host-facing result types ──
 export type {
@@ -142,6 +153,12 @@ export type {
   WorkflowMeta,
   WorkflowMetaPhase,
   JournalEntry,
+  JournalCallMetadata,
+  WorkflowLogTail,
+  WorkflowRunCallStatus,
+  WorkflowRunInspectionOptions,
+  WorkflowRunStatus,
+  WorkflowRunStatusTruncation,
   WorkflowRunResult,
   TokenUsage,
 } from "@automatalabs/shared-types";

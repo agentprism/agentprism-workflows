@@ -685,7 +685,21 @@ export async function runWorkflow<T = unknown>(
             const tokens = recordTokens(result);
             const session = sessionRecord();
             if (session) state.agentSessions.push(session);
-            if (journaling) options.onAgentJournal?.({ index: callIndex, hash: callHash, result, session });
+            if (journaling) {
+              options.onAgentJournal?.({
+                index: callIndex,
+                hash: callHash,
+                result,
+                session,
+                call: {
+                  kind: "agent",
+                  label,
+                  phase: assignedPhase,
+                  model: displayModel,
+                  backendId: session?.backendId,
+                },
+              });
+            }
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
@@ -1043,7 +1057,14 @@ export async function runWorkflow<T = unknown>(
       reply = checkpointOptions.default ?? true;
     }
     throwIfAborted();
-    if (journaling) options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
+    if (journaling) {
+      options.onAgentJournal?.({
+        index: callIndex,
+        hash: callHash,
+        result: reply,
+        call: { kind: "checkpoint", label: "checkpoint", phase: state.currentPhase },
+      });
+    }
     return reply;
   };
 

@@ -1,48 +1,113 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 // Internals under test, imported via ../src (same-package unit test).
-import { clampWorkflowInput, workflowToolInputShape } from "../src/index.js";
+import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "../src/index.js";
 
 // The MCP SDK validates a Zod RAW SHAPE before the handler runs; build the object schema
 // the SDK would build so we can assert exactly what the wire boundary accepts/rejects.
 const Schema = z.object(workflowToolInputShape);
 
-test("input shape: script is REQUIRED and must be non-empty", () => {
-  assert.throws(() => Schema.parse({}), "missing script must be rejected");
+test("input shape: primitive validation allows the union and the parser requires a complete branch", () => {
+  assert.deepEqual(Schema.parse({}), {}, "script is raw-schema optional so inspect can omit it");
+  assert.throws(() => parseWorkflowToolInput(Schema.parse({})), /Invalid workflow tool input/);
   assert.throws(() => Schema.parse({ script: "" }), "empty script must be rejected (min(1))");
-  // A present, non-empty script alone is a valid input.
-  const ok = Schema.parse({ script: "export const meta = {};" });
+  const ok = parseWorkflowToolInput(Schema.parse({ script: "export const meta = {};" }));
   assert.equal(ok.script, "export const meta = {};");
+  assert.equal(ok.action, undefined, "omitted action preserves legacy execution");
+  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "run", script: "x" })).action, "run");
 });
 
 test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => {
   assert.doesNotThrow(() => Schema.parse({ script: "x" }), "args omitted is fine");
-  const withArgs = Schema.parse({ script: "x", args: { topic: "ai", depth: [1, 2, 3], nested: { a: true } } });
+  const withArgs = parseWorkflowToolInput(
+    Schema.parse({ script: "x", args: { topic: "ai", depth: [1, 2, 3], nested: { a: true } } }),
+  );
   assert.deepEqual(withArgs.args, { topic: "ai", depth: [1, 2, 3], nested: { a: true } });
   // args may be any JSON value, not just an object.
   assert.equal(Schema.parse({ script: "x", args: "plain-string" }).args, "plain-string");
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: there is NO startInBackground field (sync run model dropped it)", () => {
+test("input shape: one tool advertises run and inspect fields without detached-run fields", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
     [
+      "action",
       "agentRetries",
       "agentTimeoutMs",
       "args",
       "checkpointReplies",
       "concurrency",
+      "labelGlob",
+      "lastN",
+      "logLines",
       "maxAgents",
       "resumeFromRunId",
+      "runId",
       "script",
       "tokenBudget",
     ],
-    "the exact wire input fields (no background; resume is explicit via resumeFromRunId)",
+    "the exact run/inspect wire fields (background and await belong to the sibling spec)",
   );
+});
+
+test("inspection accepts defaults and exact bounds, and rejects invalid IDs/globs/ranges", () => {
+  const bare = parseWorkflowToolInput(Schema.parse({ action: "inspect", runId: "mabc1234-k9x2pq" }));
+  assert.deepEqual(bare, {
+    action: "inspect",
+    runId: "mabc1234-k9x2pq",
+    lastN: undefined,
+    labelGlob: undefined,
+    logLines: undefined,
+  });
+  assert.doesNotThrow(() =>
+    parseWorkflowToolInput(
+      Schema.parse({ action: "inspect", runId: "a-b", lastN: 1, logLines: 0, labelGlob: "review-?" }),
+    ),
+  );
+  assert.doesNotThrow(() =>
+    parseWorkflowToolInput(Schema.parse({ action: "inspect", runId: "a-b", lastN: 50, logLines: 50 })),
+  );
+  for (const input of [
+    { action: "inspect", runId: "../run" },
+    { action: "inspect", runId: "UPPER-case" },
+    { action: "inspect", runId: "a-b", lastN: 0 },
+    { action: "inspect", runId: "a-b", lastN: 51 },
+    { action: "inspect", runId: "a-b", logLines: -1 },
+    { action: "inspect", runId: "a-b", logLines: 51 },
+    { action: "inspect", runId: "a-b", labelGlob: "" },
+    { action: "inspect", runId: "a-b", labelGlob: "😀".repeat(129) },
+  ]) {
+    assert.throws(() => Schema.parse(input));
+  }
+});
+
+test("the discriminator rejects every missing or mixed run/inspect branch", () => {
+  for (const input of [
+    { action: "run" },
+    { action: "inspect" },
+    { runId: "a-b" },
+    { action: "inspect", runId: "a-b", script: "x" },
+    { action: "inspect", runId: "a-b", args: {} },
+    { action: "inspect", runId: "a-b", concurrency: 2 },
+    { action: "inspect", runId: "a-b", resumeFromRunId: "c-d" },
+    { action: "inspect", runId: "a-b", checkpointReplies: { 0: true } },
+    { script: "x", runId: "a-b" },
+    { action: "run", script: "x", lastN: 1 },
+    { action: "run", script: "x", labelGlob: "*" },
+    { action: "run", script: "x", logLines: 0 },
+  ]) {
+    const primitive = Schema.parse(input);
+    assert.throws(
+      () => parseWorkflowToolInput(primitive),
+      (error: unknown) =>
+        error instanceof McpError && error.code === ErrorCode.InvalidParams && /Invalid workflow tool input/.test(error.message),
+    );
+  }
 });
 
 test("input shape: checkpointReplies accepts JSON string indexes and coerces them to numeric keys", () => {

@@ -14,10 +14,10 @@ import { createWorkflowServer } from "./server.js";
 
 export { createWorkflowServer } from "./server.js";
 export type { WorkflowConfirmCallback, WorkflowCheckpointOptions } from "./server.js";
-export { clampWorkflowInput, workflowToolInputShape } from "./workflow-tool-input.js";
-export type { WorkflowToolInput } from "./workflow-tool-input.js";
+export { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
+export type { WorkflowExecuteToolInput, WorkflowInspectToolInput, WorkflowToolInput } from "./workflow-tool-input.js";
 export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
-export type { WorkflowToolResult } from "./workflow-tool-output.js";
+export type { WorkflowExecutionToolResult, WorkflowToolResult } from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
