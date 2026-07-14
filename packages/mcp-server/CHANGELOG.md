@@ -1,5 +1,13 @@
 # @automatalabs/mcp-server
 
+## 0.10.2
+
+### Patch Changes
+
+- 123e1b3: Add reusable and sequenced dry-run mock answers to the validator SDK and CLI, with deterministic label-glob selection, strict schema enforcement, attribution, and unused-fixture reporting. Refresh the MCP authoring prompt with the new validator guidance.
+- Updated dependencies [123e1b3]
+  - @automatalabs/workflows@0.29.0
+
 ## 0.10.1
 
 ### Patch Changes
