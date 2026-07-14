@@ -1,5 +1,13 @@
 # @automatalabs/mcp-server
 
+## 0.10.1
+
+### Patch Changes
+
+- 86c17a8: Expose each fulfilled `gate()` result's exact last validator verdict, preserve producer and structured-verdict inference in the ambient DSL, support boolean and null verdicts, and refresh the bundled MCP authoring guidance.
+- Updated dependencies [86c17a8]
+  - @automatalabs/workflows@0.28.0
+
 ## 0.10.0
 
 ### Minor Changes

@@ -1,5 +1,11 @@
 # @automatalabs/workflow-engine
 
+## 0.18.0
+
+### Minor Changes
+
+- 86c17a8: Expose each fulfilled `gate()` result's exact last validator verdict, preserve producer and structured-verdict inference in the ambient DSL, support boolean and null verdicts, and refresh the bundled MCP authoring guidance.
+
 ## 0.17.0
 
 ### Minor Changes
