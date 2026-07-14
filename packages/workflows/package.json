@@ -47,9 +47,7 @@
   "dependencies": {
     "@automatalabs/shared-types": "workspace:*",
     "@automatalabs/workflow-engine": "workspace:*",
-    "@automatalabs/acp-agents": "workspace:*"
-  },
-  "devDependencies": {
+    "@automatalabs/acp-agents": "workspace:*",
     "typebox": "1.3.2"
   }
 }

@@ -8,7 +8,7 @@
 // that fabricates schema-conforming results — no ACP process is spawned. See
 // ./validate.ts for the programmatic API (`validateWorkflowScript`).
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { openWorkflowDir } from "@automatalabs/workflow-engine";
 import { validateWorkflowScript, formatValidateReport } from "./validate.js";
@@ -25,6 +25,8 @@ Validates an AgentPrism workflow script without spending tokens:
 Options:
   --args <json>          the script's \`args\` global for the dry run (a JSON value)
   --args-file <path>     read the args JSON from a file instead
+  --mock-answers <json>       label-glob mock answers for dry-run agent calls
+  --mock-answers-file <path>  read the label-glob mock answers JSON from a UTF-8 file
   --workflows-dir <dir>  a directory of workflow scripts (repeatable; precedence in
                          the order given). Enables validating by NAME (filename stem)
                          and resolves nested workflow("<name>") calls in the dry run
@@ -48,7 +50,7 @@ Notes:
 Exit codes: 0 valid · 1 parse/static failure · 2 dry-run failure · 3 usage error`;
 
 function fail(message: string): never {
-  process.stderr.write(`${message}\n\nRun \`agentprism-workflows validate --help\` for usage.\n`);
+  writeFileSync(process.stderr.fd, `${message}\n\nRun \`agentprism-workflows validate --help\` for usage.\n`);
   process.exit(3);
 }
 
@@ -68,6 +70,7 @@ async function main(argv: string[]): Promise<void> {
 
   let file: string | undefined;
   let json = false;
+  let mockAnswersFlag: "--mock-answers" | "--mock-answers-file" | undefined;
   const workflowDirs: string[] = [];
   const options: ValidateWorkflowOptions = {};
 
@@ -99,6 +102,36 @@ async function main(argv: string[]): Promise<void> {
           fail(`--args-file: ${error instanceof Error ? error.message : String(error)}`);
         }
         break;
+      case "--mock-answers": {
+        if (mockAnswersFlag === arg) fail(`${arg} may appear at most once`);
+        if (mockAnswersFlag) fail("--mock-answers and --mock-answers-file are mutually exclusive");
+        mockAnswersFlag = arg;
+        const source = rest[++i];
+        if (source === undefined) fail("--mock-answers expects a JSON object (quote it for your shell)");
+        if (Buffer.byteLength(source, "utf8") > 256 * 1024) fail("--mock-answers exceeds the 256 KiB source limit");
+        try {
+          options.mockAnswers = JSON.parse(source);
+        } catch {
+          fail("--mock-answers expects a JSON object (quote it for your shell)");
+        }
+        break;
+      }
+      case "--mock-answers-file": {
+        if (mockAnswersFlag === arg) fail(`${arg} may appear at most once`);
+        if (mockAnswersFlag) fail("--mock-answers and --mock-answers-file are mutually exclusive");
+        mockAnswersFlag = arg;
+        const rawPath = rest[++i];
+        if (rawPath === undefined) fail("--mock-answers-file expects a path");
+        const path = resolve(rawPath);
+        try {
+          if (statSync(path).size > 256 * 1024) fail("--mock-answers-file exceeds the 256 KiB source limit");
+          options.mockAnswers = JSON.parse(readFileSync(path, "utf8"));
+        } catch (error) {
+          if (error instanceof SyntaxError) fail(`--mock-answers-file: ${error.message}`);
+          fail(`--mock-answers-file: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        break;
+      }
       case "--workflows-dir":
         workflowDirs.push(resolve(rest[++i] ?? fail("--workflows-dir expects a directory")));
         break;
@@ -143,9 +176,20 @@ async function main(argv: string[]): Promise<void> {
     fail(`cannot read ${file}: no such file (pass --workflows-dir to validate by name)`);
   }
 
-  const report = await validateWorkflowScript(script, options);
-  process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${formatValidateReport(report)}\n`);
-  process.exit(report.exitCode);
+  let report;
+  try {
+    report = await validateWorkflowScript(script, options);
+  } catch (error) {
+    if (mockAnswersFlag && error instanceof TypeError) {
+      fail(`${mockAnswersFlag}: ${error.message}`);
+    }
+    throw error;
+  }
+  writeFileSync(
+    process.stdout.fd,
+    json ? `${JSON.stringify(report, null, 2)}\n` : `${formatValidateReport(report)}\n`,
+  );
+  process.exitCode = report.exitCode;
 }
 
 main(process.argv.slice(2)).catch((error) => {

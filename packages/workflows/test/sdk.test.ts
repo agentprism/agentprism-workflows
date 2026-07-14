@@ -77,7 +77,26 @@ import type {
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
   WorkflowRunResult,
+  MockAnswers,
+  MockAnswerSequence,
+  ValidatedMockAnswerUse,
+  ValidatedMockAnswers,
 } from "../src/index.js";
+
+const mockAnswerSequence: MockAnswerSequence = { $sequence: [{ ok: false }, { ok: true }] };
+const mockAnswers: MockAnswers = { "quality:*": mockAnswerSequence };
+const validatedMockAnswerUse: ValidatedMockAnswerUse = {
+  glob: "quality:*",
+  sequenceIndex: 0,
+  sequenceLength: 2,
+};
+const validatedMockAnswers: ValidatedMockAnswers = {
+  rules: [{ glob: "quality:*", kind: "sequence", matchingCalls: 1, consumedCalls: 1, sequenceLength: 2 }],
+  unused: [{ glob: "quality:*", sequenceIndex: 1, reason: "not-reached" }],
+};
+void mockAnswers;
+void validatedMockAnswerUse;
+void validatedMockAnswers;
 
 type EqualTypes<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2

@@ -115,11 +115,18 @@ faster than output volume alone suggests.
 
 ```bash
 npm run validate
+
+# Exercise both sides of the report gate: first reject, then approve.
+npx @automatalabs/workflows validate repo-triage --workflows-dir workflows \
+  --mock-answers-file report-gate.mock-answers.json
 ```
 
 Zero tokens, no agent processes: a static parse plus a dry run of **both** scripts in
 the real engine realm against a mock backend (`--workflows-dir` is what lets the
-nested `workflow("quick-wins")` call resolve). Do this after any script edit.
+nested `workflow("quick-wins")` call resolve). `report-gate.mock-answers.json` partially
+overrides only `ok`: the first review inherits the fabricated `feedback`, the second
+sets it to an empty string, and the finite sequence proves the gate's revision and
+approval paths. Do this after any script edit.
 
 ## Notes
 

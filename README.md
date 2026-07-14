@@ -306,8 +306,12 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 > and the determinism rules.
 
 Validate a script **without spending tokens** (static parse + a dry run over a mock agent backend — no
-ACP process, no auth needed): `npx @automatalabs/workflows validate <file> --args '<json>'`. Exit codes:
-`0` valid, `1` parse failure, `2` dry-run failure.
+ACP process, no auth needed): `npx @automatalabs/workflows validate <file> --args '<json>'`. Script a
+false branch by resolved label with `--mock-answers '{"refute:*":{"real":false}}'`; reusable answers
+deep-merge over fabricated schema defaults, and `$sequence` fixtures exercise multi-round convergence.
+Exit codes: `0` valid, `1` parse failure, `2` dry-run failure. See the
+[workflows validator guide](packages/workflows/README.md#validating-scripts--agentprism-workflows-validate)
+for file fixtures, precedence, validation, limits, and reports.
 
 ---
 
