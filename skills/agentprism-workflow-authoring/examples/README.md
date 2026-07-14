@@ -14,7 +14,14 @@ Validate either one for free (zero tokens, no agent processes):
 
 ```bash
 npx @automatalabs/workflows validate repo-triage --workflows-dir <this directory>
+npx @automatalabs/workflows validate repo-triage --workflows-dir <this directory> \
+  --mock-answers-file <this directory>/report-gate.mock-answers.json
 ```
+
+The byte-identical `report-gate.mock-answers.json` fixture scripts `report:review` to
+reject once and approve once. Its first partial `{ "ok": false }` answer demonstrates
+fresh-base deep merge; the second supplies `{ "ok": true, "feedback": "" }` and
+finishes the existing gate.
 
 After running either script through MCP, retain the returned `runId`. Inspect the most recent
 triage workers without re-running anything:

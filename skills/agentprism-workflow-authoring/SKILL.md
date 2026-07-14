@@ -422,6 +422,12 @@ npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 
 It does two passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results. That catches the bugs a parse can't: thunks-vs-promises mistakes, reference errors, broken result plumbing between calls, schema shapes your own code then misreads. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
 
+The default fabricator returns `true` for every boolean. Do not accept that all-true path as proof
+that a convergence loop works: script its control labels with `--mock-answers` or a reusable
+`--mock-answers-file`. Use a finite `$sequence` such as reject-then-approve so validation executes
+the revision branch and proves the loop stops; the report identifies every consumed and unused
+fixture without printing answer bodies.
+
 Exit codes: `0` valid · `1` parse failure · `2` dry-run failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
 
 If the script nests saved workflows by name (`workflow("review-pr")`), pass the folder so names resolve — and the positional itself may then be a name: `npx @automatalabs/workflows validate review-pr --workflows-dir ./workflows`. A green dry run proves structure, not judgment — prompts and schemas still deserve review.
@@ -438,6 +444,7 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.
 - [ ] `return` a compact, structured result — it is the run's `result`, not a transcript.
+- [ ] Boolean-controlled convergence branches are scripted with mock answers (including reject-then-approve), not left to the all-true default.
 - [ ] `npx @automatalabs/workflows validate <file> --args '<json>'` exits 0 with no surprising warnings.
 
 For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and how hosts run scripts, read [`reference.md`](reference.md).

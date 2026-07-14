@@ -351,11 +351,13 @@ Backend auth comes from the machine the host runs on: Claude via a logged-in Cla
 npx @automatalabs/workflows validate <workflow-file> [options]
 ```
 
-Zero tokens, no ACP processes: a static parse (meta literal, syntax, determinism blocklist) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates schema-conforming results (`enum[0]`, `true` booleans so ok-gates terminate, `mock-<field>` strings, one array item). No auth is needed to validate.
+Zero tokens, no ACP processes: a static parse (meta literal, syntax, determinism blocklist) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). No auth is needed to validate. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
 
 | flag | meaning |
 |---|---|
 | `--args <json>` / `--args-file <path>` | the script's `args` global for the dry run |
+| `--mock-answers <json>` | label-glob answers for dry-run calls; mutually exclusive with the file form |
+| `--mock-answers-file <path>` | read the same JSON object from a UTF-8 file resolved against the process cwd |
 | `--workflows-dir <dir>` | repeatable; a folder of workflow scripts (name = filename stem). Lets the positional be a NAME and resolves nested `workflow("<name>")` calls |
 | `--parse-only` | static parse only |
 | `--cwd <dir>` | dry-run base cwd (default: throwaway temp dir, so `isolation: "worktree"` no-ops; a real repo cwd creates and cleans up real worktrees) |
@@ -364,9 +366,42 @@ Zero tokens, no ACP processes: a static parse (meta literal, syntax, determinism
 | `--timeout-ms <n>` | dry-run wall-clock limit (default 30000) |
 | `--json` | machine-readable `ValidateWorkflowReport` on stdout |
 
-Exit codes: `0` valid · `1` parse/static failure · `2` dry-run failure · `3` usage error. The report lists every agent call (label, phase, model spec, backend attribution, schema flag), every checkpoint with the reply the mock confirm took (`default ?? true`), and warnings: script-declared backends (approval reminder), declared-but-unused / used-but-undeclared phases, `headless: "abort"` checkpoints, agent-less scripts. Because validation supplies that mock live channel, `headless: "pause"` dry-runs cleanly; the abort warning remains because a truly unattended run would abort. Limits: `workflow("<saved-name>")` fails without `--workflows-dir` (the report warns and names the fix); the mock's all-success answers can't exercise failure-handling branches — `null`-path handling still needs your own reading.
+Inline false-branch fixture (exact shell form):
 
-Programmatic: `validateWorkflowScript(script, { args, workflows, dryRun, cwd, tokenBudget, maxAgents, timeoutMs })` from `@automatalabs/workflows` returns the same report object and never throws for an invalid script.
+```bash
+agentprism-workflows validate flow.workflow.js \
+  --mock-answers '{"refute:*":{"real":false}}'
+```
+
+Equivalent reusable file with a reject-then-approve sequence:
+
+```json
+{
+  "refute:*": { "real": false },
+  "quality:review": {
+    "$sequence": [
+      { "ok": false, "feedback": "exercise the revision path" },
+      { "ok": true }
+    ]
+  }
+}
+```
+
+```bash
+agentprism-workflows validate flow.workflow.js --mock-answers-file mock-answers.json
+```
+
+Rules match the final resolved label case-sensitively across the whole string. `*` matches zero or more characters (including `:` and `/`), `?` one character, and `\` escapes the next character; empty globs and trailing escapes are invalid. Object order is captured once and the **last matching rule wins**, so put `"*"` before narrower exceptions. Raw canonical array-index keys (`"0"` or a non-zero, no-leading-zero decimal through `"4294967294"`) are reserved because ECMAScript reorders them. To match numeric label `10`, use JSON key `"\\10"`; `"01"` and `"4294967295"` are ordinary keys.
+
+A single answer is reusable. `{ "$sequence": [...] }` is finite and only the winning rule consumes it; a raw array is one array result, and a sequence element is ordinary answer data even when it contains `$sequence`. Exhaustion fails instead of repeating the last item or falling back. The machine report uses zero-based `sequenceIndex`; human lines render one-based `[position/length]`. Earlier matching rules count the match even when shadowed, and `dryRun.mockAnswers.unused` distinguishes `no-match`, `shadowed`, and partially consumed `not-reached` items. Unused fixtures warn but do not fail validation.
+
+For schema calls, each answer deep-merges over a **fresh** fabricated base: JSON objects merge recursively; arrays, `null`, falsy primitives, and other scalars replace. The merged value is TypeBox-checked without coercion. Any answer-caused violation fails non-recoverably with `SCHEMA_NONCOMPLIANCE`; a failure already present at the identical untouched path/message in the simple fabricated base may be accepted with a grouped inherited-fabrication warning. A valid override can repair such a base limitation. Schema-less answers must be nonblank strings. Fixture failure messages, attribution, and warnings contain only labels, globs, positions, paths, and counts—not answer values.
+
+Limits: 256 KiB raw UTF-8 for either CLI source and canonical JSON for programmatic input; 256 rules; 1–256 UTF-16 code units per glob; 256 entries per sequence; answer depth 32. Inputs must be plain JSON data. Mock-enabled validation serves agent calls serially for deterministic FIFO sequence allocation; it is not a concurrency/load simulation, and the soft token gate may admit work differently than an unscripted concurrent dry run. Fixture values still flow into the script like real agent results, so author code can expose them via `log()` or its returned result—never store credentials or production data in fixtures.
+
+Exit codes: `0` valid · `1` parse/static failure · `2` dry-run failure · `3` usage error. The report also lists every checkpoint with the mock reply (`default ?? true`) and warnings for backend approval, phase mismatch, `headless: "abort"`, and agent-less scripts. `headless: "pause"` dry-runs cleanly. A saved nested workflow still needs `--workflows-dir`.
+
+Programmatic: `validateWorkflowScript(script, { args, workflows, dryRun, cwd, tokenBudget, maxAgents, timeoutMs, mockAnswers })` from `@automatalabs/workflows` returns the same report. Invalid workflow scripts resolve to reports; invalid `mockAnswers` supplied from untyped JavaScript throws `TypeError` before parsing.
 
 ## Workflow folders — `openWorkflowDir`
 

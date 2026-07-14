@@ -482,16 +482,56 @@ failure, `2` dry-run failure, `3` usage error.
 Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
 NAME and resolve nested `workflow("<name>")` calls from your folder), `--parse-only`,
 `--cwd <dir>`, `--token-budget <n>` (exercise `budget`-guarded paths; the mock reports 1000
-tokens per call), `--max-agents <n>`, `--timeout-ms <n>`, `--json`.
+tokens per call), `--max-agents <n>`, `--timeout-ms <n>`, `--mock-answers <json>`,
+`--mock-answers-file <path>`, `--json`. The two mock-answer flags are mutually exclusive.
 
-The same check is available programmatically — it never throws for an invalid script:
+Mock answers select the final resolved agent label with case-sensitive, whole-label globs: `*`
+matches any characters (including `:` and `/`), `?` matches one character, and `\` escapes the
+next character. Rules are captured once in object-member order and the **last matching rule wins**,
+so put broad defaults before narrow exceptions. Raw canonical array-index property names (`"0"`
+through `"4294967294"`, with no leading zero) are rejected because JavaScript reorders them;
+escape a digit to match a numeric label, for example the JSON key `"\\10"` matches label `10`.
+`"01"` and `"4294967295"` are ordinary keys.
+
+A rule is either one reusable JSON answer or `{ "$sequence": [...] }`, a finite sequence consumed
+only when that rule wins. A raw JSON array is one array-valued answer. Each schema-bearing answer
+deep-merges over a fresh `fabricateFromSchema()` base: objects merge recursively, while arrays,
+`null`, scalars, and falsy primitives replace. The merged value is checked without coercion. Any
+answer-caused schema violation fails with `SCHEMA_NONCOMPLIANCE`; an identical failure inherited
+from an untouched limitation of the simple fabricator may be accepted with a grouped warning.
+Schema-less answers must be nonblank strings. Sequences never repeat or fall back: exhaustion fails
+the dry run, while unconsumed singles/items remain non-fatal and appear in structured `unused`
+records plus grouped warnings. Supplying mock answers serializes dry-run agent service for stable
+FIFO sequence allocation, so this mode is not a concurrency/load simulator and its token-budget
+admission timing can differ from an unscripted concurrent dry run.
+
+Fixture input is capped at 256 KiB (raw CLI UTF-8 and canonical programmatic JSON), 256 rules,
+256 UTF-16 code units per glob, 256 sequence entries, and answer nesting depth 32. Values must be
+plain JSON data. Reports and fixture errors expose only globs, counters, positions, and schema
+diagnostics—not answer bodies. A fixture is still handed to workflow code like a real agent result,
+so the script can deliberately expose it through `log()` or its return value; do not put credentials
+or production data in mock-answer files.
+
+The same check is available programmatically. Invalid workflow scripts still resolve to reports;
+an invalid `mockAnswers` option is an option-contract error and throws `TypeError` before parsing:
 
 ```ts
-import { validateWorkflowScript } from "@automatalabs/workflows";
+import { validateWorkflowScript, type MockAnswers } from "@automatalabs/workflows";
 
-const report = await validateWorkflowScript(script, { args: { target: "src/" } });
+const mockAnswers: MockAnswers = {
+  "*": { approved: true },
+  "refute:*": { real: false },
+  "quality:review": {
+    $sequence: [
+      { ok: false, feedback: "exercise the revision path" },
+      { ok: true },
+    ],
+  },
+};
+const report = await validateWorkflowScript(script, { args: { target: "src/" }, mockAnswers });
 report.ok;                 // parse ok AND dry run completed
-report.dryRun?.agentCalls; // [{ label, phase, model, backend, schema }, …]
+report.dryRun?.agentCalls; // calls include mockAnswer: { glob, sequenceIndex?, sequenceLength? }
+report.dryRun?.mockAnswers;// normalized rule counters + item-level unused records
 report.warnings;           // approval reminders, phase mismatches, headless-abort checkpoints, …
 ```
 
@@ -593,6 +633,8 @@ AGENTPRISM_PERSISTENCE_ROOT_ENV,
 
 // ── Types ──
 RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
+MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
+ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidatedAgentCall, ValidatedCheckpoint,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,

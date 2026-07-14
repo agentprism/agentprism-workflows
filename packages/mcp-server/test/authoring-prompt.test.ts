@@ -51,6 +51,9 @@ test("prompts/get returns the self-contained guide with the task framed in", asy
     assert.ok(text.includes("loopUntilDry"), "contains the quick-wins example script");
     assert.ok(text.includes("{ ok, value, verdict, attempts }"), "contains the complete gate result contract");
     assert.ok(text.includes("outcome.verdict"), "shows authors how to consume the terminal verdict");
+    assert.ok(text.includes("--mock-answers"), "documents inline validator mock answers");
+    assert.ok(text.includes("--mock-answers-file"), "documents reusable validator fixture files");
+    assert.ok(text.includes("$sequence"), "documents finite repeated-call fixtures");
     assert.ok(text.includes("Find flaky tests and fix them"), "frames the task argument");
     assert.ok(text.includes("`workflow` tool"), "directs the host at the workflow tool");
 

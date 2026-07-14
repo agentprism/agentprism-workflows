@@ -44,10 +44,18 @@ export {
 //    the `agentprism-workflows validate` CLI (./cli.ts). ──
 export { validateWorkflowScript, fabricateFromSchema, formatValidateReport, MOCK_TOKENS_PER_AGENT } from "./validate.js";
 export type {
+  MockAnswerJson,
+  MockAnswerRule,
+  MockAnswers,
+  MockAnswerSequence,
+  UnusedMockAnswer,
   ValidateWorkflowOptions,
   ValidateWorkflowReport,
   ValidatedAgentCall,
   ValidatedCheckpoint,
+  ValidatedMockAnswerRule,
+  ValidatedMockAnswers,
+  ValidatedMockAnswerUse,
 } from "./validate.js";
 export type {
   WorkflowRunOptions,

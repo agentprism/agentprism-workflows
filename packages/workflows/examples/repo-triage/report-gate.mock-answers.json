@@ -1,0 +1,8 @@
+{
+  "report:review": {
+    "$sequence": [
+      { "ok": false },
+      { "ok": true, "feedback": "" }
+    ]
+  }
+}
