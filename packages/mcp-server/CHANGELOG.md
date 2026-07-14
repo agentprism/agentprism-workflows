@@ -1,5 +1,11 @@
 # @automatalabs/mcp-server
 
+## 0.8.2
+
+### Patch Changes
+
+- 9343e89: No runtime changes — verifies the app-token release automation (Version PR authored by the release app, CI-gated auto-merge, publish leg) end to end.
+
 ## 0.8.1
 
 ### Patch Changes
