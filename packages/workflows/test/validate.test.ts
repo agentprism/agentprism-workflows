@@ -3,7 +3,7 @@
 // the whole point of the surface under test.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,6 +29,11 @@ import {
 function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
+
+const RESUME_LOOP_CAP_EXAMPLE = readFileSync(
+  new URL("../../../skills/agentprism-workflow-authoring/examples/resume-loop-cap.workflow.js", import.meta.url),
+  "utf8",
+);
 
 test("valid script: parse + dry run complete; calls, backends, checkpoints, phases reported", async () => {
   const script = [
@@ -68,6 +73,20 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
   assert.match(result.pair[1], /dry-run/);
   assert.deepEqual(report.dryRun!.phasesVisited, ["Fan", "Judge"]);
   assert.equal(report.warnings.length, 0);
+});
+
+test("published resume-loop-cap example validates its default and intentional six-round failure", async () => {
+  const complete = await validateWorkflowScript(RESUME_LOOP_CAP_EXAMPLE);
+  assert.equal(complete.ok, true);
+  assert.equal(complete.exitCode, 0);
+  assert.equal(complete.dryRun?.status, "completed");
+  assert.equal(complete.dryRun?.agentCalls.length, 8);
+
+  const capped = await validateWorkflowScript(RESUME_LOOP_CAP_EXAMPLE, { args: { maxRounds: 6 } });
+  assert.equal(capped.exitCode, 2);
+  assert.equal(capped.dryRun?.status, "failed");
+  assert.equal(capped.dryRun?.agentCalls.length, 6);
+  assert.match(capped.dryRun?.reason ?? "", /review cap 6 reached before 8 rounds/);
 });
 
 test("determinism violation fails the static parse (exit 1), no dry run", async () => {

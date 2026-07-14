@@ -137,11 +137,45 @@ The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elic
 
 ## Determinism & the resume journal
 
-- Banned in the realm (they throw): `Date.now()`, `Math.random()`, no-arg `new Date()` / `Date()`. `new Date(value)` works. No `require`/`import`, no Node or network APIs — the realm is a determinism boundary, not a security sandbox.
-- Each `agent()` call journals its result under a monotonic call index plus an identity hash of `prompt + model + mode-when-set + tier + phase + agentType + agent-definition + schema`.
-- Resume replays the **longest unchanged prefix** as cache hits (zero tokens); the first changed/new call and everything after runs live. `retry`/`gate` chains cache-miss-cascade on resume by design (attempt N+1's prompt embeds attempt N's live result).
-- Additive options are **not** hashed and can differ across resumes: `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`.
-- `checkpoint()` replies — including synthetic `checkpointReplies` answers — are journaled and replay on resume instead of re-asking.
+> **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
+
+- Banned in the realm because they break deterministic replay: `Date.now()`, `Math.random()`, no-arg `new Date()` / `Date()`. `new Date(value)` works. There is no `require`, `import`, Node API, or network API in the realm.
+- Each `agent()` result is journaled under a monotonic call index and a SHA-256 identity hash. The canonical identity fields, in order, are `prompt`, resolved `model`, `mode` only when set, `tier`, `phase`, `agentType`, resolved `agentDef`, and `schema`. Missing fields other than `mode` serialize as `null`; an unset `mode` key is omitted for compatibility with older journals.
+- `agentDef` is the resolved definition's tools, disallowed tools, model, isolation, and body prompt. Changing a named definition therefore invalidates its call even when the `agentType` name is unchanged.
+- `args` is exposed to the script but is not directly included in the call hash. An args change cache-misses only when evaluating the script produces a changed hashed field, changed call order, or a new call.
+- Resume replays the longest unchanged prefix as cache hits with zero agent tokens. The first changed/new call and every call after it run live. `retry` and `gate` chains naturally cascade because a later attempt's prompt usually includes the preceding live result.
+- The additive options `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not hashed. A changed value affects only a live call; it does not invalidate or modify a replayed result.
+- `checkpoint()` uses the same monotonic call sequence and hashes its prompt, normalized kind, and choices. Real or synthetic `checkpointReplies` decisions are journaled and replay instead of being requested again.
+
+An args-controlled cap is the useful case. In this complete script, `maxRounds` changes how many calls are reachable but does not appear in an earlier call's prompt:
+
+```js
+export const meta = {
+  name: "resume-loop-cap",
+  description: "Run expensive review rounds up to an args-controlled cap",
+  phases: [{ title: "Review" }],
+};
+
+const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+const numericCap = Number(input.maxRounds);
+const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 8;
+
+phase("Review");
+const rounds = [];
+for (let i = 0; i < maxRounds; i += 1) {
+  rounds.push(
+    await agent(
+      `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
+      { label: `review:${i + 1}`, phase: "Review" },
+    ),
+  );
+}
+
+if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rounds`);
+return { rounds };
+```
+
+The first MCP request uses `{ "args": { "maxRounds": 6 } }` and returns a failed run with a persisted six-entry journal. The next request sends the same `script`, `{ "args": { "maxRounds": 8 } }`, and the returned run ID as `resumeFromRunId`. Calls 0–5 replay for zero tokens; calls 6–7 are new and run live. This changed-args pattern is specific to entry points that accept new args together with a hydrated journal. The MCP `workflow` tool does. `WorkflowManager.resume(runId)` instead reloads the persisted original script and args; an SDK caller that needs changed args uses `runSync(script, newArgs, { resumeJournal })`.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 

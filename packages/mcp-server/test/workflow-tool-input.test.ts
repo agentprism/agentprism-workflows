@@ -57,6 +57,14 @@ test("input shape: one tool advertises the exact run, inspect, and await field s
   );
 });
 
+test("resumeFromRunId advertises the canonical changed-args replay rule", () => {
+  assert.ok(
+    workflowToolInputShape.resumeFromRunId.description?.includes(
+      "Resume rule: args changes don't invalidate the journal; prompt changes cache-miss from the first changed call.",
+    ),
+  );
+});
+
 test("background defaults false and accepts explicit false or true on run only", () => {
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x" })).background, false);
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: false })).background, false);

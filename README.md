@@ -35,6 +35,10 @@ The backend is chosen **per `agent()` call**: an `opus` review step, a `gpt-5.5`
 
 Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. Kill the process mid-run — crash, deploy, Ctrl-C — and `resume()` replays the completed prefix from the journal as cache-hits (**zero tokens**), then executes only the steps that never ran. Provider quota walls don't fail the run either: it **pauses** with the provider's reset hint and resumes after the budget refills.
 
+> **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
+>
+> `args` is not itself part of an `agent()` call's replay hash. New args can raise an orchestration-only loop cap while earlier calls keep replaying for zero tokens. If the new args change a prompt or another hashed identity field, replay stops at the first affected call and that call plus every later call runs live. The hashed identity is the prompt, resolved model, mode when set, tier, phase, agent type and resolved agent definition, and schema. `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` do not invalidate a cached call; changed values apply only to calls that run live.
+
 ### Structured output as validated objects
 
 `agent({ schema })` returns a schema-validated object, not text to parse. Claude and Codex constrain generation natively; OpenCode and eligible custom ACP agents get a client-hosted `StructuredOutput` MCP tool injected automatically when they advertise HTTP MCP support. The runner still validates and re-prompts on mismatch, so the same API works for native, tool-capture, and final-text JSON fallback paths.
@@ -263,6 +267,38 @@ not from the stdio server process: process exit can stop in-flight work, while t
 prefix remains resumable. Background runs send no request progress and use authored headless
 checkpoint behavior. Resume after a pause/crash by starting a new run with `resumeFromRunId`; each
 new background run durably inherits the replay prefix under its new run ID before acknowledgement.
+
+#### Raise a loop cap without paying for completed rounds twice
+
+This script intentionally halts after six expensive reviews when called with `{ "maxRounds": 6 }`, although eight are required:
+
+```js
+export const meta = {
+  name: "resume-loop-cap",
+  description: "Run expensive review rounds up to an args-controlled cap",
+  phases: [{ title: "Review" }],
+};
+
+const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+const numericCap = Number(input.maxRounds);
+const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 8;
+
+phase("Review");
+const rounds = [];
+for (let i = 0; i < maxRounds; i += 1) {
+  rounds.push(
+    await agent(
+      `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
+      { label: `review:${i + 1}`, phase: "Review" },
+    ),
+  );
+}
+
+if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rounds`);
+return { rounds };
+```
+
+Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `workflow` again with the same script, `args: { "maxRounds": 8 }`, and that ID as `resumeFromRunId`. Rounds 1–6 rebuild the same prompts and replay from the journal at zero token cost; only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` there would change round 1's prompt and make all eight rounds run live.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, inspect its safe log and
 call tail:

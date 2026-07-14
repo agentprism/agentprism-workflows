@@ -18,10 +18,11 @@ const echo = {
 };
 
 /** Run a script with the echo agent and return its journal entries in index order. */
-async function journalOf(script: string): Promise<JournalEntry[]> {
+async function journalOf(script: string, args?: unknown): Promise<JournalEntry[]> {
   const journal: JournalEntry[] = [];
   await runWorkflow(script, {
     agent: echo,
+    args,
     persistLogs: false,
     onAgentJournal: (e) => journal.push(e),
   });
@@ -48,6 +49,7 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
     // journals and this assertion fails.
     // NOTE deliberately NO `mode` key here: mode joins the identity ONLY when set, so
     // journals written before session modes existed keep replaying for mode-less calls.
+    // The resolved `agentDef` is still an identity field even when its value is null.
     const expectedIdentity = JSON.stringify({
       prompt: "only",
       model: null,
@@ -71,6 +73,13 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
       b.map((e) => e.hash),
       "the same call identity hashes to the same bytes every run (resume depends on it)",
     );
+  });
+
+  it("is byte-identical when args change but the call identity does not", async () => {
+    const [first] = await journalOf(singleCall, { maxRounds: 6 });
+    const [second] = await journalOf(singleCall, { maxRounds: 8 });
+
+    assert.equal(first.hash, second.hash, "args are not serialized into the agent call identity");
   });
 
   it("changes only the edited call's hash and keeps earlier indices byte-stable", async () => {

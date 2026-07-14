@@ -16,6 +16,18 @@ test("generated authoring-prompt content is in sync with the skill sources", () 
   );
 });
 
+test("generated authoring-prompt teaches changed-args resume semantics", () => {
+  assert.ok(
+    AUTHORING_PROMPT_CONTENT.includes(
+      "**Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.",
+    ),
+  );
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("resolved agent definition"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 6'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 8'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
+});
+
 test("prompts/list advertises author-workflow with the optional task argument", async () => {
   const { client, dispose } = await connect(okRunner());
   try {

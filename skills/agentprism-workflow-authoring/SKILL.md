@@ -268,11 +268,49 @@ Structured output works on custom backends through the same injected-tool/fallba
 
 ## Determinism and resume
 
-Runs are journaled: every `agent()` and `checkpoint()` result is recorded under a deterministic call index, and a paused/killed run **resumes by replaying the completed prefix from the journal at zero token cost**, executing only what never ran. Authoring rules that keep this working:
+Runs are journaled: every `agent()` and `checkpoint()` result is recorded under a deterministic call index, and a paused, killed, or failed run can resume by replaying the completed prefix from the journal at zero token cost.
 
-- `Date.now()`, `Math.random()`, and no-arg `new Date()` **throw inside the realm** (`new Date(isoString)` is fine). Need a timestamp or a random seed? Pass it in via `args`.
-- A call's replay identity hashes its prompt, `model`, `mode` (when set), `tier`, `phase`, `agentType`, and `schema`. Resume replays the **longest unchanged prefix** — editing an early prompt re-runs everything from there, while `label`, `cwd`, `mcpServers`, `images`, `meta`/`promptMeta`, and `keepSession` are deliberately *not* hashed and can change freely between resume attempts.
-- Keep call order deterministic: same `args` in, same sequence of calls out. Derive iteration from `args` and prior agent results, never from ambient state.
+> **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
+
+- `Date.now()`, `Math.random()`, and no-arg `new Date()` throw inside the realm (`new Date(isoString)` is fine). Need a timestamp or random seed? Pass it through `args`.
+- An `agent()` replay identity hashes the prompt, resolved `model`, `mode` when set, `tier`, `phase`, `agentType`, the resolved agent definition, and `schema`. The resolved definition covers its tool allowlist/denylist, model, isolation, and body prompt, so editing an agent definition invalidates calls that use it.
+- `args` is not hashed directly. If new args only raise a loop cap, earlier calls with the same prompts and other identity fields replay. If new args change a prompt, model selection, phase, schema, call order, or another hashed field, the first affected call is a miss.
+- Resume uses the longest unchanged prefix: the first changed or new call and every later call run live. This prevents an unchanged-looking downstream call from reusing a result produced from stale upstream state.
+- `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not hashed. Changing one does not rerun a cached call; the new value affects only calls that run live. Change a hashed field, normally the prompt, when a call must execute again.
+- Keep call order deterministic. Derive iteration from `args` and prior agent results, never from ambient state.
+
+### Worked resume — raise a loop cap
+
+The following workflow requires eight reviews but lets the caller cap how many are attempted in one run:
+
+```js
+export const meta = {
+  name: "resume-loop-cap",
+  description: "Run expensive review rounds up to an args-controlled cap",
+  phases: [{ title: "Review" }],
+};
+
+const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+const numericCap = Number(input.maxRounds);
+const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 8;
+
+phase("Review");
+const rounds = [];
+for (let i = 0; i < maxRounds; i += 1) {
+  rounds.push(
+    await agent(
+      `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
+      { label: `review:${i + 1}`, phase: "Review" },
+    ),
+  );
+}
+
+if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rounds`);
+return { rounds };
+```
+
+With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same script with `args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 replay for zero tokens and only rounds 7–8 run live because the cap controls call count but is not interpolated into the round prompt. If the prompt included `maxRounds`, round 1 would change and the whole eight-call suffix would run live.
+
 - Narrate decisions and round summaries with `log()`, and give repeated calls stable, descriptive
   labels. MCP hosts can safely retrieve the latest log lines and compact results by label after a
   pause or failure; useful narration turns that inspection into a diagnosis instead of a guess.
