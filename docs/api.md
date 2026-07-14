@@ -10,7 +10,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
-| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing `workflow` plus two auth tools when the runner is auth-capable | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing one `workflow` tool for run, resume, and inspect | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
 
@@ -119,6 +119,7 @@ explicitly selects `headless: "pause"`.
 |---|---|---|
 | `startInBackground(script, args?, exec?)` | `{ runId, promise }` | Returns immediately. The promise rejects on failure (a side-channel catch prevents host unhandled rejections if you don't await it). |
 | `runSync(script, args?, exec?)` | `Promise<WorkflowRunResult>` | Blocks; always resolves to a **terminal** result (`completed \| paused \| failed \| aborted`) — never throws for ordinary outcomes. |
+| `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, read-only, live-first safe projection; falls back to the manager's project-scoped persistence. Never leases, saves, or changes status. |
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
 | `stop(runId)` | `boolean` | Terminal abort. Not resumable. |
 | `resume(runId, exec?)` | `Promise<boolean>` | Restarts a paused/failed run in the background: the journaled prefix replays without spending tokens; only un-run steps execute. Runs in the run's original per-run `cwd` unless `exec.cwd` overrides. Requires journaling. |
@@ -128,6 +129,71 @@ explicitly selects `headless: "pause"`.
 | `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |
 | `dispose()` / `close()` | — | Facade manager only: detach its `agentEvent` runner subscriptions. Never disposes the runner itself. |
+
+### Run inspection and terminal log tails
+
+`WorkflowRunInspectionOptions` has `lastN?` (default 20, integer 1–50), `logLines?` (default
+20, integer 0–50), and `labelGlob?` (non-empty, at most 128 Unicode code points). The glob is
+case-sensitive and matches the entire raw agent label: `*` matches zero or more Unicode code
+points, `?` one, and backslash escapes the next character; a trailing backslash is literal.
+Checkpoints and unknown legacy entries do not match a label glob. Filtering precedes latest-N
+selection and selected calls return in ascending deterministic index order.
+
+```ts
+interface WorkflowLogTail {
+  lines: string[];
+  totalLines: number;
+  omittedLines: number;
+  truncatedLines: number;
+  redactedLines: number;
+}
+
+interface WorkflowRunCallStatus {
+  index: number;
+  kind: "agent" | "checkpoint" | "unknown";
+  label?: string;
+  phase?: string;
+  model?: string;
+  backendId?: string;
+  resultPreview: string;
+  resultRedacted: boolean;
+  resultTruncated: boolean;
+}
+
+interface WorkflowRunStatus {
+  runId: string;
+  status: RunStatus;
+  workflowName: string;
+  phases: string[];
+  currentPhase?: string;
+  reason?: string;
+  errorCode?: WorkflowErrorCode;
+  logTail: WorkflowLogTail;
+  calls: WorkflowRunCallStatus[];
+  filter: { lastN: number; logLines: number; labelGlob?: string };
+  truncation: WorkflowRunStatusTruncation;
+}
+```
+
+`WorkflowRunStatusTruncation` reports the fixed `maxStructuredBytes` (24,576), whether the byte
+cap removed data, phase total/returned/shortened counts, log total/returned/shortened/redacted
+counts, and call total/matched/returned/shortened-result/redacted-result counts. Inspection keeps
+at most 64 phase titles and enforces the cap by removing oldest calls, then oldest log lines, then
+oldest phases. Every outward text scalar and compact JSON result preview is redacted and capped at
+512 UTF-8 bytes. Result compaction keeps depth four, the first ten array items, and first twenty
+object keys. Sensitive keys and PEM/auth/URL/JWT/assignment/known-prefix/opaque-token credential
+patterns are redacted. There is no raw mode: scripts, args, prompts, histories, journal hashes,
+session IDs, cwd, checkpoint prompt/default, auth context, and raw results are never projected.
+
+`JournalEntry.call?: JournalCallMetadata` adds replay-neutral attribution. Agent metadata contains
+`{ kind:"agent", label, phase?, model?, backendId? }`; checkpoint metadata contains
+`{ kind:"checkpoint", label:"checkpoint", phase? }`. It never participates in hashes or replay.
+Legacy entries remain valid; inspection derives old agent label/phase/backend only from a present
+session record, otherwise reports `kind:"unknown"`.
+
+Paused, failed, and aborted `WorkflowRunResult`s carry a `logTail` containing the redacted final 20
+snapshot logs, present even when empty. Completed results omit it. The existing full `logs` array
+is unchanged.
 
 A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused**, not failed — the journal checkpoints and `resume()` picks up after the budget refills (`resetHint` carries the provider's "resets in…" text when present).
 
@@ -446,7 +512,15 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface: pass a raw `script` + `args`; it runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`. For `headless: "pause"`, non-elicitation clients receive structured `checkpointContext` and resume with `checkpointReplies`; elicitation-capable clients use the live `confirm` channel, including on resume. The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir` feature. The server honors the same runtime environment variables as the SDK plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface. Omitted `action` or `action:"run"` requires a non-empty raw `script` and accepts the existing execution knobs (`args`, `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `tokenBudget`, `resumeFromRunId`, `checkpointReplies`). `action:"inspect"` requires an engine-shaped `runId` and accepts only `lastN`, `labelGlob`, and `logLines`. Mixed/missing branches, invalid run IDs, and invalid inspection bounds are MCP Invalid Params (`-32602`). Execution runs via a `WorkflowManager`, streams progress, and supports `resumeFromRunId`; inspection is read-only and never parses a script, invokes a runner, approves a backend, elicits, reports progress, or acquires a lease. For `headless: "pause"`, non-elicitation clients receive structured `checkpointContext` and resume with `checkpointReplies`; elicitation-capable clients use the live `confirm` channel, including on resume. The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir` feature. The server honors the same runtime environment variables as the SDK plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
+
+Inspect returns exactly `WorkflowRunStatus`. Its JSON structured content is capped at 24,576 bytes
+and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
+An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
+`No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution
+keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable
+call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped
+at 12,288 bytes; malformed pre-run scripts have no run ID or tail.
 
 **The `author-workflow` prompt.** Prompt-capable hosts additionally get one user-controlled MCP prompt, `author-workflow` (optional `task` argument): it returns the complete, self-contained authoring guide — SKILL.md + the exhaustive reference tables + a validated example script, generated from `skills/agentprism-workflow-authoring` at `scripts/generate-authoring-prompt.mjs` and version-matched to the installed engine. Prompts never enter the model's tool-selection loop, so the tool surface stays exactly `workflow`.
 

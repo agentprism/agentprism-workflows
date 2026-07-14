@@ -1,18 +1,8 @@
-// packages/mcp-server/src/workflow-tool-input.ts
-//
-// Input schema for the MCP `workflow` tool (registerTool inputSchema). The MCP TS SDK
-// validates a Zod RAW SHAPE (ZodRawShapeCompat, verified mcp.d.ts:150-154) and rejects
-// with InvalidParams BEFORE the handler runs — so numeric BOUNDS are deliberately PLAIN
-// numbers, never z.number().max(...): out-of-range values must be CLAMPED by the engine
-// (normalizeConcurrency -> MAX_CONCURRENCY 16; normalizeAgentRetries -> MAX_AGENT_RETRIES 3),
-// NOT rejected. This is a behavioral contract (ground-truth corrections item 3, README §4):
-// keep ONLY type + positivity in Zod; never add .max(). These mirror WorkflowManager.runSync
-// ExecOptions { resumeJournal, checkpointReplies, maxAgents, tokenBudget, concurrency,
-// agentRetries, confirm, onProgress }.
-//
-// One semantic change vs Pi: the run is SYNCHRONOUS (one tools/call == one full run, awaited
-// to completion; taskSupport:'forbidden'), so background/startInBackground are DROPPED. Resume
-// is no longer lost — it becomes EXPLICIT via `resumeFromRunId`.
+// Input schema and cross-field discriminator for the single MCP `workflow` tool.
+// Numeric execution knobs retain their existing clamp-at-runtime behavior. Inspection
+// bounds are rejected at the Zod boundary because they are wire-contract limits.
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import type { WorkflowRunInspectionOptions } from "@automatalabs/workflows";
 import { z } from "zod";
 
 const checkpointRepliesSchema = z
@@ -29,11 +19,13 @@ const checkpointRepliesSchema = z
   );
 
 export const workflowToolInputShape = {
+  action: z.enum(["run", "inspect"]).optional().describe("Operation. Omit or use run to execute; inspect reads a run."),
   script: z
     .string()
     .min(1)
+    .optional()
     .describe(
-      "Required raw JavaScript workflow script (no Markdown fences). First statement MUST be `export const meta = { name, description, phases? }`; the script MUST call agent() at least once.",
+      "Raw JavaScript workflow script (no Markdown fences). Required for run; forbidden for inspect. First statement MUST be `export const meta = { name, description, phases? }`.",
     ),
   args: z.unknown().optional().describe("Optional JSON value exposed to the script as the global `args`."),
   maxAgents: z
@@ -42,14 +34,12 @@ export const workflowToolInputShape = {
     .positive()
     .optional()
     .describe("Max agents allowed in this run. Default 1000 (engine cap MAX_AGENTS_PER_RUN)."),
-  // PLAIN number — NO .max(). The engine clamps to MAX_CONCURRENCY (16).
   concurrency: z
     .number()
     .int()
     .positive()
     .optional()
     .describe("Max concurrent agents. CLAMPED to the runtime max (16) by the engine — not rejected."),
-  // PLAIN number — NO .max(). The engine clamps to MAX_AGENT_RETRIES (3).
   agentRetries: z
     .number()
     .int()
@@ -73,18 +63,29 @@ export const workflowToolInputShape = {
   resumeFromRunId: z
     .string()
     .optional()
-    .describe(
-      "Resume a prior run from its persisted journal (the shell loads the journal by runId and passes it to the engine as resumeJournal). Replaces Pi's background result-delivery: resume is now EXPLICIT.",
-    ),
+    .describe("Execute a new run by replaying the unchanged prefix of a prior run's persisted journal."),
   checkpointReplies: checkpointRepliesSchema
     .optional()
-    .describe(
-      "With resumeFromRunId, decisions for durable checkpoints keyed by checkpointContext.callIndex. JSON string keys are coerced to numeric call indexes and journaled before replay.",
-    ),
+    .describe("With resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),
+  runId: z
+    .string()
+    .max(128)
+    .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
+    .optional()
+    .describe("Project-scoped workflow run ID. Required for inspect; forbidden for run."),
+  lastN: z.number().int().min(1).max(50).optional().describe("Latest matching calls. Default 20; range 1..50."),
+  labelGlob: z
+    .string()
+    .refine((value) => [...value].length >= 1 && [...value].length <= 128, {
+      message: "labelGlob must contain from 1 through 128 Unicode code points",
+    })
+    .optional()
+    .describe("Case-sensitive whole-label glob using *, ?, and backslash escaping."),
+  logLines: z.number().int().min(0).max(50).optional().describe("Latest run-log lines. Default 20; range 0..50."),
 } as const;
 
-/** z.infer<z.ZodObject<typeof workflowToolInputShape>> — the handler's validated input. */
-export interface WorkflowToolInput {
+export interface WorkflowExecuteToolInput {
+  action?: "run";
   script: string;
   args?: unknown;
   maxAgents?: number;
@@ -94,41 +95,98 @@ export interface WorkflowToolInput {
   tokenBudget?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
+  runId?: never;
+  lastN?: never;
+  labelGlob?: never;
+  logLines?: never;
 }
 
-/**
- * Handler-side CLAMP (NOT schema-encoded). Run on the validated input before handing it
- * to runWorkflow/runSync so out-of-range knobs degrade gracefully instead of throwing
- * InvalidParams. Mirrors the engine's own normalizeConcurrency/normalizeAgentRetries, so
- * even a direct engine caller gets the same result. NOTE: keeping the bounds out of the
- * Zod shape AND clamping here is the contract — do not move bounds into the wire schema.
- */
-export function clampWorkflowInput(input: WorkflowToolInput): WorkflowToolInput {
-  const clampInt = (v: number | undefined, lo: number, hi: number) =>
-    v === undefined || !Number.isFinite(v) ? undefined : Math.min(hi, Math.max(lo, Math.floor(v)));
+export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
+  action: "inspect";
+  runId: string;
+  script?: never;
+}
+
+export type WorkflowToolInput = WorkflowExecuteToolInput | WorkflowInspectToolInput;
+
+interface RawWorkflowToolInput {
+  action?: "run" | "inspect";
+  script?: string;
+  args?: unknown;
+  maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+  tokenBudget?: number | null;
+  resumeFromRunId?: string;
+  checkpointReplies?: Record<number, unknown>;
+  runId?: string;
+  lastN?: number;
+  labelGlob?: string;
+  logLines?: number;
+}
+
+function invalid(message: string): never {
+  throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
+}
+
+/** Apply the action discriminator after the MCP SDK has validated primitive fields. */
+export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolInput {
+  if (raw.action === "inspect") {
+    if (!raw.runId) invalid('action="inspect" requires runId');
+    if (
+      raw.script !== undefined ||
+      raw.args !== undefined ||
+      raw.maxAgents !== undefined ||
+      raw.concurrency !== undefined ||
+      raw.agentRetries !== undefined ||
+      raw.agentTimeoutMs !== undefined ||
+      raw.tokenBudget !== undefined ||
+      raw.resumeFromRunId !== undefined ||
+      raw.checkpointReplies !== undefined
+    ) {
+      invalid('action="inspect" cannot include execution fields');
+    }
+    return {
+      action: "inspect",
+      runId: raw.runId,
+      lastN: raw.lastN,
+      labelGlob: raw.labelGlob,
+      logLines: raw.logLines,
+    };
+  }
+
+  if (raw.runId !== undefined || raw.lastN !== undefined || raw.labelGlob !== undefined || raw.logLines !== undefined) {
+    invalid("run inputs cannot include inspection fields");
+  }
+  if (!raw.script) invalid(raw.action === "run" ? 'action="run" requires script' : "script or an explicit action is required");
+  return {
+    action: raw.action,
+    script: raw.script,
+    args: raw.args,
+    maxAgents: raw.maxAgents,
+    concurrency: raw.concurrency,
+    agentRetries: raw.agentRetries,
+    agentTimeoutMs: raw.agentTimeoutMs,
+    tokenBudget: raw.tokenBudget,
+    resumeFromRunId: raw.resumeFromRunId,
+    checkpointReplies: raw.checkpointReplies,
+  };
+}
+
+/** Clamp only execution resource knobs; inspection values are rejected rather than clamped. */
+export function clampWorkflowInput(input: WorkflowExecuteToolInput): WorkflowExecuteToolInput {
+  const clampInt = (value: number | undefined, minimum: number, maximum: number) =>
+    value === undefined || !Number.isFinite(value)
+      ? undefined
+      : Math.min(maximum, Math.max(minimum, Math.floor(value)));
   return {
     ...input,
-    concurrency: clampInt(input.concurrency, 1, 16), // MAX_CONCURRENCY
-    agentRetries: clampInt(input.agentRetries, 0, 3), // MAX_AGENT_RETRIES
+    concurrency: clampInt(input.concurrency, 1, 16),
+    agentRetries: clampInt(input.agentRetries, 0, 3),
     maxAgents:
       input.maxAgents === undefined || !Number.isFinite(input.maxAgents)
         ? undefined
         : Math.max(1, Math.floor(input.maxAgents)),
   };
 }
-
-// Tool registration sketch (synchronous; clamp in; structuredContent + text out):
-//   server.registerTool("workflow",
-//     { inputSchema: workflowToolInputShape, outputSchema: workflowToolOutputShape },
-//     async (raw, extra) => {
-//       const input = clampWorkflowInput(raw);
-//       const run = await manager.runSync(input, {
-//         agent: createAcpRunner(),                 // REQUIRED AgentRunner injection (composition root)
-//         signal: extra.signal,                     // engine-owned cancel
-//         onProgress: (p, total, message) =>        // no-op when progressToken absent
-//           extra.sendNotification?.({ method: "notifications/progress",
-//             params: { progressToken: extra._meta?.progressToken, progress: p, total, message } }),
-//       });
-//       const structuredContent = toWorkflowToolResult(run);   // see workflow-tool-output.ts
-//       return { structuredContent, content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }] };
-//     });

@@ -5,6 +5,7 @@ import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 
 import {
   connect,
+  makeRunner,
   NO_AGENT_SCRIPT,
   okRunner,
   ONE_AGENT_SCRIPT,
@@ -21,7 +22,7 @@ function field(value: unknown, key: string): unknown {
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
 const RUN_ID = /^[a-z0-9]+-[a-z0-9]+$/;
 
-test("tool registration: single `workflow` tool, input requires only `script`, no startInBackground", async () => {
+test("tool registration: one `workflow` tool advertises the run/inspect union", async () => {
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
@@ -29,19 +30,202 @@ test("tool registration: single `workflow` tool, input requires only `script`, n
     const tool = tools[0];
     assert.equal(tool.name, "workflow");
 
-    assert.deepEqual(tool.inputSchema.required, ["script"], "only `script` is required");
+    assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
     const inputProps = Object.keys(tool.inputSchema.properties ?? {});
     assert.ok(!inputProps.includes("startInBackground"), "startInBackground is not advertised");
     assert.ok(inputProps.includes("resumeFromRunId"), "explicit resume knob is advertised");
+    assert.ok(inputProps.includes("action") && inputProps.includes("runId"), "inspection action fields are advertised");
+    assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
     assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
     assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
 
     // The machine-readable output core includes structured pause contexts.
     assert.ok(tool.outputSchema, "an output schema is declared");
     const outProps = Object.keys(field(tool.outputSchema, "properties") ?? {});
-    for (const k of ["runId", "status", "result", "tokenUsage", "logs", "authContext", "checkpointContext"]) {
+    for (const k of [
+      "runId",
+      "status",
+      "result",
+      "tokenUsage",
+      "logs",
+      "authContext",
+      "checkpointContext",
+      "workflowName",
+      "phases",
+      "logTail",
+      "calls",
+      "filter",
+      "truncation",
+    ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
+  } finally {
+    await dispose();
+  }
+});
+
+test("run and inspect both validate after listTools caching; inspect is read-only and chronologically filtered", async () => {
+  let calls = 0;
+  const runner = makeRunner((prompt, options) => {
+    calls++;
+    options.onModelResolved?.("resolved/model");
+    options.onSessionOpen?.({
+      sessionId: `private-session-${calls}`,
+      backendId: "actual-backend",
+      cwd: "/private/cwd",
+      reopen: { load: true, resume: true, list: true },
+    });
+    return { prompt, approved: !prompt.includes("two"), secret: "ghp_abcdefgh12345678" };
+  });
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const script = [
+      'export const meta = { name: "inspection", description: "inspection", phases: [{ title: "Plan" }, { title: "Review" }] };',
+      'phase("Plan");',
+      'log("plan complete");',
+      'await agent("one", { label: "plan-one" });',
+      'phase("Review");',
+      'await agent("two", { label: "review-two" });',
+      'log("review complete");',
+      'await agent("three", { label: "review-three" });',
+      'return true;',
+    ].join("\n");
+    const run = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
+    const runStatus = structured(run);
+    assert.equal(runStatus?.status, "completed");
+    assert.equal(calls, 3);
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "inspect",
+        runId: String(runStatus?.runId),
+        lastN: 2,
+        labelGlob: "review-*",
+        logLines: 2,
+      },
+    });
+    assert.equal(inspected.isError, false);
+    assert.equal(calls, 3, "inspection never invokes the runner");
+    const status = structured(inspected);
+    assert.equal(status?.status, "completed");
+    assert.equal(status?.workflowName, "inspection");
+    assert.deepEqual(status?.phases, ["Plan", "Review"]);
+    assert.ok((field(status?.logTail, "lines") as string[]).includes("review complete"));
+    const projectedCalls = status?.calls as Array<Record<string, unknown>>;
+    assert.deepEqual(projectedCalls.map((call) => call.index), [1, 2]);
+    assert.deepEqual(projectedCalls.map((call) => call.label), ["review-two", "review-three"]);
+    assert.ok(projectedCalls.every((call) => call.model === "resolved/model"));
+    assert.ok(projectedCalls.every((call) => call.backendId === "actual-backend"));
+    assert.ok(projectedCalls.every((call) => call.resultRedacted === true));
+    assert.ok(!JSON.stringify(status).includes("private-session"));
+  } finally {
+    await dispose();
+  }
+});
+
+test("unknown inspection is an exact tool error; inspecting a failed run is a successful read", async () => {
+  const runner = throwingRunner(
+    () => new WorkflowError("FAIL-CLOSED", WorkflowErrorCode.SCRIPT_ERROR, { recoverable: false }),
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const missing = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: "missing-run" },
+    });
+    assert.equal(missing.isError, true);
+    assert.equal(missing.structuredContent, undefined);
+    assert.equal(
+      textOf(missing),
+      'No workflow run found for runId "missing-run" in this server\'s project-scoped run store.',
+    );
+
+    const failed = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    assert.equal(failed.isError, true);
+    const failedRun = structured(failed);
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: String(failedRun?.runId) },
+    });
+    assert.equal(inspected.isError, false, "the read succeeds even when the run status is failed");
+    assert.equal(structured(inspected)?.status, "failed");
+    assert.equal(structured(inspected)?.reason, "FAIL-CLOSED");
+  } finally {
+    await dispose();
+  }
+});
+
+test("inspection structured content is at most 24 KiB and text is at most 8 KiB", async () => {
+  const large = "safe".repeat(1_000);
+  const runner = makeRunner((prompt) => ({ prompt, large }));
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const phases = Array.from({ length: 70 }, (_, index) => ({ title: `phase-${index}-${"x".repeat(600)}` }));
+    const script = [
+      `export const meta = ${JSON.stringify({ name: "large", description: "large", phases })};`,
+      'for (let i = 0; i < 50; i++) { phase(`dynamic-${i}-${"x".repeat(600)}`); log(`line-${i}-${"😀".repeat(1000)}`); await agent(`prompt-${i}`, { label: `call-${i}` }); }',
+      'return true;',
+    ].join("\n");
+    const run = await client.callTool({ name: "workflow", arguments: { script } });
+    assert.equal(structured(run)?.status, "completed");
+    const runId = String(structured(run)?.runId);
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId, lastN: 50, logLines: 50 },
+    });
+    const status = structured(inspected);
+    assert.ok(status);
+    assert.ok(Buffer.byteLength(JSON.stringify(status), "utf8") <= 24_576);
+    assert.ok(Buffer.byteLength(textOf(inspected), "utf8") <= 8_192);
+    assert.equal(field(status?.truncation, "byteCapApplied"), true);
+  } finally {
+    await dispose();
+  }
+});
+
+test("paused and failed terminal summaries carry redacted final-20 log tails and preserve status guidance", async () => {
+  const token = "ghp_abcdefgh12345678";
+  const logs = 'for (let i = 1; i <= 25; i++) log(i === 10 ? `line-${i} ghp_abcdefgh12345678` : `line-${i}`);';
+  const { client, dispose } = await connect(okRunner(), { listTools: true });
+  try {
+    const paused = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: `export const meta = { name: "paused-tail", description: "paused" };\n${logs}\nawait checkpoint("q", { headless: "pause" });`,
+      },
+    });
+    assert.equal(paused.isError, false);
+    const pausedTail = field(structured(paused)?.logTail, "lines") as string[];
+    assert.equal(pausedTail.length, 20);
+    assert.equal(pausedTail[0], "line-6");
+    assert.equal(pausedTail.at(-1), "line-25");
+    assert.equal(pausedTail.some((line) => line.includes(token)), false);
+    assert.match(textOf(paused), /recent run log \(last 20 of 25\):/);
+    assert.match(textOf(paused), /\n  line-6\n/);
+    assert.doesNotMatch(textOf(paused), /\n  line-[1-5]\n/);
+    assert.doesNotMatch(textOf(paused), /ghp_/);
+    assert.match(textOf(paused), /resumeFromRunId/);
+
+    const failed = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: `export const meta = { name: "failed-tail", description: "failed" };\n${logs}\nthrow new Error("boom");`,
+      },
+    });
+    assert.equal(failed.isError, true);
+    const failedTail = field(structured(failed)?.logTail, "lines") as string[];
+    assert.equal(failedTail[0], "line-6");
+    assert.match(textOf(failed), /recent run log \(last 20 of 25\):/);
+
+    const empty = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: 'export const meta = { name: "empty-tail", description: "empty" };\nthrow new Error("boom");',
+      },
+    });
+    assert.deepEqual(field(structured(empty)?.logTail, "lines"), []);
+    assert.match(textOf(empty), /recent run log \(last 0 of 0\):/);
   } finally {
     await dispose();
   }

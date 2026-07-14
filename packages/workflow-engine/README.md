@@ -65,6 +65,31 @@ const result = await manager.runSync(script, { topic: "otters" });
 console.log(result.status, result.result, result.tokenUsage);
 ```
 
+Inspect a run without executing or leasing it:
+
+```ts
+const status = manager.inspectRun(result.runId, {
+  lastN: 10,
+  labelGlob: "review-*",
+  logLines: 20,
+});
+```
+
+`inspectRun()` is synchronous, read-only, and live-first: it projects the manager's freshest
+in-memory snapshot and journal, then falls back to the same project-scoped persistence used by
+resume. It returns `undefined` for a missing/unreadable ID. `lastN` defaults to 20 (1–50),
+`logLines` defaults to 20 (0–50), and `labelGlob` is a case-sensitive whole-label glob where `*`
+matches zero or more Unicode code points, `?` matches one, and backslash escapes the next character
+(a trailing backslash is literal). Filtering precedes latest-N selection; calls are returned in
+ascending call-index order.
+
+The `WorkflowRunStatus` projection is allowlisted: it never exposes script, args, prompts,
+histories, journal hashes, session IDs, cwd, checkpoint text/defaults, auth context, or raw results.
+Text and result previews are redacted and capped at 512 UTF-8 bytes; results are structurally
+compacted; at most 64 phases are considered; and the serialized status is capped at 24,576 bytes
+by dropping oldest calls, then logs, then phases. `truncation` reports every selection, shortening,
+redaction, and byte-budget decision.
+
 Or call the bare engine function (no manager, no persistence layer):
 
 ```ts
@@ -132,6 +157,13 @@ intentionally unavailable and rejects with `journaling disabled for this run` fo
 The manager-level `journal` event still emits live `{ runId, entry }` observations when file
 journaling is disabled.
 
+Successful journal writes now include optional replay-neutral `JournalEntry.call` attribution.
+Agent entries record the final label/phase/resolved model/actual backend; checkpoint and synthetic
+checkpoint-reply entries record checkpoint kind/label/phase. Old entries remain readable and hashes
+are unchanged. Terminal persisted states retain a safe run-level `reason` and `errorCode` for cold
+inspection. Every paused, failed, or aborted `WorkflowRunResult` has a redacted final-20 `logTail`
+(present even when empty); completed results omit it and preserve the full raw `logs` array.
+
 The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, and `CHECKPOINT_REQUIRED` as resumable
 pause conditions rather than failed runs. An authentication pause uses `reason: "auth_required"`
 and carries only the non-secret `authContext`; complete authentication through the injected runner,
@@ -157,7 +189,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
   `SharedRuntime`.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
   `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
-  `RunLease`, `RunStatus`, `PersistedRunState`, `PersistedAgentState`, `FsLayer`.
+  `RunLease`, `RunStatus`, `PersistedRunState`, `PersistedAgentState`, `FsLayer`; safe
+  `inspectRun()` and the `WorkflowRunStatus` / inspection / log-tail / call / truncation contracts.
 - **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /
   `OpenWorkflowDirOptions` types.
 - **Errors** — `WorkflowError`, `WorkflowErrorCode`, `isWorkflowError`, `wrapError`,

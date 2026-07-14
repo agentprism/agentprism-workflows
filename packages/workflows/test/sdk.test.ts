@@ -69,6 +69,12 @@ import type {
   AuthCapableRunner,
   AuthErrorContext,
   CheckpointContext,
+  JournalCallMetadata,
+  WorkflowLogTail,
+  WorkflowRunCallStatus,
+  WorkflowRunInspectionOptions,
+  WorkflowRunStatus,
+  WorkflowRunStatusTruncation,
 } from "../src/index.js";
 
 /**
@@ -243,6 +249,52 @@ test("facade re-exports the public surface", () => {
     kind: "confirm",
   };
   assert.equal(checkpointContext.callIndex, 1);
+  const callMetadata: JournalCallMetadata = { kind: "agent", label: "review" };
+  const inspectionOptions: WorkflowRunInspectionOptions = { lastN: 1, logLines: 0 };
+  const tail: WorkflowLogTail = {
+    lines: [],
+    totalLines: 0,
+    omittedLines: 0,
+    truncatedLines: 0,
+    redactedLines: 0,
+  };
+  const callStatus: WorkflowRunCallStatus = {
+    index: 0,
+    kind: "agent",
+    label: "review",
+    resultPreview: "true",
+    resultRedacted: false,
+    resultTruncated: false,
+  };
+  const truncation: WorkflowRunStatusTruncation = {
+    maxStructuredBytes: 24_576,
+    byteCapApplied: false,
+    phases: { total: 0, returned: 0, shortened: 0 },
+    logs: { total: 0, returned: 0, shortened: 0, redacted: 0 },
+    calls: { total: 1, matched: 1, returned: 1, shortenedResults: 0, redactedResults: 0 },
+  };
+  const status: WorkflowRunStatus = {
+    runId: "a-b",
+    status: "completed",
+    workflowName: "review",
+    phases: [],
+    logTail: tail,
+    calls: [callStatus],
+    filter: { lastN: inspectionOptions.lastN ?? 20, logLines: inspectionOptions.logLines ?? 20 },
+    truncation,
+  };
+  assert.equal(callMetadata.label, status.calls[0]?.label);
+});
+
+test("facade WorkflowManager exposes inspectRun and shared status without engine imports", async () => {
+  const manager = new WorkflowManager({ agent: okRunner() });
+  const result = await manager.runSync(ONE_AGENT_SCRIPT);
+  const status: WorkflowRunStatus | undefined = manager.inspectRun(result.runId, { lastN: 1, logLines: 0 });
+  assert.equal(status?.status, "completed");
+  assert.equal(status?.workflowName, "one-agent");
+  assert.equal(status?.calls.length, 1);
+  assert.equal(status?.filter.lastN, 1);
+  assert.equal(status?.filter.logLines, 0);
 });
 
 // §4.2 SDK exports (PR6). The facade re-exports the `isAuthRequired` VALUE through the

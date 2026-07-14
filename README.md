@@ -112,7 +112,7 @@ Two packages are the primary **user-facing entry points** — start with one of 
 | Package | What it is |
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
-| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing `workflow` plus conditional auth tools — built on `@automatalabs/workflows`. |
+| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing one `workflow` tool for run, resume, and inspect — built on `@automatalabs/workflows`. |
 
 One optional integration package attaches to the SDK's manager surface:
 
@@ -192,7 +192,8 @@ await runner.dispose();   // closes pooled backend processes
 
 ## Quickstart — MCP server
 
-The `workflow` tool runs a script to completion synchronously, streaming `notifications/progress`, and returns the structured result.
+The single `workflow` tool runs or resumes a script synchronously and can safely inspect any known
+project-scoped run by ID. Execution streams `notifications/progress` and returns the structured result.
 
 Register the stdio server in your MCP host's config:
 
@@ -224,7 +225,8 @@ From a source checkout, point at the built entry instead:
 
 | Param | Type | Notes |
 |---|---|---|
-| `script` | string (**required**) | Raw JS; first statement must be `export const meta = { name, description, phases? }`. Agent-less scripts are valid, though the validator warns when a script has neither `agent()` nor `checkpoint()`. |
+| `action` | `"run" \| "inspect"` | Omit for the legacy run form. `"inspect"` selects a read-only status lookup. |
+| `script` | string (required for run) | Raw JS; first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect. |
 | `args` | any | Exposed to the script as the global `args`. |
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
@@ -233,8 +235,23 @@ From a source checkout, point at the built entry instead:
 | `tokenBudget` | number \| null | Hard total-token cap for the run; omit for none. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `checkpointReplies` | object | With `resumeFromRunId`, map a paused `checkpointContext.callIndex` to its decision. JSON string keys are accepted and coerced to numbers. |
+| `runId` | string | Required for inspect; the project-scoped run capability returned by execution. |
+| `lastN` | integer | Inspect only: latest matching calls, default 20, range 1–50. |
+| `labelGlob` | string | Inspect only: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
+| `logLines` | integer | Inspect only: latest log lines, default 20, range 0–50. |
 
 The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`. For a durable `checkpoint(..., { headless: "pause" })`, an elicitation-capable client can answer live on resume; other clients also pass `checkpointReplies: { "<callIndex>": <decision> }` from the returned `checkpointContext`.
+
+Retain every returned `runId`. Before guessing why a run paused or failed, inspect its safe log and
+call tail:
+
+```json
+{ "action": "inspect", "runId": "mabc1234-k9x2pq", "lastN": 10, "labelGlob": "review-*", "logLines": 20 }
+```
+
+Inspection returns lifecycle status, ordered phases, a redacted log tail, and attributed compact
+call previews. Its structured payload is capped at 24,576 UTF-8 bytes and its text at 8,192 bytes.
+Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
 The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`) — logged-in CLIs need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; log that CLI in out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 

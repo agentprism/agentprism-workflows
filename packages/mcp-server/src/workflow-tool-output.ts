@@ -1,30 +1,20 @@
-// packages/mcp-server/src/workflow-tool-output.ts
-//
-// The MCP `workflow` tool OUTPUT. The host-facing WorkflowRunResult<T> (runId, status,
-// result, meta, phases, agentCount, durationMs, tokenUsage?, logs, reason?, resetHint?,
-// authContext?, checkpointContext?)
-// lives in @automatalabs/shared-types — it is the engine's runWorkflow return PLUS the
-// run-manager's terminal status trio (the engine seam at :465 stays unchanged; the
-// manager composes status). THIS file declares the MINIMAL outputSchema the MCP SDK
-// validates structuredContent against, and projects the full result onto it.
-//
-// When an outputSchema is declared, CallToolResult.structuredContent is MANDATORY and
-// SDK-validated (verified mcp.d.ts:150-154 + types.js:1289). We pin only the durable,
-// machine-readable core — including structured pause contexts — and ALSO emit a
-// human-readable text content block alongside it.
+import type { WorkflowRunResult, WorkflowRunStatus } from "@automatalabs/workflows";
 import { z } from "zod";
-import type { WorkflowRunResult } from "@automatalabs/workflows";
 
-/** MINIMAL MCP outputSchema (registerTool `outputSchema`). Pins WorkflowRunResult's
- *  machine-readable core. status lets a host tell completed from paused (provider
- *  usage-limit, auth_required, or checkpoint_required via headless:"pause") / failed /
- *  aborted WITHOUT parsing logs. */
+const logTailSchema = z.object({
+  lines: z.array(z.string()),
+  totalLines: z.number().int().nonnegative(),
+  omittedLines: z.number().int().nonnegative(),
+  truncatedLines: z.number().int().nonnegative(),
+  redactedLines: z.number().int().nonnegative(),
+});
+
+const countSchema = z.object({ total: z.number().int().nonnegative(), returned: z.number().int().nonnegative() });
+
+/** Common MCP output schema for legacy execution results and exact inspection statuses. */
 export const workflowToolOutputShape = {
   runId: z.string(),
   status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
-  // Optional: present only on a completed run (the script's resolved value). Paused/failed/
-  // aborted runs have NO result, so it must not be required — a strict MCP client that caches
-  // this output schema via listTools would otherwise reject EVERY non-completed run with -32602.
   result: z.unknown().optional(),
   tokenUsage: z
     .object({
@@ -41,11 +31,7 @@ export const workflowToolOutputShape = {
     .object({
       backendId: z.string().optional(),
       methods: z.array(
-        z.object({
-          id: z.string(),
-          type: z.enum(["agent", "terminal", "env_var"]),
-          name: z.string().optional(),
-        }),
+        z.object({ id: z.string(), type: z.enum(["agent", "terminal", "env_var"]), name: z.string().optional() }),
       ),
     })
     .optional(),
@@ -59,33 +45,70 @@ export const workflowToolOutputShape = {
       default: z.unknown().optional(),
     })
     .optional(),
+  workflowName: z.string().optional(),
+  phases: z.array(z.string()).optional(),
+  currentPhase: z.string().optional(),
+  reason: z.string().optional(),
+  errorCode: z.string().optional(),
+  logTail: logTailSchema.optional(),
+  calls: z
+    .array(
+      z.object({
+        index: z.number().int().nonnegative(),
+        kind: z.enum(["agent", "checkpoint", "unknown"]),
+        label: z.string().optional(),
+        phase: z.string().optional(),
+        model: z.string().optional(),
+        backendId: z.string().optional(),
+        resultPreview: z.string(),
+        resultRedacted: z.boolean(),
+        resultTruncated: z.boolean(),
+      }),
+    )
+    .optional(),
+  filter: z
+    .object({
+      lastN: z.number().int().min(1).max(50),
+      logLines: z.number().int().min(0).max(50),
+      labelGlob: z.string().optional(),
+    })
+    .optional(),
+  truncation: z
+    .object({
+      maxStructuredBytes: z.number().int().positive(),
+      byteCapApplied: z.boolean(),
+      phases: countSchema.extend({ shortened: z.number().int().nonnegative() }),
+      logs: countSchema.extend({ shortened: z.number().int().nonnegative(), redacted: z.number().int().nonnegative() }),
+      calls: countSchema.extend({
+        matched: z.number().int().nonnegative(),
+        shortenedResults: z.number().int().nonnegative(),
+        redactedResults: z.number().int().nonnegative(),
+      }),
+    })
+    .optional(),
 } as const;
 
-/** The validated structuredContent shape (z.infer of the object built from the shape). */
-export interface WorkflowToolResult<T = unknown> {
+export interface WorkflowExecutionToolResult<T = unknown> {
   runId: string;
   status: WorkflowRunResult["status"];
   result?: T;
   tokenUsage?: WorkflowRunResult["tokenUsage"];
   logs?: string[];
+  logTail?: WorkflowRunResult["logTail"];
   authContext?: WorkflowRunResult["authContext"];
   checkpointContext?: WorkflowRunResult["checkpointContext"];
 }
 
-/**
- * Project the host-facing WorkflowRunResult<T> onto the minimal MCP structuredContent.
- * The manager already settled `status` (normal return -> "completed"; a thrown
- * PROVIDER_USAGE_LIMIT / AUTH_REQUIRED / CHECKPOINT_REQUIRED WorkflowError -> "paused"
- * with its structured pause metadata, persisted and resumable via resumeFromRunId; abort ->
- * "aborted"; any other non-recoverable throw -> "failed"), so this is a pure narrowing.
- */
-export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowToolResult<T> {
+export type WorkflowToolResult<T = unknown> = WorkflowExecutionToolResult<T> | WorkflowRunStatus;
+
+export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExecutionToolResult<T> {
   return {
     runId: run.runId,
     status: run.status,
     result: run.result,
     tokenUsage: run.tokenUsage,
     logs: run.logs,
+    ...(run.logTail === undefined ? {} : { logTail: run.logTail }),
     authContext: run.authContext,
     checkpointContext: run.checkpointContext,
   };

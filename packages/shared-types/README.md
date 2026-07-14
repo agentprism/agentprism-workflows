@@ -93,9 +93,17 @@ From [`src/index.ts`](./src/index.ts):
 **Workflow result**
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,
   `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`,
-  `authContext?`, `agentSessions?`).
+  `authContext?`, `agentSessions?`). Paused, failed, and aborted results additionally carry the
+  optional redacted final-20 `logTail`; completed results omit it and `logs` remains the full
+  compatibility array.
 - `RunStatus`, `WorkflowMeta`, `WorkflowMetaPhase`, `WorkflowBackendConfig`, `TokenUsage`,
   `JournalEntry`, `AgentSessionRef`, `AgentSessionRecord`.
+- `JournalCallMetadata` and optional `JournalEntry.call` — replay-neutral agent/checkpoint
+  attribution (`kind`, label, phase, resolved model, actual backend). Legacy entries without it
+  remain valid.
+- `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
+  `WorkflowRunStatusTruncation`, and `WorkflowRunStatus` — the shared bounded status contract used
+  by SDK and MCP polling/inspection hosts.
 
 **MCP config**
 - `McpServerConfig` (union) + `McpStdioServerConfig`, `McpHttpServerConfig`,

@@ -579,7 +579,7 @@ test(
 );
 
 test(
-  "createRunPersistence save and load preserves journal entries",
+  "createRunPersistence round-trips terminal cause and enriched journals while loading legacy shapes",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
     const state: PersistedRunState = {
@@ -587,22 +587,46 @@ test(
       workflowName: "wf",
       script: "export const meta = { name: 'w', description: 'w' }",
       status: "paused",
+      reason: "checkpoint_required",
+      errorCode: WorkflowErrorCode.CHECKPOINT_REQUIRED,
       phases: [],
       agents: [],
       logs: [],
       journal: [
         { index: 0, hash: "abc123", result: { ok: true } },
-        { index: 1, hash: "def456", result: { value: 42 } },
+        {
+          index: 1,
+          hash: "def456",
+          result: { value: 42 },
+          call: { kind: "agent", label: "review", phase: "Review", model: "provider/model", backendId: "provider" },
+        },
+        { index: 2, hash: "ghi789", result: true, call: { kind: "checkpoint", label: "checkpoint", phase: "Review" } },
       ],
       startedAt: "2024-01-01T00:00:00.000Z",
       updatedAt: "2024-01-01T00:00:00.000Z",
     };
     rp.save(state);
     const loaded = rp.load("journal-test");
-    assert.equal(loaded?.journal?.length, 2);
+    assert.equal(loaded?.journal?.length, 3);
     assert.equal(loaded?.journal?.[0].index, 0);
     assert.equal(loaded?.journal?.[0].hash, "abc123");
     assert.deepEqual(loaded?.journal?.[0].result, { ok: true });
+    assert.equal(loaded?.journal?.[0].call, undefined, "pre-change entries stay valid");
+    assert.equal(loaded?.journal?.[1].call?.kind, "agent");
+    assert.equal(loaded?.journal?.[2].call?.kind, "checkpoint");
+    assert.equal(loaded?.reason, "checkpoint_required");
+    assert.equal(loaded?.errorCode, WorkflowErrorCode.CHECKPOINT_REQUIRED);
+
+    const legacy: PersistedRunState = {
+      ...state,
+      runId: "journal-legacy",
+      journal: [{ index: 0, hash: "legacy", result: true }],
+    };
+    delete legacy.reason;
+    delete legacy.errorCode;
+    rp.save(legacy);
+    assert.equal(rp.load(legacy.runId)?.reason, undefined);
+    assert.equal(rp.load(legacy.runId)?.errorCode, undefined);
   }),
 );
 
