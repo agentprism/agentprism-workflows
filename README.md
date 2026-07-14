@@ -236,7 +236,7 @@ From a source checkout, point at the built entry instead:
 
 The run is synchronous (one `tools/call` = one full run). Resume after a pause/crash by calling `workflow` again with `resumeFromRunId`. For a durable `checkpoint(..., { headless: "pause" })`, an elicitation-capable client can answer live on resume; other clients also pass `checkpointReplies: { "<callIndex>": <decision> }` from the returned `checkpointContext`.
 
-The `workflow` tool is the server's whole surface. Backend auth belongs to the agents' own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`) — logged-in CLIs need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; log that CLI in out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`) — logged-in CLIs need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; log that CLI in out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 

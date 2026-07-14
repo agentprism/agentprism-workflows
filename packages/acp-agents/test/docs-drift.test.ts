@@ -110,7 +110,7 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   assert.ok(authSpec.includes("### 4.7 Completed PR sequencing (historical)"));
 
   const mcpReadme = readRepoFile("packages/mcp-server/README.md");
-  for (const contract of ["OpenCode", "`AGENTPRISM_PERSISTENCE_ROOT`", "resumeFromRunId"]) {
+  for (const contract of ["OpenCode", "`AGENTPRISM_PERSISTENCE_ROOT`", "resumeFromRunId", "`author-workflow`"]) {
     assert.ok(mcpReadme.includes(contract), `MCP README must document ${contract}`);
   }
   // The MCP server's whole tool surface is the single `workflow` tool: backend auth belongs to

@@ -20,6 +20,7 @@ export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-o
 export type { WorkflowToolResult } from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
+export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
 
 /**
  * Bootstrap the MCP `workflow` server over stdio. Composition root: build the ACP-backed

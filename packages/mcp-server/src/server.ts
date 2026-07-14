@@ -1,7 +1,8 @@
 // packages/mcp-server/src/server.ts
 //
-// The MCP shell: constructs an McpServer, registers the single SYNCHRONOUS `workflow` tool,
-// and is the composition root where all three packages meet — the injected acp-agents
+// The MCP shell: constructs an McpServer, registers the single SYNCHRONOUS `workflow` tool
+// (plus the user-controlled `author-workflow` prompt — see authoring-prompt.ts), and is the
+// composition root where all three packages meet — the injected acp-agents
 // AgentRunner is wired into a workflow-engine WorkflowManager (DI) and every tool call runs
 // through WorkflowManager.runSync.
 //
@@ -36,6 +37,7 @@ import type {
 import { clampWorkflowInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
 import { createProgressReporter } from "./progress.js";
+import { registerAuthoringPrompt } from "./authoring-prompt.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
@@ -407,10 +409,12 @@ function formatRunSummary(run: WorkflowRunResult): string {
 }
 
 /**
- * Build the MCP server with the single `workflow` tool registered — the server's whole surface.
- * Backend auth is the agents' own concern (their CLI credential stores); a run that genuinely
- * hits AUTH_REQUIRED pauses with authContext and resumes after an out-of-band CLI login. The
- * AgentRunner is the DI seam: it is injected here into a single
+ * Build the MCP server with the single `workflow` tool registered — the whole model-facing
+ * tool surface — plus the user-controlled `author-workflow` prompt (the bundled authoring
+ * guide; prompts are a separate MCP primitive and never enter the model's tool-selection
+ * loop). Backend auth is the agents' own concern (their CLI credential stores); a run that
+ * genuinely hits AUTH_REQUIRED pauses with authContext and resumes after an out-of-band CLI
+ * login. The AgentRunner is the DI seam: it is injected here into a single
  * WorkflowManager (so persistence — and therefore resume — is shared across calls) and every run goes
  * through manager.runSync. The returned McpServer is not yet connected — the caller attaches a
  * transport (see index.ts).
@@ -423,6 +427,8 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
   const manager = new WorkflowManager({ agent: runner });
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
+
+  registerAuthoringPrompt(mcp);
 
   mcp.registerTool(
     "workflow",
