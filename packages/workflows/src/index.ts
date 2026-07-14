@@ -75,6 +75,9 @@ export type {
   WorkflowRunInspectionOptions,
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
+  WorkflowRunFallback,
+  WorkflowCheckpointSource,
+  WorkflowCheckpointTaken,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,

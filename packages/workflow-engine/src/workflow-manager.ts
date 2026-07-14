@@ -17,7 +17,9 @@ import type {
   JournalEntry,
   TokenUsage,
   WorkflowBackendConfig,
+  WorkflowCheckpointTaken,
   WorkflowMeta,
+  WorkflowRunFallback,
   WorkflowRunInspectionOptions,
   WorkflowRunResult,
   WorkflowRunStatus,
@@ -55,6 +57,9 @@ export interface ManagedRun {
   meta?: WorkflowMeta;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
+  /** Result-only observability collected during this execution. */
+  fallbacks: WorkflowRunFallback[];
+  checkpointsTaken: WorkflowCheckpointTaken[];
   /**
    * False for host-owned transcript storage. The run stays fully tracked in memory,
    * but the engine writes no run-state/log journal files and resume is forbidden.
@@ -312,6 +317,8 @@ export class WorkflowManager extends EventEmitter {
       meta: parsed.meta,
       cwd: exec.cwd,
       journal: [],
+      fallbacks: [],
+      checkpointsTaken: [],
       journaling,
       background: true,
       lease: lease ?? undefined,
@@ -435,6 +442,8 @@ export class WorkflowManager extends EventEmitter {
       args,
       meta: parsed.meta,
       journal: [],
+      fallbacks: [],
+      checkpointsTaken: [],
       journaling,
       background: false,
     };
@@ -471,6 +480,7 @@ export class WorkflowManager extends EventEmitter {
             cacheWrite: snapshotUsage.cacheWrite,
           }
         : undefined);
+    const { fallbacks, checkpointsTaken } = managed;
     return {
       runId: managed.runId,
       status: managed.status,
@@ -501,6 +511,8 @@ export class WorkflowManager extends EventEmitter {
       agentSessions:
         engineResult?.agentSessions ??
         managed.snapshot.agents.map((a) => a.session).filter((s): s is NonNullable<typeof s> => s != null),
+      ...(fallbacks.length === 0 ? {} : { fallbacks }),
+      ...(checkpointsTaken.length === 0 ? {} : { checkpointsTaken }),
     };
   }
 
@@ -574,6 +586,17 @@ export class WorkflowManager extends EventEmitter {
         resumeFromRunId: managed.journaling && resumeJournal ? managed.runId : undefined,
         runId: managed.runId,
         onAgentJournal: (entry) => this.recordJournalEntry(managed, entry),
+        injectedCheckpointReplies: new Set(
+          Object.keys(exec.checkpointReplies ?? {}).map((index) => Number(index)),
+        ),
+        onFallback: (entry) => {
+          managed.fallbacks.push(entry);
+          this.persistRun(managed);
+        },
+        onCheckpointTaken: (entry) => {
+          managed.checkpointsTaken.push(entry);
+          this.persistRun(managed);
+        },
         onLog: (message) => {
           managed.snapshot.logs.push(message);
           this.emit("log", { runId: managed.runId, message });
@@ -737,6 +760,8 @@ export class WorkflowManager extends EventEmitter {
         cwd: managed.cwd,
         sessionId: this.sessionId,
         journal: managed.journal,
+        ...(managed.fallbacks.length === 0 ? {} : { fallbacks: managed.fallbacks }),
+        ...(managed.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: managed.checkpointsTaken }),
         status: managed.status,
         reason: runReason(managed.status, managed.error),
         errorCode: managed.error?.code,
@@ -958,6 +983,8 @@ export class WorkflowManager extends EventEmitter {
       cwd: exec.cwd ?? persisted.cwd,
       meta,
       journal: persisted.journal ?? [],
+      fallbacks: [],
+      checkpointsTaken: [],
       journaling: true,
       background: true,
       lease,

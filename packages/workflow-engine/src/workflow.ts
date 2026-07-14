@@ -14,8 +14,10 @@ import type {
   McpServerConfig,
   PromptImage,
   WorkflowBackendConfig,
+  WorkflowCheckpointTaken,
   WorkflowMeta,
   WorkflowMetaPhase,
+  WorkflowRunFallback,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
 import {
@@ -123,6 +125,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeFromRunId?: string;
   /** Called after each live agent/checkpoint completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Checkpoint reply indexes injected for this execution, used only for result attribution. */
+  injectedCheckpointReplies?: ReadonlySet<number>;
+  /** Observability callbacks; neither participates in journal identity. */
+  onFallback?: (entry: WorkflowRunFallback) => void;
+  onCheckpointTaken?: (entry: WorkflowCheckpointTaken) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
@@ -287,6 +294,8 @@ interface RuntimeState {
   /** Re-attach records for every ACP session the run observed (live via onSessionOpen,
    *  replayed via JournalEntry.session), in completion order -> result.agentSessions. */
   agentSessions: AgentSessionRecord[];
+  fallbacks: WorkflowRunFallback[];
+  checkpointsTaken: WorkflowCheckpointTaken[];
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -378,6 +387,8 @@ export async function runWorkflow<T = unknown>(
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
     agentSessions: [],
+    fallbacks: [],
+    checkpointsTaken: [],
   };
 
   const agentRunner = options.agent;
@@ -662,7 +673,23 @@ export async function runWorkflow<T = unknown>(
                 },
                 onModelFallback: (spec: string) => {
                   // Make the silent degrade visible in /workflows, not just console.
-                  log(`${label}: model "${spec}" unavailable — using the session default`);
+                  const message = `${label}: model "${spec}" unavailable — using the session default`;
+                  log(message);
+                  const kind = isModifierFallbackSignal(spec) ? "modifier" : "model";
+                  const fallback: WorkflowRunFallback = {
+                    callIndex,
+                    label,
+                    ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
+                    requestedSpec: modelSpec ?? agentOptions.tier ?? spec,
+                    ...(kind === "modifier" && displayModel !== undefined ? { resolvedModel: displayModel } : {}),
+                    ...(sessionRef?.backendId === undefined ? {} : { backendId: sessionRef.backendId }),
+                    kind,
+                    message,
+                  };
+                  if (!state.fallbacks.some((entry) => sameFallback(entry, fallback))) {
+                    state.fallbacks.push(fallback);
+                    options.onFallback?.(fallback);
+                  }
                 },
                 onUsage: (u: AgentUsage) => {
                   usage = u;
@@ -844,6 +871,8 @@ export async function runWorkflow<T = unknown>(
         runId: `${runId}-nested${shared.depth}`,
         persistLogs: false,
       });
+      state.fallbacks.push(...(child.fallbacks ?? []));
+      state.checkpointsTaken.push(...(child.checkpointsTaken ?? []));
       return child.result;
     } finally {
       shared.depth--;
@@ -1032,14 +1061,24 @@ export async function runWorkflow<T = unknown>(
     const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
+      const entry: WorkflowCheckpointTaken = {
+        callIndex,
+        kind: checkpointOptions.kind ?? "confirm",
+        decision: cached.result,
+        source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
+      };
+      state.checkpointsTaken.push(entry);
+      options.onCheckpointTaken?.(entry);
       return cached.result; // replay the journaled human reply
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
     shared.agentCount++;
 
     let reply: unknown;
+    let source: WorkflowCheckpointTaken["source"];
     if (options.confirm) {
       reply = await options.confirm(promptText, checkpointOptions);
+      source = "live";
     } else if (checkpointOptions.headless === "abort") {
       throw new WorkflowError(
         `checkpoint "${promptText}" needs human input but none is available (headless run)`,
@@ -1064,6 +1103,7 @@ export async function runWorkflow<T = unknown>(
       );
     } else {
       reply = checkpointOptions.default ?? true;
+      source = "headless-default";
     }
     throwIfAborted();
     if (journaling) {
@@ -1074,6 +1114,14 @@ export async function runWorkflow<T = unknown>(
         call: { kind: "checkpoint", label: "checkpoint", phase: state.currentPhase },
       });
     }
+    const entry: WorkflowCheckpointTaken = {
+      callIndex,
+      kind: checkpointOptions.kind ?? "confirm",
+      decision: reply,
+      source,
+    };
+    state.checkpointsTaken.push(entry);
+    options.onCheckpointTaken?.(entry);
     return reply;
   };
 
@@ -1170,7 +1218,26 @@ export async function runWorkflow<T = unknown>(
     runId,
     tokenUsage: shared.tokenUsage,
     agentSessions: state.agentSessions,
+    ...(state.fallbacks.length === 0 ? {} : { fallbacks: state.fallbacks }),
+    ...(state.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: state.checkpointsTaken }),
   };
+}
+
+function isModifierFallbackSignal(spec: string): boolean {
+  return spec.includes(": reasoning_effort ") || spec.endsWith(": Fast mode not advertised");
+}
+
+function sameFallback(left: WorkflowRunFallback, right: WorkflowRunFallback): boolean {
+  return (
+    left.callIndex === right.callIndex &&
+    left.label === right.label &&
+    left.phase === right.phase &&
+    left.requestedSpec === right.requestedSpec &&
+    left.resolvedModel === right.resolvedModel &&
+    left.backendId === right.backendId &&
+    left.kind === right.kind &&
+    left.message === right.message
+  );
 }
 
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {

@@ -51,6 +51,8 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
       "logs",
       "authContext",
       "checkpointContext",
+      "fallbacks",
+      "checkpointsTaken",
       "workflowName",
       "phases",
       "logTail",
@@ -62,6 +64,60 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
+  } finally {
+    await dispose();
+  }
+});
+
+test("foreground and await outcomes expose result observability while inspection status stays bounded", async () => {
+  let sessions = 0;
+  const runner = makeRunner((_prompt, options) => {
+    options.onSessionOpen?.({
+      sessionId: `observable-${sessions++}`,
+      backendId: "codex",
+      cwd: "/workspace",
+      reopen: { load: true, resume: true, list: true },
+    });
+    options.onModelResolved?.("gpt-example");
+    options.onModelFallback?.('gpt-example[high]: reasoning_effort "high" not advertised');
+    return "ok";
+  });
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const script = [
+      'export const meta = { name: "result-observability", description: "result observability" };',
+      'await agent("review", { label: "review", model: "gpt-example[high]" });',
+      'return await checkpoint("Release?", { kind: "select", choices: ["ship", "hold"], default: "hold" });',
+    ].join("\n");
+
+    const foreground = await client.callTool({ name: "workflow", arguments: { script } });
+    const foregroundResult = structured(foreground);
+    assert.equal((foregroundResult?.fallbacks as unknown[])?.length, 1);
+    assert.deepEqual(foregroundResult?.checkpointsTaken, [
+      { callIndex: 1, kind: "select", decision: "hold", source: "headless-default" },
+    ]);
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: String(foregroundResult?.runId) },
+    });
+    const status = structured(inspected);
+    assert.equal(Object.hasOwn(status ?? {}, "fallbacks"), false);
+    assert.equal(Object.hasOwn(status ?? {}, "checkpointsTaken"), false);
+
+    const accepted = await client.callTool({ name: "workflow", arguments: { script, background: true } });
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
+    });
+    const awaitResult = structured(awaited);
+    assert.equal(Object.hasOwn(awaitResult ?? {}, "fallbacks"), false);
+    assert.equal(Object.hasOwn(awaitResult ?? {}, "checkpointsTaken"), false);
+    const outcome = field(awaitResult?.outcome, "fallbacks") as unknown[];
+    assert.equal(outcome.length, 1);
+    assert.deepEqual(field(awaitResult?.outcome, "checkpointsTaken"), [
+      { callIndex: 1, kind: "select", decision: "hold", source: "headless-default" },
+    ]);
   } finally {
     await dispose();
   }

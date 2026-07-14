@@ -8,8 +8,11 @@ import type {
   CheckpointContext,
   JournalCallMetadata,
   JournalEntry,
+  WorkflowCheckpointTaken,
   WorkflowLogTail,
+  WorkflowRunFallback,
   WorkflowRunInspectionOptions,
+  WorkflowRunResult,
   WorkflowRunStatus,
 } from "../src/index.js";
 
@@ -73,6 +76,49 @@ test("run-observability contracts are exported and legacy journals remain valid"
   assert.equal(entries[1]?.call?.kind, "agent");
   assert.equal(entries[2]?.call?.kind, "checkpoint");
   assert.equal(status.logTail.lines[0], "done");
+});
+
+test("run-result observability entries are exported and remain additive", () => {
+  type StatusExcludesFallbacks = "fallbacks" extends keyof WorkflowRunStatus ? never : true;
+  type StatusExcludesCheckpoints = "checkpointsTaken" extends keyof WorkflowRunStatus ? never : true;
+  const statusExcludesFallbacks: StatusExcludesFallbacks = true;
+  const statusExcludesCheckpoints: StatusExcludesCheckpoints = true;
+  const fallback: WorkflowRunFallback = {
+    callIndex: 1,
+    label: "review",
+    phase: "Review",
+    requestedSpec: "gpt-example[high]",
+    resolvedModel: "gpt-example",
+    backendId: "codex",
+    kind: "modifier",
+    message: 'review: model "gpt-example[high]: reasoning_effort "high" not advertised" unavailable — using the session default',
+  };
+  const checkpoint: WorkflowCheckpointTaken = {
+    callIndex: 2,
+    kind: "confirm",
+    decision: true,
+    source: "journal-replay",
+  };
+  const legacyResult: WorkflowRunResult = {
+    runId: "mabc-def",
+    status: "completed",
+    meta: { name: "legacy", description: "legacy" },
+    result: null,
+    phases: [],
+    agentCount: 0,
+    durationMs: 1,
+    logs: [],
+  };
+  const observedResult: WorkflowRunResult = {
+    ...legacyResult,
+    fallbacks: [fallback],
+    checkpointsTaken: [checkpoint],
+  };
+  assert.equal(legacyResult.fallbacks, undefined);
+  assert.equal(observedResult.fallbacks?.[0]?.kind, "modifier");
+  assert.equal(observedResult.checkpointsTaken?.[0]?.source, "journal-replay");
+  assert.equal(statusExcludesFallbacks, true);
+  assert.equal(statusExcludesCheckpoints, true);
 });
 
 test("cross-repo wire literals: the fork namespace and Codex `_meta` keys never drift", () => {

@@ -116,7 +116,7 @@ console.log(run.result, run.agentCount, run.durationMs);
 ```
 
 `runWorkflow` returns the `EngineRunResult` (meta / result / logs / phases / agentCount /
-durationMs / runId / tokenUsage / optional `agentSessions`). `WorkflowManager` stamps the terminal
+durationMs / runId / tokenUsage / optional `agentSessions`, `fallbacks`, and `checkpointsTaken`). `WorkflowManager` stamps the terminal
 `status` / `reason` / `resetHint` on top to produce a `WorkflowRunResult`.
 
 ## The script DSL
@@ -191,6 +191,14 @@ are unchanged. Terminal persisted states retain a safe run-level `reason` and `e
 inspection. Every paused, failed, or aborted `WorkflowRunResult` has a redacted final-20 `logTail`
 (present even when empty); completed results omit it and preserve the full raw `logs` array.
 
+Two optional terminal audit arrays are persisted alongside that state. `fallbacks` attributes each
+live whole-model or bracket-modifier degrade to `callIndex`/label/phase, the requested spec, known
+resolved model/backend, and the existing log message. `checkpointsTaken` records each checkpoint
+that resolved in this execution with its journaled decision and source: `live`, `headless-default`,
+`journal-replay`, or `injected` from `checkpointReplies`. Pausing checkpoints are omitted. Both
+arrays are absent when empty, stay outside call hashes, and are deliberately excluded from
+`WorkflowRunStatus`.
+
 The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, and `CHECKPOINT_REQUIRED` as resumable
 pause conditions rather than failed runs. An authentication pause uses `reason: "auth_required"`
 and carries only the non-secret `authContext`; complete authentication through the injected runner,
@@ -237,7 +245,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
   `workflowUserSavedDir`, `workflowProjectKey`, `AGENTPRISM_PERSISTENCE_ROOT_ENV`,
   `createWorkflowLogger`, `parseFrontmatter`.
 - **Seam re-exports** (from `@automatalabs/shared-types`) — `AgentRunner`, `RunOptions`,
-  `AgentResult`, `AgentUsage`, `WorkflowMeta`, `WorkflowRunResult`, `JournalEntry`,
+  `AgentResult`, `AgentUsage`, `WorkflowMeta`, `WorkflowRunResult`, `WorkflowRunFallback`,
+  `WorkflowCheckpointTaken`, `WorkflowCheckpointSource`, `JournalEntry`,
   `TokenUsage`, …
 
 ## License

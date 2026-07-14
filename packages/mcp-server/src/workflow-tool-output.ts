@@ -37,6 +37,24 @@ const checkpointContextSchema = z.object({
   default: z.unknown().optional(),
 });
 
+const fallbackSchema = z.object({
+  callIndex: z.number().int().nonnegative(),
+  label: z.string(),
+  phase: z.string().optional(),
+  requestedSpec: z.string(),
+  resolvedModel: z.string().optional(),
+  backendId: z.string().optional(),
+  kind: z.enum(["model", "modifier"]),
+  message: z.string(),
+});
+
+const checkpointTakenSchema = z.object({
+  callIndex: z.number().int().nonnegative(),
+  kind: z.enum(["confirm", "input", "select"]),
+  decision: z.unknown(),
+  source: z.enum(["live", "headless-default", "journal-replay", "injected"]),
+});
+
 const executionResultSchema = z.object({
   runId: z.string(),
   status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
@@ -46,6 +64,8 @@ const executionResultSchema = z.object({
   logTail: logTailSchema.optional(),
   authContext: authContextSchema.optional(),
   checkpointContext: checkpointContextSchema.optional(),
+  fallbacks: z.array(fallbackSchema).optional(),
+  checkpointsTaken: z.array(checkpointTakenSchema).optional(),
 });
 
 /** Common MCP output schema for legacy execution results and exact inspection statuses. */
@@ -57,6 +77,8 @@ export const workflowToolOutputShape = {
   logs: z.array(z.string()).optional(),
   authContext: authContextSchema.optional(),
   checkpointContext: checkpointContextSchema.optional(),
+  fallbacks: z.array(fallbackSchema).optional(),
+  checkpointsTaken: z.array(checkpointTakenSchema).optional(),
   workflowName: z.string().optional(),
   phases: z.array(z.string()).optional(),
   currentPhase: z.string().optional(),
@@ -117,6 +139,8 @@ export interface WorkflowExecutionToolResult<T = unknown> {
   logTail?: WorkflowRunResult["logTail"];
   authContext?: WorkflowRunResult["authContext"];
   checkpointContext?: WorkflowRunResult["checkpointContext"];
+  fallbacks?: WorkflowRunResult["fallbacks"];
+  checkpointsTaken?: WorkflowRunResult["checkpointsTaken"];
 }
 
 export interface WorkflowBackgroundAccepted {
@@ -154,5 +178,7 @@ export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExec
     ...(run.logTail === undefined ? {} : { logTail: run.logTail }),
     authContext: run.authContext,
     checkpointContext: run.checkpointContext,
+    ...(run.fallbacks === undefined ? {} : { fallbacks: run.fallbacks }),
+    ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
   };
 }

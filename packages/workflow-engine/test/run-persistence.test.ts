@@ -432,7 +432,10 @@ test(
       }),
     );
 
-    assert.equal(rp.load("legacy-run")?.workflowName, "legacy");
+    const loaded = rp.load("legacy-run");
+    assert.equal(loaded?.workflowName, "legacy");
+    assert.equal(loaded?.fallbacks, undefined);
+    assert.equal(loaded?.checkpointsTaken, undefined);
     assert.equal(
       rp.list().some((run) => run.runId === "legacy-run"),
       true,

@@ -211,6 +211,20 @@ Paused, failed, and aborted `WorkflowRunResult`s carry a `logTail` containing th
 snapshot logs, present even when empty. Completed results omit it. The existing full `logs` array
 is unchanged.
 
+Terminal run results also expose two replay-neutral audit fields, both absent when empty:
+
+- `fallbacks?: WorkflowRunFallback[]` records live model selection degrades as
+  `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind: "model" | "modifier", message }`.
+  `message` is the same human-readable line written to the run log. Exact repeats within one call
+  are deduplicated; replayed agent calls do not create entries.
+- `checkpointsTaken?: WorkflowCheckpointTaken[]` records each checkpoint that resolved in this
+  execution as `{ callIndex, kind, decision, source }`. Source is `"live"`, `"headless-default"`,
+  `"journal-replay"`, or `"injected"` (an indexed `checkpointReplies` answer). A checkpoint that
+  paused is not resolved and therefore is not listed.
+
+Both arrays persist on `PersistedRunState` for cold terminal reads. Neither enters call hashes, and
+neither is added to the bounded `WorkflowRunStatus` inspection shape.
+
 A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused**, not failed — the journal checkpoints and `resume()` picks up after the budget refills (`resetHint` carries the provider's "resets in…" text when present).
 
 A run that hits `AUTH_REQUIRED` is likewise **paused** (`reason: "auth_required"`), not failed: the journal checkpoints and the paused state persists the structured, non-secret `authContext` (`backendId` + advertised method `{ id, type, name }[]` — never credential material). `resume()` re-arms against the runner: for an `"auth_required"` pause it consults `runner.auth.canResume(backendId)` before re-executing. When the credential survived (warm resume in the same process, or a disk-backed method a fresh process re-reads from the native store/env) it proceeds; when an in-process (gateway) or spawn-env intent was lost to a cold process it **immediately re-pauses** with `re-supply credentials for <backend> via runner auth before resuming` rather than re-running into the same wall. A runner with no `auth` controller (the default-off host) cannot confirm resumability and re-pauses.

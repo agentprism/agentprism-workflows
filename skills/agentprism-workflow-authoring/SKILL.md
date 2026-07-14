@@ -39,6 +39,7 @@ Run it with the SDK —
 import { runDynamicWorkflow } from "@automatalabs/workflows";
 const run = await runDynamicWorkflow(script, { cwd: "/abs/project", args: { path: "." } });
 // run.status: "completed" | "paused" | "failed" | "aborted"; run.result: the script's return value
+// run.fallbacks / run.checkpointsTaken: optional result-only routing and checkpoint audit trails
 ```
 
 — or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes (`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
@@ -80,7 +81,7 @@ const review = await agent(reviewPrompt(impl),   { label: "review",    model: "o
 Two things worth designing for:
 
 - **Cross-vendor independence.** Reviewing or verifying with a *different* vendor than the one that produced the work removes correlated blind spots — an agent family tends to approve its own idioms. When correctness matters, judge across vendors.
-- **Fallback is silent, not fatal.** An unroutable or unavailable model spec logs a line (`model "…" unavailable — using the session default`) and the call proceeds on the default. A typo'd model never throws — check the run log if a step behaves like the wrong model served it.
+- **Fallback is observable, not fatal.** An unroutable or unavailable model spec logs a line (`model "…" unavailable — using the session default`) and the call proceeds on the default. The terminal result also records the live degrade in `fallbacks`; a typo'd model never throws.
 
 ## Structured output
 
@@ -328,6 +329,9 @@ Choose `background: true` for work that may outlive one MCP request. The start c
 failure: it returns the newest safe status and cumulative usage, so call await again. Use
 `action:"inspect"` (or `waitMs:0`) when you need an immediate filtered diagnostic instead of waiting.
 At terminal status await adds `outcome`, the foreground-equivalent authored result/pause context.
+That outcome carries optional `fallbacks` and `checkpointsTaken`; inspect and the top-level await
+status intentionally do not. `checkpointsTaken` identifies resolved live, headless-default,
+journal-replay, and injected `checkpointReplies` decisions without repeating prompt text.
 
 Background is detached from the initiating request, not from the MCP server process; a stdio child
 exit can stop in-flight work. It has no progress token or live checkpoint elicitation, so authored

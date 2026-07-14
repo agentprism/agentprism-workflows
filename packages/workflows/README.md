@@ -251,6 +251,12 @@ checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a de
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
+Every terminal result may also carry `fallbacks` (live whole-model/modifier degrades with call,
+requested-spec, resolved-model/backend, and log-message attribution) and `checkpointsTaken` (one
+resolved checkpoint per call with the journaled decision and `live` / `headless-default` /
+`journal-replay` / `injected` source). They are absent when empty, persist for cold reads, never
+enter replay hashes, and are not part of `WorkflowRunStatus` inspection.
+
 `startInBackground(script, args?, exec?)` is detached only for the lifetime of this process and
 returns `{ runId, promise: Promise<WorkflowRunResult> }`. The facade keeps an ACP event bridge for a
 per-execution `exec.agent` until that promise settles, including rejection. Read live state with
@@ -636,7 +642,8 @@ RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
 MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidatedAgentCall, ValidatedCheckpoint,
-WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowSnapshot,
+WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowRunFallback,
+WorkflowCheckpointTaken, WorkflowCheckpointSource, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig,

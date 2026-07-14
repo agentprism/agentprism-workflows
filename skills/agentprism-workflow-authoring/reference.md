@@ -235,6 +235,7 @@ const run = await runDynamicWorkflow(script, {
 });
 // run.status: "completed" | "paused" | "failed" | "aborted"
 // run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
+// run.fallbacks? · run.checkpointsTaken? (result-only observability; absent when empty)
 ```
 
 The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`. Foreground is the default and streams progress/resolves checkpoints live; long work uses `background:true` plus bounded `action:"await"`. It supports `resumeFromRunId`, and non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from terminal `outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — run/resume/inspect/await are action branches, not separate tools. A run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
@@ -282,6 +283,13 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   outcome?: WorkflowExecutionToolResult<T>; // present exactly when lifecycle is terminal
 }
 ```
+
+`WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` records live whole-model and modifier
+degrades as `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }`.
+`WorkflowRunResult.checkpointsTaken?: WorkflowCheckpointTaken[]` records resolved checkpoints as
+`{ callIndex, kind, decision, source }`, where source is `live`, `headless-default`,
+`journal-replay`, or `injected`. A paused checkpoint is not resolved. Both fields are persisted and
+appear in foreground results plus terminal await `outcome`; neither appears on `WorkflowRunStatus`.
 
 At most four background runs may be active or starting per server instance. Foreground, inspect,
 and await consume no slot. A timeout returns the freshest status and partial cumulative usage; replay
