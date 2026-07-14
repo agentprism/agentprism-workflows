@@ -24,7 +24,7 @@ and [`docs/design-notes.md`](docs/design-notes.md) for what already exists.
 | Item | Status | One-liner |
 | --- | --- | --- |
 | [Remote execution & the runner gateway](docs/roadmap/remote-execution.md) | next | Drive ACP agents over WebSocket instead of stdio subprocesses; a runner gateway that exposes any ACP agent server remotely |
-| [Evals (`agentprism-evals`)](docs/roadmap/evals.md) | next | Workflow-level output and process evals built on journal replay and typed structured outputs |
+| [Evals (`agentprism-evals`)](docs/roadmap/evals.md) | next | Workflow-level evals built on journal replay and typed outputs; model/harness substitution testing against your own recorded runs |
 | [Workspace model](docs/roadmap/workspace-model.md) | designed | Any folder is a workspace; snapshot via namespaced refs without polluting existing repos; workflows associated, never checked in uninvited |
 | [Natural-language workflow authoring](docs/roadmap/nl-workflow-authoring.md) | designed | Generate workflow scripts from a conversation, validated through four layers before anything runs |
 | [VS Code extension channel](docs/roadmap/vscode-extension.md) | exploring | A satellite editor surface layered on the MCP server, not a parallel implementation |
