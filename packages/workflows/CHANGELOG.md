@@ -1,5 +1,11 @@
 # @automatalabs/workflows
 
+## 0.29.0
+
+### Minor Changes
+
+- 123e1b3: Add reusable and sequenced dry-run mock answers to the validator SDK and CLI, with deterministic label-glob selection, strict schema enforcement, attribution, and unused-fixture reporting. Refresh the MCP authoring prompt with the new validator guidance.
+
 ## 0.28.0
 
 ### Minor Changes
