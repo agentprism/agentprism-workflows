@@ -66,7 +66,9 @@ export const workflowToolInputShape = {
   resumeFromRunId: z
     .string()
     .optional()
-    .describe("Execute a new run by replaying the unchanged prefix of a prior run's persisted journal."),
+    .describe(
+      "Start a new run using the persisted journal identified by this run ID. Resume rule: args changes don't invalidate the journal; prompt changes cache-miss from the first changed call. Re-send the script and desired args; the longest unchanged call prefix replays at zero token cost, and the first changed or new call plus its suffix runs live. If the run ID is empty or not found in this project namespace, execution starts fresh.",
+    ),
   checkpointReplies: checkpointRepliesSchema
     .optional()
     .describe("With resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),

@@ -1,7 +1,7 @@
 # Example scripts
 
 Full-scale workflow scripts to study alongside `SKILL.md` — read them when the inline
-worked examples aren't enough. Both are **verbatim copies** of the runnable
+worked examples aren't enough. The first two are **verbatim copies** of the runnable
 [`repo-triage` example project](https://github.com/VikashLoomba/agentprism-workflows/tree/main/packages/workflows/examples/repo-triage)
 (canonical source in the monorepo; kept byte-identical so a plain `diff` catches drift).
 
@@ -9,6 +9,9 @@ worked examples aren't enough. Both are **verbatim copies** of the runnable
 |---|---|
 | [`repo-triage.workflow.js`](repo-triage.workflow.js) | The broadest support-API tour, autonomous end-to-end (no `checkpoint()` — every gate is another agent): `pipeline` with no inter-stage barrier, a cross-vendor adversarial verification panel (`parallel`), `gate()` where the writer and reviewer are always *different* vendors and the terminal review verdict is returned, nesting a saved workflow by name (`workflow("quick-wins", …)`), `completenessCheck()`, budget headroom reservation before an optional stage, string-form `args` hardening, path guards on schema outputs, the unverified-vs-confirmed bucket split, and rethrowing pause-class errors (`PROVIDER_USAGE_LIMIT` / `AUTH_REQUIRED`) out of `try/catch` so managed runs pause resumably instead of fake-completing. |
 | [`quick-wins.workflow.js`](quick-wins.workflow.js) | A small nested-or-standalone hunter: `loopUntilDry()` with a per-round vendor rotation, dedup threading via a `seen` list interpolated into each prompt, and a budget floor check inside the round (reads the *parent* run's shared budget when nested). |
+| [`resume-loop-cap.workflow.js`](resume-loop-cap.workflow.js) | Journal identity and longest-prefix replay: run with `maxRounds: 6`, then resume with `maxRounds: 8` so six expensive calls replay for zero tokens and only two new calls run live. |
+
+`resume-loop-cap.workflow.js` defaults to eight rounds and therefore validates successfully without args. Its six-round failure is intentional: call the MCP `workflow` tool with `args: { "maxRounds": 6 }`, then repeat the script with `args: { "maxRounds": 8 }` and the returned `runId` as `resumeFromRunId`. Keep the cap out of the agent prompt or the prompt change will invalidate the journal from round 1.
 
 Validate either one for free (zero tokens, no agent processes):
 

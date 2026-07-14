@@ -120,7 +120,7 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Per-agent timeout in ms. Omit or pass `null` for no hard timeout (the engine owns timeouts). |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
-| `resumeFromRunId` | string | no | — | Resume a prior run from its persisted journal (the engine replays the unchanged prefix and runs the rest live). See [Run model](#run-model). |
+| `resumeFromRunId` | string | no | — | Start a new run from this prior run's persisted journal. **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call. Re-send the script and desired args; the longest unchanged prefix replays for zero tokens and the first changed/new call plus its suffix runs live. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map `checkpointContext.callIndex` to the durable checkpoint decision. JSON string keys are coerced to numeric indexes. |
 | `runId` | engine run ID | inspect/await only | — | Required for inspect/await; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
@@ -294,12 +294,7 @@ Top-level and outcome token usage are identical. Paused outcomes carry the exist
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit resume and multi-hop durability.** A run can pause for provider usage, authentication,
-  or a durable checkpoint. Continue with the same script plus `resumeFromRunId`. This executes a
-  **new run with a new ID**; changed args are allowed and the unchanged call prefix replays. A
-  background child copies the full inherited prefix and synthetic checkpoint answer into its own
-  initial durable record before acknowledgement, so a later resume from that child never depends on
-  replay callbacks to preserve earlier calls. Await itself is read-only and never resumes.
+- **Explicit resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed runs retain their completed journal too. Call `workflow` again with the script, the desired `args`, and `resumeFromRunId` set to the prior `runId`. `args` is not directly hashed: an orchestration-only cap change can reveal new calls while the unchanged prefix replays for zero tokens. If new args change a prompt or another hashed identity field, that call and the complete suffix run live. The resumed MCP request creates a new run ID; an empty or unknown prior ID loads no journal and runs fresh.
 - **Checkpoints.** Foreground uses MCP elicitation when advertised. Background never retains that
   request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus

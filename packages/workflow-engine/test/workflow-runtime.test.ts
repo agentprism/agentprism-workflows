@@ -496,6 +496,80 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
   assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
 });
 
+const resumeLoopCapScript = `export const meta = { name: 'resume-loop-cap', description: 'Run expensive review rounds up to an args-controlled cap', phases: [{ title: 'Review' }] };
+const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+const numericCap = Number(input.maxRounds);
+const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 8;
+phase('Review');
+const rounds = [];
+for (let i = 0; i < maxRounds; i += 1) {
+  rounds.push(await agent(\`Review round \${i + 1}: inspect the repository and report unresolved release blockers.\`, { label: \`review:\${i + 1}\`, phase: 'Review' }));
+}
+if (maxRounds < 8) throw new Error(\`review cap \${maxRounds} reached before 8 rounds\`);
+return { rounds };`;
+
+test("resume with a raised args-controlled cap replays the unchanged prefix", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await assert.rejects(
+    runWorkflow(resumeLoopCapScript, {
+      agent: first.runner,
+      args: { maxRounds: 6 },
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    }),
+    /review cap 6 reached before 8 rounds/,
+  );
+  assert.equal(first.state.calls, 6);
+  assert.equal(journal.length, 6);
+
+  const second = countingAgent();
+  const resumed = await runWorkflow(resumeLoopCapScript, {
+    agent: second.runner,
+    args: { maxRounds: 8 },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+  const rounds = (resumed.result as { rounds: string[] }).rounds;
+  assert.equal(second.state.calls, 2, "only the two newly reachable rounds run live");
+  assert.equal(rounds.length, 8);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(rounds.slice(0, 6))),
+    journal.map((entry) => entry.result),
+    "the first six values come from the original journal",
+  );
+});
+
+test("an args-caused middle prompt change invalidates that call and the complete suffix", async () => {
+  const script = `export const meta = { name: 'args-prefix', description: 'args-driven prefix resume' }
+const a = await agent('A', { label: 'a' })
+const b = await agent(String(args.middle), { label: 'b' })
+const c = await agent('C', { label: 'c' })
+return { a, b, c }`;
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: first.runner,
+    args: { middle: "B" },
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const second = countingAgent();
+  const resumed = await runWorkflow(script, {
+    agent: second.runner,
+    args: { middle: "B-edited" },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+  assert.equal(second.state.calls, 2, "the changed middle call and unchanged-looking final call run live");
+  assert.deepEqual(JSON.parse(JSON.stringify(resumed.result)), {
+    a: journal[0].result,
+    b: "ran:B-edited",
+    c: "ran:C",
+  });
+});
+
 test("resume in parallel(): editing one thunk re-runs that index and every later one", async () => {
   // Three identical-prompt thunks; editing the middle one must invalidate it and
   // the same-or-later index, not just the single changed call.
