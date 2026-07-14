@@ -110,22 +110,24 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   assert.ok(authSpec.includes("### 4.7 Completed PR sequencing (historical)"));
 
   const mcpReadme = readRepoFile("packages/mcp-server/README.md");
-  for (const contract of [
-    "`workflow_auth_status`",
-    "`workflow_authenticate`",
-    "`workflow_providers`",
-    "`workflow_set_provider`",
-    "`workflow_disable_provider`",
-    "OpenCode",
-    "`AGENTPRISM_MCP_INLINE_AUTH`",
-    "`AGENTPRISM_PERSISTENCE_ROOT`",
-  ]) {
+  for (const contract of ["OpenCode", "`AGENTPRISM_PERSISTENCE_ROOT`", "resumeFromRunId"]) {
     assert.ok(mcpReadme.includes(contract), `MCP README must document ${contract}`);
   }
-  // The provider tools are documented in the central API reference too.
+  // The MCP server's whole tool surface is the single `workflow` tool: backend auth belongs to
+  // the agents' own CLI credential stores (auth/provider management lives in the SDK runner
+  // APIs). Retired MCP tool names must not resurface in the current-state docs.
   const apiDocs = readRepoFile("docs/api.md");
-  for (const tool of ["`workflow_providers`", "`workflow_set_provider`", "`workflow_disable_provider`"]) {
-    assert.ok(apiDocs.includes(tool), `docs/api.md must document ${tool}`);
+  for (const retired of [
+    "workflow_auth_status",
+    "workflow_authenticate",
+    "workflow_providers",
+    "workflow_set_provider",
+    "workflow_disable_provider",
+    "AGENTPRISM_MCP_INLINE_AUTH",
+  ]) {
+    for (const [path, text] of [["packages/mcp-server/README.md", mcpReadme], ["docs/api.md", apiDocs]] as const) {
+      assert.ok(!text.includes(retired), `${path} must not document the retired MCP surface ${retired}`);
+    }
   }
   assert.ok(!mcpReadme.includes("return r.text"), "schema-less MCP examples return a string directly");
 
