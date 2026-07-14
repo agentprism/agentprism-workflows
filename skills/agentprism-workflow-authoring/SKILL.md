@@ -161,7 +161,7 @@ These helpers spawn their own subagents (on the default model — hand-roll with
 
 | helper | shape | use for |
 |---|---|---|
-| `gate(produce, validate, { attempts })` | produce → validate → feed `feedback` back into the next attempt | produce-until-a-reviewer-approves loops |
+| `gate(produce, validate, { attempts })` | produce → validate → feed `feedback` back; return `{ ok, value, verdict, attempts }` | produce-until-a-reviewer-approves loops that need the final review evidence |
 | `retry(thunk, { attempts, until })` | bounded retry until `until(result)` holds | flaky single steps |
 | `verify(item, { reviewers, threshold, lens })` | N adversarial reviewers vote `real`/not | killing plausible-but-wrong findings |
 | `judgePanel(attempts, { judges, rubric })` | score candidates 0–1 against a rubric, return the best | picking among independent solutions |
@@ -179,13 +179,15 @@ const outcome = await gate(
   ),
   (result) => agent(
     `Run the test suite and review this change summary:\n${result}\n` +
-    `Return ok=true only if tests pass and the fix is correct.`,
+    `Return ok=true only if tests pass and the fix is correct; include the reviewed commit SHA.`,
     { label: "gate-review", model: "opus", schema: { type: "object", additionalProperties: false,
-      required: ["ok"], properties: { ok: { type: "boolean" }, feedback: { type: "string" } } } },
+      required: ["ok"], properties: { ok: { type: "boolean" }, feedback: { type: "string" },
+        commitSha: { type: "string" } } } },
   ),
   { attempts: 3 },
 );
 if (!outcome.ok) log(`reviewer never approved after ${outcome.attempts} attempts`);
+else log(`reviewer approved commit ${outcome.verdict?.commitSha ?? "(unspecified)"}`);
 ```
 
 ## Human gates: `checkpoint()`
@@ -343,13 +345,13 @@ const outcome = await gate(
     ])).filter(Boolean);
     const rejections = reviews.filter((r) => !r.ok);
     return rejections.length
-      ? { ok: false, feedback: rejections.map((r) => r.feedback).join("\n") }
-      : { ok: true };
+      ? { ok: false, feedback: rejections.map((r) => r.feedback).join("\n"), reviews }
+      : { ok: true, reviews };
   },
   { attempts: 3 },
 );
 
-return { implemented: outcome.ok, attempts: outcome.attempts, plan };
+return { implemented: outcome.ok, attempts: outcome.attempts, reviewVerdict: outcome.verdict, plan };
 ```
 
 (The planner would ideally run read-only, but mode ids are backend-specific — this call routes to OpenCode, so it leaves `mode` unset rather than guessing; a Claude-routed planner could safely say `mode: "plan"`.)

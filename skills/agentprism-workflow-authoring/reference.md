@@ -74,8 +74,8 @@ agent(prompt, options?)                    → Promise<string | object | null>
 parallel(thunks)                           → Promise<results[]>   // barrier; input order; failed slot = null
 pipeline(items, ...stages)                 → Promise<results[]>   // no inter-stage barrier; stage(prev, original, index); failed item = null
 workflow(nameOrScript, args?)              → Promise<unknown>     // one nesting level; names resolve from the host's workflows folder, inline scripts always work
-gate(thunk, validator, { attempts = 3 })   → { ok, value, attempts }
-    // thunk(feedback, attempt); validator(result) → { ok, feedback? } (may be async / an agent call)
+gate(thunk, validator, { attempts = 3 })   → { ok, value, verdict, attempts }
+    // thunk(feedback, attempt); validator(result) → { ok, feedback?, ... } | boolean | null (may be async / an agent call)
 retry(thunk, { attempts = 3, until? })     → last result           // thunk(attempt); stops early when until(result)
 verify(item, { reviewers = 2, threshold = 0.5, lens? })
     → { real, realCount, total, votes: [{ real?, reason? }] }
@@ -92,6 +92,15 @@ args                                       // the host-provided input value, ver
 cwd                                        // the run's base working directory (string); process.cwd() returns it too
 budget.total | budget.spent() | budget.remaining()
 ```
+
+For `gate()`, `value` is the final producer result and `verdict` is the exact last completed
+validator return, including any extra structured fields. `{ ok: true }` and bare `true` pass;
+`{ ok: false, feedback? }`, bare `false`, and `null` reject. Only object feedback is threaded into
+the next producer attempt. A producer result of `null` is still passed to the validator. Producer
+or validator exceptions propagate immediately, so no partial gate result is returned and no later
+attempt runs. An explicit unsupported `undefined` validator return is a rejection represented as
+`verdict: null`. If the script returns the gate result, its complete verdict is persisted and may
+reach the host; keep evidence concise and never put credentials or other secrets in verdict data.
 
 `verify`, `judgePanel`, and `completenessCheck` spawn their subagents on the run's default model — hand-roll with `parallel` + `agent` to pin panel members to specific backends.
 

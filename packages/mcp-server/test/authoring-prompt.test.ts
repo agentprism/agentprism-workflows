@@ -49,6 +49,8 @@ test("prompts/get returns the self-contained guide with the task framed in", asy
     assert.ok(text.includes("# Writing AgentPrism workflow scripts"), "contains the SKILL.md guide");
     assert.ok(text.includes("| `keepSession` |"), "contains the reference.md option tables");
     assert.ok(text.includes("loopUntilDry"), "contains the quick-wins example script");
+    assert.ok(text.includes("{ ok, value, verdict, attempts }"), "contains the complete gate result contract");
+    assert.ok(text.includes("outcome.verdict"), "shows authors how to consume the terminal verdict");
     assert.ok(text.includes("Find flaky tests and fix them"), "frames the task argument");
     assert.ok(text.includes("`workflow` tool"), "directs the host at the workflow tool");
 

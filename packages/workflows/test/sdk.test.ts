@@ -79,6 +79,33 @@ import type {
   WorkflowRunResult,
 } from "../src/index.js";
 
+type EqualTypes<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? (<T>() => T extends B ? 1 : 2) extends <T>() => T extends A ? 1 : 2
+      ? true
+      : false
+    : false;
+type AssertType<T extends true> = T;
+
+async function gateInferenceProbe(): Promise<void> {
+  const outcome = await gate(
+    () => ({ branch: "issue-131", tests: 148 }),
+    (value) => ({ ok: true, commitSha: `${value.branch}-${value.tests}` }),
+  );
+  const commitSha: string | undefined = outcome.verdict?.commitSha;
+  const producer: { branch: string; tests: number } = outcome.value;
+
+  const booleanValidator = (_value: number): boolean => true;
+  const booleanOutcome = await gate(() => 1, booleanValidator);
+  type BooleanVerdictInference = AssertType<EqualTypes<typeof booleanOutcome.verdict, boolean | null>>;
+  const booleanVerdictInference: BooleanVerdictInference = true;
+
+  void commitSha;
+  void producer;
+  void booleanVerdictInference;
+}
+void gateInferenceProbe;
+
 /**
  * Build an AgentRunner test double from a plain implementation. The seam's run() is
  * generic over the optional typebox schema; this stub is schema-less and returns raw

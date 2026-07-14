@@ -177,6 +177,56 @@ test("checkpoint headless:pause dry-runs through the mock confirm without a warn
   assert.doesNotMatch(report.warnings.join("\n"), /headless: "pause"/);
 });
 
+test("dry-run gate result exposes every fabricated structured validator field", async () => {
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "gate-verdict", description: "structured gate verdict" };',
+      "const PRODUCER = { type: 'object', additionalProperties: false, required: ['branch', 'tests'],",
+      "  properties: { branch: { type: 'string' }, tests: { type: 'number' } } };",
+      "const VERDICT = { type: 'object', additionalProperties: false, required: ['ok', 'commitSha', 'feedback', 'scores'],",
+      "  properties: { ok: { type: 'boolean' }, commitSha: { type: 'string' }, feedback: { type: 'string' },",
+      "    scores: { type: 'object', additionalProperties: false, required: ['correctness'],",
+      "      properties: { correctness: { type: 'number' } } } } };",
+      "return await gate(",
+      '  () => agent("produce", { label: "gate:producer", schema: PRODUCER }),',
+      '  (value) => agent("validate " + value.branch, { label: "gate:validator", schema: VERDICT }),',
+      ");",
+    ].join("\n"),
+  );
+
+  assert.equal(report.ok, true);
+  assert.equal(report.exitCode, 0);
+  assert.equal(report.dryRun?.status, "completed");
+  assert.deepEqual(
+    report.dryRun?.agentCalls.map(({ label, schema }) => ({ label, schema })),
+    [
+      { label: "gate:producer", schema: true },
+      { label: "gate:validator", schema: true },
+    ],
+  );
+  const outcome = report.dryRun?.result as {
+    ok: boolean;
+    value: { branch: string; tests: number };
+    verdict: {
+      ok: boolean;
+      commitSha: string;
+      feedback: string;
+      scores: { correctness: number };
+    };
+    attempts: number;
+  };
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.attempts, 1);
+  assert.equal(typeof outcome.value.branch, "string");
+  assert.equal(typeof outcome.value.tests, "number");
+  assert.deepEqual(outcome.verdict, {
+    ok: true,
+    commitSha: "mock-commitSha",
+    feedback: "mock-feedback",
+    scores: { correctness: 1 },
+  });
+});
+
 test("fabricateFromSchema covers the portable-schema subset", () => {
   assert.equal(fabricateFromSchema({ type: "string", enum: ["a", "b"] }), "a");
   assert.equal(fabricateFromSchema({ const: 42 }), 42);

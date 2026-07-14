@@ -989,19 +989,27 @@ export async function runWorkflow<T = unknown>(
   };
   const gate = async (
     thunk: (feedback: string | undefined, attempt: number) => Promise<unknown> | unknown,
-    validator: (r: unknown) => Promise<{ ok: boolean; feedback?: string }> | { ok: boolean; feedback?: string },
+    validator: (r: unknown) => Promise<unknown> | unknown,
     opts: { attempts?: number } = {},
   ) => {
     const attempts = Math.max(1, opts.attempts ?? 3);
     let feedback: string | undefined;
     let last: unknown;
+    let lastVerdict: unknown = null;
     for (let i = 0; i < attempts; i++) {
       last = await thunk(feedback, i);
-      const verdict = await validator(last);
-      if (verdict?.ok) return { ok: true, value: last, attempts: i + 1 };
-      feedback = verdict?.feedback; // fed into the next attempt
+      lastVerdict = await validator(last);
+      const accepted =
+        typeof lastVerdict === "boolean"
+          ? lastVerdict
+          : Boolean((lastVerdict as { ok?: unknown } | null)?.ok);
+      if (accepted) return { ok: true, value: last, verdict: lastVerdict ?? null, attempts: i + 1 };
+      feedback =
+        typeof lastVerdict === "boolean"
+          ? undefined
+          : (lastVerdict as { feedback?: string } | null)?.feedback; // fed into the next attempt
     }
-    return { ok: false, value: last, attempts };
+    return { ok: false, value: last, verdict: lastVerdict ?? null, attempts };
   };
 
   // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it

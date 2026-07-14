@@ -179,6 +179,7 @@ return {
   accepted: outcome.ok,
   attempts: outcome.attempts,
   imagePath: (outcome.value && outcome.value.imagePath) || lastImagePath || null,
+  verdict: outcome.verdict,
   concept: brief.concept ?? null,
   exactText: brief.exactText,
 };

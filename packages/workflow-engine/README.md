@@ -136,7 +136,10 @@ Inside a workflow body these are available as globals (no imports):
   (resolved via the host's live `confirm`; headless defaults to `default ?? true`, can abort
   with `headless: "abort"`, or durably pause with `headless: "pause"`).
 - Quality combinators built on the above: `verify`, `judgePanel`, `loopUntilDry`,
-  `completenessCheck`, `retry`, `gate`.
+  `completenessCheck`, `retry`, and `gate`. A fulfilled `gate` returns
+  `{ ok, value, verdict, attempts }`, where `value` is the final producer result and
+  `verdict` is the exact last validator return. Its inner `agent()` calls are journaled;
+  the aggregate gate result is not a separate journal entry.
 - `phase(title, { budget? })`, `log(msg)`, and the read-only `args`, `cwd`, `budget`.
 
 The realm is hardened for determinism: `Math.random()`, `Date.now()`, and `new Date()`
