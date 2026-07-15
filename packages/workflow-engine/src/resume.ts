@@ -53,6 +53,33 @@ export const RESUME_CALL_FAILED_REASONS = Object.freeze([
   "resume-fatal-latch",
 ] as const satisfies readonly WorkflowResumeCallFailedReason[]);
 
+export function validateResumeSafetyMarker(
+  record: WorkflowCallRecord,
+  legacyResume: boolean,
+): boolean {
+  if (record.kind !== "agent" || record.outcome !== "result") {
+    return record.resumeSafety === undefined;
+  }
+  if (record.origin === "journal-replay") {
+    if (legacyResume) return record.resumeSafety === undefined;
+    if (
+      record.resumeSafety === undefined ||
+      record.replay === undefined ||
+      record.replay.sourceResumeSafety !== record.resumeSafety
+    ) {
+      return false;
+    }
+  }
+  if (record.resumeSafety === undefined) return true;
+  if (record.resumeSafety === "declared-read-only") return record.isolation === undefined;
+  if (record.isolation !== "worktree") return false;
+  return (
+    (record.origin === "runner" && record.worktree === true) ||
+    (record.origin === "journal-replay" &&
+      record.replay?.sourceResumeSafety === "isolated-worktree")
+  );
+}
+
 /** Manager-prepared, engine-internal execution input. */
 export type PreparedResume =
   | {

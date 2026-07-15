@@ -30,6 +30,7 @@ type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 export {
   runWorkflow,
   parseWorkflowScript,
+  hashCheckpointInputs,
   redactText,
   truncateUtf8,
   CALL_PATH_FORMAT,

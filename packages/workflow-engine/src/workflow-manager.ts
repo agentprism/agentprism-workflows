@@ -36,6 +36,7 @@ import { captureRunEnvironment, type RunEnvironmentIdentity } from "./run-enviro
 import {
   createRunPersistence,
   generateRunId,
+  type PersistedResumeFormat,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
@@ -48,6 +49,7 @@ import { cloneFrozenStrictJson, cloneStrictJsonValue, deepFreeze } from "./stric
 import {
   CALL_INPUTS_FORMAT,
   CALL_PATH_FORMAT,
+  CHECKPOINT_INPUTS_FORMAT,
   type CheckpointCallContext,
   type CheckpointOptions,
   type EngineRunResult,
@@ -83,8 +85,21 @@ export interface ManagedRun {
   checkpointsTaken: WorkflowCheckpointTaken[];
   calls: WorkflowCallRecord[];
   effectiveCwd: string;
-  runtime: { node: string; v8: string; pathFormat: number; inputsFormat: number };
+  runtime: {
+    node: string;
+    v8: string;
+    pathFormat: number;
+    inputsFormat: number;
+    checkpointInputsFormat?: number;
+  };
   environment?: RunEnvironmentIdentity;
+  resume?: PersistedResumeFormat;
+  resumeActivity?: number;
+  resumeActivityInvalid?: true;
+  resumeFilesystemTainted?: boolean;
+  resumeTerminalFinalized?: boolean;
+  executionSettled?: boolean;
+  environmentKey?: string;
   callsAllocated?: number;
   limits?: NonNullable<WorkflowRunResult["effectiveLimits"]>;
   abortSignaled?: true;
@@ -92,6 +107,8 @@ export interface ManagedRun {
   agentsDir?: string;
   nestedWorkflows?: true;
   legacyResume?: true;
+  /** A fresh run seeded from another execution; terminal saves replace inherited rows. */
+  newRunResume?: true;
   executionMode?: PersistedRunState["executionMode"];
   /**
    * False for host-owned transcript storage. The run stays fully tracked in memory,
@@ -247,6 +264,7 @@ function runtimeIdentity(): ManagedRun["runtime"] {
     v8: process.versions.v8,
     pathFormat: CALL_PATH_FORMAT,
     inputsFormat: CALL_INPUTS_FORMAT,
+    checkpointInputsFormat: CHECKPOINT_INPUTS_FORMAT,
   };
 }
 
@@ -474,8 +492,12 @@ export class WorkflowManager extends EventEmitter {
       if (managed.journaling && exec.resumeJournal) {
         managed.journal = latestRows([...exec.resumeJournal.values()]);
       }
+      if (managed.journaling && exec.resumeCalls) {
+        managed.calls = latestRows(exec.resumeCalls);
+      }
       this.runs.set(managed.runId, managed);
-      this.persistRun(managed);
+      if (managed.journaling && exec.resumeJournal) this.persistRunOrThrow(managed);
+      else this.persistRun(managed);
     } catch (err) {
       this.persistence.releaseRunLease(identity.lease);
       this.runs.delete(identity.runId);
@@ -521,10 +543,17 @@ export class WorkflowManager extends EventEmitter {
     if (managed.journaling && exec.resumeCalls) {
       managed.calls = latestRows(exec.resumeCalls);
     }
-    this.runs.set(managed.runId, managed);
-    // Persist the initial state immediately so listRuns()/the task panel can see
-    // the run the moment it starts, not only after the first agent journals.
-    this.persistRun(managed);
+    try {
+      this.runs.set(managed.runId, managed);
+      // Persist the initial state immediately so listRuns()/the task panel can see
+      // the run the moment it starts, not only after the first agent journals.
+      if (managed.journaling && exec.resumeJournal) this.persistRunOrThrow(managed);
+      else this.persistRun(managed);
+    } catch (error) {
+      this.releaseRunLease(managed);
+      this.runs.delete(managed.runId);
+      throw error;
+    }
     try {
       return await this.executeRun(managed, script, exec);
     } catch (error) {
@@ -588,9 +617,17 @@ export class WorkflowManager extends EventEmitter {
       effectiveCwd,
       runtime: runtimeIdentity(),
       environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),
+      ...(journaling ? { resume: { format: "identity-v1" as const } } : {}),
+      resumeActivity: 0,
+      resumeFilesystemTainted: false,
+      resumeTerminalFinalized: false,
+      executionSettled: false,
+      environmentKey: exec.environmentKey ?? this.environmentKey,
+      callsAllocated: 0,
       mainModel: this.mainModel,
       agentsDir: this.agentsDir,
       executionMode: exec.executionMode,
+      ...(exec.resumeJournal ? { legacyResume: true as const, newRunResume: true as const } : {}),
       journaling,
       background,
       lease: identity.lease,
@@ -862,6 +899,27 @@ export class WorkflowManager extends EventEmitter {
         resumeJournal: managed.journaling ? resumeJournal : undefined,
         resumeFromRunId: managed.journaling && resumeJournal ? managed.runId : undefined,
         runId: managed.runId,
+        onResumeFilesystemTainted: () => {
+          managed.resumeFilesystemTainted = true;
+        },
+        onResumeActivity: (active) => {
+          if (
+            !Number.isSafeInteger(active) ||
+            active < 0 ||
+            Math.abs(active - (managed.resumeActivity ?? 0)) !== 1
+          ) {
+            managed.resumeActivityInvalid = true;
+            return;
+          }
+          managed.resumeActivity = active;
+        },
+        onResumeCallAllocated: (allocated) => {
+          if (!Number.isSafeInteger(allocated) || allocated !== (managed.callsAllocated ?? 0) + 1) {
+            managed.resumeActivityInvalid = true;
+            return;
+          }
+          managed.callsAllocated = allocated;
+        },
         onAgentJournal: (entry) => this.recordJournalEntry(managed, entry),
         injectedCheckpointReplies: new Set(
           Object.keys(exec.checkpointReplies ?? {}).map((index) => Number(index)),
@@ -984,6 +1042,7 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
+      managed.executionSettled = true;
       managed.calls = engineResult.calls ?? [];
       managed.callsAllocated = engineResult.callsAllocated;
       managed.limits = engineResult.effectiveLimits;
@@ -1008,6 +1067,7 @@ export class WorkflowManager extends EventEmitter {
 
       return result;
     } catch (error) {
+      managed.executionSettled = true;
       // The engine wraps every fault that crosses the script boundary as a WorkflowError
       // (script crashes are SCRIPT_ERROR), so a bare error HERE is manager/host-level
       // (persistence, fs). Label it UNKNOWN — never WORKFLOW_ABORTED, which is reserved
@@ -1127,6 +1187,46 @@ export class WorkflowManager extends EventEmitter {
     if (this.dropPostTerminal(managed, "callRecord")) return;
     const rootScope = record.scope === undefined || record.scope === managed.runId;
     if (rootScope) {
+      if (record.origin === "journal-replay" && record.outcome === "result") {
+        const source = managed.journal.find(
+          (entry) => entry.index === record.index && entry.hash === record.hash,
+        );
+        if (source) {
+          const phase = record.kind === "checkpoint" ? managed.snapshot.currentPhase : source.call?.phase;
+          const label = record.kind === "agent" ? record.label ?? source.call?.label ?? "agent" : "checkpoint";
+          const rebound = deepFreeze({
+            ...source,
+            kind: record.kind,
+            scope: managed.runId,
+            ...(source.session
+              ? {
+                  session: {
+                    ...source.session,
+                    callIndex: record.index,
+                    label,
+                    ...(phase === undefined ? {} : { phase }),
+                  },
+                }
+              : {}),
+            call: record.kind === "agent"
+              ? {
+                  ...source.call,
+                  kind: "agent" as const,
+                  label,
+                  ...(phase === undefined ? {} : { phase }),
+                }
+              : {
+                  kind: "checkpoint" as const,
+                  label: "checkpoint" as const,
+                  phase,
+                },
+          } satisfies JournalEntry);
+          managed.journal = latestRows([
+            ...managed.journal.filter((entry) => entry.index !== record.index),
+            rebound,
+          ]);
+        }
+      }
       managed.calls = managed.calls.filter((row) => row.index !== record.index);
       managed.calls.push(record);
     }
@@ -1152,101 +1252,156 @@ export class WorkflowManager extends EventEmitter {
     return true;
   }
 
+  private prepareTerminalResumeState(managed: ManagedRun): void {
+    if (managed.status === "running") return;
+    if (managed.newRunResume) {
+      managed.calls = latestRows(managed.calls.filter((row) => row.scope === managed.runId));
+      const resultRows = new Map(
+        managed.calls
+          .filter((row) => row.outcome === "result")
+          .map((row) => [row.index, row] as const),
+      );
+      managed.journal = latestRows(
+        managed.journal.filter((entry) => {
+          if (entry.scope !== managed.runId) return false;
+          const row = resultRows.get(entry.index);
+          return row !== undefined && entry.kind === row.kind && entry.hash === row.hash;
+        }),
+      );
+    }
+    if (managed.resumeTerminalFinalized) return;
+    managed.resumeTerminalFinalized = true;
+    if (!managed.resume) return;
+    managed.resume = { format: "identity-v1" };
+    if (!managed.executionSettled || managed.resumeActivityInvalid || (managed.resumeActivity ?? 0) !== 0) return;
+    const terminalEnvironment = captureRunEnvironment(managed.effectiveCwd, managed.environmentKey);
+    if (terminalEnvironment?.git) {
+      managed.resume = { format: "identity-v1", terminalEnvironment };
+    } else if (terminalEnvironment?.key !== undefined && !managed.resumeFilesystemTainted) {
+      managed.resume = { format: "identity-v1", terminalEnvironment };
+    }
+  }
+
+  private persistedState(managed: ManagedRun): PersistedRunState {
+    this.prepareTerminalResumeState(managed);
+    return {
+      runId: managed.runId,
+      workflowName: managed.snapshot.name,
+      // Persist the real script + journal so the run can be resumed. Runs live
+      // in workflow run storage — protect via directory permissions, not blanking.
+      script: managed.script,
+      args: managed.args,
+      argsUnreplayable: managed.argsUnreplayable,
+      // The per-run working directory, so resume() re-runs in the SAME place.
+      cwd: managed.cwd,
+      effectiveCwd: managed.effectiveCwd,
+      runtime: managed.runtime,
+      environment: managed.environment,
+      ...(managed.resume ? { resume: managed.resume } : {}),
+      mainModel: managed.mainModel,
+      agentsDir: managed.agentsDir,
+      executionMode: managed.executionMode,
+      eventStreamId: managed.eventStreamId,
+      eventSeq: managed.eventSeq,
+      eventLogIncomplete: managed.eventLogIncomplete,
+      nestedWorkflows: managed.nestedWorkflows,
+      legacyResume: managed.legacyResume,
+      sessionId: this.sessionId,
+      journal: managed.journal,
+      ...(managed.fallbacks.length === 0 ? {} : { fallbacks: managed.fallbacks }),
+      ...(managed.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: managed.checkpointsTaken }),
+      calls: managed.calls,
+      callsAllocated: managed.callsAllocated,
+      limits: managed.limits,
+      ...(managed.abortSignaled || managed.controller.signal.aborted
+        ? { abortSignaled: true as const }
+        : {}),
+      status: managed.status,
+      reason: runReason(managed.status, managed.error),
+      errorCode: managed.error?.code,
+      // Why a pause happened, so the navigator / a future cold start can show it and
+      // re-arm resume (§2.12). Selector switches on the paused run's error code:
+      // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit",
+      // CHECKPOINT_REQUIRED -> "checkpoint_required".
+      pauseReason:
+        managed.status === "paused"
+          ? managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
+            ? "auth_required"
+            : managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+              ? "usage_limit"
+              : managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
+                ? "checkpoint_required"
+                : undefined
+          : undefined,
+      // resetHint stays usage-limit-only.
+      resetHint:
+        managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+          ? managed.error.resetHint
+          : undefined,
+      // The NON-SECRET auth surface for an auth pause — backendId + advertised method
+      // ids/types/names only (never authenticateMeta/envValues; Principle 9, §2.14). It
+      // arms resume()'s cold re-check (§2.13).
+      authContext:
+        managed.status === "paused" && managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
+          ? managed.error.authContext
+          : undefined,
+      // The NON-SECRET pending durable checkpoint surface. Its callIndex/hash pair arms
+      // resume() to inject the host's decision as a deterministic journal entry.
+      checkpointContext:
+        managed.status === "paused" && managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
+          ? managed.error.checkpointContext
+          : undefined,
+      phases: managed.snapshot.phases,
+      currentPhase: managed.snapshot.currentPhase,
+      agents: managed.snapshot.agents.map((a) => ({
+        ...a,
+        startedAt: managed.startedAt.toISOString(),
+        endedAt: new Date().toISOString(),
+      })),
+      logs: managed.snapshot.logs,
+      result: managed.result?.result,
+      tokenUsage: managed.snapshot.tokenUsage
+        ? {
+            input: managed.snapshot.tokenUsage.input,
+            output: managed.snapshot.tokenUsage.output,
+            total: managed.snapshot.tokenUsage.total,
+            cost: managed.snapshot.tokenUsage.cost,
+            cacheRead: managed.snapshot.tokenUsage.cacheRead,
+            cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
+          }
+        : undefined,
+      startedAt: managed.startedAt.toISOString(),
+      updatedAt: new Date().toISOString(),
+      completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
+      durationMs: managed.result?.durationMs,
+    };
+  }
+
   private persistRun(managed: ManagedRun) {
     if (!managed.journaling || !managed.lease) return;
     try {
-      this.persistence.save({
-        runId: managed.runId,
-        workflowName: managed.snapshot.name,
-        // Persist the real script + journal so the run can be resumed. Runs live
-        // in workflow run storage — protect via directory permissions, not blanking.
-        script: managed.script,
-        args: managed.args,
-        argsUnreplayable: managed.argsUnreplayable,
-        // The per-run working directory, so resume() re-runs in the SAME place.
-        cwd: managed.cwd,
-        effectiveCwd: managed.effectiveCwd,
-        runtime: managed.runtime,
-        environment: managed.environment,
-        mainModel: managed.mainModel,
-        agentsDir: managed.agentsDir,
-        executionMode: managed.executionMode,
-        eventStreamId: managed.eventStreamId,
-        eventSeq: managed.eventSeq,
-        eventLogIncomplete: managed.eventLogIncomplete,
-        nestedWorkflows: managed.nestedWorkflows,
-        legacyResume: managed.legacyResume,
-        sessionId: this.sessionId,
-        journal: managed.journal,
-        ...(managed.fallbacks.length === 0 ? {} : { fallbacks: managed.fallbacks }),
-        ...(managed.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: managed.checkpointsTaken }),
-        calls: managed.calls,
-        callsAllocated: managed.callsAllocated,
-        limits: managed.limits,
-        ...(managed.abortSignaled || managed.controller.signal.aborted
-          ? { abortSignaled: true as const }
-          : {}),
-        status: managed.status,
-        reason: runReason(managed.status, managed.error),
-        errorCode: managed.error?.code,
-        // Why a pause happened, so the navigator / a future cold start can show it and
-        // re-arm resume (§2.12). Selector switches on the paused run's error code:
-        // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit",
-        // CHECKPOINT_REQUIRED -> "checkpoint_required".
-        pauseReason:
-          managed.status === "paused"
-            ? managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
-              ? "auth_required"
-              : managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-                ? "usage_limit"
-                : managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
-                  ? "checkpoint_required"
-                  : undefined
-            : undefined,
-        // resetHint stays usage-limit-only.
-        resetHint:
-          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-            ? managed.error.resetHint
-            : undefined,
-        // The NON-SECRET auth surface for an auth pause — backendId + advertised method
-        // ids/types/names only (never authenticateMeta/envValues; Principle 9, §2.14). It
-        // arms resume()'s cold re-check (§2.13).
-        authContext:
-          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
-            ? managed.error.authContext
-            : undefined,
-        // The NON-SECRET pending durable checkpoint surface. Its callIndex/hash pair arms
-        // resume() to inject the host's decision as a deterministic journal entry.
-        checkpointContext:
-          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
-            ? managed.error.checkpointContext
-            : undefined,
-        phases: managed.snapshot.phases,
-        currentPhase: managed.snapshot.currentPhase,
-        agents: managed.snapshot.agents.map((a) => ({
-          ...a,
-          startedAt: managed.startedAt.toISOString(),
-          endedAt: new Date().toISOString(),
-        })),
-        logs: managed.snapshot.logs,
-        result: managed.result?.result,
-        tokenUsage: managed.snapshot.tokenUsage
-          ? {
-              input: managed.snapshot.tokenUsage.input,
-              output: managed.snapshot.tokenUsage.output,
-              total: managed.snapshot.tokenUsage.total,
-              cost: managed.snapshot.tokenUsage.cost,
-              cacheRead: managed.snapshot.tokenUsage.cacheRead,
-              cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
-            }
-          : undefined,
-        startedAt: managed.startedAt.toISOString(),
-        updatedAt: new Date().toISOString(),
-        completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
-        durationMs: managed.result?.durationMs,
-      });
+      this.persistence.save(this.persistedState(managed));
     } catch (err) {
       this.reportPersistenceFailure(err);
+    }
+  }
+
+  private persistRunOrThrow(managed: ManagedRun): void {
+    if (!managed.journaling || !managed.lease) {
+      throw new WorkflowError(
+        `run ${managed.runId} has no persistence lease`,
+        WorkflowErrorCode.PERSISTENCE_ERROR,
+        { recoverable: false },
+      );
+    }
+    try {
+      this.persistence.save(this.persistedState(managed));
+    } catch (error) {
+      throw new WorkflowError(
+        `failed to persist resume state for ${managed.runId}: ${errorMessage(error)}`,
+        WorkflowErrorCode.PERSISTENCE_ERROR,
+        { recoverable: false },
+      );
     }
   }
 
@@ -1319,6 +1474,17 @@ export class WorkflowManager extends EventEmitter {
     ) {
       this.persistence.releaseRunLease(lease);
       return { accepted: false };
+    }
+    persisted.legacyResume = true;
+    try {
+      this.persistence.save(persisted);
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw new WorkflowError(
+        `failed to persist legacy resume marker for ${runId}: ${errorMessage(error)}`,
+        WorkflowErrorCode.PERSISTENCE_ERROR,
+        { recoverable: false },
+      );
     }
     const publication = this.prepareEventPublicationState(persisted, lease);
     const saveResumeGate = () => {
@@ -1473,9 +1639,16 @@ export class WorkflowManager extends EventEmitter {
       effectiveCwd,
       runtime: runtimeIdentity(),
       environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),
+      ...(persisted.resume ? { resume: { format: "identity-v1" as const } } : {}),
+      resumeActivity: 0,
+      resumeFilesystemTainted: false,
+      resumeTerminalFinalized: false,
+      executionSettled: false,
+      environmentKey: exec.environmentKey ?? this.environmentKey,
+      callsAllocated: 0,
       mainModel: persisted.mainModel ?? this.mainModel,
       agentsDir: persisted.agentsDir ?? this.agentsDir,
-      ...(persisted.calls === undefined || persisted.legacyResume ? { legacyResume: true as const } : {}),
+      legacyResume: true,
       journaling: true,
       background: true,
       lease,

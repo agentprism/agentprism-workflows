@@ -261,6 +261,7 @@ test(
       assert.equal(loaded?.calls, undefined);
       assert.equal(loaded?.limits, undefined);
       assert.equal(loaded?.runtime, undefined);
+      assert.equal(loaded?.resume, undefined);
       assert.equal(persistence.list().some((run) => run.runId === fixture.runId), true);
 
       const manager = new WorkflowManager({
@@ -275,6 +276,7 @@ test(
       assert.equal(result.status, "completed");
       assert.equal(result.result, "fresh");
       assert.equal(persistence.load(fixture.runId)?.legacyResume, true);
+      assert.equal(persistence.load(fixture.runId)?.resume, undefined);
     } finally {
       rmSync(persistenceRoot, { recursive: true, force: true });
     }

@@ -9,7 +9,7 @@ import type { JournalEntry, WorkflowCallRecord } from "@automatalabs/shared-type
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { createRunPersistence, type PersistedRunState, type RunPersistence } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
-import { CALL_INPUTS_FORMAT, CALL_PATH_FORMAT } from "../src/workflow.js";
+import { CALL_INPUTS_FORMAT, CALL_PATH_FORMAT, CHECKPOINT_INPUTS_FORMAT } from "../src/workflow.js";
 
 const script = (body: string, name = "manager-state") =>
   `export const meta = { name: ${JSON.stringify(name)}, description: 'manager state' }\n${body}`;
@@ -158,6 +158,7 @@ return { count: args.count, answer }`,
         v8: process.versions.v8,
         pathFormat: CALL_PATH_FORMAT,
         inputsFormat: CALL_INPUTS_FORMAT,
+        checkpointInputsFormat: CHECKPOINT_INPUTS_FORMAT,
       });
       assert.deepEqual(persisted?.environment, { key: "host-environment" });
       assert.equal(persisted?.callsAllocated, 0);

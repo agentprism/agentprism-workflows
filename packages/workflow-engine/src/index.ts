@@ -6,6 +6,7 @@
 export {
   runWorkflow,
   parseWorkflowScript,
+  hashCheckpointInputs,
   CALL_PATH_FORMAT,
   CALL_INPUTS_FORMAT,
   CHECKPOINT_INPUTS_FORMAT,
