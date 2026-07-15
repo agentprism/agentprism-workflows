@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 0.28.1
+
+### Patch Changes
+
+- 8f2c109: Bump `@automatalabs/codex-acp` to 1.6.5 (upstream sync: Codex subagent activity over ACP merged into the fork).
+- Updated dependencies [2a411c3]
+  - @automatalabs/shared-types@0.23.0
+
 ## 0.28.0
 
 ### Minor Changes
