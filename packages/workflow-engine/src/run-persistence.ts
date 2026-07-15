@@ -139,11 +139,14 @@ export interface PersistedRunState {
   executionMode?: { kind: "isolation"; baselineRunId: string };
   /** Aggregate isolation report, attached after the terminal manager save. */
   replayReport?: ReplayReport;
-  /** Event-log generation discriminator. */
+  /** Event-log generation discriminator: 32 lowercase hex characters. New-format journaling
+   *  runs mint it with eventSeq: 0. */
   eventStreamId?: string;
-  /** Highest successfully appended event sequence reflected by this snapshot. */
+  /** Highest successfully appended event seq whose state effects this snapshot reflects.
+   *  New-format journaling runs write 0 before their first event. */
   eventSeq?: number;
-  /** At least one persistable event could not be appended. */
+  /** At least one persistable live event could not be appended. When set, the log is not a
+   *  gap-free projection and read/watch fail with EVENT_LOG_INCOMPLETE. */
   eventLogIncomplete?: true;
 }
 

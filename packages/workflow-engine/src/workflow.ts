@@ -88,6 +88,11 @@ export interface SharedRuntime {
   nestedSeq: number;
 }
 
+export interface WorkflowCallbackContext {
+  /** The runWorkflow invocation that produced this callback. */
+  scope: string;
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   /**
@@ -171,8 +176,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     options: CheckpointOptions,
     context?: CheckpointCallContext,
   ) => Promise<unknown>;
-  onLog?: (message: string) => void;
-  onPhase?: (title: string) => void;
+  onLog?: (message: string, context?: WorkflowCallbackContext) => void;
+  onPhase?: (title: string, context?: WorkflowCallbackContext) => void;
   onAgentStart?: (event: {
     label: string;
     phase?: string;
@@ -210,14 +215,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     callIndex: number;
     scope: string;
   }) => void;
-  onTokenUsage?: (usage: {
-    input: number;
-    output: number;
-    total: number;
-    cost: number;
-    cacheRead?: number;
-    cacheWrite?: number;
-  }) => void;
+  onTokenUsage?: (
+    usage: {
+      input: number;
+      output: number;
+      total: number;
+      cost: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+    },
+    context?: WorkflowCallbackContext,
+  ) => void;
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -431,6 +439,7 @@ export async function runWorkflow<T = unknown>(
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runAgentRetries = normalizeAgentRetries(options.agentRetries ?? 0);
   const runId = options.runId ?? `run-${started.toString(36)}`;
+  const callbackContext: WorkflowCallbackContext = { scope: runId };
   const baseCwd = options.cwd ?? process.cwd();
   const vmFilename = `${sanitizeVmName(meta.name)}.js`;
   const preludeLines = DETERMINISM_PRELUDE.split("\n").length;
@@ -451,7 +460,7 @@ export async function runWorkflow<T = unknown>(
     cwd: options.cwd ?? process.cwd(),
     persistenceRoot: options.persistenceRoot,
     persist: journaling ? (options.persistLogs ?? true) : false,
-    onLog: options.onLog,
+    onLog: (message) => options.onLog?.(message, callbackContext),
   });
 
   const state: RuntimeState = {
@@ -504,7 +513,7 @@ export async function runWorkflow<T = unknown>(
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
     }
-    options.onPhase?.(title);
+    options.onPhase?.(title, callbackContext);
   };
 
   const budget = Object.freeze({
@@ -835,7 +844,7 @@ export async function runWorkflow<T = unknown>(
         shared.tokenUsage.total += tokens;
         if (!options.budgetReplay) shared.spent += tokens;
         budgetDebit += tokens;
-        options.onTokenUsage?.({ ...shared.tokenUsage });
+        options.onTokenUsage?.({ ...shared.tokenUsage }, callbackContext);
         return tokens;
       };
 
@@ -1487,8 +1496,8 @@ export async function runWorkflow<T = unknown>(
               hash: callHash,
               prompt: promptText,
               kind: checkpointOptions.kind ?? "confirm",
-              choices: checkpointOptions.choices,
-              default: checkpointOptions.default,
+              ...(checkpointOptions.choices === undefined ? {} : { choices: checkpointOptions.choices }),
+              ...(checkpointOptions.default === undefined ? {} : { default: checkpointOptions.default }),
             },
           },
         );
@@ -1609,7 +1618,7 @@ export async function runWorkflow<T = unknown>(
   }
 
   // Emit final token usage
-  options.onTokenUsage?.(shared.tokenUsage);
+  options.onTokenUsage?.(shared.tokenUsage, callbackContext);
 
   return {
     meta,

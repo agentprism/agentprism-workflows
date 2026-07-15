@@ -8,6 +8,7 @@ export {
   parseWorkflowScript,
   type EngineRunResult,
   type WorkflowRunOptions,
+  type WorkflowCallbackContext,
   type WorkflowAgentOptions,
   type AgentOptions,
   type CheckpointOptions,
