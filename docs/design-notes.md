@@ -700,7 +700,63 @@ the unchanged engine.
 
 ---
 
-## 8. Caveats / version pins / things to design around
+## 8. Isolation mode — why replay fails closed
+
+Isolation mode is a backend-neutral engine primitive exposed through
+`@automatalabs/workflow-engine` and ACP-defaulted by `@automatalabs/workflows`. It re-executes the
+recorded script with recorded args, serves every non-target terminal call from the manifest/journal,
+and delegates selected targets live. The implementation deliberately admits fewer recordings than a
+best-effort replay system: every accepted comparison must have a provable call correspondence and
+execution context.
+
+**Call paths and their honest boundary.** Each `agent()` and `checkpoint()` captures a normalized
+V8 call-site path alongside its deterministic hash. The VM compile filename is sanitized, async
+frames are excluded, and the path/input format versions plus the full Node and V8 versions are
+persisted. A path is stable only inside that recorded runtime boundary; isolation preflight requires
+exact format/Node/V8 equality rather than claiming portability across engines. The target's separate
+input fingerprint covers behavior-shaping runner inputs omitted from the journal hash, and its
+resolved cwd is compared immediately before delegation. Git HEAD plus dirty-content identity (or an
+explicit non-Git environment key) gates filesystem comparability before any candidate spend.
+
+**Guarded terminal settlement.** A logical call decides its terminal state once. The engine-owned
+manifest append happens first, followed by journal and terminal observers, each guarded separately.
+A throwing observer is logged and swallowed: it cannot retry, fail, or duplicate the call. The same
+settlement seal drops late usage, model, session, history, provenance, and manager events from timed
+out or floated work, so the manifest and sealed `agentEnd` event are the target report's only
+authority.
+
+**Record-time freezing.** Agent results, checkpoint replies, usage/history/model/session telemetry,
+errors, arguments, journal entries, events, and persisted rows cross a strict-JSON snapshot boundary
+when captured and are deep-frozen. The VM receives an independent clone of strict-JSON args. This
+prevents caller, listener, or script mutation after the fact from changing identity, replay values,
+or persistence; values that cannot be represented faithfully are either rejected at the relevant
+result/reply boundary or explicitly marked unusable as a baseline for permissive input paths.
+
+**Serving algebra and the fatal latch.** Target calls require exact `(path, hash)` identity plus an
+equal input fingerprint and cwd, then delegate with only the optional model rewritten. Non-targets
+serve by exact `(kind, path, hash)` identity; after a target changes downstream content, a row may
+serve by path only when that path has exactly one recorded candidate. Repeated identities,
+multi-candidate paths, new calls, nested calls, dependent targets, and target-context drift latch one
+typed fatal divergence. Once latched, every later arrival rethrows before serving or spending. This
+strict posture is what makes "held fixed" meaningful: propagation mode remains the correct tool for
+scripts that cannot prove isolated correspondence.
+
+**Budget trajectory and gate freedom.** Every recorded call has a dense settlement ordinal and
+every agent call a sealed budget debit. Replay forces the recording's token/agent limits and feeds
+those debits back in settlement order, reproducing both `budget.spent()`/`remaining()` and
+pre-allocation token gates even when served calls settle at different wall-clock speeds. Baselines
+at the agent-limit boundary, with abort residue, or without limits/trajectory facts are refused
+before spend because those gates cannot otherwise be proven inactive. Concurrency reproduces the
+scheduling envelope, not timing; timeout and retry settings affect only the live target because
+served calls resolve at the replay seam.
+
+Isolation artifacts carry an initial run-level `executionMode` marker, per-call provenance, and a
+persisted `ReplayReport`; they cannot be resumed or selected as later baselines. See
+[`api.md`](api.md#isolation-mode) for the public surface and complete refusal vocabulary.
+
+---
+
+## 9. Caveats / version pins / things to design around
 
 - **Version-specific (Claude):** the structured-output path is verified for
   `claude-agent-acp@0.57.0` / `@anthropic-ai/claude-agent-sdk@0.3.202`. The `_meta.claudeCode`
@@ -737,7 +793,7 @@ the unchanged engine.
 
 ---
 
-## 9. References
+## 10. References
 
 **Packages (verified versions, 2026-07-09):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk

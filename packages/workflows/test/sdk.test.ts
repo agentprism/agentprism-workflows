@@ -35,6 +35,8 @@ import {
   WorkflowManager,
   runWorkflow,
   runDynamicWorkflow,
+  runIsolation,
+  createReplayRunner,
   WorkflowError,
   WorkflowErrorCode,
   isAuthRequired,
@@ -84,7 +86,40 @@ import type {
   MockAnswerSequence,
   ValidatedMockAnswerUse,
   ValidatedMockAnswers,
+  CheckpointCallContext,
+  IsolationRunResult,
+  IsolationTarget,
+  ReplayCallReport,
+  ReplayDivergenceEvent,
+  ReplayObservation,
+  ReplayReport,
+  ReplayRunner,
+  ReplayRunnerOptions,
+  ResolvedIsolationTarget,
+  RunIsolationOptions,
+  RunIsolationSdkOptions,
+  WorkflowCallRecord,
+  WorkflowRecordedError,
 } from "../src/index.js";
+import { __setDefaultRunnerFactoryForTests } from "../src/isolation.js";
+
+type IsolationTypeSurface = [
+  CheckpointCallContext,
+  IsolationRunResult,
+  IsolationTarget,
+  ReplayCallReport,
+  ReplayDivergenceEvent,
+  ReplayObservation,
+  ReplayReport,
+  ReplayRunner,
+  ReplayRunnerOptions,
+  ResolvedIsolationTarget,
+  RunIsolationOptions,
+  RunIsolationSdkOptions,
+  WorkflowCallRecord,
+  WorkflowRecordedError,
+];
+void (undefined as unknown as IsolationTypeSurface);
 
 const mockAnswerSequence: MockAnswerSequence = { $sequence: [{ ok: false }, { ok: true }] };
 const mockAnswers: MockAnswers = { "quality:*": mockAnswerSequence };
@@ -142,6 +177,51 @@ function makeRunner(impl: (prompt: string, options: RunOptions) => unknown | Pro
 /** A runner that echoes a deterministic, non-empty text reply for every agent() call. */
 function okRunner(reply: (prompt: string) => string = (p) => `stub:${p}`): AgentRunner {
   return makeRunner((prompt) => reply(prompt));
+}
+
+const ISOLATION_ENVIRONMENT_KEY = "workflows-sdk-isolation-test";
+
+function telemetryRunner(reply: string): AgentRunner {
+  return makeRunner((_prompt, options) => {
+    options.onModelResolved?.(`${reply}/resolved`);
+    options.onUsage?.({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2, cost: 0 });
+    return reply;
+  });
+}
+
+async function recordIsolationBaseline(options: {
+  backends?: Record<string, { command: string }>;
+} = {}): Promise<{ root: string; cwd: string; runId: string }> {
+  const root = mkdtempSync(join(tmpdir(), "automatalabs-workflows-isolation-root-"));
+  const cwd = mkdtempSync(join(tmpdir(), "automatalabs-workflows-isolation-cwd-"));
+  const meta = {
+    name: "sdk-isolation-baseline",
+    description: "SDK isolation wrapper fixture",
+    ...(options.backends === undefined ? {} : { backends: options.backends }),
+  };
+  const script = [
+    `export const meta = ${JSON.stringify(meta)};`,
+    'return await agent("baseline prompt", { label: "target", model: "baseline/requested" });',
+  ].join("\n");
+  const manager = new WorkflowManager({
+    cwd,
+    persistenceRoot: root,
+    environmentKey: ISOLATION_ENVIRONMENT_KEY,
+    agent: telemetryRunner("baseline"),
+  });
+  const run = await manager.runSync(script, undefined, {
+    runId: "sdk-isolation-baseline",
+    maxAgents: 10,
+    tokenBudget: null,
+    concurrency: 1,
+    agentRetries: 0,
+    agentTimeoutMs: null,
+    environmentKey: ISOLATION_ENVIRONMENT_KEY,
+    scriptBackends: options.backends,
+  });
+  manager.dispose();
+  assert.equal(run.status, "completed");
+  return { root, cwd, runId: run.runId };
 }
 
 /**
@@ -272,6 +352,8 @@ test("facade re-exports the public surface", () => {
   assert.equal(typeof WorkflowManager, "function");
   assert.equal(typeof runWorkflow, "function");
   assert.equal(typeof runDynamicWorkflow, "function");
+  assert.equal(typeof runIsolation, "function");
+  assert.equal(typeof createReplayRunner, "function");
   assert.equal(typeof WorkflowError, "function");
   assert.equal(typeof toJsonSchema, "function");
   assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
@@ -365,6 +447,89 @@ test("facade WorkflowManager exposes inspectRun and shared status without engine
   assert.equal(status?.calls.length, 1);
   assert.equal(status?.filter.lastN, 1);
   assert.equal(status?.filter.logLines, 0);
+});
+
+test("runIsolation defaults to an owned ACP runner and disposes it through the named test seam", async (t) => {
+  const fixture = await recordIsolationBaseline();
+  let factoryCalls = 0;
+  let disposeCalls = 0;
+  const fakeDefault = Object.assign(telemetryRunner("candidate"), {
+    async dispose() {
+      disposeCalls++;
+    },
+  });
+  __setDefaultRunnerFactoryForTests(() => {
+    factoryCalls++;
+    return fakeDefault;
+  });
+  t.after(() => {
+    __setDefaultRunnerFactoryForTests(undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+    rmSync(fixture.cwd, { recursive: true, force: true });
+  });
+
+  const result = await runIsolation({
+    baselineRunId: fixture.runId,
+    live: [{ label: "target", model: "candidate/requested" }],
+    cwd: fixture.cwd,
+    persistenceRoot: fixture.root,
+    environmentKey: ISOLATION_ENVIRONMENT_KEY,
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(factoryCalls, 1);
+  assert.equal(disposeCalls, 1, "the SDK owns and disposes its default runner");
+  assert.equal(result.report.calls[0]?.mode, "live-target");
+  assert.equal(result.report.calls[0]?.resolvedModel, "candidate/resolved");
+});
+
+test("runIsolation applies allowScriptBackends before delegating the recorded script", async (t) => {
+  const backends = { browser: { command: "browser-acp" } };
+  const fixture = await recordIsolationBaseline({ backends });
+  t.after(() => {
+    rmSync(fixture.root, { recursive: true, force: true });
+    rmSync(fixture.cwd, { recursive: true, force: true });
+  });
+  let liveCalls = 0;
+  let capturedBackends: RunOptions["backends"];
+  const runner = makeRunner((_prompt, options) => {
+    liveCalls++;
+    capturedBackends = options.backends;
+    options.onModelResolved?.("candidate/resolved");
+    options.onUsage?.({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2, cost: 0 });
+    return "candidate";
+  });
+
+  await assert.rejects(
+    runIsolation({
+      baselineRunId: fixture.runId,
+      live: [{ label: "target", model: "candidate/requested" }],
+      runner,
+      cwd: fixture.cwd,
+      persistenceRoot: fixture.root,
+      environmentKey: ISOLATION_ENVIRONMENT_KEY,
+    }),
+    /allowScriptBackends/,
+  );
+  assert.equal(liveCalls, 0);
+
+  const approved: string[] = [];
+  const result = await runIsolation({
+    baselineRunId: fixture.runId,
+    live: [{ label: "target", model: "candidate/requested" }],
+    runner,
+    cwd: fixture.cwd,
+    persistenceRoot: fixture.root,
+    environmentKey: ISOLATION_ENVIRONMENT_KEY,
+    allowScriptBackends: (backend) => {
+      approved.push(`${backend.name}:${backend.command}`);
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(approved, ["browser:browser-acp"]);
+  assert.deepEqual(capturedBackends, backends);
 });
 
 // §4.2 SDK exports (PR6). The facade re-exports the `isAuthRequired` VALUE through the
