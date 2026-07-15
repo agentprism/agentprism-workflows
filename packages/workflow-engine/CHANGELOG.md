@@ -1,5 +1,11 @@
 # @automatalabs/workflow-engine
 
+## 0.19.1
+
+### Patch Changes
+
+- c81df46: Replace client-side model matching and modifier handling with deterministic registered-prefix routing and verbatim model selection by the serving ACP harness.
+
 ## 0.19.0
 
 ### Minor Changes
