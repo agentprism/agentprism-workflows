@@ -1,5 +1,13 @@
 # @automatalabs/shared-types
 
+## 0.20.0
+
+### Minor Changes
+
+- 134dffc: Expose ACP session config options as a verbatim per-call authoring surface, add routed no-prompt
+  catalog probing to the runner and workflow validator, and preserve existing replay hash bytes when
+  the new option bag is absent or empty.
+
 ## 0.19.0
 
 ### Minor Changes
