@@ -44,6 +44,16 @@ test("generated authoring-prompt teaches fail-to-live identity resume semantics"
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
 });
 
+test("generated authoring-prompt teaches scriptPath, resources, and stop-patch-resume", () => {
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`scriptPath` (an absolute path on the server's filesystem)"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("workflow://runs/{runId}/script"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("a bare `resumeFromRunId`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("never silently reuses the old script"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('{ action: "stop", runId, lastN?, labelGlob?, logLines? }'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("authoritative durable acknowledgement"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("absolute `scriptPath` plus"));
+});
+
 test("generated authoring-prompt teaches registered-prefix routing and verbatim selection", () => {
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Route by one registered first segment."));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("No model config call is made."));

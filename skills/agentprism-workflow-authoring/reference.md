@@ -202,7 +202,16 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-The first MCP request uses `{ "args": { "maxRounds": 6 } }` and returns a failed run with a persisted six-entry journal. The next request sends the same `script`, `{ "args": { "maxRounds": 8 } }`, and the returned run ID as `resumeFromRunId`. Calls 0–5 match uniquely and replay for zero current provider tokens; calls 6–7 are new and run live. This changed-args pattern is specific to new-run entry points that accept current args with `resumeFromRunId`. The MCP `workflow` tool does, as does `WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`. `WorkflowManager.resume(runId)` is a different same-ID recovery API: it reloads the persisted original script/args and permanently uses legacy positional semantics.
+The first MCP request uses `{ "args": { "maxRounds": 6 } }` and returns a failed run with a
+persisted six-entry journal. The next request sends the same content via `script` (or the same
+absolute `scriptPath`), `{ "args": { "maxRounds": 8 } }`, and the returned run ID as
+`resumeFromRunId`. Calls 0–5 match uniquely and replay for zero current provider tokens; calls 6–7
+are new and run live. This changed-args pattern is specific to new-run entry points that accept
+current args with `resumeFromRunId`. The MCP `workflow` tool does, as does
+`WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`. MCP resume always requires
+explicit content; a bare `resumeFromRunId` is invalid. `WorkflowManager.resume(runId)` is a
+different same-ID recovery API: it reloads the persisted original script/args and permanently uses
+legacy positional semantics.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 
@@ -268,14 +277,29 @@ For edited-script/current-args resume, call the same entry point with
 `exec: { resumeFromRunId: previous.runId, resumePolicy: "auto", checkpointReplies }`. Reply keys
 name source indexes. The manager prepares and durably persists correspondence before execution.
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`. Foreground is the default and streams progress/resolves checkpoints live; long work uses `background:true` plus bounded `action:"await"`. It supports `resumeFromRunId`, and non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from terminal `outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — run/resume/inspect/await are action branches, not separate tools. A run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts exactly one of raw
+`script` source or an absolute server-filesystem `scriptPath`, plus `args`. A path is read once and
+snapshotted at admission. Foreground is the default and streams progress/resolves checkpoints live;
+long work uses `background:true` plus bounded `action:"await"`. It supports explicit
+`resumeFromRunId` with content supplied again by either mechanism; non-elicitation clients resume
+`headless: "pause"` checkpoints with `checkpointReplies` from terminal
+`outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a
+saved workflow name. The `workflow` tool is the server's whole tool surface —
+run/resume/inspect/await/stop are action branches, not separate tools. A run that pauses with
+`reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band
+(see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also
+get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional
+`task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`,
+`AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool,
+one injected-tool registry per process), `AGENTPRISM_BACKENDS`,
+`AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend
+`*_CMD`/`_ARGS`/`_BIN` overrides.
 
 Exact detached host types:
 
 ```ts
-interface WorkflowExecuteToolInput {
+interface WorkflowExecuteToolInputBase {
   action?: "run";
-  script: string;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -287,6 +311,11 @@ interface WorkflowExecuteToolInput {
   checkpointReplies?: Record<number, unknown>;
   background?: boolean; // default false
 }
+
+type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
+  | { script: string; scriptPath?: never }
+  | { script?: never; scriptPath: string } // absolute path on the server
+);
 
 interface WorkflowAwaitToolInput {
   action: "await";
@@ -300,6 +329,8 @@ interface WorkflowAwaitToolInput {
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
+  scriptSource: "inline" | "path";
+  scriptUri: string;
 }
 
 interface WorkflowAwaitMetadata {
@@ -312,6 +343,19 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
   outcome?: WorkflowExecutionToolResult<T>; // present exactly when lifecycle is terminal
+  scriptUri: string;
+  lineage: Array<{ runId: string; uri: string; available: boolean }>;
+}
+
+interface WorkflowStopToolInput {
+  action: "stop";
+  runId: string;
+  lastN?: number;
+  labelGlob?: string;
+  logLines?: number;
+  script?: never;
+  scriptPath?: never;
+  waitMs?: never;
 }
 ```
 
@@ -324,7 +368,7 @@ resolution pipeline no longer produces entries.
 appear in foreground results plus terminal await `outcome`; neither appears on `WorkflowRunStatus`.
 
 At most four background runs may be active or starting per server instance. Foreground, inspect,
-and await consume no slot. A timeout returns the freshest status and partial cumulative usage; replay
+await, and stop consume no slot. A timeout returns the freshest status and partial cumulative usage; replay
 hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
 project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
 structured bytes and 8,192 text bytes. Terminal `outcome` preserves the raw authored result/full
@@ -342,10 +386,24 @@ daemon execution: process death can interrupt an in-flight call, and stale durab
 recovers to `paused`.
 
 `action:"await"` and `action:"inspect"` are read-only: they never replay the script, spend tokens,
-or acquire the run lease. `resumeFromRunId` executes a new run with the caller's current script/args
-and a new run ID. Every resumed background run durably seeds its inherited prefix (including a
+or acquire the run lease. `resumeFromRunId` executes a new run with the caller's current script or
+path snapshot and args, and a new run ID. Every resumed background run durably seeds its inherited prefix (including a
 synthetic checkpoint answer) beneath that new ID before acknowledgement, so later resume hops remain
 self-contained.
+
+Every admitted script is an immutable persistence-backed MCP resource at
+`workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the full resume
+lineage oldest-to-newest and expose structured `{ runId, uri, available }` entries. A fresh session
+can read a lost inline script and explicitly send that text back with `resumeFromRunId`; a path is
+never persisted or implicitly re-read. Listing/completion include only the 50 newest runs, but a
+direct URI read works for any retained project run.
+
+`action:"stop"` durably aborts a `running` or `paused` run live in this server process, cancels any
+pending agent/checkpoint request, appends `stopped`, releases the lease, and returns the final
+inspection projection with `stopped:true`. Resume is safe immediately; await adds nothing. Only
+backend session wind-down can remain, observable through inspect's agent states. A repeated stop on
+a terminal run succeeds with `stopped:false, alreadyTerminal:true`. For the kill-patch-resume loop:
+stop, edit the file, then submit its `scriptPath` with `resumeFromRunId`.
 
 Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
 
@@ -357,6 +415,7 @@ interface WorkflowInspectToolInput {
   labelGlob?: string;  // non-empty; at most 128 Unicode code points
   logLines?: number;   // default 20; integer 0..50
   script?: never;
+  scriptPath?: never;
 }
 ```
 

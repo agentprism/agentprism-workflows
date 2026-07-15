@@ -42,7 +42,12 @@ const run = await runDynamicWorkflow(script, { cwd: "/abs/project", args: { path
 // run.resumeReport: optional new-run replay correspondence; run.fallbacks/checkpointsTaken: audit trails
 ```
 
-— or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes (`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
+— or pass it to the `workflow` MCP tool served by `@automatalabs/mcp-server`, using exactly one of
+`script` (the source string) or `scriptPath` (an absolute path on the server's filesystem). A path
+is read once at admission and its content is snapshotted, so later edits affect only a new run.
+`args` arrives in the script as the `args` global; the run's base directory is the `cwd` global.
+Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes
+(`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
 
 ## The `meta` header
 
@@ -338,7 +343,13 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same script with `args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 match uniquely and replay for zero current provider tokens; only rounds 7–8 run live because the cap controls call count but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all eight identities would change and all would run live.
+With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same
+content (again via `script`, or via the absolute `scriptPath` you are editing) with
+`args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 replay
+for zero current provider tokens and only rounds 7–8 run live because the cap controls call count
+but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all
+eight identities would change and all would run live. Resume always states its content; a bare
+`resumeFromRunId` never silently reuses the old script.
 
 - Narrate decisions and round summaries with `log()`, and give repeated calls stable, descriptive
   labels. MCP hosts can safely retrieve the latest log lines and compact results by label after a
@@ -351,8 +362,23 @@ still unclear, call the same single `workflow` tool with
 label glob and latest-N tail to identify the last relevant work before deciding whether to resume,
 edit, or stop. `resumeFromRunId` executes a new run; inspection does not.
 
-Choose `background: true` for work that may outlive one MCP request. The start call returns exactly
-`{ runId, status: "running" }` after durable admission; retain that new ID and normally collect with
+Every admitted script is also an immutable MCP resource at
+`workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the complete
+resume lineage oldest-to-newest. If a later session has lost an inline script, read that URI and
+explicitly send the retrieved text as `script` with `resumeFromRunId` (and `checkpointReplies` when
+recovering a durable checkpoint). Resource content is the admission snapshot, never a re-read path.
+
+To kill, patch, and resume a live run, call
+`{ action: "stop", runId, lastN?, labelGlob?, logLines? }`. The returned `aborted` snapshot is the
+authoritative durable acknowledgement: resume is safe immediately and a follow-up await adds
+nothing. Edit the file, then start a new run with its absolute `scriptPath` plus
+`resumeFromRunId: runId`; the unchanged journal prefix replays and the changed suffix runs live.
+Only backend session wind-down can remain after stop, so inspect per-agent states only if cleanup
+appears hung. A repeated stop of a terminal run is a successful no-op.
+
+Choose `background: true` for work that may outlive one MCP request. The start call returns
+`{ runId, status: "running", scriptSource, scriptUri }` plus a script resource link after durable
+admission; retain that new ID and normally collect with
 20-second bounded calls: `{ action: "await", runId, waitMs: 20000 }`. A timeout is progress, not
 failure: it returns the newest safe status and cumulative usage, so call await again. Use
 `action:"inspect"` (or `waitMs:0`) when you need an immediate filtered diagnostic instead of waiting.
