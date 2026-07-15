@@ -82,6 +82,10 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  matches still allow, and a resolver still decides. Agent modes confine writes/escalations,
    *  not reads. */
   mode?: string;
+  /** Agent-advertised ACP session config options, set verbatim after model selection and before
+   *  the prompt. Option ids are applied in ascending lexicographic order. The reserved `model`
+   *  id is rejected by the workflow engine; use the dedicated `model` field instead. */
+  configOptions?: Record<string, string | boolean>;
   /** Coarse tier ("small" | "medium" | "big"). Consulted only when `model` is unset; `model` wins. */
   tier?: string;
   /** Working directory (e.g. an isolated git worktree). ABSOLUTE. Maps to ACP session/new {cwd}. NOT hashed. */

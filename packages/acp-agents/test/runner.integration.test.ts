@@ -23,7 +23,8 @@ interface LogEntry {
     clientInfo?: unknown;
     _meta?: Record<string, unknown> | null;
     configId?: string;
-    value?: string;
+    value?: string | boolean;
+    type?: string;
     mcpServers?: unknown;
   };
   outcome?: { outcome: string; optionId?: string };
@@ -851,6 +852,180 @@ test("set_config_option rejection follows the existing agent-error path with no 
   assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
   assert.deepEqual(resolved, []);
   assert.deepEqual(fallbacks, []);
+});
+
+test("configOptions are sent verbatim after model selection in ascending option-id order", async () => {
+  const { cwd, readLog } = configure({
+    configOptions: [
+      {
+        id: "model",
+        type: "select",
+        name: "Model",
+        category: "model",
+        currentValue: "default-model",
+        options: [{ value: "target-model", name: "Target" }],
+      },
+      {
+        id: "reasoning_effort",
+        type: "select",
+        name: "Reasoning effort",
+        category: "thought_level",
+        currentValue: "medium",
+        options: [{ value: "high", name: "High" }],
+      },
+      {
+        id: "fast_mode",
+        type: "boolean",
+        name: "Fast mode",
+        category: "model_config",
+        currentValue: false,
+      },
+      {
+        id: "10",
+        type: "select",
+        name: "Ten",
+        category: "other",
+        currentValue: "old-ten",
+        options: [{ value: "ten", name: "Ten" }],
+      },
+      {
+        id: "2",
+        type: "select",
+        name: "Two",
+        category: "other",
+        currentValue: "old-two",
+        options: [{ value: "two", name: "Two" }],
+      },
+    ],
+    turns: [{ text: "ok" }],
+  });
+
+  assert.equal(
+    await makeRunner().run("hi", {
+      model: "claude/target-model",
+      cwd,
+      configOptions: {
+        "2": "two",
+        "10": "ten",
+        reasoning_effort: "high",
+        fast_mode: true,
+      },
+    }),
+    "ok",
+  );
+
+  const wire = readLog().filter((entry) =>
+    ["newSession", "setSessionConfigOption", "prompt"].includes(entry.method),
+  );
+  assert.deepEqual(wire.map((entry) => entry.method), [
+    "newSession",
+    "setSessionConfigOption",
+    "setSessionConfigOption",
+    "setSessionConfigOption",
+    "setSessionConfigOption",
+    "setSessionConfigOption",
+    "prompt",
+  ]);
+  const configCalls = wire.filter((entry) => entry.method === "setSessionConfigOption");
+  assert.deepEqual(configCalls.map((entry) => entry.params?.configId), [
+    "model",
+    "10",
+    "2",
+    "fast_mode",
+    "reasoning_effort",
+  ]);
+  assert.deepEqual(configCalls.map((entry) => entry.params?.value), [
+    "target-model",
+    "ten",
+    "two",
+    true,
+    "high",
+  ]);
+  assert.equal(configCalls[3].params?.type, "boolean");
+  assert.equal(configCalls[4].params?.type, undefined);
+});
+
+test("configOptions rejection follows the existing agent-error path without retry or prompt", async () => {
+  const { cwd, readLog } = configure({
+    setConfigOptionError: "unknown config option",
+    turns: [{ text: "must not run" }],
+  });
+  await assert.rejects(
+    () => makeRunner().run("hi", { model: "claude", cwd, configOptions: { invented: "value" } }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      assert.equal(error.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+      assert.equal(error.recoverable, true);
+      return true;
+    },
+  );
+  assert.equal(readLog().filter((entry) => entry.method === "newSession").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+});
+
+test("probeConfigOptions opens and closes exactly one session without sending a prompt", async () => {
+  const advertised = [
+    {
+      id: "reasoning_effort",
+      type: "select",
+      name: "Reasoning effort",
+      category: "thought_level",
+      currentValue: "medium",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "high", name: "High" },
+      ],
+    },
+    {
+      id: "fast_mode",
+      type: "boolean",
+      name: "Fast mode",
+      category: "model_config",
+      currentValue: false,
+    },
+  ];
+  const { cwd, readLog } = configure({ configOptions: advertised });
+
+  const probed = await makeRunner().probeConfigOptions("codex/ignored-for-probe", { cwd });
+
+  assert.equal(probed.backendId, "codex");
+  assert.deepEqual(probed.options, advertised);
+  assert.equal(readLog().filter((entry) => entry.method === "newSession").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "closeSession").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+  assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 0);
+});
+
+test("probeConfigOptions propagates an authentication failure cleanly", async () => {
+  const { cwd, readLog } = configure({ authRequiredOnNewSession: true });
+  await assert.rejects(
+    () => makeRunner().probeConfigOptions("claude", { cwd }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      assert.equal(error.code, WorkflowErrorCode.AUTH_REQUIRED);
+      return true;
+    },
+  );
+  assert.equal(readLog().filter((entry) => entry.method === "newSession").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+});
+
+test("probeConfigOptions propagates a spawn failure cleanly", async () => {
+  const { cwd } = harness.configure<LogEntry>({}, {
+    env: {
+      AGENTPRISM_CLAUDE_ACP_CMD: "/definitely/missing/agentprism-acp-agent",
+      AGENTPRISM_CLAUDE_ACP_ARGS: undefined,
+    },
+  });
+  await assert.rejects(
+    () => makeRunner().probeConfigOptions("claude", { cwd }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      assert.equal(error.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+      return true;
+    },
+  );
 });
 
 // ---- (#5) client-provided mcpServers reach session/new -------------------------------

@@ -37,6 +37,13 @@ test("generated authoring-prompt teaches registered-prefix routing and verbatim 
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("model resolution does not emit them"));
 });
 
+test("generated authoring-prompt teaches configOptions and validate-time probe surfacing", () => {
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("| `configOptions` |"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Ids and string/boolean values pass through verbatim"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("advertised-options table"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("marks it `probed:false`"));
+});
+
 test("prompts/list advertises author-workflow with the optional task argument", async () => {
   const { client, dispose } = await connect(okRunner());
   try {

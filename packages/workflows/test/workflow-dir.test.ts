@@ -20,7 +20,15 @@ process.on("exit", () => {
 
 import { openWorkflowDir, runDynamicWorkflow } from "../src/index.js";
 import { validateWorkflowScript } from "../src/validate.js";
+import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
 import type { AgentRunner } from "../src/index.js";
+
+setValidateProbeFactoryForTests(() => ({
+  async probeConfigOptions(spec) {
+    return { backendId: spec ?? "claude", options: [] };
+  },
+  async dispose() {},
+}));
 
 const FLOWS_DIR = mkdtempSync(join(tmpdir(), "automatalabs-workflows-dir-test-flows-"));
 process.on("exit", () => {

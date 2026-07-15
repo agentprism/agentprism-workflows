@@ -25,6 +25,44 @@ import {
   validateWorkflowScript,
   MOCK_TOKENS_PER_AGENT,
 } from "../src/validate.js";
+import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
+import type { SessionConfigOption } from "@automatalabs/acp-agents";
+
+const ADVERTISED_OPTIONS: SessionConfigOption[] = [
+  {
+    id: "model",
+    type: "select",
+    name: "Model",
+    category: "model",
+    currentValue: "default-model",
+    options: [{ value: "default-model", name: "Default" }],
+  },
+  {
+    id: "reasoning_effort",
+    type: "select",
+    name: "Reasoning effort",
+    category: "thought_level",
+    currentValue: "medium",
+    options: [
+      { value: "low", name: "Low" },
+      { value: "high", name: "High" },
+    ],
+  },
+  {
+    id: "fast_mode",
+    type: "boolean",
+    name: "Fast mode",
+    category: "model_config",
+    currentValue: false,
+  },
+];
+
+setValidateProbeFactoryForTests(() => ({
+  async probeConfigOptions(spec) {
+    return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+  },
+  async dispose() {},
+}));
 
 function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -73,6 +111,119 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
   assert.match(result.pair[1], /dry-run/);
   assert.deepEqual(report.dryRun!.phasesVisited, ["Fan", "Judge"]);
   assert.equal(report.warnings.length, 0);
+});
+
+test("validate probes each distinct routed harness once and surfaces catalogs without authored configOptions", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  process.env.AGENTPRISM_DEFAULT_BACKEND = "browser";
+  const probes: Array<{ spec?: string; cwd?: string }> = [];
+  const restore = setValidateProbeFactoryForTests((backends) => {
+    assert.ok(backends?.browser, "script-declared custom backend reaches the probe runner registry");
+    return {
+      async probeConfigOptions(spec, opts) {
+        probes.push({ spec, cwd: opts?.cwd });
+        return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+      },
+      async dispose() {},
+    };
+  });
+  try {
+    const report = await validateWorkflowScript(
+      [
+        'export const meta = { name: "routing", description: "d", backends: { browser: { command: "browser-acp" } } };',
+        'const a = await agent("a", { label: "default-a" });',
+        'const b = await agent("b", { label: "browser-b", model: "browser/visual" });',
+        'const c = await agent("c", { label: "codex-c", model: "codex/gpt" });',
+        'return { a, b, c };',
+      ].join("\n"),
+      { cwd: TEST_HOME },
+    );
+
+    assert.equal(report.ok, true);
+    assert.deepEqual(probes.map((probe) => probe.spec), ["browser", "codex"]);
+    assert.ok(probes.every((probe) => probe.cwd === TEST_HOME));
+    assert.deepEqual(report.dryRun?.harnessOptions?.map((harness) => harness.backendId), ["browser", "codex"]);
+    assert.ok(report.dryRun?.harnessOptions?.every((harness) => harness.probed));
+    assert.deepEqual(report.dryRun?.harnessOptions?.[0].options, ADVERTISED_OPTIONS);
+    assert.equal(report.dryRun?.agentCalls[0].configOptions, undefined);
+    const human = formatValidateReport(report);
+    assert.match(human, /advertised config options:/);
+    assert.match(human, /reasoning_effort \| select \| "medium" \| "low", "high"/);
+    assert.match(JSON.stringify(report), /reasoning_effort/);
+  } finally {
+    restore();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
+test("config-option error classes make validation INVALID with labels, values, and alternatives", async () => {
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "bad-options", description: "d" };',
+      'await agent("a", { label: "unknown-call", configOptions: { mystery: "wat" } });',
+      'await agent("b", { label: "select-call", configOptions: { reasoning_effort: "extreme" } });',
+      'await agent("c", { label: "boolean-call", configOptions: { fast_mode: 1 } });',
+      'return agent("d", { label: "model-call", configOptions: { model: "shadow" } });',
+    ].join("\n"),
+  );
+
+  assert.equal(report.ok, false);
+  assert.equal(report.exitCode, 2);
+  assert.equal(report.dryRun?.ok, false);
+  const reason = report.dryRun?.reason ?? "";
+  for (const label of ["unknown-call", "select-call", "boolean-call", "model-call"]) {
+    assert.match(reason, new RegExp(label));
+  }
+  for (const value of ["wat", "extreme", "1", "shadow"]) assert.match(reason, new RegExp(value));
+  assert.match(reason, /advertised alternatives: option ids/);
+  assert.match(reason, /advertised alternatives: "low", "high"/);
+  assert.match(reason, /advertised alternatives: true, false/);
+  assert.match(reason, /use the call's model field/);
+  assert.deepEqual(plain(report.dryRun?.agentCalls.map((call) => call.configOptions)), [
+    { mystery: "wat" },
+    { reasoning_effort: "extreme" },
+    { fast_mode: 1 },
+    { model: "shadow" },
+  ]);
+});
+
+test("probe failure warns once per harness, reports probed:false, and skips its option checks", async () => {
+  const probes: string[] = [];
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec) {
+      probes.push(spec ?? "claude");
+      if (spec === "codex") throw new Error("login required by fake codex");
+      return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript(
+      [
+        'export const meta = { name: "degrade", description: "d" };',
+        'const a = await agent("a", { label: "codex-a", model: "codex/gpt", configOptions: { mystery: "x" } });',
+        'const b = await agent("b", { label: "codex-b", model: "codex/other" });',
+        'const c = await agent("c", { label: "claude-c", model: "claude" });',
+        'return { a, b, c };',
+      ].join("\n"),
+    );
+
+    assert.equal(report.ok, true, "an unverified unknown option is skipped, not failed");
+    assert.deepEqual(probes, ["claude", "codex"]);
+    const codex = report.dryRun?.harnessOptions?.find((harness) => harness.backendId === "codex");
+    assert.deepEqual(codex, {
+      backendId: "codex",
+      probed: false,
+      error: "login required by fake codex",
+    });
+    assert.equal(report.warnings.filter((warning) => /could not probe codex/.test(warning)).length, 1);
+    assert.match(report.warnings.join("\n"), /configOptions on its calls are unverified/);
+    assert.doesNotMatch(report.dryRun?.reason ?? "", /mystery/);
+    assert.match(formatValidateReport(report), /codex: probe failed — login required by fake codex/);
+  } finally {
+    restore();
+  }
 });
 
 test("published resume-loop-cap example validates its default and intentional six-round failure", async () => {

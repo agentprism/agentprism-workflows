@@ -8,8 +8,9 @@ import { runWorkflow } from "../src/workflow.js";
 // JournalEntry (workflow.ts: onAgentJournal({ index, hash, result })). The resume
 // contract is "replay a cached result iff cached.hash === hash", so this hash is the
 // load-bearing resume key: it MUST be byte-stable for a fixed call identity and MUST
-// change when any identity input (prompt / model / mode-when-set / tier / phase / agentType / agentDef
-// / schema) changes. These tests pin that through the observable journal.
+// change when any identity input (prompt / model / mode-when-set / configOptions-when-non-empty /
+// tier / phase / agentType / agentDef / schema) changes. These tests pin that through the
+// observable journal.
 
 const echo = {
   async run(prompt: string) {
@@ -62,6 +63,7 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
     const expected = createHash("sha256").update(expectedIdentity).digest("hex");
 
     const [entry] = await journalOf(singleCall);
+    assert.equal(entry.hash, "2aa09c56e72fb040ff729ab7ada54158759da157dd048aecd467867debc30e99");
     assert.equal(entry.hash, expected, "journal hash equals sha256 of the canonical identity JSON");
   });
 
@@ -120,6 +122,74 @@ return a`;
     const [plain] = await journalOf(noMode);
     const [mode] = await journalOf(withMode);
     assert.notEqual(plain.hash, mode.hash, "adding a mode changes the resume key even for an identical prompt");
+  });
+
+  it("folds sorted configOptions into identity while omitting unset and empty maps", async () => {
+    const absent = `export const meta = { name: 'h-config-absent', description: 'hash' }
+return agent('same', { label: 'a' })`;
+    const empty = `export const meta = { name: 'h-config-empty', description: 'hash' }
+return agent('same', { label: 'a', configOptions: {} })`;
+    const firstOrder = `export const meta = { name: 'h-config-first', description: 'hash' }
+return agent('same', { label: 'a', configOptions: { zeta: 'last', alpha: true } })`;
+    const reverseOrder = `export const meta = { name: 'h-config-reverse', description: 'hash' }
+return agent('same', { label: 'a', configOptions: { alpha: true, zeta: 'last' } })`;
+    const changed = `export const meta = { name: 'h-config-changed', description: 'hash' }
+return agent('same', { label: 'a', configOptions: { alpha: false, zeta: 'last' } })`;
+
+    const [[plain], [emptyMap], [ordered], [reordered], [different]] = await Promise.all([
+      journalOf(absent),
+      journalOf(empty),
+      journalOf(firstOrder),
+      journalOf(reverseOrder),
+      journalOf(changed),
+    ]);
+    assert.equal(emptyMap.hash, plain.hash, "empty configOptions is omitted from old journal bytes");
+    assert.equal(reordered.hash, ordered.hash, "authored key order cannot change replay identity");
+    assert.notEqual(ordered.hash, plain.hash, "adding configOptions changes replay identity");
+    assert.notEqual(different.hash, ordered.hash, "changing a configOptions value changes replay identity");
+  });
+
+  it("serializes integer-like option ids in lexicographic rather than numeric key order", async () => {
+    const source = `export const meta = { name: 'h-config-integer-ids', description: 'hash' }
+return agent('same', { label: 'a', configOptions: { '2': 'two', '10': 'ten' } })`;
+    const [entry] = await journalOf(source);
+    const expectedIdentity =
+      '{"prompt":"same","model":null,"configOptions":{"10":"ten","2":"two"},"tier":null,"phase":null,"agentType":null,"agentDef":null,"schema":null}';
+    assert.equal(entry.hash, createHash("sha256").update(expectedIdentity).digest("hex"));
+  });
+
+  it("replays reordered configOptions and cache-misses when a value changes", async () => {
+    const source = `export const meta = { name: 'h-config-replay', description: 'hash' }
+return agent('same', { label: 'a', configOptions: { zeta: 'last', alpha: true } })`;
+    const reordered = source.replace("zeta: 'last', alpha: true", "alpha: true, zeta: 'last'");
+    const changed = source.replace("alpha: true", "alpha: false");
+    const journal = await journalOf(source);
+    const resumeJournal = new Map(journal.map((entry) => [entry.index, entry]));
+    let calls = 0;
+    const runner = {
+      async run() {
+        calls++;
+        return "live";
+      },
+    };
+
+    const replayed = await runWorkflow(reordered, {
+      agent: runner,
+      persistLogs: false,
+      resumeJournal,
+      resumeFromRunId: "source",
+    });
+    assert.equal(replayed.result, "ran:same");
+    assert.equal(calls, 0, "sorted-key equivalent options replay from the journal");
+
+    const missed = await runWorkflow(changed, {
+      agent: runner,
+      persistLogs: false,
+      resumeJournal,
+      resumeFromRunId: "source",
+    });
+    assert.equal(missed.result, "live");
+    assert.equal(calls, 1, "changed option value runs live");
   });
 
   it("folds phase into the identity (phase change => different hash)", async () => {

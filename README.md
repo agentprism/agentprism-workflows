@@ -37,7 +37,7 @@ Scripts run in a deterministic realm and every `agent()` call is journaled under
 
 > **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
 >
-> `args` is not itself part of an `agent()` call's replay hash. New args can raise an orchestration-only loop cap while earlier calls keep replaying for zero tokens. If the new args change a prompt or another hashed identity field, replay stops at the first affected call and that call plus every later call runs live. The hashed identity is the prompt, resolved model, mode when set, tier, phase, agent type and resolved agent definition, and schema. `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` do not invalidate a cached call; changed values apply only to calls that run live.
+> `args` is not itself part of an `agent()` call's replay hash. New args can raise an orchestration-only loop cap while earlier calls keep replaying for zero tokens. If the new args change a prompt or another hashed identity field, replay stops at the first affected call and that call plus every later call runs live. The hashed identity is the prompt, resolved model, mode when set, `configOptions` when non-empty, tier, phase, agent type and resolved agent definition, and schema. `configOptions` keys are sorted in the identity; an omitted or empty bag keeps existing journal bytes unchanged. `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` do not invalidate a cached call; changed values apply only to calls that run live.
 
 ### Structured output as validated objects
 
@@ -319,7 +319,7 @@ The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts a
 
 A script is plain JavaScript whose **first statement** is the `meta` literal. Inside it, these globals are available (injected into the run's realm — they are not importable functions; `@automatalabs/workflows` ships an ambient `.d.ts` so your editor knows them):
 
-- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`. (`keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
+- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`. (`configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
 - `parallel([fn, …])` — run thunks concurrently; **barrier** (awaits all).
 - `pipeline(items, stage1, stage2, …)` — stream each item through stages independently (no inter-stage barrier).
 - `phase(title)`, `log(msg)` — progress grouping + narration.
@@ -341,8 +341,11 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 > It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, budgets, isolation,
 > and the determinism rules.
 
-Validate a script **without spending tokens** (static parse + a dry run over a mock agent backend — no
-ACP process, no auth needed): `npx @automatalabs/workflows validate <file> --args '<json>'`. Script a
+Validate a script **without spending tokens**: `npx @automatalabs/workflows validate <file> --args '<json>'`.
+After its static parse and mock-agent dry run, validation opens each distinctly routed ACP harness
+once without a prompt to surface its advertised config-option table and check authored
+`configOptions`. An unavailable or unauthenticated harness adds one warning and skips only its
+option checks; it does not fail validation. Script a
 false branch by resolved label with `--mock-answers '{"refute:*":{"real":false}}'`; reusable answers
 deep-merge over fabricated schema defaults, and `$sequence` fixtures exercise multi-round convergence.
 Exit codes: `0` valid, `1` parse failure, `2` dry-run failure. See the
@@ -365,6 +368,12 @@ The backend is chosen per `agent()` call from the effective `model`/`tier` spec 
 - A backend name alone (`claude`, `codex`, `opencode`, or a custom name) selects no model, leaving that harness's configured default untouched.
 - Otherwise route the entire authored string, unchanged, to `AGENTPRISM_DEFAULT_BACKEND` (historical default `claude`). `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases.
 - When a model id remains, it is sent byte-for-byte through `session/set_config_option`: no catalog matching, case folding, bracket parsing, or fallback. Brackets, dots, and provider prefixes are ordinary id characters, and a harness rejection follows the existing agent-error path.
+
+Per-call `configOptions` extends that same verbatim rule to the rest of the harness's ACP session
+options: exact ids and string/boolean values are sent in ascending option-id order, after model
+selection and before the prompt, with no aliases or coercion. The `"model"` key is reserved; use
+the dedicated `model` field. Run the validator and read each harness's advertised-options table
+before choosing ids or select values.
 
 Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer the backend-only forms when the desired model is configured inside the harness.
 

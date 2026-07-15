@@ -105,6 +105,60 @@ return r`,
   assert.deepEqual(seen, ["read-only"]);
 });
 
+test("agent() forwards configOptions to the runner without coercion", async () => {
+  const seen: Array<Record<string, string | boolean> | undefined> = [];
+  await runWorkflow(
+    `export const meta = { name: 'config_threading', description: 'config threading' }
+return agent('x', { label: 'config-agent', configOptions: { reasoning_effort: 'high', fast_mode: true } })`,
+    {
+      agent: {
+        async run(_prompt: string, options: { configOptions?: Record<string, string | boolean> }) {
+          seen.push(options.configOptions);
+          return "ok";
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(seen.length, 1);
+  assert.deepEqual(Object.entries(seen[0] ?? {}), [
+    ["reasoning_effort", "high"],
+    ["fast_mode", true],
+  ]);
+});
+
+test('configOptions "model" is rejected before the runner can open a session', async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'config_model', description: 'reserved config' }
+return agent('x', { label: 'reserved-call', configOptions: { model: 'shadow-model' } })`,
+        {
+          agent: {
+            async run() {
+              calls++;
+              return "must not run";
+            },
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.equal(error.recoverable, false);
+      assert.equal(error.agentLabel, "reserved-call");
+      assert.match(error.message, /reserved-call/);
+      assert.match(error.message, /shadow-model/);
+      assert.match(error.message, /model field/);
+      return true;
+    },
+  );
+  assert.equal(calls, 0);
+});
+
 test("runWorkflow retries recoverable empty output then succeeds", async () => {
   let calls = 0;
   const journal: JournalEntry[] = [];

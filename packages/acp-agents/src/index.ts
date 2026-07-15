@@ -20,6 +20,7 @@ export type {
   ListSessionsOptions,
   LogoutOptions,
   ProviderCapableRunner,
+  ProbedConfigOptions,
   ReattachSessionOptions,
   SetProviderOptions,
 } from "./runner.js";
@@ -120,6 +121,7 @@ export type {
   ProvidersCapabilities,
   SessionMode,
   SessionModeState,
+  SessionConfigOption,
   SessionInfo,
   SendRequestOptions,
   SetProviderRequest,

@@ -122,8 +122,9 @@ npx @automatalabs/workflows validate repo-triage --workflows-dir workflows \
   --mock-answers-file report-gate.mock-answers.json
 ```
 
-Zero tokens, no agent processes: a static parse plus a dry run of **both** scripts in
-the real engine realm against a mock backend (`--workflows-dir` is what lets the
+Zero tokens: a static parse plus a dry run of **both** scripts in the real engine realm against a
+mock backend, followed by one no-prompt config-options probe per routed harness (an unavailable
+harness only warns). `--workflows-dir` is what lets the
 nested `workflow("quick-wins")` call resolve). `report-gate.mock-answers.json` partially
 overrides only `ok`: the first review inherits the fabricated `feedback`, the second
 sets it to an empty string, and the finite sequence proves the gate's revision and

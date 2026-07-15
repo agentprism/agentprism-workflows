@@ -28,6 +28,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
 | `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Claude-family: `default`, `plan`, `acceptEdits`, `bypassPermissions`. Codex-family: `read-only`, `agent`, `agent-full-access`. OpenCode: its mode config option. Part of the resume hash when set. |
+| `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. Run validation and read the advertised-options table before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
 | `cwd` | `string` | Per-session working directory; relative resolves against the run's base cwd. Overridden by worktree isolation. Not hashed. |
@@ -53,6 +54,25 @@ A `model` string is resolved solely from its first segment, then delegated to th
 Selection is a single `session/set_config_option` with `configId: "model"` and the exact remaining string. There is no catalog matching, case folding, normalization, bracket parsing, nearest-neighbor selection, sibling effort/Fast option driving, retry, or echo verification. Brackets, dots, and provider-style prefixes are ordinary model-id characters. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; prefer backend-only forms for harness-configured models.
 
 Whatever the harness returns is the outcome. A rejection follows the existing agent-error path with no resolution-specific code or fallback event. `onModelFallback` and `WorkflowRunResult.fallbacks` remain public compatibility surfaces, but model resolution does not emit them.
+
+### Session config options
+
+`configOptions` extends the model rule to any other ACP session knob the routed harness advertises:
+
+```js
+await agent("Implement the approved change.", {
+  label: "implement",
+  model: "codex",
+  configOptions: { fast_mode: true, reasoning_effort: "high" },
+});
+```
+
+Ids and values are verbatim: strings stay strings, booleans stay booleans, and the client has no
+aliases, vocabulary, defaults, coercion, or catalog fallback. Entries are sent in ascending
+option-id order after model selection and before the prompt. A harness rejection follows the
+ordinary agent-error path. Never put `"model"` in this bag; the engine rejects it before opening a
+session. The catalog varies by harness version, login, and machine, so run the validator every
+time and read its advertised config options before picking an id or select value.
 
 ## Structured output channels
 
@@ -139,7 +159,7 @@ The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elic
 > **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
 
 - Banned in the realm because they break deterministic replay: `Date.now()`, `Math.random()`, no-arg `new Date()` / `Date()`. `new Date(value)` works. There is no `require`, `import`, Node API, or network API in the realm.
-- Each `agent()` result is journaled under a monotonic call index and a SHA-256 identity hash. The canonical identity fields, in order, are `prompt`, resolved `model`, `mode` only when set, `tier`, `phase`, `agentType`, resolved `agentDef`, and `schema`. Missing fields other than `mode` serialize as `null`; an unset `mode` key is omitted for compatibility with older journals.
+- Each `agent()` result is journaled under a monotonic call index and a SHA-256 identity hash. The canonical identity fields, in order, are `prompt`, resolved `model`, `mode` only when set, `configOptions` only when non-empty, `tier`, `phase`, `agentType`, resolved `agentDef`, and `schema`. Config-option keys are sorted before serialization. Missing fields other than `mode` and `configOptions` serialize as `null`; an unset `mode` and an unset/empty `configOptions` key are omitted for compatibility with older journals.
 - `agentDef` is the resolved definition's tools, disallowed tools, model, isolation, and body prompt. Changing a named definition therefore invalidates its call even when the `agentType` name is unchanged.
 - `args` is exposed to the script but is not directly included in the call hash. An args change cache-misses only when evaluating the script produces a changed hashed field, changed call order, or a new call.
 - Resume replays the longest unchanged prefix as cache hits with zero agent tokens. The first changed/new call and every call after it run live. `retry` and `gate` chains naturally cascade because a later attempt's prompt usually includes the preceding live result.
@@ -393,7 +413,7 @@ Backend auth comes from the machine the host runs on: Claude via a logged-in Cla
 npx @automatalabs/workflows validate <workflow-file> [options]
 ```
 
-Zero tokens, no ACP processes: a static parse (meta literal, syntax, determinism blocklist) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). No auth is needed to validate. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
+Zero tokens: a static parse (meta literal, syntax, determinism blocklist) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). Afterward, validation opens each distinct routed ACP harness once without a prompt and surfaces its full advertised config-options table in both human and JSON reports, even when the script authors none. It checks exact authored ids, select values, boolean types, and the reserved `"model"` key; errors name the call label, authored value, and advertised alternatives and exit `2`. A harness spawn/auth/session failure adds one warning, reports `probed:false`, and skips only that harness's checks—it never fails validation by itself. Catalogs are read afresh on every validation. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
 
 | flag | meaning |
 |---|---|
