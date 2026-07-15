@@ -2,7 +2,21 @@
  * Workflow run state persistence for pause/resume support.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  truncateSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import type {
   AgentHistoryEntry,
@@ -18,6 +32,7 @@ import type {
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { ReplayReport } from "./isolation.js";
+import { withRunEventsUsingFs, type RunEventPersistence } from "./run-event-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -124,6 +139,12 @@ export interface PersistedRunState {
   executionMode?: { kind: "isolation"; baselineRunId: string };
   /** Aggregate isolation report, attached after the terminal manager save. */
   replayReport?: ReplayReport;
+  /** Event-log generation discriminator. */
+  eventStreamId?: string;
+  /** Highest successfully appended event sequence reflected by this snapshot. */
+  eventSeq?: number;
+  /** At least one persistable event could not be appended. */
+  eventLogIncomplete?: true;
 }
 
 export interface RunPersistence {
@@ -171,6 +192,12 @@ export type FsLayer = {
   renameSync: typeof renameSync;
   unlinkSync: typeof unlinkSync;
   writeFileSync: typeof writeFileSync;
+  openSync?: typeof openSync;
+  writeSync?: typeof writeSync;
+  closeSync?: typeof closeSync;
+  truncateSync?: typeof truncateSync;
+  statSync?: typeof statSync;
+  watch?: typeof watch;
 };
 
 export interface RunPersistenceOptions {
@@ -182,7 +209,7 @@ export function createRunPersistence(
   cwd: string,
   fsOverride?: Partial<FsLayer>,
   options: RunPersistenceOptions = {},
-): RunPersistence {
+): RunEventPersistence {
   const _existsSync = fsOverride?.existsSync ?? existsSync;
   const _mkdirSync = fsOverride?.mkdirSync ?? mkdirSync;
   const _readdirSync = fsOverride?.readdirSync ?? readdirSync;
@@ -242,7 +269,7 @@ export function createRunPersistence(
     return true;
   };
 
-  return {
+  const persistence: RunPersistence = {
     save(state: PersistedRunState) {
       ensureDir();
       state.updatedAt = new Date().toISOString();
@@ -300,15 +327,6 @@ export function createRunPersistence(
       let deleted = false;
       try {
         for (const path of candidateRunPaths(runId)) {
-          const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-          // Best-effort cleanup of the sidecar files alongside the primary.
-          for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
-            try {
-              if (_existsSync(sidecar)) _unlinkSync(sidecar);
-            } catch {
-              // ignore sidecar cleanup failures
-            }
-          }
           try {
             if (_existsSync(path)) {
               _unlinkSync(path);
@@ -316,6 +334,23 @@ export function createRunPersistence(
             }
           } catch {
             // ignore per-file cleanup failures
+          }
+          // Snapshot recovery artifacts follow the primary; the writer lock is always last.
+          for (const sidecar of [`${path}.bak`, `${path}.tmp`]) {
+            try {
+              if (_existsSync(sidecar)) _unlinkSync(sidecar);
+            } catch {
+              // ignore sidecar cleanup failures
+            }
+          }
+        }
+        // Both storage locations are settled before either writer-exclusion file is removed.
+        for (const dir of [legacyRunsDir, runsDir]) {
+          try {
+            const lock = lockPath(dir, runId);
+            if (_existsSync(lock)) _unlinkSync(lock);
+          } catch {
+            // ignore lock cleanup failures
           }
         }
         return deleted;
@@ -371,6 +406,7 @@ export function createRunPersistence(
       return runsDir;
     },
   };
+  return withRunEventsUsingFs(persistence, fsOverride);
 }
 
 /**
@@ -381,3 +417,18 @@ export function generateRunId(): string {
   const random = Math.random().toString(36).slice(2, 8);
   return `${timestamp}-${random}`;
 }
+
+export {
+  RUN_EVENT_MAX_RECORD_BYTES,
+  RUN_EVENT_READ_LIMIT_DEFAULT,
+  RUN_EVENT_READ_LIMIT_MAX,
+  RunEventLogError,
+  withRunEvents,
+  type AppendRunEventInput,
+  type ReadRunEventsOptions,
+  type ReadRunEventsResult,
+  type RunEventLogErrorCode,
+  type RunEventPersistence,
+  type RunEventStream,
+  type WatchRunEventsOptions,
+} from "./run-event-persistence.js";
