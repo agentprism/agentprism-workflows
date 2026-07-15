@@ -18,6 +18,12 @@ export const SCRIPT_RESOURCE_MIME_TYPE = "text/javascript";
 export const SCRIPT_RESOURCE_LIST_LIMIT = 50;
 
 const SCRIPT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/script$/;
+const ADMISSION_ARGS_KEY = "__agentprismMcpDurableAdmission184";
+
+interface AdmissionArgsEnvelope {
+  [ADMISSION_ARGS_KEY]: boolean;
+  value?: unknown;
+}
 
 interface PersistedMcpRunMetadata {
   scriptSource?: WorkflowScriptSource;
@@ -28,6 +34,8 @@ type PersistedMcpRunState = PersistedRunState & PersistedMcpRunMetadata;
 
 interface StoredRunMetadata {
   scriptSource: WorkflowScriptSource;
+  script?: string;
+  args?: unknown;
   resumeSourceRunId?: string;
   ancestorRunIds?: string[];
   elicitationController?: AbortController;
@@ -40,6 +48,9 @@ interface AdmissionMetadata extends StoredRunMetadata {
 export interface WorkflowAdmission extends AdmissionMetadata {
   runId?: string;
   resourceAvailable?: boolean;
+  rejected?: boolean;
+  initialSaveAttempted?: boolean;
+  initialSaveSucceeded?: boolean;
 }
 
 function resourceNotFound(uri: string): never {
@@ -52,6 +63,70 @@ export function workflowScriptUri(runId: string): string {
 
 export function workflowRunIdFromScriptUri(uri: string): string | undefined {
   return SCRIPT_URI_PATTERN.exec(uri)?.[1];
+}
+
+function leadingScriptTriviaLength(script: string): number {
+  let offset = 0;
+  while (offset < script.length) {
+    const point = script[offset];
+    if (point !== undefined && /\s/u.test(point)) {
+      offset++;
+      continue;
+    }
+    if (script.startsWith("//", offset)) {
+      const newline = script.indexOf("\n", offset + 2);
+      offset = newline < 0 ? script.length : newline + 1;
+      continue;
+    }
+    if (script.startsWith("/*", offset)) {
+      const close = script.indexOf("*/", offset + 2);
+      offset = close < 0 ? script.length : close + 2;
+      continue;
+    }
+    if (offset === 0 && script.startsWith("#!")) {
+      const newline = script.indexOf("\n", 2);
+      offset = newline < 0 ? script.length : newline + 1;
+      continue;
+    }
+    break;
+  }
+  return offset;
+}
+
+/**
+ * WorkflowManager suppresses initial save errors and enters the VM immediately. Put a synchronous
+ * guard at the start of the parsed body; the persistence interceptor releases it only after the
+ * first durable save. The original script and args are projected into persistence unchanged.
+ */
+export function prepareWorkflowAdmissionExecution(
+  script: string,
+  parsedBody: string,
+  args: unknown,
+): { script: string; args: AdmissionArgsEnvelope } {
+  const prefixLength = leadingScriptTriviaLength(script);
+  const prefix = parsedBody.slice(0, prefixLength);
+  const suffix = parsedBody.slice(prefixLength);
+  const metaEnd = script.length - suffix.length;
+  if (script.slice(0, prefixLength) !== prefix || !script.endsWith(suffix) || metaEnd <= prefixLength) {
+    throw new TypeError("Unable to locate the validated workflow meta declaration");
+  }
+
+  const guard =
+    `;if(this.args?.${ADMISSION_ARGS_KEY}!==true){` +
+    `throw new Error("workflow admission was not durably persisted");` +
+    `}this.args=this.args.value;`;
+  return {
+    script: script.slice(0, metaEnd) + guard + script.slice(metaEnd),
+    args: {
+      [ADMISSION_ARGS_KEY]: false,
+      ...(args === undefined ? {} : { value: args }),
+    },
+  };
+}
+
+function admitExecutionArgs(value: unknown): void {
+  if (typeof value !== "object" || value === null || !(ADMISSION_ARGS_KEY in value)) return;
+  (value as AdmissionArgsEnvelope)[ADMISSION_ARGS_KEY] = true;
 }
 
 function startedAtMillis(state: PersistedRunState): number {
@@ -69,6 +144,7 @@ export class WorkflowScriptResources {
   private readonly subscriptions = new Set<string>();
   private readonly admissionContext = new AsyncLocalStorage<WorkflowAdmission>();
   private readonly metadataByRunId = new Map<string, StoredRunMetadata>();
+  private readonly rejectedRunIds = new Set<string>();
 
   constructor(
     private readonly mcp: McpServer,
@@ -91,11 +167,17 @@ export class WorkflowScriptResources {
     if (admission.runId) {
       const metadata = this.metadataByRunId.get(admission.runId);
       if (metadata) metadata.elicitationController = undefined;
+      this.rejectedRunIds.delete(admission.runId);
     }
   }
 
+  rejectAdmission(admission: WorkflowAdmission): void {
+    admission.rejected = true;
+    if (admission.runId) this.rejectedRunIds.add(admission.runId);
+  }
+
   admissionResourceAvailable(admission: WorkflowAdmission): boolean {
-    if (!admission.resourceAvailable || !admission.runId) return false;
+    if (!admission.initialSaveSucceeded || !admission.resourceAvailable || !admission.runId) return false;
     try {
       return this.persistence.load(admission.runId) !== null;
     } catch {
@@ -121,12 +203,15 @@ export class WorkflowScriptResources {
       pointerVisited.add(currentRunId);
       const state = this.persistence.load(currentRunId) as PersistedMcpRunState | null;
       if (state?.resumeSeed?.ancestorRunIds) {
-        const oldestToNewest = [
+        const flattenedPrefix = [
           ...state.resumeSeed.ancestorRunIds,
           state.resumeSeed.sourceRunId,
           currentRunId,
         ];
-        return this.projectLineage(oldestToNewest, runId);
+        return this.projectLineage(
+          [...flattenedPrefix, ...newestToOldest.reverse()],
+          runId,
+        );
       }
       newestToOldest.push(currentRunId);
       if (!state) break;
@@ -191,14 +276,18 @@ export class WorkflowScriptResources {
           : undefined;
       const admission = this.admissionContext.getStore();
       const matchingAdmission =
-        admission && (admission.runId === undefined || admission.runId === state.runId)
+        admission && !admission.rejected && (admission.runId === undefined || admission.runId === state.runId)
           ? admission
           : undefined;
       if (matchingAdmission && matchingAdmission.runId === undefined) matchingAdmission.runId = state.runId;
+      const initialAdmissionSave = matchingAdmission !== undefined && !matchingAdmission.initialSaveAttempted;
+      if (initialAdmissionSave) matchingAdmission.initialSaveAttempted = true;
 
       const admissionMetadata: StoredRunMetadata | undefined = matchingAdmission
         ? {
             scriptSource: matchingAdmission.scriptSource,
+            script: matchingAdmission.script,
+            args: matchingAdmission.args,
             resumeSourceRunId: matchingAdmission.resumeSourceRunId,
             ancestorRunIds: matchingAdmission.ancestorRunIds,
             elicitationController: matchingAdmission.elicitationController,
@@ -210,12 +299,12 @@ export class WorkflowScriptResources {
         );
       }
       const metadata = committedMetadata ?? embeddedMetadata ?? admissionMetadata;
-      const newlyAdmitted =
-        committedMetadata === undefined && embeddedMetadata === undefined && matchingAdmission !== undefined;
-
       const persisted: PersistedMcpRunState = metadata
         ? {
             ...state,
+            ...(metadata.script === undefined
+              ? {}
+              : { script: metadata.script, args: metadata.args }),
             scriptSource: metadata.scriptSource,
             ...(metadata.resumeSourceRunId
               ? {
@@ -228,8 +317,12 @@ export class WorkflowScriptResources {
           }
         : state;
       save(persisted);
+      if (initialAdmissionSave && matchingAdmission) {
+        matchingAdmission.initialSaveSucceeded = true;
+        admitExecutionArgs(state.args);
+      }
       if (metadata && committedMetadata === undefined) this.metadataByRunId.set(state.runId, metadata);
-      if (newlyAdmitted && matchingAdmission) {
+      if (initialAdmissionSave && matchingAdmission) {
         matchingAdmission.resourceAvailable = true;
         void this.mcp.sendResourceListChanged();
       }
@@ -239,10 +332,11 @@ export class WorkflowScriptResources {
     this.persistence.delete = (runId) => {
       const deleted = remove(runId);
       if (deleted) {
+        const rejectedAdmission = this.rejectedRunIds.delete(runId);
         const uri = workflowScriptUri(runId);
         this.subscriptions.delete(uri);
         this.metadataByRunId.delete(runId);
-        void this.mcp.sendResourceListChanged();
+        if (!rejectedAdmission) void this.mcp.sendResourceListChanged();
       }
       return deleted;
     };
@@ -298,7 +392,10 @@ export class WorkflowScriptResources {
       return {};
     });
     this.mcp.server.setRequestHandler(UnsubscribeRequestSchema, (request) => {
-      this.subscriptions.delete(request.params.uri);
+      const uri = request.params.uri;
+      const runId = workflowRunIdFromScriptUri(uri);
+      if (!runId || !this.persistence.load(runId)) resourceNotFound(uri);
+      this.subscriptions.delete(uri);
       return {};
     });
   }

@@ -29,13 +29,13 @@ import type {
   ExecOptions,
   PersistedRunState,
   WorkflowSnapshot,
-  AgentRunner,
+  JournalEntry,
   WorkflowBackendConfig,
   WorkflowRunResult,
   WorkflowRunStatus,
   WorkflowResumeReport,
 } from "@automatalabs/workflows";
-import type { TokenUsage } from "@automatalabs/shared-types";
+import type { AgentRunner, RunOptions, TokenUsage } from "@automatalabs/shared-types";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
@@ -47,7 +47,11 @@ import type {
 import { createAwaitProgressReporter, createProgressReporter } from "./progress.js";
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
-import { WorkflowScriptResources, workflowScriptUri } from "./workflow-resources.js";
+import {
+  prepareWorkflowAdmissionExecution,
+  WorkflowScriptResources,
+  workflowScriptUri,
+} from "./workflow-resources.js";
 import type { WorkflowAdmission } from "./workflow-resources.js";
 
 const SERVER_NAME = "agentprism-workflow";
@@ -57,6 +61,37 @@ const SERVER_VERSION = (require("../package.json") as { version: string }).versi
 export const MAX_BACKGROUND_RUNS = 4;
 
 const TERMINAL_STATUSES = new Set(["paused", "completed", "failed", "aborted"]);
+
+interface AdmissionExecutionGate {
+  runner: AgentRunner;
+  admit(): void;
+  deny(): void;
+}
+
+function createAdmissionExecutionGate(delegate: AgentRunner): AdmissionExecutionGate {
+  let decision: "admitted" | "denied" | undefined;
+  let release!: () => void;
+  const decided = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const run = async (prompt: string, options?: RunOptions): Promise<unknown> => {
+    await decided;
+    if (decision !== "admitted") {
+      throw new Error("Workflow execution was denied because admission did not become durable");
+    }
+    return delegate.run(prompt, options);
+  };
+  const settle = (next: "admitted" | "denied") => {
+    if (decision !== undefined) return;
+    decision = next;
+    release();
+  };
+  return {
+    runner: { run } as AgentRunner,
+    admit: () => settle("admitted"),
+    deny: () => settle("denied"),
+  };
+}
 
 function isTerminalStatus(status: WorkflowRunStatus["status"]): boolean {
   return TERMINAL_STATUSES.has(status);
@@ -518,10 +553,50 @@ function formatInspectionSummary(status: WorkflowRunStatus): string {
 }
 
 const MAX_INSPECTION_STRUCTURED_BYTES = 24_576;
+const MAX_INSPECTION_SCALAR_BYTES = 512;
+const MAX_INSPECTION_PHASES = 64;
+
+interface RetainedInspectionText {
+  shortened: boolean;
+  redacted: boolean;
+}
+
+interface InspectionRetentionMetadata {
+  phases: RetainedInspectionText[];
+  logs: RetainedInspectionText[];
+}
+
+function retainedInspectionText(value: string): RetainedInspectionText {
+  const redacted = redactText(value);
+  return {
+    shortened: truncateUtf8(redacted.value, MAX_INSPECTION_SCALAR_BYTES) !== redacted.value,
+    redacted: redacted.redacted,
+  };
+}
+
+function inspectionRetentionMetadata(
+  manager: WorkflowManager,
+  runId: string,
+  status: WorkflowRunStatus,
+): InspectionRetentionMetadata {
+  const live = manager.getRun(runId);
+  const persisted = live ? undefined : manager.getPersistence().load(runId);
+  const sourcePhases = live?.snapshot.phases ?? persisted?.phases ?? [];
+  const sourceLogs = live?.snapshot.logs ?? persisted?.logs ?? [];
+  const phaseCandidates = sourcePhases.slice(-MAX_INSPECTION_PHASES).map(retainedInspectionText);
+  const logCandidates = (
+    status.filter.logLines === 0 ? [] : sourceLogs.slice(-status.filter.logLines)
+  ).map(retainedInspectionText);
+  return {
+    phases: status.phases.length === 0 ? [] : phaseCandidates.slice(-status.phases.length),
+    logs: status.logTail.lines.length === 0 ? [] : logCandidates.slice(-status.logTail.lines.length),
+  };
+}
 
 function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields extends object>(
   status: Status,
   fields: Fields,
+  retention: InspectionRetentionMetadata,
 ): Status & Fields {
   const projected: Status & Fields = {
     ...status,
@@ -536,6 +611,26 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
     },
     ...fields,
   };
+  const phaseRetention = [...retention.phases];
+  const logRetention = [...retention.logs];
+  const refreshCounters = () => {
+    projected.logTail.omittedLines = projected.logTail.totalLines - projected.logTail.lines.length;
+    projected.logTail.truncatedLines = logRetention.filter((line) => line.shortened).length;
+    projected.logTail.redactedLines = logRetention.filter((line) => line.redacted).length;
+    projected.truncation.phases.returned = projected.phases.length;
+    projected.truncation.phases.shortened = phaseRetention.filter((phase) => phase.shortened).length;
+    projected.truncation.logs.returned = projected.logTail.lines.length;
+    projected.truncation.logs.shortened = projected.logTail.truncatedLines;
+    projected.truncation.logs.redacted = projected.logTail.redactedLines;
+    projected.truncation.calls.returned = projected.calls.length;
+    projected.truncation.calls.shortenedResults = projected.calls.filter(
+      (call) => call.resultTruncated,
+    ).length;
+    projected.truncation.calls.redactedResults = projected.calls.filter(
+      (call) => call.resultRedacted,
+    ).length;
+  };
+  refreshCounters();
   const structuredBytes = () => Buffer.byteLength(JSON.stringify(projected), "utf8");
   const mandatoryEnvelope = {
     ...projected,
@@ -564,22 +659,25 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
 
   while (projected.calls.length > 0 && tooLarge()) {
     projected.calls.shift();
-    projected.truncation.calls.returned = projected.calls.length;
+    refreshCounters();
     projected.truncation.byteCapApplied = true;
   }
   while (projected.logTail.lines.length > 0 && tooLarge()) {
     projected.logTail.lines.shift();
-    projected.logTail.omittedLines = Math.max(
-      projected.logTail.omittedLines,
-      projected.logTail.totalLines - projected.logTail.lines.length,
-    );
-    projected.truncation.logs.returned = projected.logTail.lines.length;
+    logRetention.shift();
+    refreshCounters();
     projected.truncation.byteCapApplied = true;
   }
   while (projected.phases.length > 0 && tooLarge()) {
-    projected.phases.pop();
-    projected.truncation.phases.returned = projected.phases.length;
+    projected.phases.shift();
+    phaseRetention.shift();
+    refreshCounters();
     projected.truncation.byteCapApplied = true;
+  }
+  if (tooLarge()) {
+    delete projected.reason;
+    delete projected.errorCode;
+    delete projected.currentPhase;
   }
   return projected;
 }
@@ -615,8 +713,11 @@ function requireAdmissionResource(
   manager: WorkflowManager,
   scriptResources: WorkflowScriptResources,
   admission: WorkflowAdmission,
+  rejectExecution: () => void,
 ): void {
   if (scriptResources.admissionResourceAvailable(admission)) return;
+
+  rejectExecution();
 
   if (admission.runId) {
     const live = manager.getRun(admission.runId);
@@ -632,6 +733,48 @@ function requireAdmissionResource(
     ErrorCode.InternalError,
     "Workflow admission failed because its script resource could not be persisted; no run was admitted.",
   );
+}
+
+function requireDurableStoppedRun(manager: WorkflowManager, runId: string): void {
+  const persistence = manager.getPersistence();
+  const persisted = persistence.load(runId);
+  if (persisted?.status !== "aborted") {
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Workflow stop for runId "${runId}" could not be durably acknowledged: the persisted status is ${persisted?.status ?? "missing"}, not aborted.`,
+    );
+  }
+  if (
+    persisted.eventLogIncomplete ||
+    persisted.eventStreamId === undefined ||
+    persisted.eventSeq === undefined ||
+    persisted.eventSeq < 1
+  ) {
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Workflow stop for runId "${runId}" could not be durably acknowledged: its stopped event is not durably readable.`,
+    );
+  }
+
+  let stoppedEventIsDurable = false;
+  try {
+    const events = persistence.readEvents(runId, {
+      after: persisted.eventSeq - 1,
+      streamId: persisted.eventStreamId,
+      limit: 1,
+    });
+    stoppedEventIsDurable = events.events.some(
+      (record) => record.seq === persisted.eventSeq && record.event.type === "stopped",
+    );
+  } catch {
+    stoppedEventIsDurable = false;
+  }
+  if (!stoppedEventIsDurable) {
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Workflow stop for runId "${runId}" could not be durably acknowledged: its terminal stopped event is missing.`,
+    );
+  }
 }
 
 function normalizeTokenUsage(
@@ -950,10 +1093,14 @@ export function createWorkflowServer(
           };
         }
         const lineage = scriptResources.lineage(parsedInput.runId);
-        const projected = addInspectionResourceFields(status, {
-          scriptUri: workflowScriptUri(parsedInput.runId),
-          lineage,
-        });
+        const projected = addInspectionResourceFields(
+          status,
+          {
+            scriptUri: workflowScriptUri(parsedInput.runId),
+            lineage,
+          },
+          inspectionRetentionMetadata(manager, parsedInput.runId, status),
+        );
         return {
           structuredContent: { ...projected },
           content: [
@@ -1000,6 +1147,7 @@ export function createWorkflowServer(
             }
           } else {
             scriptResources.cancelPendingElicitation(parsedInput.runId);
+            requireDurableStoppedRun(manager, parsedInput.runId);
           }
         }
 
@@ -1017,12 +1165,16 @@ export function createWorkflowServer(
           );
         }
         const lineage = scriptResources.lineage(parsedInput.runId);
-        const projected = addInspectionResourceFields(status, {
-          scriptUri: workflowScriptUri(parsedInput.runId),
-          lineage,
-          stopped,
-          alreadyTerminal,
-        });
+        const projected = addInspectionResourceFields(
+          status,
+          {
+            scriptUri: workflowScriptUri(parsedInput.runId),
+            lineage,
+            stopped,
+            alreadyTerminal,
+          },
+          inspectionRetentionMetadata(manager, parsedInput.runId, status),
+        );
         const result: WorkflowStopResult = { ...projected, status: status.status };
         const currentLink = scriptResources
           .links(lineage)
@@ -1128,12 +1280,16 @@ export function createWorkflowServer(
           elapsedMs: Math.max(0, Date.now() - startedAt),
           returnedBecause,
         };
-        const projected = addInspectionResourceFields(status, {
-          wait,
-          ...(tokenUsage === undefined ? {} : { tokenUsage }),
-          scriptUri: workflowScriptUri(parsedInput.runId),
-          lineage,
-        });
+        const projected = addInspectionResourceFields(
+          status,
+          {
+            wait,
+            ...(tokenUsage === undefined ? {} : { tokenUsage }),
+            scriptUri: workflowScriptUri(parsedInput.runId),
+            lineage,
+          },
+          inspectionRetentionMetadata(manager, parsedInput.runId, status),
+        );
         const result: WorkflowRunAwaitResult = {
           ...projected,
           ...(outcome === undefined ? {} : { outcome }),
@@ -1151,6 +1307,8 @@ export function createWorkflowServer(
       const input = clampWorkflowInput(parsedInput);
       const scriptSource = input.script === undefined ? "path" as const : "inline" as const;
       const admittedScript = input.script ?? readScriptAtAdmission(input.scriptPath);
+      const parsedScript = parseWorkflowScript(admittedScript);
+      const execution = prepareWorkflowAdmissionExecution(admittedScript, parsedScript.body, input.args);
       let backgroundReservation = false;
       if (input.background) {
         if (!backgroundRuns.reserve()) {
@@ -1189,12 +1347,16 @@ export function createWorkflowServer(
           resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,
         };
+        const admissionController = new AbortController();
+        const executionGate = createAdmissionExecutionGate(runner);
+        exec.agent = executionGate.runner;
+        exec.signal = admissionController.signal;
 
         let elicitationController: AbortController | undefined;
         let cancelElicitationFromRequest: (() => void) | undefined;
         if (!input.background) {
           const reporter = createProgressReporter(extra);
-          exec.signal = extra.signal;
+          exec.signal = AbortSignal.any([extra.signal, admissionController.signal]);
           // The engine drives progress with the live snapshot; project it onto the MCP wire
           // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
           exec.onProgress = (snapshot: WorkflowSnapshot) => {
@@ -1218,14 +1380,20 @@ export function createWorkflowServer(
         if (input.background) {
           const admission = scriptResources.beginAdmission({
             script: admittedScript,
+            args: input.args,
             scriptSource,
             resumeSourceRunId: input.resumeFromRunId,
           });
           try {
             const started = scriptResources.runAdmission(admission, () =>
-              manager.startInBackground(admittedScript, input.args, exec),
+              manager.startInBackground(execution.script, execution.args, exec),
             );
-            requireAdmissionResource(manager, scriptResources, admission);
+            requireAdmissionResource(manager, scriptResources, admission, () => {
+              scriptResources.rejectAdmission(admission);
+              executionGate.deny();
+              admissionController.abort();
+            });
+            executionGate.admit();
             const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
             backgroundRuns.track(started.runId, started.promise);
             backgroundReservation = false;
@@ -1264,17 +1432,25 @@ export function createWorkflowServer(
         // surfaces it as a tool error.
         const admission = scriptResources.beginAdmission({
           script: admittedScript,
+          args: input.args,
           scriptSource,
           resumeSourceRunId: input.resumeFromRunId,
           elicitationController,
         });
         let run: WorkflowRunResult;
         try {
-          run = await scriptResources.runAdmission(admission, () =>
-            manager.runSync(admittedScript, input.args, exec),
+          const pendingRun = scriptResources.runAdmission(admission, () =>
+            manager.runSync(execution.script, execution.args, exec),
           );
-          requireAdmissionResource(manager, scriptResources, admission);
+          requireAdmissionResource(manager, scriptResources, admission, () => {
+            scriptResources.rejectAdmission(admission);
+            executionGate.deny();
+            admissionController.abort();
+          });
+          executionGate.admit();
+          run = await pendingRun;
         } finally {
+          executionGate.deny();
           scriptResources.finishAdmission(admission);
           if (cancelElicitationFromRequest) {
             extra.signal.removeEventListener("abort", cancelElicitationFromRequest);

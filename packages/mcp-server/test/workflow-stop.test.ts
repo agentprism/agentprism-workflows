@@ -8,6 +8,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { RunOptions } from "@automatalabs/shared-types";
+import {
+  WorkflowManager,
+  type PersistedRunState,
+  type RunPersistence,
+} from "@automatalabs/workflows";
 
 import { createWorkflowServer } from "../src/index.js";
 
@@ -46,6 +51,57 @@ class AbortAwareRunner {
         );
       }),
   );
+}
+
+function faultablePersistence(root: string): {
+  persistence: RunPersistence;
+  load(runId: string): PersistedRunState | null;
+  setSaveFailure(fail: boolean): void;
+} {
+  const records = new Map<string, PersistedRunState>();
+  const leases = new Map<string, string>();
+  let leaseSequence = 0;
+  let failSave = false;
+  const persistence: RunPersistence = {
+    save(state) {
+      if (failSave) throw new Error("injected terminal snapshot save failure");
+      records.set(state.runId, structuredClone(state));
+    },
+    load(runId) {
+      const state = records.get(runId);
+      return state ? structuredClone(state) : null;
+    },
+    list: () => [...records.values()].map((state) => structuredClone(state)),
+    delete: (runId) => records.delete(runId),
+    acquireRunLease(runId) {
+      if (leases.has(runId)) return null;
+      const token = `${runId}-${leaseSequence++}`;
+      leases.set(runId, token);
+      return { runId, token };
+    },
+    releaseRunLease(lease) {
+      if (leases.get(lease.runId) === lease.token) leases.delete(lease.runId);
+    },
+    getRunsDir: () => root,
+  };
+  return {
+    persistence,
+    load: (runId) => persistence.load(runId),
+    setSaveFailure(fail) {
+      failSave = fail;
+    },
+  };
+}
+
+async function connectWithManager(
+  runner: ReturnType<typeof makeRunner>,
+  manager: WorkflowManager,
+): Promise<{ client: Client; server: ReturnType<typeof createWorkflowServer> }> {
+  const server = createWorkflowServer(runner, { manager });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "stop-fault-client", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  return { client, server };
 }
 
 async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
@@ -158,6 +214,127 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     for (const call of controlled.calls) call.resolve("cleanup");
     await dispose();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stop refuses a final acknowledgement when the terminal snapshot save fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-stop-save-fault-"));
+  const store = faultablePersistence(root);
+  const controlled = new AbortAwareRunner();
+  const manager = new WorkflowManager({ cwd: root, agent: controlled.runner, persistence: store.persistence });
+  const first = await connectWithManager(controlled.runner, manager);
+  let fresh: Awaited<ReturnType<typeof connectWithManager>> | undefined;
+  try {
+    const accepted = await first.client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "stop-save-fault", description: "fault" };',
+          'return await agent("block");',
+        ].join("\n"),
+        background: true,
+      },
+    });
+    const runId = runIdOf(accepted);
+    await waitUntil(() => controlled.calls.length === 1, "the background runner should start");
+    store.setSaveFailure(true);
+
+    const stopped = await first.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId },
+    });
+    assert.equal(stopped.isError, true);
+    assert.equal(stopped.structuredContent, undefined);
+    assert.match(textOf(stopped), /could not be durably acknowledged/i);
+    assert.match(textOf(stopped), /persisted status is running/i);
+    assert.equal(store.load(runId)?.status, "running");
+
+    store.setSaveFailure(false);
+    await first.client.close();
+    await first.server.close();
+    const freshRunner = okRunner();
+    const freshManager = new WorkflowManager({ cwd: root, agent: freshRunner, persistence: store.persistence });
+    fresh = await connectWithManager(freshRunner, freshManager);
+    const inspected = await fresh.client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId },
+    });
+    assert.equal(structured(inspected)?.status, "paused");
+    const coldStop = await fresh.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId },
+    });
+    assert.equal(coldStop.isError, true);
+    assert.match(textOf(coldStop), /nothing live to stop in this server process/i);
+  } finally {
+    store.setSaveFailure(false);
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await first.client.close().catch(() => {});
+    await first.server.close().catch(() => {});
+    await fresh?.client.close().catch(() => {});
+    await fresh?.server.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stop refuses a final acknowledgement when the stopped event append fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-stop-event-fault-"));
+  const store = faultablePersistence(root);
+  const controlled = new AbortAwareRunner();
+  const manager = new WorkflowManager({ cwd: root, agent: controlled.runner, persistence: store.persistence });
+  const eventPersistence = manager.getPersistence();
+  const appendEvent = eventPersistence.appendEvent.bind(eventPersistence);
+  eventPersistence.appendEvent = (runId, input) => {
+    if (input.event.type === "stopped") throw new Error("injected stopped event append failure");
+    return appendEvent(runId, input);
+  };
+  const first = await connectWithManager(controlled.runner, manager);
+  let fresh: Awaited<ReturnType<typeof connectWithManager>> | undefined;
+  try {
+    const accepted = await first.client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "stop-event-fault", description: "fault" };',
+          'return await agent("block");',
+        ].join("\n"),
+        background: true,
+      },
+    });
+    const runId = runIdOf(accepted);
+    await waitUntil(() => controlled.calls.length === 1, "the background runner should start");
+
+    const stopped = await first.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId },
+    });
+    assert.equal(stopped.isError, true);
+    assert.equal(stopped.structuredContent, undefined);
+    assert.match(textOf(stopped), /could not be durably acknowledged/i);
+    assert.match(textOf(stopped), /stopped event is not durably readable/i);
+    assert.equal(store.load(runId)?.status, "aborted");
+    assert.equal(store.load(runId)?.eventLogIncomplete, true);
+
+    await first.client.close();
+    await first.server.close();
+    const freshRunner = okRunner();
+    const freshManager = new WorkflowManager({ cwd: root, agent: freshRunner, persistence: store.persistence });
+    fresh = await connectWithManager(freshRunner, freshManager);
+    const coldStop = await fresh.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId },
+    });
+    assert.equal(coldStop.isError, false);
+    assert.equal(structured(coldStop)?.status, "aborted");
+    assert.equal(structured(coldStop)?.stopped, false);
+    assert.equal(structured(coldStop)?.alreadyTerminal, true);
+  } finally {
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await first.client.close().catch(() => {});
+    await first.server.close().catch(() => {});
+    await fresh?.client.close().catch(() => {});
+    await fresh?.server.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
