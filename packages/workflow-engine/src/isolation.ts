@@ -10,6 +10,7 @@ import type {
 } from "@automatalabs/shared-types";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { captureRunEnvironment } from "./run-environment.js";
+import { buildResumeExactIndex, environmentsEqual, resumeExactKey } from "./resume-identity.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -562,16 +563,6 @@ function validateStructure(recording: PersistedRunState): void {
   }
 }
 
-function sameEnvironment(
-  left: PersistedRunState["environment"],
-  right: PersistedRunState["environment"],
-): boolean {
-  if (left?.git && right?.git) {
-    return left.git.head === right.git.head && left.git.dirtyDigest === right.git.dirtyDigest;
-  }
-  return left?.key !== undefined && right?.key !== undefined && left.key === right.key;
-}
-
 function preflight(recording: PersistedRunState, options: PreflightOptions = {}): PreflightResult {
   validateStructure(recording);
   const calls = recording.calls ?? [];
@@ -668,14 +659,14 @@ function preflight(recording: PersistedRunState, options: PreflightOptions = {})
     });
   }
 
-  const identities = new Map<string, number[]>();
-  for (const row of calls) {
-    const key = `${row.kind}\u0000${row.path ?? ""}\u0000${row.hash}`;
-    const group = identities.get(key) ?? [];
-    group.push(row.index);
-    identities.set(key, group);
-  }
-  const ambiguousIndexes = [...identities.values()].filter((group) => group.length > 1).flat();
+  const identities = buildResumeExactIndex(calls, (row) => ({
+    kind: row.kind,
+    path: row.path ?? "",
+    hash: row.hash,
+  }));
+  const ambiguousIndexes = [...identities.values()]
+    .filter((group) => group.length > 1)
+    .flatMap((group) => group.map((row) => row.index));
   if (ambiguousIndexes.length > 0) {
     failRecording(recording, "ambiguous-identity", "recording contains duplicate call identities", {
       indexes: ambiguousIndexes.sort((a, b) => a - b),
@@ -715,7 +706,7 @@ function preflight(recording: PersistedRunState, options: PreflightOptions = {})
     failRecording(recording, "no-environment-identity", "recording has no environment identity");
   }
   const currentEnvironment = captureRunEnvironment(executionCwd, options.environmentKey);
-  if (!sameEnvironment(recording.environment, currentEnvironment)) {
+  if (!environmentsEqual(recording.environment, currentEnvironment)) {
     failRecording(recording, "environment-mismatch", "recording environment identity does not match", {
       field: recording.environment.git ? "environment.git" : "environment.key",
     });
@@ -940,22 +931,18 @@ class ReplayRunnerImplementation implements ReplayRunner {
     this.journalByIndex = new Map((recording.journal ?? []).map((entry) => [entry.index, entry]));
     for (const row of this.calls) {
       this.rowsByIndex.set(row.index, row);
-      this.rowsByIdentity.set(this.identity(row.kind, row.path as string, row.hash), row);
+      this.rowsByIdentity.set(resumeExactKey(row.kind, row.path as string, row.hash), row);
       const byPath = row.kind === "agent" ? this.agentRowsByPath : this.checkpointRowsByPath;
       const pathRows = byPath.get(row.path as string) ?? [];
       pathRows.push(row);
       byPath.set(row.path as string, pathRows);
     }
     for (const target of targets) {
-      this.targetByIdentity.set(this.identity("agent", target.path, target.hash), target);
+      this.targetByIdentity.set(resumeExactKey("agent", target.path, target.hash), target);
       const pathTargets = this.targetsByPath.get(target.path) ?? [];
       pathTargets.push(target);
       this.targetsByPath.set(target.path, pathTargets);
     }
-  }
-
-  private identity(kind: "agent" | "checkpoint", path: string, hash: string): string {
-    return `${kind}\u0000${path}\u0000${hash}`;
   }
 
   private bindingKey(scope: string, callIndex: number): string {
@@ -1090,7 +1077,7 @@ class ReplayRunnerImplementation implements ReplayRunner {
       });
     }
 
-    const exactTarget = this.targetByIdentity.get(this.identity("agent", path, hash));
+    const exactTarget = this.targetByIdentity.get(resumeExactKey("agent", path, hash));
     if (exactTarget && !this.visited.has(exactTarget.recordedIndex)) {
       const row = this.rowForTarget(exactTarget);
       const fingerprintMatches =
@@ -1124,7 +1111,7 @@ class ReplayRunnerImplementation implements ReplayRunner {
       return (await this.delegate(binding, prompt, options)) as AgentResult<S>;
     }
 
-    const exactRow = this.rowsByIdentity.get(this.identity("agent", path, hash));
+    const exactRow = this.rowsByIdentity.get(resumeExactKey("agent", path, hash));
     if (exactRow) {
       const reserved = this.targets.some((target) => target.recordedIndex === exactRow.index);
       if (reserved) {
@@ -1261,7 +1248,7 @@ class ReplayRunnerImplementation implements ReplayRunner {
       });
     }
 
-    let row = this.rowsByIdentity.get(this.identity("checkpoint", context.path, context.hash));
+    let row = this.rowsByIdentity.get(resumeExactKey("checkpoint", context.path, context.hash));
     let hashMatched = true;
     if (row && this.visited.has(row.index)) {
       throw this.diverge({
