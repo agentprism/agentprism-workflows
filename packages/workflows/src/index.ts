@@ -27,7 +27,19 @@ type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
-export { runWorkflow, parseWorkflowScript, redactText, truncateUtf8 } from "@automatalabs/workflow-engine";
+export {
+  runWorkflow,
+  parseWorkflowScript,
+  redactText,
+  truncateUtf8,
+  CALL_PATH_FORMAT,
+  CALL_INPUTS_FORMAT,
+  CHECKPOINT_INPUTS_FORMAT,
+  RESUME_FALLBACK_REASONS,
+  RESUME_DISABLED_REASONS,
+  RESUME_CALL_LIVE_REASONS,
+  RESUME_CALL_FAILED_REASONS,
+} from "@automatalabs/workflow-engine";
 
 // ── Isolation mode: deterministic substitution testing over a recorded run. The SDK
 //    wrapper defaults the live target runner to ACP and owns that runner's disposal. ──
@@ -91,6 +103,11 @@ export type {
   RunPersistenceOptions,
   PersistedRunState,
   PersistedAgentState,
+  PersistedResumeFormat,
+  PersistedResumeCandidate,
+  PersistedCheckpointInjection,
+  PersistedResumeSeed,
+  PreparedResume,
   WorkflowLogTail,
   WorkflowRunCallStatus,
   WorkflowRunInspectionOptions,
@@ -99,6 +116,17 @@ export type {
   WorkflowRunFallback,
   WorkflowCheckpointSource,
   WorkflowCheckpointTaken,
+  ResumePolicy,
+  WorkflowResumeStrategy,
+  WorkflowResumeMatch,
+  WorkflowResumeFallbackReason,
+  WorkflowResumeDisabledReason,
+  WorkflowResumeCallLiveReason,
+  WorkflowResumeCallFailedReason,
+  WorkflowResumeSafety,
+  WorkflowCallReplayProvenance,
+  WorkflowResumeCallDecision,
+  WorkflowResumeReport,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,

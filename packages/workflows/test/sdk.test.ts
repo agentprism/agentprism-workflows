@@ -53,6 +53,13 @@ import {
   RUN_EVENT_READ_LIMIT_MAX,
   RUN_EVENT_MAX_RECORD_BYTES,
   RUN_EVENT_LOG_VERSION,
+  CALL_PATH_FORMAT,
+  CALL_INPUTS_FORMAT,
+  CHECKPOINT_INPUTS_FORMAT,
+  RESUME_FALLBACK_REASONS,
+  RESUME_DISABLED_REASONS,
+  RESUME_CALL_LIVE_REASONS,
+  RESUME_CALL_FAILED_REASONS,
 } from "../src/index.js";
 import type {
   AcpEventContext,
@@ -67,6 +74,11 @@ import type {
   RunOptions,
   PersistedAgentState,
   PersistedRunState,
+  PersistedResumeFormat,
+  PersistedResumeCandidate,
+  PersistedCheckpointInjection,
+  PersistedResumeSeed,
+  PreparedResume,
   RunPersistenceOptions,
   WorkflowPathOptions,
   // §4.2 type re-exports — the runner-facing auth surface the SDK facade re-exports.
@@ -135,6 +147,17 @@ import type {
   RunIsolationOptions,
   RunIsolationSdkOptions,
   WorkflowCallRecord,
+  ResumePolicy,
+  WorkflowResumeStrategy,
+  WorkflowResumeMatch,
+  WorkflowResumeFallbackReason,
+  WorkflowResumeDisabledReason,
+  WorkflowResumeCallLiveReason,
+  WorkflowResumeCallFailedReason,
+  WorkflowResumeSafety,
+  WorkflowCallReplayProvenance,
+  WorkflowResumeCallDecision,
+  WorkflowResumeReport,
   WorkflowRecordedError,
 } from "../src/index.js";
 import { __setDefaultRunnerFactoryForTests } from "../src/isolation.js";
@@ -225,6 +248,45 @@ function managerAgentEventOverloadFixture(
 }
 void managerAgentEventOverloadFixture;
 void (undefined as unknown as IsolationTypeSurface);
+
+type IncrementalResumeSurface = [
+  PersistedResumeFormat,
+  PersistedResumeCandidate,
+  PersistedCheckpointInjection,
+  PersistedResumeSeed,
+  PreparedResume,
+  ResumePolicy,
+  WorkflowResumeStrategy,
+  WorkflowResumeMatch,
+  WorkflowResumeFallbackReason,
+  WorkflowResumeDisabledReason,
+  WorkflowResumeCallLiveReason,
+  WorkflowResumeCallFailedReason,
+  WorkflowResumeSafety,
+  WorkflowCallReplayProvenance,
+  WorkflowResumeCallDecision,
+  WorkflowResumeReport,
+];
+void (undefined as unknown as IncrementalResumeSurface);
+
+test("incremental resume constants are re-exported by the SDK facade", () => {
+  assert.equal(CALL_PATH_FORMAT, 1);
+  assert.equal(CALL_INPUTS_FORMAT, 1);
+  assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
+  assert.deepEqual(RESUME_FALLBACK_REASONS, [
+    "legacy-recording",
+    "forced-positional",
+    "unsafe-recording",
+    "nested-workflows",
+    "legacy-resume",
+  ]);
+  assert.equal(RESUME_DISABLED_REASONS.length, 12);
+  assert.equal(RESUME_CALL_LIVE_REASONS.length, 14);
+  assert.deepEqual(RESUME_CALL_FAILED_REASONS, [
+    "seed-persistence-error",
+    "resume-fatal-latch",
+  ]);
+});
 
 const mockAnswerSequence: MockAnswerSequence = { $sequence: [{ ok: false }, { ok: true }] };
 const mockAnswers: MockAnswers = { "quality:*": mockAnswerSequence };

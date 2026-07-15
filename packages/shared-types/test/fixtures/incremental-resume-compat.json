@@ -1,0 +1,67 @@
+{
+  "old": {
+    "journalEntry": {
+      "index": 0,
+      "hash": "legacy-journal-hash",
+      "result": "cached"
+    },
+    "workflowCallRecord": {
+      "index": 0,
+      "kind": "agent",
+      "hash": "legacy-call-hash",
+      "outcome": "result",
+      "origin": "runner"
+    },
+    "workflowRunResult": {
+      "runId": "legacy-run",
+      "status": "completed",
+      "meta": {
+        "name": "legacy",
+        "description": "legacy result"
+      },
+      "result": null,
+      "phases": [],
+      "agentCount": 0,
+      "durationMs": 1,
+      "logs": []
+    }
+  },
+  "future": {
+    "journalEntry": {
+      "index": 1,
+      "hash": "future-journal-hash",
+      "result": {
+        "ok": true
+      },
+      "futureResumeContract": {
+        "version": 2
+      }
+    },
+    "workflowCallRecord": {
+      "index": 1,
+      "kind": "checkpoint",
+      "hash": "future-call-hash",
+      "outcome": "result",
+      "origin": "confirm",
+      "futureResumeContract": {
+        "version": 2
+      }
+    },
+    "workflowRunResult": {
+      "runId": "future-run",
+      "status": "completed",
+      "meta": {
+        "name": "future",
+        "description": "future result"
+      },
+      "result": true,
+      "phases": [],
+      "agentCount": 0,
+      "durationMs": 1,
+      "logs": [],
+      "futureResumeContract": {
+        "version": 2
+      }
+    }
+  }
+}

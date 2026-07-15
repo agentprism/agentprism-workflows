@@ -171,6 +171,141 @@ export interface JournalEntry {
   scope?: string;
 }
 
+/** Resume correspondence policy selected for a manager-prepared new execution. */
+export type ResumePolicy = "auto" | "positional";
+
+export type WorkflowResumeStrategy = "identity-v1" | "positional-v1" | "live";
+
+export type WorkflowResumeMatch = "path-hash" | "unique-hash" | "index-hash";
+
+export type WorkflowResumeFallbackReason =
+  | "legacy-recording"
+  | "forced-positional"
+  | "unsafe-recording"
+  | "nested-workflows"
+  | "legacy-resume";
+
+export type WorkflowResumeDisabledReason =
+  | "unsupported-format"
+  | "source-not-terminal"
+  | "abort-residue"
+  | "isolation-recording"
+  | "resume-metadata-missing"
+  | "manifest-invalid"
+  | "cwd-mismatch"
+  | "runtime-mismatch"
+  | "environment-missing"
+  | "environment-mismatch"
+  | "source-environment-drift"
+  | "resume-seed-invalid";
+
+export type WorkflowResumeCallLiveReason =
+  | "strategy-live"
+  | "positional-miss"
+  | "positional-suffix"
+  | "not-recorded"
+  | "path-missing"
+  | "inputs-missing"
+  | "inputs-changed"
+  | "ambiguous-identity"
+  | "ambiguous-content"
+  | "candidate-consumed"
+  | "empty-output"
+  | "safety-changed"
+  | "unsafe-suffix"
+  | "worktree-degraded";
+
+export type WorkflowResumeCallFailedReason =
+  | "seed-persistence-error"
+  | "resume-fatal-latch";
+
+export type WorkflowResumeSafety =
+  | "declared-read-only"
+  | "isolated-worktree";
+
+export interface WorkflowCallReplayProvenance {
+  sourceRunId: string;
+  recordedIndex: number;
+  match: WorkflowResumeMatch;
+  /** Preserved source cost. Applied to script-visible spent only by identity-v1;
+   *  absent for checkpoints and legacy rows without a source manifest. */
+  logicalBudgetDebit?: number;
+  /** Agents only: source row's admitted safety class. Required on every non-legacy
+   *  journal replay and equal to the current row's resumeSafety. */
+  sourceResumeSafety?: WorkflowResumeSafety;
+  /** Checkpoints only: the selected source outcome was produced by a host confirm or
+   *  inherited from one. Required to carry that eligibility across resume hops. */
+  checkpointHostDecision?: true;
+  checkpointInjected?: true;
+}
+
+export type WorkflowResumeCallDecision =
+  | {
+      index: number;
+      kind: "agent" | "checkpoint";
+      action: "replayed";
+      sourceRunId: string;
+      recordedIndex: number;
+      match: WorkflowResumeMatch;
+      reason?: never;
+      logicalBudgetDebit?: number;
+      checkpointInjected?: true;
+    }
+  | {
+      index: number;
+      kind: "agent" | "checkpoint";
+      action: "live";
+      reason: WorkflowResumeCallLiveReason;
+      sourceRunId?: never;
+      recordedIndex?: never;
+      match?: never;
+      logicalBudgetDebit?: never;
+      checkpointInjected?: never;
+    }
+  | {
+      index: number;
+      kind: "agent" | "checkpoint";
+      action: "failed";
+      reason: WorkflowResumeCallFailedReason;
+      sourceRunId?: never;
+      recordedIndex?: never;
+      match?: never;
+      logicalBudgetDebit?: never;
+      checkpointInjected?: never;
+    };
+
+interface WorkflowResumeReportBase {
+  sourceRunId: string;
+  requestedPolicy: ResumePolicy;
+  replayed: number;
+  live: number;
+  failed: number;
+  /** One decision per root call, ordered by current execution index. */
+  calls: WorkflowResumeCallDecision[];
+}
+
+export type WorkflowResumeReport = WorkflowResumeReportBase &
+  (
+    | {
+        strategy: "identity-v1";
+        fallbackReason?: never;
+        disabledReason?: never;
+        eligibility?: never;
+      }
+    | {
+        strategy: "positional-v1";
+        fallbackReason: WorkflowResumeFallbackReason;
+        eligibility: "legacy" | "safe-prefix" | "all-live";
+        disabledReason?: never;
+      }
+    | {
+        strategy: "live";
+        disabledReason: WorkflowResumeDisabledReason;
+        fallbackReason?: never;
+        eligibility?: never;
+      }
+  );
+
 /** One record per TERMINATED call of an engine run, emitted at the call's terminal
  *  transition — including calls that never journal (failures, caught throws,
  *  engine-side deaths, aborts). What the journal is to results, this is to structure. */
@@ -182,7 +317,8 @@ export interface WorkflowCallRecord {
   hash: string;
   /** The structural call-path key, when captured. */
   path?: string;
-  /** The input fingerprint, when computable. Agent calls only. */
+  /** hashCallInputs() for an agent or hashCheckpointInputs() for a checkpoint,
+   *  when the corresponding strict fingerprint was computable. */
   inputsHash?: string;
   /** options.label as resolved by the engine (agent calls). */
   label?: string;
@@ -219,6 +355,13 @@ export interface WorkflowCallRecord {
   /** What this logical call added to the run's script-visible spent value. Zero on
    *  journal-replayed rows; absent on checkpoint rows. */
   budgetDebit?: number;
+  /** Why this recorded agent result is safe for content-addressed mainline replay.
+   *  "declared-read-only" reflects the authored assertion at allocation.
+   *  "isolated-worktree" is written only after createWorktree() returned
+   *  isolated:true. Absent for checkpoints and every unproved agent call. */
+  resumeSafety?: WorkflowResumeSafety;
+  /** Manager-owned provenance for a resumeFromRunId journal replay. */
+  replay?: WorkflowCallReplayProvenance;
   /** 1-based position of this call's terminal transition in the run's settlement
    *  sequence. */
   settlementOrdinal?: number;
@@ -349,6 +492,8 @@ export interface WorkflowRunResult<T = unknown> {
   checkpointsTaken?: WorkflowCheckpointTaken[];
   /** The engine-owned authoritative manifest: one frozen record per terminated call. */
   calls?: WorkflowCallRecord[];
+  /** Manager-owned correspondence report for a resumeFromRunId execution. */
+  resumeReport?: WorkflowResumeReport;
   /** Final number of agent()/checkpoint() call indexes allocated by this engine run. */
   callsAllocated?: number;
   /** The resolved execution inputs in force for this engine run. Per-call

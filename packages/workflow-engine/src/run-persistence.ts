@@ -28,10 +28,12 @@ import type {
   JournalEntry,
   WorkflowCallRecord,
   WorkflowCheckpointTaken,
+  WorkflowResumeReport,
   WorkflowRunFallback,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { ReplayReport } from "./isolation.js";
+import type { RunEnvironmentIdentity } from "./run-environment.js";
 import { withRunEventsUsingFs, type RunEventPersistence } from "./run-event-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
@@ -65,6 +67,43 @@ export interface PersistedAgentState {
   provenance?: AgentResultProvenance;
 }
 
+export interface PersistedResumeFormat {
+  format: "identity-v1";
+  /** Captured only after the script has settled AND resume activity is zero, immediately
+   *  before the terminal save. Absent from a crash snapshot, a non-quiescent terminal
+   *  run, and an unsafe non-git execution whose static host key cannot recapture state. */
+  terminalEnvironment?: RunEnvironmentIdentity;
+}
+
+export interface PersistedResumeCandidate {
+  sourceRunId: string;
+  recordedIndex: number;
+  /** Frozen source values; entry.index/call.index remain the source index. */
+  entry: JournalEntry;
+  call: WorkflowCallRecord;
+  /** Logical debit preserved across resume hops. Agent candidates only. */
+  logicalBudgetDebit?: number;
+}
+
+export interface PersistedCheckpointInjection {
+  sourceRunId: string;
+  recordedIndex: number;
+  hash: string;
+  path: string;
+  /** hashCheckpointInputs() for the source pending checkpoint. */
+  inputsHash: string;
+  decision: unknown;
+}
+
+export interface PersistedResumeSeed {
+  format: "identity-v1";
+  /** Immediate run named by resumeFromRunId; individual candidates may originate in an
+   *  older hop and retain that run ID themselves. */
+  sourceRunId: string;
+  candidates: PersistedResumeCandidate[];
+  checkpointInjections?: PersistedCheckpointInjection[];
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -77,8 +116,17 @@ export interface PersistedRunState {
   cwd?: string;
   /** The directory the run actually executed in. */
   effectiveCwd?: string;
-  runtime?: { node: string; v8: string; pathFormat: number; inputsFormat: number };
-  environment?: { git?: { head: string; dirtyDigest: string }; key?: string };
+  runtime?: {
+    node: string;
+    v8: string;
+    pathFormat: number;
+    inputsFormat: number;
+    checkpointInputsFormat?: number;
+  };
+  environment?: RunEnvironmentIdentity;
+  resume?: PersistedResumeFormat;
+  resumeSeed?: PersistedResumeSeed;
+  resumeReport?: WorkflowResumeReport;
   /** The session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;

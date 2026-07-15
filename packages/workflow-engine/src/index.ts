@@ -6,6 +6,9 @@
 export {
   runWorkflow,
   parseWorkflowScript,
+  CALL_PATH_FORMAT,
+  CALL_INPUTS_FORMAT,
+  CHECKPOINT_INPUTS_FORMAT,
   type EngineRunResult,
   type WorkflowRunOptions,
   type WorkflowCallbackContext,
@@ -31,9 +34,20 @@ export {
   type RunStatus,
   type PersistedRunState,
   type PersistedAgentState,
+  type PersistedResumeFormat,
+  type PersistedResumeCandidate,
+  type PersistedCheckpointInjection,
+  type PersistedResumeSeed,
   type FsLayer,
   type RunPersistenceOptions,
 } from "./run-persistence.js";
+export {
+  RESUME_FALLBACK_REASONS,
+  RESUME_DISABLED_REASONS,
+  RESUME_CALL_LIVE_REASONS,
+  RESUME_CALL_FAILED_REASONS,
+  type PreparedResume,
+} from "./resume.js";
 export {
   RUN_EVENT_MAX_RECORD_BYTES,
   RUN_EVENT_READ_LIMIT_DEFAULT,
@@ -263,5 +277,16 @@ export type {
   WorkflowRunFallback,
   WorkflowCheckpointSource,
   WorkflowCheckpointTaken,
+  ResumePolicy,
+  WorkflowResumeStrategy,
+  WorkflowResumeMatch,
+  WorkflowResumeFallbackReason,
+  WorkflowResumeDisabledReason,
+  WorkflowResumeCallLiveReason,
+  WorkflowResumeCallFailedReason,
+  WorkflowResumeSafety,
+  WorkflowCallReplayProvenance,
+  WorkflowResumeCallDecision,
+  WorkflowResumeReport,
   TokenUsage,
 } from "@automatalabs/shared-types";
