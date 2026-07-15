@@ -30,8 +30,8 @@ importers:
         specifier: ^1.2.1
         version: 1.2.1(zod@4.4.3)
       '@automatalabs/codex-acp':
-        specifier: 1.6.4
-        version: 1.6.4
+        specifier: 1.6.5
+        version: 1.6.5
       '@automatalabs/shared-types':
         specifier: workspace:*
         version: link:../shared-types
@@ -184,8 +184,8 @@ packages:
       zod:
         optional: true
 
-  '@automatalabs/codex-acp@1.6.4':
-    resolution: {integrity: sha512-tVV484tLy3YRyWIc5r4W7tZpCj/OLQCdGE6MQNo0CElIqF1qzHpDZ/Sr4LfpzWEcBhdm0TbwpvVdQTvizUjjjQ==}
+  '@automatalabs/codex-acp@1.6.5':
+    resolution: {integrity: sha512-n4PaGBP09ZIzMPGeLd1w0eJlYdX0Exl2f+VpL4KmmWTMd7Jin71xQ22xiGEix+dGsZNfk03vskRFXI08VgrADg==}
     hasBin: true
 
   '@babel/runtime@7.29.7':
@@ -1302,7 +1302,7 @@ snapshots:
     optionalDependencies:
       zod: 4.4.3
 
-  '@automatalabs/codex-acp@1.6.4':
+  '@automatalabs/codex-acp@1.6.5':
     dependencies:
       '@agentclientprotocol/sdk': 1.2.1(zod@4.4.3)
       '@openai/codex': 0.144.4
