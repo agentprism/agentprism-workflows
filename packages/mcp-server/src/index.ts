@@ -19,6 +19,7 @@ export type {
   WorkflowAwaitToolInput,
   WorkflowExecuteToolInput,
   WorkflowInspectToolInput,
+  WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
 export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
@@ -27,6 +28,10 @@ export type {
   WorkflowBackgroundAccepted,
   WorkflowExecutionToolResult,
   WorkflowRunAwaitResult,
+  WorkflowScriptLineageEntry,
+  WorkflowScriptResourceFields,
+  WorkflowScriptSource,
+  WorkflowStopResult,
   WorkflowToolResult,
 } from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";

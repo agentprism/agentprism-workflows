@@ -31,7 +31,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises the exact run, inspect, and await field superset", () => {
+test("input shape: one tool advertises the exact run, inspect, await, and stop field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -51,10 +51,11 @@ test("input shape: one tool advertises the exact run, inspect, and await field s
       "resumePolicy",
       "runId",
       "script",
+      "scriptPath",
       "tokenBudget",
       "waitMs",
     ],
-    "the exact run/inspect/await wire fields",
+    "the exact run/inspect/await/stop wire fields",
   );
 });
 
@@ -100,6 +101,26 @@ test("background defaults false and accepts explicit false or true on run only",
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x" })).background, false);
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: false })).background, false);
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: true })).background, true);
+});
+
+test("script and scriptPath are an absolute-path XOR for every run and resume", () => {
+  assert.equal(parseWorkflowToolInput(Schema.parse({ scriptPath: "/tmp/workflow.js" })).scriptPath, "/tmp/workflow.js");
+  assert.equal(
+    parseWorkflowToolInput(Schema.parse({ action: "run", scriptPath: "/tmp/workflow.js", resumeFromRunId: "a-b" })).scriptPath,
+    "/tmp/workflow.js",
+  );
+  assert.throws(() => Schema.parse({ scriptPath: "relative/workflow.js" }), /scriptPath must be an absolute path/);
+  for (const input of [
+    {},
+    { action: "run" },
+    { script: "x", scriptPath: "/tmp/workflow.js" },
+    { action: "run", script: "x", scriptPath: "/tmp/workflow.js" },
+  ]) {
+    assert.throws(
+      () => parseWorkflowToolInput(Schema.parse(input)),
+      /exactly one of script or scriptPath is required/,
+    );
+  }
 });
 
 test("await applies its default and accepts the exact wait bounds", () => {
@@ -149,12 +170,32 @@ test("inspection accepts defaults and exact bounds, and rejects invalid IDs/glob
   }
 });
 
+test("stop requires runId, allows inspection fields, and rejects execution fields and waitMs", () => {
+  assert.deepEqual(
+    parseWorkflowToolInput(
+      Schema.parse({ action: "stop", runId: "a-b", lastN: 5, labelGlob: "review:*", logLines: 2 }),
+    ),
+    { action: "stop", runId: "a-b", lastN: 5, labelGlob: "review:*", logLines: 2 },
+  );
+  for (const input of [
+    { action: "stop" },
+    { action: "stop", runId: "a-b", script: "x" },
+    { action: "stop", runId: "a-b", scriptPath: "/tmp/x.js" },
+    { action: "stop", runId: "a-b", args: {} },
+    { action: "stop", runId: "a-b", background: true },
+    { action: "stop", runId: "a-b", waitMs: 0 },
+  ]) {
+    assert.throws(() => parseWorkflowToolInput(Schema.parse(input)), /Invalid workflow tool input/);
+  }
+});
+
 test("the discriminator rejects every missing or mixed run/inspect/await branch", () => {
   for (const input of [
     { action: "run" },
     { action: "inspect" },
     { runId: "a-b" },
     { action: "inspect", runId: "a-b", script: "x" },
+    { action: "inspect", runId: "a-b", scriptPath: "/tmp/x.js" },
     { action: "inspect", runId: "a-b", args: {} },
     { action: "inspect", runId: "a-b", concurrency: 2 },
     { action: "inspect", runId: "a-b", resumeFromRunId: "c-d" },
@@ -164,6 +205,7 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "inspect", runId: "a-b", waitMs: 0 },
     { action: "await" },
     { action: "await", runId: "a-b", script: "x" },
+    { action: "await", runId: "a-b", scriptPath: "/tmp/x.js" },
     { action: "await", runId: "a-b", args: {} },
     { action: "await", runId: "a-b", maxAgents: 1 },
     { action: "await", runId: "a-b", concurrency: 1 },

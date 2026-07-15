@@ -113,6 +113,19 @@ const resumeReportSchema = z.discriminatedUnion("strategy", [
   }),
 ]);
 
+const scriptSourceSchema = z.enum(["inline", "path"]);
+
+const scriptLineageEntrySchema = z.object({
+  runId: z.string(),
+  uri: z.string(),
+  available: z.boolean(),
+});
+
+const scriptResourceShape = {
+  scriptSource: scriptSourceSchema.optional(),
+  scriptUri: z.string().optional(),
+  lineage: z.array(scriptLineageEntrySchema).optional(),
+} as const;
 const executionResultSchema = z.object({
   runId: z.string(),
   status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
@@ -125,6 +138,7 @@ const executionResultSchema = z.object({
   fallbacks: z.array(fallbackSchema).optional(),
   checkpointsTaken: z.array(checkpointTakenSchema).optional(),
   resumeReport: resumeReportSchema.optional(),
+  ...scriptResourceShape,
 });
 
 /** Common MCP output schema for legacy execution results and exact inspection statuses. */
@@ -139,6 +153,9 @@ export const workflowToolOutputShape = {
   fallbacks: z.array(fallbackSchema).optional(),
   checkpointsTaken: z.array(checkpointTakenSchema).optional(),
   resumeReport: resumeReportSchema.optional(),
+  ...scriptResourceShape,
+  stopped: z.boolean().optional(),
+  alreadyTerminal: z.boolean().optional(),
   workflowName: z.string().optional(),
   phases: z.array(z.string()).optional(),
   currentPhase: z.string().optional(),
@@ -190,7 +207,21 @@ export const workflowToolOutputShape = {
   outcome: executionResultSchema.optional(),
 } as const;
 
-export interface WorkflowExecutionToolResult<T = unknown> {
+export type WorkflowScriptSource = z.infer<typeof scriptSourceSchema>;
+
+export interface WorkflowScriptLineageEntry {
+  runId: string;
+  uri: string;
+  available: boolean;
+}
+
+export interface WorkflowScriptResourceFields {
+  scriptSource?: WorkflowScriptSource;
+  scriptUri?: string;
+  lineage?: WorkflowScriptLineageEntry[];
+}
+
+export interface WorkflowExecutionToolResult<T = unknown> extends WorkflowScriptResourceFields {
   runId: string;
   status: WorkflowRunResult["status"];
   result?: T;
@@ -204,7 +235,7 @@ export interface WorkflowExecutionToolResult<T = unknown> {
   resumeReport?: WorkflowRunResult["resumeReport"];
 }
 
-export interface WorkflowBackgroundAccepted {
+export interface WorkflowBackgroundAccepted extends WorkflowScriptResourceFields {
   runId: string;
   status: "running";
 }
@@ -221,13 +252,21 @@ export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   tokenUsage?: TokenUsage;
   /** Present exactly when status is paused/completed/failed/aborted. */
   outcome?: WorkflowExecutionToolResult<T>;
+  scriptUri?: string;
+  lineage?: WorkflowScriptLineageEntry[];
+}
+
+export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  stopped: boolean;
+  alreadyTerminal: boolean;
 }
 
 export type WorkflowToolResult<T = unknown> =
   | WorkflowExecutionToolResult<T>
   | WorkflowBackgroundAccepted
   | WorkflowRunStatus
-  | WorkflowRunAwaitResult<T>;
+  | WorkflowRunAwaitResult<T>
+  | WorkflowStopResult;
 
 export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExecutionToolResult<T> {
   return {

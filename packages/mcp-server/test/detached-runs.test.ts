@@ -83,7 +83,12 @@ test("background acceptance is immediate and await reports immediate, timeout, c
       { signal: initiating.signal },
     );
     const acceptedRunId = runIdOf(accepted);
-    assert.deepEqual(structured(accepted), { runId: acceptedRunId, status: "running" });
+    assert.deepEqual(structured(accepted), {
+      runId: acceptedRunId,
+      status: "running",
+      scriptSource: "inline",
+      scriptUri: `workflow://runs/${acceptedRunId}/script`,
+    });
     assert.equal(
       textOf(accepted),
       `Workflow "detached-review" started in the background.\n` +
@@ -308,7 +313,11 @@ test("await cancellation closes its event watcher without cancelling the workflo
 
     const result = await awaited;
     assert.equal(result.isError, true);
-    assert.equal(watcherCloseCalls, 1);
+    assert.equal(
+      watcherCloseCalls,
+      2,
+      "the resource projection and await path each obtain the instrumented shared persistence instance",
+    );
     assert.equal(controlled.calls[0].options.signal?.aborted, false);
   } finally {
     WorkflowManager.prototype.getPersistence = originalGetPersistence;
