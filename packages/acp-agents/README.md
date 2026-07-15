@@ -178,7 +178,17 @@ gated, so inspect the handle's `reopen` flags rather than assuming every ACP age
 
 ## Listening in: live ACP events
 
-`AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions, elicitations). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId? }` context envelope (a pooled runner multiplexes many runs at once). `permission_pending` / `elicitation_pending` are resolver-only and carry `{ request }` before the host resolver is invoked; `permission_request` / `elicitation_request` fire exactly once with the final `{ request, outcome }` returned to the agent; `elicitation_complete` carries `{ notification }` for URL completions. `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
+`AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions, elicitations). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId?, callIndex? }` context envelope (a pooled runner multiplexes many runs at once). `permission_pending` / `elicitation_pending` are resolver-only and carry `{ request }` before the host resolver is invoked; `permission_request` / `elicitation_request` fire exactly once with the final `{ request, outcome }` returned to the agent; `elicitation_complete` carries `{ notification }` for URL completions. `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
+
+`AcpEventContext.callIndex` is the optional `RunOptions.callIndex` of the engine `agent()` call that
+opened the session. It is copied through session state and late-event tombstones onto session
+updates, permissions, elicitations, raw messages, and session open/close events; retries of one
+engine call retain the same value. Direct runner callers and interactive sessions may omit it.
+
+`callIndex` is host-only correlation metadata: it is never sent on the ACP wire, placed in `_meta`,
+used as session identity, or included in workflow journal hashes. Filter by `(runId, callIndex)`
+when direct call attribution is available, with `label`/`runId` remaining valid for compatibility.
+Connection-scoped `backend_error` has no session, run, or call context.
 
 ```ts
 const off = runner.on("agent_message_chunk", (e) => {

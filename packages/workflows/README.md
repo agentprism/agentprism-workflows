@@ -303,17 +303,55 @@ execution results carry an immediate redacted final-20 `logTail`; completed resu
 
 Manager events are Node `EventEmitter` notifications: `agentStart`, `agentEnd`, `agentHistory`,
 `journal`, `tokenUsage`, `log`, `phase`, `complete`, `paused`, `resumed`, `stopped`, `error`,
-and `agentEvent`. `journal` emits `{ runId, entry }` for each live journal append, even when
-file journaling is disabled via `journaling: false`. `agentEvent` forwards the live ACP stream
-from an ACP-capable runner with `name`, `event`, and the runner context fields (`runId`, `label`,
-`sessionId`, `backendId`) when the event carries them; `backend_error` is connection-scoped and
-carries `backendId` only. ACP `session/update` traffic is emitted once under its inner
-discriminant name, while permission/elicitation/session/raw/backend events keep their runner
-names.
+and `agentEvent`. Their overloads infer exact payloads from `EngineRunEventPayloadMap` and
+`WorkflowAgentEventPayloadMap`; `WorkflowRunEvent` is the exhaustive union when a host wants one
+dispatcher. Every engine event carries the owning root `runId` and originating engine `scope`.
+`journal` emits `{ runId, scope, entry }` for each live journal append, even when file journaling is
+disabled via `journaling: false`.
 
 ```ts
-manager.on("agentEvent", ({ runId, label, name }) => console.error(runId, label, name));
+import {
+  WorkflowManager,
+  createAcpRunner,
+  type EngineRunEventPayloadMap,
+  type WorkflowRunEvent,
+} from "@automatalabs/workflows";
+
+const manager = new WorkflowManager({ agent: createAcpRunner() });
+
+const onAgentEnd = (event: EngineRunEventPayloadMap["agentEnd"]) => {
+  console.error(event.scope, event.callIndex, event.label, event.result);
+};
+manager.on("agentEnd", onAgentEnd); // the overload infers the same payload without annotation
+
+const target = { scope: "build-abc-nested1", callIndex: 3 };
+manager.on("agentEvent", (event) => {
+  if (event.scope === target.scope && event.callIndex === target.callIndex) {
+    renderAcpUpdate(event.name, event.event);
+  }
+});
+
+function consumeEvent(event: WorkflowRunEvent): void {
+  switch (event.type) {
+    case "phase":
+      console.error(event.scope, event.title);
+      break;
+    case "agentEvent":
+      console.error(event.scope, event.callIndex, event.name);
+      break;
+    default:
+      break;
+  }
+}
 ```
+
+`agentEvent` forwards the live ACP stream from an ACP-capable runner with `name`, `event`, and the
+runner context fields (`runId`, `scope`, `callIndex`, `label`, `sessionId`, `backendId`) when present.
+`scope` repeats the runner's originating engine `runId`, so nested calls filter directly on
+`(scope, callIndex)`. Direct runner/interactive sessions can omit `callIndex`; `backend_error` is
+connection-scoped and carries `backendId` only. ACP `session/update` traffic is emitted once under
+its inner discriminant name, while permission/elicitation/session/raw/backend events keep their
+runner names.
 
 Every live ACP-backed `agent()` call records a non-secret re-attach handle in
 `run.agentSessions`. Set `agent(..., { keepSession: true })` to skip release-time `session/close`,
@@ -441,16 +479,18 @@ await runner.dispose();
 | `backend_error` | `{ backendId, error }` — a pooled backend process crashed |
 
 **Context envelope.** A pooled runner multiplexes many concurrent runs over one process, so every
-event (except `backend_error`) carries `{ sessionId, backendId, label?, runId? }` — filter by
-`label`/`runId` (from the run's `RunOptions`) to attribute an event to a specific run.
+event (except `backend_error`) carries `{ sessionId, backendId, label?, runId?, callIndex? }`.
+`callIndex` echoes the optional `RunOptions.callIndex` used to open the session and is never sent on
+the ACP wire. Engine-created calls supply it; direct/interactive runner callers may omit it.
 
 **Best-effort.** Listeners are observers: a throwing listener is isolated and never breaks the run,
 the update drain, or sibling listeners.
 
 **With `runDynamicWorkflow` / `WorkflowManager`.** Subscribe at the manager layer:
-`manager.on("agentEvent", ({ runId, label, name, event }) => …)`. Every `agent()` call in the
-script then streams live ACP events through the manager; ACP `session/update` traffic is forwarded
-once under `name = event.sessionUpdate`, so hosts do not receive both the catch-all and the
+`manager.on("agentEvent", ({ scope, callIndex, name, event }) => …)`. Every `agent()` call in the
+script then streams live ACP events through the manager; the bridge sets `scope = runId` and repeats
+the optional `callIndex` for direct call filtering. ACP `session/update` traffic is forwarded once
+under `name = event.sessionUpdate`, so hosts do not receive both the catch-all and the
 per-discriminant runner event.
 
 ---

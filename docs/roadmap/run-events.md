@@ -1,19 +1,17 @@
 # Run events: typed contract & durable event log
 
-**Status:** next · **Updated:** 2026-07-15
+**Status:** implementing · **Contract:** frozen · **Updated:** 2026-07-15
 
 A run already emits a rich in-process event stream — `WorkflowManager` extends `EventEmitter`
 and forwards every engine callback (`log`, `phase`, `agentStart`, `agentEnd`, `tokenUsage`,
 `paused` with checkpoint/auth context, `complete`, `stopped`, `resumed`), and the SDK manager
 bridges live ACP session updates (message chunks, tool calls, usage) as `agentEvent`. What's
-missing is a **contract** and a **durable form**: the events are untyped strings over
-`EventEmitter`, so every consumer hand-rolls its own payload types (`agentprism-otel` does
-exactly this today); ACP deltas carry `sessionId`/`label`/`runId` but not `callIndex`, so
-joining a token stream to a specific `agent()` call takes an indirect session lookup; and
-events exist only in the emitting process — a consumer that attaches after a run starts, or
-reads from another process, has no event source at all. Background runs currently emit no
-progress for the same reason. Run-state persistence is a wholesale atomic rewrite of
-`<runId>.json` plus an unstructured text log — neither is a tailable event stream.
+missing was a **contract** and a **durable form**: the events were untyped strings over
+`EventEmitter`, consumers hand-rolled payload types, ACP deltas could not join directly to an
+`agent()` call, and another process had no tailable source. The contract is now frozen in
+[`docs/specs/run-events-spec.md`](../specs/run-events-spec.md), and its staged implementation is in
+progress. The specification—not this roadmap summary—is authoritative for event shapes, ordering,
+durability, compatibility, and semver.
 
 ## Direction
 
@@ -33,12 +31,20 @@ progress for the same reason. Run-state persistence is a wholesale atomic rewrit
    server, an OTel exporter, an editor extension, a process supervisor) and consume the same
    seam.
 
-## Open questions
+The formerly open choices are frozen for v1: the per-event persistence policy is fixed, transcript
+traffic remains relay-only, records are bounded while the complete file follows run retention with
+no rotation/TTL, every JSONL line carries schema version 1, and the existing `onProgress` callback
+remains compatible alongside typed events.
 
-- The exact persisted-vs-relay-only split per event type, and whether the policy is
-  host-tunable.
-- Event-log retention and growth: rotation, caps, and cleanup alongside the existing run
-  records.
-- Schema versioning for the event union across engine releases.
-- Whether the existing `onProgress` snapshot callback is re-expressed over the new contract or
-  kept as-is for compatibility.
+## Staged rollout
+
+| Stage | Scope | State |
+| --- | --- | --- |
+| PR1 | Shared live/persisted event types and optional ACP `callIndex` correlation | implemented |
+| PR2 | Event projection, JSONL persistence, generation-pinned read/watch seam, and failure validation | implemented |
+| PR3 | Lease-owned manager publication, snapshot watermarks, nested scopes, crash recovery, and deletion ordering | implemented |
+| PR4 | SDK/OTel consumers and MCP background-await tail progress | implemented |
+| PR5 | API/design/package documentation, authoring guidance, generated prompt, and coordinated release metadata | implemented |
+
+Integration and publication remain release work; the contract is no longer open to design changes
+inside these implementation stages.

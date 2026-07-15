@@ -348,16 +348,22 @@ Choose `background: true` for work that may outlive one MCP request. The start c
 20-second bounded calls: `{ action: "await", runId, waitMs: 20000 }`. A timeout is progress, not
 failure: it returns the newest safe status and cumulative usage, so call await again. Use
 `action:"inspect"` (or `waitMs:0`) when you need an immediate filtered diagnostic instead of waiting.
+The background start has no enduring request channel: it returns immediately and emits no progress
+after returning, even if that initiating request supplied a progress token. A later bounded
+`action:"await"` is a separate request; when that await carries a progress token, it can stream
+coarse phase and distinct started/ended-call progress while pending. A legacy/inconsistent-log
+polling fallback still returns bounded status without progress notifications.
 At terminal status await adds `outcome`, the foreground-equivalent authored result/pause context.
 That outcome carries optional `fallbacks` and `checkpointsTaken`; inspect and the top-level await
 status intentionally do not. `checkpointsTaken` identifies resolved live, headless-default,
 journal-replay, and injected `checkpointReplies` decisions without repeating prompt text.
 
 Background is detached from the initiating request, not from the MCP server process; a stdio child
-exit can stop in-flight work. It has no progress token or live checkpoint elicitation, so authored
+exit can stop in-flight work. The start request has no live checkpoint elicitation, so authored
 headless checkpoint modes apply. Resume only a paused durable journal: submit a new run with the
-script, `resumeFromRunId`, and any `checkpointReplies`. That execution gets a new run ID and durably
-inherits the complete replay prefix. Await and inspect are read-only and never resume anything.
+script, `resumeFromRunId`, and any `checkpointReplies`. That execution gets a new run ID and
+durably inherits the complete replay prefix. Await and inspect are read-only and never resume
+anything.
 
 ## Worked example — cross-vendor build with every major primitive
 

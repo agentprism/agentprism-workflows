@@ -318,11 +318,16 @@ project run record remains readable. The inherited status fields stay redacted/b
 structured bytes and 8,192 text bytes. Terminal `outcome` preserves the raw authored result/full
 logs and has no new total cap, but it is never copied into text.
 
-Background has no request signal, progress token, or live checkpoint channel. Headless checkpoint
-default continues, abort fails with `WORKFLOW_ABORTED`, and pause returns `checkpoint_required` plus
-`outcome.checkpointContext`. Auth pauses return non-secret `outcome.authContext`; log the backend CLI
-in before resume. Background is process-lifetime, not daemon execution: process death can interrupt
-an in-flight call, and stale durable `running` state recovers to `paused`.
+The background start has no enduring request signal, progress channel, or live checkpoint channel.
+It returns immediately and emits no progress after returning, even if the initiating request
+supplied a progress token. A later bounded `action:"await"` is a separate request; when that await
+carries a progress token, it can stream coarse phase and distinct started/ended-call progress while
+pending. The legacy/inconsistent-log polling fallback emits no progress notifications. Headless
+checkpoint default continues, abort fails with `WORKFLOW_ABORTED`, and pause returns
+`checkpoint_required` plus `outcome.checkpointContext`. Auth pauses return non-secret
+`outcome.authContext`; log the backend CLI in before resume. Background is process-lifetime, not
+daemon execution: process death can interrupt an in-flight call, and stale durable `running` state
+recovers to `paused`.
 
 `action:"await"` and `action:"inspect"` are read-only: they never replay the script, spend tokens,
 or acquire the run lease. `resumeFromRunId` executes a new run with the caller's current script/args
