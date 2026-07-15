@@ -1,5 +1,11 @@
 # @automatalabs/workflow-engine
 
+## 0.21.1
+
+### Patch Changes
+
+- 7b00535: Validate nondeterministic workflow APIs from executable AST call nodes so API names in prompts, descriptions, templates, and comments remain valid, and align workflow-validator guidance with the AST-aware behavior.
+
 ## 0.21.0
 
 ### Minor Changes
