@@ -1,5 +1,23 @@
 # @automatalabs/workflows
 
+## 0.34.0
+
+### Minor Changes
+
+- f93fcf3: Export the exact ACP-specialized `WorkflowRunEvent` union, payload maps, and durable event
+  read/watch seam through the SDK facade. Typed manager events now expose nested `scope`, and
+  `agentEvent` repeats optional `callIndex` so hosts can correlate live ACP updates directly by
+  `(scope, callIndex)` while the existing `AgentEventPayload` compatibility alias remains available.
+
+### Patch Changes
+
+- Updated dependencies [f93fcf3]
+- Updated dependencies [f93fcf3]
+- Updated dependencies [f93fcf3]
+  - @automatalabs/acp-agents@0.28.0
+  - @automatalabs/shared-types@0.22.0
+  - @automatalabs/workflow-engine@0.23.0
+
 ## 0.33.1
 
 ### Patch Changes

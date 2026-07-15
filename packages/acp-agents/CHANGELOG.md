@@ -1,5 +1,18 @@
 # @automatalabs/acp-agents
 
+## 0.28.0
+
+### Minor Changes
+
+- f93fcf3: Add optional `AcpEventContext.callIndex` correlation and thread it through session state,
+  tombstones, and every contextual runner event. The value echoes `RunOptions.callIndex` when
+  supplied; it is never sent on the ACP wire, placed in `_meta`, or used as session identity.
+
+### Patch Changes
+
+- Updated dependencies [f93fcf3]
+  - @automatalabs/shared-types@0.22.0
+
 ## 0.27.1
 
 ### Patch Changes

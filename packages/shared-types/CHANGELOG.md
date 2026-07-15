@@ -1,5 +1,13 @@
 # @automatalabs/shared-types
 
+## 0.22.0
+
+### Minor Changes
+
+- f93fcf3: Export the typed live `RunEvent` union and payload maps, persisted event projections, versioned
+  JSONL record shapes, origin scopes, and strict-JSON error records so hosts can consume one stable
+  run-observability contract without inferring manager callback types.
+
 ## 0.21.0
 
 ### Minor Changes
