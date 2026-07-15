@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dirname, "../../..");
 const CLI = resolve(import.meta.dirname, "../src/cli.ts");
+const FAKE_AGENT = resolve(import.meta.dirname, "../../acp-agents/test/fixtures/fake-acp-agent.mjs");
 const FIXTURES = mkdtempSync(join(tmpdir(), "automatalabs-workflows-cli-"));
 
 process.on("exit", () => {
@@ -27,7 +28,17 @@ function runCli(args: string[]) {
   return spawnSync(process.execPath, ["--import", "tsx", CLI, "validate", ...args], {
     cwd: ROOT,
     encoding: "utf8",
-    env: { ...process.env, HOME: FIXTURES },
+    env: {
+      ...process.env,
+      HOME: FIXTURES,
+      AGENTPRISM_CLAUDE_ACP_CMD: process.execPath,
+      AGENTPRISM_CLAUDE_ACP_ARGS: FAKE_AGENT,
+      AGENTPRISM_CODEX_ACP_CMD: process.execPath,
+      AGENTPRISM_CODEX_ACP_ARGS: FAKE_AGENT,
+      AGENTPRISM_OPENCODE_ACP_CMD: process.execPath,
+      AGENTPRISM_OPENCODE_ACP_ARGS: FAKE_AGENT,
+      AGENTPRISM_FAKE_SCENARIO: JSON.stringify({ configOptions: [] }),
+    },
   });
 }
 
@@ -76,6 +87,21 @@ test("--mock-answers drives a bounded false branch and exposes JSON attribution"
   assert.equal(report.dryRun.result.round, 0);
   assert.equal(report.dryRun.result.answer.real, false);
   assert.deepEqual(report.dryRun.agentCalls[0].mockAnswer, { glob: "refute:*" });
+});
+
+test("human and --json reports both surface the freshly probed harness catalog", () => {
+  const json = runCli([SIMPLE, "--json"]);
+  assert.equal(json.status, 0, json.stderr);
+  const report = JSON.parse(json.stdout);
+  assert.deepEqual(report.dryRun.harnessOptions, [
+    { backendId: "claude", probed: true, options: [] },
+  ]);
+
+  const human = runCli([SIMPLE]);
+  assert.equal(human.status, 0, human.stderr);
+  assert.match(human.stdout, /advertised config options:/);
+  assert.match(human.stdout, /claude:/);
+  assert.match(human.stdout, /\(none advertised\)/);
 });
 
 test("--mock-answers-file reads a two-round sequence and human output uses one-based indexes", () => {

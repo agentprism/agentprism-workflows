@@ -18,6 +18,8 @@
  * Each call is journaled under a deterministic index for resume. `options.model` may be a
  * backend-only harness name, or a registered harness prefix plus an id sent verbatim after
  * that one prefix is stripped; unregistered prefixes remain part of the id on the default.
+ * `options.configOptions` passes exact agent-advertised option ids and string/boolean values;
+ * validate first and use its per-harness table to choose them.
  */
 declare function agent(
   prompt: string,

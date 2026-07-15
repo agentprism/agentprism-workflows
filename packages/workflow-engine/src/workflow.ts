@@ -178,6 +178,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     phase?: string;
     prompt: string;
     model?: string;
+    configOptions?: Record<string, string | boolean>;
     callIndex: number;
     scope: string;
   }) => void;
@@ -234,6 +235,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * unsupported modes fail the agent call instead of falling back to an unconfined session.
    */
   mode?: string;
+  /**
+   * Agent-advertised ACP session config options. Ids and string/boolean values pass through
+   * verbatim, in ascending option-id order. The reserved `model` id is rejected; use `model`.
+   * Present non-empty maps participate in the journal identity hash.
+   */
+  configOptions?: Record<string, string | boolean>;
   /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config. An explicit `model` takes precedence; a tier takes
@@ -628,6 +635,7 @@ export async function runWorkflow<T = unknown>(
     }
 
     const requestedLabel = agentOptions.label?.trim();
+    const pendingLabel = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
     const agentDef = resolveAgentType(agentOptions.agentType, agentRegistry);
@@ -651,6 +659,20 @@ export async function runWorkflow<T = unknown>(
     // spec, else the session's main model. The real resolved id overrides this via
     // onModelResolved once the subagent session is created.
     let displayModel = modelSpec ?? options.mainModel;
+    if (hasModelConfigOption(agentOptions.configOptions)) {
+      // Surface the rejected authored call to validation/observability without invoking the
+      // AgentRunner. The following assertion is the pre-session authority.
+      options.onAgentStart?.({
+        label: pendingLabel,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        configOptions: agentOptions.configOptions,
+        callIndex: state.callSeq,
+        scope: runId,
+      });
+    }
+    assertNoModelConfigOption(agentOptions.configOptions, pendingLabel);
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
     const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
@@ -738,6 +760,7 @@ export async function runWorkflow<T = unknown>(
           phase: assignedPhase,
           prompt,
           model: displayModel,
+          configOptions: agentOptions.configOptions,
           callIndex,
           scope: runId,
         }));
@@ -893,6 +916,7 @@ export async function runWorkflow<T = unknown>(
           phase: assignedPhase,
           prompt,
           model: displayModel,
+          configOptions: agentOptions.configOptions,
           callIndex,
           scope: runId,
         }));
@@ -933,6 +957,7 @@ export async function runWorkflow<T = unknown>(
                   ),
                   model: modelSpec,
                   mode: agentOptions.mode,
+                  configOptions: agentOptions.configOptions,
                   tier: agentOptions.tier,
                   toolNames: agentDef?.tools,
                   disallowedToolNames: agentDef?.disallowedTools,
@@ -1887,6 +1912,7 @@ function hashAgentCall(
   options: AgentOptions,
   agentDefKey: string | null,
 ): string {
+  const configOptions = sortedConfigOptions(options.configOptions);
   const identity = JSON.stringify({
     prompt,
     model: model ?? null,
@@ -1894,6 +1920,7 @@ function hashAgentCall(
     // but journals written before modes existed must keep replaying for mode-less
     // calls — an unconditional `mode: null` key would cache-miss every old journal.
     ...(mode !== undefined ? { mode } : {}),
+    ...(configOptions ? { configOptions } : {}),
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
@@ -1903,6 +1930,34 @@ function hashAgentCall(
     schema: options.schema ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
+}
+
+function sortedConfigOptions(
+  configOptions: Record<string, string | boolean> | undefined,
+): Record<string, string | boolean> | undefined {
+  if (!configOptions || Object.keys(configOptions).length === 0) return undefined;
+  const ids = Object.keys(configOptions).sort();
+  const sorted = Object.fromEntries(ids.map((id) => [id, configOptions[id]]));
+  // JSON.stringify normally hoists integer-like object keys into numeric order. ACP option ids
+  // are unrestricted strings, so expose the already-sorted key list through [[OwnPropertyKeys]]
+  // and keep the contract lexicographic for ids such as "10" and "2" as well.
+  return new Proxy(sorted, { ownKeys: () => ids });
+}
+
+function assertNoModelConfigOption(
+  configOptions: Record<string, string | boolean> | undefined,
+  label: string,
+): void {
+  if (!configOptions || !("model" in configOptions)) return;
+  throw new WorkflowError(
+    `agent "${label}": configOptions option "model" with authored value ${JSON.stringify(configOptions.model)} is reserved; use the model field instead`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label },
+  );
+}
+
+function hasModelConfigOption(configOptions: Record<string, string | boolean> | undefined): boolean {
+  return Boolean(configOptions && "model" in configOptions);
 }
 
 function buildAgentInstructions(

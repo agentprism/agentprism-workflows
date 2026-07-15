@@ -81,6 +81,23 @@ const impl   = await agent(implPrompt(plan),     { label: "implement", model: "c
 const review = await agent(reviewPrompt(impl),   { label: "review",    model: "claude/opus[1m]", schema: REVIEW });
 ```
 
+Use `configOptions` only for exact ACP session options advertised by that routed harness. Run the
+validator first and read its per-harness advertised-options table before choosing ids or select
+values; catalogs vary by harness version, login, and machine.
+
+```js
+const impl = await agent(implPrompt(plan), {
+  label: "implement",
+  model: "codex",
+  configOptions: { fast_mode: true, reasoning_effort: "high" },
+});
+```
+
+Ids and string/boolean values pass through verbatim in ascending id order, after model selection
+and before the prompt. There are no aliases, coercion, client-side vocabulary, defaults, or cached
+catalogs. Never put `"model"` in `configOptions`; use the dedicated `model` field. A harness
+rejection follows the ordinary agent-error path.
+
 Two things worth designing for:
 
 - **Cross-vendor independence.** Reviewing or verifying with a *different* vendor than the one that produced the work removes correlated blind spots — an agent family tends to approve its own idioms. When correctness matters, judge across vendors.
@@ -277,7 +294,7 @@ Runs are journaled: every `agent()` and `checkpoint()` result is recorded under 
 > **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
 
 - `Date.now()`, `Math.random()`, and no-arg `new Date()` throw inside the realm (`new Date(isoString)` is fine). Need a timestamp or random seed? Pass it through `args`.
-- An `agent()` replay identity hashes the prompt, resolved `model`, `mode` when set, `tier`, `phase`, `agentType`, the resolved agent definition, and `schema`. The resolved definition covers its tool allowlist/denylist, model, isolation, and body prompt, so editing an agent definition invalidates calls that use it.
+- An `agent()` replay identity hashes the prompt, resolved `model`, `mode` when set, `configOptions` when non-empty (with sorted keys), `tier`, `phase`, `agentType`, the resolved agent definition, and `schema`. An omitted or empty config bag preserves existing hash bytes. The resolved definition covers its tool allowlist/denylist, model, isolation, and body prompt, so editing an agent definition invalidates calls that use it.
 - `args` is not hashed directly. If new args only raise a loop cap, earlier calls with the same prompts and other identity fields replay. If new args change a prompt, model selection, phase, schema, call order, or another hashed field, the first affected call is a miss.
 - Resume uses the longest unchanged prefix: the first changed or new call and every later call run live. This prevents an unchanged-looking downstream call from reusing a result produced from stale upstream state.
 - `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not hashed. Changing one does not rerun a cached call; the new value affects only calls that run live. Change a hashed field, normally the prompt, when a call must execute again.
@@ -459,13 +476,13 @@ When the inline examples above aren't enough, study the complete, validated scri
 
 ## Validate before you run
 
-The SDK ships a validator that costs **zero tokens** and spawns **no agent processes** — always run it on a script you just wrote or edited:
+The SDK ships a validator that costs **zero tokens** — always run it on a script you just wrote or edited:
 
 ```bash
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 ```
 
-It does two passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results. That catches the bugs a parse can't: thunks-vs-promises mistakes, reference errors, broken result plumbing between calls, schema shapes your own code then misreads. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
+It does three passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results — then one no-prompt session on each distinct routed ACP harness. The last pass spends no tokens and surfaces each harness's full advertised config-options table in the human and JSON reports every time. Read that table before picking `configOptions` values. Unknown ids, bad select values, non-boolean boolean values, and the reserved `"model"` key fail validation with the call label, authored value, and advertised alternatives. If a harness cannot spawn or authenticate, validation emits one warning, marks it `probed:false`, skips only its checks, and stays valid; this is the offline degradation behavior. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
 
 The default fabricator returns `true` for every boolean. Do not accept that all-true path as proof
 that a convergence loop works: script its control labels with `--mock-answers` or a reusable
@@ -473,7 +490,7 @@ that a convergence loop works: script its control labels with `--mock-answers` o
 the revision branch and proves the loop stops; the report identifies every consumed and unused
 fixture without printing answer bodies.
 
-Exit codes: `0` valid · `1` parse failure · `2` dry-run failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
+Exit codes: `0` valid · `1` parse failure · `2` dry-run or config-option failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
 
 If the script nests saved workflows by name (`workflow("review-pr")`), pass the folder so names resolve — and the positional itself may then be a name: `npx @automatalabs/workflows validate review-pr --workflows-dir ./workflows`. A green dry run proves structure, not judgment — prompts and schemas still deserve review.
 
@@ -485,6 +502,7 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] Every agent prompt is self-contained — prior results interpolated in, no "as discussed above".
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.
 - [ ] Model specs only where a specific backend earns its keep; use a registered prefix plus a live-catalog-verified id (or backend-only form), and expect harness rejection rather than client fallback.
+- [ ] Every `configOptions` id/value comes verbatim from the validator's advertised-options table; `"model"` stays in the dedicated field.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
 - [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.

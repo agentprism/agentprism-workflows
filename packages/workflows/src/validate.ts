@@ -1,9 +1,10 @@
 // Token-free validation for workflow scripts: a static parse (meta literal, syntax,
 // determinism blocklist) followed by an optional DRY RUN — the script executes for real
 // in the engine's deterministic realm, but every agent() call is served by an in-process
-// mock AgentRunner that fabricates schema-conforming results. No ACP process is spawned,
-// no tokens are spent, a mock live confirm resolves checkpoints to their declared defaults, and run state is
-// journaled nowhere (journaling off + a throwaway persistence root for the run lease).
+// mock AgentRunner that fabricates schema-conforming results. Afterward, each routed ACP harness
+// is opened once without a prompt to read its advertised config options. No tokens are spent, a
+// mock live confirm resolves checkpoints to their declared defaults, and run state is journaled
+// nowhere (journaling off + a throwaway persistence root for the run lease).
 //
 // This is the programmatic core behind `agentprism-workflows validate` (see ./cli.ts).
 
@@ -18,11 +19,20 @@ import {
   parseWorkflowScript,
   redactText,
 } from "@automatalabs/workflow-engine";
-import { resolveBackendRegistry, selectBackend } from "@automatalabs/acp-agents";
-import type { CustomBackendConfig } from "@automatalabs/acp-agents";
+import {
+  registryWithRunBackends,
+  resolveBackendRegistry,
+  selectBackend,
+} from "@automatalabs/acp-agents";
+import type {
+  BackendRegistry,
+  CustomBackendConfig,
+  SessionConfigOption,
+} from "@automatalabs/acp-agents";
 import type { WorkflowDir } from "@automatalabs/workflow-engine";
 import type { AgentRunner, AgentUsage, WorkflowMeta } from "@automatalabs/shared-types";
 import { Check, Errors } from "typebox/value";
+import { createValidateProbeRunner } from "./validate-internal.js";
 
 export type MockAnswerJson =
   | null
@@ -101,12 +111,22 @@ export interface ValidatedAgentCall {
   model?: string;
   tier?: string;
   mode?: string;
-  /** Which backend the spec routes to: "claude" | "codex" | "opencode" | a custom backend
-   *  name (suffixed " (script-declared)" when it comes from meta.backends) | "default". */
+  /** The verbatim session config options authored for this call. */
+  configOptions?: Record<string, string | boolean>;
+  /** Which concrete backend the spec routes to: "claude" | "codex" | "opencode" | a custom
+   *  backend name (suffixed " (script-declared)" when it comes from meta.backends). */
   backend: string;
   /** True when the call requested structured output. */
   schema: boolean;
   mockAnswer?: ValidatedMockAnswerUse;
+}
+
+export interface ValidateHarnessOptions {
+  backendId: string;
+  probed: boolean;
+  /** Present when probed=false: the harness's spawn/auth/session error. */
+  error?: string;
+  options?: SessionConfigOption[];
 }
 
 export interface ValidatedCheckpoint {
@@ -117,9 +137,9 @@ export interface ValidatedCheckpoint {
 }
 
 export interface ValidateWorkflowReport {
-  /** True when the parse succeeded AND the dry run (if performed) completed. */
+  /** True when parse, dry run, and all checks against successfully probed catalogs pass. */
   ok: boolean;
-  /** 0 = valid; 1 = parse/static failure; 2 = dry-run failure. */
+  /** 0 = valid; 1 = parse/static failure; 2 = dry-run or config-option failure. */
   exitCode: 0 | 1 | 2;
   parse: {
     ok: boolean;
@@ -137,6 +157,8 @@ export interface ValidateWorkflowReport {
     phasesVisited: string[];
     logs: string[];
     durationMs: number;
+    /** Fresh, per-run advertised config-option catalogs for every routed harness. */
+    harnessOptions?: ValidateHarnessOptions[];
     /** The script's return value, composed from fabricated agent results. */
     result?: unknown;
     mockAnswers?: ValidatedMockAnswers;
@@ -722,6 +744,7 @@ interface MockRunOptions {
   model?: string;
   tier?: string;
   mode?: string;
+  configOptions?: Record<string, string | boolean>;
   schema?: unknown;
   onUsage?: (usage: AgentUsage) => void;
 }
@@ -730,28 +753,176 @@ interface MockRunOptions {
  *  budget-guarded script paths deterministically. */
 export const MOCK_TOKENS_PER_AGENT = 1000;
 
-function attributeBackend(
+interface RoutedBackend {
+  backendId: string;
+  display: string;
+}
+
+function routeBackend(
   model: string | undefined,
   tier: string | undefined,
-  declared: Record<string, unknown> | undefined,
-): string {
-  const spec = model ?? tier;
-  if (!spec) return "default";
-  const head = spec.split("/")[0].replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
-  if (declared && Object.keys(declared).some((name) => name.toLowerCase() === head)) {
-    return `${head} (script-declared)`;
-  }
+  registry: BackendRegistry,
+  hostRegistry: BackendRegistry,
+  declared: Record<string, CustomBackendConfig> | undefined,
+): RoutedBackend {
+  const backendId = selectBackend({ model, tier }, registry).id;
+  const scriptDeclared =
+    !hostRegistry.has(backendId) &&
+    Object.keys(declared ?? {}).some((name) => name.toLowerCase() === backendId.toLowerCase());
+  return {
+    backendId,
+    display: scriptDeclared ? `${backendId} (script-declared)` : backendId,
+  };
+}
+
+function registryOptions(registry: BackendRegistry): Record<string, CustomBackendConfig> | undefined {
+  if (registry.size === 0) return undefined;
+  return Object.fromEntries(
+    [...registry].map(([name, entry]) => {
+      const { name: _name, ...config } = entry;
+      return [name, config];
+    }),
+  );
+}
+
+interface ProbeStageResult {
+  harnessOptions: ValidateHarnessOptions[];
+  catalogs: Map<string, SessionConfigOption[]>;
+}
+
+async function probeHarnessConfigOptions(
+  calls: ValidatedAgentCall[],
+  cwd: string,
+  registry: BackendRegistry,
+  hostRegistry: BackendRegistry,
+  declared: Record<string, CustomBackendConfig> | undefined,
+  warnings: string[],
+): Promise<ProbeStageResult> {
+  const backendIds = [
+    ...new Set(
+      calls.map((call) =>
+        routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId,
+      ),
+    ),
+  ].sort();
+  const harnessOptions: ValidateHarnessOptions[] = [];
+  const catalogs = new Map<string, SessionConfigOption[]>();
+  if (backendIds.length === 0) return { harnessOptions, catalogs };
+
+  let runner: ReturnType<typeof createValidateProbeRunner>;
   try {
-    const registry = resolveBackendRegistry(declared as Record<string, CustomBackendConfig> | undefined);
-    return selectBackend({ model, tier }, registry).id;
-  } catch {
-    return "default";
+    runner = createValidateProbeRunner(registryOptions(registry));
+  } catch (error) {
+    const reason = errorMessage(error);
+    for (const backendId of backendIds) {
+      warnings.push(
+        `could not probe ${backendId} — configOptions on its calls are unverified: ${reason}`,
+      );
+      harnessOptions.push({ backendId, probed: false, error: reason });
+    }
+    return { harnessOptions, catalogs };
   }
+
+  try {
+    for (const backendId of backendIds) {
+      try {
+        const result = await runner.probeConfigOptions(backendId, { cwd });
+        catalogs.set(backendId, result.options);
+        harnessOptions.push({
+          backendId: result.backendId,
+          probed: true,
+          options: result.options,
+        });
+      } catch (error) {
+        const reason = errorMessage(error);
+        warnings.push(
+          `could not probe ${backendId} — configOptions on its calls are unverified: ${reason}`,
+        );
+        harnessOptions.push({ backendId, probed: false, error: reason });
+      }
+    }
+  } finally {
+    try {
+      await runner.dispose();
+    } catch {
+      // Probe results are complete; process cleanup must not change validation semantics.
+    }
+  }
+  return { harnessOptions, catalogs };
+}
+
+function errorMessage(error: unknown): string {
+  return redactText(error instanceof Error ? error.message : String(error)).value;
+}
+
+function configOptionErrors(
+  calls: ValidatedAgentCall[],
+  catalogs: Map<string, SessionConfigOption[]>,
+  registry: BackendRegistry,
+  hostRegistry: BackendRegistry,
+  declared: Record<string, CustomBackendConfig> | undefined,
+): string[] {
+  const errors: string[] = [];
+  for (const call of calls) {
+    if (!call.configOptions || Object.keys(call.configOptions).length === 0) continue;
+    const backendId = routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId;
+    const advertised = catalogs.get(backendId);
+    if (!advertised) continue;
+    const optionIds = advertised.map((option) => option.id);
+    for (const [id, value] of Object.entries(call.configOptions as Record<string, unknown>)) {
+      const authored = displayValue(value);
+      if (id === "model") {
+        errors.push(
+          `agent "${call.label}" configOptions option "model" authored value ${authored} is reserved; ` +
+            `advertised alternatives: use the call's model field; option ids ${displayAlternatives(optionIds)}`,
+        );
+        continue;
+      }
+      const option = advertised.find((candidate) => candidate.id === id);
+      if (!option) {
+        errors.push(
+          `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} is unknown; ` +
+            `advertised alternatives: option ids ${displayAlternatives(optionIds)}`,
+        );
+        continue;
+      }
+      if (option.type === "select") {
+        const choices = selectChoiceValues(option);
+        if (typeof value !== "string" || !choices.includes(value)) {
+          errors.push(
+            `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} is not an advertised select value; ` +
+              `advertised alternatives: ${displayAlternatives(choices)}`,
+          );
+        }
+        continue;
+      }
+      if (typeof value !== "boolean") {
+        errors.push(
+          `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} must be boolean; ` +
+            "advertised alternatives: true, false",
+        );
+      }
+    }
+  }
+  return errors;
+}
+
+function selectChoiceValues(option: Extract<SessionConfigOption, { type: "select" }>): string[] {
+  return option.options.flatMap((entry) => ("options" in entry ? entry.options : [entry])).map((entry) => entry.value);
+}
+
+function displayValue(value: unknown): string {
+  return JSON.stringify(value) ?? String(value);
+}
+
+function displayAlternatives(values: readonly string[]): string {
+  return values.length > 0 ? values.map((value) => JSON.stringify(value)).join(", ") : "(none advertised)";
 }
 
 /**
- * Validate a workflow script: parse it, then (by default) dry-run it against a mock
- * AgentRunner. Never throws for an invalid script — read `report.ok` / `report.exitCode`.
+ * Validate a workflow script: parse it, dry-run against a mock AgentRunner, then probe
+ * each routed harness's advertised config options. Never throws for an invalid script —
+ * read `report.ok` / `report.exitCode`.
  */
 export async function validateWorkflowScript(
   script: string,
@@ -772,7 +943,12 @@ export async function validateWorkflowScript(
     };
   }
 
-  const declaredBackends = meta.backends && Object.keys(meta.backends).length > 0 ? meta.backends : undefined;
+  const declaredBackends =
+    meta.backends && Object.keys(meta.backends).length > 0
+      ? (meta.backends as Record<string, CustomBackendConfig>)
+      : undefined;
+  const hostRegistry = resolveBackendRegistry();
+  const backendRegistry = registryWithRunBackends(hostRegistry, declaredBackends);
   if (declaredBackends) {
     warnings.push(
       `script declares custom backends (${Object.keys(declaredBackends).join(", ")}) — real runs must approve them ` +
@@ -793,13 +969,22 @@ export async function validateWorkflowScript(
   const agentCalls: ValidatedAgentCall[] = [];
   const pendingAgentCalls: ValidatedAgentCall[] = [];
   const checkpoints: ValidatedCheckpoint[] = [];
-  const mockMeta = new Map<string, { tier?: string; mode?: string; schema: boolean }>();
+  const mockMeta = new Map<
+    string,
+    {
+      tier?: string;
+      mode?: string;
+      configOptions?: Record<string, string | boolean>;
+      schema: boolean;
+    }
+  >();
   const runner = {
     async run(_prompt: string, runOptions: MockRunOptions = {}) {
       const label = runOptions.label ?? "";
       const metadata = {
         tier: runOptions.tier,
         mode: runOptions.mode,
+        configOptions: runOptions.configOptions,
         schema: runOptions.schema !== undefined,
       };
       mockMeta.set(label, metadata);
@@ -807,8 +992,15 @@ export async function validateWorkflowScript(
       if (pendingCall) {
         pendingCall.tier = metadata.tier;
         pendingCall.mode = metadata.mode;
+        pendingCall.configOptions = metadata.configOptions;
         pendingCall.schema = metadata.schema;
-        pendingCall.backend = attributeBackend(pendingCall.model, metadata.tier, declaredBackends);
+        pendingCall.backend = routeBackend(
+          pendingCall.model,
+          metadata.tier,
+          backendRegistry,
+          hostRegistry,
+          declaredBackends,
+        ).display;
       }
 
       const base = runOptions.schema === undefined ? undefined : fabricateFromSchema(runOptions.schema);
@@ -855,7 +1047,12 @@ export async function validateWorkflowScript(
     persistenceRoot,
     loadSavedWorkflow: flows?.resolve,
   });
-  manager.on("agentStart", (event: { label: string; phase?: string; model?: string }) => {
+  manager.on("agentStart", (event: {
+    label: string;
+    phase?: string;
+    model?: string;
+    configOptions?: Record<string, string | boolean>;
+  }) => {
     const extra = mockMeta.get(event.label) ?? mockMeta.get("") ?? { schema: false };
     const call: ValidatedAgentCall = {
       label: event.label,
@@ -863,7 +1060,8 @@ export async function validateWorkflowScript(
       model: event.model,
       tier: extra.tier,
       mode: extra.mode,
-      backend: attributeBackend(event.model, extra.tier, declaredBackends),
+      configOptions: event.configOptions ?? extra.configOptions,
+      backend: routeBackend(event.model, extra.tier, backendRegistry, hostRegistry, declaredBackends).display,
       schema: extra.schema,
     };
     agentCalls.push(call);
@@ -899,20 +1097,27 @@ export async function validateWorkflowScript(
         if (extra) {
           call.tier = extra.tier;
           call.mode = extra.mode;
+          call.configOptions = extra.configOptions;
           call.schema = extra.schema;
-          call.backend = attributeBackend(call.model, extra.tier, declaredBackends);
+          call.backend = routeBackend(
+            call.model,
+            extra.tier,
+            backendRegistry,
+            hostRegistry,
+            declaredBackends,
+          ).display;
         }
       }
     }
 
-    const ok = run.status === "completed";
-    if (!ok && flows === undefined && run.reason?.includes("must be the first statement") && /\bworkflow\s*\(/.test(script)) {
+    const runOk = run.status === "completed";
+    if (!runOk && flows === undefined && run.reason?.includes("must be the first statement") && /\bworkflow\s*\(/.test(script)) {
       warnings.push(
         'the failure looks like a nested workflow("<name>") call on a bare name — provide workflow dirs ' +
           "(ValidateWorkflowOptions.workflows / --workflows-dir) so names resolve during the dry run",
       );
     }
-    if (ok) {
+    if (runOk) {
       if (agentCalls.length === 0 && checkpoints.length === 0) {
         warnings.push("the script completed without a single agent() or checkpoint() call");
       }
@@ -931,6 +1136,29 @@ export async function validateWorkflowScript(
 
     const mockAnswers = mockAnswerState ? buildMockAnswersReport(mockAnswerState) : undefined;
     if (mockAnswerState && mockAnswers) appendMockAnswerWarnings(mockAnswerState, mockAnswers, warnings);
+    const probed = await probeHarnessConfigOptions(
+      agentCalls,
+      baseCwd,
+      backendRegistry,
+      hostRegistry,
+      declaredBackends,
+      warnings,
+    );
+    const optionErrors = configOptionErrors(
+      agentCalls,
+      probed.catalogs,
+      backendRegistry,
+      hostRegistry,
+      declaredBackends,
+    );
+    const ok = runOk && optionErrors.length === 0;
+    const runReason = timedOut ? `dry run exceeded ${timeoutMs}ms and was aborted` : run.reason;
+    const reason =
+      optionErrors.length === 0
+        ? runReason
+        : [runReason, "configOptions validation failed:", ...optionErrors.map((error) => `- ${error}`)]
+            .filter(Boolean)
+            .join("\n");
 
     return {
       ok,
@@ -939,13 +1167,14 @@ export async function validateWorkflowScript(
       dryRun: {
         ok,
         status: run.status,
-        reason: timedOut ? `dry run exceeded ${timeoutMs}ms and was aborted` : run.reason,
+        reason,
         timedOut,
         agentCalls,
         checkpoints,
         phasesVisited: run.phases ?? [],
         logs: run.logs ?? [],
         durationMs: run.durationMs,
+        harnessOptions: probed.harnessOptions,
         result: run.result,
         ...(mockAnswers ? { mockAnswers } : {}),
       },
@@ -1001,6 +1230,26 @@ export function formatValidateReport(report: ValidateWorkflowReport): string {
         .join("  ");
       lines.push(`    • ${call.label}  ${bits}`);
     }
+    lines.push("    advertised config options:");
+    for (const harness of dry.harnessOptions ?? []) {
+      if (!harness.probed) {
+        lines.push(`      ${harness.backendId}: probe failed — ${harness.error ?? "unknown error"}`);
+        continue;
+      }
+      lines.push(`      ${harness.backendId}:`);
+      lines.push("        id | type | current | choices");
+      if ((harness.options ?? []).length === 0) {
+        lines.push("        (none advertised)");
+        continue;
+      }
+      for (const option of harness.options ?? []) {
+        const choices = option.type === "select" ? displayAlternatives(selectChoiceValues(option)) : "true, false";
+        lines.push(
+          `        ${option.id} | ${option.type} | ${displayValue(option.currentValue)} | ${choices}`,
+        );
+      }
+    }
+    if ((dry.harnessOptions ?? []).length === 0) lines.push("      (no routed harnesses)");
     for (const cp of dry.checkpoints) {
       lines.push(`    ◆ checkpoint [${cp.kind}] "${truncate(cp.prompt, 60)}" → ${JSON.stringify(cp.reply)}`);
     }

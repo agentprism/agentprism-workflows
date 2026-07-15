@@ -35,6 +35,8 @@ export interface InteractiveSessionOptions {
   model?: string;
   /** Agent-advertised session mode id. Strict: openSession fails rather than running unconfined. */
   mode?: string;
+  /** Agent-advertised ACP session config options, applied verbatim in sorted option-id order. */
+  configOptions?: Record<string, string | boolean>;
   /** Coarse tier consulted only when `model` is unset. */
   tier?: string;
   /** Absolute working directory for ACP session/new. Required for held-open sessions. */

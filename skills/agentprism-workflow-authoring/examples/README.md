@@ -13,7 +13,8 @@ worked examples aren't enough. The first two are **verbatim copies** of the runn
 
 `resume-loop-cap.workflow.js` defaults to eight rounds and therefore validates successfully without args. Its six-round failure is intentional: call the MCP `workflow` tool with `args: { "maxRounds": 6 }`, then repeat the script with `args: { "maxRounds": 8 }` and the returned `runId` as `resumeFromRunId`. Keep the cap out of the agent prompt or the prompt change will invalidate the journal from round 1.
 
-Validate either one for free (zero tokens, no agent processes):
+Validate either one for free (zero tokens; each routed harness opens one no-prompt option probe,
+with a warning-only degradation when unavailable):
 
 ```bash
 npx @automatalabs/workflows validate repo-triage --workflows-dir <this directory>

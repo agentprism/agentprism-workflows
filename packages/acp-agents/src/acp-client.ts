@@ -1908,9 +1908,21 @@ export class SessionHandle implements StructuredSource {
     return this.pooled.capabilities;
   }
 
+  /** The agent-advertised session config options in their verbatim ACP wire shapes. */
+  get advertisedConfigOptions(): SessionConfigOption[] {
+    return this.configOptions;
+  }
+
   /** Pass the routed model id straight to the agent. Its catalog and validation are authoritative. */
   async selectModel(spec: string): Promise<void> {
     await this.applyConfigOption("model", spec);
+  }
+
+  /** Apply authored session config options verbatim in deterministic option-id order. */
+  async setConfigOptions(options: Record<string, string | boolean> | undefined): Promise<void> {
+    for (const id of Object.keys(options ?? {}).sort()) {
+      await this.applyConfigOption(id, options![id]);
+    }
   }
 
   /** Set one session config option via the wire method and adopt the echoed catalog.

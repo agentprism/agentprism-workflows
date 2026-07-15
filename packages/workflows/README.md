@@ -164,7 +164,7 @@ try {
 }
 ```
 
-`run(prompt, options?)` accepts the seam's `RunOptions`: `schema`, `maxSchemaRetries`, `model`, `mode`, `tier`, `cwd`,
+`run(prompt, options?)` accepts the seam's `RunOptions`: `schema`, `maxSchemaRetries`, `model`, `mode`, `configOptions`, `tier`, `cwd`,
 `instructions`, `label`, `toolNames` / `disallowedToolNames`, `signal`, `mcpServers`, `images`,
 `backends`, `meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
 `session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), `keepSession`, and
@@ -488,23 +488,30 @@ promises — `parallel([() => agent("a"), () => agent("b")])`, not `parallel([ag
 
 ## Validating scripts — `agentprism-workflows validate`
 
-The package ships a bin that validates a workflow script **without spending tokens or spawning
-any agent process** — no backend auth needed:
+The package ships a bin that validates a workflow script **without spending tokens**:
 
 ```bash
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 ```
 
-Two passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a
+Three passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a
 **dry run** — the script executes in the real engine realm while every `agent()` call is served
 by an in-process mock `AgentRunner` that fabricates schema-conforming results. The dry run
 catches what a parse can't: thunk-vs-promise mistakes, reference errors, broken plumbing between
-calls. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"`
+calls. Finally, validation opens one no-prompt session on every distinct routed ACP harness,
+surfaces the complete advertised config-option catalog, and checks every authored `configOptions`
+bag against it. This probe uses zero tokens. A harness that cannot spawn, authenticate, or open a
+session contributes one warning and `probed:false`; only that harness's option checks are skipped,
+so probe failure alone never invalidates the script. There is no cached catalog or opt-out flag.
+A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"`
 dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort.
 Script-declared `meta.backends` are treated as approved (with a warning that real runs require
-approval). The report lists every agent call with
-its backend attribution, every checkpoint, and warnings; exit codes are `0` valid, `1` parse
-failure, `2` dry-run failure, `3` usage error.
+approval). The report lists every agent call with its backend attribution and `configOptions`
+echo, every checkpoint, the full option table for every routed harness (even when no call authors
+options), and warnings. Unknown ids, invalid select values, non-boolean boolean values, and the
+reserved `"model"` id make the report invalid with exit code `2`; each diagnostic names the call,
+authored value, and advertised alternatives. Exit codes are `0` valid, `1` parse failure, `2`
+dry-run or config-option failure, `3` usage error.
 
 Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
 NAME and resolve nested `workflow("<name>")` calls from your folder), `--parse-only`,
@@ -558,6 +565,8 @@ const mockAnswers: MockAnswers = {
 const report = await validateWorkflowScript(script, { args: { target: "src/" }, mockAnswers });
 report.ok;                 // parse ok AND dry run completed
 report.dryRun?.agentCalls; // calls include mockAnswer: { glob, sequenceIndex?, sequenceLength? }
+report.dryRun?.harnessOptions;
+// [{ backendId, probed, options?: SessionConfigOption[], error?: string }]
 report.dryRun?.mockAnswers;// normalized rule counters + item-level unused records
 report.warnings;           // approval reminders, phase mismatches, headless-abort checkpoints, …
 ```
@@ -626,6 +635,14 @@ retry, echo verification, or fallback. Brackets, dots, slashes, and provider-sty
 ordinary id characters. A harness error follows the existing agent-error path. Per-backend pool
 size is `AGENTPRISM_ACP_POOL_SIZE` (or `AcpPoolOptions.size`).
 
+`agent({ configOptions })` applies the rest of that selected harness's ACP option surface with the
+same verbatim philosophy. Exact ids and string/boolean values are sent in ascending option-id
+order, after model selection and before the prompt; there are no aliases, coercion, defaults,
+catalog matching, or client-side option vocabulary. The `"model"` key is rejected before a session
+opens because the dedicated `model` field is its only channel. Run `validate` and read the routed
+harness's advertised-options table before choosing ids or select values. A live harness rejection
+otherwise follows the existing agent-error path.
+
 ---
 
 ## Exports
@@ -637,7 +654,7 @@ runIsolation,                 // ACP-defaulted single-target substitution over a
 createReplayRunner,           // backend-neutral in-memory replay composition primitive
 runWorkflow,                  // the bare engine run (no status trio)
 parseWorkflowScript,          // parse a script's meta + body
-validateWorkflowScript,       // token-free parse + mock-runner dry run (the `validate` CLI's core)
+validateWorkflowScript,       // token-free parse + mock dry run + no-prompt harness option probes
 fabricateFromSchema,          // the dry run's JSON-Schema value fabricator
 formatValidateReport,         // render a ValidateWorkflowReport as CLI text
 openWorkflowDir,              // read-only view over folders of workflow scripts (name = filename stem)
@@ -668,13 +685,15 @@ ReplayCallReport, ReplayDivergenceEvent, ResolvedIsolationTarget,
 WorkflowRunOptions, AgentOptions, ExecOptions, CheckpointCallContext,
 MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
-ValidateWorkflowOptions, ValidateWorkflowReport, ValidatedAgentCall, ValidatedCheckpoint,
+ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,
+ValidatedAgentCall, ValidatedCheckpoint,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowRunFallback,
 WorkflowCheckpointTaken, WorkflowCheckpointSource, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
-InteractiveSessionOptions, InteractiveTurn, PermissionResolver,
+InteractiveSessionOptions, InteractiveTurn, ProbedConfigOptions, SessionConfigOption,
+PermissionResolver,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
 ProviderCapableRunner,        // duck-type gate for the MCP provider tools (providers/list|set|disable)
 ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,

@@ -41,6 +41,7 @@ import type {
   LogoutResponse,
   SetProviderRequest,
   SetProviderResponse,
+  SessionConfigOption,
   StopReason,
 } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
@@ -104,6 +105,7 @@ const STRUCTURED_TOOL_REPROMPT_TEXT =
 interface SessionPreparationOptions {
   model?: string;
   mode?: string;
+  configOptions?: Record<string, string | boolean>;
   tier?: string;
   toolNames?: string[];
   disallowedToolNames?: string[];
@@ -129,6 +131,12 @@ interface PreparedSession {
   backend: Backend;
   modelSpec: string | undefined;
   sessionOptions: AcpSessionOptions;
+}
+
+export interface ProbedConfigOptions {
+  backendId: string;
+  /** The agent-advertised options, verbatim ACP shapes (id, name, type, currentValue, choices). */
+  options: SessionConfigOption[];
 }
 
 interface LifecycleRoutingOptions {
@@ -421,6 +429,32 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     );
   }
 
+  /** Route a model spec, open exactly one session without prompting, and return the agent's
+   *  advertised config-option catalog verbatim. */
+  async probeConfigOptions(spec?: string, opts: { cwd?: string } = {}): Promise<ProbedConfigOptions> {
+    if (this.disposed) throw new Error("ACP agent runner is disposed");
+    const cwd = opts.cwd ?? process.cwd();
+    const prepared = this.prepareSession({ model: spec }, {
+      cwd,
+      schema: undefined,
+      registry: this.backends,
+    });
+    let session: SessionHandle | undefined;
+    try {
+      session = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
+      return {
+        backendId: prepared.backend.id,
+        options: session.advertisedConfigOptions,
+      };
+    } finally {
+      try {
+        await session?.release();
+      } catch {
+        // Probe cleanup is best-effort and must not mask spawn/auth/session errors.
+      }
+    }
+  }
+
   /** Return the selected backend's initialize-advertised authentication methods. */
   async authMethods(opts: AuthMethodsOptions = {}): Promise<AuthMethod[]> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
@@ -688,6 +722,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     options: RunOptions<S> = {},
   ): Promise<AgentResult<S>> {
     const opts = options as AnyRunOptions;
+    assertNoModelConfigOption(opts.configOptions, opts.label);
     const schema = opts.schema;
     // Layer any run-scoped backends (an APPROVED script-declared meta.backends) under the
     // host registry. Malformed entries fail the call loudly and are NOT retried —
@@ -793,6 +828,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       // A registered first segment is routing only. Everything after it is sent verbatim;
       // an unregistered first segment leaves the entire authored string intact for the default.
       await applyModelSelection(activeSession, prepared.modelSpec, opts);
+      opts.signal?.throwIfAborted();
+      await activeSession.setConfigOptions(opts.configOptions);
       opts.signal?.throwIfAborted();
       if (opts.mode) await activeSession.setMode(opts.mode);
 
@@ -917,6 +954,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     open: (connection: PooledConnection, prepared: PreparedSession) => Promise<SessionHandle>,
   ): Promise<InteractiveSession> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
+    assertNoModelConfigOption(opts.configOptions, opts.label);
     validateInteractiveCwd(opts.cwd, opts.label, methodName);
     opts.signal?.throwIfAborted();
 
@@ -942,6 +980,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       session = await open(connection, prepared);
       opts.signal?.throwIfAborted();
       await applyModelSelection(session, prepared.modelSpec, opts);
+      opts.signal?.throwIfAborted();
+      await session.setConfigOptions(opts.configOptions);
       opts.signal?.throwIfAborted();
       if (opts.mode) await session.setMode(opts.mode);
       opts.signal?.throwIfAborted();
@@ -1267,6 +1307,18 @@ async function applyModelSelection(
   if (spec === undefined) return;
   await session.selectModel(spec);
   opts.onModelResolved?.(spec);
+}
+
+function assertNoModelConfigOption(
+  configOptions: Record<string, string | boolean> | undefined,
+  label: string | undefined,
+): void {
+  if (!configOptions || !("model" in configOptions)) return;
+  throw new WorkflowError(
+    `Agent call${label ? ` "${label}"` : ""} configOptions must not contain reserved option id "model"; use the model field instead`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label },
+  );
 }
 
 /** Pick the backend for the effective model spec (`model` wins over `tier`). The first segment
