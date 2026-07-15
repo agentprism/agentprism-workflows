@@ -113,6 +113,7 @@ interface SessionPreparationOptions {
   meta?: Record<string, unknown>;
   runId?: string;
   label?: string;
+  callIndex?: number;
   baseInstructions?: string;
   developerInstructions?: string;
 }
@@ -1210,6 +1211,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         runId: opts.runId,
         // Stamped onto emitted ACP events as context (never sent on the wire).
         label: opts.label,
+        // Direct engine-call correlation on emitted events only; never sent on the ACP wire.
+        callIndex: opts.callIndex,
         // CODEX-ONLY session instruction overrides -> session/new _meta bare keys. Additive;
         // never hashed. The Claude backend ignores them.
         baseInstructions: opts.baseInstructions,

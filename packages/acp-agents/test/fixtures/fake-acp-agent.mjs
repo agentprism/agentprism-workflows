@@ -416,6 +416,10 @@ class FakeAgent {
     for (const call of postTurnClientCalls) {
       await this.callClient(call, params.sessionId);
     }
+    const postCloseUpdates = Array.isArray(turn?.postCloseUpdates) ? turn.postCloseUpdates : [];
+    for (const update of postCloseUpdates) {
+      await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
+    }
     this.turnBySession.delete(params.sessionId);
     this.modesBySession.delete(params.sessionId);
     this.mcpServersBySession.delete(params.sessionId);
