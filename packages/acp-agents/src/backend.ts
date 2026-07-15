@@ -51,9 +51,8 @@ export interface Backend {
    *  with DIFFERENT commands (script-declared `meta.backends`): keying the pool by name alone
    *  would hand run B a pooled process spawned from run A's command. */
   readonly poolKey?: string;
-  /** When true, `model:"id/inner"` uses `id` only for backend routing and sends `inner` to
-   *  the agent's model catalog. Custom backends and OpenCode need this; Claude/Codex provider
-   *  specs pass through whole. */
+  /** @deprecated Prefix stripping is defined solely by the runner's registered first-segment
+   *  routing. This compatibility property is no longer consulted. */
   readonly stripsRoutingPrefix?: boolean;
   /** When true, the runner EMBEDS the JSON Schema in the prompt text on schema runs. For the
    *  native built-ins the native constraint channel is authoritative and this stays unset; a

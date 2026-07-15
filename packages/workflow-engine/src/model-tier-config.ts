@@ -2,14 +2,14 @@
  * Model tier configuration for workflow subagent model routing.
  *
  * A tier is a named slot (small/medium/big) holding exactly ONE model spec
- * string (e.g. "openai/gpt-4.1-mini"). When an agent() call specifies
+ * string (e.g. "codex/gpt-4.1-mini" or backend-only "codex"). When an agent() call specifies
  * opts.tier, that single model is resolved and used as the subagent's model
  * (unless an explicit opts.model is given, which always wins).
  *
  * This augments the phase-pattern routing in model-routing.ts: phase routing
  * maps workflow phases → models via the script's meta; tiers give scripts a
  * coarse, user-configurable small/medium/big knob that is independent of any
- * concrete provider/model id.
+ * concrete harness/model id.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -23,7 +23,7 @@ import { MODEL_TIERS_FILE } from "./config.js";
 
 /**
  * Model tier configuration. Maps tier names (e.g. "small", "medium", "big")
- * to a single model spec string (e.g. "gpt-4.1-mini" or "openai/gpt-4.1-mini").
+ * to a single model spec string (e.g. "codex/gpt-4.1-mini" or backend-only "codex").
  */
 export interface ModelTierConfig {
   tiers: Record<string, string>;

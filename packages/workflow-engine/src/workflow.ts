@@ -57,8 +57,8 @@ export interface WorkflowAgentOptions {
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
   /**
-   * The session's main model (`provider/modelId`). Shown for default agents and
-   * passed to the runner as the tier fallback when no model/tier resolves.
+   * The session's main model spec. A registered first segment routes and is stripped once;
+   * the remaining id is sent verbatim. A backend name alone uses that harness's default.
    */
   mainModel?: string;
 }
@@ -85,7 +85,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * engine never constructs an agent and depends on no concrete backend.
    */
   agent: AgentRunner;
-  /** The session's main model (provider/id), shown in /workflows for default agents. */
+  /** The session's main model spec, shown in /workflows for default agents. */
   mainModel?: string;
   /**
    * Named subagent definitions for `agent({ agentType })`. Snapshotted once per
@@ -180,10 +180,9 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   phase?: string;
   schema?: TSchemaDef;
   /**
-   * Run this agent on a specific model (`provider/modelId` or a bare `modelId`).
-   * The workflow author chooses per-agent models per the routing policy in the
-   * tool guidelines (e.g. a lighter model for exploration, the main model for
-   * analysis). When omitted, the session's main model is used.
+   * Run this agent with a model spec. `claude`, `codex`, `opencode`, or a registered custom
+   * name may prefix an id and is stripped once; the remainder is sent byte-for-byte. A backend
+   * name alone preserves its harness default. Unregistered prefixes go intact to the default.
    */
   model?: string;
   /**
@@ -495,7 +494,7 @@ export async function runWorkflow<T = unknown>(
     // Model precedence: explicit agentOptions.model > agentType.model > resolved tier >
     // mainModel tier fallback > historical behavior. A tier suppresses phase routing; when
     // it has no configured model and no mainModel fallback, leave model undefined and pass
-    // the raw tier through so the runner's default/fallback signaling stays intact.
+    // the raw tier through for the runner to route under the same deterministic rules.
     const explicitModel = agentOptions.model ?? agentDef?.model;
     const tierModel =
       !explicitModel && agentOptions.tier && modelTierConfig
@@ -672,18 +671,16 @@ export async function runWorkflow<T = unknown>(
                   displayModel = id;
                 },
                 onModelFallback: (spec: string) => {
-                  // Make the silent degrade visible in /workflows, not just console.
+                  // Compatibility surface for non-resolution subsystems or third-party runners.
                   const message = `${label}: model "${spec}" unavailable — using the session default`;
                   log(message);
-                  const kind = isModifierFallbackSignal(spec) ? "modifier" : "model";
                   const fallback: WorkflowRunFallback = {
                     callIndex,
                     label,
                     ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
                     requestedSpec: modelSpec ?? agentOptions.tier ?? spec,
-                    ...(kind === "modifier" && displayModel !== undefined ? { resolvedModel: displayModel } : {}),
                     ...(sessionRef?.backendId === undefined ? {} : { backendId: sessionRef.backendId }),
-                    kind,
+                    kind: "model",
                     message,
                   };
                   if (!state.fallbacks.some((entry) => sameFallback(entry, fallback))) {
@@ -1221,10 +1218,6 @@ export async function runWorkflow<T = unknown>(
     ...(state.fallbacks.length === 0 ? {} : { fallbacks: state.fallbacks }),
     ...(state.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: state.checkpointsTaken }),
   };
-}
-
-function isModifierFallbackSignal(spec: string): boolean {
-  return spec.includes(": reasoning_effort ") || spec.endsWith(": Fast mode not advertised");
 }
 
 function sameFallback(left: WorkflowRunFallback, right: WorkflowRunFallback): boolean {

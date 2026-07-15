@@ -39,7 +39,7 @@ Run it with the SDK —
 import { runDynamicWorkflow } from "@automatalabs/workflows";
 const run = await runDynamicWorkflow(script, { cwd: "/abs/project", args: { path: "." } });
 // run.status: "completed" | "paused" | "failed" | "aborted"; run.result: the script's return value
-// run.fallbacks / run.checkpointsTaken: optional result-only routing and checkpoint audit trails
+// run.fallbacks (compatibility) / run.checkpointsTaken: optional result-only audit trails
 ```
 
 — or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes (`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
@@ -56,7 +56,7 @@ export const meta = {
     { title: "Find", model: "opencode/zai/glm-5.2" },  // per-phase default model
     { title: "Fix" },
   ],
-  model: "sonnet",                                 // optional run-wide default model
+  model: "claude/sonnet",                          // optional run-wide default model
   backends: { /* optional custom ACP agents — see "Custom ACP backends" */ },
 };
 ```
@@ -65,23 +65,26 @@ Per-agent model resolution order: explicit `agent({ model })` > `agent({ tier })
 
 ## Choosing the agent for each call
 
-The backend is selected **per `agent()` call** from its `model` string. This is the core capability: one script can plan on one vendor's agent, implement on another's, and review on a third's, handing structured results between them.
+The backend is selected **per `agent()` call** from its effective `model` string. This is the core capability: one script can plan on one vendor's agent, implement on another's, and review on a third's, handing structured results between them.
 
 - **Omit `model` entirely** for maximum portability — the call runs on whatever default backend the host configured (`AGENTPRISM_DEFAULT_BACKEND`, or the host's session model). A script with no model specs anywhere runs unchanged on any backend.
-- **Name a model to route**: `opus`, `sonnet`, `haiku`, `claude`, `anthropic/…` → the Claude backend; `gpt-…`, `codex`, `o3`/`o4`, `openai/…` → the Codex backend; `opencode/<provider>/<model>` → OpenCode (the `opencode/` prefix is stripped, the rest selects the model — a bare `glm-5.2` does **not** route to OpenCode); a registered custom backend's name → that backend, with `name/<inner-model>` selecting a model from its catalog.
-- **Bracket modifiers** tune backend-native knobs: `gpt-5.5[high]` sets reasoning effort; `[high fast]` also enables the backend's fast mode; `opencode/zai/glm-5.2[high]` maps to that agent's thought-level option.
+- **Route by one registered first segment.** Split on the first `/`; ASCII-case-insensitive `claude`, `codex`, `opencode`, or a registered custom backend name selects that harness and is stripped exactly once. A custom registration wins on a built-in-name collision.
+- **Use a backend name alone** (`claude`, `codex`, `opencode`, or a custom name) to preserve the harness's configured default model. No model config call is made.
+- **Everything else goes intact to the default backend.** `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases. When an id remains after routing, it is sent byte-for-byte: no catalog matching, case folding, bracket parsing, effort/Fast option driving, retry, or fallback. Brackets, dots, and provider prefixes are ordinary id characters; harness rejection is an agent error.
 - **`tier`** (`"small" | "medium" | "big"`) is a coarse alternative resolved from the host's tier config — use it when you want "a cheap model" without naming a vendor.
+
+The published examples use ids verified against live harness catalogs: `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer backend-only forms when the desired model is configured inside the harness.
 
 ```js
 const plan   = await agent(PLAN_PROMPT,          { label: "plan",      model: "opencode/zai/glm-5.2", schema: PLAN });
-const impl   = await agent(implPrompt(plan),     { label: "implement", model: "gpt-5.5[high]" });
-const review = await agent(reviewPrompt(impl),   { label: "review",    model: "opus", schema: REVIEW });
+const impl   = await agent(implPrompt(plan),     { label: "implement", model: "codex/gpt-5.6-sol" });
+const review = await agent(reviewPrompt(impl),   { label: "review",    model: "claude/opus[1m]", schema: REVIEW });
 ```
 
 Two things worth designing for:
 
 - **Cross-vendor independence.** Reviewing or verifying with a *different* vendor than the one that produced the work removes correlated blind spots — an agent family tends to approve its own idioms. When correctness matters, judge across vendors.
-- **Fallback is observable, not fatal.** An unroutable or unavailable model spec logs a line (`model "…" unavailable — using the session default`) and the call proceeds on the default. The terminal result also records the live degrade in `fallbacks`; a typo'd model never throws.
+- **The harness is authoritative.** The client never substitutes a nearby model or silently falls back. A rejected id follows the existing agent-error path; a harness that accepts or ignores it determines the outcome. The public `fallbacks`/`onModelFallback` fields remain for compatibility but model resolution does not emit them.
 
 ## Structured output
 
@@ -176,12 +179,12 @@ const outcome = await gate(
   (feedback, attempt) => agent(
     `Implement the fix described here:\n${JSON.stringify(plan)}\n` +
     (feedback ? `\nA reviewer rejected attempt ${attempt}: ${feedback}\nAddress every point.` : ""),
-    { label: `fix:${attempt + 1}`, model: "gpt-5.5" },
+    { label: `fix:${attempt + 1}`, model: "codex/gpt-5.6-sol" },
   ),
   (result) => agent(
     `Run the test suite and review this change summary:\n${result}\n` +
     `Return ok=true only if tests pass and the fix is correct; include the reviewed commit SHA.`,
-    { label: "gate-review", model: "opus", schema: { type: "object", additionalProperties: false,
+    { label: "gate-review", model: "claude/opus[1m]", schema: { type: "object", additionalProperties: false,
       required: ["ok"], properties: { ok: { type: "boolean" }, feedback: { type: "string" },
         commitSha: { type: "string" } } } },
   ),
@@ -374,14 +377,14 @@ const outcome = await gate(
     `Implement: ${args.feature}\nPlan:\n- ${plan.steps.join("\n- ")}\n` +
     `Run the project's tests before finishing and report results.` +
     (feedback ? `\n\nReviewer feedback on attempt ${attempt}:\n${feedback}\nAddress every point.` : ""),
-    { label: `implement:${attempt + 1}`, model: "gpt-5.5[high]", retries: 1 },
+    { label: `implement:${attempt + 1}`, model: "codex/gpt-5.6-sol", retries: 1 },
   ),
   async (report) => {
     if (!report) return { ok: false, feedback: "implementation agent produced no result" };
     phase("Review");
     const reviews = (await parallel([   // two vendors, two lenses — independent eyes
       () => agent(`Review the working-tree diff for correctness. Implementer's report:\n${report}`,
-                  { label: "review:correctness", model: "opus", schema: VERDICT }),
+                  { label: "review:correctness", model: "claude/opus[1m]", schema: VERDICT }),
       () => agent(`Review the working-tree diff for regressions and missing tests. Report:\n${report}`,
                   { label: "review:coverage", model: "opencode/zai/glm-5.2", schema: VERDICT }),
     ])).filter(Boolean);
@@ -481,7 +484,7 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] Every `parallel` element is a **thunk**; results are `.filter(Boolean)`-ed or null-checked.
 - [ ] Every agent prompt is self-contained — prior results interpolated in, no "as discussed above".
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.
-- [ ] Model specs only where a specific backend earns its keep; verification crosses vendors when stakes are high; remember unroutable specs degrade silently to the default.
+- [ ] Model specs only where a specific backend earns its keep; use a registered prefix plus a live-catalog-verified id (or backend-only form), and expect harness rejection rather than client fallback.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
 - [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.

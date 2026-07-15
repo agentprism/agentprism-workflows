@@ -48,7 +48,7 @@ afterEach(async () => {
 
 test("(7) sends benign clientInfo at initialize — NOT JetBrains/IntelliJ 2026.1", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
-  await makeRunner().run("hi", { model: "anthropic/claude-opus-4-1", cwd });
+  await makeRunner().run("hi", { model: "claude/claude-opus-4-1", cwd });
 
   const init = readLog().find((e) => e.method === "initialize");
   assert.ok(init, "initialize was observed by the agent");
@@ -126,7 +126,7 @@ test("(4) schema never satisfied after the ladder => SCHEMA_NONCOMPLIANCE (non-r
   await assert.rejects(
     () =>
       makeRunner().run("give me json", {
-        model: "openai/gpt-5.6-luna",
+        model: "codex/gpt-5.6-luna",
         schema: SCHEMA,
         cwd,
         maxSchemaRetries: 0, // no repair turns -> fail fast after the first turn
@@ -151,7 +151,7 @@ test("(2b) Codex forwards the strict schema via _meta[outputSchema] into the tur
     turns: [{ text: JSON.stringify({ city: "NYC", hot: true }) }],
   });
   const out = await makeRunner().run("weather?", {
-    model: "openai/gpt-5.6-luna",
+    model: "codex/gpt-5.6-luna",
     schema: SCHEMA,
     cwd,
   });
@@ -190,7 +190,7 @@ test("(2b) schema result is the FINAL assistant message — a schema-shaped prog
     ],
   });
   const out = await makeRunner().run("structured please", {
-    model: "openai/gpt-5.6-luna",
+    model: "codex/gpt-5.6-luna",
     schema: SCHEMA,
     cwd,
   });
@@ -205,7 +205,7 @@ test("(3b) Claude sets outputFormat+emitRawSDKMessages at session/new and reads 
   });
   const resolved: string[] = [];
   const out = await makeRunner().run("weather?", {
-    model: "anthropic/claude-opus-4-1",
+    model: "claude/claude-opus-4-1",
     schema: SCHEMA,
     cwd,
     onModelResolved: (m) => resolved.push(m),
@@ -337,7 +337,7 @@ test("(#2) refusal on a SCHEMA run is NOT burned through the repair ladder into 
   await assert.rejects(
     () =>
       makeRunner().run("give me json", {
-        model: "openai/gpt-5.6-luna",
+        model: "codex/gpt-5.6-luna",
         schema: SCHEMA,
         cwd,
         maxSchemaRetries: 3, // 3 repair turns WOULD fire if we entered the ladder
@@ -362,7 +362,7 @@ test("(#2) stopReason 'max_tokens' => distinct 'output truncated' failure, even 
   await assert.rejects(
     () =>
       makeRunner().run("weather?", {
-        model: "openai/gpt-5.6-luna",
+        model: "codex/gpt-5.6-luna",
         schema: SCHEMA,
         cwd,
         maxSchemaRetries: 3,
@@ -412,9 +412,9 @@ test("(#2) normal stopReason 'end_turn' still returns the assistant text", async
   assert.equal(out, "all good");
 });
 
-// ---- (#3) reasoning_effort + Fast-mode driven from the model[effort] spec ------------
+// ---- model ids are sent verbatim; catalogs and bracket contents are opaque ----------------
 
-test("(#3) a model[effort] spec drives the reasoning_effort config option via set_config_option", async () => {
+test("a bracketed model id is sent verbatim and no sibling config option is touched", async () => {
   const { cwd, readLog } = configure({
     configOptions: [
       // Real codex-acp shape: model values are BARE base ids, effort is a SEPARATE select.
@@ -432,8 +432,6 @@ test("(#3) a model[effort] spec drives the reasoning_effort config option via se
         name: "Reasoning effort",
         category: "thought_level",
         currentValue: "medium",
-        // codex-acp 1.6.0 capitalizes the display NAMES while the wire VALUES stay lowercase;
-        // effort matching keys on value only, so the bracket token still lands.
         options: [
           { value: "low", name: "Low" },
           { value: "medium", name: "Medium" },
@@ -445,23 +443,60 @@ test("(#3) a model[effort] spec drives the reasoning_effort config option via se
   });
   const resolved: string[] = [];
   const out = await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna[high]",
+    model: "codex/gpt-5.6-luna[high]",
     cwd,
     onModelResolved: (m) => resolved.push(m),
   });
   assert.equal(out, "ok");
-  // The bracket strips off for the model select (matches the bare base id); the effort rides
-  // the separate reasoning_effort option.
-  assert.deepEqual(resolved, ["gpt-5.6-luna"]);
-
-  const effortSet = readLog().find(
-    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "reasoning_effort",
-  );
-  assert.ok(effortSet, "reasoning_effort was set via session/set_config_option");
-  assert.equal(effortSet.params?.value, "high");
+  assert.deepEqual(resolved, ["gpt-5.6-luna[high]"]);
+  const configCalls = readLog().filter((e) => e.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "gpt-5.6-luna[high]");
 });
 
-test("(#3) a `fast` bracket token turns the advertised Fast-mode option on", async () => {
+test("(#147) an unprefixed bracketed model id is sent verbatim without driving effort", async () => {
+  const { cwd, readLog } = configure({
+    configOptions: [
+      {
+        id: "model",
+        type: "select",
+        name: "Model",
+        category: "model",
+        currentValue: "claude-fable-5",
+        options: [{ value: "claude-fable-5", name: "Claude Fable 5" }],
+      },
+      {
+        id: "reasoning_effort",
+        type: "select",
+        name: "Reasoning effort",
+        category: "thought_level",
+        currentValue: "medium",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ],
+      },
+    ],
+    turns: [{ text: "ok" }],
+  });
+
+  assert.equal(
+    await makeRunner().run("hi", { model: "claude-fable-5[high]", cwd }),
+    "ok",
+  );
+  const configCalls = readLog().filter((entry) => entry.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "claude-fable-5[high]");
+  assert.equal(
+    configCalls.filter((entry) => entry.params?.configId === "reasoning_effort").length,
+    0,
+  );
+});
+
+test("bracket tokens remain ordinary model-id characters even when matching options are advertised", async () => {
   const { cwd, readLog } = configure({
     configOptions: [
       {
@@ -486,17 +521,14 @@ test("(#3) a `fast` bracket token turns the advertised Fast-mode option on", asy
     ],
     turns: [{ text: "ok" }],
   });
-  await makeRunner().run("hi", { model: "openai/gpt-5.6-luna[high fast]", cwd });
-  const fastSet = readLog().find(
-    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
-  );
-  assert.ok(fastSet, "fast-mode was set via session/set_config_option");
-  assert.equal(fastSet.params?.value, "on");
+  await makeRunner().run("hi", { model: "codex/gpt-5.6-luna[high fast]", cwd });
+  const configCalls = readLog().filter((e) => e.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "gpt-5.6-luna[high fast]");
 });
 
-test("(#3) a `fast` bracket token turns a BOOLEAN-typed Fast-mode option on", async () => {
-  // codex-acp >= 1.4.0 advertises Fast mode as `type: "boolean"` (category "model_config")
-  // when the client declares session.configOptions.boolean — which this client now does.
+test("a boolean Fast-mode option is ignored during verbatim model selection", async () => {
   const { cwd, readLog } = configure({
     configOptions: [
       {
@@ -519,20 +551,18 @@ test("(#3) a `fast` bracket token turns a BOOLEAN-typed Fast-mode option on", as
   });
   const fallbacks: string[] = [];
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna[fast]",
+    model: "codex/gpt-5.6-luna[fast]",
     cwd,
     onModelFallback: (s) => fallbacks.push(s),
   });
-  const fastSet = readLog().find(
-    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
-  );
-  assert.ok(fastSet, "boolean fast-mode was set via session/set_config_option");
-  assert.equal(fastSet.params?.value, true);
-  assert.equal(fastSet.params?.type, "boolean", "the wire request carries the boolean type discriminator");
-  assert.deepEqual(fallbacks, [], "an applied boolean Fast mode must not fire a fallback");
+  const configCalls = readLog().filter((e) => e.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "gpt-5.6-luna[fast]");
+  assert.deepEqual(fallbacks, []);
 });
 
-test("(#3) a boolean Fast-mode option already ON is left untouched", async () => {
+test("catalog current values do not suppress the verbatim model request", async () => {
   const { cwd, readLog } = configure({
     configOptions: [
       {
@@ -553,11 +583,15 @@ test("(#3) a boolean Fast-mode option already ON is left untouched", async () =>
     ],
     turns: [{ text: "ok" }],
   });
-  await makeRunner().run("hi", { model: "openai/gpt-5.6-luna[fast]", cwd });
+  await makeRunner().run("hi", { model: "codex/gpt-5.6-luna[fast]", cwd });
   const fastSet = readLog().find(
     (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
   );
-  assert.equal(fastSet, undefined, "already-on boolean Fast mode => no wire call");
+  assert.equal(fastSet, undefined);
+  const modelSet = readLog().find(
+    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "model",
+  );
+  assert.equal(modelSet?.params?.value, "gpt-5.6-luna[fast]");
 });
 
 test("(#3) a plain effort spec does NOT touch a Fast-mode option that is advertised", async () => {
@@ -585,16 +619,20 @@ test("(#3) a plain effort spec does NOT touch a Fast-mode option that is adverti
     ],
     turns: [{ text: "ok" }],
   });
-  await makeRunner().run("hi", { model: "openai/gpt-5.6-luna[high]", cwd });
+  await makeRunner().run("hi", { model: "codex/gpt-5.6-luna[high]", cwd });
   const fastSet = readLog().find(
     (e) => e.method === "setSessionConfigOption" && e.params?.configId === "fast-mode",
   );
-  assert.equal(fastSet, undefined, "no `fast` token => Fast-mode is left untouched");
+  assert.equal(fastSet, undefined);
+  const modelSet = readLog().find(
+    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "model",
+  );
+  assert.equal(modelSet?.params?.value, "gpt-5.6-luna[high]");
 });
 
-// ---- (#4) effort/Fast fallback signal: an unadvertised modifier is SURFACED -----------
+// ---- model resolution never emits fallback events ----------------------------------------
 
-test("(#4) a model[high] whose 'high' effort is NOT advertised fires onModelFallback exactly once", async () => {
+test("an unadvertised bracketed id is still sent verbatim without a fallback event", async () => {
   const { cwd, readLog } = configure({
     configOptions: [
       {
@@ -623,26 +661,21 @@ test("(#4) a model[high] whose 'high' effort is NOT advertised fires onModelFall
   const resolved: string[] = [];
   const fallbacks: string[] = [];
   const out = await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna[high]",
+    model: "codex/gpt-5.6-luna[high]",
     cwd,
     onModelResolved: (m) => resolved.push(m),
     onModelFallback: (s) => fallbacks.push(s),
   });
   assert.equal(out, "ok");
-  // The MODEL still resolved (the bare base id matched); only the effort tier could not apply.
-  assert.deepEqual(resolved, ["gpt-5.6-luna"]);
-  // The unmet effort is surfaced on the same channel model fallback uses — exactly once.
-  assert.equal(fallbacks.length, 1, "the unadvertised 'high' effort fires onModelFallback once");
-  assert.match(fallbacks[0], /reasoning_effort/i);
-  assert.match(fallbacks[0], /high/);
-  // It is a no-op, not a throw: reasoning_effort was never set on the wire.
-  assert.equal(
-    readLog().find((e) => e.method === "setSessionConfigOption" && e.params?.configId === "reasoning_effort"),
-    undefined,
-  );
+  assert.deepEqual(resolved, ["gpt-5.6-luna[high]"]);
+  assert.deepEqual(fallbacks, []);
+  const configCalls = readLog().filter((e) => e.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "gpt-5.6-luna[high]");
 });
 
-test("(#4) an ADVERTISED effort applies cleanly and does NOT fire onModelFallback", async () => {
+test("advertised effort choices do not affect the model value or emit fallbacks", async () => {
   const { cwd, readLog } = configure({
     configOptions: [
       {
@@ -670,20 +703,19 @@ test("(#4) an ADVERTISED effort applies cleanly and does NOT fire onModelFallbac
   });
   const fallbacks: string[] = [];
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna[high]",
+    model: "codex/gpt-5.6-luna[high]",
     cwd,
     onModelFallback: (s) => fallbacks.push(s),
   });
-  // The effort applied -> no fallback signal.
   assert.deepEqual(fallbacks, []);
-  const effortSet = readLog().find(
-    (e) => e.method === "setSessionConfigOption" && e.params?.configId === "reasoning_effort",
-  );
-  assert.equal(effortSet?.params?.value, "high");
+  const configCalls = readLog().filter((e) => e.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "gpt-5.6-luna[high]");
 });
 
-test("(#4) an unadvertised Fast mode also surfaces on the fallback channel", async () => {
-  const { cwd } = configure({
+test("an unadvertised Fast-mode token stays inside the id without a fallback event", async () => {
+  const { cwd, readLog } = configure({
     configOptions: [
       {
         id: "model",
@@ -711,13 +743,114 @@ test("(#4) an unadvertised Fast mode also surfaces on the fallback channel", asy
   });
   const fallbacks: string[] = [];
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna[high fast]",
+    model: "codex/gpt-5.6-luna[high fast]",
     cwd,
     onModelFallback: (s) => fallbacks.push(s),
   });
-  // `high` applied (advertised); `fast` could not (no Fast-mode option) -> one fallback.
-  assert.equal(fallbacks.length, 1);
-  assert.match(fallbacks[0], /fast/i);
+  assert.deepEqual(fallbacks, []);
+  const configCalls = readLog().filter((e) => e.method === "setSessionConfigOption");
+  assert.equal(configCalls.length, 1);
+  assert.equal(configCalls[0].params?.configId, "model");
+  assert.equal(configCalls[0].params?.value, "gpt-5.6-luna[high fast]");
+});
+
+test("backend-only specs select no model for every built-in harness", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  const runner = makeRunner();
+  for (const model of ["claude", "codex", "opencode"]) {
+    assert.equal(await runner.run("hi", { model, cwd }), "ok");
+  }
+  assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 0);
+});
+
+test("routing strips at most one segment and sends authored brackets, dots, and provider prefixes byte-for-byte", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  const fallbacks: string[] = [];
+  const runner = makeRunner();
+  const cases = [
+    ["claude/anthropic/claude.4[high]", "anthropic/claude.4[high]"],
+    ["codex/openai/gpt.5[high]", "openai/gpt.5[high]"],
+    ["opencode/zai/glm.5[max]", "zai/glm.5[max]"],
+    ["anthropic/claude.4[high]", "anthropic/claude.4[high]"],
+    ["claude/codex/gpt.5[high]", "codex/gpt.5[high]"],
+  ] as const;
+  for (const [model] of cases) {
+    assert.equal(
+      await runner.run("hi", { model, cwd, onModelFallback: (spec) => fallbacks.push(spec) }),
+      "ok",
+    );
+  }
+
+  const calls = readLog().filter((entry) => entry.method === "setSessionConfigOption");
+  assert.deepEqual(calls.map((entry) => entry.params?.configId), cases.map(() => "model"));
+  assert.deepEqual(calls.map((entry) => entry.params?.value), cases.map(([, value]) => value));
+  assert.deepEqual(fallbacks, []);
+});
+
+test("catalog order and content never affect the value sent for model selection", async () => {
+  const catalogs = [
+    [
+      {
+        id: "model",
+        type: "select",
+        name: "Model",
+        category: "model",
+        currentValue: "close-match",
+        options: [
+          { value: "prefix-target-suffix", name: "target" },
+          { value: "target", name: "Exact display" },
+        ],
+      },
+    ],
+    [
+      {
+        id: "unrelated",
+        type: "select",
+        name: "Unrelated",
+        category: "other",
+        currentValue: "x",
+        options: [{ value: "x", name: "X" }],
+      },
+    ],
+  ];
+  for (const configOptions of catalogs) {
+    const { cwd, readLog } = configure({ configOptions, turns: [{ text: "ok" }] });
+    const runner = makeRunner();
+    await runner.run("hi", { model: "codex/Target.Model[HIGH]", cwd });
+    await runner.dispose();
+    const calls = readLog().filter((entry) => entry.method === "setSessionConfigOption");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].params?.configId, "model");
+    assert.equal(calls[0].params?.value, "Target.Model[HIGH]");
+  }
+});
+
+test("set_config_option rejection follows the existing agent-error path with no retry or fallback", async () => {
+  const { cwd, readLog } = configure({
+    setConfigOptionError: "unknown model id",
+    turns: [{ text: "must not run" }],
+  });
+  const fallbacks: string[] = [];
+  const resolved: string[] = [];
+  await assert.rejects(
+    () =>
+      makeRunner().run("hi", {
+        model: "claude/rejected.model[high]",
+        cwd,
+        onModelResolved: (model) => resolved.push(model),
+        onModelFallback: (spec) => fallbacks.push(spec),
+      }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      assert.equal(error.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+      assert.equal(error.recoverable, true);
+      return true;
+    },
+  );
+  assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+  assert.deepEqual(resolved, []);
+  assert.deepEqual(fallbacks, []);
 });
 
 // ---- (#5) client-provided mcpServers reach session/new -------------------------------
@@ -766,7 +899,7 @@ test("(#5b) runId coexists with the Claude schema _meta at session/new", async (
     turns: [{ text: "x", structuredOutput: { city: "LA", hot: false } }],
   });
   await makeRunner().run("weather?", {
-    model: "anthropic/claude-opus-4-1",
+    model: "claude/claude-opus-4-1",
     schema: SCHEMA,
     cwd,
     runId: "run-xyz",
@@ -782,7 +915,7 @@ test("(#5b) Codex session/new carries the runId _meta even though the schema rid
     turns: [{ text: JSON.stringify({ city: "NYC", hot: true }) }],
   });
   await makeRunner().run("weather?", {
-    model: "openai/gpt-5.6-luna",
+    model: "codex/gpt-5.6-luna",
     schema: SCHEMA,
     cwd,
     runId: "run-codex-1",
@@ -801,7 +934,7 @@ test("(#5b) Codex session/new carries the runId _meta even though the schema rid
 test("(#instr) RunOptions base/developerInstructions reach Codex session/new _meta (bare keys)", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna",
+    model: "codex/gpt-5.6-luna",
     cwd,
     baseInstructions: "You only write Rust.",
     developerInstructions: "Prefer iterators.",
@@ -819,7 +952,7 @@ test("(#instr) RunOptions base/developerInstructions reach Codex session/new _me
 test("(#instr) instructions coexist with the runId stamp at Codex session/new", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   await makeRunner().run("hi", {
-    model: "openai/gpt-5.6-luna",
+    model: "codex/gpt-5.6-luna",
     cwd,
     runId: "run-xyz",
     baseInstructions: "BASE",
@@ -833,7 +966,7 @@ test("(#instr) instructions coexist with the runId stamp at Codex session/new", 
 test("(#instr) Claude ignores base/developer instructions (no such _meta at session/new)", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   await makeRunner().run("hi", {
-    model: "anthropic/claude-opus-4-1",
+    model: "claude/claude-opus-4-1",
     cwd,
     baseInstructions: "BASE",
     developerInstructions: "DEV",

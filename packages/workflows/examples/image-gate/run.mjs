@@ -86,7 +86,7 @@ try {
       attempts: 3,
       // Art direction and review are judgment-heavy — pin them to Fable 5. The producer
       // stays on the session default; its job is tool-calling, not taste.
-      models: { brief: "claude-fable-5", validate: "claude-fable-5" },
+      models: { brief: "claude/claude-fable-5[1m]", validate: "claude/claude-fable-5[1m]" },
       nanobanana: {
         command: process.execPath, // node
         args: [resolve(serverEntry)],

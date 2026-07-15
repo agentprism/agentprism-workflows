@@ -191,9 +191,10 @@ are unchanged. Terminal persisted states retain a safe run-level `reason` and `e
 inspection. Every paused, failed, or aborted `WorkflowRunResult` has a redacted final-20 `logTail`
 (present even when empty); completed results omit it and preserve the full raw `logs` array.
 
-Two optional terminal audit arrays are persisted alongside that state. `fallbacks` attributes each
-live whole-model or bracket-modifier degrade to `callIndex`/label/phase, the requested spec, known
-resolved model/backend, and the existing log message. `checkpointsTaken` records each checkpoint
+Two optional terminal audit arrays are persisted alongside that state. `fallbacks` remains a
+compatibility surface for non-resolution subsystems and third-party runners; model selection no
+longer emits entries because harness errors propagate through the existing agent-error path.
+`checkpointsTaken` records each checkpoint
 that resolved in this execution with its journaled decision and source: `live`, `headless-default`,
 `journal-replay`, or `injected` from `checkpointReplies`. Pausing checkpoints are omitted. Both
 arrays are absent when empty, stay outside call hashes, and are deliberately excluded from

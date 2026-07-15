@@ -15,7 +15,9 @@
 /**
  * Run ONE subagent to completion and return its result. With `options.schema` the
  * result is the validated object; otherwise it is the assistant's final text.
- * Each call is journaled under a deterministic index for resume.
+ * Each call is journaled under a deterministic index for resume. `options.model` may be a
+ * backend-only harness name, or a registered harness prefix plus an id sent verbatim after
+ * that one prefix is stripped; unregistered prefixes remain part of the id on the default.
  */
 declare function agent(
   prompt: string,

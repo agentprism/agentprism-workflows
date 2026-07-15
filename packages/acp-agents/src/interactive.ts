@@ -31,7 +31,7 @@ import {
  *  permission/elicitation resolvers win over the runner-wide defaults; tool allow/deny policy is
  *  used only when no permission resolver is present. */
 export interface InteractiveSessionOptions {
-  /** Model spec (`provider/modelId`, bare model id, or registered custom backend route). */
+  /** Model spec: registered first segment routes once; any remaining id is sent verbatim. */
   model?: string;
   /** Agent-advertised session mode id. Strict: openSession fails rather than running unconfined. */
   mode?: string;
@@ -47,9 +47,9 @@ export interface InteractiveSessionOptions {
   onPermissionRequest?: PermissionResolver;
   /** Session-scoped elicitation resolver; overrides the runner-wide resolver for this session. */
   onElicitation?: ElicitationResolver;
-  /** The actually-resolved concrete model id (display/telemetry). */
+  /** The model id accepted for the session (display/telemetry). */
   onModelResolved?: RunOptions["onModelResolved"];
-  /** A requested model/tier spec that was not found and fell back to the session default. */
+  /** Compatibility callback for non-resolution subsystems or third-party runners. */
   onModelFallback?: RunOptions["onModelFallback"];
   /** Event/telemetry label stamped onto this session's emitted ACP events. */
   label?: string;

@@ -435,6 +435,9 @@ class FakeAgent {
 
   setSessionConfigOption(params) {
     record({ method: "setSessionConfigOption", params });
+    if (scenario.setConfigOptionError) {
+      throw RequestError.invalidParams(params, String(scenario.setConfigOptionError));
+    }
     // Echo the catalog back with the requested value marked current.
     this.configOptions = this.configOptions.map((opt) =>
       opt.id === params.configId ? { ...opt, currentValue: params.value } : opt,

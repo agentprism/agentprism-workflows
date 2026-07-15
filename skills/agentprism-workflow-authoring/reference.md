@@ -25,7 +25,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `label` | `string` | Display/telemetry name; also stamped on every live ACP event for this call. Always set it. Not part of the resume hash. |
 | `phase` | `string` | Assign this call to a phase explicitly (needed inside concurrent stages where the global `phase()` state would race). |
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
-| `model` | `string` | Model spec; selects the backend **and** the model. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
+| `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
 | `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Claude-family: `default`, `plan`, `acceptEdits`, `bypassPermissions`. Codex-family: `read-only`, `agent`, `agent-full-access`. OpenCode: its mode config option. Part of the resume hash when set. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
@@ -41,19 +41,18 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 
 ## Model specs & routing
 
-A `model` string selects the backend, then the concrete model within it:
+A `model` string is resolved solely from its first segment, then delegated to the harness:
 
 | spec shape | routes to | notes |
 |---|---|---|
 | *(omitted)* | host default backend | `AGENTPRISM_DEFAULT_BACKEND` (`claude` \| `codex` \| `opencode` \| custom name; default `claude`), session default model. Most portable. |
-| `claude`, `opus`, `sonnet`, `haiku`, `anthropic/…`, `claude/…` | Claude backend | Provider prefixes pass through whole. |
-| `codex`, `gpt-…`, `openai/…`, `o3`/`o4`-style ids | Codex backend | |
-| `opencode` or `opencode/<provider>/<model>` | OpenCode backend | Prefix is stripped before model selection: `opencode/zai/glm-5.2` selects `zai/glm-5.2`. A bare `glm-5.2` does **not** route to OpenCode. |
-| `<custom-name>` or `<custom-name>/<inner-model>` | that registered custom backend | Names are case-insensitive; `claude`/`codex`/`opencode` are reserved. Registered names win over pattern matches. |
+| `claude`, `codex`, `opencode`, or `<custom-name>` | that registered harness | Backend-only: no model config call; the harness default remains active. |
+| `claude/<id>`, `codex/<id>`, `opencode/<id>`, or `<custom-name>/<id>` | that registered harness | Match the first segment ASCII-case-insensitively and strip exactly one segment. Custom names take priority on collision. The remaining `<id>` is sent verbatim, including further `/` characters. |
+| any other string, including `anthropic/…`, `openai/…`, bare `opus`, or bare `gpt-…` | host default backend | The **entire** authored string is sent verbatim; these are not routing aliases. |
 
-**Bracket modifiers** (trailing `[…]`): `gpt-5.5[high]` sets reasoning effort; `[high fast]` also enables the backend's fast mode; on OpenCode/custom backends the effort word maps to a thought-level/effort config option when one exists.
+Selection is a single `session/set_config_option` with `configId: "model"` and the exact remaining string. There is no catalog matching, case folding, normalization, bracket parsing, nearest-neighbor selection, sibling effort/Fast option driving, retry, or echo verification. Brackets, dots, and provider-style prefixes are ordinary model-id characters. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; prefer backend-only forms for harness-configured models.
 
-**Fallback is observable, never fatal**: an unmatched model or modifier logs `<label>: model "<spec>" unavailable — using the session default` to the run log and proceeds on the session default.
+Whatever the harness returns is the outcome. A rejection follows the existing agent-error path with no resolution-specific code or fallback event. `onModelFallback` and `WorkflowRunResult.fallbacks` remain public compatibility surfaces, but model resolution does not emit them.
 
 ## Structured output channels
 
@@ -205,7 +204,7 @@ Markdown files at `<runCwd>/.agentprism/agents/<name>.md` (project) and `~/.agen
 description: Read-only security auditor
 tools: [read, grep, glob]        # allowlist of tool names (omit = all)
 disallowedTools: [bash]          # denylist, applied after the allowlist
-model: opus                      # any model spec; agent({ model }) overrides it
+model: claude/opus[1m]           # verified id; agent({ model }) overrides it
 isolation: worktree              # optional
 ---
 You are a security auditor. Report findings; never modify files.
@@ -235,7 +234,7 @@ const run = await runDynamicWorkflow(script, {
 });
 // run.status: "completed" | "paused" | "failed" | "aborted"
 // run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
-// run.fallbacks? · run.checkpointsTaken? (result-only observability; absent when empty)
+// run.fallbacks? (compatibility) · run.checkpointsTaken? (absent when empty)
 ```
 
 The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts **raw script source** + `args`. Foreground is the default and streams progress/resolves checkpoints live; long work uses `background:true` plus bounded `action:"await"`. It supports `resumeFromRunId`, and non-elicitation clients resume `headless: "pause"` checkpoints with `checkpointReplies` from terminal `outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a saved workflow name. The `workflow` tool is the server's whole tool surface — run/resume/inspect/await are action branches, not separate tools. A run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`, `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool, one injected-tool registry per process), `AGENTPRISM_BACKENDS`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend `*_CMD`/`_ARGS`/`_BIN` overrides.
@@ -284,8 +283,9 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
 }
 ```
 
-`WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` records live whole-model and modifier
-degrades as `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }`.
+`WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` retains the compatibility shape
+`{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }`; the model
+resolution pipeline no longer produces entries.
 `WorkflowRunResult.checkpointsTaken?: WorkflowCheckpointTaken[]` records resolved checkpoints as
 `{ callIndex, kind, decision, source }`, where source is `live`, `headless-default`,
 `journal-replay`, or `injected`. A paused checkpoint is not resolved. Both fields are persisted and

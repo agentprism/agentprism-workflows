@@ -18,6 +18,8 @@ interface LogEntry {
   params?: {
     sessionId?: string;
     prompt?: ContentBlock[];
+    configId?: string;
+    value?: string;
   };
 }
 
@@ -112,17 +114,24 @@ test("per-session on() ignores events from a parallel run() session", async () =
   await session.release();
 });
 
-test("openSession surfaces model fallback callbacks", async () => {
-  const { cwd } = configure({ turns: [{ text: "unused" }] });
+test("openSession sends an unprefixed model verbatim without a fallback callback", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "unused" }] });
   const runner = makeRunner();
   const fallbacks: string[] = [];
+  const resolved: string[] = [];
   const session = await runner.openSession({
     cwd,
     model: "not-a-real-model",
     onModelFallback: (spec) => fallbacks.push(spec),
+    onModelResolved: (model) => resolved.push(model),
   });
 
-  assert.deepEqual(fallbacks, ["not-a-real-model"]);
+  assert.deepEqual(fallbacks, []);
+  assert.deepEqual(resolved, ["not-a-real-model"]);
+  const modelSet = readLog().find(
+    (entry) => entry.method === "setSessionConfigOption" && entry.params?.configId === "model",
+  );
+  assert.equal(modelSet?.params?.value, "not-a-real-model");
   await session.release();
 });
 

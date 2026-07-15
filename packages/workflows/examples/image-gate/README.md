@@ -62,10 +62,10 @@ node run.mjs --brand AgentPrism "an attractive README.md banner image for this r
 `--brand <name>` sets the exact product name rendered in the image (default `AgentPrism`);
 the remaining arguments are the request handed to the brief agent.
 
-The brief and validator agents are pinned to **Fable 5** via the per-agent `model` option
-(`args.models` in run.mjs — specs resolve against the Claude backend's model catalog, with a
-logged fallback to the session default if unavailable). The producer stays on the session
-default; its job is tool-calling, not judgment.
+The brief and validator agents are pinned to the live-catalog-verified Claude id
+`claude/claude-fable-5[1m]` via `args.models` in run.mjs. The registered prefix is stripped once
+and the remaining id is sent verbatim; harness rejection follows the normal agent-error path.
+The producer stays on the session default; its job is tool-calling, not judgment.
 
 run.mjs passes `cwd: repoRoot` to `runDynamicWorkflow`, so every agent session runs at the
 repo root and the brief agent explores with plain relative ls/grep. Generated images land in

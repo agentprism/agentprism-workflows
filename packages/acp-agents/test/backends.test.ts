@@ -141,28 +141,24 @@ test("OpenCodeBackend is the third built-in backend", () => {
 
 // ---- selectBackend cross-provider routing -------------------------------------------
 
-test("selectBackend routes by provider prefix and bare model id", () => {
-  // provider prefixes
-  assert.equal(selectBackend({ model: "openai/gpt-5.6-luna" }).id, "codex");
+test("selectBackend routes only by a registered first segment", () => {
   assert.equal(selectBackend({ model: "codex/whatever" }).id, "codex");
   assert.equal(selectBackend({ model: "opencode" }).id, "opencode");
   assert.equal(selectBackend({ model: "opencode/zai/glm-5.2" }).id, "opencode");
-  assert.equal(selectBackend({ model: "anthropic/claude-opus-4-1" }).id, "claude");
   assert.equal(selectBackend({ model: "claude/sonnet" }).id, "claude");
-  // bare model ids (no provider)
-  assert.equal(selectBackend({ model: "gpt-5.6-luna" }).id, "codex");
-  assert.equal(selectBackend({ model: "o3-mini" }).id, "codex");
-  assert.notEqual(selectBackend({ model: "glm-5.2" }).id, "opencode");
+  assert.equal(selectBackend({ model: "CoDeX/gpt-5.6-luna" }).id, "codex");
+  // Aliases and bare family names are unregistered, so they use the default (Claude here).
+  assert.equal(selectBackend({ model: "openai/gpt-5.6-luna" }).id, "claude");
+  assert.equal(selectBackend({ model: "gpt-5.6-luna" }).id, "claude");
+  assert.equal(selectBackend({ model: "o3-mini" }).id, "claude");
+  assert.equal(selectBackend({ model: "glm-5.2" }).id, "claude");
   assert.equal(selectBackend({ model: "claude-3-5-sonnet" }).id, "claude");
   assert.equal(selectBackend({ model: "opus" }).id, "claude");
 });
 
-test("selectBackend: model wins over tier; falls back to default (claude) when both unknown", () => {
-  // a recognizable model overrides a tier that maps elsewhere
-  assert.equal(selectBackend({ model: "gpt-5.6-luna", tier: "claude-ish" }).id, "codex");
-  // unrecognized model but tier disambiguates
-  assert.equal(selectBackend({ model: "mystery-model", tier: "openai/gpt" }).id, "codex");
-  // nothing recognizable => default backend (claude)
+test("selectBackend: model is the effective spec when present; otherwise tier is used", () => {
+  assert.equal(selectBackend({ model: "mystery-model", tier: "codex/gpt" }).id, "claude");
+  assert.equal(selectBackend({ tier: "codex/gpt" }).id, "codex");
   assert.equal(selectBackend({ model: "mystery-model" }).id, "claude");
   assert.equal(selectBackend({}).id, "claude");
 });
@@ -176,8 +172,8 @@ test("selectBackend honors AGENTPRISM_DEFAULT_BACKEND when nothing else matches"
     process.env.AGENTPRISM_DEFAULT_BACKEND = "opencode";
     assert.equal(selectBackend({}).id, "opencode");
     assert.equal(selectBackend({ model: "unknownish" }).id, "opencode");
-    // an explicit recognizable spec still overrides the default
-    assert.equal(selectBackend({ model: "claude-opus" }).id, "claude");
+    assert.equal(selectBackend({ model: "anthropic/claude-opus" }).id, "opencode");
+    assert.equal(selectBackend({ model: "claude/claude-opus" }).id, "claude");
   } finally {
     if (prev === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
     else process.env.AGENTPRISM_DEFAULT_BACKEND = prev;

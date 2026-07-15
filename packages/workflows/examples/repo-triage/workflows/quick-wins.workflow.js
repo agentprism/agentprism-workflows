@@ -24,12 +24,11 @@ const focus =
     : "small, safe, high-confidence improvements";
 const avoid = Array.isArray(opt.avoid) ? opt.avoid.filter((x) => typeof x === "string") : [];
 
-// Bracket tokens ride each agent's advertised effort ladder — see the pool note in
-// repo-triage.workflow.js ([xhigh] for Codex; glm-5.2 advertises high | max).
+// These registered-prefix specs use ids verified against each live harness catalog.
 const POOL = [
-  { name: "claude", model: "opus[1m]", mode: "plan" },
-  { name: "codex", model: "gpt-5.6-sol[xhigh]", mode: "read-only" },
-  { name: "opencode", model: "opencode/zai/glm-5.2[max]" },
+  { name: "claude", model: "claude/opus[1m]", mode: "plan" },
+  { name: "codex", model: "codex/gpt-5.6-sol", mode: "read-only" },
+  { name: "opencode", model: "opencode/zai/glm-5.2" },
 ];
 
 const WINS = {

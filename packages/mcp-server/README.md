@@ -192,7 +192,7 @@ interface WorkflowExecutionToolResult {
   logTail?: WorkflowLogTail;               // paused/failed/aborted only
   authContext?: AuthErrorContext;           // auth_required pauses only
   checkpointContext?: CheckpointContext;   // checkpoint_required pauses only
-  fallbacks?: WorkflowRunFallback[];       // live model/modifier degrades; absent when empty
+  fallbacks?: WorkflowRunFallback[];       // compatibility events; absent when empty
   checkpointsTaken?: WorkflowCheckpointTaken[]; // resolved checkpoints; absent when empty
 }
 
@@ -222,7 +222,7 @@ type WorkflowToolResult =
 
 | Execution output field | Shape | Notes |
 | --- | --- | --- |
-| `fallbacks` | `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }[]` | `kind` is `"model"` or `"modifier"`; live calls only; absent when empty. |
+| `fallbacks` | `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }[]` | Compatibility surface for non-resolution subsystems or third-party runners; model selection emits none; absent when empty. |
 | `checkpointsTaken` | `{ callIndex, kind, decision, source }[]` | `source` is `"live"`, `"headless-default"`, `"journal-replay"`, or `"injected"`; paused checkpoints are omitted; absent when empty. |
 
 These fields appear on foreground execution results and terminal await `outcome` objects. They are
@@ -343,7 +343,7 @@ Each `agent()` call is dispatched to an **ACP agent server** chosen by the call'
 - **Codex** → `@automatalabs/codex-acp` (a published fork that bakes in the structured-output patch). By default the server resolves that package and runs it under the current Node.
 - **OpenCode** → `opencode acp`. `opencode-ai` is intentionally not bundled; install it in the host environment or put `opencode` on `PATH`.
 
-Beyond the built-ins, **any ACP agent** can be registered as a named backend via `AGENTPRISM_BACKENDS` (see the table below) and routed to with `agent(p, { model: "<name>" })` — or `"<name>/<inner-model>"` to also select a model from the agent's catalog. Scripts can pass arbitrary session/turn `_meta` to such agents with `agent(p, { meta, promptMeta })`.
+Beyond the built-ins, **any ACP agent** can be registered as a named backend via `AGENTPRISM_BACKENDS` (see the table below) and routed to with `agent(p, { model: "<name>" })` — or `"<name>/<inner-model>"` to send `<inner-model>` verbatim as its model config value. Scripts can pass arbitrary session/turn `_meta` to such agents with `agent(p, { meta, promptMeta })`.
 
 A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config (approvals stick for the session); otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
 

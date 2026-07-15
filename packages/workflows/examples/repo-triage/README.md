@@ -15,7 +15,8 @@ markdown report to disk.
                               ▼   one pipeline — no barrier between stages
 ┌───────────────────────────────────────────────────────────────┐
 │ Sweep   each area audited by the next vendor in the pool      │
-│         (opus[1m] / gpt-5.6-sol[xhigh] / zai glm-5.2[max])    │
+│         (claude/opus[1m] / codex/gpt-5.6-sol /                │
+│          opencode/zai/glm-5.2)                                │
 │ Verify  every finding adversarially re-checked by the TWO     │
 │         vendors that did not produce it; unanimity to survive │
 └─────────────────────────────┬─────────────────────────────────┘
@@ -44,7 +45,7 @@ would put a `checkpoint()` before the irreversible step — see the SDK README.)
 |---|---|
 | `openWorkflowDir` + `runDynamicWorkflow` (list saved workflows, run one by **name**) | `src/main.ts` |
 | `exec` knobs: `tokenBudget`, `agentTimeoutMs`, `agentRetries`, `onProgress` | `src/main.ts` |
-| Per-call **backend routing** (`model`) + bracket modifiers riding each agent's advertised options (`[xhigh]`/`[max]` effort ladders; `opus[1m]` selects Claude's catalog-encoded 1M-context variant) | the vendor pool in both scripts |
+| Per-call **backend routing** (`model`) with registered prefixes and live-catalog-verified ids sent verbatim | the vendor pool in both scripts |
 | **Read-only session modes** (`mode: "plan"` / `"read-only"`) on pinned calls | the vendor pool in both scripts |
 | `pipeline()` (barrier-less multi-stage flow) + `parallel()` (verification panel) | `repo-triage.workflow.js` |
 | Structured output via `schema`, placeholder guards in script code | both scripts |
@@ -73,8 +74,8 @@ repo-triage/
    install or `ANTHROPIC_API_KEY`; Codex via `~/.codex/auth.json`; OpenCode via
    `opencode auth login` (its CLI must be installed). A degraded setup fails in
    well-defined ways, not mysteriously — but know the mechanics:
-   - a **model id its backend doesn't list** logs a fallback line and the call runs
-     on that backend's default model (never a different backend);
+   - a **model id rejected by its harness** follows the normal agent-error/retry path;
+     the client never substitutes a nearby model or silently falls back;
    - a backend whose **CLI is missing** fails its calls after retries (they resolve
      to `null`): the script skips that vendor's areas and returns findings whose
      jurors are all gone in `unverified` instead of `findings`;
