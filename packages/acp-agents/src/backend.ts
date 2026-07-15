@@ -8,6 +8,7 @@
 //   3. how to read the native structured result OUT (Claude: structured_output off the raw
 //      _claude/sdkMessage; Codex/OpenCode: JSON.parse the final assistant message off the stream).
 import type { TSchema } from "typebox";
+import type { ProviderUsageLimitContext } from "@automatalabs/shared-types";
 import type { AuthProfile } from "./auth/auth-profiles.js";
 
 /** The built-in backends. Custom registry backends extend the id space beyond these. */
@@ -44,6 +45,18 @@ export interface SessionMetaInputs {
   developerInstructions?: string;
 }
 
+/** Structured provider metadata accumulated alongside a prompt before its request rejects. */
+export interface ProviderErrorMetadata {
+  /** RFC 3339 reset instant derived from provider-owned numeric metadata. */
+  resetAt?: string;
+}
+
+/** Adapter-owned classification returned to the generic thrown-error mapper. */
+export type ProviderErrorClassification = {
+  kind: "provider_usage_limit";
+  context: ProviderUsageLimitContext;
+};
+
 export interface Backend {
   readonly id: BackendId;
   /** Pool identity for this backend's long-lived processes. Defaults to `id` — but a CUSTOM
@@ -74,6 +87,12 @@ export interface Backend {
    *  runner consults `profile.describe`/`buildMeta` (§1.3/§2.9), and the connection refines client
    *  auth capabilities through `profile.clientAuthCapabilities` (§1.2). */
   readonly authProfile?: AuthProfile;
+  /** Interpret this adapter's structured provider error surface. Any unavoidable prose fallback
+   *  stays inside the concrete adapter implementation rather than generic runner/engine flow. */
+  classifyProviderError?(
+    error: unknown,
+    metadata?: ProviderErrorMetadata,
+  ): ProviderErrorClassification | undefined;
   /** How to launch this backend's ACP server over stdio. */
   spawnConfig(): SpawnConfig;
   /** OPTIONAL backend-level `_meta` DEFAULTS for session/new (e.g. a custom registry entry's

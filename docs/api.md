@@ -225,7 +225,7 @@ Terminal run results also expose two replay-neutral audit fields, both absent wh
 Both arrays persist on `PersistedRunState` for cold terminal reads. Neither enters call hashes, and
 neither is added to the bounded `WorkflowRunStatus` inspection shape.
 
-A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused**, not failed — the journal checkpoints and `resume()` picks up after the budget refills (`resetHint` carries the provider's "resets in…" text when present).
+A run that hits a provider usage/quota wall (`PROVIDER_USAGE_LIMIT`) is **paused**, not failed — the journal checkpoints and `resume()` picks up after the budget refills (`resetHint` is synthesized as `Resets at <RFC 3339 instant>` when structured provider reset metadata is present).
 
 A run that hits `AUTH_REQUIRED` is likewise **paused** (`reason: "auth_required"`), not failed: the journal checkpoints and the paused state persists the structured, non-secret `authContext` (`backendId` + advertised method `{ id, type, name }[]` — never credential material). `resume()` re-arms against the runner: for an `"auth_required"` pause it consults `runner.auth.canResume(backendId)` before re-executing. When the credential survived (warm resume in the same process, or a disk-backed method a fresh process re-reads from the native store/env) it proceeds; when an in-process (gateway) or spawn-env intent was lost to a cold process it **immediately re-pauses** with `re-supply credentials for <backend> via runner auth before resuming` rather than re-running into the same wall. A runner with no `auth` controller (the default-off host) cannot confirm resumability and re-pauses.
 
@@ -708,7 +708,7 @@ Workflow scripts may *declare* backends via `meta.backends`, but declarations ar
 
 ## Errors — `WorkflowError`
 
-One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds across packages) with `.code`, `.recoverable`, `.agentLabel?`, `.resetHint?`, `.authContext?`, and `.checkpointContext?`. Recoverable agent failures retry up to `agentRetries`, then resolve that agent to `null`; non-recoverable ones halt the run except the three manager-owned pause codes called out below.
+One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds across packages) with `.code`, `.recoverable`, `.agentLabel?`, `.resetHint?`, `.providerUsageLimitContext?`, `.authContext?`, and `.checkpointContext?`. Recoverable agent failures retry up to `agentRetries`, then resolve that agent to `null`; non-recoverable ones halt the run except the three manager-owned pause codes called out below.
 
 | Code | Recoverable | Meaning / engine behavior |
 |---|---|---|
@@ -718,7 +718,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `AGENT_TIMEOUT` | yes | Engine-enforced per-agent timeout. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
-| `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `resetHint`. |
+| `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
 | `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
 | `CHECKPOINT_REQUIRED` | no | `checkpoint(..., { headless: "pause" })` has no live channel → the run **pauses** with non-secret `checkpointContext`; resume with `checkpointReplies` or a live `confirm`. |
 | `TOKEN_BUDGET_EXHAUSTED` / `AGENT_LIMIT_EXCEEDED` | no | Run caps hit. |

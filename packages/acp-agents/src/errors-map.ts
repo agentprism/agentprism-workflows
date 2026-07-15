@@ -1,18 +1,18 @@
-// ACP failure -> WorkflowError{code, recoverable, resetHint}.
+// ACP failure -> WorkflowError{code, recoverable, providerUsageLimitContext}.
 //
 // Every hard backend failure REJECTS the ACP request (claude-agent-acp `failActive(...)`,
 // codex-acp request errors), so the runner catches one thrown error and classifies it HERE.
-// Provider usage/quota/rate walls are detected by running the thrown error's MESSAGE through
-// classifyProviderLimit (shared-types) — this is the "gate on the error channel, never task
-// text" rule: we only ever classify text that arrived via an error/reject, never the
-// assistant's normal output. A matched wall becomes PROVIDER_USAGE_LIMIT (non-recoverable +
-// resetHint -> the engine PAUSES and resumes instead of retrying into the same wall).
+// Provider usage/quota/rate walls arrive as an adapter-owned structured discriminant. A wall
+// becomes PROVIDER_USAGE_LIMIT (non-recoverable -> the engine PAUSES and resumes instead of
+// retrying into the same wall). Any unavoidable provider-prose fallback lives inside the
+// concrete adapter, never in this generic mapper or the workflow engine.
 // Everything else is a recoverable AGENT_EXECUTION_ERROR (transient process/ACP faults that
 // the engine retries). WorkflowErrors raised inside the ladder (SCHEMA_NONCOMPLIANCE,
 // AGENT_EMPTY_OUTPUT) pass through unchanged.
-import { classifyProviderLimit, isWorkflowError, WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
+import { isWorkflowError, WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import type { AuthErrorContext } from "@automatalabs/shared-types";
 import type { AuthMethod } from "@agentclientprotocol/sdk";
+import type { Backend, ProviderErrorClassification, ProviderErrorMetadata } from "./backend.js";
 
 export const ACP_AUTH_REQUIRED_ERROR_CODE = -32000;
 
@@ -25,6 +25,8 @@ const OTHER_RESERVED = new Set([-32700, -32600, -32601, -32602, -32603, -32800, 
 export interface ErrorMapContext {
   label?: string;
   backendId?: string;
+  backend?: Backend;
+  providerErrorMetadata?: ProviderErrorMetadata;
   authMethods?: readonly AuthMethod[];
 }
 
@@ -93,12 +95,21 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
     });
   }
 
-  const { matched, resetHint } = classifyProviderLimit(message);
-  if (matched) {
+  const providerError = classifyProviderError(error, context);
+  if (providerError?.kind === "provider_usage_limit") {
+    const resetHint = providerError.context.resetAt
+      ? `Resets at ${providerError.context.resetAt}`
+      : undefined;
     return new WorkflowError(
       message || "Provider usage/quota limit reached",
       WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
-      { recoverable: false, agentLabel: context.label, resetHint, details: error },
+      {
+        recoverable: false,
+        agentLabel: context.label,
+        resetHint,
+        providerUsageLimitContext: providerError.context,
+        details: error,
+      },
     );
   }
 
@@ -107,6 +118,18 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
     agentLabel: context.label,
     details: error,
   });
+}
+
+function classifyProviderError(
+  error: unknown,
+  context: ErrorMapContext,
+): ProviderErrorClassification | undefined {
+  try {
+    return context.backend?.classifyProviderError?.(error, context.providerErrorMetadata);
+  } catch {
+    // A hostile thrown object must remain a recoverable execution error, not escape containment.
+    return undefined;
+  }
 }
 
 function isAcpAuthRequired(error: unknown, message: string): boolean {

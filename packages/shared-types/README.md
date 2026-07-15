@@ -87,8 +87,9 @@ From [`src/index.ts`](./src/index.ts):
 **Errors** (runtime, not just types)
 - `WorkflowError` (class) + `WorkflowErrorCode` (enum) + `WorkflowErrorOptions`.
 - `AuthErrorContext` — the non-secret backend/method summary carried by `AUTH_REQUIRED`.
-- `isWorkflowError`, `isProviderUsageLimit`, `isAuthRequired`, `classifyProviderLimit`
-  (guards / classifier).
+- `ProviderUsageLimitContext` — the backend/code and provider-derived reset instant carried by
+  `PROVIDER_USAGE_LIMIT`.
+- `isWorkflowError`, `isProviderUsageLimit`, `isAuthRequired` (guards).
 
 **Workflow result**
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,

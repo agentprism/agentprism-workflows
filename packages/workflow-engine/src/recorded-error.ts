@@ -49,7 +49,14 @@ export function projectRecordedError(error: unknown): WorkflowRecordedError {
       const recoverable = guardedRead(error, "recoverable");
       if (recoverable.ok && typeof recoverable.value === "boolean") output.recoverable = recoverable.value;
       else markLossy();
-      for (const key of ["agentLabel", "details", "resetHint", "authContext", "checkpointContext"]) {
+      for (const key of [
+        "agentLabel",
+        "details",
+        "resetHint",
+        "providerUsageLimitContext",
+        "authContext",
+        "checkpointContext",
+      ]) {
         projectOptional(output, error, key, markLossy);
       }
       if (lossy) output.lossy = true;

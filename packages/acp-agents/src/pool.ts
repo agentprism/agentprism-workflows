@@ -91,6 +91,7 @@ export class AcpAgentPool {
       throw mapThrownError(error, {
         label: opts.label,
         backendId: connection.backendId,
+        backend,
         authMethods: connection.capabilities?.authMethods,
       });
     }
@@ -111,6 +112,7 @@ export class AcpAgentPool {
       throw mapThrownError(error, {
         label: context.label,
         backendId: connection.backendId,
+        backend,
         authMethods: connection.capabilities?.authMethods,
       });
     }

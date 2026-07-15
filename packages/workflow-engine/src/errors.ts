@@ -1,18 +1,17 @@
 /**
  * Engine-local error helpers.
  *
- * The seam-level error CONTRACT (the WorkflowError runtime class, the
- * WorkflowErrorCode enum, isWorkflowError/isProviderUsageLimit, and the pure
- * classifyProviderLimit text classifier) lives in @automatalabs/shared-types so the
- * runner (acp-agents) and this engine share ONE class — `instanceof WorkflowError`
- * holds across packages. They are re-exported here so the lifted engine modules can
- * keep importing them from "./errors.js".
+ * The seam-level error CONTRACT (the WorkflowError runtime class, the WorkflowErrorCode
+ * enum, and its guards) lives in @automatalabs/shared-types so the runner (acp-agents)
+ * and this engine share ONE class — `instanceof WorkflowError` holds across packages.
+ * They are re-exported here so the lifted engine modules can keep importing them from
+ * "./errors.js".
  *
  * wrapError / errorMessage / isAbortError / isTimeoutError stay engine-local: they are
  * the engine's own classification/formatting of the failures it observes when calling
  * the injected runner or executing workflow code.
  */
-import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
+import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 
 export {
   WorkflowError,
@@ -20,13 +19,17 @@ export {
   isWorkflowError,
   isProviderUsageLimit,
   isAuthRequired,
-  classifyProviderLimit,
 } from "@automatalabs/shared-types";
-export type { WorkflowErrorOptions, AuthErrorContext, CheckpointContext } from "@automatalabs/shared-types";
+export type {
+  WorkflowErrorOptions,
+  AuthErrorContext,
+  CheckpointContext,
+  ProviderUsageLimitContext,
+} from "@automatalabs/shared-types";
 
 export function isAbortError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return /\babort(?:ed)?\b/i.test(errorMessage(error));
+  return readName(error) === "AbortError";
 }
 
 export function isTimeoutError(error: unknown): boolean {
@@ -54,22 +57,6 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       WorkflowErrorCode.AGENT_TIMEOUT,
       { recoverable: true, agentLabel: context?.agentLabel },
     );
-  }
-
-  // Defense-in-depth: the runner normally raises PROVIDER_USAGE_LIMIT itself, but a
-  // backend might throw a raw provider error. Classify a thrown limit here too —
-  // recoverable:false so the run checkpoints (paused) instead of being retried into
-  // the same wall or silently nulled.
-  if (error instanceof Error) {
-    const message = errorMessage(error);
-    const limit = classifyProviderLimit(message);
-    if (limit.matched) {
-      return new WorkflowError(message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
-        recoverable: false,
-        agentLabel: context?.agentLabel,
-        resetHint: limit.resetHint,
-      });
-    }
   }
 
   return new WorkflowError(

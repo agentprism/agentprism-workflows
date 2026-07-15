@@ -883,6 +883,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       throw mapThrownError(error, {
         label: opts.label,
         backendId: prepared.backend.id,
+        backend: prepared.backend,
+        providerErrorMetadata: session?.providerErrorMetadata,
         authMethods: session?.capabilities?.authMethods,
       });
     } finally {
@@ -1011,6 +1013,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       throw mapThrownError(error, {
         label: opts.label,
         backendId: prepared.backend.id,
+        backend: prepared.backend,
+        providerErrorMetadata: session?.providerErrorMetadata,
         authMethods: connection.capabilities?.authMethods,
       });
     }
@@ -1084,7 +1088,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       try {
         await connection.authenticate({ methodId }, label);
       } catch (error) {
-        throw mapThrownError(error, { label, backendId: backend.id, authMethods: [...advertised] });
+        throw mapThrownError(error, { label, backendId: backend.id, backend, authMethods: [...advertised] });
       } finally {
         await disposeBestEffort(connection);
       }

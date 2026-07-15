@@ -140,6 +140,12 @@ return { a, c }`,
               agentLabel: "hard",
               details: { public: true },
               resetHint: "later",
+              providerUsageLimitContext: {
+                backendId: "claude",
+                source: "provider",
+                providerCode: "rate_limit",
+                resetAt: "2026-07-15T09:00:00.000Z",
+              },
               authContext: { backendId: "backend", methods: [] },
             });
           },
@@ -159,6 +165,12 @@ return { a, c }`,
       agentLabel: "hard",
       details: { public: true },
       resetHint: "later",
+      providerUsageLimitContext: {
+        backendId: "claude",
+        source: "provider",
+        providerCode: "rate_limit",
+        resetAt: "2026-07-15T09:00:00.000Z",
+      },
       authContext: { backendId: "backend", methods: [] },
     });
   });

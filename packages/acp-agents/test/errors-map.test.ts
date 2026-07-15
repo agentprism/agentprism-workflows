@@ -1,11 +1,19 @@
-// Supports area (4): the ACP failure -> WorkflowError classifier. Provider walls become
-// PROVIDER_USAGE_LIMIT (non-recoverable + resetHint, gated on the ERROR channel only); in-band
-// seam errors pass through untouched; everything else is a recoverable AGENT_EXECUTION_ERROR.
+// ACP adapter classifications become typed seam errors; generic mapping never parses prose.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
-import { ACP_AUTH_REQUIRED_ERROR_CODE, errorText, mapThrownError } from "../src/index.js";
+import {
+  ACP_AUTH_REQUIRED_ERROR_CODE,
+  ClaudeBackend,
+  CodexBackend,
+  errorText,
+  mapThrownError,
+  OpenCodeBackend,
+} from "../src/index.js";
+
+const LIVE_USAGE_CREDITS =
+  "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
 
 test("errorText extracts a message from Error, string, {message}, and falls back to JSON/String", () => {
   assert.equal(errorText(new Error("boom")), "boom");
@@ -15,59 +23,101 @@ test("errorText extracts a message from Error, string, {message}, and falls back
   assert.equal(errorText(42), "42");
 });
 
-test("provider wall => PROVIDER_USAGE_LIMIT, non-recoverable, with resetHint preserved", () => {
-  const mapped = mapThrownError(new Error("Usage limit reached. Resets in 3 hours."), "weather-agent");
+test("codex-acp usageLimitExceeded data maps to PROVIDER_USAGE_LIMIT with structured reset metadata", () => {
+  // Exact @automatalabs/codex-acp@1.6.3 shape from createTurnErrorData(): provider text plus the
+  // Codex app-server's typed codexErrorInfo discriminant in RequestError.data.
+  const wall = RequestError.internalError({
+    message: "You've hit your usage limit.",
+    codexErrorInfo: "usageLimitExceeded",
+  });
+  assert.equal(wall.code, -32603);
+  assert.equal(wall.message, "Internal error");
+  const mapped = mapThrownError(wall, {
+    label: "codex-agent",
+    backendId: "codex",
+    backend: new CodexBackend(),
+    providerErrorMetadata: { resetAt: "2026-07-15T08:00:00.000Z" },
+  });
   assert.ok(mapped instanceof WorkflowError);
   assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
   assert.equal(mapped.recoverable, false);
-  assert.equal(mapped.resetHint, "Resets in 3 hours");
-  assert.equal(mapped.agentLabel, "weather-agent");
-  assert.equal(mapped.details instanceof Error, true);
-});
-
-test("codex-acp usageLimitExceeded RequestError (text in .data.message) => PROVIDER_USAGE_LIMIT + resetHint", () => {
-  // Exact reconstructed shape from @automatalabs/codex-acp@1.6.1: usageLimitExceeded wraps the
-  // provider text as RequestError.internalError(createTurnErrorData(...)) — code -32603, message
-  // "Internal error", the real quota/reset text only in `.data.message`. The ACP SDK client
-  // reconstructs it identically via `new RequestError(code, message, data)` (jsonrpc.js), so
-  // RequestError.internalError({ message }) reproduces the on-client object faithfully.
-  const wall = RequestError.internalError({ message: "You've hit your usage limit. Resets in 2 hours 30 minutes." });
-  assert.equal(wall.code, -32603);
-  assert.equal(wall.message, "Internal error");
-  const mapped = mapThrownError(wall, { label: "codex-agent", backendId: "codex" });
-  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
-  assert.equal(mapped.recoverable, false);
-  assert.equal(mapped.resetHint, "Resets in 2 hours 30 minutes");
+  assert.equal(mapped.resetHint, "Resets at 2026-07-15T08:00:00.000Z");
   assert.equal(mapped.agentLabel, "codex-agent");
+  assert.deepEqual(mapped.providerUsageLimitContext, {
+    backendId: "codex",
+    source: "provider",
+    providerCode: "usageLimitExceeded",
+    resetAt: "2026-07-15T08:00:00.000Z",
+  });
   assert.match(mapped.message, /usage limit/i); // provider text surfaced, not just "Internal error"
 });
 
-test("codex-acp usageLimitExceeded RequestError with no reset time => PROVIDER_USAGE_LIMIT, resetHint undefined", () => {
-  const wall = RequestError.internalError({ message: "You have exceeded your current quota." });
-  const mapped = mapThrownError(wall, "codex-agent");
+test("codex-acp typed HTTP 429 data maps without consulting provider prose", () => {
+  const wall = RequestError.internalError({
+    message: "localized provider failure",
+    codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+  });
+  const mapped = mapThrownError(wall, { backendId: "codex", backend: new CodexBackend() });
+  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(mapped.providerUsageLimitContext?.providerCode, "http_429");
+});
+
+test("claude-agent-acp errorKind maps the exact live #149 text and structured reset epoch", () => {
+  const wall = RequestError.internalError({ errorKind: "billing_error" }, LIVE_USAGE_CREDITS);
+  const mapped = mapThrownError(wall, {
+    label: "fable-reviewer",
+    backendId: "claude",
+    backend: new ClaudeBackend(),
+    providerErrorMetadata: { resetAt: "2026-07-15T09:00:00.000Z" },
+  });
   assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
   assert.equal(mapped.recoverable, false);
+  assert.equal(mapped.resetHint, "Resets at 2026-07-15T09:00:00.000Z");
+  assert.deepEqual(mapped.providerUsageLimitContext, {
+    backendId: "claude",
+    source: "provider",
+    providerCode: "billing_error",
+    resetAt: "2026-07-15T09:00:00.000Z",
+  });
+  assert.equal(mapped.message.includes(LIVE_USAGE_CREDITS), true);
+});
+
+test("legacy Claude and current OpenCode adapter fallbacks cover the live #149 message only at the boundary", () => {
+  const claude = mapThrownError(new Error(LIVE_USAGE_CREDITS), {
+    backendId: "claude",
+    backend: new ClaudeBackend(),
+  });
+  const opencode = mapThrownError(RequestError.internalError({ errorName: "APIError" }, LIVE_USAGE_CREDITS), {
+    backendId: "opencode",
+    backend: new OpenCodeBackend(),
+  });
+  assert.equal(claude.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(claude.providerUsageLimitContext?.source, "adapter_fallback");
+  assert.equal(opencode.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+  assert.equal(opencode.providerUsageLimitContext?.source, "adapter_fallback");
+});
+
+test("billing endpoint unavailable is not a provider usage limit", () => {
+  for (const backend of [new ClaudeBackend(), new OpenCodeBackend(), new CodexBackend()]) {
+    const mapped = mapThrownError(new Error("billing endpoint unavailable"), {
+      backendId: backend.id,
+      backend,
+    });
+    assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR, backend.id);
+    assert.equal(mapped.recoverable, true, backend.id);
+  }
+});
+
+test("provider-looking prose without an adapter discriminant remains recoverable", () => {
+  const mapped = mapThrownError(new Error("Usage limit reached. Resets at 9:00 AM."));
+  assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  assert.equal(mapped.recoverable, true);
   assert.equal(mapped.resetHint, undefined);
-});
-
-test("provider text in RequestError .data.details also classifies (backend-generic, no codex special-casing)", () => {
-  const wall = new RequestError(-32603, "Internal error", { details: "rate limit exceeded, resets at 5pm UTC" });
-  const mapped = mapThrownError(wall);
-  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
-  assert.equal(mapped.recoverable, false);
-  assert.equal(mapped.resetHint, "resets at 5pm UTC");
-});
-
-test("regression: plain-message provider wall (Claude path, no .data) still => PROVIDER_USAGE_LIMIT", () => {
-  // Claude fails the active turn with the provider text directly on the Error message (no `.data`).
-  const mapped = mapThrownError(new Error("Usage limit reached. Resets at 9:00 AM."), "claude-agent");
-  assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
-  assert.equal(mapped.recoverable, false);
-  assert.equal(mapped.resetHint, "Resets at 9:00 AM");
+  assert.equal(mapped.providerUsageLimitContext, undefined);
   assert.equal(mapped.message, "Usage limit reached. Resets at 9:00 AM.");
 });
 
-test("errorText folds RequestError .data text in for classification; leaves non-text data alone", () => {
+test("errorText folds RequestError .data text in for display; leaves non-text data alone", () => {
   assert.match(errorText(RequestError.internalError({ message: "quota exceeded" })), /quota exceeded/);
   // A `.data` with no message/details string adds nothing (e.g. methodNotFound's `{ method }`).
   assert.equal(errorText(RequestError.methodNotFound("session/foo")), `"Method not found": session/foo`);
@@ -156,18 +206,6 @@ test("AUTH_REQUIRED with no advertised methods yields an empty methods array (ba
     backendId: "custom",
   });
   assert.deepEqual(mapped.authContext, { backendId: "custom", methods: [] });
-});
-
-test("various provider-wall phrasings all classify as PROVIDER_USAGE_LIMIT", () => {
-  for (const msg of [
-    "429 Too Many Requests",
-    "You have exceeded your current quota",
-    "rate limit exceeded",
-    "insufficient_quota",
-    "GoUsageLimitError: blocked",
-  ]) {
-    assert.equal(mapThrownError(new Error(msg)).code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, msg);
-  }
 });
 
 test("a non-wall fault => recoverable AGENT_EXECUTION_ERROR (engine retries it)", () => {

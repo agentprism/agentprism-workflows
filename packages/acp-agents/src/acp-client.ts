@@ -106,7 +106,7 @@ import {
   type AgentHistoryEntry,
   type McpServerConfig,
 } from "@automatalabs/shared-types";
-import type { Backend, BackendId, StructuredSource } from "./backend.js";
+import type { Backend, BackendId, ProviderErrorMetadata, StructuredSource } from "./backend.js";
 import {
   adaptPromptContent,
   describeAuthProviderAdvertisement,
@@ -193,6 +193,7 @@ class SessionState {
   readonly urlElicitationIds = new Set<string>();
   readonly mcpConnectionIds = new Set<McpConnectionId>();
   rawResultSuccess: RawResultSuccess | undefined;
+  providerErrorMetadata: ProviderErrorMetadata | undefined;
   modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
@@ -227,6 +228,7 @@ class SessionState {
     }
     this.finalMessageStartIndex = this.turnStartIndex;
     this.rawResultSuccess = undefined;
+    this.providerErrorMetadata = undefined;
   }
 
   currentTurnText(): string {
@@ -280,6 +282,8 @@ class SessionState {
         // Also feed the context token counts so AgentUsage.total is non-zero for backends
         // that report tokens via usage_update but never via PromptResponse.usage.
         this.usage.recordContextTokens(update.used, update.size);
+        const providerErrorMetadata = claudeProviderErrorMetadata(update._meta);
+        if (providerErrorMetadata) this.providerErrorMetadata = providerErrorMetadata;
         break;
       }
       case "current_mode_update": {
@@ -311,6 +315,30 @@ class SessionState {
   settlePendingElicitations(): void {
     for (const settle of [...this.pendingElicitations]) settle(cancelledElicitationResponse());
   }
+}
+
+function claudeProviderErrorMetadata(meta: unknown): ProviderErrorMetadata | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const rateLimit = (meta as Record<string, unknown>)["_claude/rateLimit"];
+  if (!rateLimit || typeof rateLimit !== "object") return undefined;
+  const values = rateLimit as Record<string, unknown>;
+  const primary = finiteEpochSeconds(values.resetsAt);
+  const overage = finiteEpochSeconds(values.overageResetsAt);
+  const resetEpoch = values.status === "rejected"
+    ? primary
+    : values.overageStatus === "rejected"
+      ? overage ?? primary
+      : primary ?? overage;
+  if (resetEpoch === undefined) return undefined;
+  try {
+    return { resetAt: new Date(resetEpoch * 1_000).toISOString() };
+  } catch {
+    return undefined;
+  }
+}
+
+function finiteEpochSeconds(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 /** The single client-side handler set for one pooled connection (registered on the SDK's fluent
@@ -1886,6 +1914,11 @@ export class SessionHandle implements StructuredSource {
   /** Per-session usage accumulator (read by the runner on BOTH success and error paths). */
   get usage(): UsageAccumulator {
     return this.state.usage;
+  }
+
+  /** Structured provider metadata observed before the current prompt rejected. */
+  get providerErrorMetadata(): ProviderErrorMetadata | undefined {
+    return this.state.providerErrorMetadata;
   }
 
   /** Diagnostic message/tool history accumulated across this session's run. */

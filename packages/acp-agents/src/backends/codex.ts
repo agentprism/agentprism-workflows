@@ -10,7 +10,14 @@
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
-import type { Backend, SessionMetaInputs, SpawnConfig, StructuredSource } from "../backend.js";
+import type {
+  Backend,
+  ProviderErrorClassification,
+  ProviderErrorMetadata,
+  SessionMetaInputs,
+  SpawnConfig,
+  StructuredSource,
+} from "../backend.js";
 import { splitArgs } from "../backend.js";
 import { codexAuthProfile } from "../auth/auth-profiles.js";
 import { GATED_CUSTOM_META_KEYS } from "../capabilities.js";
@@ -28,6 +35,20 @@ export class CodexBackend implements Backend {
     namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
     gatedKeys: GATED_CUSTOM_META_KEYS,
   } as const;
+
+  classifyProviderError(
+    error: unknown,
+    metadata?: ProviderErrorMetadata,
+  ): ProviderErrorClassification | undefined {
+    const info = errorData(error)?.codexErrorInfo;
+    if (info === "usageLimitExceeded") {
+      return providerUsageLimit("usageLimitExceeded", metadata);
+    }
+    if (codexHttpStatus(info) === 429) {
+      return providerUsageLimit("http_429", metadata);
+    }
+    return undefined;
+  }
 
   spawnConfig(): SpawnConfig {
     const env = process.env;
@@ -66,5 +87,46 @@ export class CodexBackend implements Backend {
     // fallback if the message also carried leading prose. Final message ONLY — the turn-wide
     // constraint makes intermediate progress messages schema-shaped as well.
     return parseFinalJson(source.finalMessageText());
+  }
+}
+
+function providerUsageLimit(
+  providerCode: string,
+  metadata: ProviderErrorMetadata | undefined,
+): ProviderErrorClassification {
+  return {
+    kind: "provider_usage_limit",
+    context: {
+      backendId: "codex",
+      source: "provider",
+      providerCode,
+      resetAt: metadata?.resetAt,
+    },
+  };
+}
+
+function codexHttpStatus(info: unknown): number | undefined {
+  if (!info || typeof info !== "object") return undefined;
+  for (const key of [
+    "httpConnectionFailed",
+    "responseStreamConnectionFailed",
+    "responseStreamDisconnected",
+    "responseTooManyFailedAttempts",
+  ]) {
+    const detail = (info as Record<string, unknown>)[key];
+    if (!detail || typeof detail !== "object") continue;
+    const status = (detail as Record<string, unknown>).httpStatusCode;
+    if (typeof status === "number") return status;
+  }
+  return undefined;
+}
+
+function errorData(error: unknown): Record<string, unknown> | undefined {
+  try {
+    if (!error || typeof error !== "object") return undefined;
+    const data = (error as { data?: unknown }).data;
+    return data && typeof data === "object" ? data as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
   }
 }

@@ -242,6 +242,7 @@ function isRecordedError(value: unknown): value is WorkflowRecordedError {
     if (value.recoverable !== undefined && typeof value.recoverable !== "boolean") return false;
     if (value.agentLabel !== undefined && typeof value.agentLabel !== "string") return false;
     if (value.resetHint !== undefined && typeof value.resetHint !== "string") return false;
+    if (value.providerUsageLimitContext !== undefined && !isRecord(value.providerUsageLimitContext)) return false;
     if (value.authContext !== undefined && !isRecord(value.authContext)) return false;
     if (value.checkpointContext !== undefined && !isRecord(value.checkpointContext)) return false;
     return true;
@@ -857,6 +858,7 @@ function reconstructRecordedError(record: WorkflowRecordedError): unknown {
       agentLabel: record.agentLabel,
       details: jsonClone(record.details),
       resetHint: record.resetHint,
+      providerUsageLimitContext: jsonClone(record.providerUsageLimitContext),
       authContext: jsonClone(record.authContext),
       checkpointContext: jsonClone(record.checkpointContext),
     });
