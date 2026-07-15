@@ -60,6 +60,13 @@ export function validateResumeSafetyMarker(
   if (record.kind !== "agent" || record.outcome !== "result") {
     return record.resumeSafety === undefined;
   }
+  if (
+    record.resumeSafety !== undefined &&
+    record.resumeSafety !== "declared-read-only" &&
+    record.resumeSafety !== "isolated-worktree"
+  ) {
+    return false;
+  }
   if (record.origin === "journal-replay") {
     if (legacyResume) return record.resumeSafety === undefined;
     if (
@@ -71,7 +78,9 @@ export function validateResumeSafetyMarker(
     }
   }
   if (record.resumeSafety === undefined) return true;
-  if (record.resumeSafety === "declared-read-only") return record.isolation === undefined;
+  if (record.resumeSafety === "declared-read-only") {
+    return record.isolation === undefined && record.worktree === undefined;
+  }
   if (record.isolation !== "worktree") return false;
   return (
     (record.origin === "runner" && record.worktree === true) ||
