@@ -6,10 +6,13 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import { join } from "node:path";
 import type {
   AgentHistoryEntry,
+  AgentResultProvenance,
   AgentSessionRecord,
+  AgentUsage,
   AuthErrorContext,
   CheckpointContext,
   JournalEntry,
+  WorkflowCallRecord,
   WorkflowCheckpointTaken,
   WorkflowRunFallback,
 } from "@automatalabs/shared-types";
@@ -25,6 +28,8 @@ export interface PersistedAgentState {
   prompt: string;
   status: "queued" | "running" | "done" | "error" | "skipped";
   result?: unknown;
+  /** Persisted display projection of the result. */
+  resultPreview?: string;
   error?: string;
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
@@ -36,6 +41,12 @@ export interface PersistedAgentState {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** This logical call's aggregate token debit (provider total or estimate). */
+  tokens?: number;
+  callIndex?: number;
+  scope?: string;
+  usage?: AgentUsage;
+  provenance?: AgentResultProvenance;
 }
 
 export interface PersistedRunState {
@@ -43,9 +54,15 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
+  /** The persisted args value was not a faithful pre-execution strict-JSON snapshot. */
+  argsUnreplayable?: true;
   /** The run's working directory (ExecOptions.cwd) when it overrode the manager cwd —
    *  kept so resume() re-runs in the same directory (e.g. the same worktree). */
   cwd?: string;
+  /** The directory the run actually executed in. */
+  effectiveCwd?: string;
+  runtime?: { node: string; v8: string; pathFormat: number; inputsFormat: number };
+  environment?: { git?: { head: string; dirtyDigest: string }; key?: string };
   /** The session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
@@ -88,6 +105,22 @@ export interface PersistedRunState {
   /** Additive terminal observability; absent on legacy runs and when no event occurred. */
   fallbacks?: WorkflowRunFallback[];
   checkpointsTaken?: WorkflowCheckpointTaken[];
+  /** Root-scope terminal-call manifest for this execution. */
+  calls?: WorkflowCallRecord[];
+  callsAllocated?: number;
+  limits?: {
+    maxAgents: number;
+    tokenBudget: number | null;
+    concurrency: number;
+    agentRetries: number;
+    agentTimeoutMs: number | null;
+  };
+  abortSignaled?: true;
+  mainModel?: string;
+  agentsDir?: string;
+  nestedWorkflows?: true;
+  legacyResume?: true;
+  executionMode?: { kind: "isolation"; baselineRunId: string };
 }
 
 export interface RunPersistence {

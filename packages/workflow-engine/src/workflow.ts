@@ -6,6 +6,7 @@ import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import type {
   AgentHistoryEntry,
+  AgentResultProvenance,
   AgentRunner,
   AgentSessionRecord,
   AgentSessionRef,
@@ -14,9 +15,11 @@ import type {
   McpServerConfig,
   PromptImage,
   WorkflowBackendConfig,
+  WorkflowCallRecord,
   WorkflowCheckpointTaken,
   WorkflowMeta,
   WorkflowMetaPhase,
+  WorkflowRecordedError,
   WorkflowRunFallback,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
@@ -32,7 +35,14 @@ import { errorMessage, WorkflowError, WorkflowErrorCode, wrapError } from "./err
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { loadModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import { projectRecordedError } from "./recorded-error.js";
 import { registerRunTripwire } from "./rejection-tripwire.js";
+import {
+  canonicalStrictJson,
+  cloneFrozenStrictJson,
+  cloneTelemetry,
+  deepFreeze,
+} from "./strict-json.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 // WorkflowMeta / WorkflowMetaPhase / JournalEntry / WorkflowRunResult are the shared,
@@ -132,6 +142,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Observability callbacks; neither participates in journal identity. */
   onFallback?: (entry: WorkflowRunFallback) => void;
   onCheckpointTaken?: (entry: WorkflowCheckpointTaken) => void;
+  /** Called at each call's terminal transition after the authoritative manifest append. */
+  onCallRecord?: (record: WorkflowCallRecord) => void;
   /** Called synchronously when workflow() allocates a unique child-run ordinal. */
   onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
@@ -158,7 +170,14 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   ) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    callIndex: number;
+    scope: string;
+  }) => void;
   onAgentEnd?: (event: {
     label: string;
     phase?: string;
@@ -171,8 +190,22 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     recoverable?: boolean;
     /** The call's ACP session re-attach record (live or journal-replayed), when one exists. */
     session?: AgentSessionRecord;
+    callIndex: number;
+    scope: string;
+    usage?: AgentUsage;
+    modelResolved?: string;
+    modelFallbacks?: string[];
+    backendId?: string;
+    provenance?: AgentResultProvenance;
+    errorRecord?: WorkflowRecordedError;
   }) => void;
-  onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
+  onAgentHistory?: (event: {
+    label: string;
+    phase?: string;
+    history: AgentHistoryEntry[];
+    callIndex: number;
+    scope: string;
+  }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -314,6 +347,10 @@ interface RuntimeState {
   agentSessions: AgentSessionRecord[];
   fallbacks: WorkflowRunFallback[];
   checkpointsTaken: WorkflowCheckpointTaken[];
+  /** Engine-owned terminal-call manifest for this run's local index space. */
+  calls: WorkflowCallRecord[];
+  /** Run-local terminal transition ordinal. */
+  settlementSeq: number;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -385,6 +422,7 @@ export async function runWorkflow<T = unknown>(
   const modelTierConfig = loadModelTierConfig();
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  const runAgentRetries = normalizeAgentRetries(options.agentRetries ?? 0);
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
   const vmFilename = `${sanitizeVmName(meta.name)}.js`;
@@ -423,6 +461,8 @@ export async function runWorkflow<T = unknown>(
     agentSessions: [],
     fallbacks: [],
     checkpointsTaken: [],
+    calls: [],
+    settlementSeq: 0,
   };
 
   const agentRunner = options.agent;
@@ -440,6 +480,7 @@ export async function runWorkflow<T = unknown>(
   };
   const limiter = shared.limiter;
   let nestedWorkflows = false;
+  let abortSignaled = false;
 
   const log = (message: string) => {
     const text = String(message);
@@ -471,11 +512,62 @@ export async function runWorkflow<T = unknown>(
   // tokens. Combined with the caller's signal so both channels cancel the same work.
   const faults = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, faults.signal]) : faults.signal;
+  if (signal.aborted) abortSignaled = true;
+  signal.addEventListener(
+    "abort",
+    () => {
+      abortSignaled = true;
+    },
+    { once: true },
+  );
 
   const throwIfAborted = () => {
     if (signal.aborted) {
+      abortSignaled = true;
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
+  };
+
+  const reportTerminalObserverError = (observer: string, error: unknown) => {
+    try {
+      logger.error(`${observer} terminal observer failed: ${errorMessage(error)}`);
+    } catch {
+      // Terminal observer reporting is itself best-effort.
+    }
+  };
+
+  const guardTerminal = (observer: string, callback: (() => void) | undefined) => {
+    if (!callback) return;
+    try {
+      callback();
+    } catch (error) {
+      reportTerminalObserverError(observer, error);
+    }
+  };
+
+  const appendCallRecord = (
+    input: Omit<WorkflowCallRecord, "settlementOrdinal" | "scope">,
+  ): WorkflowCallRecord => {
+    const record = deepFreeze({
+      ...input,
+      settlementOrdinal: ++state.settlementSeq,
+      scope: runId,
+    } satisfies WorkflowCallRecord);
+    state.calls.push(record);
+    guardTerminal("onCallRecord", () => options.onCallRecord?.(record));
+    return record;
+  };
+
+  const strictSnapshot = (value: unknown, description: string, agentLabel?: string): unknown => {
+    const captured = cloneFrozenStrictJson(value);
+    if (!captured.ok) {
+      throw new WorkflowError(
+        `${description} is not strict JSON at ${captured.path}`,
+        WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+        { recoverable: false, agentLabel },
+      );
+    }
+    return captured.clone;
   };
 
   const agent = async (prompt: string, agentOptions: AgentOptions = {}) => {
@@ -547,7 +639,8 @@ export async function runWorkflow<T = unknown>(
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
     const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
-    const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
+    const retryAttempts =
+      agentOptions.retries !== undefined ? normalizeAgentRetries(agentOptions.retries) : runAgentRetries;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
 
     // Every identity component is computed before the index is allocated. A hash
@@ -579,6 +672,35 @@ export async function runWorkflow<T = unknown>(
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
 
+    let settled: WorkflowCallRecord | undefined;
+    const settle = (
+      terminal: Omit<
+        WorkflowCallRecord,
+        "index" | "kind" | "hash" | "path" | "inputsHash" | "label" | "modelRequested" | "isolation" | "scope" | "settlementOrdinal"
+      >,
+    ): WorkflowCallRecord => {
+      if (settled) return settled;
+      settled = appendCallRecord({
+        index: callIndex,
+        kind: "agent",
+        hash: callHash,
+        ...(callPath !== undefined ? { path: callPath } : {}),
+        ...(callInputsHash !== undefined ? { inputsHash: callInputsHash } : {}),
+        label,
+        ...(modelSpec !== undefined ? { modelRequested: modelSpec } : {}),
+        ...(resolvedIsolation !== undefined ? { isolation: resolvedIsolation } : {}),
+        ...terminal,
+      });
+      return settled;
+    };
+
+    const emitAgentEnd = (
+      event: Omit<NonNullable<WorkflowRunOptions["onAgentEnd"]> extends (event: infer E) => void ? E : never, "callIndex" | "scope">,
+    ) => {
+      const terminalEvent = deepFreeze({ ...event, callIndex, scope: runId });
+      guardTerminal("onAgentEnd", () => options.onAgentEnd?.(terminalEvent));
+    };
+
     // Reserve the agent slot synchronously — atomic with the limit/budget gate
     // above (no await in between) — so a parallel() fan-out can't all observe the
     // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
@@ -595,20 +717,52 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      // A replayed call re-surfaces its journaled session record verbatim: the session was
-      // opened by the ORIGINAL run, and re-attachability is a property of the agent's store,
-      // not of this process — so the ref stays valid across resume exactly like the result.
-      if (cached.session) state.agentSessions.push(cached.session);
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({
-        label,
-        phase: assignedPhase,
-        result: cached.result,
-        tokens: 0,
-        model: displayModel,
-        session: cached.session,
-      });
-      return cached.result;
+      try {
+        options.onAgentStart?.(deepFreeze({
+          label,
+          phase: assignedPhase,
+          prompt,
+          model: displayModel,
+          callIndex,
+          scope: runId,
+        }));
+        const resultSnapshot = strictSnapshot(cached.result, `agent "${label}" replayed result`, label);
+        const cachedSession = cached.session ? cloneTelemetry(cached.session) : undefined;
+        const cachedUsage = cached.usage ? copyValidUsage(cached.usage) : undefined;
+        if (cachedSession) state.agentSessions.push(cachedSession);
+        settle({
+          outcome: "result",
+          origin: "journal-replay",
+          ...(cachedUsage ? { usage: cachedUsage } : {}),
+          budgetDebit: 0,
+        });
+        emitAgentEnd({
+          label,
+          phase: assignedPhase,
+          result: resultSnapshot,
+          tokens: 0,
+          model: displayModel,
+          session: cachedSession,
+          usage: cachedUsage,
+        });
+        return resultSnapshot;
+      } catch (error) {
+        const errorRecord = projectRecordedError(error);
+        const workflowError = wrapError(error, { agentLabel: label });
+        settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+        emitAgentEnd({
+          label,
+          phase: assignedPhase,
+          result: null,
+          tokens: 0,
+          model: displayModel,
+          error: workflowError.message,
+          errorCode: workflowError.code,
+          recoverable: workflowError.recoverable,
+          errorRecord,
+        });
+        throw error;
+      }
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
@@ -616,51 +770,26 @@ export async function runWorkflow<T = unknown>(
 
     return limiter(async () => {
       const maxAttempts = retryAttempts + 1;
-
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-
-      // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
-      // Precedence: explicit call-site isolation > agentDef isolation.
-      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
-      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
-      // or override with a def that has no isolation field if opt-out is needed.
-      if (agentOptions.cwd !== undefined && typeof agentOptions.cwd !== "string") {
-        throw new WorkflowError(
-          `agent "${label}": options.cwd must be a string`,
-          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-          { recoverable: false, agentLabel: label },
-        );
-      }
       let worktree: Worktree | undefined;
-      if (resolvedIsolation === "worktree") {
-        worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
-      }
-      // Session cwd precedence: worktree isolation > per-agent options.cwd (relative
-      // resolves against the run's base cwd) > the run's base cwd. Threading baseCwd —
-      // instead of leaving the runner to fall back to the HOST's process.cwd() — is what
-      // makes WorkflowRunOptions.cwd actually reach the subagent sessions.
-      const runCwd = worktree?.isolated ? worktree.cwd : resolvePath(baseCwd, agentOptions.cwd ?? ".");
+      let runCwd: string | undefined;
+      let attemptsRan = 0;
+      let budgetDebit = 0;
+      const sealedUsage: AgentUsage[] = [];
+      const modelFallbacks: string[] = [];
 
-      // Captured from the subagent's real session usage; falls back to an
-      // estimate when the provider reports no usage (total === 0). Usage is reset
-      // per retry attempt so a failed attempt does not double-count the next one.
-      let usage: AgentUsage | undefined;
-      // The attempt's ACP session identity (onSessionOpen); reset per retry so a failed
-      // attempt's session is never attributed to the attempt that replaced it.
-      let sessionRef: AgentSessionRef | undefined;
-      const sessionRecord = (): AgentSessionRecord | undefined =>
-        sessionRef
-          ? {
-              ...sessionRef,
-              callIndex,
-              label,
-              phase: assignedPhase,
-              keptOpen: agentOptions.keepSession === true,
-            }
-          : undefined;
-      const recordTokens = (result: unknown): number => {
-        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
+      interface AttemptSlots {
+        sealed: boolean;
+        usage?: AgentUsage;
+        sessionRef?: AgentSessionRef;
+        modelResolved?: string;
+        modelFallbacks: string[];
+        provenance?: AgentResultProvenance;
+        budgetReplay?: { settlementOrdinal: number };
+        history?: AgentHistoryEntry[];
+      }
+
+      const recordTokens = (value: unknown, usage: AgentUsage | undefined): number => {
+        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(value) + estimateTokens(prompt);
         if (usage) {
           shared.tokenUsage.input += usage.input;
           shared.tokenUsage.output += usage.output;
@@ -670,93 +799,211 @@ export async function runWorkflow<T = unknown>(
         }
         shared.tokenUsage.total += tokens;
         shared.spent += tokens;
+        budgetDebit += tokens;
         options.onTokenUsage?.({ ...shared.tokenUsage });
         return tokens;
       };
 
+      const sealAttempt = (slot: AttemptSlots) => {
+        if (slot.sealed) return;
+        slot.sealed = true;
+        if (slot.usage) sealedUsage.push(slot.usage);
+        modelFallbacks.push(...slot.modelFallbacks);
+      };
+
+      const sessionRecord = (slot: AttemptSlots): AgentSessionRecord | undefined =>
+        slot.sessionRef
+          ? deepFreeze({
+              ...slot.sessionRef,
+              callIndex,
+              label,
+              phase: assignedPhase,
+              keptOpen: agentOptions.keepSession === true,
+            })
+          : undefined;
+
+      const terminalUsage = (): AgentUsage | undefined => sumUsage(sealedUsage);
+
+      const emitFailure = (
+        thrown: unknown,
+        origin: "runner" | "engine",
+        outcome: "null" | "error",
+        slot: AttemptSlots | undefined,
+        aborted: boolean,
+      ) => {
+        const errorRecord = projectRecordedError(thrown);
+        const workflowError = wrapError(thrown, { agentLabel: label });
+        const usage = terminalUsage();
+        const session = slot ? sessionRecord(slot) : undefined;
+        if (session) state.agentSessions.push(session);
+        settle({
+          outcome,
+          origin,
+          error: errorRecord,
+          ...(aborted ? { aborted: true as const } : {}),
+          ...(origin === "runner" ? { attempts: attemptsRan } : {}),
+          ...(usage ? { usage } : {}),
+          ...(slot?.modelResolved ? { modelResolved: slot.modelResolved } : {}),
+          ...(slot?.sessionRef?.backendId ? { backendId: slot.sessionRef.backendId } : {}),
+          ...(modelFallbacks.length ? { modelFallback: true as const } : {}),
+          ...(worktree?.isolated ? { worktree: true } : {}),
+          ...(runCwd !== undefined && origin === "runner" ? { resolvedCwd: runCwd } : {}),
+          budgetDebit,
+          ...(slot?.provenance ? { provenance: slot.provenance } : {}),
+        });
+        emitAgentEnd({
+          label,
+          phase: assignedPhase,
+          result: null,
+          tokens: budgetDebit,
+          worktree: runCwd,
+          model: slot?.modelResolved ?? displayModel,
+          error: workflowError.message,
+          errorCode: workflowError.code,
+          recoverable: workflowError.recoverable,
+          session,
+          usage,
+          modelResolved: slot?.modelResolved,
+          modelFallbacks: modelFallbacks.length ? [...modelFallbacks] : undefined,
+          backendId: slot?.sessionRef?.backendId,
+          provenance: slot?.provenance,
+          errorRecord,
+        });
+      };
+
       try {
+        options.onAgentStart?.(deepFreeze({
+          label,
+          phase: assignedPhase,
+          prompt,
+          model: displayModel,
+          callIndex,
+          scope: runId,
+        }));
+
+        if (agentOptions.cwd !== undefined && typeof agentOptions.cwd !== "string") {
+          throw new WorkflowError(
+            `agent "${label}": options.cwd must be a string`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false, agentLabel: label },
+          );
+        }
+        if (resolvedIsolation === "worktree") {
+          worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
+          if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+        }
+        runCwd = worktree?.isolated ? worktree.cwd : resolvePath(baseCwd, agentOptions.cwd ?? ".");
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          usage = undefined;
-          sessionRef = undefined;
+          const slot: AttemptSlots = { sealed: false, modelFallbacks: [] };
           try {
             throwIfAborted();
-
-            // Run agent with timeout. THE SEAM: the only call to the injected
-            // AgentRunner. The opts bag is cast `as any` (the field names are the
-            // real, frozen contract — see @automatalabs/shared-types RunOptions).
-            const result = await withTimeout(
-              agentRunner.run(prompt, {
+            const attemptController = new AbortController();
+            const attemptSignal = AbortSignal.any([signal, attemptController.signal]);
+            attemptsRan++;
+            let result: unknown;
+            try {
+              result = await withTimeout(
+                agentRunner.run(prompt, {
+                  label,
+                  schema: agentOptions.schema,
+                  signal: attemptSignal,
+                  instructions: buildAgentInstructions(
+                    options.instructions,
+                    assignedPhase,
+                    agentOptions,
+                    agentDef,
+                    resolvedIsolation,
+                  ),
+                  model: modelSpec,
+                  mode: agentOptions.mode,
+                  tier: agentOptions.tier,
+                  toolNames: agentDef?.tools,
+                  disallowedToolNames: agentDef?.disallowedTools,
+                  cwd: runCwd,
+                  mcpServers: agentOptions.mcpServers,
+                  images: agentOptions.images,
+                  meta: agentOptions.meta,
+                  promptMeta: agentOptions.promptMeta,
+                  backends: options.scriptBackends,
+                  runId,
+                  keepSession: agentOptions.keepSession,
+                  callIndex,
+                  callHash,
+                  callPath,
+                  callInputsHash,
+                  onSessionOpen: (ref: AgentSessionRef) => {
+                    if (slot.sealed) return;
+                    const copied = cloneTelemetry(ref);
+                    if (copied) slot.sessionRef = copied;
+                  },
+                  onModelResolved: (id: string) => {
+                    if (slot.sealed) return;
+                    slot.modelResolved = id;
+                    displayModel = id;
+                  },
+                  onModelFallback: (spec: string) => {
+                    if (slot.sealed) return;
+                    slot.modelFallbacks.push(spec);
+                    const message = `${label}: model "${spec}" unavailable — using the session default`;
+                    log(message);
+                    const fallback: WorkflowRunFallback = deepFreeze({
+                      callIndex,
+                      label,
+                      ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
+                      requestedSpec: modelSpec ?? agentOptions.tier ?? spec,
+                      ...(slot.sessionRef?.backendId === undefined ? {} : { backendId: slot.sessionRef.backendId }),
+                      kind: "model",
+                      message,
+                    });
+                    if (!state.fallbacks.some((entry) => sameFallback(entry, fallback))) {
+                      state.fallbacks.push(fallback);
+                      options.onFallback?.(fallback);
+                    }
+                  },
+                  onUsage: (reported: AgentUsage) => {
+                    if (slot.sealed) return;
+                    const copied = copyValidUsage(reported);
+                    if (copied) slot.usage = copied;
+                    else bestEffortDebug(`agent ${label}: dropped invalid usage report`);
+                  },
+                  onResultProvenance: (reported: AgentResultProvenance) => {
+                    if (slot.sealed) return;
+                    const copied = cloneTelemetry(reported);
+                    if (copied) slot.provenance = copied;
+                  },
+                  onBudgetReplay: (reported: { settlementOrdinal: number }) => {
+                    if (slot.sealed) return;
+                    const copied = cloneTelemetry(reported);
+                    if (copied) slot.budgetReplay = copied;
+                  },
+                  onHistory: (history: AgentHistoryEntry[]) => {
+                    if (slot.sealed) return;
+                    const copied = cloneTelemetry(history);
+                    if (!copied) {
+                      bestEffortDebug(`agent ${label}: dropped uncopyable history report`);
+                      return;
+                    }
+                    slot.history = copied;
+                    options.onAgentHistory?.(deepFreeze({
+                      label,
+                      phase: assignedPhase,
+                      history: copied,
+                      callIndex,
+                      scope: runId,
+                    }));
+                  },
+                } as any),
+                timeout,
                 label,
-                schema: agentOptions.schema,
-                signal,
-                instructions: buildAgentInstructions(
-                  options.instructions,
-                  assignedPhase,
-                  agentOptions,
-                  agentDef,
-                  resolvedIsolation,
-                ),
-                model: modelSpec,
-                mode: agentOptions.mode,
-                tier: agentOptions.tier,
-                toolNames: agentDef?.tools,
-                disallowedToolNames: agentDef?.disallowedTools,
-                cwd: runCwd,
-                // Additive run input: wires tools, NOT part of the resume identity (hashAgentCall).
-                mcpServers: agentOptions.mcpServers,
-                // Additive prompt attachments, NOT part of the resume identity (hashAgentCall).
-                images: agentOptions.images,
-                // Generic ACP _meta passthroughs (session/new + session/prompt). Additive,
-                // NOT part of the resume identity (hashAgentCall).
-                meta: agentOptions.meta,
-                promptMeta: agentOptions.promptMeta,
-                // APPROVED script-declared backends (composition-root-gated). Additive,
-                // NOT part of the resume identity (hashAgentCall).
-                backends: options.scriptBackends,
-                // Engine run id as an end-to-end correlation stamp on the ACP session/new _meta.
-                // Additive telemetry, NOT part of the resume identity (hashAgentCall).
-                runId,
-                // Session hand-off pair: capture the re-attach ref, optionally skip the
-                // release-time close. Additive, NOT part of the resume identity (hashAgentCall).
-                keepSession: agentOptions.keepSession,
-                callIndex,
-                callHash,
-                callPath,
-                callInputsHash,
-                onSessionOpen: (ref: AgentSessionRef) => {
-                  sessionRef = ref;
+                () => {
+                  sealAttempt(slot);
+                  attemptController.abort();
                 },
-                onModelResolved: (id: string) => {
-                  displayModel = id;
-                },
-                onModelFallback: (spec: string) => {
-                  // Compatibility surface for non-resolution subsystems or third-party runners.
-                  const message = `${label}: model "${spec}" unavailable — using the session default`;
-                  log(message);
-                  const fallback: WorkflowRunFallback = {
-                    callIndex,
-                    label,
-                    ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
-                    requestedSpec: modelSpec ?? agentOptions.tier ?? spec,
-                    ...(sessionRef?.backendId === undefined ? {} : { backendId: sessionRef.backendId }),
-                    kind: "model",
-                    message,
-                  };
-                  if (!state.fallbacks.some((entry) => sameFallback(entry, fallback))) {
-                    state.fallbacks.push(fallback);
-                    options.onFallback?.(fallback);
-                  }
-                },
-                onUsage: (u: AgentUsage) => {
-                  usage = u;
-                },
-                onHistory: (history: AgentHistoryEntry[]) => {
-                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
-                },
-              } as any),
-              timeout,
-              label,
-            );
+              );
+            } finally {
+              sealAttempt(slot);
+            }
 
             throwIfAborted();
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
@@ -765,41 +1012,68 @@ export async function runWorkflow<T = unknown>(
                 agentLabel: label,
               });
             }
-
-            const tokens = recordTokens(result);
-            const session = sessionRecord();
+            const resultSnapshot = strictSnapshot(result, `agent "${label}" result`, label);
+            recordTokens(result, slot.usage);
+            const usage = terminalUsage();
+            const session = sessionRecord(slot);
             if (session) state.agentSessions.push(session);
+            settle({
+              outcome: "result",
+              origin: "runner",
+              attempts: attemptsRan,
+              ...(usage ? { usage } : {}),
+              ...(slot.modelResolved ? { modelResolved: slot.modelResolved } : {}),
+              ...(slot.sessionRef?.backendId ? { backendId: slot.sessionRef.backendId } : {}),
+              ...(modelFallbacks.length ? { modelFallback: true as const } : {}),
+              ...(worktree?.isolated ? { worktree: true } : {}),
+              resolvedCwd: runCwd,
+              budgetDebit,
+              ...(slot.provenance ? { provenance: slot.provenance } : {}),
+            });
             if (journaling) {
-              options.onAgentJournal?.({
+              const entry = deepFreeze({
                 index: callIndex,
                 hash: callHash,
-                result,
-                session,
+                result: resultSnapshot,
+                kind: "agent" as const,
+                scope: runId,
+                ...(session ? { session } : {}),
+                ...(usage ? { usage } : {}),
                 call: {
-                  kind: "agent",
+                  kind: "agent" as const,
                   label,
                   phase: assignedPhase,
-                  model: displayModel,
+                  model: slot.modelResolved ?? displayModel,
                   backendId: session?.backendId,
                 },
               });
+              guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
             }
-            options.onAgentEnd?.({
+            emitAgentEnd({
               label,
               phase: assignedPhase,
-              result,
-              tokens,
+              result: resultSnapshot,
+              tokens: budgetDebit,
               worktree: runCwd,
-              model: displayModel,
+              model: slot.modelResolved ?? displayModel,
               session,
+              usage,
+              modelResolved: slot.modelResolved,
+              modelFallbacks: modelFallbacks.length ? [...modelFallbacks] : undefined,
+              backendId: slot.sessionRef?.backendId,
+              provenance: slot.provenance,
             });
             return result;
           } catch (error) {
-            if (signal.aborted) throw error;
+            if (!slot.sealed) sealAttempt(slot);
+            if (signal.aborted) {
+              emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", slot, true);
+              throw error;
+            }
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const tokens = recordTokens(null);
+            recordTokens(null, slot.usage);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
               log(
@@ -808,36 +1082,24 @@ export async function runWorkflow<T = unknown>(
               continue;
             }
 
-            // A failed call's session record is still surfaced (result.agentSessions +
-            // event): loading the session afterward is a first-class way to debug what
-            // the agent actually did before it failed.
-            const failedSession = sessionRecord();
-            if (failedSession) state.agentSessions.push(failedSession);
-            options.onAgentEnd?.({
-              label,
-              phase: assignedPhase,
-              result: null,
-              tokens,
-              worktree: runCwd,
-              model: displayModel,
-              error: workflowError.message,
-              errorCode: workflowError.code,
-              recoverable: workflowError.recoverable,
-              session: failedSession,
-            });
-
             if (workflowError.recoverable) {
               log(
                 `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
               );
+              emitFailure(workflowError, "runner", "null", slot, false);
               return null;
             }
+            emitFailure(workflowError, "runner", "error", slot, false);
             throw workflowError;
           }
         }
         return null;
+      } catch (error) {
+        if (!settled) {
+          emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", undefined, signal.aborted);
+        }
+        throw error;
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
         if (worktree?.isolated) await removeWorktree(worktree);
       }
     });
@@ -1119,76 +1381,114 @@ export async function runWorkflow<T = unknown>(
     const callHash = hashCheckpoint(promptText, checkpointOptions);
     const callPath = captureCallPath(vmFilename, preludeLines);
     const callIndex = state.callSeq++;
+    let settled: WorkflowCallRecord | undefined;
+    const settle = (
+      terminal: Omit<
+        WorkflowCallRecord,
+        "index" | "kind" | "hash" | "path" | "scope" | "settlementOrdinal"
+      >,
+    ): WorkflowCallRecord => {
+      if (settled) return settled;
+      settled = appendCallRecord({
+        index: callIndex,
+        kind: "checkpoint",
+        hash: callHash,
+        ...(callPath !== undefined ? { path: callPath } : {}),
+        ...terminal,
+      });
+      return settled;
+    };
     const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
-      const entry: WorkflowCheckpointTaken = {
-        callIndex,
-        kind: checkpointOptions.kind ?? "confirm",
-        decision: cached.result,
-        source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
-      };
-      state.checkpointsTaken.push(entry);
-      options.onCheckpointTaken?.(entry);
-      return cached.result; // replay the journaled human reply
+      try {
+        const resultSnapshot = strictSnapshot(cached.result, `checkpoint "${promptText}" replayed reply`);
+        settle({ outcome: "result", origin: "journal-replay" });
+        const entry: WorkflowCheckpointTaken = deepFreeze({
+          callIndex,
+          kind: checkpointOptions.kind ?? "confirm",
+          decision: resultSnapshot,
+          source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
+        });
+        state.checkpointsTaken.push(entry);
+        guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(entry));
+        return resultSnapshot;
+      } catch (error) {
+        settle({ outcome: "error", origin: "journal-replay", error: projectRecordedError(error) });
+        throw error;
+      }
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
     shared.agentCount++;
 
-    let reply: unknown;
-    let source: WorkflowCheckpointTaken["source"];
-    if (options.confirm) {
-      reply = await options.confirm(promptText, checkpointOptions, {
-        callIndex,
-        hash: callHash,
-        scope: runId,
-        path: callPath,
-      });
-      source = "live";
-    } else if (checkpointOptions.headless === "abort") {
-      throw new WorkflowError(
-        `checkpoint "${promptText}" needs human input but none is available (headless run)`,
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: false },
-      );
-    } else if (checkpointOptions.headless === "pause") {
-      throw new WorkflowError(
-        `checkpoint "${promptText}" awaits a human decision`,
-        WorkflowErrorCode.CHECKPOINT_REQUIRED,
-        {
-          recoverable: false,
-          checkpointContext: {
-            callIndex,
-            hash: callHash,
-            prompt: promptText,
-            kind: checkpointOptions.kind ?? "confirm",
-            choices: checkpointOptions.choices,
-            default: checkpointOptions.default,
+    const origin = options.confirm ? "confirm" as const : "headless" as const;
+    try {
+      let reply: unknown;
+      if (options.confirm) {
+        reply = await options.confirm(promptText, checkpointOptions, {
+          callIndex,
+          hash: callHash,
+          scope: runId,
+          path: callPath,
+        });
+      } else if (checkpointOptions.headless === "abort") {
+        throw new WorkflowError(
+          `checkpoint "${promptText}" needs human input but none is available (headless run)`,
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: false },
+        );
+      } else if (checkpointOptions.headless === "pause") {
+        throw new WorkflowError(
+          `checkpoint "${promptText}" awaits a human decision`,
+          WorkflowErrorCode.CHECKPOINT_REQUIRED,
+          {
+            recoverable: false,
+            checkpointContext: {
+              callIndex,
+              hash: callHash,
+              prompt: promptText,
+              kind: checkpointOptions.kind ?? "confirm",
+              choices: checkpointOptions.choices,
+              default: checkpointOptions.default,
+            },
           },
-        },
-      );
-    } else {
-      reply = checkpointOptions.default ?? true;
-      source = "headless-default";
-    }
-    throwIfAborted();
-    if (journaling) {
-      options.onAgentJournal?.({
-        index: callIndex,
-        hash: callHash,
-        result: reply,
-        call: { kind: "checkpoint", label: "checkpoint", phase: state.currentPhase },
+        );
+      } else {
+        reply = checkpointOptions.default ?? true;
+      }
+      throwIfAborted();
+      const replySnapshot = strictSnapshot(reply, `checkpoint "${promptText}" reply`);
+      settle({ outcome: "result", origin });
+      if (journaling) {
+        const entry = deepFreeze({
+          index: callIndex,
+          hash: callHash,
+          result: replySnapshot,
+          kind: "checkpoint" as const,
+          scope: runId,
+          call: { kind: "checkpoint" as const, label: "checkpoint" as const, phase: state.currentPhase },
+        });
+        guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
+      }
+      const checkpointTaken: WorkflowCheckpointTaken = deepFreeze({
+        callIndex,
+        kind: checkpointOptions.kind ?? "confirm",
+        decision: replySnapshot,
+        source: options.confirm ? "live" : "headless-default",
       });
+      state.checkpointsTaken.push(checkpointTaken);
+      guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(checkpointTaken));
+      return reply;
+    } catch (error) {
+      const aborted = signal.aborted;
+      settle({
+        outcome: "error",
+        origin: aborted ? "engine" : origin,
+        error: projectRecordedError(error),
+        ...(aborted ? { aborted: true as const } : {}),
+      });
+      throw error;
     }
-    const entry: WorkflowCheckpointTaken = {
-      callIndex,
-      kind: checkpointOptions.kind ?? "confirm",
-      decision: reply,
-      source,
-    };
-    state.checkpointsTaken.push(entry);
-    options.onCheckpointTaken?.(entry);
-    return reply;
   };
 
   // Adopt every engine-returned promise into the SCRIPT's realm at the context boundary.
@@ -1284,6 +1584,16 @@ export async function runWorkflow<T = unknown>(
     agentSessions: state.agentSessions,
     ...(state.fallbacks.length === 0 ? {} : { fallbacks: state.fallbacks }),
     ...(state.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: state.checkpointsTaken }),
+    calls: Object.freeze([...state.calls]) as WorkflowCallRecord[],
+    callsAllocated: state.callSeq,
+    effectiveLimits: {
+      maxAgents,
+      tokenBudget: options.tokenBudget ?? null,
+      concurrency,
+      agentRetries: runAgentRetries,
+      agentTimeoutMs,
+    },
+    ...(abortSignaled ? { abortSignaled: true as const } : {}),
     ...(nestedWorkflows ? { nestedWorkflows: true as const } : {}),
   };
 }
@@ -1521,76 +1831,6 @@ function captureCallPath(vmFilename: string, preludeLines: number): string | und
   }
 }
 
-const HOST_OBJECT_CONSTRUCTOR_SOURCE = Function.prototype.toString.call(Object);
-const INVALID_STRICT_JSON = Symbol("invalid-strict-json");
-type StrictJsonValue = null | boolean | number | string | StrictJsonValue[] | { [key: string]: StrictJsonValue };
-
-function isRealmNeutralPlainRecord(value: object): boolean {
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype === null) return true;
-  if (Object.getPrototypeOf(prototype) !== null) return false;
-  const constructor = Object.getOwnPropertyDescriptor(prototype, "constructor");
-  if (!constructor || !("value" in constructor)) return false;
-  const candidate = constructor.value;
-  return (
-    typeof candidate === "function" &&
-    candidate.prototype === prototype &&
-    Function.prototype.toString.call(candidate) === HOST_OBJECT_CONSTRUCTOR_SOURCE
-  );
-}
-
-function cloneStrictJson(value: unknown, ancestors: Set<object>): StrictJsonValue {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
-  if (typeof value === "number") {
-    if (Number.isFinite(value)) return value;
-    throw INVALID_STRICT_JSON;
-  }
-  if (typeof value !== "object" || ancestors.has(value)) throw INVALID_STRICT_JSON;
-
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) {
-      if (Object.getOwnPropertySymbols(value).length !== 0) throw INVALID_STRICT_JSON;
-      const names = Object.getOwnPropertyNames(value);
-      if (names.length !== value.length + 1 || !names.includes("length")) throw INVALID_STRICT_JSON;
-      const clone: StrictJsonValue[] = [];
-      for (let index = 0; index < value.length; index++) {
-        const key = String(index);
-        if (!names.includes(key)) throw INVALID_STRICT_JSON;
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (!descriptor?.enumerable || !("value" in descriptor)) throw INVALID_STRICT_JSON;
-        clone.push(cloneStrictJson(descriptor.value, ancestors));
-      }
-      return clone;
-    }
-
-    if (!isRealmNeutralPlainRecord(value)) throw INVALID_STRICT_JSON;
-    if (Object.getOwnPropertySymbols(value).length !== 0) throw INVALID_STRICT_JSON;
-    const clone: { [key: string]: StrictJsonValue } = {};
-    for (const key of Object.getOwnPropertyNames(value).sort()) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor?.enumerable || !("value" in descriptor)) throw INVALID_STRICT_JSON;
-      Object.defineProperty(clone, key, {
-        value: cloneStrictJson(descriptor.value, ancestors),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
-    }
-    return clone;
-  } finally {
-    ancestors.delete(value);
-  }
-}
-
-function canonicalStrictJson(value: unknown): string | undefined {
-  try {
-    return JSON.stringify(cloneStrictJson(value, new Set()));
-  } catch {
-    return undefined;
-  }
-}
-
 function hashCanonicalStrictJson(value: unknown): string | undefined {
   const canonical = canonicalStrictJson(value);
   return canonical === undefined ? undefined : createHash("sha256").update(canonical).digest("hex");
@@ -1687,16 +1927,69 @@ function normalizeAgentRetries(value: unknown): number {
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
 }
 
+function copyValidUsage(value: AgentUsage): AgentUsage | undefined {
+  try {
+    const copy: AgentUsage = {
+      input: value.input,
+      output: value.output,
+      cacheRead: value.cacheRead,
+      cacheWrite: value.cacheWrite,
+      total: value.total,
+      cost: value.cost,
+    };
+    return Object.values(copy).every((field) => Number.isFinite(field) && field >= 0)
+      ? deepFreeze(copy)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sumUsage(values: AgentUsage[]): AgentUsage | undefined {
+  if (values.length === 0) return undefined;
+  return deepFreeze(
+    values.reduce<AgentUsage>(
+      (sum, usage) => ({
+        input: sum.input + usage.input,
+        output: sum.output + usage.output,
+        cacheRead: sum.cacheRead + usage.cacheRead,
+        cacheWrite: sum.cacheWrite + usage.cacheWrite,
+        total: sum.total + usage.total,
+        cost: sum.cost + usage.cost,
+      }),
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+    ),
+  );
+}
+
+function bestEffortDebug(message: string): void {
+  try {
+    console.debug(`[workflow-engine] ${message}`);
+  } catch {
+    // Debug reporting never changes execution.
+  }
+}
+
 /**
  * Run a promise with a timeout.
  */
-async function withTimeout<T>(promise: Promise<T>, ms: number | null, label: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number | null,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
   if (ms === null) return promise;
 
   let timeoutId: NodeJS.Timeout | undefined;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        // Attempt cancellation is best-effort; timeout classification still wins.
+      }
       reject(
         new WorkflowError(
           `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
