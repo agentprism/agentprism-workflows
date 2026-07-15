@@ -1682,9 +1682,24 @@ export async function runIsolation<T = unknown>(
 
   if (journaling) {
     try {
-      const artifact = persistence.load(rootRunId);
-      if (!artifact) throw new Error(`isolation artifact ${rootRunId} is missing`);
-      persistence.save({ ...artifact, replayReport: report });
+      const lease = persistence.acquireRunLease(rootRunId);
+      if (!lease) throw new Error(`isolation artifact ${rootRunId} is leased`);
+      try {
+        const artifact = persistence.load(rootRunId);
+        if (!artifact) throw new Error(`isolation artifact ${rootRunId} is missing`);
+        const executionMode = artifact.executionMode as Record<string, unknown> | undefined;
+        if (
+          !executionMode ||
+          Object.keys(executionMode).length !== 2 ||
+          executionMode.kind !== "isolation" ||
+          executionMode.baselineRunId !== options.baselineRunId
+        ) {
+          throw new Error(`isolation artifact ${rootRunId} was replaced`);
+        }
+        persistence.save({ ...artifact, replayReport: report });
+      } finally {
+        persistence.releaseRunLease(lease);
+      }
     } catch (error) {
       const reason = errorMessage(error);
       try {

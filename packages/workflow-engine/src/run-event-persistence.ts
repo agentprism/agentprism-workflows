@@ -187,7 +187,7 @@ function hasRequired(value: Record<string, unknown>, key: string, predicate: (ca
 }
 
 function hasOptional(value: Record<string, unknown>, key: string, predicate: (candidate: unknown) => boolean): boolean {
-  return !hasOwn(value, key) || predicate(value[key]);
+  return !hasOwn(value, key) || value[key] === undefined || predicate(value[key]);
 }
 
 function hasNone(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -273,10 +273,10 @@ function isCheckpointContext(value: unknown, projected: boolean): boolean {
   ) {
     return false;
   }
-  if (hasOwn(value, "choices")) {
+  if (hasOwn(value, "choices") && value.choices !== undefined) {
     if (!Array.isArray(value.choices) || (projected && value.choices.length > 20) || !value.choices.every(text)) return false;
   }
-  return !projected || !hasOwn(value, "default") || isProjectionValue(value.default);
+  return !projected || !hasOwn(value, "default") || value.default === undefined || isProjectionValue(value.default);
 }
 
 function isProviderUsageContext(value: unknown, projected: boolean): boolean {

@@ -10,11 +10,16 @@
  * try/catch.
  */
 
+import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type {
   AgentRunner,
   AgentSessionRecord,
+  EngineRunEvent,
+  EngineRunEventName,
+  EngineRunEventPayloadMap,
   JournalEntry,
+  PersistableEngineRunEvent,
   TokenUsage,
   WorkflowBackendConfig,
   WorkflowCallRecord,
@@ -36,6 +41,8 @@ import {
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
+import { withRunEvents, type RunEventPersistence } from "./run-event-persistence.js";
+import { projectRecordedError } from "./recorded-error.js";
 import { workflowHomeDir } from "./workflow-paths.js";
 import { cloneFrozenStrictJson, cloneStrictJsonValue, deepFreeze } from "./strict-json.js";
 import {
@@ -93,6 +100,9 @@ export interface ManagedRun {
   journaling: boolean;
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
+  eventStreamId?: string;
+  eventSeq?: number;
+  eventLogIncomplete?: true;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -100,6 +110,20 @@ export interface ManagedRun {
    * result, so re-delivering would duplicate it.
    */
   background: boolean;
+}
+
+interface EventPublicationState {
+  runId: string;
+  journaling: boolean;
+  lease?: RunLease;
+  eventStreamId?: string;
+  eventSeq?: number;
+  eventLogIncomplete?: true;
+}
+
+interface RunEventPublicationActions {
+  beforeLive?: () => void;
+  afterLive?: () => void;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -249,6 +273,48 @@ function runReason(status: RunStatus, error: WorkflowError | undefined): string 
   return error?.message;
 }
 
+function generateEventStreamId(): string {
+  return randomBytes(16).toString("hex");
+}
+
+function isPersistableRunEvent(event: EngineRunEvent): event is PersistableEngineRunEvent {
+  return event.type !== "agentHistory";
+}
+
+export interface WorkflowManager {
+  addListener<Name extends EngineRunEventName>(
+    eventName: Name,
+    listener: (payload: EngineRunEventPayloadMap[Name]) => void,
+  ): this;
+  on<Name extends EngineRunEventName>(
+    eventName: Name,
+    listener: (payload: EngineRunEventPayloadMap[Name]) => void,
+  ): this;
+  once<Name extends EngineRunEventName>(
+    eventName: Name,
+    listener: (payload: EngineRunEventPayloadMap[Name]) => void,
+  ): this;
+  removeListener<Name extends EngineRunEventName>(
+    eventName: Name,
+    listener: (payload: EngineRunEventPayloadMap[Name]) => void,
+  ): this;
+  off<Name extends EngineRunEventName>(
+    eventName: Name,
+    listener: (payload: EngineRunEventPayloadMap[Name]) => void,
+  ): this;
+  emit<Name extends EngineRunEventName>(
+    eventName: Name,
+    payload: EngineRunEventPayloadMap[Name],
+  ): boolean;
+
+  addListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  on(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  once(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  removeListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  off(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  emit(eventName: string | symbol, ...args: any[]): boolean;
+}
+
 /**
  * Stateful workflow run manager. Events are OBSERVABILITY ONLY: listeners are
  * best-effort observers, isolated from sibling listeners and from run execution. A
@@ -256,7 +322,7 @@ function runReason(status: RunStatus, error: WorkflowError | undefined): string 
  */
 export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
-  private persistence: RunPersistence;
+  private persistence: RunEventPersistence;
   private cwd: string;
   private concurrency: number;
   private loadSavedWorkflow?: (name: string) => string | undefined;
@@ -286,7 +352,9 @@ export class WorkflowManager extends EventEmitter {
     this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
     this.journaling = options.journaling ?? true;
     this.environmentKey = options.environmentKey;
-    this.persistence = options.persistence ?? createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
+    this.persistence = options.persistence
+      ? withRunEvents(options.persistence)
+      : createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
     // Stale-run recovery mutates the PERSISTED run store, so it is gated on this manager's
     // journaling default: a `journaling: false` manager (host keeps its own transcript/audit
     // store) must never rewrite run state that belongs to journaling processes.
@@ -326,7 +394,10 @@ export class WorkflowManager extends EventEmitter {
           const lease = this.persistence.acquireRunLease(p.runId);
           if (!lease) continue;
           try {
-            this.persistence.save({ ...p, status: "paused" });
+            const current = this.persistence.load(p.runId);
+            if (current?.status === "running") {
+              this.persistence.save({ ...current, status: "paused" });
+            }
           } finally {
             this.persistence.releaseRunLease(lease);
           }
@@ -523,11 +594,125 @@ export class WorkflowManager extends EventEmitter {
       journaling,
       background,
       lease: identity.lease,
+      ...(journaling ? { eventStreamId: generateEventStreamId(), eventSeq: 0 } : {}),
     };
   }
 
   private resolveJournaling(exec: ExecOptions): boolean {
     return exec.journaling ?? this.journaling;
+  }
+
+  private createRunEvent<Name extends EngineRunEventName>(
+    type: Name,
+    payload: EngineRunEventPayloadMap[Name],
+  ): EngineRunEvent {
+    return Object.assign({ type }, payload as object) as unknown as EngineRunEvent;
+  }
+
+  private reportPersistenceFailure(error: unknown): void {
+    try {
+      console.warn("[workflow-manager] Persist run failed:", error);
+    } catch {
+      // Persistence diagnostics are best-effort.
+    }
+  }
+
+  private savePersistedState(state: PersistedRunState, publication: EventPublicationState): boolean {
+    if (!publication.lease) return false;
+    try {
+      this.persistence.save(state);
+      return true;
+    } catch (error) {
+      this.reportPersistenceFailure(error);
+      return false;
+    }
+  }
+
+  private syncEventWatermark(state: EventPublicationState, snapshot: PersistedRunState): void {
+    snapshot.eventStreamId = state.eventStreamId;
+    snapshot.eventSeq = state.eventSeq;
+    if (state.eventLogIncomplete) snapshot.eventLogIncomplete = true;
+  }
+
+  private prepareEventPublicationState(
+    snapshot: PersistedRunState,
+    lease: RunLease,
+  ): EventPublicationState {
+    const state: EventPublicationState = {
+      runId: snapshot.runId,
+      journaling: true,
+      lease,
+      eventStreamId: snapshot.eventStreamId,
+      eventSeq: snapshot.eventSeq,
+      eventLogIncomplete: snapshot.eventLogIncomplete,
+    };
+
+    if (snapshot.eventStreamId === undefined && snapshot.eventSeq === undefined) {
+      state.eventStreamId = generateEventStreamId();
+      state.eventSeq = 0;
+      this.syncEventWatermark(state, snapshot);
+      if (!this.savePersistedState(snapshot, state)) {
+        state.eventLogIncomplete = true;
+        snapshot.eventLogIncomplete = true;
+        this.savePersistedState(snapshot, state);
+        return state;
+      }
+    }
+
+    if (state.eventLogIncomplete) return state;
+
+    try {
+      const tail = this.persistence.readEvents(snapshot.runId).endCursor;
+      state.eventSeq = tail;
+    } catch (error) {
+      state.eventLogIncomplete = true;
+      snapshot.eventLogIncomplete = true;
+      this.reportPersistenceFailure(error);
+      this.savePersistedState(snapshot, state);
+    }
+    return state;
+  }
+
+  private deliverRunEvent(event: EngineRunEvent): boolean {
+    if (event.type === "error" && this.listenerCount("error") === 0) return false;
+    const { type, ...payload } = event;
+    return this.emit(type, payload);
+  }
+
+  private publishRunEvent(
+    state: EventPublicationState,
+    event: EngineRunEvent,
+    saveIncompleteMarker: () => void,
+    actions: RunEventPublicationActions = {},
+  ): boolean {
+    if (
+      isPersistableRunEvent(event) &&
+      state.journaling &&
+      state.lease &&
+      !state.eventLogIncomplete
+    ) {
+      try {
+        if (state.eventStreamId === undefined || state.eventSeq === undefined) {
+          throw new Error(`run ${state.runId} has no event publication watermark`);
+        }
+        const candidate = state.eventSeq + 1;
+        const record = this.persistence.appendEvent(state.runId, {
+          seq: candidate,
+          timestamp: new Date().toISOString(),
+          event,
+        });
+        state.eventSeq = record.seq;
+      } catch (error) {
+        state.eventLogIncomplete = true;
+        this.reportPersistenceFailure(error);
+        saveIncompleteMarker();
+      }
+    }
+
+    actions.beforeLive?.();
+    const delivered = this.deliverRunEvent(event);
+    actions.afterLive?.();
+    return delivered;
   }
 
   /**
@@ -629,6 +814,8 @@ export class WorkflowManager extends EventEmitter {
       Object.assign(managed.snapshot, recomputeWorkflowSnapshot(managed.snapshot));
       onProgress?.(managed.snapshot);
     };
+    const publish = (event: EngineRunEvent, actions?: RunEventPublicationActions) =>
+      this.publishRunEvent(managed, event, () => this.persistRun(managed), actions);
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     const hostSignal = externalSignal ?? signal;
     if (hostSignal) {
@@ -688,17 +875,25 @@ export class WorkflowManager extends EventEmitter {
           this.persistRun(managed);
         },
         onCallRecord: (record) => this.recordCallRecord(managed, record),
-        onLog: (message) => {
+        onLog: (message, context) => {
           managed.snapshot.logs.push(message);
-          this.emit("log", { runId: managed.runId, message });
+          publish(this.createRunEvent("log", {
+            runId: managed.runId,
+            scope: context?.scope ?? managed.runId,
+            message,
+          }));
           progress();
         },
-        onPhase: (title) => {
+        onPhase: (title, context) => {
           managed.snapshot.currentPhase = title;
           if (!managed.snapshot.phases.includes(title)) {
             managed.snapshot.phases.push(title);
           }
-          this.emit("phase", { runId: managed.runId, title });
+          publish(this.createRunEvent("phase", {
+            runId: managed.runId,
+            scope: context?.scope ?? managed.runId,
+            title,
+          }));
           progress();
         },
         onAgentStart: (event) => {
@@ -713,7 +908,11 @@ export class WorkflowManager extends EventEmitter {
             callIndex: event.callIndex,
             scope: event.scope,
           });
-          this.emit("agentStart", { runId: managed.runId, ...event });
+          publish(this.createRunEvent("agentStart", {
+            runId: managed.runId,
+            ...event,
+            scope: event.scope ?? managed.runId,
+          }));
           progress();
         },
         onAgentEnd: (event) => {
@@ -745,7 +944,11 @@ export class WorkflowManager extends EventEmitter {
             if (event.model) agentSnapshot.model = event.model;
             if (event.session) agentSnapshot.session = event.session;
           }
-          this.emit("agentEnd", { runId: managed.runId, ...event });
+          publish(this.createRunEvent("agentEnd", {
+            runId: managed.runId,
+            ...event,
+            scope: event.scope ?? managed.runId,
+          }));
           progress();
         },
         onAgentHistory: (event) => {
@@ -763,12 +966,20 @@ export class WorkflowManager extends EventEmitter {
           if (agentSnapshot) {
             agentSnapshot.history = event.history;
           }
-          this.emit("agentHistory", { runId: managed.runId, ...event });
+          publish(this.createRunEvent("agentHistory", {
+            runId: managed.runId,
+            ...event,
+            scope: event.scope ?? managed.runId,
+          }));
           progress();
         },
-        onTokenUsage: (usage) => {
+        onTokenUsage: (usage, context) => {
           managed.snapshot.tokenUsage = usage;
-          this.emit("tokenUsage", { runId: managed.runId, usage });
+          publish(this.createRunEvent("tokenUsage", {
+            runId: managed.runId,
+            scope: context?.scope ?? managed.runId,
+            usage,
+          }));
           progress();
         },
       });
@@ -781,11 +992,19 @@ export class WorkflowManager extends EventEmitter {
       managed.status = "completed";
       const result = this.composeResult(managed, undefined, engineResult);
       managed.result = result;
-      this.emit("complete", { runId: managed.runId, result });
-
-      // Persist final state
-      this.persistRun(managed);
-      this.releaseRunLease(managed);
+      publish(
+        this.createRunEvent("complete", {
+          runId: managed.runId,
+          scope: managed.runId,
+          result,
+        }),
+        {
+          afterLive: () => {
+            this.persistRun(managed);
+            this.releaseRunLease(managed);
+          },
+        },
+      );
 
       return result;
     } catch (error) {
@@ -824,30 +1043,55 @@ export class WorkflowManager extends EventEmitter {
       managed.error = workflowError;
       managed.result = this.composeResult(managed, workflowError);
 
-      // Persist final state + release the lease BEFORE emitting, so a consumer that did not
-      // subscribe to 'error' (EventEmitter throws ERR_UNHANDLED_ERROR on an unheard 'error')
-      // can never skip cleanup and leak the run lease / lose the persisted "failed" state.
-      this.persistRun(managed);
-      this.releaseRunLease(managed);
-
       if (paused) {
-        // The emit is untyped (WorkflowManager extends EventEmitter with an untyped override
-        // emit); the payload is a bare literal. `reason` is a free-form string, so it just takes
-        // "auth_required"/"usage_limit"/"checkpoint_required". resetHint is usage-limit-only;
-        // each structured context is present only for its corresponding pause reason.
-        this.emit("paused", {
-          runId: managed.runId,
-          reason: authPaused ? "auth_required" : checkpointPaused ? "checkpoint_required" : "usage_limit",
-          error: workflowError,
-          resetHint: usageLimitPaused ? workflowError.resetHint : undefined,
-          authContext: authPaused ? workflowError.authContext : undefined,
-          checkpointContext: checkpointPaused ? workflowError.checkpointContext : undefined,
+        const errorRecord = projectRecordedError(workflowError);
+        const pausedEvent = authPaused
+          ? this.createRunEvent("paused", {
+              runId: managed.runId,
+              scope: managed.runId,
+              reason: "auth_required",
+              error: workflowError,
+              errorRecord,
+              authContext: workflowError.authContext,
+            })
+          : checkpointPaused
+            ? this.createRunEvent("paused", {
+                runId: managed.runId,
+                scope: managed.runId,
+                reason: "checkpoint_required",
+                error: workflowError,
+                errorRecord,
+                checkpointContext: workflowError.checkpointContext,
+              })
+            : this.createRunEvent("paused", {
+                runId: managed.runId,
+                scope: managed.runId,
+                reason: "usage_limit",
+                error: workflowError,
+                errorRecord,
+                resetHint: workflowError.resetHint,
+              });
+        publish(pausedEvent, {
+          beforeLive: () => {
+            this.persistRun(managed);
+            this.releaseRunLease(managed);
+          },
         });
-      } else if (this.listenerCount("error") > 0) {
-        // Only emit 'error' when someone is listening: an unheard 'error' would throw
-        // ERR_UNHANDLED_ERROR here, masking the real workflowError thrown below (which
-        // pollutes the failed run's reason) — guard so the real error always propagates.
-        this.emit("error", { runId: managed.runId, error: workflowError });
+      } else {
+        publish(
+          this.createRunEvent("error", {
+            runId: managed.runId,
+            scope: managed.runId,
+            error: workflowError,
+            errorRecord: projectRecordedError(workflowError),
+          }),
+          {
+            beforeLive: () => {
+              this.persistRun(managed);
+              this.releaseRunLease(managed);
+            },
+          },
+        );
       }
 
       throw workflowError;
@@ -866,9 +1110,17 @@ export class WorkflowManager extends EventEmitter {
     if (rootScope) {
       managed.journal = managed.journal.filter((e) => e.index !== entry.index);
       managed.journal.push(entry);
-      if (managed.journaling) this.persistRun(managed);
     }
-    if (this.listenerCount("journal") > 0) this.emit("journal", { runId: managed.runId, entry });
+    this.publishRunEvent(
+      managed,
+      this.createRunEvent("journal", {
+        runId: managed.runId,
+        scope: entry.scope ?? managed.runId,
+        entry,
+      }),
+      () => this.persistRun(managed),
+      rootScope ? { beforeLive: () => this.persistRun(managed) } : undefined,
+    );
   }
 
   private recordCallRecord(managed: ManagedRun, record: WorkflowCallRecord): void {
@@ -877,11 +1129,17 @@ export class WorkflowManager extends EventEmitter {
     if (rootScope) {
       managed.calls = managed.calls.filter((row) => row.index !== record.index);
       managed.calls.push(record);
-      if (managed.journaling) this.persistRun(managed);
     }
-    if (this.listenerCount("callRecord") > 0) {
-      this.emit("callRecord", { runId: managed.runId, record });
-    }
+    this.publishRunEvent(
+      managed,
+      this.createRunEvent("callRecord", {
+        runId: managed.runId,
+        scope: record.scope ?? managed.runId,
+        record,
+      }),
+      () => this.persistRun(managed),
+      rootScope ? { beforeLive: () => this.persistRun(managed) } : undefined,
+    );
   }
 
   private dropPostTerminal(managed: ManagedRun, event: string): boolean {
@@ -895,7 +1153,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private persistRun(managed: ManagedRun) {
-    if (!managed.journaling) return;
+    if (!managed.journaling || !managed.lease) return;
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -913,6 +1171,9 @@ export class WorkflowManager extends EventEmitter {
         mainModel: managed.mainModel,
         agentsDir: managed.agentsDir,
         executionMode: managed.executionMode,
+        eventStreamId: managed.eventStreamId,
+        eventSeq: managed.eventSeq,
+        eventLogIncomplete: managed.eventLogIncomplete,
         nestedWorkflows: managed.nestedWorkflows,
         legacyResume: managed.legacyResume,
         sessionId: this.sessionId,
@@ -985,10 +1246,7 @@ export class WorkflowManager extends EventEmitter {
         durationMs: managed.result?.durationMs,
       });
     } catch (err) {
-      // Persistence is best-effort: the run is still healthy in memory.
-      // Log so an operator debugging state-loss has a lead, but never crash
-      // the workflow over a disk-full situation.
-      console.warn("[workflow-manager] Persist run failed:", err);
+      this.reportPersistenceFailure(err);
     }
   }
 
@@ -1001,9 +1259,17 @@ export class WorkflowManager extends EventEmitter {
 
     managed.controller.abort();
     managed.status = "paused";
-    this.emit("paused", { runId });
-    this.persistRun(managed);
-    this.releaseRunLease(managed);
+    this.publishRunEvent(
+      managed,
+      this.createRunEvent("paused", { runId, scope: runId }),
+      () => this.persistRun(managed),
+      {
+        afterLive: () => {
+          this.persistRun(managed);
+          this.releaseRunLease(managed);
+        },
+      },
+    );
     return true;
   }
 
@@ -1036,13 +1302,30 @@ export class WorkflowManager extends EventEmitter {
     if (active?.status === "running") return { accepted: false };
     if (active?.status === "aborted") return { accepted: false };
 
-    const persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") {
-      return { accepted: false };
-    }
-    if (persisted.executionMode) return { accepted: false };
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return { accepted: false };
+    let persisted: PersistedRunState | null;
+    try {
+      persisted = this.persistence.load(runId);
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
+    if (
+      !persisted?.script ||
+      persisted.status === "completed" ||
+      persisted.status === "aborted" ||
+      persisted.executionMode
+    ) {
+      this.persistence.releaseRunLease(lease);
+      return { accepted: false };
+    }
+    const publication = this.prepareEventPublicationState(persisted, lease);
+    const saveResumeGate = () => {
+      this.syncEventWatermark(publication, persisted);
+      persisted.updatedAt = new Date().toISOString();
+      this.savePersistedState(persisted, publication);
+    };
 
     const checkpointContext =
       persisted.pauseReason === "checkpoint_required" ? persisted.checkpointContext : undefined;
@@ -1086,17 +1369,26 @@ export class WorkflowManager extends EventEmitter {
           WorkflowErrorCode.AUTH_REQUIRED,
           { recoverable: false, authContext: persisted.authContext },
         );
-        // The on-disk state is already a valid "auth_required" pause (journal + authContext
-        // intact), so we do NOT re-persist — that would risk clobbering the journal. We surface
-        // the re-supply cause on the "paused" event and release the lease we just took.
-        this.emit("paused", {
-          runId,
-          reason: "auth_required",
-          error: reSupplyError,
-          resetHint: undefined,
-          authContext: persisted.authContext,
-        });
-        this.persistence.releaseRunLease(lease);
+        const gateEventSeq = publication.eventSeq;
+        this.publishRunEvent(
+          publication,
+          this.createRunEvent("paused", {
+            runId,
+            scope: runId,
+            reason: "auth_required",
+            error: reSupplyError,
+            errorRecord: projectRecordedError(reSupplyError),
+            authContext: persisted.authContext,
+          }),
+          saveResumeGate,
+          {
+            afterLive: () => {
+              if (publication.eventSeq !== gateEventSeq) saveResumeGate();
+              this.persistence.releaseRunLease(lease);
+              publication.lease = undefined;
+            },
+          },
+        );
         // A normal background execution that reaches a paused terminal state rejects
         // with its WorkflowError. Match that settlement for this synchronous re-pause
         // while handling the rejection internally just like startInBackground.
@@ -1115,15 +1407,26 @@ export class WorkflowManager extends EventEmitter {
         WorkflowErrorCode.CHECKPOINT_REQUIRED,
         { recoverable: false, checkpointContext },
       );
-      this.emit("paused", {
-        runId,
-        reason: "checkpoint_required",
-        error: checkpointError,
-        resetHint: undefined,
-        authContext: undefined,
-        checkpointContext,
-      });
-      this.persistence.releaseRunLease(lease);
+      const gateEventSeq = publication.eventSeq;
+      this.publishRunEvent(
+        publication,
+        this.createRunEvent("paused", {
+          runId,
+          scope: runId,
+          reason: "checkpoint_required",
+          error: checkpointError,
+          errorRecord: projectRecordedError(checkpointError),
+          checkpointContext,
+        }),
+        saveResumeGate,
+        {
+          afterLive: () => {
+            if (publication.eventSeq !== gateEventSeq) saveResumeGate();
+            this.persistence.releaseRunLease(lease);
+            publication.lease = undefined;
+          },
+        },
+      );
       const promise = Promise.reject<WorkflowRunResult>(checkpointError);
       promise.catch(() => {});
       return { accepted: true, promise };
@@ -1176,6 +1479,9 @@ export class WorkflowManager extends EventEmitter {
       journaling: true,
       background: true,
       lease,
+      eventStreamId: publication.eventStreamId,
+      eventSeq: publication.eventSeq,
+      eventLogIncomplete: publication.eventLogIncomplete,
     };
     this.runs.set(runId, managed);
 
@@ -1196,7 +1502,11 @@ export class WorkflowManager extends EventEmitter {
       managed.journal.push(syntheticEntry);
       this.persistRun(managed);
     }
-    this.emit("resumed", { runId });
+    this.publishRunEvent(
+      managed,
+      this.createRunEvent("resumed", { runId, scope: runId }),
+      () => this.persistRun(managed),
+    );
     // Run in the background; executeRun records status/errors on the managed run.
     // Preserve the original promise for callers while preventing an ignored resume
     // from becoming an unhandled rejection.
@@ -1212,11 +1522,65 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
 
+    let pausedSnapshot: PersistedRunState | undefined;
+    if (managed.status === "paused" && !managed.lease) {
+      const lease = this.persistence.acquireRunLease(runId);
+      if (!lease) return false;
+      managed.lease = lease;
+      if (managed.journaling) {
+        let current: PersistedRunState | null;
+        try {
+          current = this.persistence.load(runId);
+        } catch (error) {
+          this.reportPersistenceFailure(error);
+          this.releaseRunLease(managed);
+          return false;
+        }
+        if (current?.status !== "paused") {
+          this.releaseRunLease(managed);
+          return false;
+        }
+        pausedSnapshot = current;
+        const publication = this.prepareEventPublicationState(current, lease);
+        managed.eventStreamId = publication.eventStreamId;
+        managed.eventSeq = publication.eventSeq;
+        managed.eventLogIncomplete = publication.eventLogIncomplete;
+      }
+    }
+
     managed.controller.abort();
     managed.status = "aborted";
-    this.emit("stopped", { runId });
-    this.persistRun(managed);
-    this.releaseRunLease(managed);
+    if (pausedSnapshot) {
+      pausedSnapshot.status = "aborted";
+      pausedSnapshot.reason = undefined;
+      pausedSnapshot.errorCode = undefined;
+      pausedSnapshot.pauseReason = undefined;
+      pausedSnapshot.resetHint = undefined;
+      pausedSnapshot.authContext = undefined;
+      pausedSnapshot.checkpointContext = undefined;
+      pausedSnapshot.abortSignaled = true;
+    }
+    const saveStopped = () => {
+      if (!managed.lease) return;
+      if (!pausedSnapshot) {
+        this.persistRun(managed);
+        return;
+      }
+      this.syncEventWatermark(managed, pausedSnapshot);
+      pausedSnapshot.updatedAt = new Date().toISOString();
+      this.savePersistedState(pausedSnapshot, managed);
+    };
+    this.publishRunEvent(
+      managed,
+      this.createRunEvent("stopped", { runId, scope: runId }),
+      saveStopped,
+      {
+        afterLive: () => {
+          saveStopped();
+          this.releaseRunLease(managed);
+        },
+      },
+    );
     return true;
   }
 
@@ -1314,15 +1678,21 @@ export class WorkflowManager extends EventEmitter {
    */
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed) this.releaseRunLease(managed);
-    this.runs.delete(runId);
-    return this.persistence.delete(runId);
+    const lease = managed?.lease ?? this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      return this.persistence.delete(runId);
+    } finally {
+      this.persistence.releaseRunLease(lease);
+      if (managed) managed.lease = undefined;
+      this.runs.delete(runId);
+    }
   }
 
   /**
    * Get the persistence layer (for saving workflows).
    */
-  getPersistence(): RunPersistence {
+  getPersistence(): RunEventPersistence {
     return this.persistence;
   }
 }
