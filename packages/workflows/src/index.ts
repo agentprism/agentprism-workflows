@@ -20,7 +20,7 @@ import {
 } from "@automatalabs/workflow-engine";
 import type { AcpEventListener, AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
 import type { ExecOptions, WorkflowDir, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
-import type { AgentRunner, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
+import type { AgentRunner, RunEvent, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 import { approveScriptBackends, type ScriptBackendApproval } from "./script-backends.js";
 
 type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
@@ -259,7 +259,7 @@ export type {
 
 // ── Live ACP events: `createAcpRunner().on("tool_call", evt => …)` to listen in on the
 //    stream of a run. The event map keys are ACP `sessionUpdate` discriminants plus a few
-//    cross-cutting events; each payload carries a `{ sessionId, backendId, label?, runId? }`
+//    cross-cutting events; each payload carries a `{ sessionId, backendId, label?, runId?, callIndex? }`
 //    context envelope so a pooled runner's concurrent runs are disambiguable. ──
 export { TypedEventEmitter } from "@automatalabs/acp-agents";
 export type {
@@ -319,25 +319,72 @@ interface AcpBridgeEntry {
   unsubscribers: Array<() => void>;
 }
 
-type ContextProperty<T, K extends PropertyKey> = K extends keyof T ? T[K] : never;
-type OptionalContextProperty<T, K extends PropertyKey> = K extends keyof T ? T[K] : undefined;
+type ContextProperty<T, Key extends PropertyKey> = Key extends keyof T ? T[Key] : never;
+type OptionalContextProperty<T, Key extends PropertyKey> =
+  Key extends keyof T ? T[Key] : undefined;
 
-/** Payload of `WorkflowManager`'s `agentEvent` observer. `event` is the verbatim runner event
- *  payload; the top-level envelope repeats the ACP context fields hosts filter on. `backend_error`
- *  is connection-scoped in acp-agents and therefore has no session/run context to repeat. */
-type AgentEventPayloadMap = {
-  [K in AcpEventName]: {
-    name: K;
-    event: AcpRunnerEventMap[K];
-    backendId: ContextProperty<AcpRunnerEventMap[K], "backendId">;
-  } & ("sessionId" extends keyof AcpRunnerEventMap[K]
-    ? { sessionId: ContextProperty<AcpRunnerEventMap[K], "sessionId"> }
+/** The manager unwraps the runner catch-all into its concrete sessionUpdate discriminant. */
+export type WorkflowAgentEventName = Exclude<AcpEventName, "session_update">;
+
+/**
+ * Envelope map over the runner's whole public event-name type. The manager-emitted map below
+ * picks only names the bridge actually publishes; retaining the full map preserves the existing
+ * AgentEventPayload<"session_update"> type argument for source compatibility.
+ */
+type WorkflowAgentEventEnvelopeMap = {
+  [Name in AcpEventName]: {
+    name: Name;
+    event: AcpRunnerEventMap[Name];
+    backendId: ContextProperty<AcpRunnerEventMap[Name], "backendId">;
+  } & ("sessionId" extends keyof AcpRunnerEventMap[Name]
+    ? { sessionId: ContextProperty<AcpRunnerEventMap[Name], "sessionId"> }
     : { sessionId?: undefined }) & {
-      label?: OptionalContextProperty<AcpRunnerEventMap[K], "label">;
-      runId?: OptionalContextProperty<AcpRunnerEventMap[K], "runId">;
+      label?: OptionalContextProperty<AcpRunnerEventMap[Name], "label">;
+      runId?: OptionalContextProperty<AcpRunnerEventMap[Name], "runId">;
+      scope?: OptionalContextProperty<AcpRunnerEventMap[Name], "runId">;
+      callIndex?: OptionalContextProperty<AcpRunnerEventMap[Name], "callIndex">;
     };
 };
-export type AgentEventPayload<K extends AcpEventName = AcpEventName> = AgentEventPayloadMap[K];
+
+export type WorkflowAgentEventPayloadMap = Pick<
+  WorkflowAgentEventEnvelopeMap,
+  WorkflowAgentEventName
+>;
+
+export type WorkflowAgentEventPayload<
+  Name extends WorkflowAgentEventName = WorkflowAgentEventName,
+> = WorkflowAgentEventPayloadMap[Name];
+
+export type WorkflowAgentEvent = {
+  [Name in WorkflowAgentEventName]:
+    { type: "agentEvent" } & WorkflowAgentEventPayload<Name>;
+}[WorkflowAgentEventName];
+
+export type WorkflowRunEvent = RunEvent<WorkflowAgentEvent>;
+
+/**
+ * Compatibility alias retained with its pre-contract generic constraint and default. The
+ * "session_update" member is type-only: the manager did not emit it before this contract and
+ * still does not. New exact consumers use WorkflowAgentEventPayload/WorkflowAgentEvent.
+ */
+export type AgentEventPayload<
+  Name extends AcpEventName = AcpEventName,
+> = WorkflowAgentEventEnvelopeMap[Name];
+
+export interface WorkflowManager {
+  addListener(eventName: "agentEvent", listener: (payload: WorkflowAgentEventPayload) => void): this;
+  on(eventName: "agentEvent", listener: (payload: WorkflowAgentEventPayload) => void): this;
+  once(eventName: "agentEvent", listener: (payload: WorkflowAgentEventPayload) => void): this;
+  removeListener(eventName: "agentEvent", listener: (payload: WorkflowAgentEventPayload) => void): this;
+  off(eventName: "agentEvent", listener: (payload: WorkflowAgentEventPayload) => void): this;
+  emit(eventName: "agentEvent", payload: WorkflowAgentEventPayload): boolean;
+  addListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  on(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  once(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  removeListener(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  off(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  emit(eventName: string | symbol, ...args: any[]): boolean;
+}
 
 /**
  * Stateful workflow manager exported by the SDK facade. It is the workflow-engine manager plus
@@ -464,7 +511,7 @@ function isAcpEventBusRunner(agent: AgentRunner | undefined): agent is AcpEventB
 
 function toSessionUpdateAgentEventPayload(
   event: AcpRunnerEventMap["session_update"],
-): AgentEventPayload<AcpUpdateKind> {
+): WorkflowAgentEventPayload<AcpUpdateKind> {
   const name = event.update.sessionUpdate;
   return toAgentEventPayload(name, {
     ...event.update,
@@ -472,15 +519,20 @@ function toSessionUpdateAgentEventPayload(
     backendId: event.backendId,
     label: event.label,
     runId: event.runId,
+    callIndex: event.callIndex,
   } as AcpRunnerEventMap[typeof name]);
 }
 
-function toAgentEventPayload<K extends AcpEventName>(name: K, event: AcpRunnerEventMap[K]): AgentEventPayload<K> {
+function toAgentEventPayload<Name extends WorkflowAgentEventName>(
+  name: Name,
+  event: AcpRunnerEventMap[Name],
+): WorkflowAgentEventPayload<Name> {
   const context = event as Partial<{
     backendId: string;
     sessionId: string;
     label: string;
     runId: string;
+    callIndex: number;
   }>;
   return {
     name,
@@ -489,7 +541,9 @@ function toAgentEventPayload<K extends AcpEventName>(name: K, event: AcpRunnerEv
     ...(context.sessionId !== undefined ? { sessionId: context.sessionId } : {}),
     ...(context.label !== undefined ? { label: context.label } : {}),
     ...(context.runId !== undefined ? { runId: context.runId } : {}),
-  } as AgentEventPayload<K>;
+    ...(context.runId !== undefined ? { scope: context.runId } : {}),
+    ...(context.callIndex !== undefined ? { callIndex: context.callIndex } : {}),
+  } as WorkflowAgentEventPayload<Name>;
 }
 
 /**

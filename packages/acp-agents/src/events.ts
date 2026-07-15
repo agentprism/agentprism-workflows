@@ -35,6 +35,8 @@ export interface AcpEventContext {
   label?: string;
   /** `RunOptions.runId` correlation id, if one was set. */
   runId?: string;
+  /** `RunOptions.callIndex` for the agent() call that opened this session, when supplied. */
+  callIndex?: number;
 }
 
 /** Per-discriminant events: key = ACP `sessionUpdate` string, payload = that variant + context. */

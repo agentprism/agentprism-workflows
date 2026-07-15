@@ -174,6 +174,7 @@ interface SessionTombstone {
   readonly cwd: string;
   readonly label?: string;
   readonly runId?: string;
+  readonly callIndex?: number;
 }
 
 const parseConnectMcpRequest = (params: unknown): ConnectMcpRequest => params as ConnectMcpRequest;
@@ -198,7 +199,7 @@ class SessionState {
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
 
-  /** `label`/`runId` are carried here ONLY so the MultiplexClient can stamp them onto emitted
+  /** `label`/`runId`/`callIndex` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
   constructor(
     readonly cwd: string,
@@ -207,6 +208,7 @@ class SessionState {
     readonly elicitationResolver?: ElicitationResolver,
     readonly label?: string,
     readonly runId?: string,
+    readonly callIndex?: number,
     modes?: SessionModeState | null,
     readonly mcpServerIds: readonly string[] = [],
     private readonly retainSessionLog = true,
@@ -367,15 +369,29 @@ class MultiplexClient {
     private readonly elicitationResolver?: ElicitationResolver,
   ) {}
 
-  private contextFor(sessionId: string, state: SessionState | undefined): AcpEventContext {
-    return { sessionId, backendId: this.backendId, label: state?.label, runId: state?.runId };
+  private contextFor(sessionId: string): AcpEventContext {
+    const context = this.sessions.get(sessionId) ?? this.tombstones.get(sessionId);
+    return {
+      sessionId,
+      backendId: this.backendId,
+      ...(context?.label !== undefined ? { label: context.label } : {}),
+      ...(context?.runId !== undefined ? { runId: context.runId } : {}),
+      ...(context?.callIndex !== undefined ? { callIndex: context.callIndex } : {}),
+    };
   }
 
   private handlerContext(params: { sessionId: string }): AcpSessionContext {
     const state = this.sessions.get(params.sessionId);
     if (state) return { sessionId: params.sessionId, cwd: state.cwd, label: state.label, runId: state.runId };
     const tombstone = this.tombstones.get(params.sessionId);
-    if (tombstone) return { sessionId: params.sessionId, ...tombstone };
+    if (tombstone) {
+      return {
+        sessionId: params.sessionId,
+        cwd: tombstone.cwd,
+        label: tombstone.label,
+        runId: tombstone.runId,
+      };
+    }
     throw unknownSession(params.sessionId);
   }
 
@@ -393,7 +409,7 @@ class MultiplexClient {
     this.tombstones.delete(sessionId);
     this.sessions.set(sessionId, state);
     for (const serverId of state.mcpServerIds) this.mcpServerSessions.set(serverId, sessionId);
-    this.onEvent?.("session_open", this.contextFor(sessionId, state));
+    this.onEvent?.("session_open", this.contextFor(sessionId));
   }
 
   unregister(sessionId: string): void {
@@ -411,13 +427,14 @@ class MultiplexClient {
         cwd: state.cwd,
         label: state.label,
         runId: state.runId,
+        callIndex: state.callIndex,
       });
       while (this.tombstones.size > TOMBSTONE_SESSION_CAP) {
         const oldest = this.tombstones.keys().next().value;
         if (oldest === undefined) break;
         this.tombstones.delete(oldest);
       }
-      this.onEvent?.("session_close", this.contextFor(sessionId, state));
+      this.onEvent?.("session_close", this.contextFor(sessionId));
     }
   }
 
@@ -452,7 +469,7 @@ class MultiplexClient {
     const state = this.sessions.get(params.sessionId);
     // Unknown/closed session: refuse rather than silently allow a tool we can't attribute.
     if (!state) return cancelledPermissionResponse();
-    const ctx = this.contextFor(params.sessionId, state);
+    const ctx = this.contextFor(params.sessionId);
     const resolver = state.permissionResolver ?? this.permissionResolver;
     if (resolver) return this.requestPermissionViaResolver(params, state, ctx, resolver);
     const outcome = decidePermission(params, state.policy);
@@ -507,7 +524,7 @@ class MultiplexClient {
     if (!sessionId) return declinedElicitationResponse();
 
     const state = this.sessions.get(sessionId);
-    const ctx = this.contextFor(sessionId, state);
+    const ctx = this.contextFor(sessionId);
     // Unknown/closed session: decline rather than asking a human for a prompt we cannot route.
     if (!state) {
       const outcome = declinedElicitationResponse();
@@ -657,7 +674,7 @@ class MultiplexClient {
     // Fold into the accumulator FIRST (the drain contract), THEN bubble the event up unchanged.
     state?.applyUpdate(params.update);
     if (this.onEvent) {
-      emitSessionUpdate(this.onEvent, params.update, this.contextFor(params.sessionId, state));
+      emitSessionUpdate(this.onEvent, params.update, this.contextFor(params.sessionId));
     }
   }
 
@@ -671,7 +688,7 @@ class MultiplexClient {
     const state = this.sessions.get(sessionId);
     state?.applyRawMessage(rawMessage as RawResultSuccess | undefined);
     this.onEvent?.("raw_message", {
-      ...this.contextFor(sessionId, state),
+      ...this.contextFor(sessionId),
       method,
       message: rawMessage,
     });
@@ -919,6 +936,8 @@ export interface AcpSessionOptions {
   runId?: string;
   /** `RunOptions.label`, propagated onto emitted events as context. NOT sent on the wire. */
   label?: string;
+  /** `RunOptions.callIndex`, propagated onto emitted events as context. NOT sent on the wire. */
+  callIndex?: number;
   /** CODEX-ONLY session instruction overrides. The backend folds these into session/new `_meta`
    *  (bare keys) for the codex-acp adapter; the Claude backend ignores them. Omitted => unset. */
   baseInstructions?: string;
@@ -1522,6 +1541,7 @@ export class PooledConnection {
       opts.elicitationResolver,
       opts.label,
       opts.runId,
+      opts.callIndex,
       response.modes,
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
@@ -1551,6 +1571,7 @@ export class PooledConnection {
       opts.elicitationResolver,
       opts.label,
       opts.runId,
+      opts.callIndex,
       undefined,
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
@@ -1610,6 +1631,7 @@ export class PooledConnection {
       opts.elicitationResolver,
       opts.label,
       opts.runId,
+      opts.callIndex,
       undefined,
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,

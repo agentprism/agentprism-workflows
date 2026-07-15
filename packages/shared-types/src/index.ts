@@ -6,3 +6,4 @@ export * from "./mcp-config.js"; // McpServerConfig (client-provided MCP servers
 export * from "./agent-runner.js"; // AgentRunner — THE SEAM
 export * from "./meta.js"; // META_KEYS, CODEX_META_KEYS, ClaudeCodeSessionMeta
 export * from "./workflow-result.js"; // WorkflowRunResult, WorkflowCallRecord, RunStatus, WorkflowMeta, TokenUsage, JournalEntry
+export * from "./run-events.js";

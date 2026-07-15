@@ -50,6 +50,8 @@ import type {
   AcpEventListener,
   AcpEventName,
   AcpRunnerEventMap,
+  AcpSessionUpdate,
+  AcpUpdateKind,
   AgentEventPayload,
   AgentUsage,
   AgentRunner,
@@ -82,6 +84,11 @@ import type {
   WorkflowRunFallback,
   WorkflowCheckpointSource,
   WorkflowCheckpointTaken,
+  WorkflowAgentEvent,
+  WorkflowAgentEventName,
+  WorkflowAgentEventPayload,
+  WorkflowAgentEventPayloadMap,
+  WorkflowRunEvent,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -119,6 +126,50 @@ type IsolationTypeSurface = [
   WorkflowCallRecord,
   WorkflowRecordedError,
 ];
+
+type Assert<T extends true> = T;
+type IsNever<T> = [T] extends [never] ? true : false;
+
+type _SessionUpdateExcluded = Assert<IsNever<Extract<WorkflowAgentEventName, "session_update">>>;
+type _AgentEventNamesComplete = Assert<IsNever<Exclude<Exclude<AcpEventName, "session_update">, WorkflowAgentEventName>>>;
+type _AgentEventNamesExact = Assert<IsNever<Exclude<WorkflowAgentEventName, Exclude<AcpEventName, "session_update">>>>;
+type _SpecializedRunEvent = Assert<WorkflowAgentEvent extends Extract<WorkflowRunEvent, { type: "agentEvent" }> ? true : false>;
+type _PayloadMapKeys = Assert<IsNever<Exclude<WorkflowAgentEventName, keyof WorkflowAgentEventPayloadMap>>>;
+type _CompatibilityCatchAll = Assert<AgentEventPayload<"session_update"> extends { name: "session_update" } ? true : false>;
+type _CompatibilityDefault = Assert<AgentEventPayload extends AgentEventPayload<AcpEventName> ? true : false>;
+type _CompatibilityCallIndex = Assert<"callIndex" extends keyof AgentEventPayload<"session_update"> ? true : false>;
+type AgentMessageEnvelopeKeys = Exclude<
+  keyof WorkflowAgentEventPayload<"agent_message_chunk">,
+  "name" | "event"
+>;
+type _AgentMessageEnvelopeComplete = Assert<
+  IsNever<
+    Exclude<
+      "backendId" | "sessionId" | "label" | "runId" | "scope" | "callIndex",
+      AgentMessageEnvelopeKeys
+    >
+  >
+>;
+
+function managerAgentEventOverloadFixture(
+  manager: WorkflowManager,
+  payload: WorkflowAgentEventPayload,
+): void {
+  const listener = (event: WorkflowAgentEventPayload) => {
+    if (event.name === "agent_message_chunk") {
+      const update: AcpRunnerEventMap["agent_message_chunk"] = event.event;
+      void update.content;
+    }
+  };
+  manager.addListener("agentEvent", listener);
+  manager.on("agentEvent", listener);
+  manager.once("agentEvent", listener);
+  manager.removeListener("agentEvent", listener);
+  manager.off("agentEvent", listener);
+  manager.emit("agentEvent", payload);
+  manager.on("host-defined-event", () => {});
+}
+void managerAgentEventOverloadFixture;
 void (undefined as unknown as IsolationTypeSurface);
 
 const mockAnswerSequence: MockAnswerSequence = { $sequence: [{ ok: false }, { ok: true }] };
@@ -279,6 +330,7 @@ class EventedRunner {
       backendId: this.backendId,
       label: options?.label,
       runId: options?.runId,
+      callIndex: options?.callIndex,
     };
   }
 }
@@ -286,6 +338,56 @@ class EventedRunner {
 function eventedAgent(runner: EventedRunner): AgentRunner {
   return runner as unknown as AgentRunner;
 }
+
+const ALL_ACP_UPDATE_KINDS = [
+  "user_message_chunk",
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+  "plan",
+  "plan_update",
+  "plan_removed",
+  "available_commands_update",
+  "current_mode_update",
+  "config_option_update",
+  "session_info_update",
+  "usage_update",
+] as const satisfies readonly AcpUpdateKind[];
+type _AllAcpUpdateKindsComplete = Assert<
+  IsNever<Exclude<AcpUpdateKind, (typeof ALL_ACP_UPDATE_KINDS)[number]>>
+>;
+type ManagerCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;
+const ALL_MANAGER_CROSS_CUTTING_NAMES = [
+  "permission_pending",
+  "permission_request",
+  "elicitation_pending",
+  "elicitation_request",
+  "elicitation_complete",
+  "raw_message",
+  "session_open",
+  "session_close",
+  "backend_error",
+] as const satisfies readonly ManagerCrossCuttingEventName[];
+type _AllManagerCrossCuttingNamesComplete = Assert<
+  IsNever<Exclude<ManagerCrossCuttingEventName, (typeof ALL_MANAGER_CROSS_CUTTING_NAMES)[number]>>
+>;
+
+const ALL_ACP_SESSION_UPDATES: AcpSessionUpdate[] = [
+  { sessionUpdate: "user_message_chunk", content: { type: "text", text: "question" } },
+  { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } },
+  { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thought" } },
+  { sessionUpdate: "tool_call", toolCallId: "tool-1", title: "Read", kind: "read" },
+  { sessionUpdate: "tool_call_update", toolCallId: "tool-1", status: "completed" },
+  { sessionUpdate: "plan", entries: [] },
+  { sessionUpdate: "plan_update", plan: { type: "items", planId: "plan-1", entries: [] } },
+  { sessionUpdate: "plan_removed", planId: "plan-1" },
+  { sessionUpdate: "available_commands_update", availableCommands: [] },
+  { sessionUpdate: "current_mode_update", currentModeId: "default" },
+  { sessionUpdate: "config_option_update", configOptions: [] },
+  { sessionUpdate: "session_info_update", title: "Session" },
+  { sessionUpdate: "usage_update", used: 10, size: 100 },
+];
 
 function deferred() {
   let resolve!: () => void;
@@ -757,14 +859,66 @@ test("WorkflowManager forwards injected runner live ACP events as agentEvent", a
   });
   assert.ok(chunk, "session_update catch-all should forward once as the inner discriminant");
   assert.equal(chunk.runId, result.runId);
+  assert.equal(chunk.scope, result.runId);
+  assert.equal(chunk.callIndex, 0);
   assert.equal(chunk.label, "live-label");
   assert.equal(chunk.sessionId, runner.sessionId);
   assert.equal(chunk.backendId, runner.backendId);
   assert.equal(chunk.event.content.type, "text");
+  assert.equal(chunk.event.callIndex, 0);
   assert.equal(chunk.event.content.type === "text" ? chunk.event.content.text : "", "live");
   assert.equal(runner.listenerCount("session_update"), 1, "constructor bridge survives run settlement");
   manager.dispose();
   assert.equal(runner.listenerCount("session_update"), 0, "dispose removes constructor bridge");
+});
+
+test("WorkflowManager agentEvent union exactly covers every bridged ACP event", () => {
+  const runner = new EventedRunner();
+  const manager = new WorkflowManager({ agent: eventedAgent(runner) });
+  const events: WorkflowAgentEventPayload[] = [];
+  const context: AcpEventContext = {
+    sessionId: "session-exact",
+    backendId: "claude",
+    label: "exact",
+    runId: "run-exact",
+    callIndex: 41,
+  };
+  manager.on("agentEvent", (event) => events.push(event));
+
+  for (const update of ALL_ACP_SESSION_UPDATES) {
+    runner.emit("session_update", { ...context, update });
+  }
+  const crossCuttingEvents: Array<[ManagerCrossCuttingEventName, unknown]> = [
+    ["permission_pending", { ...context, request: {} }],
+    ["permission_request", { ...context, request: {}, outcome: {} }],
+    ["elicitation_pending", { ...context, request: {} }],
+    ["elicitation_request", { ...context, request: {}, outcome: {} }],
+    ["elicitation_complete", { ...context, notification: {} }],
+    ["raw_message", { ...context, method: "vendor/message", message: {} }],
+    ["session_open", context],
+    ["session_close", context],
+    ["backend_error", { backendId: "claude", error: new Error("backend failed") }],
+  ];
+  for (const [name, event] of crossCuttingEvents) runner.emit(name, event as never);
+
+  const expectedNames = [...ALL_ACP_UPDATE_KINDS, ...ALL_MANAGER_CROSS_CUTTING_NAMES];
+  assert.deepEqual(events.map((event) => event.name), expectedNames);
+  assert.equal(events.some((event) => event.name === ("session_update" as WorkflowAgentEventName)), false);
+  for (const event of events) {
+    if (event.name === "backend_error") {
+      assert.equal("sessionId" in event, false);
+      assert.equal("runId" in event, false);
+      assert.equal("scope" in event, false);
+      assert.equal("callIndex" in event, false);
+      continue;
+    }
+    assert.equal(event.sessionId, context.sessionId);
+    assert.equal(event.runId, context.runId);
+    assert.equal(event.scope, context.runId);
+    assert.equal(event.callIndex, context.callIndex);
+    assert.equal(event.event.callIndex, context.callIndex);
+  }
+  manager.dispose();
 });
 
 test("WorkflowManager removes exec runner bridge after runSync settles", async () => {

@@ -75,7 +75,13 @@ test("removeAllListeners clears one event or all", () => {
 function sinkOf(em: TypedEventEmitter<AcpRunnerEventMap>): AcpEventSink {
   return (name, event) => em.emit(name, event);
 }
-const CTX: AcpEventContext = { sessionId: "s1", backendId: "claude", label: "L", runId: "R" };
+const CTX: AcpEventContext = {
+  sessionId: "s1",
+  backendId: "claude",
+  label: "L",
+  runId: "R",
+  callIndex: 7,
+};
 
 test("emitSessionUpdate fans out to the per-discriminant event AND the wildcard, merging context", () => {
   const em = new TypedEventEmitter<AcpRunnerEventMap>();
@@ -87,6 +93,7 @@ test("emitSessionUpdate fans out to the per-discriminant event AND the wildcard,
     assert.equal(e.backendId, "claude");
     assert.equal(e.label, "L");
     assert.equal(e.runId, "R");
+    assert.equal(e.callIndex, 7);
     if (e.content.type === "text") chunks.push(e.content.text);
   });
   em.on("session_update", (e) => wild.push(e.update.sessionUpdate));
