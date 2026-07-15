@@ -1,4 +1,10 @@
 import type { TokenUsage } from "@automatalabs/shared-types";
+import {
+  RESUME_CALL_FAILED_REASONS,
+  RESUME_CALL_LIVE_REASONS,
+  RESUME_DISABLED_REASONS,
+  RESUME_FALLBACK_REASONS,
+} from "@automatalabs/workflows";
 import type { WorkflowRunResult, WorkflowRunStatus } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -55,6 +61,58 @@ const checkpointTakenSchema = z.object({
   source: z.enum(["live", "headless-default", "journal-replay", "injected"]),
 });
 
+const resumeCallDecisionSchema = z.discriminatedUnion("action", [
+  z.object({
+    index: z.number().int().nonnegative(),
+    kind: z.enum(["agent", "checkpoint"]),
+    action: z.literal("replayed"),
+    sourceRunId: z.string(),
+    recordedIndex: z.number().int().nonnegative(),
+    match: z.enum(["path-hash", "unique-hash", "index-hash"]),
+    logicalBudgetDebit: z.number().optional(),
+    checkpointInjected: z.literal(true).optional(),
+  }),
+  z.object({
+    index: z.number().int().nonnegative(),
+    kind: z.enum(["agent", "checkpoint"]),
+    action: z.literal("live"),
+    reason: z.enum(RESUME_CALL_LIVE_REASONS),
+  }),
+  z.object({
+    index: z.number().int().nonnegative(),
+    kind: z.enum(["agent", "checkpoint"]),
+    action: z.literal("failed"),
+    reason: z.enum(RESUME_CALL_FAILED_REASONS),
+  }),
+]);
+
+const resumeReportBaseShape = {
+  sourceRunId: z.string(),
+  requestedPolicy: z.enum(["auto", "positional"]),
+  replayed: z.number().int().nonnegative(),
+  live: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+  calls: z.array(resumeCallDecisionSchema),
+} as const;
+
+const resumeReportSchema = z.discriminatedUnion("strategy", [
+  z.object({
+    ...resumeReportBaseShape,
+    strategy: z.literal("identity-v1"),
+  }),
+  z.object({
+    ...resumeReportBaseShape,
+    strategy: z.literal("positional-v1"),
+    fallbackReason: z.enum(RESUME_FALLBACK_REASONS),
+    eligibility: z.enum(["legacy", "safe-prefix", "all-live"]),
+  }),
+  z.object({
+    ...resumeReportBaseShape,
+    strategy: z.literal("live"),
+    disabledReason: z.enum(RESUME_DISABLED_REASONS),
+  }),
+]);
+
 const executionResultSchema = z.object({
   runId: z.string(),
   status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
@@ -66,6 +124,7 @@ const executionResultSchema = z.object({
   checkpointContext: checkpointContextSchema.optional(),
   fallbacks: z.array(fallbackSchema).optional(),
   checkpointsTaken: z.array(checkpointTakenSchema).optional(),
+  resumeReport: resumeReportSchema.optional(),
 });
 
 /** Common MCP output schema for legacy execution results and exact inspection statuses. */
@@ -79,6 +138,7 @@ export const workflowToolOutputShape = {
   checkpointContext: checkpointContextSchema.optional(),
   fallbacks: z.array(fallbackSchema).optional(),
   checkpointsTaken: z.array(checkpointTakenSchema).optional(),
+  resumeReport: resumeReportSchema.optional(),
   workflowName: z.string().optional(),
   phases: z.array(z.string()).optional(),
   currentPhase: z.string().optional(),
@@ -141,6 +201,7 @@ export interface WorkflowExecutionToolResult<T = unknown> {
   checkpointContext?: WorkflowRunResult["checkpointContext"];
   fallbacks?: WorkflowRunResult["fallbacks"];
   checkpointsTaken?: WorkflowRunResult["checkpointsTaken"];
+  resumeReport?: WorkflowRunResult["resumeReport"];
 }
 
 export interface WorkflowBackgroundAccepted {
@@ -180,5 +241,6 @@ export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExec
     checkpointContext: run.checkpointContext,
     ...(run.fallbacks === undefined ? {} : { fallbacks: run.fallbacks }),
     ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
+    ...(run.resumeReport === undefined ? {} : { resumeReport: run.resumeReport }),
   };
 }

@@ -647,6 +647,7 @@ test("background checkpoints stay headless despite elicitation capability and au
 
 test("MCP multi-hop background resume preserves all eleven agents under each new run ID and await is read-only", async () => {
   let calls = 0;
+  let terminalRunId = "";
   const runner = makeRunner((prompt) => {
     calls++;
     return `answer:${prompt}`;
@@ -655,7 +656,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
   const script = [
     'export const meta = { name: "mcp-multi-hop", description: "multi hop" };',
     'const values = [];',
-    'for (let i = 0; i < args.count; i++) values.push(await agent(`call-${i}`, { label: `call-${i}` }));',
+    'for (let i = 0; i < args.count; i++) values.push(await agent(`call-${i}`, { label: `call-${i}`, resume: { filesystem: "read-only" } }));',
     'if (args.pause) values.push(await checkpoint("ship?", { headless: "pause" }));',
     "return values;",
   ].join("\n");
@@ -684,6 +685,11 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     });
     assert.equal(structured(secondAwait)?.status, "paused");
     assert.equal(calls, 11, "only call ten executes live in the background child");
+    const secondReport = field(structured(secondAwait)?.outcome, "resumeReport");
+    assert.equal(field(secondReport, "strategy"), "identity-v1");
+    assert.equal(field(secondReport, "replayed"), 10);
+    assert.equal(field(secondReport, "live"), 2);
+    assert.match(textOf(secondAwait), /^resume: identity-v1, 10 replayed, 2 live, 0 failed$/m);
     const repeated = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: secondId, waitMs: 0 },
@@ -713,6 +719,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
       },
     });
     const thirdId = runIdOf(thirdAccepted);
+    terminalRunId = thirdId;
     assert.notEqual(thirdId, sourceId);
     assert.notEqual(thirdId, secondId);
     const thirdAwait = await client.callTool({
@@ -721,9 +728,36 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     });
     assert.equal(structured(thirdAwait)?.status, "completed");
     assert.equal(calls, 11, "the third run replays zero through ten and the synthetic checkpoint");
+    const thirdReport = field(structured(thirdAwait)?.outcome, "resumeReport");
+    assert.equal(field(thirdReport, "strategy"), "identity-v1");
+    assert.equal(field(thirdReport, "replayed"), 12);
+    assert.equal(field(thirdReport, "live"), 0);
+    assert.match(textOf(thirdAwait), /^resume: identity-v1, 12 replayed, 0 live, 0 failed$/m);
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: thirdId },
+    });
+    assert.equal(Object.hasOwn(structured(inspected) ?? {}, "resumeReport"), false);
+    assert.doesNotMatch(textOf(inspected), /resume:/);
     assert.equal(existsSync(lock), false, "await did not acquire the paused run's lease");
   } finally {
     await dispose();
+  }
+
+  const cold = await connect(makeRunner(() => assert.fail("a terminal await must not execute agents")), {
+    listTools: true,
+  });
+  try {
+    const persisted = await cold.client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId: terminalRunId, waitMs: 0 },
+    });
+    const persistedReport = field(structured(persisted)?.outcome, "resumeReport");
+    assert.equal(field(persistedReport, "strategy"), "identity-v1");
+    assert.equal(field(persistedReport, "replayed"), 12);
+    assert.match(textOf(persisted), /^resume: identity-v1, 12 replayed, 0 live, 0 failed$/m);
+  } finally {
+    await cold.dispose();
   }
 });
 
@@ -733,7 +767,7 @@ test("stale running persistence recovers to paused and resumes from its journal"
     sourceCalls++;
     return "cached";
   }));
-  const script = 'export const meta = { name: "stale", description: "stale" }; return await agent("cached");';
+  const script = 'export const meta = { name: "stale", description: "stale" }; return await agent("cached", { resume: { filesystem: "read-only" } });';
   const source = await first.client.callTool({ name: "workflow", arguments: { script } });
   const sourceId = runIdOf(source);
   await first.dispose();
@@ -744,6 +778,14 @@ test("stale running persistence recovers to paused and resumes from its journal"
   const staleId = `stale-${Date.now().toString(36)}`;
   state.runId = staleId;
   state.status = "running";
+  state.journal = (state.journal as Array<Record<string, unknown>> | undefined)?.map((entry) => ({
+    ...entry,
+    scope: staleId,
+  }));
+  state.calls = (state.calls as Array<Record<string, unknown>> | undefined)?.map((call) => ({
+    ...call,
+    scope: staleId,
+  }));
   delete state.result;
   delete state.completedAt;
   const staleFile = join(dirname(sourceFile), `${staleId}.json`);

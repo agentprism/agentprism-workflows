@@ -7,7 +7,13 @@ import { z } from "zod";
 
 const checkpointRepliesSchema = z
   .record(
-    z.string().regex(/^(0|[1-9]\d*)$/, "checkpoint reply keys must be non-negative integer call indexes"),
+    z.string().refine(
+      (key) => {
+        const callIndex = Number(key);
+        return Number.isSafeInteger(callIndex) && callIndex >= 0 && String(callIndex) === key;
+      },
+      "checkpoint reply keys must be canonical non-negative safe integer call indexes",
+    ),
     z.unknown(),
   )
   .transform(
@@ -65,10 +71,15 @@ export const workflowToolInputShape = {
     .describe("Hard total-token budget for the whole run. Omit/null for no limit."),
   resumeFromRunId: z
     .string()
+    .min(1)
     .optional()
     .describe(
-      "Start a new run using the persisted journal identified by this run ID. Resume rule: args changes don't invalidate the journal; prompt changes cache-miss from the first changed call. Re-send the script and desired args; the longest unchanged call prefix replays at zero token cost, and the first changed or new call plus its suffix runs live. If the run ID is empty or not found in this project namespace, execution starts fresh.",
+      "Start a new run from this persisted source run. The manager validates replay eligibility and runs live wherever reuse is uncertain. The source ID must exist in this project namespace.",
     ),
+  resumePolicy: z
+    .enum(["auto", "positional"])
+    .optional()
+    .describe('Resume matching policy. Default "auto"; requires resumeFromRunId.'),
   checkpointReplies: checkpointRepliesSchema
     .optional()
     .describe("With resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),
@@ -110,6 +121,7 @@ export interface WorkflowExecuteToolInput {
   agentTimeoutMs?: number | null;
   tokenBudget?: number | null;
   resumeFromRunId?: string;
+  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   /** Default false. True acknowledges after admission and executes in this server process. */
   background?: boolean;
@@ -126,6 +138,9 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   script?: never;
   background?: never;
   waitMs?: never;
+  resumeFromRunId?: never;
+  resumePolicy?: never;
+  checkpointReplies?: never;
 }
 
 export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
@@ -136,6 +151,7 @@ export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   script?: never;
   background?: never;
   resumeFromRunId?: never;
+  resumePolicy?: never;
   checkpointReplies?: never;
 }
 
@@ -151,6 +167,7 @@ interface RawWorkflowToolInput {
   agentTimeoutMs?: number | null;
   tokenBudget?: number | null;
   resumeFromRunId?: string;
+  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
   runId?: string;
@@ -177,6 +194,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
       raw.agentTimeoutMs !== undefined ||
       raw.tokenBudget !== undefined ||
       raw.resumeFromRunId !== undefined ||
+      raw.resumePolicy !== undefined ||
       raw.checkpointReplies !== undefined ||
       raw.background !== undefined ||
       raw.waitMs !== undefined
@@ -203,6 +221,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
       raw.agentTimeoutMs !== undefined ||
       raw.tokenBudget !== undefined ||
       raw.resumeFromRunId !== undefined ||
+      raw.resumePolicy !== undefined ||
       raw.checkpointReplies !== undefined ||
       raw.background !== undefined
     ) {
@@ -228,6 +247,12 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
     invalid("run inputs cannot include inspection fields");
   }
   if (!raw.script) invalid(raw.action === "run" ? 'action="run" requires script' : "script or an explicit action is required");
+  if (raw.resumePolicy !== undefined && raw.resumeFromRunId === undefined) {
+    invalid("resumePolicy requires resumeFromRunId");
+  }
+  if (raw.checkpointReplies !== undefined && raw.resumeFromRunId === undefined) {
+    invalid("checkpointReplies requires resumeFromRunId");
+  }
   return {
     action: raw.action,
     script: raw.script,
@@ -238,6 +263,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
     agentTimeoutMs: raw.agentTimeoutMs,
     tokenBudget: raw.tokenBudget,
     resumeFromRunId: raw.resumeFromRunId,
+    resumePolicy: raw.resumePolicy,
     checkpointReplies: raw.checkpointReplies,
     background: raw.background ?? false,
   };

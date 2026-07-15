@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { connect, okRunner, structured, textOf } from "./_harness.js";
+import { connect, countingRunner, okRunner, structured, textOf } from "./_harness.js";
 
 function field(value: unknown, key: string): unknown {
   return value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
@@ -46,6 +46,9 @@ test("non-elicitation client receives checkpointContext and resumes with checkpo
     assert.equal(second.isError, false);
     assert.equal(completed?.status, "completed");
     assert.equal(field(completed?.result, "decision"), "ship");
+    assert.equal(field(completed?.resumeReport, "strategy"), "identity-v1");
+    assert.equal(field(completed?.resumeReport, "replayed"), 1);
+    assert.match(textOf(second), /^resume: identity-v1, 1 replayed, 0 live, 0 failed$/m);
 
     // The resumed call has its own run id. Its final persisted journal must retain the
     // synthetic checkpoint reply, so another cold replay needs neither replies nor elicitation.
@@ -57,6 +60,62 @@ test("non-elicitation client receives checkpointContext and resumes with checkpo
     assert.equal(third.isError, false);
     assert.equal(replayed?.status, "completed");
     assert.equal(field(replayed?.result, "decision"), "ship");
+    assert.equal(field(replayed?.resumeReport, "replayed"), 1);
+  } finally {
+    await dispose();
+  }
+});
+
+test("checkpoint replies stay keyed to the source index when an inserted call shifts the checkpoint", async () => {
+  const sourceScript = `export const meta = { name: 'shifted-checkpoint', description: 'source-index reply' }
+await agent('stable', { label: 'stable', resume: { filesystem: 'read-only' } })
+const decision = await checkpoint('Ship release?', { headless: 'pause', default: false })
+return { decision }`;
+  const shiftedScript = `export const meta = { name: 'shifted-checkpoint', description: 'source-index reply' }
+await agent('inserted', { label: 'inserted', resume: { filesystem: 'read-only' } })
+await agent('stable', { label: 'stable', resume: { filesystem: 'read-only' } })
+const decision = await checkpoint('Ship release?', { headless: 'pause', default: false })
+return { decision }`;
+  const { runner, calls } = countingRunner();
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const first = await client.callTool({ name: "workflow", arguments: { script: sourceScript } });
+    const paused = structured(first);
+    assert.equal(paused?.status, "paused");
+    assert.equal(field(paused?.checkpointContext, "callIndex"), 1);
+    assert.equal(calls(), 1);
+
+    const second = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: shiftedScript,
+        resumeFromRunId: String(paused?.runId),
+        checkpointReplies: { "1": true },
+      },
+    });
+    const completed = structured(second);
+    assert.equal(second.isError, false);
+    assert.equal(completed?.status, "completed");
+    assert.equal(field(completed?.result, "decision"), true);
+    assert.equal(calls(), 2, "only the inserted agent runs live; the moved stable call replays");
+    const reportCalls = field(completed?.resumeReport, "calls") as Array<Record<string, unknown>>;
+    assert.deepEqual(reportCalls.map((call) => [call.index, call.action]), [
+      [0, "live"],
+      [1, "replayed"],
+      [2, "replayed"],
+    ]);
+    assert.deepEqual(reportCalls[2], {
+      index: 2,
+      kind: "checkpoint",
+      action: "replayed",
+      sourceRunId: String(paused?.runId),
+      recordedIndex: 1,
+      match: "unique-hash",
+      checkpointInjected: true,
+    });
+    assert.deepEqual(completed?.checkpointsTaken, [
+      { callIndex: 2, kind: "confirm", decision: true, source: "injected" },
+    ]);
   } finally {
     await dispose();
   }
