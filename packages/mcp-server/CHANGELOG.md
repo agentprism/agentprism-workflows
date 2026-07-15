@@ -1,5 +1,19 @@
 # @automatalabs/mcp-server
 
+## 0.11.7
+
+### Patch Changes
+
+- f93fcf3: Tail durable event logs for bounded background awaits and emit monotonic coarse phase and distinct
+  started/ended-call progress when the await request carries a progress token. Background-start
+  requests still return without an enduring progress channel or any notification after return, and
+  legacy/inconsistent-log polling fallback emits no progress notifications. Tool schemas are
+  unchanged; refresh the bundled workflow-authoring prompt and host guidance accordingly.
+- Updated dependencies [f93fcf3]
+- Updated dependencies [f93fcf3]
+  - @automatalabs/shared-types@0.22.0
+  - @automatalabs/workflows@0.34.0
+
 ## 0.11.6
 
 ### Patch Changes
