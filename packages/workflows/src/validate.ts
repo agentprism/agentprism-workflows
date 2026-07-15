@@ -1,10 +1,10 @@
 // Token-free validation for workflow scripts: a static parse (meta literal, syntax,
-// determinism blocklist) followed by an optional DRY RUN — the script executes for real
-// in the engine's deterministic realm, but every agent() call is served by an in-process
-// mock AgentRunner that fabricates schema-conforming results. Afterward, each routed ACP harness
-// is opened once without a prompt to read its advertised config options. No tokens are spent, a
-// mock live confirm resolves checkpoints to their declared defaults, and run state is journaled
-// nowhere (journaling off + a throwaway persistence root for the run lease).
+// direct nondeterministic call expressions) followed by an optional DRY RUN — the script
+// executes for real in the engine's deterministic realm, but every agent() call is served by
+// an in-process mock AgentRunner that fabricates schema-conforming results. Afterward, each
+// routed ACP harness is opened once without a prompt to read its advertised config options.
+// No tokens are spent, a mock live confirm resolves checkpoints to their declared defaults,
+// and run state is journaled nowhere (journaling off + a throwaway persistence root for the run lease).
 //
 // This is the programmatic core behind `agentprism-workflows validate` (see ./cli.ts).
 

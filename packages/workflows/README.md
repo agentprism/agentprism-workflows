@@ -494,11 +494,11 @@ The package ships a bin that validates a workflow script **without spending toke
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 ```
 
-Three passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), then a
-**dry run** — the script executes in the real engine realm while every `agent()` call is served
-by an in-process mock `AgentRunner` that fabricates schema-conforming results. The dry run
-catches what a parse can't: thunk-vs-promise mistakes, reference errors, broken plumbing between
-calls. Finally, validation opens one no-prompt session on every distinct routed ACP harness,
+Three passes: a **static parse** (the `meta` literal, syntax, and direct nondeterministic call
+expressions), then a **dry run** — the script executes in the real engine realm while every
+`agent()` call is served by an in-process mock `AgentRunner` that fabricates schema-conforming
+results. The dry run catches what a parse can't: thunk-vs-promise mistakes, reference errors,
+broken plumbing between calls. Finally, validation opens one no-prompt session on every distinct routed ACP harness,
 surfaces the complete advertised config-option catalog, and checks every authored `configOptions`
 bag against it. This probe uses zero tokens. A harness that cannot spawn, authenticate, or open a
 session contributes one warning and `probed:false`; only that harness's option checks are skipped,
