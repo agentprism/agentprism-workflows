@@ -1,5 +1,18 @@
 # @automatalabs/workflows
 
+## 0.33.0
+
+### Minor Changes
+
+- 805b51f: Replace shared error-message matching with adapter-owned structured provider-limit classification, carry typed reset metadata through workflow errors and the top-level SDK, and reserve abort classification for structured cancellation. Closes #149.
+
+### Patch Changes
+
+- Updated dependencies [805b51f]
+  - @automatalabs/shared-types@0.21.0
+  - @automatalabs/acp-agents@0.27.0
+  - @automatalabs/workflow-engine@0.22.0
+
 ## 0.32.1
 
 ### Patch Changes
