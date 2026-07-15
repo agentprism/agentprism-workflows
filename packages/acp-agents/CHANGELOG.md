@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.27.1
+
+### Patch Changes
+
+- 0ff724b: Bump `@automatalabs/codex-acp` to 1.6.4 (upstream sync: plan and goal command actions merged into the fork).
+
 ## 0.27.0
 
 ### Minor Changes
