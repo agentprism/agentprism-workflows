@@ -15,6 +15,7 @@ and [`docs/design-notes.md`](docs/design-notes.md) for what already exists.
 | Status | Meaning |
 | --- | --- |
 | **implementing** | Contract frozen; staged implementation is landing |
+| **implemented-by-this-contract** | The linked frozen contract is implemented; retained here for design provenance until release notes replace the row |
 | **next** | Actively being scoped; expected to be the next major work |
 | **designed** | Design settled and recorded; awaiting build slot |
 | **exploring** | Direction chosen; design still open |
@@ -25,7 +26,7 @@ and [`docs/design-notes.md`](docs/design-notes.md) for what already exists.
 | Item | Status | One-liner |
 | --- | --- | --- |
 | [Run events: typed contract & durable event log](docs/roadmap/run-events.md) | implementing | Frozen contract: typed `RunEvent` payloads, direct ACP call correlation, and a generation-pinned append-only tail are landing in staged PRs |
-| [Content-addressed incremental resume](docs/roadmap/incremental-resume.md) | next | Generalize identity-keyed replay into mainline resume so unchanged calls replay regardless of where an edit landed, instead of the longest-unchanged-prefix rule |
+| [Content-addressed incremental resume](docs/roadmap/incremental-resume.md) | **implemented-by-this-contract** | Identity-v1 mainline resume now reuses uniquely matched safety-proved calls, with terminal-environment admission and fail-to-live fallback |
 | [Remote execution & the runner gateway](docs/roadmap/remote-execution.md) | next | Drive ACP agents over WebSocket instead of stdio subprocesses; a runner gateway that exposes any ACP agent server remotely |
 | [Evals (`agentprism-evals`)](docs/roadmap/evals.md) | next | Substitution-testing substrate shipped (isolation runner, call manifest, per-call usage — workflow-engine 0.20.0); next: the evals harness itself — scoring, repetition, vitest-evals integration, report UX |
 | [Workspace model](docs/roadmap/workspace-model.md) | designed | Any folder is a workspace; snapshot via namespaced refs without polluting existing repos; workflows associated, never checked in uninvited |

@@ -33,11 +33,27 @@ The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a
 
 ### Durable runs — resume without re-spending tokens
 
-Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. Kill the process mid-run — crash, deploy, Ctrl-C — and `resume()` replays the completed prefix from the journal as cache-hits (**zero tokens**), then executes only the steps that never ran. Provider quota walls don't fail the run either: it **pauses** with the provider's reset hint and resumes after the budget refills.
+Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution can replay unchanged, explicitly safe calls even after insertions or reordering; ambiguous, unsafe, or environment-mismatched calls run live. Provider quota walls don't fail the run either: the run **pauses** with the provider's reset hint and can continue from its durable journal.
 
-> **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
+> **Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.
 >
-> `args` is not itself part of an `agent()` call's replay hash. New args can raise an orchestration-only loop cap while earlier calls keep replaying for zero tokens. If the new args change a prompt or another hashed identity field, replay stops at the first affected call and that call plus every later call runs live. The hashed identity is the prompt, resolved model, mode when set, `configOptions` when non-empty, tier, phase, agent type and resolved agent definition, and schema. `configOptions` keys are sorted in the identity; an omitted or empty bag keeps existing journal bytes unchanged. `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` do not invalidate a cached call; changed values apply only to calls that run live.
+> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls and their content-dependent descendants miss. New-format reuse also requires exact cwd/runtime/terminal-workspace admission and `resume: { filesystem: "read-only" }` safety on source and current agents. Identity hits preserve logical budget debit but spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, checkpoints, and filesystem boundaries.
+
+Compact read-only/worktree fan-out:
+
+```js
+const [audit, experiment] = await parallel([
+  () => agent("Audit src/api without changing files.", {
+    label: "audit:api", resume: { filesystem: "read-only" },
+  }),
+  () => agent("Try the worker fix in isolation; return a unified diff.", {
+    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+  }),
+]);
+```
+
+The worktree's edits are discarded; return them as data. Worktree isolation without the explicit
+declaration is not replay-safe.
 
 ### Structured output as validated objects
 
@@ -241,7 +257,8 @@ From a source checkout, point at the built entry instead:
 | `agentTimeoutMs` | number \| null | Per-agent timeout; omit for none. |
 | `tokenBudget` | number \| null | Hard total-token cap for the run; omit for none. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
-| `checkpointReplies` | object | With `resumeFromRunId`, map a paused `checkpointContext.callIndex` to its decision. JSON string keys are accepted and coerced to numbers. |
+| `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format safety/environment gates. Requires `resumeFromRunId`. |
+| `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
 | `runId` | string | Required for inspect/await; the project-scoped run capability returned by execution. |
 | `waitMs` | integer | Await only: default 20,000, range 0–25,000; zero is a non-blocking status read. |
 | `lastN` | integer | Inspect/await: latest matching calls, default 20, range 1–50. |
@@ -289,7 +306,7 @@ for (let i = 0; i < maxRounds; i += 1) {
   rounds.push(
     await agent(
       `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
-      { label: `review:${i + 1}`, phase: "Review" },
+      { label: `review:${i + 1}`, phase: "Review", resume: { filesystem: "read-only" } },
     ),
   );
 }
@@ -298,7 +315,7 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `workflow` again with the same script, `args: { "maxRounds": 8 }`, and that ID as `resumeFromRunId`. Rounds 1–6 rebuild the same prompts and replay from the journal at zero token cost; only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` there would change round 1's prompt and make all eight rounds run live.
+Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `workflow` again with the same script, `args: { "maxRounds": 8 }`, and that ID as `resumeFromRunId`. Rounds 1–6 rebuild the same safe identities and replay with zero current provider tokens; only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` into every prompt would change all eight identities and make all eight calls live.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, inspect its safe log and
 call tail:
@@ -319,7 +336,7 @@ The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts a
 
 A script is plain JavaScript whose **first statement** is the `meta` literal. Inside it, these globals are available (injected into the run's realm — they are not importable functions; `@automatalabs/workflows` ships an ambient `.d.ts` so your editor knows them):
 
-- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`. (`configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
+- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `resume`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`. (`resume: { filesystem: "read-only" }` is the explicit content-addressed replay safety contract; `configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
 - `parallel([fn, …])` — run thunks concurrently; **barrier** (awaits all).
 - `pipeline(items, stage1, stage2, …)` — stream each item through stages independently (no inter-stage barrier).
 - `phase(title)`, `log(msg)` — progress grouping + narration.
@@ -327,7 +344,7 @@ A script is plain JavaScript whose **first statement** is the `meta` literal. In
 - `gate(produce, validate, opts?)` — returns `{ ok, value, verdict, attempts }`: `value` is the final producer result and `verdict` is the exact last validator return.
 - `checkpoint()`, `verify()`, `judgePanel()`, `loopUntilDry()`, `completenessCheck()`, `retry()`, `workflow()`, `args`.
 
-Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so a killed run **resumes** from its journal with a cache-hit on the unchanged prefix.
+Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so replay identities and input fingerprints are reproducible. Eligible new-format calls match by exact path/hash or unique content; uncertain correspondence runs live.
 
 > **Writing scripts with an AI agent?** This repo publishes a backend-agnostic authoring skill —
 > [`skills/agentprism-workflow-authoring`](skills/agentprism-workflow-authoring/SKILL.md) — in the standard

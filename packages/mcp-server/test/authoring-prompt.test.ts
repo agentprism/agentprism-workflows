@@ -25,13 +25,20 @@ test("generated authoring-prompt distinguishes background start from awaited pro
   assert.ok(!AUTHORING_PROMPT_CONTENT.includes("It has no progress token or live checkpoint elicitation"));
 });
 
-test("generated authoring-prompt teaches changed-args resume semantics", () => {
+test("generated authoring-prompt teaches fail-to-live identity resume semantics", () => {
   assert.ok(
     AUTHORING_PROMPT_CONTENT.includes(
-      "**Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.",
+      "**Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.",
     ),
   );
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("resolved agent definition"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('resume: { filesystem: "read-only" }'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('replay as `"unique-hash"`'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Source headless decisions always execute fresh."));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("keys always name the checkpoint index in the source run"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('resumePolicy: "positional"'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('source-wide `"manifest-invalid"`'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("A Node or V8 upgrade"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 6'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 8'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
