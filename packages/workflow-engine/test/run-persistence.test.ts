@@ -248,6 +248,110 @@ test(
 );
 
 test(
+  "pre-contract run fixture loads, lists, and resumes with additive fields absent",
+  withTempCwd(async (cwd) => {
+    const persistenceRoot = mkdtempSync(join(tmpdir(), "ap-dw-old-fixture-"));
+    try {
+      const fixture = JSON.parse(
+        readFileSync(join(import.meta.dirname, "fixtures", "pre-contract-run.json"), "utf8"),
+      ) as PersistedRunState;
+      const persistence = createRunPersistence(cwd, undefined, { persistenceRoot });
+      persistence.save(fixture);
+      const loaded = persistence.load(fixture.runId);
+      assert.equal(loaded?.calls, undefined);
+      assert.equal(loaded?.limits, undefined);
+      assert.equal(loaded?.runtime, undefined);
+      assert.equal(persistence.list().some((run) => run.runId === fixture.runId), true);
+
+      const manager = new WorkflowManager({
+        cwd,
+        persistenceRoot,
+        agent: { async run() { return "fresh"; } },
+      });
+      const resumed = await manager.resumeInBackground(fixture.runId);
+      assert.equal(resumed.accepted, true);
+      if (!resumed.accepted) assert.fail("old fixture remains resumable");
+      const result = await resumed.promise;
+      assert.equal(result.status, "completed");
+      assert.equal(result.result, "fresh");
+      assert.equal(persistence.load(fixture.runId)?.legacyResume, true);
+    } finally {
+      rmSync(persistenceRoot, { recursive: true, force: true });
+    }
+  }),
+);
+
+test(
+  "run persistence round-trips every PR3 run and agent field",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const state: PersistedRunState = {
+      runId: "pr3-parity",
+      workflowName: "parity",
+      script: "export const meta = { name: 'parity', description: 'parity' }\nreturn 1",
+      args: { input: true },
+      argsUnreplayable: true,
+      cwd: "/override",
+      effectiveCwd: "/effective",
+      runtime: { node: "v24.1.0", v8: "13.6.1", pathFormat: 1, inputsFormat: 1 },
+      environment: { key: "environment" },
+      status: "completed",
+      phases: [],
+      agents: [
+        {
+          id: 1,
+          label: "agent",
+          prompt: "prompt",
+          status: "done",
+          resultPreview: "result",
+          tokens: 5,
+          callIndex: 0,
+          scope: "pr3-parity",
+          usage: { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0.1 },
+          provenance: { source: "live", overrideModel: "candidate" },
+        },
+      ],
+      logs: [],
+      journal: [
+        {
+          index: 0,
+          hash: "hash",
+          result: "result",
+          kind: "agent",
+          usage: { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0.1 },
+          scope: "pr3-parity",
+        },
+      ],
+      calls: [
+        {
+          index: 0,
+          kind: "agent",
+          hash: "hash",
+          outcome: "result",
+          origin: "runner",
+          attempts: 1,
+          budgetDebit: 5,
+          settlementOrdinal: 1,
+          scope: "pr3-parity",
+        },
+      ],
+      callsAllocated: 1,
+      limits: { maxAgents: 10, tokenBudget: null, concurrency: 2, agentRetries: 1, agentTimeoutMs: null },
+      abortSignaled: true,
+      mainModel: "provider/model",
+      agentsDir: "/agents",
+      nestedWorkflows: true,
+      legacyResume: true,
+      executionMode: { kind: "isolation", baselineRunId: "baseline" },
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    persistence.save(state);
+    assert.deepEqual(persistence.load(state.runId), state);
+  }),
+);
+
+test(
   "WorkflowManager can use an injected persistence implementation for run state",
   withTempCwd(async (cwd) => {
     const store = memoryPersistence();

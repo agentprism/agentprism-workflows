@@ -13,6 +13,7 @@ import {
   WorkflowErrorCode,
   type AuthErrorContext,
   type CheckpointContext,
+  type WorkflowRecordedError,
 } from "../src/errors.js";
 
 describe("classifyProviderLimit", () => {
@@ -156,6 +157,45 @@ describe("WorkflowError.checkpointContext", () => {
 });
 
 describe("WorkflowError", () => {
+  it("exposes the isolation recording and replay error codes as stable wire literals", () => {
+    assert.equal(WorkflowErrorCode.RECORDING_UNUSABLE, "RECORDING_UNUSABLE");
+    assert.equal(WorkflowErrorCode.REPLAY_TARGET_INVALID, "REPLAY_TARGET_INVALID");
+    assert.equal(WorkflowErrorCode.REPLAY_DIVERGENCE, "REPLAY_DIVERGENCE");
+  });
+
+  it("types each strict-JSON recorded-error projection form", () => {
+    const projections: WorkflowRecordedError[] = [
+      {
+        form: "workflow-error",
+        message: "recording is incomplete",
+        code: WorkflowErrorCode.RECORDING_UNUSABLE,
+        recoverable: false,
+        agentLabel: "researcher",
+        details: { reason: "incomplete-manifest", indexes: [2] },
+        resetHint: "record again",
+        authContext: { backendId: "codex", methods: [] },
+        checkpointContext: {
+          callIndex: 2,
+          hash: "abc123",
+          prompt: "Continue?",
+          kind: "confirm",
+        },
+      },
+      {
+        form: "error",
+        name: "RouteError",
+        message: "route failed",
+        props: { route: "codex" },
+      },
+      { form: "value", value: { stopped: true }, lossy: false },
+    ];
+
+    assert.deepEqual(
+      projections.map((projection) => projection.form),
+      ["workflow-error", "error", "value"],
+    );
+  });
+
   it("captures code, recoverable, resetHint, agentLabel, and details from options", () => {
     const e = new WorkflowError("Codex usage limit reached. Resets in ~3h.", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
       recoverable: false,

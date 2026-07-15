@@ -11,6 +11,7 @@ export {
   type WorkflowAgentOptions,
   type AgentOptions,
   type CheckpointOptions,
+  type CheckpointCallContext,
   type SharedRuntime,
 } from "./workflow.js";
 
@@ -32,6 +33,24 @@ export {
   type FsLayer,
   type RunPersistenceOptions,
 } from "./run-persistence.js";
+
+// ── Isolation mode ──
+export {
+  runIsolation,
+  createReplayRunner,
+  RECORDING_UNUSABLE_REASONS,
+  REPLAY_DIVERGENCE_KINDS,
+  type RunIsolationOptions,
+  type IsolationRunResult,
+  type ReplayRunnerOptions,
+  type ResolvedIsolationTarget,
+  type IsolationTarget,
+  type ReplayRunner,
+  type ReplayObservation,
+  type ReplayReport,
+  type ReplayCallReport,
+  type ReplayDivergenceEvent,
+} from "./isolation.js";
 
 // ── Errors: the shared seam contract (re-exported) + engine-local helpers ──
 export {
@@ -149,12 +168,15 @@ export type {
   AgentRunOptions,
   AgentRunResult,
   AgentUsage,
+  AgentResultProvenance,
   AgentHistoryEntry,
   WorkflowMeta,
   WorkflowMetaPhase,
   JournalEntry,
   JournalCallMetadata,
+  WorkflowCallRecord,
   WorkflowLogTail,
+  WorkflowRecordedError,
   WorkflowRunCallStatus,
   WorkflowRunInspectionOptions,
   WorkflowRunStatus,

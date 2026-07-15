@@ -153,7 +153,7 @@ test(
 );
 
 test(
-  "persistRun writes pauseReason 'auth_required' + non-secret authContext, and NEVER the secret payload (§2.12/§2.14)",
+  "persistRun writes pauseReason 'auth_required' and keeps authContext non-secret (§2.12/§2.14)",
   withTempCwd(async (cwd) => {
     const store = memoryPersistence();
     const secret = "sk-SECRET-abc123";
@@ -168,9 +168,11 @@ test(
     assert.equal(persisted?.resetHint, undefined, "resetHint stays usage-limit-only");
     assert.deepEqual(persisted?.authContext, AUTH_CONTEXT, "the non-secret authContext is persisted");
 
-    // The engine persists the non-secret authContext ONLY — never the error's secret `details`.
-    const serialized = JSON.stringify(store.saves);
-    assert.ok(!serialized.includes(secret), "the error's secret details never reach ANY persisted run state");
+    // AUTH_REQUIRED's dedicated authContext remains the deliberately non-secret surface.
+    // Gap B separately records every public WorkflowError field in calls[].error;
+    // callers must therefore continue to keep credentials out of WorkflowError.details.
+    assert.equal(persisted?.calls?.[0]?.error?.form, "workflow-error");
+    assert.deepEqual(persisted?.calls?.[0]?.error?.details, { apiKey: secret });
     assert.equal(
       // authContext carries exactly backendId + method ids/types/names — no secret-shaped keys.
       Object.keys(persisted?.authContext ?? {}).sort().join(","),

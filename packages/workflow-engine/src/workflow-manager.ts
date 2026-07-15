@@ -17,6 +17,7 @@ import type {
   JournalEntry,
   TokenUsage,
   WorkflowBackendConfig,
+  WorkflowCallRecord,
   WorkflowCheckpointTaken,
   WorkflowMeta,
   WorkflowRunFallback,
@@ -26,6 +27,7 @@ import type {
 } from "@automatalabs/shared-types";
 import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { captureRunEnvironment, type RunEnvironmentIdentity } from "./run-environment.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -35,7 +37,16 @@ import {
   type RunStatus,
 } from "./run-persistence.js";
 import { workflowHomeDir } from "./workflow-paths.js";
-import { type EngineRunResult, parseWorkflowScript, runWorkflow } from "./workflow.js";
+import { cloneFrozenStrictJson, cloneStrictJsonValue, deepFreeze } from "./strict-json.js";
+import {
+  CALL_INPUTS_FORMAT,
+  CALL_PATH_FORMAT,
+  type CheckpointCallContext,
+  type CheckpointOptions,
+  type EngineRunResult,
+  parseWorkflowScript,
+  runWorkflow,
+} from "./workflow.js";
 import { createWorkflowLogTail, projectWorkflowRunStatus } from "./run-observability.js";
 
 export interface ManagedRun {
@@ -50,6 +61,9 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   args?: unknown;
+  /** True when managed.args is a faithful strict-JSON pre-execution snapshot. */
+  argsSnapshotOk: boolean;
+  argsUnreplayable?: true;
   /** THIS run's working directory (ExecOptions.cwd), when it overrides the manager cwd.
    *  Persisted so resume() re-runs in the same directory (e.g. the same worktree). */
   cwd?: string;
@@ -60,6 +74,18 @@ export interface ManagedRun {
   /** Result-only observability collected during this execution. */
   fallbacks: WorkflowRunFallback[];
   checkpointsTaken: WorkflowCheckpointTaken[];
+  calls: WorkflowCallRecord[];
+  effectiveCwd: string;
+  runtime: { node: string; v8: string; pathFormat: number; inputsFormat: number };
+  environment?: RunEnvironmentIdentity;
+  callsAllocated?: number;
+  limits?: NonNullable<WorkflowRunResult["effectiveLimits"]>;
+  abortSignaled?: true;
+  mainModel?: string;
+  agentsDir?: string;
+  nestedWorkflows?: true;
+  legacyResume?: true;
+  executionMode?: PersistedRunState["executionMode"];
   /**
    * False for host-owned transcript storage. The run stays fully tracked in memory,
    * but the engine writes no run-state/log journal files and resume is forbidden.
@@ -78,6 +104,12 @@ export interface ManagedRun {
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
+  /** Caller-minted run id. Collision checks happen under the run lease. */
+  runId?: string;
+  /** Marks this run as an isolation execution from its initial save onward. */
+  executionMode?: PersistedRunState["executionMode"];
+  /** Non-git environment identity for replay comparability. */
+  environmentKey?: string;
   /**
    * The agent backend for THIS run. Overrides the manager's constructor-injected
    * `agent`. Either this or the constructor `agent` must be set, or the run fails
@@ -103,6 +135,8 @@ export interface ExecOptions {
    * rejects with "journaling disabled for this run".
    */
   journaling?: boolean;
+  /** Resume seed for the root-scope call manifest. */
+  resumeCalls?: WorkflowCallRecord[];
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -115,12 +149,20 @@ export interface ExecOptions {
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
   tokenBudget?: number | null;
+  /** Isolation-only recorded budget trajectory. */
+  budgetReplay?: { trajectory: Array<{ ordinal: number; debit: number }> };
   /** Max concurrent agents for this execution. */
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
-  confirm?: (promptText: string, options: unknown) => Promise<unknown>;
+  confirm?: (
+    promptText: string,
+    options: CheckpointOptions,
+    context?: CheckpointCallContext,
+  ) => Promise<unknown>;
+  /** Called synchronously when workflow() allocates a unique child-run ordinal. */
+  onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /**
    * APPROVED script-declared custom ACP backends (`meta.backends`) for this run. The
    * composition root owns the approval decision (MCP elicitation, SDK allowScriptBackends,
@@ -163,6 +205,39 @@ export interface WorkflowManagerOptions {
   persistence?: RunPersistence;
   /** Default journaling policy for runs created by this manager. Default true. */
   journaling?: boolean;
+  /** Default non-git environment identity. */
+  environmentKey?: string;
+}
+
+type ArgsSnapshot = { ok: true; clone: unknown } | { ok: false };
+
+function snapshotArgs(value: unknown): ArgsSnapshot {
+  if (value === undefined) return { ok: true, clone: undefined };
+  const captured = cloneStrictJsonValue(value);
+  return captured.ok ? { ok: true, clone: captured.clone } : { ok: false };
+}
+
+function runtimeIdentity(): ManagedRun["runtime"] {
+  return {
+    node: process.version,
+    v8: process.versions.v8,
+    pathFormat: CALL_PATH_FORMAT,
+    inputsFormat: CALL_INPUTS_FORMAT,
+  };
+}
+
+function latestRootRows<T extends { index: number; scope?: string }>(rows: T[], runId: string): T[] {
+  const latest = new Map<number, T>();
+  for (const row of rows) {
+    if (row.scope === undefined || row.scope === runId) latest.set(row.index, row);
+  }
+  return [...latest.values()].sort((a, b) => a.index - b.index);
+}
+
+function latestRows<T extends { index: number }>(rows: T[]): T[] {
+  const latest = new Map<number, T>();
+  for (const row of rows) latest.set(row.index, row);
+  return [...latest.values()].sort((a, b) => a.index - b.index);
 }
 
 function runReason(status: RunStatus, error: WorkflowError | undefined): string | undefined {
@@ -195,6 +270,7 @@ export class WorkflowManager extends EventEmitter {
   private agentsDir?: string;
   private persistenceRoot: string;
   private journaling: boolean;
+  private environmentKey?: string;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -209,6 +285,7 @@ export class WorkflowManager extends EventEmitter {
     this.agentsDir = options.agentsDir;
     this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
     this.journaling = options.journaling ?? true;
+    this.environmentKey = options.environmentKey;
     this.persistence = options.persistence ?? createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
     // Stale-run recovery mutates the PERSISTED run store, so it is gated on this manager's
     // journaling default: a `journaling: false` manager (host keeps its own transcript/audit
@@ -280,6 +357,35 @@ export class WorkflowManager extends EventEmitter {
     return agent;
   }
 
+  private acquireNewRunIdentity(requestedRunId?: string): { runId: string; lease: RunLease } {
+    for (;;) {
+      const runId = requestedRunId ?? generateRunId();
+      const lease = this.persistence.acquireRunLease(runId);
+      if (!lease) {
+        if (requestedRunId) {
+          throw new WorkflowError(`run id already exists: ${runId}`, WorkflowErrorCode.PERSISTENCE_ERROR, {
+            recoverable: false,
+          });
+        }
+        continue;
+      }
+      let persistedExists: boolean;
+      try {
+        persistedExists = this.persistence.load(runId) !== null;
+      } catch (error) {
+        this.persistence.releaseRunLease(lease);
+        throw error;
+      }
+      if (!this.runs.has(runId) && !persistedExists) return { runId, lease };
+      this.persistence.releaseRunLease(lease);
+      if (requestedRunId) {
+        throw new WorkflowError(`run id already exists: ${runId}`, WorkflowErrorCode.PERSISTENCE_ERROR, {
+          recoverable: false,
+        });
+      }
+    }
+  }
+
   /**
    * Start a workflow in the background.
    * Returns immediately with a run ID; the workflow executes asynchronously.
@@ -289,69 +395,19 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
-    const runId = generateRunId();
-    const controller = new AbortController();
-    const parsed = parseWorkflowScript(script);
     const journaling = this.resolveJournaling(exec);
-    const lease = this.persistence.acquireRunLease(runId);
-    if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
-
-    const managed: ManagedRun = {
-      runId,
-      status: "running",
-      snapshot: {
-        name: parsed.meta.name,
-        description: parsed.meta.description,
-        phases: parsed.meta.phases?.map((p) => p.title) ?? [],
-        logs: [],
-        agents: [],
-        agentCount: 0,
-        runningCount: 0,
-        doneCount: 0,
-        errorCount: 0,
-      },
-      controller,
-      startedAt: new Date(),
-      script,
-      args,
-      meta: parsed.meta,
-      cwd: exec.cwd,
-      journal: [],
-      fallbacks: [],
-      checkpointsTaken: [],
-      journaling,
-      background: true,
-      lease: lease ?? undefined,
-    };
-
-    if (managed.journaling && exec.resumeJournal) {
-      managed.journal = [...exec.resumeJournal.values()].sort((a, b) => a.index - b.index);
-    }
-
-    this.runs.set(runId, managed);
-
+    const identity = this.acquireNewRunIdentity(exec.runId);
+    let managed: ManagedRun;
     try {
-      // Persist initial state
-      if (managed.journaling) {
-        this.persistence.save({
-          runId,
-          workflowName: parsed.meta.name,
-          script,
-          args,
-          cwd: exec.cwd,
-          sessionId: this.sessionId,
-          status: "running",
-          journal: managed.journal,
-          phases: managed.snapshot.phases,
-          agents: [],
-          logs: [],
-          startedAt: managed.startedAt.toISOString(),
-          updatedAt: managed.startedAt.toISOString(),
-        });
+      managed = this.createManaged(script, args, journaling, exec, true, identity);
+      if (managed.journaling && exec.resumeJournal) {
+        managed.journal = latestRows([...exec.resumeJournal.values()]);
       }
+      this.runs.set(managed.runId, managed);
+      this.persistRun(managed);
     } catch (err) {
-      this.releaseRunLease(managed);
-      this.runs.delete(runId);
+      this.persistence.releaseRunLease(identity.lease);
+      this.runs.delete(identity.runId);
       throw err;
     }
 
@@ -360,10 +416,10 @@ export class WorkflowManager extends EventEmitter {
     // when a workflow is aborted/paused/stopped — executeRun()'s catch block
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
-    const promise = this.executeRun(managed, script, args, exec);
+    const promise = this.executeRun(managed, script, exec);
     promise.catch(() => {});
 
-    return { runId, promise };
+    return { runId: managed.runId, promise };
   }
 
   /**
@@ -377,22 +433,29 @@ export class WorkflowManager extends EventEmitter {
    * so the MCP shell can project `run.status` without catching.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args, this.resolveJournaling(exec), exec.cwd);
+    const identity = this.acquireNewRunIdentity(exec.runId);
+    let managed: ManagedRun;
+    try {
+      managed = this.createManaged(script, args, this.resolveJournaling(exec), exec, false, identity);
+    } catch (error) {
+      this.persistence.releaseRunLease(identity.lease);
+      throw error;
+    }
     if (managed.journaling && exec.resumeJournal) {
       // runSync is also the MCP shell's explicit-resume path. Replayed entries do not fire
       // onAgentJournal, so carry the hydrated prefix into this new managed run up front; any
       // synthetic checkpoint reply in the map must survive another cold resume from this run.
-      managed.journal = [...exec.resumeJournal.values()].sort((a, b) => a.index - b.index);
+      managed.journal = latestRows([...exec.resumeJournal.values()]);
     }
-    const lease = this.persistence.acquireRunLease(managed.runId);
-    if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
-    managed.lease = lease;
+    if (managed.journaling && exec.resumeCalls) {
+      managed.calls = latestRows(exec.resumeCalls);
+    }
     this.runs.set(managed.runId, managed);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
     this.persistRun(managed);
     try {
-      return await this.executeRun(managed, script, args, exec);
+      return await this.executeRun(managed, script, exec);
     } catch (error) {
       const wfError =
         error instanceof WorkflowError
@@ -418,12 +481,16 @@ export class WorkflowManager extends EventEmitter {
     script: string,
     args: unknown | undefined,
     journaling: boolean,
-    cwd?: string,
+    exec: ExecOptions,
+    background: boolean,
+    identity: { runId: string; lease: RunLease },
   ): ManagedRun {
     const parsed = parseWorkflowScript(script);
+    const capturedArgs = snapshotArgs(args);
+    const effectiveCwd = exec.cwd ?? this.cwd;
     return {
-      runId: generateRunId(),
-      cwd,
+      runId: identity.runId,
+      cwd: exec.cwd,
       status: "running",
       snapshot: {
         name: parsed.meta.name,
@@ -439,13 +506,23 @@ export class WorkflowManager extends EventEmitter {
       controller: new AbortController(),
       startedAt: new Date(),
       script,
-      args,
+      args: capturedArgs.ok ? capturedArgs.clone : args,
+      argsSnapshotOk: capturedArgs.ok,
+      ...(!capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
       meta: parsed.meta,
       journal: [],
       fallbacks: [],
       checkpointsTaken: [],
+      calls: [],
+      effectiveCwd,
+      runtime: runtimeIdentity(),
+      environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),
+      mainModel: this.mainModel,
+      agentsDir: this.agentsDir,
+      executionMode: exec.executionMode,
       journaling,
-      background: false,
+      background,
+      lease: identity.lease,
     };
   }
 
@@ -513,13 +590,17 @@ export class WorkflowManager extends EventEmitter {
         managed.snapshot.agents.map((a) => a.session).filter((s): s is NonNullable<typeof s> => s != null),
       ...(fallbacks.length === 0 ? {} : { fallbacks }),
       ...(checkpointsTaken.length === 0 ? {} : { checkpointsTaken }),
+      calls: engineResult?.calls ?? managed.calls,
+      callsAllocated: engineResult?.callsAllocated ?? managed.callsAllocated,
+      effectiveLimits: engineResult?.effectiveLimits ?? managed.limits,
+      ...(engineResult?.abortSignaled || managed.abortSignaled ? { abortSignaled: true as const } : {}),
+      ...(engineResult?.nestedWorkflows || managed.nestedWorkflows ? { nestedWorkflows: true as const } : {}),
     };
   }
 
   private async executeRun(
     managed: ManagedRun,
     script: string,
-    args?: unknown,
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
     const {
@@ -530,9 +611,11 @@ export class WorkflowManager extends EventEmitter {
       signal,
       onProgress,
       tokenBudget,
+      budgetReplay,
       concurrency,
       agentRetries,
       confirm,
+      onNestedWorkflow,
       scriptBackends,
     } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
@@ -561,19 +644,26 @@ export class WorkflowManager extends EventEmitter {
       // Resolve the injected agent backend (per-run override > constructor). The
       // engine REQUIRES an AgentRunner and never constructs one.
       const agent = this.resolveAgent(exec);
+      const vmArgsSnapshot = managed.argsSnapshotOk ? snapshotArgs(managed.args) : { ok: false as const };
+      const argsForVm = vmArgsSnapshot.ok ? vmArgsSnapshot.clone : managed.args;
       const engineResult = await runWorkflow(script, {
-        cwd: managed.cwd ?? this.cwd,
-        args,
+        cwd: managed.effectiveCwd,
+        args: argsForVm,
         agent,
-        mainModel: this.mainModel,
-        agentsDir: this.agentsDir,
+        mainModel: managed.mainModel,
+        agentsDir: managed.agentsDir,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
+        budgetReplay,
         confirm,
+        onNestedWorkflow: (ordinal, childRunId) => {
+          managed.nestedWorkflows = true;
+          onNestedWorkflow?.(ordinal, childRunId);
+        },
         scriptBackends,
         loadSavedWorkflow: this.loadSavedWorkflow,
         // Manager-level `journal` events are observation, not persistence. Keep the engine's
@@ -597,6 +687,7 @@ export class WorkflowManager extends EventEmitter {
           managed.checkpointsTaken.push(entry);
           this.persistRun(managed);
         },
+        onCallRecord: (record) => this.recordCallRecord(managed, record),
         onLog: (message) => {
           managed.snapshot.logs.push(message);
           this.emit("log", { runId: managed.runId, message });
@@ -611,6 +702,7 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentStart: (event) => {
+          if (this.dropPostTerminal(managed, "agentStart")) return;
           managed.snapshot.agents.push({
             id: managed.snapshot.agents.length + 1,
             label: event.label,
@@ -618,21 +710,38 @@ export class WorkflowManager extends EventEmitter {
             prompt: event.prompt,
             status: "running",
             model: event.model,
+            callIndex: event.callIndex,
+            scope: event.scope,
           });
           this.emit("agentStart", { runId: managed.runId, ...event });
           progress();
         },
         onAgentEnd: (event) => {
-          const agentSnapshot = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          if (this.dropPostTerminal(managed, "agentEnd")) return;
+          const agentSnapshot = event.callIndex === undefined
+            ? [...managed.snapshot.agents]
+                .reverse()
+                .find((a) => a.label === event.label && a.status === "running")
+            : managed.snapshot.agents.find(
+                (a) =>
+                  a.scope === event.scope &&
+                  a.callIndex === event.callIndex &&
+                  a.status === "running",
+              );
           if (agentSnapshot) {
-            agentSnapshot.status = event.result === null ? "error" : "done";
+            agentSnapshot.status =
+              event.errorRecord || (event.provenance?.source === "replay" && event.result === null)
+                ? "error"
+                : "done";
             agentSnapshot.resultPreview = preview(event.result);
             agentSnapshot.error = event.error;
             agentSnapshot.errorCode = event.errorCode;
             agentSnapshot.recoverable = event.recoverable;
             agentSnapshot.tokens = event.tokens;
+            agentSnapshot.callIndex = event.callIndex;
+            agentSnapshot.scope = event.scope;
+            agentSnapshot.usage = event.usage;
+            agentSnapshot.provenance = event.provenance;
             if (event.model) agentSnapshot.model = event.model;
             if (event.session) agentSnapshot.session = event.session;
           }
@@ -640,9 +749,17 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentHistory: (event) => {
-          const agentSnapshot = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          if (this.dropPostTerminal(managed, "agentHistory")) return;
+          const agentSnapshot = event.callIndex === undefined
+            ? [...managed.snapshot.agents]
+                .reverse()
+                .find((a) => a.label === event.label && a.status === "running")
+            : managed.snapshot.agents.find(
+                (a) =>
+                  a.scope === event.scope &&
+                  a.callIndex === event.callIndex &&
+                  a.status === "running",
+              );
           if (agentSnapshot) {
             agentSnapshot.history = event.history;
           }
@@ -656,6 +773,11 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
+      managed.calls = engineResult.calls ?? [];
+      managed.callsAllocated = engineResult.callsAllocated;
+      managed.limits = engineResult.effectiveLimits;
+      if (engineResult.abortSignaled) managed.abortSignaled = true;
+      if (engineResult.nestedWorkflows) managed.nestedWorkflows = true;
       managed.status = "completed";
       const result = this.composeResult(managed, undefined, engineResult);
       managed.result = result;
@@ -739,11 +861,37 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private recordJournalEntry(managed: ManagedRun, entry: JournalEntry): void {
-    // Append (crash-safe-ish): keep the latest entry per index, then persist.
-    managed.journal = managed.journal.filter((e) => e.index !== entry.index);
-    managed.journal.push(entry);
-    if (managed.journaling) this.persistRun(managed);
+    if (this.dropPostTerminal(managed, "journal")) return;
+    const rootScope = entry.scope === undefined || entry.scope === managed.runId;
+    if (rootScope) {
+      managed.journal = managed.journal.filter((e) => e.index !== entry.index);
+      managed.journal.push(entry);
+      if (managed.journaling) this.persistRun(managed);
+    }
     if (this.listenerCount("journal") > 0) this.emit("journal", { runId: managed.runId, entry });
+  }
+
+  private recordCallRecord(managed: ManagedRun, record: WorkflowCallRecord): void {
+    if (this.dropPostTerminal(managed, "callRecord")) return;
+    const rootScope = record.scope === undefined || record.scope === managed.runId;
+    if (rootScope) {
+      managed.calls = managed.calls.filter((row) => row.index !== record.index);
+      managed.calls.push(record);
+      if (managed.journaling) this.persistRun(managed);
+    }
+    if (this.listenerCount("callRecord") > 0) {
+      this.emit("callRecord", { runId: managed.runId, record });
+    }
+  }
+
+  private dropPostTerminal(managed: ManagedRun, event: string): boolean {
+    if (managed.status === "running") return false;
+    try {
+      console.debug(`[workflow-manager] dropped post-terminal ${event} for ${managed.runId}`);
+    } catch {
+      // Debug reporting is best-effort.
+    }
+    return true;
   }
 
   private persistRun(managed: ManagedRun) {
@@ -756,12 +904,27 @@ export class WorkflowManager extends EventEmitter {
         // in workflow run storage — protect via directory permissions, not blanking.
         script: managed.script,
         args: managed.args,
+        argsUnreplayable: managed.argsUnreplayable,
         // The per-run working directory, so resume() re-runs in the SAME place.
         cwd: managed.cwd,
+        effectiveCwd: managed.effectiveCwd,
+        runtime: managed.runtime,
+        environment: managed.environment,
+        mainModel: managed.mainModel,
+        agentsDir: managed.agentsDir,
+        executionMode: managed.executionMode,
+        nestedWorkflows: managed.nestedWorkflows,
+        legacyResume: managed.legacyResume,
         sessionId: this.sessionId,
         journal: managed.journal,
         ...(managed.fallbacks.length === 0 ? {} : { fallbacks: managed.fallbacks }),
         ...(managed.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: managed.checkpointsTaken }),
+        calls: managed.calls,
+        callsAllocated: managed.callsAllocated,
+        limits: managed.limits,
+        ...(managed.abortSignaled || managed.controller.signal.aborted
+          ? { abortSignaled: true as const }
+          : {}),
         status: managed.status,
         reason: runReason(managed.status, managed.error),
         errorCode: managed.error?.code,
@@ -877,6 +1040,7 @@ export class WorkflowManager extends EventEmitter {
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") {
       return { accepted: false };
     }
+    if (persisted.executionMode) return { accepted: false };
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return { accepted: false };
 
@@ -886,6 +1050,19 @@ export class WorkflowManager extends EventEmitter {
       checkpointContext !== undefined &&
       exec.checkpointReplies !== undefined &&
       Object.prototype.hasOwnProperty.call(exec.checkpointReplies, checkpointContext.callIndex);
+    let checkpointReplySnapshot: unknown;
+    if (hasCheckpointReply) {
+      const captured = cloneFrozenStrictJson(exec.checkpointReplies?.[checkpointContext?.callIndex ?? -1]);
+      if (!captured.ok) {
+        this.persistence.releaseRunLease(lease);
+        throw new WorkflowError(
+          `checkpoint "${checkpointContext?.prompt ?? "pending checkpoint"}" reply is not strict JSON at ${captured.path}`,
+          WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+          { recoverable: false },
+        );
+      }
+      checkpointReplySnapshot = captured.clone;
+    }
 
     // Cold-resume re-arm (§2.13). An "auth_required" pause is resumable ONLY when the auth
     // survived: warm resume (same process, credentials still in the runner's AuthStore) or a
@@ -961,6 +1138,8 @@ export class WorkflowManager extends EventEmitter {
       // the snapshot name carries the run identity.
       meta = undefined;
     }
+    const capturedArgs = snapshotArgs(persisted.args);
+    const effectiveCwd = exec.cwd ?? persisted.cwd ?? persisted.effectiveCwd ?? this.cwd;
     const managed: ManagedRun = {
       runId,
       status: "running",
@@ -977,14 +1156,23 @@ export class WorkflowManager extends EventEmitter {
       controller,
       startedAt: new Date(),
       script: persisted.script,
-      args: persisted.args,
+      args: capturedArgs.ok ? capturedArgs.clone : persisted.args,
+      argsSnapshotOk: capturedArgs.ok,
+      ...(persisted.argsUnreplayable || !capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
       // Explicit override wins; else the run resumes in ITS original directory
       // (e.g. the same worktree), never silently in the manager cwd.
       cwd: exec.cwd ?? persisted.cwd,
       meta,
-      journal: persisted.journal ?? [],
+      journal: latestRootRows(persisted.journal ?? [], runId),
       fallbacks: [],
       checkpointsTaken: [],
+      calls: latestRootRows(persisted.calls ?? [], runId),
+      effectiveCwd,
+      runtime: runtimeIdentity(),
+      environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),
+      mainModel: persisted.mainModel ?? this.mainModel,
+      agentsDir: persisted.agentsDir ?? this.agentsDir,
+      ...(persisted.calls === undefined || persisted.legacyResume ? { legacyResume: true as const } : {}),
       journaling: true,
       background: true,
       lease,
@@ -993,12 +1181,14 @@ export class WorkflowManager extends EventEmitter {
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     if (checkpointContext && hasCheckpointReply) {
-      const syntheticEntry: JournalEntry = {
+      const syntheticEntry: JournalEntry = deepFreeze({
         index: checkpointContext.callIndex,
         hash: checkpointContext.hash,
-        result: exec.checkpointReplies?.[checkpointContext.callIndex],
+        result: checkpointReplySnapshot,
+        kind: "checkpoint",
+        scope: managed.runId,
         call: { kind: "checkpoint", label: "checkpoint", phase: persisted.currentPhase },
-      };
+      });
       resumeJournal.set(syntheticEntry.index, syntheticEntry);
       // Cached entries are replayed without firing onAgentJournal, so seed and persist this
       // synthetic answer now. A crash or later cold replay must never re-ask this checkpoint.
@@ -1010,7 +1200,7 @@ export class WorkflowManager extends EventEmitter {
     // Run in the background; executeRun records status/errors on the managed run.
     // Preserve the original promise for callers while preventing an ignored resume
     // from becoming an unhandled rejection.
-    const promise = this.executeRun(managed, persisted.script, persisted.args, { ...exec, resumeJournal });
+    const promise = this.executeRun(managed, persisted.script, { ...exec, resumeJournal });
     promise.catch(() => {});
     return { accepted: true, promise };
   }
