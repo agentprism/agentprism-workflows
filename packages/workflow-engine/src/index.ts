@@ -34,6 +34,24 @@ export {
   type RunPersistenceOptions,
 } from "./run-persistence.js";
 
+// ── Isolation mode ──
+export {
+  runIsolation,
+  createReplayRunner,
+  RECORDING_UNUSABLE_REASONS,
+  REPLAY_DIVERGENCE_KINDS,
+  type RunIsolationOptions,
+  type IsolationRunResult,
+  type ReplayRunnerOptions,
+  type ResolvedIsolationTarget,
+  type IsolationTarget,
+  type ReplayRunner,
+  type ReplayObservation,
+  type ReplayReport,
+  type ReplayCallReport,
+  type ReplayDivergenceEvent,
+} from "./isolation.js";
+
 // ── Errors: the shared seam contract (re-exported) + engine-local helpers ──
 export {
   WorkflowError,

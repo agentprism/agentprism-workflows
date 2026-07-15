@@ -17,6 +17,7 @@ import type {
   WorkflowRunFallback,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
+import type { ReplayReport } from "./isolation.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -121,6 +122,8 @@ export interface PersistedRunState {
   nestedWorkflows?: true;
   legacyResume?: true;
   executionMode?: { kind: "isolation"; baselineRunId: string };
+  /** Aggregate isolation report, attached after the terminal manager save. */
+  replayReport?: ReplayReport;
 }
 
 export interface RunPersistence {

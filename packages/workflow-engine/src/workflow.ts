@@ -115,6 +115,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
   tokenBudget?: number | null;
+  /** Recorded budget debits, replayed in settlement-ordinal order before a bound
+   *  call's settlement is exposed to workflow code. Isolation-only. */
+  budgetReplay?: { trajectory: Array<{ ordinal: number; debit: number }> };
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
@@ -505,6 +508,18 @@ export async function runWorkflow<T = unknown>(
     spent: () => shared.spent,
     remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
   });
+  const replayTrajectory = options.budgetReplay?.trajectory ?? [];
+  let replayCursor = 0;
+  const applyBudgetReplay = (settlementOrdinal: number | undefined) => {
+    if (!options.budgetReplay || settlementOrdinal === undefined) return;
+    while (
+      replayCursor < replayTrajectory.length &&
+      replayTrajectory[replayCursor].ordinal <= settlementOrdinal
+    ) {
+      shared.spent += replayTrajectory[replayCursor].debit;
+      replayCursor++;
+    }
+  };
 
   // Run-scoped fault channel: when the rejection tripwire fires (a promise the SCRIPT
   // floated rejected with nobody listening), the run is already failing with SCRIPT_ERROR —
@@ -798,7 +813,7 @@ export async function runWorkflow<T = unknown>(
           shared.tokenUsage.cacheWrite += usage.cacheWrite;
         }
         shared.tokenUsage.total += tokens;
-        shared.spent += tokens;
+        if (!options.budgetReplay) shared.spent += tokens;
         budgetDebit += tokens;
         options.onTokenUsage?.({ ...shared.tokenUsage });
         return tokens;
@@ -831,6 +846,7 @@ export async function runWorkflow<T = unknown>(
         slot: AttemptSlots | undefined,
         aborted: boolean,
       ) => {
+        applyBudgetReplay(slot?.budgetReplay?.settlementOrdinal);
         const errorRecord = projectRecordedError(thrown);
         const workflowError = wrapError(thrown, { agentLabel: label });
         const usage = terminalUsage();
@@ -1014,6 +1030,7 @@ export async function runWorkflow<T = unknown>(
             }
             const resultSnapshot = strictSnapshot(result, `agent "${label}" result`, label);
             recordTokens(result, slot.usage);
+            applyBudgetReplay(slot.budgetReplay?.settlementOrdinal);
             const usage = terminalUsage();
             const session = sessionRecord(slot);
             if (session) state.agentSessions.push(session);

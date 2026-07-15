@@ -149,6 +149,8 @@ export interface ExecOptions {
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
   tokenBudget?: number | null;
+  /** Isolation-only recorded budget trajectory. */
+  budgetReplay?: { trajectory: Array<{ ordinal: number; debit: number }> };
   /** Max concurrent agents for this execution. */
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
@@ -609,6 +611,7 @@ export class WorkflowManager extends EventEmitter {
       signal,
       onProgress,
       tokenBudget,
+      budgetReplay,
       concurrency,
       agentRetries,
       confirm,
@@ -655,6 +658,7 @@ export class WorkflowManager extends EventEmitter {
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
+        budgetReplay,
         confirm,
         onNestedWorkflow: (ordinal, childRunId) => {
           managed.nestedWorkflows = true;
@@ -725,7 +729,10 @@ export class WorkflowManager extends EventEmitter {
                   a.status === "running",
               );
           if (agentSnapshot) {
-            agentSnapshot.status = event.errorRecord ? "error" : "done";
+            agentSnapshot.status =
+              event.errorRecord || (event.provenance?.source === "replay" && event.result === null)
+                ? "error"
+                : "done";
             agentSnapshot.resultPreview = preview(event.result);
             agentSnapshot.error = event.error;
             agentSnapshot.errorCode = event.errorCode;
