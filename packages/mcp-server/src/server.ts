@@ -12,10 +12,9 @@
 //   - runSync RESOLVES to a TERMINAL WorkflowRunResult (status completed|paused|failed|
 //     aborted, carrying reason/resetHint) and does NOT throw on pause/fail/abort — so the
 //     shell does no status composition and needs no lifecycle try/catch.
-//   - resumeFromRunId is mapped to the engine's own persisted journal (manager persistence
-//     loads it) and handed back as exec.resumeJournal; checkpointReplies can add a pending
-//     durable-checkpoint answer before the engine replays the unchanged prefix. The shell
-//     no longer owns/forges a runId.
+//   - resumeFromRunId, resumePolicy, and checkpointReplies pass straight to the manager,
+//     which owns source admission, durable seed construction, and checkpoint injection.
+//     The shell neither hydrates journals nor owns/forges a runId.
 // Mid-run progress streams via notifications/progress; extra.signal threads cancellation into
 // the engine; checkpoint() is driven by the engine's `confirm` hook only when the client
 // advertises elicitation. Otherwise the checkpoint's authored headless mode applies.
@@ -30,10 +29,10 @@ import type {
   PersistedRunState,
   WorkflowSnapshot,
   AgentRunner,
-  JournalEntry,
   WorkflowBackendConfig,
   WorkflowRunResult,
   WorkflowRunStatus,
+  WorkflowResumeReport,
 } from "@automatalabs/workflows";
 import type { TokenUsage } from "@automatalabs/shared-types";
 
@@ -399,7 +398,15 @@ function formatCompletedSummary(run: WorkflowRunResult): string {
       `tokens: ${run.tokenUsage.total} (input ${run.tokenUsage.input}, output ${run.tokenUsage.output})  cost: $${run.tokenUsage.cost}`,
     );
   }
+  if (run.resumeReport) lines.push(formatResumeSummary(run.resumeReport));
   return lines.join("\n");
+}
+
+function formatResumeSummary(report: WorkflowResumeReport): string {
+  const strategy = report.strategy === "positional-v1"
+    ? `${report.strategy}/${report.eligibility}`
+    : report.strategy;
+  return `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed`;
 }
 
 /**
@@ -419,6 +426,7 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
     lines.push(`recent run log (last ${run.logTail.lines.length} of ${run.logTail.totalLines}):`);
     for (const line of run.logTail.lines) lines.push(`  ${line}`);
   }
+  if (run.resumeReport) lines.push(formatResumeSummary(run.resumeReport));
   if (run.status === "paused") {
     // Read the STRUCTURED authContext (§2.12) — never the free-form `reason` message string.
     if (run.reason === "auth_required" && run.authContext) {
@@ -519,6 +527,7 @@ function persistedOutcome(
     checkpointContext: persisted.checkpointContext,
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
+    ...(persisted.resumeReport === undefined ? {} : { resumeReport: persisted.resumeReport }),
   };
 }
 
@@ -674,6 +683,7 @@ function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
   lines.push(
     `wait: ${result.wait.returnedBecause} after ${result.wait.elapsedMs}ms (requested ${result.wait.requestedMs}ms)`,
   );
+  if (result.outcome?.resumeReport) lines.push(formatResumeSummary(result.outcome.resumeReport));
   if (result.status === "paused" && result.outcome) {
     if (result.reason === "auth_required" && result.outcome.authContext) {
       const backendId = result.outcome.authContext.backendId ?? "?";
@@ -906,6 +916,8 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
           agentRetries: input.agentRetries,
           agentTimeoutMs: input.agentTimeoutMs,
           tokenBudget: input.tokenBudget,
+          resumeFromRunId: input.resumeFromRunId,
+          resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,
         };
 
@@ -924,32 +936,6 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
           // install a defaulting shim for non-elicitation clients; the authored headless mode
           // must remain visible to the engine.
           exec.confirm = mcp.server.getClientCapabilities()?.elicitation ? createConfirm(mcp.server) : undefined;
-        }
-
-        // Resume: the engine owns run identity. The shell only re-hydrates the journal the
-        // engine persisted for the prior runId and hands it back as resumeJournal; the engine
-        // replays the unchanged prefix and runs the rest live.
-        if (input.resumeFromRunId) {
-          const persisted = manager.getPersistence().load(input.resumeFromRunId);
-          if (persisted) {
-            exec.resumeJournal = new Map<number, JournalEntry>(
-              (persisted.journal ?? []).map((entry) => [entry.index, entry] as const),
-            );
-            const checkpoint =
-              persisted.pauseReason === "checkpoint_required" ? persisted.checkpointContext : undefined;
-            if (
-              checkpoint &&
-              input.checkpointReplies &&
-              Object.prototype.hasOwnProperty.call(input.checkpointReplies, checkpoint.callIndex)
-            ) {
-              exec.resumeJournal.set(checkpoint.callIndex, {
-                index: checkpoint.callIndex,
-                hash: checkpoint.hash,
-                result: input.checkpointReplies[checkpoint.callIndex],
-                call: { kind: "checkpoint", label: "checkpoint", phase: persisted.currentPhase },
-              });
-            }
-          }
         }
 
         if (input.background) {

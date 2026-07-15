@@ -48,6 +48,7 @@ test("input shape: one tool advertises the exact run, inspect, and await field s
       "logLines",
       "maxAgents",
       "resumeFromRunId",
+      "resumePolicy",
       "runId",
       "script",
       "tokenBudget",
@@ -57,12 +58,42 @@ test("input shape: one tool advertises the exact run, inspect, and await field s
   );
 });
 
-test("resumeFromRunId advertises the canonical changed-args replay rule", () => {
+test("resume inputs advertise manager-owned fail-to-live admission", () => {
   assert.ok(
     workflowToolInputShape.resumeFromRunId.description?.includes(
-      "Resume rule: args changes don't invalidate the journal; prompt changes cache-miss from the first changed call.",
+      "The manager validates replay eligibility and runs live wherever reuse is uncertain.",
     ),
   );
+  assert.match(workflowToolInputShape.resumePolicy.description ?? "", /requires resumeFromRunId/);
+});
+
+test("resume policy and source validation reject invalid values and combinations", () => {
+  assert.equal(
+    parseWorkflowToolInput(Schema.parse({ script: "x", resumeFromRunId: "source-1" })).resumePolicy,
+    undefined,
+  );
+  assert.equal(
+    parseWorkflowToolInput(
+      Schema.parse({ script: "x", resumeFromRunId: "source-1", resumePolicy: "positional" }),
+    ).resumePolicy,
+    "positional",
+  );
+  for (const input of [
+    { script: "x", resumeFromRunId: "" },
+    { script: "x", resumeFromRunId: 1 },
+    { script: "x", resumeFromRunId: "source-1", resumePolicy: "future" },
+  ]) {
+    assert.throws(() => Schema.parse(input));
+  }
+  for (const input of [
+    { script: "x", resumePolicy: "auto" },
+    { script: "x", checkpointReplies: { "0": true } },
+  ]) {
+    assert.throws(
+      () => parseWorkflowToolInput(Schema.parse(input)),
+      (error: unknown) => error instanceof McpError && error.code === ErrorCode.InvalidParams,
+    );
+  }
 });
 
 test("background defaults false and accepts explicit false or true on run only", () => {
@@ -127,6 +158,7 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "inspect", runId: "a-b", args: {} },
     { action: "inspect", runId: "a-b", concurrency: 2 },
     { action: "inspect", runId: "a-b", resumeFromRunId: "c-d" },
+    { action: "inspect", runId: "a-b", resumePolicy: "auto" },
     { action: "inspect", runId: "a-b", checkpointReplies: { 0: true } },
     { action: "inspect", runId: "a-b", background: false },
     { action: "inspect", runId: "a-b", waitMs: 0 },
@@ -139,6 +171,7 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "await", runId: "a-b", agentTimeoutMs: 1 },
     { action: "await", runId: "a-b", tokenBudget: 1 },
     { action: "await", runId: "a-b", resumeFromRunId: "c-d" },
+    { action: "await", runId: "a-b", resumePolicy: "auto" },
     { action: "await", runId: "a-b", checkpointReplies: { 0: true } },
     { action: "await", runId: "a-b", background: true },
     { script: "x", runId: "a-b" },
@@ -170,6 +203,15 @@ test("input shape: checkpointReplies accepts JSON string indexes and coerces the
   assert.throws(
     () => Schema.parse({ script: "x", resumeFromRunId: "run-1", checkpointReplies: { "-1": true } }),
     "negative call indexes are rejected",
+  );
+  assert.throws(
+    () =>
+      Schema.parse({
+        script: "x",
+        resumeFromRunId: "run-1",
+        checkpointReplies: { "9007199254740992": true },
+      }),
+    "unsafe call indexes are rejected",
   );
 });
 

@@ -34,6 +34,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     const inputProps = Object.keys(tool.inputSchema.properties ?? {});
     assert.ok(!inputProps.includes("startInBackground"), "startInBackground is not advertised");
     assert.ok(inputProps.includes("resumeFromRunId"), "explicit resume knob is advertised");
+    assert.ok(inputProps.includes("resumePolicy"), "resume matching policy is advertised");
     assert.ok(inputProps.includes("action") && inputProps.includes("runId"), "inspection action fields are advertised");
     assert.ok(inputProps.includes("background") && inputProps.includes("waitMs"), "detached lifecycle fields are advertised");
     assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
@@ -53,6 +54,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
       "checkpointContext",
       "fallbacks",
       "checkpointsTaken",
+      "resumeReport",
       "workflowName",
       "phases",
       "logTail",

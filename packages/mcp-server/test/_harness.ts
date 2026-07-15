@@ -164,7 +164,7 @@ export const NO_AGENT_SCRIPT = [
 /** Two sequential agent() calls — used to prove resume replays the whole journaled prefix. */
 export const TWO_AGENT_SCRIPT = [
   'export const meta = { name: "two-agent", description: "two sequential subagents" };',
-  'const a = await agent("alpha");',
-  'const b = await agent("beta");',
+  'const a = await agent("alpha", { resume: { filesystem: "read-only" } });',
+  'const b = await agent("beta", { resume: { filesystem: "read-only" } });',
   "return { a, b };",
 ].join("\n");

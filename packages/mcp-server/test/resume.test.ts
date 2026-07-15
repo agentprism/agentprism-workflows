@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
-import { connect, countingRunner, structured, TWO_AGENT_SCRIPT } from "./_harness.js";
+import {
+  connect,
+  countingRunner,
+  makeRunner,
+  persistedRunFile,
+  structured,
+  textOf,
+  TWO_AGENT_SCRIPT,
+} from "./_harness.js";
 
 /** Read a nested field off an unknown (JSON-deserialized, possibly null-prototype) object. */
 function field(value: unknown, key: string): unknown {
@@ -21,7 +30,7 @@ const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 
 phase('Review');
 const rounds = [];
 for (let i = 0; i < maxRounds; i += 1) {
-  rounds.push(await agent(\`Review round \${i + 1}: inspect the repository and report unresolved release blockers.\`, { label: \`review:\${i + 1}\`, phase: 'Review' }));
+  rounds.push(await agent(\`Review round \${i + 1}: inspect the repository and report unresolved release blockers.\`, { label: \`review:\${i + 1}\`, phase: 'Review', resume: { filesystem: 'read-only' } }));
 }
 if (maxRounds < 8) throw new Error(\`review cap \${maxRounds} reached before 8 rounds\`);
 return { rounds };`;
@@ -56,6 +65,32 @@ test("resumeFromRunId loads the persisted journal and REPLAYS it (runner is not 
     // engine served the cache rather than re-executing (which would yield :3/:4).
     assertAlphaBeta(sc2?.result);
     assert.notEqual(String(sc2?.runId), runId1, "resume runs under a fresh engine run id");
+    const report = sc2?.resumeReport as Record<string, unknown> | undefined;
+    assert.equal(report?.strategy, "identity-v1");
+    assert.equal(report?.sourceRunId, runId1);
+    assert.equal(report?.requestedPolicy, "auto");
+    assert.equal(report?.replayed, 2);
+    assert.equal(report?.live, 0);
+    assert.equal(report?.failed, 0);
+    assert.equal((report?.calls as unknown[])?.length, 2);
+    assert.match(textOf(r2), /^resume: identity-v1, 2 replayed, 0 live, 0 failed$/m);
+    assert.doesNotMatch(textOf(r2), /path-hash|unique-hash|recordedIndex/);
+
+    const positional = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: TWO_AGENT_SCRIPT,
+        resumeFromRunId: runId1,
+        resumePolicy: "positional",
+      },
+    });
+    const positionalReport = structured(positional)?.resumeReport as Record<string, unknown> | undefined;
+    assert.equal(calls(), 2, "the forced positional policy reaches the manager and replays the safe prefix");
+    assert.equal(positionalReport?.strategy, "positional-v1");
+    assert.equal(positionalReport?.fallbackReason, "forced-positional");
+    assert.equal(positionalReport?.eligibility, "safe-prefix");
+    assert.equal(positionalReport?.replayed, 2);
+    assert.match(textOf(positional), /^resume: positional-v1\/safe-prefix, 2 replayed, 0 live, 0 failed$/m);
   } finally {
     await dispose();
   }
@@ -100,11 +135,11 @@ test("changed args can raise a loop cap while the unchanged call prefix replays"
   }
 });
 
-test("an args-caused middle prompt miss reruns the unchanged-looking suffix", async () => {
+test("an args-caused middle prompt miss still permits an independent safe suffix replay", async () => {
   const script = `export const meta = { name: 'args-prefix', description: 'args-driven prefix resume' }
-const a = await agent('A', { label: 'a' })
-const b = await agent(String(args.middle), { label: 'b' })
-const c = await agent('C', { label: 'c' })
+const a = await agent('A', { label: 'a', resume: { filesystem: 'read-only' } })
+const b = await agent(String(args.middle), { label: 'b', resume: { filesystem: 'read-only' } })
+const c = await agent('C', { label: 'c', resume: { filesystem: 'read-only' } })
 return { a, b, c }`;
   const { runner, calls } = countingRunner();
   const { client, dispose } = await connect(runner);
@@ -121,31 +156,81 @@ return { a, b, c }`;
       arguments: { script, args: { middle: "B-edited" }, resumeFromRunId: firstRunId },
     });
     const result = structured(second)?.result;
-    assert.equal(calls(), 5, "only the middle call and complete suffix run live");
+    assert.equal(calls(), 4, "the changed middle call runs live while the independent safe suffix replays");
     assert.deepEqual(
       { a: field(result, "a"), b: field(result, "b"), c: field(result, "c") },
-      { a: "r:A:1", b: "r:B-edited:4", c: "r:C:5" },
+      { a: "r:A:1", b: "r:B-edited:4", c: "r:C:3" },
     );
   } finally {
     await dispose();
   }
 });
 
-test("resumeFromRunId for an unknown run finds no journal and runs fresh (no replay)", async () => {
-  // Confirms the replay above came from the loaded journal: with no persisted journal to
-  // load, the engine runs every agent() live, so the runner IS invoked.
+test("background resume durably saves the manager seed before returning accepted", async () => {
+  let releaseInserted: ((value: string) => void) | undefined;
+  let markInsertedStarted: (() => void) | undefined;
+  const insertedStarted = new Promise<void>((resolve) => {
+    markInsertedStarted = resolve;
+  });
+  const runner = makeRunner((prompt) => {
+    if (prompt === "inserted") {
+      markInsertedStarted?.();
+      return new Promise<string>((resolve) => {
+        releaseInserted = resolve;
+      });
+    }
+    return `recorded:${prompt}`;
+  });
+  const sourceScript = `export const meta = { name: 'durable-seed', description: 'durable source' }
+return await agent('cached', { resume: { filesystem: 'read-only' } })`;
+  const resumedScript = `export const meta = { name: 'durable-seed', description: 'durable target' }
+await agent('inserted', { resume: { filesystem: 'read-only' } })
+return await agent('cached', { resume: { filesystem: 'read-only' } })`;
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const source = await client.callTool({ name: "workflow", arguments: { script: sourceScript } });
+    const sourceRunId = String(structured(source)?.runId);
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: { script: resumedScript, resumeFromRunId: sourceRunId, background: true },
+    });
+    const targetRunId = String(structured(accepted)?.runId);
+    await insertedStarted;
+    const targetFile = persistedRunFile(targetRunId);
+    assert.ok(targetFile, "accepted target already has a durable snapshot");
+    const target = JSON.parse(readFileSync(targetFile, "utf8")) as Record<string, unknown>;
+    assert.equal(field(target.resumeReport, "sourceRunId"), sourceRunId);
+    assert.equal(field(target.resumeReport, "strategy"), "identity-v1");
+    assert.equal((field(target.resumeSeed, "candidates") as unknown[])?.length, 1);
+
+    assert.ok(releaseInserted);
+    releaseInserted("recorded:inserted");
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId: targetRunId, waitMs: 1_000 },
+    });
+    assert.equal(structured(awaited)?.status, "completed");
+    assert.equal(field(structured(awaited)?.outcome, "result"), "recorded:cached");
+  } finally {
+    releaseInserted?.("cleanup");
+    await dispose();
+  }
+});
+
+test("resumeFromRunId for an unknown run is a tool error and never starts live", async () => {
   const { runner, calls } = countingRunner();
   const { client, dispose } = await connect(runner);
   try {
-    const res = await client.callTool({
-      name: "workflow",
-      arguments: { script: TWO_AGENT_SCRIPT, resumeFromRunId: "no-such-run-id" },
-    });
-    const sc = structured(res);
-    assert.equal(res.isError, false);
-    assert.equal(sc?.status, "completed");
-    assert.equal(calls(), 2, "an unknown resume id loads nothing — both agents run live");
-    assertAlphaBeta(sc?.result);
+    for (const background of [false, true]) {
+      const res = await client.callTool({
+        name: "workflow",
+        arguments: { script: TWO_AGENT_SCRIPT, resumeFromRunId: "no-such-run-id", background },
+      });
+      assert.equal(res.isError, true);
+      assert.equal(structured(res), undefined);
+      assert.match(textOf(res), /resume source does not exist: no-such-run-id/);
+    }
+    assert.equal(calls(), 0, "a missing source never degrades to a fresh run");
   } finally {
     await dispose();
   }

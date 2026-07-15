@@ -7,10 +7,10 @@ import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 
 import { createWorkflowServer } from "../src/index.js";
-import { okRunner, structured, type ToolCallResult } from "./_harness.js";
+import { okRunner, structured, textOf, type ToolCallResult } from "./_harness.js";
 
 interface CheckpointConnection {
-  callWorkflow: (script: string) => Promise<ToolCallResult>;
+  callWorkflow: (script: string, options?: Record<string, unknown>) => Promise<ToolCallResult>;
   requests: () => ElicitRequest[];
   dispose: () => Promise<void>;
 }
@@ -28,7 +28,8 @@ async function connectCheckpoint(
   });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return {
-    callWorkflow: (script: string) => client.callTool({ name: "workflow", arguments: { script } }),
+    callWorkflow: (script: string, options: Record<string, unknown> = {}) =>
+      client.callTool({ name: "workflow", arguments: { script, ...options } }),
     requests: () => requests,
     async dispose() {
       await client.close();
@@ -78,6 +79,34 @@ return await checkpoint('Name?', { kind: 'input', default: 'fallback-name', time
     assert.equal(res.isError, false);
     assert.equal(structured(res)?.result, "fallback-name");
     assert.equal(conn.requests().length, 1, "the server tried to elicit before timing out");
+  } finally {
+    await conn.dispose();
+  }
+});
+
+test("changed checkpoint timeout/default inputs run the host channel instead of replaying a stale decision", async () => {
+  const conn = await connectCheckpoint(() => new Promise<ElicitResult>(() => {}));
+  try {
+    const sourceScript = `export const meta = { name: 'timeout-resume', description: 'checkpoint input identity' }
+return await checkpoint('Proceed?', { kind: 'confirm', default: false, timeoutMs: 0 })`;
+    const changedScript = `export const meta = { name: 'timeout-resume', description: 'checkpoint input identity' }
+return await checkpoint('Proceed?', { kind: 'confirm', default: true, timeoutMs: 0 })`;
+    const source = await conn.callWorkflow(sourceScript);
+    assert.equal(structured(source)?.result, false);
+
+    const resumed = await conn.callWorkflow(changedScript, {
+      resumeFromRunId: String(structured(source)?.runId),
+    });
+    assert.equal(structured(resumed)?.result, true);
+    const report = structured(resumed)?.resumeReport as Record<string, unknown> | undefined;
+    assert.equal(report?.strategy, "identity-v1");
+    assert.equal(report?.replayed, 0);
+    assert.equal(report?.live, 1);
+    assert.deepEqual(report?.calls, [
+      { index: 0, kind: "checkpoint", action: "live", reason: "inputs-changed" },
+    ]);
+    assert.equal(conn.requests().length, 2, "the changed call invokes MCP elicitation again");
+    assert.match(textOf(resumed), /^resume: identity-v1, 0 replayed, 1 live, 0 failed$/m);
   } finally {
     await conn.dispose();
   }
