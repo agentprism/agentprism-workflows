@@ -136,6 +136,8 @@ return { safe, unsafe, empty }`),
     };
     const source = resultRow({
       hash: rows[0].hash,
+      path: rows[0].path,
+      inputsHash: rows[0].inputsHash,
       resumeSafety: "declared-read-only",
     });
     const prepared: PreparedResume = {

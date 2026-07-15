@@ -39,7 +39,19 @@ import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing
 import { loadModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { projectRecordedError } from "./recorded-error.js";
 import { registerRunTripwire } from "./rejection-tripwire.js";
-import { validateResumeSafetyMarker, type PreparedResume } from "./resume.js";
+import type { PreparedResume } from "./resume.js";
+import {
+  buildResumeCandidateIndexes,
+  buildResumeReport,
+  indexedSourceOccurrence,
+  initialPositionalFirstMiss,
+  selectPositionalResume,
+  selectResumeCandidate,
+  type IndexedResumeSource,
+  type ResumeCandidateIndexes,
+  type ResumeReportPlan,
+} from "./resume-matcher.js";
+import type { PersistedResumeSeed } from "./run-persistence.js";
 import {
   canonicalStrictJson,
   cloneFrozenStrictJson,
@@ -400,6 +412,23 @@ interface RuntimeState {
   settlementSeq: number;
 }
 
+type ResumeReplayState =
+  | { kind: "open" }
+  | { kind: "closed"; reason: "unsafe-live-call" | "worktree-degraded" | "nested-workflow" };
+
+interface ResumeDecisionGate {
+  predecessor: Promise<void>;
+  release: () => void;
+}
+
+interface ResumeSeedController {
+  seed: PersistedResumeSeed;
+  indexes: ResumeCandidateIndexes;
+  consumed: Set<string>;
+  occurrences: readonly string[];
+  commitSeed: (remaining: PersistedResumeSeed) => void;
+}
+
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
 /**
@@ -456,10 +485,17 @@ export async function runWorkflow<T = unknown>(
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
   const journaling = options.journaling ?? true;
-  if (!journaling && (options.resumeJournal || options.resumeFromRunId)) {
+  if (!journaling && (options.resumeJournal || options.resumeFromRunId || options.preparedResume)) {
     throw new WorkflowError("journaling disabled for this run", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
       recoverable: false,
     });
+  }
+  if (options.resumeJournal && options.preparedResume && options.preparedResume.strategy !== "positional-v1") {
+    throw new WorkflowError(
+      "resumeJournal is compatible only with a prepared positional resume",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
   }
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
@@ -504,7 +540,9 @@ export async function runWorkflow<T = unknown>(
     currentPhase: meta.phases?.[0]?.title,
     phaseBudgets: new Map(),
     callSeq: 0,
-    firstMiss: Number.POSITIVE_INFINITY,
+    firstMiss: options.preparedResume?.strategy === "positional-v1"
+      ? initialPositionalFirstMiss(options.preparedResume.eligibility)
+      : Number.POSITIVE_INFINITY,
     agentSessions: [],
     fallbacks: [],
     checkpointsTaken: [],
@@ -653,6 +691,167 @@ export async function runWorkflow<T = unknown>(
     }
   };
 
+  const preparedResume = options.preparedResume;
+  const resumeReportPlan: ResumeReportPlan | undefined = preparedResume
+    ? preparedResume.strategy === "identity-v1"
+      ? {
+          strategy: preparedResume.strategy,
+          sourceRunId: preparedResume.sourceRunId,
+          requestedPolicy: preparedResume.requestedPolicy,
+        }
+      : preparedResume.strategy === "positional-v1"
+        ? {
+            strategy: preparedResume.strategy,
+            sourceRunId: preparedResume.sourceRunId,
+            requestedPolicy: preparedResume.requestedPolicy,
+            fallbackReason: preparedResume.fallbackReason,
+            eligibility: preparedResume.eligibility,
+          }
+        : {
+            strategy: preparedResume.strategy,
+            sourceRunId: preparedResume.sourceRunId,
+            requestedPolicy: preparedResume.requestedPolicy,
+            disabledReason: preparedResume.disabledReason,
+          }
+    : undefined;
+  const resumeDecisions = new Map<number, WorkflowResumeCallDecision>();
+  let resumeReplayState: ResumeReplayState = { kind: "open" };
+  let resumeDecisionTail = Promise.resolve();
+  let resumeFatalError: WorkflowError | undefined;
+
+  const createResumeSeedController = (
+    seed: PersistedResumeSeed,
+    commitSeed: (remaining: PersistedResumeSeed) => void,
+  ): ResumeSeedController => {
+    const indexes = buildResumeCandidateIndexes(seed);
+    const occurrences = [
+      ...seed.candidates.map((candidate) => indexedSourceOccurrence({ type: "candidate", candidate })),
+      ...(seed.checkpointInjections ?? []).map((injection) =>
+        indexedSourceOccurrence({ type: "injection", injection }),
+      ),
+    ];
+    return { seed, indexes, consumed: new Set(), occurrences, commitSeed };
+  };
+
+  const identitySeed = preparedResume?.strategy === "identity-v1"
+    ? createResumeSeedController(preparedResume.seed, preparedResume.commitSeed)
+    : undefined;
+  const positionalCheckpointSeed = preparedResume?.strategy === "positional-v1" && preparedResume.checkpoint
+    ? createResumeSeedController(preparedResume.checkpoint.seed, preparedResume.checkpoint.commitSeed)
+    : undefined;
+
+  const appendResumeDecisionGate = (): ResumeDecisionGate | undefined => {
+    if (!preparedResume) return undefined;
+    const predecessor = resumeDecisionTail;
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      resolveGate = resolve;
+    });
+    resumeDecisionTail = predecessor.then(() => gate, () => gate);
+    let released = false;
+    return {
+      predecessor,
+      release: () => {
+        if (released) return;
+        released = true;
+        resolveGate();
+      },
+    };
+  };
+
+  const emitResumeDecision = (decision: WorkflowResumeCallDecision) => {
+    if (resumeDecisions.has(decision.index)) return;
+    const frozen = deepFreeze({ ...decision }) as WorkflowResumeCallDecision;
+    resumeDecisions.set(frozen.index, frozen);
+    guardTerminal("onResumeDecision", () => options.onResumeDecision?.(frozen));
+  };
+
+  const resumePersistenceError = (error: unknown): WorkflowError =>
+    error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR
+      ? error
+      : new WorkflowError(
+          `failed to persist resume seed: ${errorMessage(error)}`,
+          WorkflowErrorCode.PERSISTENCE_ERROR,
+          { recoverable: false, details: error },
+        );
+
+  const failResumePersistence = (
+    error: unknown,
+    call?: { index: number; kind: "agent" | "checkpoint" },
+  ): WorkflowError => {
+    const failure = resumePersistenceError(error);
+    if (call) {
+      emitResumeDecision({
+        index: call.index,
+        kind: call.kind,
+        action: "failed",
+        reason: "seed-persistence-error",
+      });
+    }
+    resumeFatalError = failure;
+    return failure;
+  };
+
+  const remainingResumeSeed = (controller: ResumeSeedController): PersistedResumeSeed => {
+    const checkpointInjections = (controller.seed.checkpointInjections ?? []).filter((injection) =>
+      !controller.consumed.has(indexedSourceOccurrence({ type: "injection", injection })),
+    );
+    const next = {
+      format: "identity-v1" as const,
+      sourceRunId: controller.seed.sourceRunId,
+      candidates: controller.seed.candidates.filter((candidate) =>
+        !controller.consumed.has(indexedSourceOccurrence({ type: "candidate", candidate })),
+      ),
+      ...(checkpointInjections.length === 0 ? {} : { checkpointInjections }),
+    };
+    const captured = cloneFrozenStrictJson(next);
+    if (!captured.ok) throw new TypeError(`remaining resume seed is not strict JSON at ${captured.path}`);
+    return captured.clone as unknown as PersistedResumeSeed;
+  };
+
+  const commitResumeRemoval = (
+    controller: ResumeSeedController,
+    occurrences: readonly string[],
+    call?: { index: number; kind: "agent" | "checkpoint" },
+  ) => {
+    let changed = false;
+    for (const occurrence of occurrences) {
+      if (controller.consumed.has(occurrence)) continue;
+      controller.consumed.add(occurrence);
+      changed = true;
+    }
+    if (!changed) return;
+    try {
+      controller.commitSeed(remainingResumeSeed(controller));
+    } catch (error) {
+      throw failResumePersistence(error, call);
+    }
+  };
+
+  const closeIdentityResumeCache = (
+    reason: Extract<ResumeReplayState, { kind: "closed" }>["reason"],
+    call?: { index: number; kind: "agent" | "checkpoint" },
+  ) => {
+    if (!identitySeed || resumeReplayState.kind === "closed") return;
+    resumeReplayState = { kind: "closed", reason };
+    commitResumeRemoval(identitySeed, identitySeed.occurrences, call);
+  };
+
+  const enterResumeDecision = async (
+    gate: ResumeDecisionGate,
+    call: { index: number; kind: "agent" | "checkpoint" },
+  ) => {
+    await gate.predecessor;
+    if (!resumeFatalError) return;
+    emitResumeDecision({
+      index: call.index,
+      kind: call.kind,
+      action: "failed",
+      reason: "resume-fatal-latch",
+    });
+    throw resumeFatalError;
+  };
+
   const appendCallRecord = (
     input: Omit<WorkflowCallRecord, "settlementOrdinal" | "scope">,
   ): WorkflowCallRecord => {
@@ -799,6 +998,7 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
+    const resumeDecisionGate = appendResumeDecisionGate();
     onAllocated(callIndex);
     reportRootCallAllocated(callIndex);
 
@@ -838,100 +1038,37 @@ export async function runWorkflow<T = unknown>(
     // push slightly past total, then further agent() calls throw.)
     shared.agentCount++;
 
-    // Longest-unchanged-prefix resume: replay a cached result only while the
-    // prefix is still intact — this call's index is before the first changed/new
-    // call. Once any call misses, it AND everything after it run live (matching
-    // Claude Code's contract), so an edited upstream call never leaves stale
-    // downstream results served from the journal.
-    const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
-    const hashMatches = cached != null && cached.hash === callHash;
-    const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      try {
-        options.onAgentStart?.(deepFreeze({
-          label,
-          phase: assignedPhase,
-          prompt,
-          model: displayModel,
-          configOptions: agentOptions.configOptions,
-          callIndex,
-          scope: runId,
-        }));
-        const resultSnapshot = strictSnapshot(cached.result, `agent "${label}" replayed result`, label);
-        const cachedSession = cached.session ? cloneTelemetry(cached.session) : undefined;
-        const cachedUsage = cached.usage ? copyValidUsage(cached.usage) : undefined;
-        const sourceCall = positionalSourceCall(options.preparedResume, callIndex, "agent", callHash);
-        const currentReplaySafety: WorkflowResumeSafety | undefined = resumeDeclared
-          ? resolvedIsolation === "worktree" && agentOptions.cwd === undefined
-            ? "isolated-worktree"
-            : resolvedIsolation === undefined
-              ? "declared-read-only"
-              : undefined
-          : undefined;
-        const sourceResumeSafety = sourceCall &&
-          validateResumeSafetyMarker(sourceCall, false) &&
-          sourceCall.resumeSafety === currentReplaySafety
-          ? sourceCall.resumeSafety
-          : undefined;
-        const logicalBudgetDebit = sourceCall ? sourceLogicalBudgetDebit(sourceCall) : undefined;
-        if (cachedSession) state.agentSessions.push(cachedSession);
-        settle({
-          outcome: "result",
-          origin: "journal-replay",
-          ...(cachedUsage ? { usage: cachedUsage } : {}),
-          budgetDebit: 0,
-          ...(sourceResumeSafety ? { resumeSafety: sourceResumeSafety } : {}),
-          ...(sourceCall && options.preparedResume?.strategy === "positional-v1"
-            ? {
-                replay: {
-                  sourceRunId: options.preparedResume.sourceRunId,
-                  recordedIndex: callIndex,
-                  match: "index-hash" as const,
-                  ...(logicalBudgetDebit !== undefined ? { logicalBudgetDebit } : {}),
-                  ...(sourceResumeSafety ? { sourceResumeSafety } : {}),
-                },
-              }
-            : {}),
-        });
-        emitAgentEnd({
-          label,
-          phase: assignedPhase,
-          result: resultSnapshot,
-          tokens: 0,
-          model: displayModel,
-          session: cachedSession,
-          usage: cachedUsage,
-        });
-        return Promise.resolve(resultSnapshot);
-      } catch (error) {
-        const errorRecord = projectRecordedError(error);
-        const workflowError = wrapError(error, { agentLabel: label });
-        settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
-        emitAgentEnd({
-          label,
-          phase: assignedPhase,
-          result: null,
-          tokens: 0,
-          model: displayModel,
-          error: workflowError.message,
-          errorCode: workflowError.code,
-          recoverable: workflowError.recoverable,
-          errorRecord,
-        });
-        throw error;
-      }
-    }
-    // A genuine miss (no journal entry, or the hash changed) marks where the
-    // unchanged prefix ends; this call and every later one then run live.
-    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
-    if (!resumeDeclared || (resolvedIsolation === "worktree" && agentOptions.cwd !== undefined)) {
-      options.onResumeFilesystemTainted?.();
-    }
+    let precreatedWorktree: Worktree | undefined;
+    let preparedRunCwd: string | undefined;
+    let worktreePrepared = false;
+    let agentStartEmitted = false;
 
-    return limiter(async () => {
+    const emitAgentStart = () => {
+      if (agentStartEmitted) return;
+      agentStartEmitted = true;
+      options.onAgentStart?.(deepFreeze({
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        configOptions: agentOptions.configOptions,
+        callIndex,
+        scope: runId,
+      }));
+    };
+
+    const currentReplaySafety: WorkflowResumeSafety | undefined = resumeDeclared
+      ? resolvedIsolation === "worktree" && agentOptions.cwd === undefined
+        ? "isolated-worktree"
+        : resolvedIsolation === undefined
+          ? "declared-read-only"
+          : undefined
+      : undefined;
+
+    const runLive = () => limiter(async () => {
       const maxAttempts = retryAttempts + 1;
-      let worktree: Worktree | undefined;
-      let runCwd: string | undefined;
+      let worktree = precreatedWorktree;
+      let runCwd = preparedRunCwd;
       let attemptsRan = 0;
       let budgetDebit = 0;
       const sealedUsage: AgentUsage[] = [];
@@ -1033,15 +1170,7 @@ export async function runWorkflow<T = unknown>(
       };
 
       try {
-        options.onAgentStart?.(deepFreeze({
-          label,
-          phase: assignedPhase,
-          prompt,
-          model: displayModel,
-          configOptions: agentOptions.configOptions,
-          callIndex,
-          scope: runId,
-        }));
+        emitAgentStart();
 
         if (agentOptions.cwd !== undefined && typeof agentOptions.cwd !== "string") {
           throw new WorkflowError(
@@ -1050,7 +1179,7 @@ export async function runWorkflow<T = unknown>(
             { recoverable: false, agentLabel: label },
           );
         }
-        if (resolvedIsolation === "worktree") {
+        if (resolvedIsolation === "worktree" && !worktreePrepared) {
           try {
             worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
           } catch (error) {
@@ -1290,6 +1419,347 @@ export async function runWorkflow<T = unknown>(
         if (worktree?.isolated) await removeWorktree(worktree);
       }
     });
+
+    const replayPreparedAgent = async (input: {
+      entry: JournalEntry;
+      resultSnapshot: unknown;
+      sourceRunId: string;
+      recordedIndex: number;
+      match: "path-hash" | "unique-hash" | "index-hash";
+      logicalBudgetDebit?: number;
+      sourceResumeSafety?: WorkflowResumeSafety;
+      rebindSession: boolean;
+      manifestProvenance: boolean;
+    }): Promise<unknown> => {
+      await Promise.resolve();
+      if (input.rebindSession) shared.spent += input.logicalBudgetDebit as number;
+
+      emitAgentStart();
+      const recordedSession = input.entry.session ? cloneTelemetry(input.entry.session) : undefined;
+      let cachedSession: AgentSessionRecord | undefined;
+      if (recordedSession && input.rebindSession) {
+        const { phase: _recordedPhase, ...session } = recordedSession;
+        cachedSession = deepFreeze({
+          ...session,
+          callIndex,
+          label,
+          ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
+        });
+      } else {
+        cachedSession = recordedSession;
+      }
+      const cachedUsage = input.entry.usage ? copyValidUsage(input.entry.usage) : undefined;
+      if (cachedSession) state.agentSessions.push(cachedSession);
+      settle({
+        outcome: "result",
+        origin: "journal-replay",
+        ...(cachedUsage ? { usage: cachedUsage } : {}),
+        budgetDebit: 0,
+        ...(input.sourceResumeSafety ? { resumeSafety: input.sourceResumeSafety } : {}),
+        ...(input.manifestProvenance
+          ? {
+              replay: {
+                sourceRunId: input.sourceRunId,
+                recordedIndex: input.recordedIndex,
+                match: input.match,
+                ...(input.logicalBudgetDebit !== undefined
+                  ? { logicalBudgetDebit: input.logicalBudgetDebit }
+                  : {}),
+                ...(input.sourceResumeSafety
+                  ? { sourceResumeSafety: input.sourceResumeSafety }
+                  : {}),
+              },
+            }
+          : {}),
+      });
+      const entry = deepFreeze({
+        index: callIndex,
+        hash: callHash,
+        result: input.resultSnapshot,
+        kind: "agent" as const,
+        scope: runId,
+        ...(cachedSession ? { session: cachedSession } : {}),
+        ...(cachedUsage ? { usage: cachedUsage } : {}),
+        call: {
+          kind: "agent" as const,
+          label,
+          phase: assignedPhase,
+          model: displayModel,
+          backendId: cachedSession?.backendId,
+        },
+      });
+      guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
+      emitAgentEnd({
+        label,
+        phase: assignedPhase,
+        result: input.resultSnapshot,
+        tokens: 0,
+        model: displayModel,
+        session: cachedSession,
+        usage: cachedUsage,
+      });
+      return input.resultSnapshot;
+    };
+
+    const runPreparedAgent = async (): Promise<unknown> => {
+      const gate = resumeDecisionGate as ResumeDecisionGate;
+      const decisionCall = { index: callIndex, kind: "agent" as const };
+      let delegated = false;
+      try {
+        await enterResumeDecision(gate, decisionCall);
+        let liveReason: Extract<WorkflowResumeCallDecision, { action: "live" }>;
+
+        if (preparedResume?.strategy === "identity-v1") {
+          const match = selectResumeCandidate((identitySeed as ResumeSeedController).indexes, {
+            kind: "agent",
+            hash: callHash,
+            path: callPath,
+            inputsHash: callInputsHash,
+            cacheOpen: resumeReplayState.kind === "open",
+            consumed: (identitySeed as ResumeSeedController).consumed,
+            hasSchema: agentOptions.schema !== undefined,
+            resumeDeclared,
+            resolvedIsolation,
+            hasAgentCwd: agentOptions.cwd !== undefined,
+          });
+          if (match.action === "replay") {
+            const source = match.source as Extract<IndexedResumeSource, { type: "candidate" }>;
+            const resultSnapshot = strictSnapshot(
+              source.candidate.entry.result,
+              `agent "${label}" replayed result`,
+              label,
+            );
+            commitResumeRemoval(
+              identitySeed as ResumeSeedController,
+              [indexedSourceOccurrence(source)],
+              decisionCall,
+            );
+            emitResumeDecision({
+              index: callIndex,
+              kind: "agent",
+              action: "replayed",
+              sourceRunId: source.candidate.sourceRunId,
+              recordedIndex: source.candidate.recordedIndex,
+              match: match.match,
+              logicalBudgetDebit: source.candidate.logicalBudgetDebit as number,
+            });
+            gate.release();
+            return replayPreparedAgent({
+              entry: source.candidate.entry,
+              resultSnapshot,
+              sourceRunId: source.candidate.sourceRunId,
+              recordedIndex: source.candidate.recordedIndex,
+              match: match.match,
+              logicalBudgetDebit: source.candidate.logicalBudgetDebit,
+              sourceResumeSafety: source.candidate.call.resumeSafety,
+              rebindSession: true,
+              manifestProvenance: true,
+            });
+          }
+          if (match.closesSuffix) {
+            closeIdentityResumeCache("unsafe-live-call", decisionCall);
+          } else if (match.remove) {
+            commitResumeRemoval(
+              identitySeed as ResumeSeedController,
+              [indexedSourceOccurrence(match.remove)],
+              decisionCall,
+            );
+          }
+          if (currentReplaySafety === undefined) {
+            closeIdentityResumeCache("unsafe-live-call", decisionCall);
+          }
+          liveReason = {
+            index: callIndex,
+            kind: "agent",
+            action: "live",
+            reason: match.reason,
+          };
+        } else if (preparedResume?.strategy === "positional-v1") {
+          const sourceCall = positionalSourceCall(preparedResume, callIndex, "agent", callHash);
+          const match = selectPositionalResume({
+            index: callIndex,
+            kind: "agent",
+            hash: callHash,
+            inputsHash: callInputsHash,
+            eligibility: preparedResume.eligibility,
+            firstMiss: state.firstMiss,
+            cached: journaling ? options.resumeJournal?.get(callIndex) : undefined,
+            sourceCall,
+            hasSchema: agentOptions.schema !== undefined,
+            resumeDeclared,
+            resolvedIsolation,
+            hasAgentCwd: agentOptions.cwd !== undefined,
+          });
+          state.firstMiss = match.nextFirstMiss;
+          if (match.action === "replay") {
+            const resultSnapshot = strictSnapshot(match.entry.result, `agent "${label}" replayed result`, label);
+            const sourceResumeSafety = sourceCall && sourceCall.resumeSafety === currentReplaySafety
+              ? sourceCall.resumeSafety
+              : undefined;
+            emitResumeDecision({
+              index: callIndex,
+              kind: "agent",
+              action: "replayed",
+              sourceRunId: preparedResume.sourceRunId,
+              recordedIndex: callIndex,
+              match: match.match,
+              ...(match.logicalBudgetDebit === undefined
+                ? {}
+                : { logicalBudgetDebit: match.logicalBudgetDebit }),
+            });
+            gate.release();
+            return replayPreparedAgent({
+              entry: match.entry,
+              resultSnapshot,
+              sourceRunId: preparedResume.sourceRunId,
+              recordedIndex: callIndex,
+              match: match.match,
+              logicalBudgetDebit: match.logicalBudgetDebit,
+              sourceResumeSafety,
+              rebindSession: false,
+              manifestProvenance: sourceCall !== undefined,
+            });
+          }
+          liveReason = {
+            index: callIndex,
+            kind: "agent",
+            action: "live",
+            reason: match.reason,
+          };
+        } else {
+          liveReason = {
+            index: callIndex,
+            kind: "agent",
+            action: "live",
+            reason: "strategy-live",
+          };
+        }
+
+        if (currentReplaySafety === undefined) options.onResumeFilesystemTainted?.();
+
+        if (resolvedIsolation === "worktree") {
+          emitAgentStart();
+          if (agentOptions.cwd !== undefined && typeof agentOptions.cwd !== "string") {
+            emitResumeDecision(liveReason);
+            gate.release();
+            throw new WorkflowError(
+              `agent "${label}": options.cwd must be a string`,
+              WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+              { recoverable: false, agentLabel: label },
+            );
+          }
+          worktreePrepared = true;
+          try {
+            precreatedWorktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
+          } catch (error) {
+            if (resumeDeclared) options.onResumeFilesystemTainted?.();
+            if (preparedResume?.strategy === "identity-v1") {
+              closeIdentityResumeCache("worktree-degraded", decisionCall);
+            }
+            liveReason = { ...liveReason, reason: "worktree-degraded" };
+            emitResumeDecision(liveReason);
+            gate.release();
+            throw error;
+          }
+          if (!precreatedWorktree.isolated) {
+            log(`isolation ignored for "${label}" (${precreatedWorktree.reason})`);
+          }
+          const worktreeDegraded = !precreatedWorktree.isolated ||
+            (resumeDeclared && agentOptions.cwd !== undefined);
+          if (worktreeDegraded) {
+            if (resumeDeclared) options.onResumeFilesystemTainted?.();
+            if (preparedResume?.strategy === "identity-v1") {
+              closeIdentityResumeCache("worktree-degraded", decisionCall);
+            }
+            liveReason = { ...liveReason, reason: "worktree-degraded" };
+          }
+          preparedRunCwd = precreatedWorktree.isolated
+            ? precreatedWorktree.cwd
+            : resolvePath(baseCwd, agentOptions.cwd ?? ".");
+        }
+
+        emitResumeDecision(liveReason);
+        gate.release();
+        delegated = true;
+        return runLive();
+      } catch (error) {
+        gate.release();
+        if (!delegated && precreatedWorktree?.isolated) await removeWorktree(precreatedWorktree);
+        if (!settled) {
+          const errorRecord = projectRecordedError(error);
+          const workflowError = wrapError(error, { agentLabel: label });
+          settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+          if (agentStartEmitted) {
+            emitAgentEnd({
+              label,
+              phase: assignedPhase,
+              result: null,
+              tokens: 0,
+              model: displayModel,
+              error: workflowError.message,
+              errorCode: workflowError.code,
+              recoverable: workflowError.recoverable,
+              errorRecord,
+            });
+          }
+        }
+        throw error;
+      }
+    };
+
+    const runManualAgent = (): Promise<unknown> => {
+      const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
+      const hashMatches = cached != null && cached.hash === callHash;
+      const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
+      if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+        try {
+          emitAgentStart();
+          const resultSnapshot = strictSnapshot(cached.result, `agent "${label}" replayed result`, label);
+          const cachedSession = cached.session ? cloneTelemetry(cached.session) : undefined;
+          const cachedUsage = cached.usage ? copyValidUsage(cached.usage) : undefined;
+          if (cachedSession) state.agentSessions.push(cachedSession);
+          settle({
+            outcome: "result",
+            origin: "journal-replay",
+            ...(cachedUsage ? { usage: cachedUsage } : {}),
+            budgetDebit: 0,
+          });
+          emitAgentEnd({
+            label,
+            phase: assignedPhase,
+            result: resultSnapshot,
+            tokens: 0,
+            model: displayModel,
+            session: cachedSession,
+            usage: cachedUsage,
+          });
+          return Promise.resolve(resultSnapshot);
+        } catch (error) {
+          const errorRecord = projectRecordedError(error);
+          const workflowError = wrapError(error, { agentLabel: label });
+          settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+          emitAgentEnd({
+            label,
+            phase: assignedPhase,
+            result: null,
+            tokens: 0,
+            model: displayModel,
+            error: workflowError.message,
+            errorCode: workflowError.code,
+            recoverable: workflowError.recoverable,
+            errorRecord,
+          });
+          throw error;
+        }
+      }
+      if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+      if (!resumeDeclared || (resolvedIsolation === "worktree" && agentOptions.cwd !== undefined)) {
+        options.onResumeFilesystemTainted?.();
+      }
+      return runLive();
+    };
+
+    return preparedResume ? runPreparedAgent() : runManualAgent();
   };
 
   const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
@@ -1363,7 +1833,22 @@ export async function runWorkflow<T = unknown>(
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
   // run's limiter/counters/budget so the global caps hold. One level deep only.
-  const workflowImplementation = async (nameOrScript: string, childArgs?: unknown) => {
+  const workflowImplementation = async (
+    nameOrScript: string,
+    childArgs: unknown,
+    resumeGate: ResumeDecisionGate | undefined,
+  ) => {
+    if (resumeGate) {
+      try {
+        await resumeGate.predecessor;
+        if (resumeFatalError) throw resumeFatalError;
+        if (preparedResume?.strategy === "identity-v1") {
+          closeIdentityResumeCache("nested-workflow");
+        }
+      } finally {
+        resumeGate.release();
+      }
+    }
     throwIfAborted();
     if (shared.depth >= 1) {
       throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
@@ -1407,10 +1892,14 @@ export async function runWorkflow<T = unknown>(
   };
 
   const workflowFn = (nameOrScript: string, childArgs?: unknown): Promise<unknown> => {
+    if (options.resumeJournal || preparedResume?.strategy === "positional-v1") {
+      state.firstMiss = Math.min(state.firstMiss, state.callSeq);
+    }
+    const resumeGate = appendResumeDecisionGate();
     beginResumeActivity();
     let promise: Promise<unknown>;
     try {
-      promise = workflowImplementation(nameOrScript, childArgs);
+      promise = workflowImplementation(nameOrScript, childArgs, resumeGate);
     } catch (error) {
       promise = Promise.reject(error);
     }
@@ -1614,6 +2103,7 @@ export async function runWorkflow<T = unknown>(
     const callInputsHash = hashCheckpointInputs(capturedCheckpointOptions);
     const callPath = captureCallPath(vmFilename, preludeLines);
     const callIndex = state.callSeq++;
+    const resumeDecisionGate = appendResumeDecisionGate();
     onAllocated(callIndex);
     reportRootCallAllocated(callIndex);
     let settled: WorkflowCallRecord | undefined;
@@ -1634,50 +2124,256 @@ export async function runWorkflow<T = unknown>(
       });
       return settled;
     };
-    const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
-      shared.agentCount++;
+    shared.agentCount++;
+
+    const replayCheckpoint = (input: {
+      resultSnapshot: unknown;
+      sourceRunId: string;
+      recordedIndex: number;
+      match: "path-hash" | "unique-hash" | "index-hash";
+      checkpointInjected?: true;
+      checkpointHostDecision: boolean;
+      manifestProvenance: boolean;
+    }): unknown => {
+      settle({
+        outcome: "result",
+        origin: "journal-replay",
+        ...(input.manifestProvenance
+          ? {
+              replay: {
+                sourceRunId: input.sourceRunId,
+                recordedIndex: input.recordedIndex,
+                match: input.match,
+                ...(input.checkpointHostDecision ? { checkpointHostDecision: true as const } : {}),
+                ...(input.checkpointInjected ? { checkpointInjected: true as const } : {}),
+              },
+            }
+          : {}),
+      });
+      const journalEntry = deepFreeze({
+        index: callIndex,
+        hash: callHash,
+        result: input.resultSnapshot,
+        kind: "checkpoint" as const,
+        scope: runId,
+        call: { kind: "checkpoint" as const, label: "checkpoint" as const, phase: state.currentPhase },
+      });
+      guardTerminal("onAgentJournal", () => options.onAgentJournal?.(journalEntry));
+      const checkpointTaken: WorkflowCheckpointTaken = deepFreeze({
+        callIndex,
+        kind: checkpointKind ?? "confirm",
+        decision: input.resultSnapshot,
+        source: input.checkpointInjected ? "injected" : "journal-replay",
+      });
+      state.checkpointsTaken.push(checkpointTaken);
+      guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(checkpointTaken));
+      return input.resultSnapshot;
+    };
+
+    if (preparedResume) {
+      const gate = resumeDecisionGate as ResumeDecisionGate;
+      const decisionCall = { index: callIndex, kind: "checkpoint" as const };
       try {
-        const resultSnapshot = strictSnapshot(cached.result, `checkpoint "${promptText}" replayed reply`);
-        const sourceCall = positionalSourceCall(options.preparedResume, callIndex, "checkpoint", callHash);
-        const checkpointHostDecision = sourceCall?.origin === "confirm" ||
-          (sourceCall?.origin === "journal-replay" && sourceCall.replay?.checkpointHostDecision === true);
-        settle({
-          outcome: "result",
-          origin: "journal-replay",
-          ...(sourceCall && options.preparedResume?.strategy === "positional-v1"
-            ? {
-                replay: {
-                  sourceRunId: options.preparedResume.sourceRunId,
-                  recordedIndex: callIndex,
-                  match: "index-hash" as const,
-                  ...(checkpointHostDecision ? { checkpointHostDecision: true as const } : {}),
-                },
+        await enterResumeDecision(gate, decisionCall);
+        let liveReason: Extract<WorkflowResumeCallDecision, { action: "live" }>;
+
+        if (preparedResume.strategy === "identity-v1") {
+          const match = selectResumeCandidate((identitySeed as ResumeSeedController).indexes, {
+            kind: "checkpoint",
+            hash: callHash,
+            path: callPath,
+            inputsHash: callInputsHash,
+            cacheOpen: resumeReplayState.kind === "open",
+            consumed: (identitySeed as ResumeSeedController).consumed,
+          });
+          if (match.action === "replay") {
+            const result = match.source.type === "candidate"
+              ? match.source.candidate.entry.result
+              : match.source.injection.decision;
+            const resultSnapshot = strictSnapshot(result, `checkpoint "${promptText}" replayed reply`);
+            commitResumeRemoval(
+              identitySeed as ResumeSeedController,
+              [indexedSourceOccurrence(match.source)],
+              decisionCall,
+            );
+            const source = match.source.type === "candidate"
+              ? match.source.candidate
+              : match.source.injection;
+            const checkpointInjected = match.source.type === "injection" ? true as const : undefined;
+            emitResumeDecision({
+              index: callIndex,
+              kind: "checkpoint",
+              action: "replayed",
+              sourceRunId: source.sourceRunId,
+              recordedIndex: source.recordedIndex,
+              match: match.match,
+              ...(checkpointInjected ? { checkpointInjected } : {}),
+            });
+            gate.release();
+            return replayCheckpoint({
+              resultSnapshot,
+              sourceRunId: source.sourceRunId,
+              recordedIndex: source.recordedIndex,
+              match: match.match,
+              ...(checkpointInjected ? { checkpointInjected } : {}),
+              checkpointHostDecision: true,
+              manifestProvenance: true,
+            });
+          }
+          if (match.remove) {
+            commitResumeRemoval(
+              identitySeed as ResumeSeedController,
+              [indexedSourceOccurrence(match.remove)],
+              decisionCall,
+            );
+          }
+          if (options.confirm) closeIdentityResumeCache("unsafe-live-call", decisionCall);
+          liveReason = {
+            index: callIndex,
+            kind: "checkpoint",
+            action: "live",
+            reason: match.reason,
+          };
+        } else if (preparedResume.strategy === "positional-v1") {
+          if (positionalCheckpointSeed && callIndex < state.firstMiss) {
+            const injectionMatch = selectResumeCandidate(positionalCheckpointSeed.indexes, {
+              kind: "checkpoint",
+              hash: callHash,
+              path: callPath,
+              inputsHash: callInputsHash,
+              cacheOpen: true,
+              consumed: positionalCheckpointSeed.consumed,
+            });
+            if (injectionMatch.action === "replay" && injectionMatch.source.type === "injection") {
+              const injection = injectionMatch.source.injection;
+              const resultSnapshot = strictSnapshot(
+                injection.decision,
+                `checkpoint "${promptText}" injected reply`,
+              );
+              commitResumeRemoval(
+                positionalCheckpointSeed,
+                [indexedSourceOccurrence(injectionMatch.source)],
+                decisionCall,
+              );
+              if (callIndex !== injection.recordedIndex) {
+                state.firstMiss = Math.min(state.firstMiss, callIndex + 1);
               }
-            : {}),
-        });
-        const entry: WorkflowCheckpointTaken = deepFreeze({
-          callIndex,
-          kind: checkpointKind ?? "confirm",
-          decision: resultSnapshot,
-          source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
-        });
-        state.checkpointsTaken.push(entry);
-        guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(entry));
-        return resultSnapshot;
+              emitResumeDecision({
+                index: callIndex,
+                kind: "checkpoint",
+                action: "replayed",
+                sourceRunId: injection.sourceRunId,
+                recordedIndex: injection.recordedIndex,
+                match: injectionMatch.match,
+                checkpointInjected: true,
+              });
+              gate.release();
+              return replayCheckpoint({
+                resultSnapshot,
+                sourceRunId: injection.sourceRunId,
+                recordedIndex: injection.recordedIndex,
+                match: injectionMatch.match,
+                checkpointInjected: true,
+                checkpointHostDecision: true,
+                manifestProvenance: true,
+              });
+            }
+          }
+
+          const sourceCall = positionalSourceCall(preparedResume, callIndex, "checkpoint", callHash);
+          const match = selectPositionalResume({
+            index: callIndex,
+            kind: "checkpoint",
+            hash: callHash,
+            inputsHash: callInputsHash,
+            eligibility: preparedResume.eligibility,
+            firstMiss: state.firstMiss,
+            cached: journaling ? options.resumeJournal?.get(callIndex) : undefined,
+            sourceCall,
+          });
+          state.firstMiss = match.nextFirstMiss;
+          if (match.action === "replay") {
+            const resultSnapshot = strictSnapshot(
+              match.entry.result,
+              `checkpoint "${promptText}" replayed reply`,
+            );
+            const checkpointHostDecision = sourceCall?.origin === "confirm" ||
+              (sourceCall?.origin === "journal-replay" &&
+                sourceCall.replay?.checkpointHostDecision === true);
+            const checkpointInjected = options.injectedCheckpointReplies?.has(callIndex)
+              ? true as const
+              : undefined;
+            emitResumeDecision({
+              index: callIndex,
+              kind: "checkpoint",
+              action: "replayed",
+              sourceRunId: preparedResume.sourceRunId,
+              recordedIndex: callIndex,
+              match: match.match,
+              ...(checkpointInjected ? { checkpointInjected } : {}),
+            });
+            gate.release();
+            return replayCheckpoint({
+              resultSnapshot,
+              sourceRunId: preparedResume.sourceRunId,
+              recordedIndex: callIndex,
+              match: match.match,
+              ...(checkpointInjected ? { checkpointInjected } : {}),
+              checkpointHostDecision,
+              manifestProvenance: sourceCall !== undefined,
+            });
+          }
+          liveReason = {
+            index: callIndex,
+            kind: "checkpoint",
+            action: "live",
+            reason: match.reason,
+          };
+        } else {
+          liveReason = {
+            index: callIndex,
+            kind: "checkpoint",
+            action: "live",
+            reason: "strategy-live",
+          };
+        }
+
+        if (options.confirm) options.onResumeFilesystemTainted?.();
+        emitResumeDecision(liveReason);
+        gate.release();
       } catch (error) {
-        settle({ outcome: "error", origin: "journal-replay", error: projectRecordedError(error) });
+        gate.release();
+        settle({ outcome: "error", origin: "engine", error: projectRecordedError(error) });
         throw error;
       }
+    } else {
+      const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
+      if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+        try {
+          const resultSnapshot = strictSnapshot(cached.result, `checkpoint "${promptText}" replayed reply`);
+          settle({ outcome: "result", origin: "journal-replay" });
+          const entry: WorkflowCheckpointTaken = deepFreeze({
+            callIndex,
+            kind: checkpointKind ?? "confirm",
+            decision: resultSnapshot,
+            source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
+          });
+          state.checkpointsTaken.push(entry);
+          guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(entry));
+          return resultSnapshot;
+        } catch (error) {
+          settle({ outcome: "error", origin: "journal-replay", error: projectRecordedError(error) });
+          throw error;
+        }
+      }
+      if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
     }
-    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
-    shared.agentCount++;
 
     const origin = options.confirm ? "confirm" as const : "headless" as const;
     try {
       let reply: unknown;
       if (options.confirm) {
-        options.onResumeFilesystemTainted?.();
+        if (!preparedResume) options.onResumeFilesystemTainted?.();
         reply = await options.confirm(promptText, capturedCheckpointOptions, {
           callIndex,
           hash: callHash,
@@ -1854,6 +2550,9 @@ export async function runWorkflow<T = unknown>(
     ...(state.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: state.checkpointsTaken }),
     calls: Object.freeze([...state.calls]) as WorkflowCallRecord[],
     callsAllocated: state.callSeq,
+    ...(resumeReportPlan
+      ? { resumeReport: buildResumeReport(resumeReportPlan, [...resumeDecisions.values()]) }
+      : {}),
     effectiveLimits: {
       maxAgents,
       tokenBudget: options.tokenBudget ?? null,
@@ -2235,15 +2934,6 @@ function positionalSourceCall(
   return source?.index === index && source.kind === kind && source.hash === hash && source.outcome === "result"
     ? source
     : undefined;
-}
-
-function sourceLogicalBudgetDebit(record: WorkflowCallRecord): number | undefined {
-  const debit = record.origin === "runner"
-    ? record.budgetDebit
-    : record.origin === "journal-replay"
-      ? record.replay?.logicalBudgetDebit
-      : undefined;
-  return typeof debit === "number" && Number.isFinite(debit) && debit >= 0 ? debit : undefined;
 }
 
 /** Stable identity hash for a checkpoint() call — a cache miss on resume when anything changes. */
