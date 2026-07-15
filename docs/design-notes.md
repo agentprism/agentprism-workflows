@@ -756,7 +756,60 @@ persisted `ReplayReport`; they cannot be resumed or selected as later baselines.
 
 ---
 
-## 9. Caveats / version pins / things to design around
+## 9. Durable run events — two authorities, one ordered observation stream
+
+The typed live `RunEvent` contract and the append-only `<runId>.events.jsonl` sidecar make manager
+observations consumable after the initiating process/request is gone. The sidecar is deliberately
+an observability projection, not another workflow recovery format and not an ACP transcript.
+
+**Append before watermark.** A publication mutates its managed state, projects and appends event
+sequence N, then advances `PersistedRunState.eventSeq` and performs any required snapshot save.
+That ordering prevents a concurrent reader from seeing a snapshot that claims an event which does
+not yet exist. It also defines snapshot-plus-tail consumption cleanly: load a snapshot at watermark
+N, pin its `eventStreamId`, then consume records strictly after N. A crash may leave a valid log
+ahead of a stale watermark, which is safe catch-up; a snapshot ahead of the valid log is an
+integrity failure and readers fail closed rather than inventing observations.
+
+**Generation pinning survives run-ID reuse.** A new journaling run mints a random 32-character
+lowercase hexadecimal `eventStreamId`; resume retains it, while delete followed by recreation of
+the same `runId` mints another. Every record repeats the generation and a watcher pins the one it
+validated at construction. A reader racing lease-protected delete/recreate therefore reports a
+stream mismatch instead of stitching the old prefix to the replacement suffix. Sequence alone
+would not distinguish those two histories.
+
+**Snapshot and log have separate authority.** The snapshot/journal is authoritative for resumable
+state, full agent results, session re-attach records, and the current run status. The event log is
+authoritative for the order and greatest valid sequence of bounded observations. A corrupt or
+incomplete event sidecar never blocks snapshot-based workflow recovery, but `readEvents()` and
+`watchEvents()` fail closed because they cannot honestly promise a gap-free tail. Conversely, the
+redacted event projection is never replayed as an agent result. Inline child workflows share the
+root sidecar with their own `scope`; they intentionally do not gain another snapshot or resume
+journal.
+
+**ACP transcript traffic stays relay-only.** `agentEvent` and `agentHistory` are typed so live
+hosts can render or capture them, but message/thought chunks, tool payloads, permission inputs, raw
+vendor messages, and session traffic are high-frequency and content-heavy. Persisting them by
+default would quietly choose security, consent, volume, and retention policy for every embedder.
+The v1 sidecar therefore admits bounded lifecycle, call, usage, and authored-log observations only;
+a host that needs transcripts owns a separate store and policy.
+
+**Writer simplicity is intentional.** Exactly one lease-owning writer may mutate a run. For each
+persisted event, the default writer performs one open/write/verify/close syscall sequence: open the
+sidecar in append mode, issue one synchronous write for the complete LF-terminated record, verify
+the byte count, and close before returning. There is no user-space buffer or per-event
+`fsync`/`fdatasync`. This is a deliberate simplicity-over-throughput choice sized for the
+lifecycle-only default persistence policy. Any future opt-in for high-frequency events must revisit
+batching, backpressure, durability, and failure boundaries rather than inherit this path
+unexamined.
+
+Deletion follows the same ownership rule. The manager holds or reacquires the run lease, removes
+the sidecar before delegating snapshot deletion, removes the default lock last, and releases in
+`finally`. Detached callbacks lose durable publication authority when deletion wins, so they cannot
+resurrect a snapshot or sidecar after the run was removed.
+
+---
+
+## 10. Caveats / version pins / things to design around
 
 - **Version-specific (Claude):** the structured-output path is verified for
   `claude-agent-acp@0.57.0` / `@anthropic-ai/claude-agent-sdk@0.3.202`. The `_meta.claudeCode`
@@ -793,7 +846,7 @@ persisted `ReplayReport`; they cannot be resumed or selected as later baselines.
 
 ---
 
-## 10. References
+## 11. References
 
 **Packages (verified versions, 2026-07-09):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk

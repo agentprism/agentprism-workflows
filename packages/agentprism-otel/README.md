@@ -46,6 +46,13 @@ export interface OtelAttachment {
 export function attachOtel(manager: WorkflowManagerLike, options?: AgentPrismOtelOptions): OtelAttachment;
 ```
 
+`WorkflowManagerLike` intentionally remains the two-method structural attachment seam (`on` and
+`removeListener`), so hosts may attach the bridge to the SDK manager or any compatible emitter
+without a runtime AgentPrism dependency. Internally, the bridge's exported payload aliases consume
+`EngineRunEventPayloadMap` and the shared `RunAgentEventPayload` contract through type-only imports;
+the published runtime dependency remains `@opentelemetry/api` alone. Existing exported names such as
+`LogPayload`, `AgentEndPayload`, `PausedPayload`, and `ToolCallEventLike` are retained.
+
 | Option | Default | Effect |
 |---|---:|---|
 | `tracerProvider` | `trace.getTracerProvider()` | Provider used to create the `@automatalabs/agentprism-otel` tracer. |
@@ -111,5 +118,9 @@ Metrics intentionally do not carry `runId` to avoid high-cardinality time series
 ## Event Surface
 
 The bridge subscribes to `log`, `phase`, `agentStart`, `agentEnd`, `tokenUsage`, `complete`, `paused`, `error`, `stopped`, `resumed`, and facade `agentEvent` tool-call updates. It does not subscribe to `journal` or `agentHistory`.
+
+Engine handlers use the shared typed run-event payload map directly. Tool correlation prefers the
+event contract's `(scope, callIndex)` key when present, then retains label-based compatibility for
+older or direct runner events that omit `callIndex`.
 
 Every handler is wrapped and reports failures through OpenTelemetry diagnostics, so malformed payloads or exporter behavior cannot throw into the manager.

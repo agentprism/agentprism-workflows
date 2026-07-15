@@ -16,6 +16,15 @@ test("generated authoring-prompt content is in sync with the skill sources", () 
   );
 });
 
+test("generated authoring-prompt distinguishes background start from awaited progress", () => {
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("background start has no enduring request channel"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("emits no progress after returning"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("when that await carries a progress token"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("distinct started/ended-call progress"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("polling fallback emits no progress notifications"));
+  assert.ok(!AUTHORING_PROMPT_CONTENT.includes("It has no progress token or live checkpoint elicitation"));
+});
+
 test("generated authoring-prompt teaches changed-args resume semantics", () => {
   assert.ok(
     AUTHORING_PROMPT_CONTENT.includes(

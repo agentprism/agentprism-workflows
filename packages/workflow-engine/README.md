@@ -216,6 +216,63 @@ journal entry and in `WorkflowRunResult.agentSessions`. `agent({ keepSession: tr
 to the runner so an ACP implementation can skip release-time `session/close`; re-attaching is a
 host/runner responsibility, not an in-script DSL operation.
 
+## Durable run-event log
+
+Journaling runs use the existing project-scoped `runsDir` and one structured sidecar:
+
+```text
+<runsDir>/<runId>.json          # atomic resumable snapshot
+<runsDir>/<runId>.json.bak      # best-effort snapshot backup
+<runsDir>/<runId>.log           # unstructured engine log
+<runsDir>/<runId>.events.jsonl  # bounded, redacted run events
+```
+
+`createRunPersistence()` and `manager.getPersistence()` return `RunEventPersistence`, an additive
+subtype of `RunPersistence`. A snapshot carries `eventStreamId` plus the highest reflected
+`eventSeq`; read the snapshot, consume the suffix after that watermark, then watch from the returned
+cursor while pinning the same stream generation:
+
+```ts
+const persistence = manager.getPersistence();
+const snapshot = persistence.load(runId);
+if (!snapshot?.eventStreamId || snapshot.eventSeq === undefined) {
+  throw new Error("run has no durable event stream");
+}
+
+const page = persistence.readEvents(runId, {
+  streamId: snapshot.eventStreamId,
+  after: snapshot.eventSeq,
+  limit: 100,
+});
+for (const record of page.events) consume(record);
+
+const stream = persistence.watchEvents(runId, {
+  streamId: page.streamId,
+  after: page.cursor,
+  signal,
+});
+for await (const record of stream) consume(record);
+```
+
+`readEvents()` returns `{ events, streamId, cursor, endCursor, hasMore }` (default limit 100,
+maximum 1000). `watchEvents()` validates synchronously, yields backlog before new appends, and
+returns a pull-based `RunEventStream`; abort, `close()`, and `return()` end it normally. The stream
+does not auto-close on completion/pause/error because the run may resume. Every continuation must
+pass the prior stream ID so delete/recreate of the same `runId` fails with `STREAM_MISMATCH` instead
+of joining generations.
+
+Lifecycle, call, usage, and authored-log events persist by default; `agentHistory` and the SDK-only
+ACP `agentEvent` stream remain live-only. Records are projected at write time, capped at 65,536
+UTF-8 bytes including LF, and have no raw-reader bypass. A corrupt, inconsistent, legacy, or marked
+incomplete sidecar raises `RunEventLogError`; snapshot/journal recovery remains independent. See
+[`docs/api.md`](../../docs/api.md#durable-run-event-log) for the complete policy and error/remedy
+table.
+
+Exactly one writer per run is required. `WorkflowManager` holds the cross-process run lease around
+publication and deletion; custom/direct callers of `appendEvent()`, `save()`, or `delete()` must
+provide equivalent exclusion. `deleteRun()` removes the sidecar before the snapshot while holding
+that lease, preventing detached callbacks or a competing process from recreating durable state.
+
 ## Key exports
 
 From `@automatalabs/workflow-engine` (see `src/index.ts`):
@@ -225,7 +282,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
   `SharedRuntime`.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
   `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
-  `RunLease`, `RunStatus`, `PersistedRunState`, `PersistedAgentState`, `FsLayer`; safe
+  `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,
+  `PersistedAgentState`, `FsLayer`; `readEvents()`/`watchEvents()` options/results/errors; safe
   `inspectRun()` and the `WorkflowRunStatus` / inspection / log-tail / call / truncation contracts.
 - **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /
   `OpenWorkflowDirOptions` types.

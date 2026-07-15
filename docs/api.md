@@ -239,22 +239,178 @@ headless-default, so detached runs do not pause unless the author opts in.
 
 ### Events
 
-`WorkflowManager` is an `EventEmitter`; **every payload carries `runId`** — route by it, no reverse index needed. Listeners are observability-only: a throwing listener is isolated and never affects the run.
+`WorkflowManager` remains a Node `EventEmitter`, but its named methods have typed overloads. Import
+the dependency-neutral engine contract from `@automatalabs/shared-types`, the persistence seam from
+`@automatalabs/workflow-engine`, or both plus the exact ACP specialization from the SDK facade:
 
-| Event | Payload (beyond `runId`) |
+```ts
+import type {
+  EngineRunEvent,
+  EngineRunEventPayloadMap,
+  RunEvent,
+} from "@automatalabs/shared-types";
+import type { RunEventLogRecord, RunEventPersistence } from "@automatalabs/workflow-engine";
+import type {
+  WorkflowAgentEvent,
+  WorkflowAgentEventPayloadMap,
+  WorkflowRunEvent,
+} from "@automatalabs/workflows";
+```
+
+`EngineRunEventPayloadMap["agentEnd"]`, for example, is the payload inferred by
+`manager.on("agentEnd", listener)`. `EngineRunEvent` is the exact engine-manager union;
+`RunEvent` adds a dependency-neutral generic `agentEvent` branch; and `WorkflowRunEvent` binds that
+branch to `AcpRunnerEventMap`. Every engine payload carries `{ runId, scope }`: `runId` owns the
+snapshot and sidecar, while `scope` identifies the root or inline nested engine invocation that
+originated the observation. Root events use `scope === runId`; an inline child uses its
+`${runId}-nested<ordinal>` scope but still writes the parent's sidecar. Use `(scope, callIndex)` as
+the logical call key. Listeners are observability-only: a throwing listener is isolated and never
+affects the run.
+
+| Event | Main live payload fields beyond `runId` and `scope` |
 |---|---|
 | `log` | `message` |
-| `phase` | `phase` title |
-| `agentStart` | `label`, `phase`, `prompt`, `model?` |
-| `agentEnd` | `label`, `phase`, `result` (`null` on error), `tokens`, `error?`, `errorCode?`, `recoverable?`, `model?`, `worktree?` |
-| `agentHistory` | `label`, `history` (message/tool-call entries) |
+| `phase` | `title` |
+| `agentStart` | `label`, `phase?`, `prompt`, `model?`, `configOptions?`, `callIndex` |
+| `agentEnd` | `label`, `phase?`, `result`, `callIndex`, usage/model/backend/provenance fields, optional error fields |
+| `agentHistory` | `label`, `phase?`, `history`, `callIndex` |
 | `journal` | `entry` (`JournalEntry`) — live journal append observations, including when file journaling is disabled |
+| `callRecord` | `record` (`WorkflowCallRecord`), including terminal non-journal exits |
 | `tokenUsage` | `usage` (cumulative input/output/total/cost/cache) |
 | `complete` | `result` (the composed `WorkflowRunResult`) |
-| `paused` | `reason` (`"usage_limit"` \| `"auth_required"` \| `"checkpoint_required"`), `error`, `resetHint?` (usage-limit only), `authContext?` (auth only), `checkpointContext?` (durable checkpoint only) |
-| `stopped` / `resumed` | — |
-| `error` | `error` (`WorkflowError`) — emitted only when a listener exists, so an unheard `error` never masks the thrown one |
-| `agentEvent` | **The token-level streaming surface** (facade manager only — see below). |
+| `paused` | manual pause, or `reason` plus `error`/`errorRecord` and the applicable reset/auth/checkpoint context |
+| `stopped` / `resumed` | origin only |
+| `error` | `error` plus strict-JSON `errorRecord`; named delivery remains listener-gated |
+| `agentEvent` | The SDK's live ACP stream (see below) |
+
+Calling public `manager.emit()` is still a raw EventEmitter operation: it does not update managed
+state, assign a sequence, or persist a record. Only manager-owned publication sites enter the
+durable stream.
+
+### Durable run-event log
+
+For journaling runs, `WorkflowManager.getPersistence()` and `createRunPersistence()` return the
+additive `RunEventPersistence` subtype. The live and persisted policies are fixed in v1:
+
+| Event type | Live named emitter | Persisted by default | Reason |
+|---|---:|---:|---|
+| `log` | yes | yes | Run narrative and warnings |
+| `phase` | yes | yes | Lifecycle/progress boundary |
+| `agentStart` | yes | yes | Lifecycle/progress boundary |
+| `agentEnd` | yes | yes | Lifecycle/progress boundary and terminal call summary |
+| `agentHistory` | yes | no | Transcript-like, content-heavy duplicate |
+| `tokenUsage` | yes | yes | Bounded cumulative usage/cost snapshot |
+| `complete` | yes | yes | Root terminal lifecycle |
+| `journal` | listener-gated | yes | Deterministic call-result lifecycle |
+| `callRecord` | listener-gated | yes | Terminal call structure, including non-journal exits |
+| `paused` | yes | yes | Root terminal/resumable lifecycle |
+| `error` | listener-gated | yes while lease-owned, even without listeners | Root failure lifecycle |
+| `stopped` | yes | yes | Host-requested lifecycle transition |
+| `resumed` | yes | yes | Same-run lifecycle transition |
+| `agentEvent` | yes, on the SDK manager | no | Verbatim high-frequency ACP stream; host-owned transcript concern |
+
+`journaling: false` disables the snapshot, watermark, and sidecar but leaves the live named events
+unchanged. There is no transcript-persistence opt-in: subscribe to `agentHistory`/`agentEvent` and
+apply a host-owned consent and retention policy when transcript storage is required.
+
+The default layout is one generation-pinned sidecar beside the existing files:
+
+```text
+<runsDir>/<runId>.json          # atomic resumable snapshot
+<runsDir>/<runId>.json.bak      # best-effort snapshot backup
+<runsDir>/<runId>.log           # existing unstructured engine log
+<runsDir>/<runId>.events.jsonl  # versioned, append-only event records
+```
+
+Each LF-terminated line is a `RunEventLogRecord` with `version`, `streamId`, dense positive `seq`,
+an ISO timestamp, a bounded `PersistedRunEvent`, and aggregate projection flags. Ordering is by
+sequence, never timestamp. `PersistedRunState.eventStreamId` identifies the generation and
+`eventSeq` is the snapshot watermark. A delete/recreate of the same `runId` mints another stream
+ID, so every continuation must carry the stream ID returned by its snapshot/prior read.
+
+The safe consumption pattern is snapshot plus tail:
+
+```ts
+const persistence: RunEventPersistence = manager.getPersistence();
+const snapshot = persistence.load(runId);
+
+if (!snapshot?.eventStreamId || snapshot.eventSeq === undefined) {
+  // Legacy runs have no gap-free event tail; use inspectRun() explicitly.
+  const legacy = manager.inspectRun(runId);
+  consumeLegacyStatus(legacy);
+} else {
+  const page = persistence.readEvents(runId, {
+    streamId: snapshot.eventStreamId,
+    after: snapshot.eventSeq,
+    limit: 100,
+  });
+  consume(snapshot, page.events);
+
+  const tail = persistence.watchEvents(runId, {
+    streamId: page.streamId,
+    after: page.cursor,
+    signal: abortController.signal,
+  });
+  for await (const record of tail) consumeEvent(record);
+}
+```
+
+`readEvents()` defaults to `after: 0, limit: 100`, caps `limit` at 1000, and returns
+`{ events, streamId, cursor, endCursor, hasMore }`. `watchEvents()` validates synchronously, yields
+backlog first, then follows appends as a pull-based `RunEventStream`; abort/`close()`/`return()` end
+normally. Watchers stay open across lifecycle events because the same run may resume. They fail
+closed on deletion, generation replacement, corruption, or inconsistency instead of following a
+different stream.
+
+#### Event-log errors and remedies
+
+Every read/watch/append persistence failure is `RunEventLogError` with a typed `code`, raw API
+`runId`, optional offending `seq`/absolute `path`, and no raw line or event content in its message.
+
+| `RunEventLogErrorCode` | Meaning and host remedy |
+|---|---|
+| `RUN_NOT_FOUND` | Neither current snapshot nor sidecar exists. Treat the ID as unknown and re-list runs. |
+| `EVENT_LOG_UNAVAILABLE` | The snapshot predates this contract. Fall back explicitly to `inspectRun()`; do not claim a gap-free tail. |
+| `INVALID_CURSOR` | `after` is not a non-negative safe integer. Correct the caller input. |
+| `INVALID_LIMIT` | `limit` is not an integer in 1–1000. Correct the caller input. |
+| `INVALID_STREAM_ID` | The supplied generation is not 32 lowercase hexadecimal characters. Correct the caller input. |
+| `CURSOR_AHEAD` | `after` is beyond the valid log tail. Reload the snapshot/current stream and start a new cursor lineage. |
+| `ORPHANED_LOG` | A sidecar exists without a loadable snapshot. Do not consume it as resumable state; surface or clean it under the run lease. |
+| `WATERMARK_MISSING` | A sidecar is paired with a snapshot that has no `eventSeq`, usually after a downgrade write. Fall back/surface the incompatible pair. |
+| `STREAM_ID_MISSING` | A watermarked snapshot has no valid generation ID. Fall back/surface the incompatible pair. |
+| `STREAM_MISMATCH` | The supplied cursor, snapshot, and/or records belong to different generations. Stop that cursor and reload the current run; never splice generations. |
+| `CORRUPT_LOG` | A terminated record is malformed or violates the v1 shape/dense sequence/run-ID rules. Stop tailing and surface the integrity failure. |
+| `UNSUPPORTED_VERSION` | A record version is unknown to this reader. Upgrade the reader; never guess the schema. |
+| `SNAPSHOT_AHEAD` | The snapshot watermark exceeds the valid log tail. Use snapshot/journal recovery or bounded inspection and surface the inconsistent observability stream. |
+| `EVENT_LOG_INCOMPLETE` | The writer recorded an append/projection failure. Resume may still use the snapshot, but consumers must fall back explicitly instead of presenting a gap-free tail. |
+| `SEQUENCE_MISMATCH` | A writer proposed anything other than the next dense sequence. Revalidate the tail while holding the lease and fix the writer; readers should surface it as internal failure. |
+| `PROJECTION_ERROR` | Projection of an otherwise admitted live event threw. The manager marks the log incomplete; custom writers should preserve the cause and stop appending. |
+| `RECORD_TOO_LARGE` | A terminated/projected line exceeds 65,536 UTF-8 bytes including LF. The manager marks the log incomplete; do not silently reshape or skip it. |
+| `IO_ERROR` | A non-ENOENT filesystem/open/write/close/watch failure occurred. Preserve the cause, repair the filesystem condition, and fall back explicitly while the tail is unavailable. |
+
+#### Redaction, durability, retention, and deletion
+
+Persistence projects synchronously before append; readers have no raw mode. Typed strings are
+credential-redacted and capped at 512 UTF-8 bytes. Unbounded values become compact JSON previews
+(depth 4, first 10 array items, first 20 object keys, sensitive-key replacement, 512-byte cap).
+Config options, auth methods, checkpoint choices, and model fallbacks are capped at 20 entries;
+session re-attach records, raw runtime errors/stacks, complete-result logs/call arrays, and verbatim
+ACP payloads never enter the sidecar. Each complete line is capped at 65,536 bytes including LF.
+There is no total-size cap, rotation, compression, prefix deletion, or TTL in v1: history is kept as
+long as the run record.
+
+Exactly one writer per run is a precondition. `WorkflowManager` enforces it with the cross-process
+run lease; direct/custom `appendEvent()`, `save()`, or `delete()` callers must hold the same lease or
+equivalent exclusion. The writer commits the full record before advancing the snapshot watermark,
+and durable append succeeds before the corresponding named listener runs. A failed append leaves
+the last sequence unchanged, marks `eventLogIncomplete`, disables later appends for that run, and
+does not change the workflow's computational result.
+
+`WorkflowManager.deleteRun(runId)` keeps or reacquires the lease, removes the event sidecar first,
+delegates snapshot/backup/temp deletion next, and lets the default persistence remove the lock last;
+lease release occurs in `finally`. It returns the underlying snapshot-delete boolean. If lease
+acquisition fails it returns `false` without deleting anything. Detached callbacks from a deleted
+managed execution may retain their legacy live delivery, but can no longer recreate durable state.
 
 ### `agentEvent` — live token-level streaming through the manager
 
@@ -262,19 +418,29 @@ The `WorkflowManager` exported by **`@automatalabs/workflows`** (the facade — 
 
 ```ts
 manager.on("agentEvent", (e: AgentEventPayload) => {
-  if (e.name === "agent_message_chunk" && e.runId) ui.stream(e.runId, e.label, e.event);
+  if (e.name === "agent_message_chunk" && e.scope && e.callIndex !== undefined) {
+    ui.stream(e.scope, e.callIndex, e.event);
+  }
 });
 ```
 
-Payload (`AgentEventPayload<K>`, exported): `{ name, event, backendId, sessionId?, label?, runId? }` —
+Exact new consumers use `WorkflowAgentEventPayload<K>`; the existing
+`AgentEventPayload<K extends AcpEventName = AcpEventName>` alias remains source-compatible,
+including its type-only `session_update` branch. The emitted envelope is
+`{ name, event, backendId, sessionId?, label?, runId?, scope?, callIndex? }` —
 
 - `name` is the ACP event name. `session/update` notifications arrive **unwrapped** as their `sessionUpdate` discriminant (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …); the cross-cutting events (`permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `session_open`, `session_close`, `backend_error`) arrive under their own names.
 - `event` is the **verbatim** runner payload for that event (typed per `name`).
-- The envelope repeats the context fields hosts filter on: `runId` + `label` identify the workflow agent (stamped by the engine on every `agent()` call), `sessionId`/`backendId` identify the ACP session. `backend_error` is connection-scoped and carries no session/run context.
+- The envelope repeats the context fields hosts filter on: `(scope, callIndex)` directly identifies
+  the engine call, `runId`/`label` retain their compatibility attribution, and
+  `sessionId`/`backendId` identify the ACP session. The bridge sets `scope = runId` when a session
+  has run context. Direct runner/interactive sessions may omit `callIndex`; `backend_error` is
+  connection-scoped and carries no session/run/call context.
 
 Bridge lifecycle: ref-counted per runner. A constructor-injected runner is bridged for the manager's lifetime; a per-run `ExecOptions.agent` runner is bridged only while its run is active. `manager.dispose()` (alias `close()`) detaches the manager's subscriptions — it does **not** dispose the runner, whose process lifetime stays with the caller. Forwarding is observability-only: a throwing `agentEvent` listener is isolated and never affects the run.
 
-Alternative: subscribe on the runner's bus directly — see [Runner events](#runner-events); same underlying stream, same `runId`/`label` attribution, no manager involved.
+Alternative: subscribe on the runner's bus directly — see [Runner events](#runner-events); same
+underlying stream and optional `runId`/`label`/`callIndex` attribution, no manager involved.
 
 ### OpenTelemetry
 
@@ -777,9 +943,10 @@ interface WorkflowBackgroundAccepted {
 }
 ```
 
-It does not await script/agent completion. The run has no initiating request signal, progress token,
-or live checkpoint `confirm`; checkpoints use authored headless behavior. Cancelling the accepted
-call cannot abort it. A fifth run fails with
+It does not await script/agent completion. The initiating request has no enduring signal, progress
+channel, or live checkpoint `confirm`; checkpoints use authored headless behavior. Even when that
+start request supplied a progress token, it emits no background progress after returning.
+Cancelling the accepted call cannot abort the run. A fifth run fails with
 `Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
 Foreground, inspect, and await do not consume slots. A background `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
@@ -800,9 +967,19 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
 ```
 
 Await returns immediately for terminal runs, is a non-blocking read at `waitMs:0`, and otherwise
-waits only for terminal lifecycle state for at most the requested duration. It uses the local
-settlement promise when available and 250-ms project-store polling after restart. Await cancellation
-ends only that request and returns
+waits only for terminal lifecycle state for at most the requested duration. For new-format runs it
+tails the generation-pinned event sidecar. When the **await request** carries a progress token, the
+server emits the existing coarse notification shape after each phase, distinct agent start, and
+first terminal agent end for `(scope, callIndex)`: `progress` is the number of distinct ended calls,
+`total` is distinct started calls (omitted while zero), and `message` is the latest phase title
+(omitted until known). Snapshot agent rows/current phase seed those sets, and the tail begins after
+the snapshot watermark, so a late await neither scans the unbounded history for progress state nor
+double-counts the known prefix.
+
+The local settlement promise may still win the terminal race without disabling tail progress. For
+legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs, await explicitly falls back
+to 250-ms `inspectRun()` terminal polling and emits no progress notifications even if that await has
+a token. Await cancellation closes its watcher/poller, ends only that request, and returns
 `Workflow await for runId "<runId>" was cancelled; the workflow was not cancelled.` with no
 structured content. Await is a successful read even for failed/aborted lifecycle status. Partial
 `tokenUsage` is cumulative live work in this execution only; cached replay adds zero. At terminal,
