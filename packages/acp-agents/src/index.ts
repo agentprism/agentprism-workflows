@@ -197,6 +197,8 @@ export type {
   Backend,
   BackendId,
   BuiltinBackendId,
+  ProviderErrorClassification,
+  ProviderErrorMetadata,
   SessionMetaInputs,
   SpawnConfig,
   StructuredSource,

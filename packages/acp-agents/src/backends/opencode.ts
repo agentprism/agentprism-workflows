@@ -6,7 +6,13 @@ import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
-import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
+import type {
+  Backend,
+  ProviderErrorClassification,
+  ProviderErrorMetadata,
+  SpawnConfig,
+  StructuredSource,
+} from "../backend.js";
 import { splitArgs } from "../backend.js";
 import { opencodeAuthProfile } from "../auth/auth-profiles.js";
 import { toJsonSchema } from "../schema-strict.js";
@@ -21,6 +27,20 @@ export class OpenCodeBackend implements Backend {
   readonly stripsRoutingPrefix = true;
   readonly embedSchemaInPrompt = true;
   readonly injectStructuredOutputTool = true;
+
+  classifyProviderError(
+    error: unknown,
+    metadata?: ProviderErrorMetadata,
+  ): ProviderErrorClassification | undefined {
+    const statusCode = errorDataNumber(error, "statusCode");
+    if (statusCode === 429) return providerUsageLimit("http_429", "provider", metadata);
+    if (isUsageCreditsError(error)) {
+      // OpenCode 1.17's ACP error data exposes only the generic `APIError` name and drops the
+      // provider status/body. This narrow boundary fallback covers the live #149 wording.
+      return providerUsageLimit(undefined, "adapter_fallback", metadata);
+    }
+    return undefined;
+  }
 
   spawnConfig(): SpawnConfig {
     const env = process.env;
@@ -50,6 +70,51 @@ export class OpenCodeBackend implements Backend {
     // progress message earlier in the turn must not win over the result).
     return parseFinalJson(source.finalMessageText());
   }
+}
+
+function providerUsageLimit(
+  providerCode: string | undefined,
+  source: "provider" | "adapter_fallback",
+  metadata: ProviderErrorMetadata | undefined,
+): ProviderErrorClassification {
+  return {
+    kind: "provider_usage_limit",
+    context: {
+      backendId: "opencode",
+      source,
+      providerCode,
+      resetAt: metadata?.resetAt,
+    },
+  };
+}
+
+function errorDataNumber(error: unknown, key: string): number | undefined {
+  try {
+    if (!error || typeof error !== "object") return undefined;
+    const data = (error as { data?: unknown }).data;
+    if (!data || typeof data !== "object") return undefined;
+    const value = (data as Record<string, unknown>)[key];
+    return typeof value === "number" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isUsageCreditsError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("out of usage credits") || message.includes("/usage-credits");
+}
+
+function errorMessage(error: unknown): string {
+  try {
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string") return message;
+    }
+  } catch {
+    return "";
+  }
+  return typeof error === "string" ? error : "";
 }
 
 function resolveOpenCodePackageBin(): string | undefined {

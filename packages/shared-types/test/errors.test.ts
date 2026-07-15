@@ -1,76 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-// Ported from pi tests/errors.test.ts. Only the parts that now live in
-// @automatalabs/shared-types are kept here: classifyProviderLimit, isProviderUsageLimit,
-// and the WorkflowError class. wrapError moved to the engine and is covered by
-// engine-core, so its describe block (and its import) are intentionally NOT ported here.
+// The shared seam owns the WorkflowError runtime class, structured contexts, and guards.
 import {
-  classifyProviderLimit,
   isAuthRequired,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
   type AuthErrorContext,
   type CheckpointContext,
+  type ProviderUsageLimitContext,
   type WorkflowRecordedError,
 } from "../src/errors.js";
-
-describe("classifyProviderLimit", () => {
-  it("matches the full provider usage/quota/rate-limit wording table", () => {
-    // One representative string per alternative in the classifier's pattern table,
-    // so adding/removing a wording in src/errors.ts is caught here.
-    const cases = [
-      "You have hit your ChatGPT usage limit (plus plan).", // usage limit
-      "Codex usage limit reached (plus plan). Resets in ~3h.", // limit reached
-      "insufficient_quota", // insufficient_quota (underscore form)
-      "insufficient quota for this request", // insufficient quota (space form)
-      "Your monthly quota exceeded for the org.", // quota exceeded
-      "You exceeded your current quota, please check your plan and billing details.", // exceeded your current quota (+ billing)
-      "You are out of budget for this billing cycle.", // out of budget
-      "Your available balance is too low to continue.", // available balance
-      "Remaining quota: 0 tokens", // bare \bquota\b
-      "rate limit exceeded", // rate limit (space)
-      "rate-limit hit, slow down", // rate.?limit (dash)
-      "Error 429: too many requests", // \b429\b + too many requests
-      "too many requests, back off", // too many requests (isolated)
-      "GoUsageLimitError", // GoUsageLimitError
-      "FreeUsageLimitError", // FreeUsageLimitError
-      "Please update your billing information.", // \bbilling\b
-    ];
-    for (const text of cases) {
-      assert.equal(classifyProviderLimit(text).matched, true, `should match: ${text}`);
-    }
-  });
-
-  it("does NOT match benign text, transient overload/5xx, or empty input", () => {
-    for (const text of [
-      "file not found",
-      "TypeError: x is not a function",
-      "agent exploded",
-      "overloaded_error: server is busy", // transient — deliberately excluded, stays recoverable
-      "503 service unavailable",
-      "",
-      undefined,
-    ]) {
-      assert.equal(classifyProviderLimit(text).matched, false, `should not match: ${String(text)}`);
-    }
-  });
-
-  it("extracts the verbatim reset hint when present, undefined otherwise", () => {
-    assert.equal(
-      classifyProviderLimit("Codex usage limit reached. Resets in ~3h.").resetHint,
-      "Resets in ~3h",
-    );
-    assert.equal(
-      classifyProviderLimit("usage limit reached, resets at 2026-06-20T06:00:00Z.").resetHint,
-      "resets at 2026-06-20T06:00:00Z",
-    );
-    // matched but no "resets in/at ..." clause => resetHint undefined
-    assert.equal(classifyProviderLimit("insufficient_quota").resetHint, undefined);
-    assert.equal(classifyProviderLimit("rate limit exceeded").resetHint, undefined);
-  });
-});
 
 describe("isProviderUsageLimit", () => {
   it("is true only for a PROVIDER_USAGE_LIMIT WorkflowError", () => {
@@ -173,6 +114,11 @@ describe("WorkflowError", () => {
         agentLabel: "researcher",
         details: { reason: "incomplete-manifest", indexes: [2] },
         resetHint: "record again",
+        providerUsageLimitContext: {
+          backendId: "codex",
+          source: "provider",
+          providerCode: "usageLimitExceeded",
+        },
         authContext: { backendId: "codex", methods: [] },
         checkpointContext: {
           callIndex: 2,
@@ -197,21 +143,29 @@ describe("WorkflowError", () => {
   });
 
   it("captures code, recoverable, resetHint, agentLabel, and details from options", () => {
-    const e = new WorkflowError("Codex usage limit reached. Resets in ~3h.", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+    const providerUsageLimitContext: ProviderUsageLimitContext = {
+      backendId: "claude",
+      source: "provider",
+      providerCode: "rate_limit",
+      resetAt: "2026-07-15T08:00:00.000Z",
+    };
+    const e = new WorkflowError("Provider usage limit reached.", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
       recoverable: false,
       agentLabel: "researcher",
       resetHint: "Resets in ~3h",
-      details: { provider: "codex" },
+      providerUsageLimitContext,
+      details: { provider: "claude" },
     });
     assert.ok(e instanceof Error);
     assert.ok(e instanceof WorkflowError);
     assert.equal(e.name, "WorkflowError");
-    assert.equal(e.message, "Codex usage limit reached. Resets in ~3h.");
+    assert.equal(e.message, "Provider usage limit reached.");
     assert.equal(e.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
     assert.equal(e.recoverable, false);
     assert.equal(e.agentLabel, "researcher");
     assert.equal(e.resetHint, "Resets in ~3h");
-    assert.deepEqual(e.details, { provider: "codex" });
+    assert.deepEqual(e.providerUsageLimitContext, providerUsageLimitContext);
+    assert.deepEqual(e.details, { provider: "claude" });
   });
 
   it("defaults recoverable to false and leaves optional fields undefined when options omitted", () => {
@@ -220,6 +174,7 @@ describe("WorkflowError", () => {
     assert.equal(e.recoverable, false);
     assert.equal(e.agentLabel, undefined);
     assert.equal(e.resetHint, undefined);
+    assert.equal(e.providerUsageLimitContext, undefined);
     assert.equal(e.details, undefined);
   });
 

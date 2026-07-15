@@ -230,8 +230,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 - **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /
   `OpenWorkflowDirOptions` types.
 - **Errors** — `WorkflowError`, `WorkflowErrorCode`, `isWorkflowError`, `wrapError`,
-  `isProviderUsageLimit`, `isAuthRequired`, `classifyProviderLimit`, `isAbortError`,
-  `isTimeoutError`, `AuthErrorContext`, and `CheckpointContext`.
+  `isProviderUsageLimit`, `isAuthRequired`, `isAbortError`, `isTimeoutError`,
+  `ProviderUsageLimitContext`, `AuthErrorContext`, and `CheckpointContext`.
 - **Config caps** — `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`,
   `DEFAULT_AGENT_TIMEOUT_MS`, `AGENTS_DIR`.
 - **Model routing / tiers** — `parseModelRoutingFromMeta`, `resolveModelForPhase`,

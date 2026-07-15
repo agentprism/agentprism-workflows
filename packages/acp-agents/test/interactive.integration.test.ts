@@ -4,6 +4,7 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { PROTOCOL_VERSION, type ContentBlock, type RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import { AcpAgentRunner, type AcpRunnerOptions } from "../src/index.js";
 import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
@@ -75,6 +76,38 @@ test("interactive session drives three prompt turns on one dedicated process", a
   assert.ok(newSessions.every((entry) => entry.pid === pid), "session/new used the dedicated process");
   assert.ok(prompts.every((entry) => entry.pid === pid), "all turns used the same process");
   assert.deepEqual(prompts[2]?.params?.prompt, [{ type: "text", text: "third" }, { type: "image", ...image }]);
+});
+
+test("interactive prompt maps a structured provider wall with reset metadata", async () => {
+  const live =
+    "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+  const { cwd } = configure({
+    turns: [{
+      throw: live,
+      throwData: { errorKind: "billing_error" },
+      usageUpdate: {
+        used: 10,
+        size: 100,
+        _meta: {
+          "_claude/rateLimit": {
+            status: "rejected",
+            resetsAt: Date.parse("2026-07-15T09:00:00.000Z") / 1_000,
+          },
+        },
+      },
+    }],
+  });
+  const runner = makeRunner();
+  const session = await runner.openSession({ cwd, label: "chat-wall" });
+
+  await assert.rejects(session.prompt("continue"), (error: unknown) => {
+    assert.ok(isWorkflowError(error));
+    assert.equal(error.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+    assert.equal(error.agentLabel, "chat-wall");
+    assert.equal(error.providerUsageLimitContext?.resetAt, "2026-07-15T09:00:00.000Z");
+    return true;
+  });
+  await session.release();
 });
 
 test("run() still completes while an interactive session is held open on the same backend", async () => {

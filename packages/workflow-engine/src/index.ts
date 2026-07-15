@@ -59,13 +59,13 @@ export {
   isWorkflowError,
   isProviderUsageLimit,
   isAuthRequired,
-  classifyProviderLimit,
   wrapError,
   isAbortError,
   isTimeoutError,
   type WorkflowErrorOptions,
   type AuthErrorContext,
   type CheckpointContext,
+  type ProviderUsageLimitContext,
 } from "./errors.js";
 
 // ── Config caps ──

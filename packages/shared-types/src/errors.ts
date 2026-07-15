@@ -8,18 +8,14 @@
 // The seam-level ERROR contract. Lives HERE (not in the engine) because the runner
 // (acp-agents) THROWS these and the engine reads .code + .recoverable via instanceof —
 // both sides MUST import the SAME class. Adapted from pi errors.ts (enum + WorkflowError
-// class + guards + the PURE, dependency-free classifyProviderLimit text classifier).
-// classifyProviderLimit is SHARED because its PRIMARY caller is the runner (acp-agents
-// raises PROVIDER_USAGE_LIMIT + resetHint) and the engine's wrapError uses it only as
-// defense-in-depth — both import ONE source so they can never diverge. The engine-local
-// wrapError/isAbortError/isTimeoutError stay in workflow-engine and import the classifier
-// from here.
+// class + guards). Provider adapters classify their own structured error surfaces before
+// constructing this shared error; no provider prose classifier lives at the seam.
 export enum WorkflowErrorCode {
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",
   AGENT_LIMIT_EXCEEDED = "AGENT_LIMIT_EXCEEDED",
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
-  /** Provider subscription/usage/quota/rate limit. Non-recoverable => engine PAUSES (resumable), not failed. Carries resetHint. */
+  /** Provider subscription/usage/quota/rate limit. Non-recoverable => engine PAUSES (resumable), not failed. */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
   /** The agent requires authentication. Non-recoverable: retrying cannot succeed until the host
    *  completes an auth flow. The machine-readable surface is `WorkflowError.authContext`
@@ -65,6 +61,15 @@ export type AuthErrorContext = {
   methods: { id: string; type: "agent" | "terminal" | "env_var"; name?: string }[];
 };
 
+/** Machine-readable provider-limit metadata carried by a `PROVIDER_USAGE_LIMIT` error.
+ *  `resetAt` is an RFC 3339 instant derived from provider-owned numeric metadata, never prose. */
+export interface ProviderUsageLimitContext {
+  backendId: string;
+  source: "provider" | "adapter_fallback";
+  providerCode?: string;
+  resetAt?: string;
+}
+
 /**
  * The structured, NON-SECRET surface of a pending durable checkpoint — persisted with a paused
  * run and shown to the host so it can collect a decision; `hash`/`callIndex` let resume inject
@@ -96,6 +101,7 @@ export interface WorkflowRecordedError {
   /** Strict-JSON projected. */
   details?: unknown;
   resetHint?: string;
+  providerUsageLimitContext?: ProviderUsageLimitContext;
   authContext?: AuthErrorContext;
   checkpointContext?: CheckpointContext;
   /** Form "error": JSON-safe own enumerable data properties of the Error. */
@@ -111,8 +117,10 @@ export interface WorkflowErrorOptions {
   recoverable?: boolean;
   agentLabel?: string;
   details?: unknown;
-  /** For PROVIDER_USAGE_LIMIT: the provider's human reset hint, e.g. "Resets in ~3h" (verbatim). */
+  /** For PROVIDER_USAGE_LIMIT: a human hint synthesized from structured reset metadata. */
   resetHint?: string;
+  /** For PROVIDER_USAGE_LIMIT: backend/code plus a provider-derived reset instant when available. */
+  providerUsageLimitContext?: ProviderUsageLimitContext;
   /** For AUTH_REQUIRED: the structured, non-secret auth surface (advertised method ids/types/names). */
   authContext?: AuthErrorContext;
   /** For CHECKPOINT_REQUIRED: the structured, non-secret pending checkpoint surface. */
@@ -125,6 +133,7 @@ export class WorkflowError extends Error {
   readonly agentLabel?: string;
   readonly details?: unknown;
   readonly resetHint?: string;
+  readonly providerUsageLimitContext?: ProviderUsageLimitContext;
   readonly authContext?: AuthErrorContext;
   readonly checkpointContext?: CheckpointContext;
 
@@ -136,6 +145,7 @@ export class WorkflowError extends Error {
     this.agentLabel = options.agentLabel;
     this.details = options.details;
     this.resetHint = options.resetHint;
+    this.providerUsageLimitContext = options.providerUsageLimitContext;
     this.authContext = options.authContext;
     this.checkpointContext = options.checkpointContext;
   }
@@ -151,27 +161,4 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
 
 export function isAuthRequired(error: unknown): error is WorkflowError {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.AUTH_REQUIRED;
-}
-
-/**
- * Detect a provider subscription/usage/quota/rate-limit exhaustion from free-form
- * error text, and extract the provider's human reset hint when present. PURE +
- * dependency-free — lifted verbatim from pi errors.ts:77-86. SHARED so the runner
- * (acp-agents — PRIMARY caller, raises PROVIDER_USAGE_LIMIT) and the engine's wrapError
- * (defense-in-depth) classify against ONE table and can never diverge.
- *
- * Callers reading SDK message metadata MUST gate on stopReason === "error" before
- * trusting this, so a task whose own output merely mentions "rate limit" is never
- * misclassified. Patterns mirror the SDK's non-retryable-limit table; transient
- * overloaded/5xx errors are deliberately excluded (they stay recoverable and keep retrying).
- */
-export function classifyProviderLimit(text: string | undefined): { matched: boolean; resetHint?: string } {
-  if (!text) return { matched: false };
-  const matched =
-    /usage limit|limit reached|insufficient[_\s]?quota|quota exceeded|exceeded your current quota|out of budget|available balance|\bquota\b|rate.?limit|too many requests|\b429\b|GoUsageLimitError|FreeUsageLimitError|\bbilling\b/i.test(
-      text,
-    );
-  if (!matched) return { matched: false };
-  const reset = text.match(/resets?\s+(?:in|at)\s+[^.\n]+/i);
-  return { matched: true, resetHint: reset?.[0]?.trim() };
 }

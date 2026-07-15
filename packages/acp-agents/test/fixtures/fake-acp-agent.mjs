@@ -585,14 +585,14 @@ class FakeAgent {
     }
 
     // 6) hard failure path: reject the prompt request (provider wall / process fault).
-    // Real backends (claude-agent-acp failActive / codex-acp request errors) reject with the
-    // failure text carried in the JSON-RPC error MESSAGE, which is what the SDK surfaces as
-    // RequestError.message on the client. Mirror that exactly so errors-map classifies it.
+    // Real backends reject with a JSON-RPC RequestError. `throwData` mirrors their structured
+    // adapter payloads (e.g. Claude's errorKind or Codex's codexErrorInfo); the message remains
+    // available for display.
     // Default to -32603 (internal error): a generic prompt failure is NOT auth. The SDK reserves
     // -32000 EXCLUSIVELY for authRequired, so tests that want the auth path use authRequired* or
     // pass an explicit throwCode; a bare generic failure must never carry -32000.
     if (turn.throw !== undefined) {
-      throw new RequestError(turn.throwCode ?? -32603, turn.throw);
+      throw new RequestError(turn.throwCode ?? -32603, turn.throw, clone(turn.throwData));
     }
 
     return {

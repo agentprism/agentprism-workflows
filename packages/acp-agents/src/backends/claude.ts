@@ -7,7 +7,13 @@
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import type { ClaudeCodeSessionMeta } from "@automatalabs/shared-types";
-import type { Backend, SpawnConfig, StructuredSource } from "../backend.js";
+import type {
+  Backend,
+  ProviderErrorClassification,
+  ProviderErrorMetadata,
+  SpawnConfig,
+  StructuredSource,
+} from "../backend.js";
 import { splitArgs } from "../backend.js";
 import { claudeAuthProfile } from "../auth/auth-profiles.js";
 import { toAnthropicJsonSchema } from "../schema-strict.js";
@@ -18,6 +24,22 @@ export class ClaudeBackend implements Backend {
   readonly id = "claude" as const;
   /** Pure-data claude auth profile (§3.2): terminal follows the host TTY, gateway follows `onAuth`. */
   readonly authProfile = claudeAuthProfile;
+
+  classifyProviderError(
+    error: unknown,
+    metadata?: ProviderErrorMetadata,
+  ): ProviderErrorClassification | undefined {
+    const providerCode = errorDataString(error, "errorKind");
+    if (providerCode === "rate_limit" || providerCode === "billing_error") {
+      return providerUsageLimit(providerCode, "provider", metadata);
+    }
+    if (providerCode === undefined && isLegacyUsageCreditsError(error)) {
+      // Boundary fallback for older/non-conformant claude-agent-acp processes that predate the
+      // typed `data.errorKind` field. Keep this live #149 wording out of generic control flow.
+      return providerUsageLimit(undefined, "adapter_fallback", metadata);
+    }
+    return undefined;
+  }
 
   spawnConfig(): SpawnConfig {
     const env = process.env;
@@ -62,4 +84,49 @@ export class ClaudeBackend implements Backend {
   nativeStructured(source: StructuredSource): unknown {
     return source.rawStructuredOutput();
   }
+}
+
+function providerUsageLimit(
+  providerCode: string | undefined,
+  source: "provider" | "adapter_fallback",
+  metadata: ProviderErrorMetadata | undefined,
+): ProviderErrorClassification {
+  return {
+    kind: "provider_usage_limit",
+    context: {
+      backendId: "claude",
+      source,
+      providerCode,
+      resetAt: metadata?.resetAt,
+    },
+  };
+}
+
+function errorDataString(error: unknown, key: string): string | undefined {
+  try {
+    if (!error || typeof error !== "object") return undefined;
+    const data = (error as { data?: unknown }).data;
+    if (!data || typeof data !== "object") return undefined;
+    const value = (data as Record<string, unknown>)[key];
+    return typeof value === "string" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isLegacyUsageCreditsError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("out of usage credits") || message.includes("/usage-credits");
+}
+
+function errorMessage(error: unknown): string {
+  try {
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string") return message;
+    }
+  } catch {
+    return "";
+  }
+  return typeof error === "string" ? error : "";
 }

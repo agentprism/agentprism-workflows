@@ -94,15 +94,39 @@ test("(4) empty no-schema output => AGENT_EMPTY_OUTPUT (recoverable)", async () 
   );
 });
 
-test("(4) provider wall (thrown) => PROVIDER_USAGE_LIMIT (non-recoverable, resetHint)", async () => {
-  const { cwd } = configure({ turns: [{ throw: "Subscription usage limit reached. Resets in 2 hours." }] });
+test("(4) structured provider wall => PROVIDER_USAGE_LIMIT with reset metadata", async () => {
+  const live =
+    "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+  const { cwd } = configure({
+    turns: [{
+      throw: live,
+      throwData: { errorKind: "billing_error" },
+      usageUpdate: {
+        used: 10,
+        size: 100,
+        _meta: {
+          "_claude/rateLimit": {
+            status: "rejected",
+            resetsAt: Date.parse("2026-07-15T09:00:00.000Z") / 1_000,
+          },
+        },
+      },
+    }],
+  });
   await assert.rejects(
     () => makeRunner().run("hi", { model: "claude", cwd, label: "wall-agent" }),
     (err: unknown) => {
       assert.ok(isWorkflowError(err));
       assert.equal(err.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
       assert.equal(err.recoverable, false);
-      assert.equal(err.resetHint, "Resets in 2 hours");
+      assert.equal(err.message, live);
+      assert.equal(err.resetHint, "Resets at 2026-07-15T09:00:00.000Z");
+      assert.deepEqual(err.providerUsageLimitContext, {
+        backendId: "claude",
+        source: "provider",
+        providerCode: "billing_error",
+        resetAt: "2026-07-15T09:00:00.000Z",
+      });
       assert.equal(err.agentLabel, "wall-agent");
       return true;
     },
@@ -291,6 +315,7 @@ test("(6) onUsage fires on the ERROR path too, carrying the usage_update cost se
       {
         usageUpdate: { used: 10, size: 200000, cost: { amount: 0.03, currency: "USD" } },
         throw: "Usage limit reached. Resets in 1 hour.",
+        throwData: { errorKind: "rate_limit" },
       },
     ],
   });

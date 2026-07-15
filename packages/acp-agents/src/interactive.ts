@@ -18,6 +18,7 @@ import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
 import type { PooledConnection, SessionHandle } from "./acp-client.js";
 import type { AcpEventListener, AcpEventName } from "./events.js";
+import { mapThrownError } from "./errors-map.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 import {
   appendPromptImages,
@@ -195,6 +196,15 @@ export class InteractiveSession {
         stopReason: response.stopReason,
         text: this.session.currentTurnText(),
       };
+    } catch (error) {
+      if (this.signal?.aborted) throw error;
+      throw mapThrownError(error, {
+        label: this.label,
+        backendId: this.backendId,
+        backend: this.backend,
+        providerErrorMetadata: this.session.providerErrorMetadata,
+        authMethods: this.capabilities?.authMethods,
+      });
     } finally {
       this.promptInFlight = false;
     }
