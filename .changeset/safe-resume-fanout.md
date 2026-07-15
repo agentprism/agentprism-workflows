@@ -39,4 +39,6 @@ Two fail-safe compatibility changes are intentional. The common terminal gate no
 or `abortSignaled` marker-less/legacy sources instead of serving their cache. Terminal compaction
 also drops inherited positional suffix rows the current run never visited, so a double-hop pause
 runs that bridged tail live on the second hop rather than replaying data absent from the immediate
-source manifest.
+source manifest. That compaction applies to every new run seeded from a prior journal — including
+low-level embedder runs supplied a manual `exec.resumeJournal` — not only manager-owned
+`resumeFromRunId` executions, keeping later hops self-contained in both entry paths.
