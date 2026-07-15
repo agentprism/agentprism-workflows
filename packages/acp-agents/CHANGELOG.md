@@ -1,5 +1,18 @@
 # @automatalabs/acp-agents
 
+## 0.26.0
+
+### Minor Changes
+
+- 134dffc: Expose ACP session config options as a verbatim per-call authoring surface, add routed no-prompt
+  catalog probing to the runner and workflow validator, and preserve existing replay hash bytes when
+  the new option bag is absent or empty.
+
+### Patch Changes
+
+- Updated dependencies [134dffc]
+  - @automatalabs/shared-types@0.20.0
+
 ## 0.25.1
 
 ### Patch Changes

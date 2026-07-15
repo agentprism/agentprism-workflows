@@ -1,5 +1,16 @@
 # @automatalabs/mcp-server
 
+## 0.11.3
+
+### Patch Changes
+
+- 134dffc: Expose ACP session config options as a verbatim per-call authoring surface, add routed no-prompt
+  catalog probing to the runner and workflow validator, and preserve existing replay hash bytes when
+  the new option bag is absent or empty.
+- Updated dependencies [134dffc]
+  - @automatalabs/workflows@0.32.0
+  - @automatalabs/shared-types@0.20.0
+
 ## 0.11.2
 
 ### Patch Changes
