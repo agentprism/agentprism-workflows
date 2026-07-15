@@ -1,5 +1,11 @@
 # @automatalabs/shared-types
 
+## 0.21.0
+
+### Minor Changes
+
+- 805b51f: Replace shared error-message matching with adapter-owned structured provider-limit classification, carry typed reset metadata through workflow errors and the top-level SDK, and reserve abort classification for structured cancellation. Closes #149.
+
 ## 0.20.0
 
 ### Minor Changes
