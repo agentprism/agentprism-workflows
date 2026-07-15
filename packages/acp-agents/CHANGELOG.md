@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.25.0
+
+### Minor Changes
+
+- c81df46: Replace client-side model matching and modifier handling with deterministic registered-prefix routing and verbatim model selection by the serving ACP harness.
+
 ## 0.24.9
 
 ### Patch Changes

@@ -1,5 +1,13 @@
 # @automatalabs/mcp-server
 
+## 0.11.1
+
+### Patch Changes
+
+- c81df46: Replace client-side model matching and modifier handling with deterministic registered-prefix routing and verbatim model selection by the serving ACP harness.
+- Updated dependencies [c81df46]
+  - @automatalabs/workflows@0.30.1
+
 ## 0.11.0
 
 ### Minor Changes
