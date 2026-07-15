@@ -20,6 +20,7 @@ import type {
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRecordedError,
+  WorkflowResumeCallDecision,
   WorkflowRunFallback,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
@@ -37,6 +38,7 @@ import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing
 import { loadModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { projectRecordedError } from "./recorded-error.js";
 import { registerRunTripwire } from "./rejection-tripwire.js";
+import type { PreparedResume } from "./resume.js";
 import {
   canonicalStrictJson,
   cloneFrozenStrictJson,
@@ -143,6 +145,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeJournal?: Map<number, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
+  /** Manager-prepared resume state. Mutually exclusive with a caller-authored
+   *  resumeJournal except for strategy "positional-v1", where that map is the cache. */
+  preparedResume?: PreparedResume;
+  /** Manager-owned synchronous latch; called before unproved persistent effects. */
+  onResumeFilesystemTainted?: () => void;
+  /** Manager-owned absolute root-execution activity count. The engine reports
+   *  every transition; it includes logical primitives and raw runner promises. */
+  onResumeActivity?: (active: number) => void;
+  /** Manager-owned absolute root agent/checkpoint allocation count. */
+  onResumeCallAllocated?: (allocated: number) => void;
+  /** Manager-owned incremental report sink. Invoked once per terminal root call
+   *  decision so paused/failed executions do not need an EngineRunResult. */
+  onResumeDecision?: (decision: WorkflowResumeCallDecision) => void;
   /** Called after each live agent/checkpoint completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Checkpoint reply indexes injected for this execution, used only for result attribution. */
@@ -411,6 +426,8 @@ export const CALL_PATH_FORMAT = 1;
 export const CALL_PATH_RAW_FRAMES = 64;
 /** Observable call-input fingerprint format. Bump when its inputs or encoding change. */
 export const CALL_INPUTS_FORMAT = 1;
+/** Observable checkpoint-input fingerprint format. Bump when its inputs or encoding change. */
+export const CHECKPOINT_INPUTS_FORMAT = 1;
 
 /** Convert a workflow name into the path-free base used for its vm filename. */
 export function sanitizeVmName(name: string): string {
