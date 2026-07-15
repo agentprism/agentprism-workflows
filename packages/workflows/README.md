@@ -132,7 +132,7 @@ try {
       type: "object", additionalProperties: false,
       required: ["summary"], properties: { summary: { type: "string" } },
     },
-    model: "opus",          // routes to Claude; e.g. "gpt-5.5" routes to Codex
+    model: "claude/opus[1m]", // registered prefix routes; the remaining id is verbatim
     cwd: process.cwd(),     // absolute working dir for the agent's session
   });
   // data is the schema-validated object (not text)
@@ -159,7 +159,7 @@ experimental), never via the return value.
 >
 > ```ts
 > await runner.run("Cut the release.", {
->   model: "gpt-5.5",
+>   model: "codex/gpt-5.6-sol",
 >   baseInstructions: "You are a release bot. Only touch CHANGELOG.md.",
 >   developerInstructions: "Prefer conventional-commit summaries.",
 > });
@@ -179,8 +179,8 @@ experimental), never via the return value.
 > await runner.run("Verify the checkout flow.", { model: "browser" });
 > ```
 >
-> `model: "browser/vision-large"` additionally selects `vision-large` from the agent's config-option
-> catalog. The same registry can be declared via `AGENTPRISM_BACKENDS` (JSON env var; the
+> `model: "browser/vision-large"` additionally sends exactly `vision-large` as the agent's model
+> config option. The same registry can be declared via `AGENTPRISM_BACKENDS` (JSON env var; the
 > programmatic option wins per name). A `schema` is forwarded as turn-level `_meta.outputSchema`
 > and embedded in the prompt. Eligible HTTP-MCP agents also receive the client-hosted
 > `StructuredOutput` capture tool; otherwise the result is JSON-parsed from the final message.
@@ -251,8 +251,8 @@ checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a de
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
-Every terminal result may also carry `fallbacks` (live whole-model/modifier degrades with call,
-requested-spec, resolved-model/backend, and log-message attribution) and `checkpointsTaken` (one
+Every terminal result may also carry `fallbacks` (a compatibility audit surface for non-resolution
+subsystems or third-party runners) and `checkpointsTaken` (one
 resolved checkpoint per call with the journaled decision and `live` / `headless-default` /
 `journal-replay` / `injected` source). They are absent when empty, persist for cold reads, never
 enter replay hashes, and are not part of `WorkflowRunStatus` inspection.
@@ -583,26 +583,27 @@ toStrictJsonSchema(schema);  // OpenAI-strict-normalized (Codex outputSchema)
 
 ## Backend selection
 
-The backend for each agent is chosen from its `model` (preferred) or `tier` string:
-
-- **Provider prefix** — `anthropic/…` or `claude/…` ⇒ Claude; `openai/…` or `codex/…` ⇒ Codex.
-- **OpenCode prefix or id** — `opencode/…` or `opencode` ⇒ OpenCode.
-- **Bare id** — matched by pattern: `codex` / `gpt` / `openai` / `o<digit>` ⇒ Codex;
-  `claude` / `opus` / `sonnet` / `haiku` / `anthropic` ⇒ Claude.
-- **No match / no spec** — the default backend: `AGENTPRISM_DEFAULT_BACKEND` (`claude`, `codex`,
-  `opencode`, or any registered custom backend name; default `claude`).
+The backend for each agent is chosen from its effective `model` (preferred) or `tier` string. Split
+the string on its first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`,
+`opencode`, or a registered custom backend name, it selects that harness and is stripped exactly
+once; a custom registration wins on a built-in-name collision. A registered harness name alone is
+backend-only and preserves that harness's configured default model. Any other first segment sends
+the entire authored string unchanged to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). Omitting
+the spec also uses the configured default backend and its default model.
 
 ```ts
 import { selectBackend } from "@automatalabs/workflows";
 
-selectBackend({ model: "opus" }).id;          // "claude"
-selectBackend({ model: "gpt-5.5" }).id;          // "codex"
-selectBackend({ model: "anthropic/claude-sonnet" }).id; // "claude"
+selectBackend({ model: "claude/opus[1m]" }).id;      // "claude"
+selectBackend({ model: "codex/gpt-5.6-sol" }).id;    // "codex"
+selectBackend({ model: "opencode/zai/glm-5.2" }).id; // "opencode"
 ```
 
-Within a provider, the model spec selects the concrete model through ACP session config
-(`session/set_config_option`, surfaced as `SessionHandle.selectModel()`). Per-backend pool size is
-`AGENTPRISM_ACP_POOL_SIZE` (or `AcpPoolOptions.size`).
+When an id remains after routing, it becomes the exact ACP `session/set_config_option` value
+(surfaced as `SessionHandle.selectModel()`): no normalization, catalog matching, bracket parsing,
+retry, echo verification, or fallback. Brackets, dots, slashes, and provider-style prefixes are
+ordinary id characters. A harness error follows the existing agent-error path. Per-backend pool
+size is `AGENTPRISM_ACP_POOL_SIZE` (or `AcpPoolOptions.size`).
 
 ---
 

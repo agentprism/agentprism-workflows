@@ -17,7 +17,7 @@ import type {
 } from "../src/index.js";
 import { createFakeAgentHarness, waitFor, withTimeout } from "./helpers/fake-agent.js";
 
-const MODEL = "anthropic/claude-opus-4-1";
+const MODEL = "claude/claude-opus-4-1";
 const FORM_ACCEPT: CreateElicitationResponse = {
   action: "accept",
   content: { answer: "blue", count: 2, ok: true },

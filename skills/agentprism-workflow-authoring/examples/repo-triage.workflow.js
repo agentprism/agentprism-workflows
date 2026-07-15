@@ -46,17 +46,13 @@ const rethrowPause = (err) => {
 // that did NOT produce it, so no vendor family approves its own blind spots.
 // Auditing calls pin an advertised read-only session mode where the backend has one
 // (`mode` is strict, so it is only ever set next to a pinned `model`); OpenCode mode
-// ids are config-specific, so its entry leaves `mode` unset. Edit specs freely — an
-// unavailable model logs a fallback line and the call runs on the session default
-// backend instead of failing the run.
-// Bracket tokens are advertise-gated per agent: [xhigh] is a Codex reasoning-effort
-// value, while OpenCode's thought-level ladder for glm-5.2 advertises high | max —
-// so its entry says [max]. An unlisted token logs a fallback and the call runs at
-// the model's default level.
+// ids are config-specific, so its entry leaves `mode` unset. Each registered first segment
+// routes and is stripped once; the remaining live-catalog-verified id is sent byte-for-byte.
+// Harness rejection follows the normal agent-error path, with no client-side fallback.
 const POOL = [
-  { name: "claude", model: "opus[1m]", mode: "plan" },
-  { name: "codex", model: "gpt-5.6-sol[xhigh]", mode: "read-only" },
-  { name: "opencode", model: "opencode/zai/glm-5.2[max]" },
+  { name: "claude", model: "claude/opus[1m]", mode: "plan" },
+  { name: "codex", model: "codex/gpt-5.6-sol", mode: "read-only" },
+  { name: "opencode", model: "opencode/zai/glm-5.2" },
 ];
 const vendor = (i) => POOL[i % POOL.length];
 

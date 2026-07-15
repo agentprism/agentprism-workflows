@@ -97,7 +97,7 @@ export interface ValidatedMockAnswers {
 export interface ValidatedAgentCall {
   label: string;
   phase?: string;
-  /** The model spec the call requested (undefined = the run/session default). */
+  /** The verbatim model spec the call requested (undefined = the run/session default). */
   model?: string;
   tier?: string;
   mode?: string;

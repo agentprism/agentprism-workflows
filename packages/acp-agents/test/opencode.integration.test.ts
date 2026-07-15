@@ -118,16 +118,16 @@ test("bare opencode routes to OpenCode without selecting an inner model", async 
   assert.equal(configCalls(readLog(), "model").length, 0);
 });
 
-test("OpenCode bracket modifier rides the stripped inner spec into the effort config option", async () => {
+test("OpenCode sends a bracketed inner model verbatim without touching effort", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
 
   assert.equal(await makeRunner().run("hi", { model: "opencode/zai/glm-5.2[high]", cwd }), "ok");
 
-  assert.equal(configCalls(readLog(), "model")[0]?.params?.value, "zai/glm-5.2");
-  assert.equal(configCalls(readLog(), "effort")[0]?.params?.value, "high");
+  assert.equal(configCalls(readLog(), "model")[0]?.params?.value, "zai/glm-5.2[high]");
+  assert.equal(configCalls(readLog(), "effort").length, 0);
 });
 
-test("a bracketed provider-prefixed spec exact-matches its own provider's entry, never a cross-provider lookalike", async () => {
+test("OpenCode catalog order cannot alter a bracketed provider-prefixed value", async () => {
   const { cwd, readLog } = configure({
     turns: [{ text: "ok" }],
     configOptions: [
@@ -138,9 +138,7 @@ test("a bracketed provider-prefixed spec exact-matches its own provider's entry,
         category: "model",
         currentValue: "opencode/big-pickle",
         options: [
-          // Ordered like OpenCode's real catalog: cross-provider entries serving the same
-          // model name sort BEFORE the provider the spec names. The substring fallback
-          // would pick the first of them; the bracket-stripped exact test must win.
+          // Cross-provider lookalikes intentionally precede the authored provider.
           { value: "huggingface/zai-org/GLM-5.2", name: "Hugging Face/GLM-5.2" },
           { value: "openrouter/z-ai/glm-5.2", name: "OpenRouter/GLM-5.2" },
           { value: "opencode/big-pickle", name: "Big Pickle" },
@@ -154,8 +152,8 @@ test("a bracketed provider-prefixed spec exact-matches its own provider's entry,
 
   assert.equal(await makeRunner().run("hi", { model: "opencode/zai/glm-5.2[high]", cwd }), "ok");
 
-  assert.equal(configCalls(readLog(), "model")[0]?.params?.value, "zai/glm-5.2");
-  assert.equal(configCalls(readLog(), "effort")[0]?.params?.value, "high");
+  assert.equal(configCalls(readLog(), "model")[0]?.params?.value, "zai/glm-5.2[high]");
+  assert.equal(configCalls(readLog(), "effort").length, 0);
 });
 
 test("OpenCode config-option mode catalog applies mode via session/set_config_option", async () => {
@@ -239,7 +237,7 @@ test("OpenCode usage combines PromptResponse tokens with latest cumulative usage
   assert.deepEqual(seen, [{ input: 50, output: 30, cacheRead: 7, cacheWrite: 2, total: 80, cost: 0.12 }]);
 });
 
-test("Claude and Codex provider specs still pass through unchanged to model selection", async () => {
+test("Claude and Codex routing prefixes are stripped before verbatim model selection", async () => {
   const claude = harness.configure<LogEntry>(
     {
       configOptions: [
@@ -249,15 +247,15 @@ test("Claude and Codex provider specs still pass through unchanged to model sele
           name: "Model",
           category: "model",
           currentValue: "default",
-          options: [{ value: "anthropic/claude-opus-4-1", name: "Claude Opus" }],
+          options: [{ value: "claude/claude-opus-4-1", name: "Claude Opus" }],
         },
       ],
       turns: [{ text: "ok" }],
     },
     { backends: ["claude"] },
   );
-  assert.equal(await makeRunner().run("hi", { model: "anthropic/claude-opus-4-1", cwd: claude.cwd }), "ok");
-  assert.equal(configCalls(claude.readLog(), "model")[0]?.params?.value, "anthropic/claude-opus-4-1");
+  assert.equal(await makeRunner().run("hi", { model: "claude/claude-opus-4-1", cwd: claude.cwd }), "ok");
+  assert.equal(configCalls(claude.readLog(), "model")[0]?.params?.value, "claude-opus-4-1");
 
   await harness.cleanup();
 
@@ -270,13 +268,13 @@ test("Claude and Codex provider specs still pass through unchanged to model sele
           name: "Model",
           category: "model",
           currentValue: "default",
-          options: [{ value: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna" }],
+          options: [{ value: "codex/gpt-5.6-luna", name: "GPT-5.6 Luna" }],
         },
       ],
       turns: [{ text: "ok" }],
     },
     { backends: ["codex"] },
   );
-  assert.equal(await makeRunner().run("hi", { model: "openai/gpt-5.6-luna", cwd: codex.cwd }), "ok");
-  assert.equal(configCalls(codex.readLog(), "model")[0]?.params?.value, "openai/gpt-5.6-luna");
+  assert.equal(await makeRunner().run("hi", { model: "codex/gpt-5.6-luna", cwd: codex.cwd }), "ok");
+  assert.equal(configCalls(codex.readLog(), "model")[0]?.params?.value, "gpt-5.6-luna");
 });

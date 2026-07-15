@@ -32,14 +32,14 @@ try {
       risk: Type.Union([Type.Literal("low"), Type.Literal("high")]),
       summary: Type.String(),
     }),
-    model: "anthropic/claude-sonnet-4", // routes to the Claude backend
+    model: "claude/sonnet",             // verified Claude harness id
     cwd: "/abs/path/to/worktree",       // ACP session/new { cwd } — absolute
   });
   console.log(review.risk, review.summary);
 
   // No schema: result is the final assistant text.
   const text = await runner.run("Explain this repo in one paragraph.", {
-    model: "openai/gpt-5", // routes to the Codex backend
+    model: "codex/gpt-5.6-luna", // verified Codex harness id
     cwd: "/abs/path/to/worktree",
   });
   console.log(text);
@@ -49,6 +49,8 @@ try {
 ```
 
 `run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, `onSessionOpen`, `onUsage`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
+
+Model routing uses only the first `/`-delimited segment. An ASCII-case-insensitive `claude`, `codex`, `opencode`, or registered custom name selects that harness and is stripped exactly once; custom registrations win on collision. A harness name alone is backend-only and issues no model config call. Otherwise the whole string goes unchanged to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). Any remaining id is sent byte-for-byte as `configId: "model"`: catalogs are not matched, brackets and provider prefixes are ordinary characters, no sibling effort/Fast option is driven, and harness errors propagate through the normal agent-error path. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; use backend-only forms for harness-configured models.
 
 ### Image attachments (`images`)
 
@@ -72,7 +74,7 @@ They ride ACP `session/new` `_meta` as bare keys and are threaded into the Codex
 
 ```ts
 await runner.run("Cut the release.", {
-  model: "openai/gpt-5.5",
+  model: "codex/gpt-5.6-sol",
   cwd: "/abs/path/to/worktree",
   baseInstructions: "You are a release bot. Only touch CHANGELOG.md.",
   developerInstructions: "Prefer conventional-commit summaries.",
@@ -110,7 +112,7 @@ const runner = createAcpRunner();
 
 try {
   const session = await runner.openSession({
-    model: "anthropic/claude-sonnet-4",
+    model: "claude/sonnet",
     cwd: "/abs/path/to/worktree",
     onPermissionRequest: async (request) => choosePermission(request),
   });
@@ -181,9 +183,9 @@ From [`src/index.ts`](./src/index.ts):
 - **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, `resumeSession()`, and `forkSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
 - **`AcpRunnerOptions.onElicitation`** — runner-wide ACP elicitation responder; sessions can override with `InteractiveSessionOptions.onElicitation`.
-- **`selectBackend({ model, tier }, registry?)`** — the cross-provider routing rule: which backend a spec maps to (registered custom names match first, exact or `name/<inner-model>`).
+- **`selectBackend({ model, tier }, registry?)`** — deterministic first-segment routing; registered custom names take priority, then the three built-ins, otherwise the configured default.
 - **`ClaudeBackend` / `CodexBackend` / `OpenCodeBackend`** — the three built-in backend strategies (spawn config + per-backend schema/auth wiring). OpenCode is host-resolved rather than bundled.
-- **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, customCapabilities? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; `claude`/`codex`/`opencode` reserved). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. `customCapabilities: { namespace, gatedKeys }` declares the agent's `agentCapabilities._meta` negotiation contract: once the agent advertises that namespace, each declared bare `_meta` key is sent only when its same-named flag is `true` (no declaration = never gated).
+- **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, customCapabilities? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; names may shadow built-ins). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. `customCapabilities: { namespace, gatedKeys }` declares the agent's `agentCapabilities._meta` negotiation contract: once the agent advertises that namespace, each declared bare `_meta` key is sent only when its same-named flag is `true` (no declaration = never gated).
 - **Auth contracts and lifecycle** — `AuthStore`, `BackendAuthMachine`, `buildAuthDescriptors`, the built-in auth profiles, and the `AuthContext` / `AuthResolution` / `AuthMethodDescriptor` / `AuthCapableRunner` types.
 - **`PermissionResolver`** — async human-in-the-loop permission resolution for runner-wide or interactive sessions.
 - **`clientCapabilitiesFor` + the `ClientHandlers` / `FsHandlers` / `TerminalHandlers` / `AcpSessionContext` types** — the client-side fs/terminal interposition surface (see above).
@@ -197,7 +199,7 @@ Also exported: `AcpAgentPool` / `resolvePoolSize`, `PooledConnection` / `Session
 
 | Variable | Effect |
 | --- | --- |
-| `AGENTPRISM_DEFAULT_BACKEND` | Backend when `model`/`tier` don't pick one (`codex` selects Codex; a registered custom name selects that backend; anything else is Claude). |
+| `AGENTPRISM_DEFAULT_BACKEND` | Backend for specs whose first segment is not registered (`codex` selects Codex; a registered custom name selects that backend; anything else is Claude). |
 | `AGENTPRISM_BACKENDS` | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}, "customCapabilities": {"namespace": "…", "gatedKeys": […]}}}`. |
 | `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | Deadline (default `60000`) for a backend's one-time ACP `initialize` handshake — a non-ACP command fails fast instead of hanging. |
 | `AGENTPRISM_ACP_POOL_SIZE` | Long-lived processes to keep per backend (default `1`). |

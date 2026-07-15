@@ -35,7 +35,7 @@ export interface AgentDefinition {
   tools?: string[];
   /** Denylist of coding-tool names, applied after the allowlist. */
   disallowedTools?: string[];
-  /** Model spec (`provider/modelId` or bare id) for this subagent. */
+  /** Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. */
   model?: string;
   /** Isolation mode. When "worktree", agents using this type run in a git worktree. */
   isolation?: "worktree";

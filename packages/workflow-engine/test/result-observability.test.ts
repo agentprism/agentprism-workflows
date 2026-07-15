@@ -37,7 +37,7 @@ function fallbackRunner(): AgentRunner {
   };
 }
 
-test("run result records whole-model and modifier fallbacks from the existing runner callbacks", async () => {
+test("run result records compatibility fallback callbacks without parsing modifier prose", async () => {
   const result = await runWorkflow(SCRIPT, { agent: fallbackRunner(), persistLogs: false });
 
   assert.deepEqual(result.fallbacks, [
@@ -55,9 +55,8 @@ test("run result records whole-model and modifier fallbacks from the existing ru
       label: "modifier",
       phase: "Review",
       requestedSpec: "gpt-example[high]",
-      resolvedModel: "gpt-example",
       backendId: "codex",
-      kind: "modifier",
+      kind: "model",
       message:
         'modifier: model "gpt-example[high]: reasoning_effort "high" not advertised" unavailable — using the session default',
     },

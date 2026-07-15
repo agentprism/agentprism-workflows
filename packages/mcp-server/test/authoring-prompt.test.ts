@@ -28,6 +28,15 @@ test("generated authoring-prompt teaches changed-args resume semantics", () => {
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
 });
 
+test("generated authoring-prompt teaches registered-prefix routing and verbatim selection", () => {
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Route by one registered first segment."));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("No model config call is made."));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("sent byte-for-byte"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("no catalog matching, case folding, bracket parsing"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`codex/gpt-5.6-sol`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("model resolution does not emit them"));
+});
+
 test("prompts/list advertises author-workflow with the optional task argument", async () => {
   const { client, dispose } = await connect(okRunner());
   try {

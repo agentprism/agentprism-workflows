@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { type AcpRunnerEventMap } from "../src/index.js";
 import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
-const MODEL = "anthropic/claude-opus-4-1"; // routes to the Claude backend (both point at the fake)
+const MODEL = "claude/claude-opus-4-1"; // routes to the Claude backend (both point at the fake)
 
 const harness = createFakeAgentHarness({ prefix: "acp-evt-" });
 const { makeRunner } = harness;

@@ -29,7 +29,7 @@ Each `agent()` call runs on a **shipped coding agent** — Claude Code, Codex, o
 
 ### Many agents, one workflow
 
-The backend is chosen **per `agent()` call**: an `opus` review step, a `gpt-5.5` implementation step, an `opencode/zai/glm-5.2` planning step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
+The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a `codex/gpt-5.6-sol` implementation step, an `opencode/zai/glm-5.2` planning step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
 
 ### Durable runs — resume without re-spending tokens
 
@@ -172,7 +172,7 @@ console.log(run.result);   // [{ repo: "...", fileCount: 123 }, …] — schema-
 console.log(run.tokenUsage, run.runId);
 ```
 
-`runDynamicWorkflow` resolves to a **terminal** `WorkflowRunResult` even on pause/fail/abort — read `run.status` instead of catching. The result's optional `fallbacks` records live model/modifier degrades with call/model/backend attribution, and `checkpointsTaken` records every checkpoint resolved in that execution with its decision source (`live`, `headless-default`, `journal-replay`, or `injected`). Both fields are absent when empty and do not affect routing or replay identity. To swap the backend (or stub it in tests), pass your own runner: `runDynamicWorkflow(script, { runner })`. For lower-level control, use `WorkflowManager` / `runWorkflow` (also re-exported from the SDK).
+`runDynamicWorkflow` resolves to a **terminal** `WorkflowRunResult` even on pause/fail/abort — read `run.status` instead of catching. The result retains the optional `fallbacks` compatibility field, but model resolution no longer emits fallback entries: the selected harness accepts, ignores, or rejects the verbatim id. `checkpointsTaken` records every checkpoint resolved in that execution with its decision source (`live`, `headless-default`, `journal-replay`, or `injected`). Both fields are absent when empty and do not affect routing or replay identity. To swap the backend (or stub it in tests), pass your own runner: `runDynamicWorkflow(script, { runner })`. For lower-level control, use `WorkflowManager` / `runWorkflow` (also re-exported from the SDK).
 
 ### Run a single agent directly
 
@@ -185,7 +185,7 @@ const data = await runner.run("Summarize this repo as JSON {summary}.", {
     type: "object", additionalProperties: false,
     required: ["summary"], properties: { summary: { type: "string" } },
   },
-  model: "opus",          // routes to Claude; e.g. "gpt-5.5" routes to Codex
+  model: "claude/opus[1m]", // verified Claude id; use "codex/gpt-5.6-sol" for Codex
   cwd: process.cwd(),
 });
 // data is typed/validated against the schema (a plain object, not text)
@@ -359,13 +359,14 @@ Pass a JSON Schema as `agent({ schema })` and the result is a **validated object
 
 ## Backends & selection
 
-The backend is chosen per `agent()` call from the `model`/`tier` you pass, by provider prefix:
+The backend is chosen per `agent()` call from the effective `model`/`tier` spec with one deterministic rule:
 
-- A **registered custom backend name** (exact, or `name/<inner-model>`) → that backend — matched first, see below.
-- `opencode`, `opencode/<provider/model>` → **OpenCode** (`opencode acp`). The inner model is an OpenCode catalog id such as `zai/glm-5.2`; bracket modifiers such as `opencode/zai/glm-5.2[high]` drive OpenCode's effort option.
-- `opus`, `sonnet`, `haiku`, `claude…`, `anthropic/…` → **Claude** (`claude-agent-acp`).
-- `gpt…`, `codex…`, `o3`/`o4`, `openai/…` → **Codex** (`codex-acp`).
-- Otherwise the default backend (`AGENTPRISM_DEFAULT_BACKEND`, default `claude` — may also name a registered custom backend).
+- Split on the first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`, `opencode`, or a registered custom backend name, route there and strip exactly that segment. Custom registrations take priority on a name collision.
+- A backend name alone (`claude`, `codex`, `opencode`, or a custom name) selects no model, leaving that harness's configured default untouched.
+- Otherwise route the entire authored string, unchanged, to `AGENTPRISM_DEFAULT_BACKEND` (historical default `claude`). `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases.
+- When a model id remains, it is sent byte-for-byte through `session/set_config_option`: no catalog matching, case folding, bracket parsing, or fallback. Brackets, dots, and provider prefixes are ordinary id characters, and a harness rejection follows the existing agent-error path.
+
+Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer the backend-only forms when the desired model is configured inside the harness.
 
 One long-lived ACP process per backend is **pooled** and reused across `agent()` calls (one spawn + one `initialize`), with a fresh session per call — so worktree isolation is preserved via each session's `cwd`.
 
@@ -389,7 +390,7 @@ const runner = createAcpRunner({
 await runDynamicWorkflow(script, { runner });
 ```
 
-Inside a script: `agent("Verify the checkout flow…", { model: "browser", schema: VERDICT, meta: { credsRef: "vault://qa" } })`. `model: "browser/vision-large"` additionally selects `vision-large` via the agent's config-option catalog. The same registry can be declared without code via the `AGENTPRISM_BACKENDS` env var (JSON of the same shape) — which is how the MCP server picks it up. Names are case-insensitive; `claude`, `codex`, and `opencode` are reserved.
+Inside a script: `agent("Verify the checkout flow…", { model: "browser", schema: VERDICT, meta: { credsRef: "vault://qa" } })`. `model: "browser/vision-large"` sends `vision-large` verbatim as the model id. The same registry can be declared without code via the `AGENTPRISM_BACKENDS` env var (JSON of the same shape) — which is how the MCP server picks it up. Names are ASCII-case-insensitive, and a registered custom name takes priority even when it matches `claude`, `codex`, or `opencode`.
 
 Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `_meta.outputSchema` (plain JSON Schema), and when the initialized agent advertises HTTP MCP support the runner injects a localhost `StructuredOutput` MCP tool whose input schema is that same schema. Without HTTP MCP, or when `structuredOutputTool:false` is set on the backend config, the schema is stated in the prompt and the result is read by JSON-parsing the final assistant message. Per-call `meta` merges over the registry's `sessionMeta` defaults; protocol-critical keys (schema channels, `runId`) always win.
 

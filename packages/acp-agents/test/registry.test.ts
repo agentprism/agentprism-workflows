@@ -1,7 +1,7 @@
-// The custom-backend REGISTRY seam: config resolution (env + option, validation, reserved
-// names), the CustomAcpBackend's generic dialect (schema via turn-level _meta.outputSchema,
+// The custom-backend REGISTRY seam: config resolution and validation, the CustomAcpBackend's
+// generic dialect (schema via turn-level _meta.outputSchema,
 // result via final-text JSON parse, static sessionMeta as DEFAULTS), and selectBackend's
-// registry-first routing (a registered name beats the built-in heuristics; the default
+// registry-first routing (a registered name beats a built-in name; the default
 // backend may itself be a registered name).
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -60,15 +60,17 @@ test("registry: fails LOUDLY on malformed env JSON / non-object shapes", () => {
   assert.throws(() => resolveBackendRegistry(undefined, envWith('{"b": "cmd"}')), /must be an object/);
 });
 
-test("registry: validates names, reserved names, and config field types", () => {
+test("registry: validates names and config field types while allowing built-in-name collisions", () => {
   assert.throws(() => resolveBackendRegistry({ "9bad": { command: "x" } }), /invalid backend name/);
   assert.throws(() => resolveBackendRegistry({ "has space": { command: "x" } }), /invalid backend name/);
-  assert.throws(() => resolveBackendRegistry({ claude: { command: "x" } }), /reserved/);
-  assert.throws(() => resolveBackendRegistry({ CODEX: { command: "x" } }), /reserved/);
-  assert.throws(
-    () => resolveBackendRegistry({ opencode: { command: "x" } }),
-    /AGENTPRISM_OPENCODE_ACP_CMD/,
-  );
+  const collisions = resolveBackendRegistry({
+    claude: { command: "custom-claude" },
+    CODEX: { command: "custom-codex" },
+    opencode: { command: "custom-opencode" },
+  });
+  assert.equal(collisions.get("claude")?.command, "custom-claude");
+  assert.equal(collisions.get("codex")?.command, "custom-codex");
+  assert.equal(collisions.get("opencode")?.command, "custom-opencode");
   assert.throws(() => resolveBackendRegistry({ b: { command: "" } }), /non-empty string "command"/);
   assert.throws(
     () => resolveBackendRegistry({ b: { command: "x", args: [1] } as never }),
@@ -174,13 +176,10 @@ test("run backends: empty/absent run declarations return the host registry uncha
   assert.equal(registryWithRunBackends(host, {}), host);
 });
 
-test("run backends: validated with the same rules (reserved names, config shapes)", () => {
+test("run backends: validated with the same config rules and may shadow built-ins", () => {
   const host = resolveBackendRegistry();
-  assert.throws(() => registryWithRunBackends(host, { claude: { command: "x" } }), /reserved/);
-  assert.throws(
-    () => registryWithRunBackends(host, { opencode: { command: "x" } }),
-    /AGENTPRISM_OPENCODE_ACP_CMD/,
-  );
+  assert.equal(registryWithRunBackends(host, { claude: { command: "x" } }).get("claude")?.command, "x");
+  assert.equal(registryWithRunBackends(host, { opencode: { command: "y" } }).get("opencode")?.command, "y");
   assert.throws(() => registryWithRunBackends(host, { b: { command: "" } }), /non-empty string "command"/);
   assert.throws(
     () => registryWithRunBackends(host, { b: { command: "x", structuredOutputTool: "no" } as never }),
@@ -224,12 +223,15 @@ test("selectBackend: a registered name routes by exact spec or name/ prefix, cas
   assert.notEqual(selectBackend({ model: "browserx" }, registry).id, "browser");
 });
 
-test("selectBackend: registered names win over the built-in heuristics", () => {
-  // "gpt-runner" would match the /gpt/ codex heuristic — the registry entry must win.
-  const registry = resolveBackendRegistry({ "gpt-runner": { command: "custom" } });
+test("selectBackend: registered names win over built-in names on collision", () => {
+  const registry = resolveBackendRegistry({
+    "gpt-runner": { command: "custom" },
+    codex: { command: "shadow-codex" },
+  });
   assert.equal(selectBackend({ model: "gpt-runner" }, registry).id, "gpt-runner");
-  // …while unregistered specs still route by heuristic.
-  assert.equal(selectBackend({ model: "gpt-5.6-luna" }, registry).id, "codex");
+  assert.equal(selectBackend({ model: "CoDeX/gpt-5.6-luna" }, registry).spawnConfig().command, "shadow-codex");
+  // Unregistered family-like ids are not interpreted and therefore use the default.
+  assert.equal(selectBackend({ model: "gpt-5.6-luna" }, registry).id, "claude");
   assert.equal(selectBackend({ model: "opus" }, registry).id, "claude");
 });
 

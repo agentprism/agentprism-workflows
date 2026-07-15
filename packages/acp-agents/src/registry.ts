@@ -3,14 +3,12 @@
 // session `_meta`), resolved once at runner construction from:
 //   1. the programmatic option: createAcpRunner({ backends: { name: config } })   (wins per name)
 //   2. the env var AGENTPRISM_BACKENDS: a JSON object of the same shape
-// Routing then matches `model`/`tier` specs against registered names FIRST (exact name, or
-// `name/<inner-model>` prefix), before the built-in heuristics — see runner.ts.
-// Names are case-insensitive (stored lowercased); built-in ids are reserved because the
-// built-ins own their ids (and their own AGENTPRISM_*_ACP_CMD override channel).
+// Routing then matches the effective model spec's first segment against registered names FIRST,
+// before the built-in names — see runner.ts. Names are ASCII-case-insensitive (stored lowercased),
+// and a custom name deliberately shadows a built-in name on collision.
 
 export const BACKENDS_ENV = "AGENTPRISM_BACKENDS";
 
-const RESERVED_NAMES = new Set(["claude", "codex", "opencode"]);
 const NAME_PATTERN = /^[a-z][a-z0-9._-]*$/;
 
 /** How to spawn (and optionally pre-configure) one custom ACP backend. */
@@ -42,8 +40,8 @@ export type BackendRegistry = ReadonlyMap<string, RegisteredBackend>;
 /**
  * Resolve the custom-backend registry: env-declared backends first, programmatic `backends`
  * merged over them (option wins per name). Throws on malformed JSON, invalid names/configs, or
- * reserved names — a misconfigured registry should fail LOUDLY at construction, not silently
- * misroute at run time.
+ * malformed configs — a misconfigured registry should fail LOUDLY at construction, not silently
+ * misroute at run time. A name matching a built-in is valid and takes routing priority.
  */
 export function resolveBackendRegistry(
   option?: Record<string, CustomBackendConfig>,
@@ -77,9 +75,8 @@ export function resolveBackendRegistry(
 /**
  * Layer a RUN-SCOPED registry (an approved script-declared `meta.backends`, arriving via
  * RunOptions.backends) UNDER the host registry: run entries are validated with the same rules
- * (reserved names rejected), and a host-registered name always wins on conflict — a script can
- * never hijack a name the operator configured. Returns the host registry unchanged when the
- * run declares nothing.
+ * and a host-registered name always wins on conflict — a script can never hijack a name the
+ * operator configured. Returns the host registry unchanged when the run declares nothing.
  */
 export function registryWithRunBackends(
   host: BackendRegistry,
@@ -95,15 +92,10 @@ export function registryWithRunBackends(
 }
 
 function validateEntry(rawName: string, config: unknown, source: string): [string, RegisteredBackend] {
-  const name = rawName.toLowerCase();
+  const name = asciiLowercase(rawName);
   if (!NAME_PATTERN.test(name)) {
     throw new Error(
       `${source}: invalid backend name "${rawName}" (must match ${NAME_PATTERN}, matched case-insensitively)`,
-    );
-  }
-  if (RESERVED_NAMES.has(name)) {
-    throw new Error(
-      `${source}: backend name "${rawName}" is reserved for the built-in backend (use AGENTPRISM_${name.toUpperCase()}_ACP_CMD to override how it spawns)`,
     );
   }
   if (config === null || typeof config !== "object" || Array.isArray(config)) {
@@ -138,6 +130,10 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
       ...(customCapabilities !== undefined ? { customCapabilities } : {}),
     },
   ];
+}
+
+function asciiLowercase(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 32));
 }
 
 function validateCustomCapabilities(

@@ -68,7 +68,7 @@ function makeRunner(backends: Record<string, CustomBackendConfig>): AcpAgentRunn
   return harness.makeRunner({ backends });
 }
 
-test("custom backend: routes by registered name, spawns the registry command, returns text", async () => {
+test("backend-only custom spec routes to its harness and issues zero model config calls", async () => {
   const { config, cwd, readLog } = fakeBackend({ turns: [{ text: "hello from custom" }] });
   const out = await makeRunner({ fake: config }).run("hi", { model: "fake", cwd });
 
@@ -210,10 +210,10 @@ test("run-level backends: SAME name with DIFFERENT configs never share a pooled 
   assert.equal(secondPids.length, 1, "second config spawned its OWN process (no pool collision)");
 });
 
-test("run-level backends: malformed/reserved declarations fail NON-RECOVERABLY with a clear message", async () => {
+test("run-level backends: malformed declarations fail NON-RECOVERABLY with a clear message", async () => {
   await assert.rejects(
-    makeRunner({}).run("hi", { model: "x", backends: { claude: { command: "x" } } }),
-    (error: Error & { recoverable?: boolean }) => /reserved/.test(error.message) && error.recoverable === false,
+    makeRunner({}).run("hi", { model: "x", backends: { broken: { command: "" } } }),
+    (error: Error & { recoverable?: boolean }) => /non-empty string/.test(error.message) && error.recoverable === false,
   );
 });
 

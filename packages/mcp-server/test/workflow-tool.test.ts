@@ -78,15 +78,15 @@ test("foreground and await outcomes expose result observability while inspection
       cwd: "/workspace",
       reopen: { load: true, resume: true, list: true },
     });
-    options.onModelResolved?.("gpt-example");
-    options.onModelFallback?.('gpt-example[high]: reasoning_effort "high" not advertised');
+    options.onModelResolved?.("gpt-5.6-sol");
+    options.onModelFallback?.("codex/gpt-5.6-sol");
     return "ok";
   });
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
     const script = [
       'export const meta = { name: "result-observability", description: "result observability" };',
-      'await agent("review", { label: "review", model: "gpt-example[high]" });',
+      'await agent("review", { label: "review", model: "codex/gpt-5.6-sol" });',
       'return await checkpoint("Release?", { kind: "select", choices: ["ship", "hold"], default: "hold" });',
     ].join("\n");
 

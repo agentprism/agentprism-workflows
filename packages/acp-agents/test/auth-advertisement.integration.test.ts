@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
-const MODEL = "anthropic/claude-opus-4-1";
+const MODEL = "claude/claude-opus-4-1";
 
 interface LogEntry {
   method: string;
