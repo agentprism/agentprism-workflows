@@ -15,10 +15,10 @@ If you want to expose a `workflow` tool to an MCP host (Claude Code, Zed, …), 
 you want to embed the runner in your own program, use this one.
 
 It is a **programmatic library**, not an MCP stdio server. It is a thin facade over the engine +
-ACP packages and adds one convenience helper, `runDynamicWorkflow`, which defaults the agent
-backend to ACP. The ACP layer does use `@modelcontextprotocol/sdk` internally when it hosts the
-optional StructuredOutput tool for eligible agents; consumers still interact through this SDK's
-workflow/runner APIs rather than MCP server schemas.
+ACP packages and adds ACP-defaulted helpers for ordinary runs (`runDynamicWorkflow`) and
+substitution tests (`runIsolation`). The ACP layer does use `@modelcontextprotocol/sdk` internally
+when it hosts the optional StructuredOutput tool for eligible agents; consumers still interact
+through this SDK's workflow/runner APIs rather than MCP server schemas.
 
 ---
 
@@ -115,6 +115,27 @@ const run = await runDynamicWorkflow(script, {
 Every script **must** begin with `export const meta = { name, description, phases? }` as its first
 statement, and must be **deterministic** — `Date.now()`, `Math.random()`, and `new Date()` are
 unavailable inside the realm (they would break journal replay on resume).
+
+### Substitution testing (isolation mode)
+
+Record a normal managed run, then re-run its recorded script with one selected step live while all
+other calls are served from the recording:
+
+```ts
+import { runIsolation } from "@automatalabs/workflows";
+
+const isolated = await runIsolation({
+  baselineRunId: recorded.runId,
+  live: [{ label: "step-2", model: "codex/gpt-5.3-codex" }],
+});
+
+const target = isolated.report.calls.find((call) => call.mode === "live-target");
+console.log(isolated.status, target?.recordedUsage, target?.liveUsage);
+```
+
+The SDK defaults the live runner to ACP and disposes it; pass `runner` to inject and retain your own.
+See the [Isolation mode API](../../docs/api.md#isolation-mode) for baseline admissibility, target
+selection, typed refusals, report semantics, and the lower-level `createReplayRunner` composition.
 
 ### b) `createAcpRunner().run(...)` — drive a single agent
 
@@ -629,6 +650,8 @@ otherwise follows the existing agent-error path.
 ```ts
 // ── Run entry & helper ──
 runDynamicWorkflow,           // (script, { args?, runner?, exec? }) => Promise<WorkflowRunResult>
+runIsolation,                 // ACP-defaulted single-target substitution over a recorded run
+createReplayRunner,           // backend-neutral in-memory replay composition primitive
 runWorkflow,                  // the bare engine run (no status trio)
 parseWorkflowScript,          // parse a script's meta + body
 validateWorkflowScript,       // token-free parse + mock dry run + no-prompt harness option probes
@@ -656,7 +679,10 @@ WorkflowError, WorkflowErrorCode, isWorkflowError, isProviderUsageLimit, isAuthR
 AGENTPRISM_PERSISTENCE_ROOT_ENV,
 
 // ── Types ──
-RunDynamicWorkflowOptions, WorkflowRunOptions, AgentOptions, ExecOptions,
+RunDynamicWorkflowOptions, RunIsolationSdkOptions, RunIsolationOptions, IsolationRunResult,
+IsolationTarget, ReplayRunnerOptions, ReplayRunner, ReplayObservation, ReplayReport,
+ReplayCallReport, ReplayDivergenceEvent, ResolvedIsolationTarget,
+WorkflowRunOptions, AgentOptions, ExecOptions, CheckpointCallContext,
 MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,
@@ -665,7 +691,7 @@ WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowRunFallbac
 WorkflowCheckpointTaken, WorkflowCheckpointSource, WorkflowSnapshot,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
-AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig,
+AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
 InteractiveSessionOptions, InteractiveTurn, ProbedConfigOptions, SessionConfigOption,
 PermissionResolver,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,

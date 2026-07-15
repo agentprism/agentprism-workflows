@@ -288,8 +288,8 @@ test(
     assert.equal(finalState?.status, "completed");
     const replyEntry = finalState?.journal?.find((entry) => entry.index === context.callIndex);
     assert.deepEqual(
-      { index: replyEntry?.index, hash: replyEntry?.hash, result: replyEntry?.result },
-      { index: context.callIndex, hash: context.hash, result: "ship" },
+      { index: replyEntry?.index, hash: replyEntry?.hash, result: replyEntry?.result, kind: replyEntry?.kind, scope: replyEntry?.scope },
+      { index: context.callIndex, hash: context.hash, result: "ship", kind: "checkpoint", scope: paused.runId },
       "the synthetic decision is in the final persisted journal",
     );
     assert.deepEqual(replyEntry?.call, { kind: "checkpoint", label: "checkpoint", phase: undefined });
@@ -356,8 +356,8 @@ test(
     assert.equal(loaded?.status, "completed", "a direct filesystem load exposes the terminal state");
     const replyEntry = loaded?.journal?.find((entry) => entry.index === context.callIndex);
     assert.deepEqual(
-      { index: replyEntry?.index, hash: replyEntry?.hash, result: replyEntry?.result },
-      { index: context.callIndex, hash: context.hash, result: "ship" },
+      { index: replyEntry?.index, hash: replyEntry?.hash, result: replyEntry?.result, kind: replyEntry?.kind, scope: replyEntry?.scope },
+      { index: context.callIndex, hash: context.hash, result: "ship", kind: "checkpoint", scope: paused.runId },
       "the synthetic checkpoint reply is durably journaled on disk",
     );
     assert.deepEqual(replyEntry?.call, { kind: "checkpoint", label: "checkpoint" });

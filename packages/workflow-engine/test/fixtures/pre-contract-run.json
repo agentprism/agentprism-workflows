@@ -1,0 +1,23 @@
+{
+  "runId": "pre-contract-run",
+  "workflowName": "pre_contract",
+  "script": "export const meta = { name: 'pre_contract', description: 'old run fixture' }\nreturn await agent('old', { label: 'old' })",
+  "args": {
+    "fixture": true
+  },
+  "status": "paused",
+  "phases": [],
+  "agents": [],
+  "logs": [
+    "old-format"
+  ],
+  "journal": [
+    {
+      "index": 0,
+      "hash": "fixture-hash-is-replaced-for-live-resume",
+      "result": "old-result"
+    }
+  ],
+  "startedAt": "2024-01-01T00:00:00.000Z",
+  "updatedAt": "2024-01-01T00:00:00.000Z"
+}

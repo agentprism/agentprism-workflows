@@ -1,5 +1,19 @@
 # @automatalabs/workflows
 
+## 0.31.0
+
+### Minor Changes
+
+- ef2c64b: Add the ACP-defaulted `runIsolation` SDK wrapper with owned-runner disposal and script-backend approval, and re-export `createReplayRunner` plus the isolation report, target, runner, call-manifest, recorded-error, and checkpoint-context types.
+
+### Patch Changes
+
+- Updated dependencies [ef2c64b]
+- Updated dependencies [ef2c64b]
+  - @automatalabs/shared-types@0.19.0
+  - @automatalabs/workflow-engine@0.20.0
+  - @automatalabs/acp-agents@0.25.1
+
 ## 0.30.1
 
 ### Patch Changes

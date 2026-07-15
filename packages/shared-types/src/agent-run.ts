@@ -26,6 +26,19 @@ export interface AgentUsage {
   cost: number;
 }
 
+/** Out-of-band result provenance a wrapping/caching AgentRunner MAY report for the
+ *  current attempt: whether the result it returns was produced live or replayed
+ *  from a recording. Generic — any memoizing or record/replay wrapper can report it;
+ *  the engine never fabricates a value; absence means an ordinary live call. */
+export type AgentResultProvenance =
+  | { source: "live"; overrideModel?: string }
+  | {
+      source: "replay";
+      recordedRunId?: string;
+      recordedIndex?: number;
+      hashMatched?: boolean;
+    };
+
 export interface PromptImage {
   readonly data: string;
   readonly mimeType: string;
@@ -53,6 +66,9 @@ export interface PromptImage {
  * `maxSchemaRetries` is runner-internal (the engine never passes it). Pi's
  * `tools?: ToolDefinition[]` is DROPPED — a pi-coding-agent type with no ACP analog (ACP
  * injects tools via session/new mcpServers, not this field) and never passed by the engine.
+ * The additive call identity context (`callIndex`, `callHash`, `callPath`,
+ * `callInputsHash`) is scoped to one engine call and does not enter the resume
+ * identity hash.
  */
 export interface RunOptions<S extends TSchema | undefined = undefined> {
   /** Human label for logs/telemetry. NOT part of the resume identity hash. */
@@ -97,8 +113,17 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
   /** With `schema`: extra client-side repair turns before strict prose extraction. Leaf default 2.
    *  Runner-internal — the engine never passes it and it is NOT plumbed to the MCP tool. */
   maxSchemaRetries?: number;
-  /** Real usage, read right before session disposal. Fires on success AND error. May never fire. */
+  /** Real usage for one runner attempt. A runner MAY invoke this multiple times within
+   *  an attempt; every report is a CUMULATIVE snapshot for that attempt, and the last
+   *  report received before the attempt settles wins. Fires on success AND error. May
+   *  never fire. */
   onUsage?: (usage: AgentUsage) => void;
+  /** Out-of-band result provenance for the current attempt. The last report received
+   *  before the attempt settles wins; late reports are dropped by the engine. */
+  onResultProvenance?: (provenance: AgentResultProvenance) => void;
+  /** Reports the recorded settlement ordinal bound to this attempt for budget-
+   *  trajectory replay. The engine seals this callback with the attempt. */
+  onBudgetReplay?: (r: { settlementOrdinal: number }) => void;
   /** The actually-resolved concrete model id (display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /** A requested model/tier/phase spec that wasn't found (fell back to the session default). */
@@ -171,6 +196,34 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  the run) and, like every on* callback, OUT-OF-BAND: run()'s return value stays the bare
    *  AgentResult. NOT part of the resume identity hash. */
   onSessionOpen?: (session: AgentSessionRef) => void;
+  /** The engine's deterministic journal index for THIS agent() call — the same
+   *  value as JournalEntry.index / WorkflowCallRecord.index. Assigned at lexical
+   *  call time BEFORE the concurrency limiter; identical on every retry attempt.
+   *  The index space is shared with checkpoint() (runner-visible indexes have gaps
+   *  at checkpoint positions) and scoped to ONE engine run — `runId` is the scope
+   *  discriminator at this seam; (runId, callIndex) is a cross-run key only when
+   *  the caller keeps runIds unique (WorkflowManager and runIsolation do; bare
+   *  runWorkflow callers own that precondition). ADDITIVE, not a hash input.
+   *  Omitted only by callers that are not the engine. */
+  callIndex?: number;
+  /** The call-identity hash for THIS call — the same value as JournalEntry.hash /
+   *  WorkflowCallRecord.hash. Proves the prompt and the REQUESTED (script-resolved)
+   *  model spec — never the model a backend actually served, and never the unhashed
+   *  inputs (label/cwd/images/mcpServers/meta). Identical across retry attempts.
+   *  ADDITIVE, not itself a hash input. */
+  callHash?: string;
+  /** The structural call-path key for THIS call: body-relative "line:column"
+   *  workflow-script frames, innermost first, joined with "<". Stable for a
+   *  byte-identical script under the same call-path format + Node major. Identical
+   *  across retry attempts. ABSENT when capture failed or was ambiguous — never
+   *  fabricated, never truncated. ADDITIVE, not hashed. */
+  callPath?: string;
+  /** The input fingerprint for THIS call: sha256 of the canonical strict-JSON of
+   *  the call's resolved unhashed execution inputs (cwd/isolation/images/mcpServers/
+   *  meta/promptMeta/keepSession/label/effective timeout+retries/approved-backends
+   *  digest). Identical across retry attempts. ABSENT when any component fails
+   *  strict-JSON canonicalization — never fabricated. ADDITIVE, not a hash input. */
+  callInputsHash?: string;
 }
 
 /** The result side of the seam: schema => the validated object, no schema => text.

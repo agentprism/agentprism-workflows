@@ -41,6 +41,15 @@ export enum WorkflowErrorCode {
   AGENT_EMPTY_OUTPUT = "AGENT_EMPTY_OUTPUT",
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
   PERSISTENCE_ERROR = "PERSISTENCE_ERROR",
+  /** A recording is unusable as an isolation baseline. Non-recoverable.
+   *  details: { reason: string; runId?: string; indexes?: number[] }. */
+  RECORDING_UNUSABLE = "RECORDING_UNUSABLE",
+  /** A target could not be resolved to exactly one admissible recorded agent call.
+   *  Non-recoverable. details: { target, reason, candidates? }. */
+  REPLAY_TARGET_INVALID = "REPLAY_TARGET_INVALID",
+  /** The re-executed script left the recording, or correspondence was unprovable.
+   *  Non-recoverable. details: ReplayDivergenceEvent. */
+  REPLAY_DIVERGENCE = "REPLAY_DIVERGENCE",
   UNKNOWN = "UNKNOWN",
 }
 
@@ -68,6 +77,34 @@ export interface CheckpointContext {
   kind: "confirm" | "input" | "select";
   choices?: string[];
   default?: unknown;
+}
+
+/** Strict-JSON projection of a thrown value recorded in a run's call manifest. */
+export interface WorkflowRecordedError {
+  /** "workflow-error" — instanceof WorkflowError; "error" — any other Error;
+   *  "value" — a non-Error thrown value. */
+  form: "workflow-error" | "error" | "value";
+  /** Form "error": the error's name (guarded read). */
+  name?: string;
+  /** REQUIRED for forms "workflow-error" and "error". A guarded read that fails or
+   *  yields a non-string sets lossy instead of omitting silently. */
+  message?: string;
+  /** Form "workflow-error": every public WorkflowError field. */
+  code?: WorkflowErrorCode;
+  recoverable?: boolean;
+  agentLabel?: string;
+  /** Strict-JSON projected. */
+  details?: unknown;
+  resetHint?: string;
+  authContext?: AuthErrorContext;
+  checkpointContext?: CheckpointContext;
+  /** Form "error": JSON-safe own enumerable data properties of the Error. */
+  props?: Record<string, unknown>;
+  /** Form "value": the thrown value, strict-JSON projected. */
+  value?: unknown;
+  /** True when any consumed part failed strict-JSON projection or a property read
+   *  threw. Lossy rows make a recording unusable as a baseline. */
+  lossy?: boolean;
 }
 
 export interface WorkflowErrorOptions {

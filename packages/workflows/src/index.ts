@@ -2,8 +2,8 @@
 // @automatalabs/workflows — the importable SDK for the AgentPrism dynamic-workflow
 // orchestrator. A FACADE re-export barrel: it re-exports the clean public surface of
 // the three engine packages, adds the SDK-level WorkflowManager ACP-event bridge, and
-// adds ONE convenience helper (`runDynamicWorkflow`) that defaults the AgentRunner seam
-// to the ACP backend. It is SEPARATE from @automatalabs/mcp-server (the stdio MCP server)
+// adds ACP-defaulted convenience helpers for ordinary and isolation runs. It is
+// SEPARATE from @automatalabs/mcp-server (the stdio MCP server)
 // and stays a PURE library — it pulls in neither @modelcontextprotocol/sdk nor zod.
 //
 // The DSL globals available INSIDE a workflow script (agent, parallel, pipeline, …) are
@@ -21,12 +21,32 @@ import {
 import type { AcpEventListener, AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
 import type { ExecOptions, WorkflowDir, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
 import type { AgentRunner, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
+import { approveScriptBackends, type ScriptBackendApproval } from "./script-backends.js";
 
 type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 
 // ── Engine: run entry, script parsing, the managed-run lifecycle, and the
 //    option/result + error types the host composes against. ──
 export { runWorkflow, parseWorkflowScript, redactText, truncateUtf8 } from "@automatalabs/workflow-engine";
+
+// ── Isolation mode: deterministic substitution testing over a recorded run. The SDK
+//    wrapper defaults the live target runner to ACP and owns that runner's disposal. ──
+export { runIsolation, createReplayRunner, type RunIsolationSdkOptions } from "./isolation.js";
+export type {
+  RunIsolationOptions,
+  IsolationRunResult,
+  ReplayRunnerOptions,
+  ResolvedIsolationTarget,
+  IsolationTarget,
+  ReplayRunner,
+  ReplayObservation,
+  ReplayReport,
+  ReplayCallReport,
+  ReplayDivergenceEvent,
+  CheckpointCallContext,
+  WorkflowCallRecord,
+  WorkflowRecordedError,
+} from "./isolation.js";
 
 // ── Workflow directory view: openWorkflowDir("./workflows") binds a read-only,
 //    per-call-fresh view over folders of versioned workflow scripts (name = filename
@@ -477,9 +497,7 @@ function toAgentEventPayload<K extends AcpEventName>(name: K, event: AcpRunnerEv
  * runDynamicWorkflow THROWS with guidance rather than running a script whose declared
  * dependencies were dropped.
  */
-export type ScriptBackendApproval =
-  | boolean
-  | ((backend: { name: string } & WorkflowBackendConfig) => boolean | Promise<boolean>);
+export type { ScriptBackendApproval } from "./script-backends.js";
 
 /** Options for {@link runDynamicWorkflow}. */
 export interface RunDynamicWorkflowOptions {
@@ -548,7 +566,10 @@ export async function runDynamicWorkflow(
   }
   let exec = opts.exec;
   if (declared && Object.keys(declared).length > 0) {
-    exec = { ...(exec ?? {}), scriptBackends: await approveScriptBackends(declared, opts.allowScriptBackends) };
+    exec = {
+      ...(exec ?? {}),
+      scriptBackends: await approveScriptBackends(declared, opts.allowScriptBackends, "runDynamicWorkflow"),
+    };
   }
   const owned = opts.runner === undefined;
   const runner = opts.runner ?? createAcpRunner();
@@ -559,34 +580,4 @@ export async function runDynamicWorkflow(
     manager.dispose();
     if (owned) await (runner as OwnedAcpRunner).dispose();
   }
-}
-
-/** Resolve the embedder's approval policy over the declared backends; throw with guidance when
- *  approval is missing or any backend is declined (an unapproved dependency must abort, never
- *  silently reroute). */
-async function approveScriptBackends(
-  declared: Record<string, WorkflowBackendConfig>,
-  approval: ScriptBackendApproval | undefined,
-): Promise<Record<string, WorkflowBackendConfig>> {
-  const names = Object.keys(declared).join(", ");
-  if (approval === undefined || approval === false) {
-    throw new WorkflowError(
-      `script declares custom ACP backends (meta.backends: ${names}) — these spawn commands on this machine and require explicit approval. ` +
-        `Pass allowScriptBackends: true (or a per-backend approval callback) to runDynamicWorkflow, ` +
-        `or thread an approved registry yourself via exec.scriptBackends.`,
-      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-      { recoverable: false },
-    );
-  }
-  if (approval === true) return declared;
-  for (const [name, config] of Object.entries(declared)) {
-    if (!(await approval({ name, ...config }))) {
-      throw new WorkflowError(
-        `script backend "${name}" (command: ${config.command}) was declined by the allowScriptBackends callback — aborting the run`,
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false },
-      );
-    }
-  }
-  return declared;
 }

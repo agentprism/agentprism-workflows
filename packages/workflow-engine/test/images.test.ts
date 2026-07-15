@@ -88,9 +88,9 @@ return await agent('same', ${opts})`;
     const withImages = await journalOf(true);
     const withoutImages = await journalOf(false);
     assert.deepEqual(
-      withImages,
-      withoutImages,
-      "adding images must keep the journal byte-identical (not part of the identity)",
+      withImages.map(({ index, hash, result, kind, usage }) => ({ index, hash, result, kind, usage })),
+      withoutImages.map(({ index, hash, result, kind, usage }) => ({ index, hash, result, kind, usage })),
+      "adding images must keep the journal identity/result byte-identical (scope is run-specific)",
     );
   });
 });

@@ -1,6 +1,13 @@
 # Evals (`agentprism-evals`)
 
-**Status:** next · **Updated:** 2026-07-14
+**Status:** replay substrate implemented · scoring/report UX next · **Updated:** 2026-07-14
+
+The isolation substrate contract is frozen in
+[`docs/specs/evals-isolation-spec.md`](../specs/evals-isolation-spec.md). Propagation mode is
+available today through journal resume, and isolation mode is implemented through `runIsolation`,
+`createReplayRunner`, the per-call manifest, and `ReplayReport`. The next roadmap stage is the evals
+harness itself: scoring, repetition/model matrices, vitest-evals integration, and report UX that
+consume `ReplayReport` plus the manifest.
 
 A package for evaluating workflows the way the rest of the stack already thinks: at the
 **workflow level**, not the single-agent level. The orchestrator's existing surfaces make two
@@ -40,18 +47,21 @@ want to make.
    evals ("did the verifier stage actually run per finding", "how many rounds until dry")
    are post-hoc queries over recorded structure — they do not require re-running agents.
 
-## Substitution mechanics the engine already fixes
+## Implemented substitution mechanics
 
-- The journal's call-identity hash includes the **resolved model**, so a swapped call can
-  never replay a stale cached result — cross-model comparisons are structurally safe.
+- The journal call hash covers the script-requested model and deterministic call inputs; the
+  manifest separately records positive requested/resolved/fallback evidence for honest baseline
+  model attribution.
 - Journal resume replays the **longest unchanged prefix**: change the model on step N and
   resume, and steps before N replay free from the journal while N *and everything
   downstream* run live. That is **propagation mode** — "what does this swap do to the final
   outcome?" — and it works today with no new machinery.
-- The `AgentRunner` seam is a first-class injection point. A record/replay runner that
-  serves recorded results for every call except the target — which runs live on the
-  candidate — gives **isolation mode**: upstream *and* downstream held fixed, a per-step
-  verdict at per-step cost. This is leaf-package work; the engine doesn't change.
+- The engine's `createReplayRunner` serves recorded results for every call except the live target,
+  with call paths, input fingerprints, environment identity, budget-trajectory replay, and strict
+  fail-closed divergence checks. The SDK's `runIsolation` executes that composition end to end and
+  persists a quarantined artifact plus `ReplayReport`: upstream *and* admissible downstream calls
+  are held fixed for a per-step comparison. Scripts outside the proven correspondence envelope use
+  propagation mode.
 
 ## Scoring "comparable"
 
@@ -67,7 +77,7 @@ Reliability ordering, exploiting that our outputs are typed:
    metric — a cheaper model can look comparable once and fail on reliability.
 4. Embedding similarity at most as a cheap drift tripwire, never a verdict.
 
-## Planned shape
+## Next stage
 
 - Investigate **vitest-evals** as the harness: its harness-first API takes typed
   JSON-serializable outputs verbatim into judges, and its normalized session/transcript
@@ -75,24 +85,17 @@ Reliability ordering, exploiting that our outputs are typed:
   sampling/aggregation and model-matrix parameterization are userland; it requires
   Vitest 4 and is pre-1.0 (pin exactly). First spike: `runDynamicWorkflow` wrapped as a
   harness, one recorded run as fixture, one typed scorer, CI-runnable.
-- A **trajectory sink**: a stable, documented projection of the journal (stages, agents,
-  backends, checkpoint decisions) that scorers consume, so process evals don't couple to
-  journal internals. Now also carries **per-call token usage/cost** — today only the
-  run-level aggregate persists, and the per-step cost-vs-quality report needs the split.
+- Build scorer-facing trajectory helpers over the now-public `WorkflowCallRecord` manifest and
+  `ReplayReport`, rather than coupling scorers to storage paths or raw journal internals. Per-call
+  baseline and candidate usage already ride the report's `recordedUsage`/`liveUsage` cost surface.
 - **Substitution reports**: the same recorded workflow scored across candidate
   models/backends, reusing the existing registry — per-step comparability verdicts plus
   cost deltas, rolled up to a whole-workflow answer.
 
-## Open questions
+## Open questions for the scoring package
 
-- Isolation-mode keying: the runner isn't handed the deterministic call index, so a
-  record/replay runner must key on prompt/label (or pin concurrency) — decide whether to
-  thread the call index through `RunOptions` as a small engine addition.
-- External substitution ergonomics: model is script-authored per call today; decide between
-  script rewriting, a per-label model-override option on run options, or letting the
-  injected runner reinterpret the model spec.
 - Scorer authoring ergonomics: plain functions first; LLM-as-judge scorers only where rubrics
   genuinely need them (and then pinned + versioned).
 - Where fixtures live (repo-local `evals/` convention vs. package-level).
-- Whether journal replay needs a compatibility guarantee across engine versions to keep old
-  recorded trajectories scoreable.
+- Report presentation: terminal/JSON first, then decide whether richer artifact comparison belongs
+  in the evals package or a separate UI consumer.

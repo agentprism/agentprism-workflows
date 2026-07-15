@@ -298,6 +298,185 @@ Metrics: `agentprism.tokens`, `agentprism.cost`, `agentprism.agents`, and `agent
 
 ---
 
+## Isolation mode
+
+Isolation mode is the single-shot substitution primitive: it re-executes a completed recorded
+workflow, serves every non-target call from that recording, delegates the selected target call to a
+live runner, and returns a typed `ReplayReport`. The persisted isolation artifact is quarantined and
+cannot itself be resumed or reused as a baseline.
+
+The SDK form defaults `runner` to `createAcpRunner()`, disposes that owned runner after the run, and
+uses `allowScriptBackends` to approve the recording's script-declared `meta.backends`:
+
+```ts
+import { runIsolation } from "@automatalabs/workflows";
+
+const isolated = await runIsolation({
+  baselineRunId: recorded.runId,
+  live: [{ label: "step-2", model: "codex/gpt-5.3-codex" }],
+  cwd: projectRoot,
+  allowScriptBackends: true,
+});
+
+if (isolated.status === "completed") {
+  const target = isolated.report.calls.find((call) => call.mode === "live-target");
+  console.log(target?.recordedUsage, target?.liveUsage);
+}
+```
+
+`RunIsolationSdkOptions` is the engine's `RunIsolationOptions` without `runner` or
+`scriptBackends`, plus optional `runner` and `allowScriptBackends`. An injected runner remains
+caller-owned. The backend-neutral engine form requires both fields explicitly:
+
+```ts
+import { runIsolation } from "@automatalabs/workflow-engine";
+
+const isolated = await runIsolation({
+  baselineRunId,
+  runner,
+  live: [{ callIndex: 3, model: "candidate/model" }],
+  scriptBackends: approvedScriptBackends,
+});
+```
+
+Both forms are async and never throw synchronously. Load, preflight, target resolution,
+environment, lease, run-id collision, and manager-start failures reject with a typed
+`WorkflowError` before script execution or live spend. Once script execution starts, every outcome
+resolves as `IsolationRunResult.status`: `"completed"`, `"target-failed"`, `"diverged"`, or
+`"failed"`.
+
+### `createReplayRunner` composition
+
+`createReplayRunner({ recording, inner, live, rootRunId, executionCwd?, environmentKey? })` is the
+in-memory composition primitive. It JSON-normalizes and preflights `recording`; its `confirm`,
+`observeAgentEnd`, `report`, and `finalize` methods let a custom host wire checkpoint serving,
+sealed target settlement, and report freezing. An own-manager composition must pass the same
+baseline marker in the initial managed-run save:
+
+```ts
+const replay = createReplayRunner({ recording, inner, live, rootRunId, executionCwd });
+manager.on("agentEnd", (event) => replay.observeAgentEnd(event));
+const run = await manager.runSync(recording.script, structuredClone(recording.args), {
+  agent: replay,
+  confirm: replay.confirm,
+  runId: rootRunId,
+  executionMode: { kind: "isolation", baselineRunId: recording.runId }, // MANDATORY
+  cwd: executionCwd,
+});
+const report = replay.finalize({ scriptCompleted: run.status === "completed" });
+```
+
+Omitting `ExecOptions.executionMode` on this own-manager path violates the quarantine contract; a
+replayed provenance row still makes later baseline use fail closed. Prefer `runIsolation` unless the
+host needs to own the manager lifecycle.
+
+### Targets and model evidence
+
+Every `IsolationTarget` selects exactly one recorded agent call: `{ callIndex, model? }` XOR
+`{ label, model? }`. A label must resolve to exactly one terminal root-scope agent row; use
+`callIndex` for duplicate labels. Targets must be runner-origin agent rows with an input
+fingerprint and a pinnable cwd; checkpoints, worktree calls, journal-replayed calls, missing rows,
+and duplicate target selections are rejected as `REPLAY_TARGET_INVALID` (`no-targets`,
+`invalid-selector`, `label-not-found`, `label-ambiguous`, `re-record-or-target-by-callindex`,
+`call-not-found`, `not-agent-call`, `journal-replay-target`, `not-runner-call`, `worktree-target`,
+`no-input-fingerprint`, `path-missing`, or `duplicate-target`). Re-record with the current engine,
+target a unique live runner row, or use propagation mode as the named condition requires.
+
+Baseline attribution has three states. A target without a model override is accepted only when the
+recorded row positively proves `modelRequested` and `modelResolved` and reports no fallback. An
+unverified baseline is refused as `unproven-baseline-model`; supplying explicit `target.model`
+states the comparison intent and admits it. Candidate attribution also requires positive evidence:
+a sealed resolved model with no fallback is verified, a sealed fallback causes
+`candidate-fallback` divergence, and a silent runner is explicitly marked
+`candidateEvidence: "unverified"` and listed in `report.unverifiedTargets`.
+
+### Recording refusals
+
+An inadmissible recording rejects with `WorkflowErrorCode.RECORDING_UNUSABLE`; `details.reason` is
+one of the following frozen values. First failure wins.
+
+| Reason | Remedy |
+|---|---|
+| `not-found` | Check `baselineRunId`, `cwd`, and `persistenceRoot`. |
+| `corrupt-structure` | Re-record with the current engine; do not hand-edit consumed run fields. |
+| `not-completed` | Use a terminal completed run; partial runs belong to propagation mode. |
+| `script-invalid` | Repair the recorded script and create a new completed recording. |
+| `incomplete-manifest` | Re-record so every allocated call has one dense terminal manifest row. |
+| `nested-workflow-recording` | Record a root workflow with no nested `workflow()` execution. |
+| `isolation-artifact` | Use the original live recording, never a quarantined isolation artifact. |
+| `legacy-resume` | Create a fresh, non-legacy recording with the current engine. |
+| `abort-residue` | Use a clean completed run that was never aborted. |
+| `engine-origin-row` | Re-record after fixing the engine-owned call failure. |
+| `replayed-row` | Use a recording whose rows were produced live, not served from another run. |
+| `unreplayable-error` | Re-record with a strict-JSON, losslessly projectable thrown value. |
+| `args-unreplayable` | Pass strict-JSON args and record again. |
+| `ambiguous-identity` | Give fan-out calls distinct lenses/prompts or call sites, or use propagation mode. |
+| `path-missing` | Re-record with an engine that captures call paths. |
+| `runtime-mismatch` | Run under exactly the recorded Node/V8 and path/input formats, or re-record. |
+| `no-limits` | Re-record so effective execution limits are persisted. |
+| `agent-limit-boundary` | Re-record with `maxAgents` strictly greater than allocated calls. |
+| `no-budget-trajectory` | Re-record so every call has a settlement ordinal and every agent a budget debit. |
+| `no-execution-cwd` | Supply `executionCwd` for a legacy recording, or create a new recording. |
+| `no-environment-identity` | Re-record in Git or supply the same explicit `environmentKey` outside Git. |
+| `environment-mismatch` | Restore the recorded Git HEAD/dirty state or matching non-Git key, then retry. |
+| `journal-manifest-mismatch` | Create a fresh run whose result journal and terminal call manifest agree. |
+
+The prominent v1 identity refusal is intentional and applies to the whole recording:
+
+> Recordings containing two calls with identical `(kind, path, hash)`
+> (`RECORDING_UNUSABLE`, `"ambiguous-identity"`, §4.9). **Prominent consequence
+> (opus r5 A2):** the engine's own stdlib produces exactly this — `verify()` with
+> no `lens` and ≥2 reviewers, `judgePanel()`, or any
+> `parallel(items.map(() => agent(samePrompt)))` emits identical-prompt,
+> identical-path calls (`workflow.ts:855-864`), so ANY recording containing such a
+> helper call is wholly non-isolatable, even to isolate an unrelated step.
+> Remedies: distinct `lens` values (which change the prompt, hence the hash),
+> distinct call sites, or propagation mode. Two all-served upstream duplicates
+> would be order-safe to serve, so this is over-conservative, not unsound — future
+> admission is out of scope.
+
+### Replay divergences
+
+After execution begins, correspondence failures resolve with status `"diverged"` (or `"failed"`
+for an unsettled target) and a `REPLAY_DIVERGENCE` error/report event using one frozen kind:
+
+| Kind | Remedy |
+|---|---|
+| `path-unavailable` | Re-record and replay under the exact supported runtime/path format. |
+| `nested-workflow-call` | Keep the isolation replay in root scope; use propagation for nested execution. |
+| `identity-reexecuted` | Restore the recording's call count/control flow at that lexical site. |
+| `target-site-reexecuted` | Select a target site that arrives exactly once. |
+| `dependent-or-drifted-target` | Isolate one independent target and restore its recorded config/context. |
+| `ambiguous-path` | Split fan-out across distinct call sites/prompts, target another step, or propagate. |
+| `unrecorded-call` | Restore recorded control flow; do not introduce a new live call. |
+| `target-inputs-drift` | Restore the target's recorded fingerprint and resolved cwd before live delegation. |
+| `target-unsettled` | Await the target and let its terminal `agentEnd` settle before script completion. |
+| `candidate-fallback` | Choose a candidate model the runner can positively serve without fallback. |
+| `checkpoint-context-unavailable` | Re-record with checkpoint call context support in the current engine. |
+
+### Cost, call identity, and persisted types
+
+An isolation run's own per-call token figures (chars/4 estimates for served calls) are not comparable to a normal run's; the `ReplayReport` — `recordedUsage` vs `liveUsage` — is the only valid cost surface.
+
+The replay substrate is public and additive. `RunOptions` carries optional `callIndex`, `callHash`,
+`callPath`, and `callInputsHash` identity plus `onResultProvenance`; runners may ignore these fields,
+while replay runners require them. `WorkflowCallRecord` is the root-scope terminal manifest.
+`JournalEntry` adds optional `kind`, `usage`, and `scope`. `PersistedRunState` adds the strict args
+snapshot marker, effective cwd/runtime/environment/limits, manifest and allocation facts,
+abort/nesting/resume markers, model and agents-directory context, `executionMode`, and
+`replayReport`.
+
+`PersistedRunState`, `PersistedAgentState`, `JournalEntry`, `WorkflowCallRecord`,
+`WorkflowRecordedError`, `AgentResultProvenance`, and `ReplayReport` are documented public types:
+their evolution is additive-only, and readers must tolerate absent old fields and unknown future
+fields. Baseline admissibility is a stricter overlay and does not make every valid run record
+replayable. The runs-directory location/layout, backup/lock files, and cross-tool file discovery are
+internal storage details; use the engine's `createRunPersistence` or
+`WorkflowManager.getPersistence()` rather than depending on paths. The SDK intentionally adds no
+new persistence export.
+
+---
+
 ## AcpAgentRunner (`createAcpRunner`)
 
 ```ts

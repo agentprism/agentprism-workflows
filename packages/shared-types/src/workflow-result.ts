@@ -1,6 +1,7 @@
 // ===== packages/shared-types/src/workflow-result.ts =====
 
-import type { AuthErrorContext, CheckpointContext, WorkflowErrorCode } from "./errors.js";
+import type { AgentResultProvenance, AgentUsage } from "./agent-run.js";
+import type { AuthErrorContext, CheckpointContext, WorkflowErrorCode, WorkflowRecordedError } from "./errors.js";
 
 /** Aggregate token/cost usage for a whole run (engine-summed; matches the
  *  onTokenUsage shape at workflow.ts:112-119). */
@@ -158,7 +159,76 @@ export interface JournalEntry {
   session?: AgentSessionRecord;
   /** Additive diagnostic metadata; it is not part of replay identity. */
   call?: JournalCallMetadata;
+  /** Which primitive journaled this entry. Absent on old journals ("unknown"). */
+  kind?: "agent" | "checkpoint";
+  /** The logical call's provider-reported usage: the per-call sum. Absent on old
+   *  journals, on checkpoint entries, and when no attempt reported in time. A
+   *  present value is a LOWER BOUND on true spend. The chars/4 estimate is never
+   *  written here. Replay carries it verbatim. */
+  usage?: AgentUsage;
+  /** The emitting engine run's runId. Absent on old journals (treated as root).
+   *  The manager persists only root-scope entries. */
+  scope?: string;
 }
+
+/** One record per TERMINATED call of an engine run, emitted at the call's terminal
+ *  transition — including calls that never journal (failures, caught throws,
+ *  engine-side deaths, aborts). What the journal is to results, this is to structure. */
+export interface WorkflowCallRecord {
+  /** Same space as JournalEntry.index. */
+  index: number;
+  kind: "agent" | "checkpoint";
+  /** hashAgentCall / hashCheckpoint at call time. Present on every record. */
+  hash: string;
+  /** The structural call-path key, when captured. */
+  path?: string;
+  /** The input fingerprint, when computable. Agent calls only. */
+  inputsHash?: string;
+  /** options.label as resolved by the engine (agent calls). */
+  label?: string;
+  /** "result" — a value returned to the script; "null" — recoverable exhaustion
+   *  resolved null; "error" — a throw propagated into the script (catchable there). */
+  outcome: "result" | "null" | "error";
+  /** Which mechanism terminated the call. */
+  origin: "runner" | "journal-replay" | "confirm" | "headless" | "engine";
+  /** REQUIRED on outcome "null"/"error", forbidden on "result": the projection of
+   *  the terminal error/thrown value. */
+  error?: WorkflowRecordedError;
+  /** True exactly on the signal-abort exits. */
+  aborted?: boolean;
+  /** Runner attempts that ran (origin "runner"; >=1). */
+  attempts?: number;
+  /** The logical call's usage: the per-call sum — present for failed calls too.
+   *  A LOWER BOUND. Journal-replayed calls carry the entry's usage verbatim. */
+  usage?: AgentUsage;
+  /** The REQUESTED (script-resolved) model spec the engine passed to the runner.
+   *  This is what the hash proves. NOT the served model. */
+  modelRequested?: string;
+  /** The runner-reported concrete model id from the terminal attempt. */
+  modelResolved?: string;
+  /** The terminal attempt's runner-reported backendId, when reported. */
+  backendId?: string;
+  /** True when any attempt reported a model fallback. */
+  modelFallback?: true;
+  /** True when the engine created a git worktree for this call. */
+  worktree?: boolean;
+  /** The resolved isolation request at call time; absent when none. */
+  isolation?: "worktree";
+  /** The post-resolution execution directory handed to the runner. */
+  resolvedCwd?: string;
+  /** What this logical call added to the run's script-visible spent value. Zero on
+   *  journal-replayed rows; absent on checkpoint rows. */
+  budgetDebit?: number;
+  /** 1-based position of this call's terminal transition in the run's settlement
+   *  sequence. */
+  settlementOrdinal?: number;
+  /** The terminal attempt's runner-reported result provenance. Permitted only on
+   *  origin "runner" rows. */
+  provenance?: AgentResultProvenance;
+  /** The emitting engine run's runId. Manager persists root-scope records only. */
+  scope?: string;
+}
+
 
 export interface WorkflowRunInspectionOptions {
   /** Latest matching journal entries. Default 20; valid range 1..50. */
@@ -277,4 +347,21 @@ export interface WorkflowRunResult<T = unknown> {
   fallbacks?: WorkflowRunFallback[];
   /** Checkpoint calls resolved in this execution. Absent when none resolved. */
   checkpointsTaken?: WorkflowCheckpointTaken[];
+  /** The engine-owned authoritative manifest: one frozen record per terminated call. */
+  calls?: WorkflowCallRecord[];
+  /** Final number of agent()/checkpoint() call indexes allocated by this engine run. */
+  callsAllocated?: number;
+  /** The resolved execution inputs in force for this engine run. Per-call
+   *  script-authored overrides are recorded by each call's input fingerprint. */
+  effectiveLimits?: {
+    maxAgents: number;
+    tokenBudget: number | null;
+    concurrency: number;
+    agentRetries: number;
+    agentTimeoutMs: number | null;
+  };
+  /** Set iff the composed signal was ever observed aborted. */
+  abortSignaled?: true;
+  /** True when this run invoked workflow(), including a zero-call child workflow. */
+  nestedWorkflows?: true;
 }
