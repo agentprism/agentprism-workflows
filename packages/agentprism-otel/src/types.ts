@@ -5,6 +5,7 @@
  */
 
 import type { MeterProvider, TracerProvider } from "@opentelemetry/api";
+import type { EngineRunEventPayloadMap, RunAgentEventPayload } from "@automatalabs/shared-types";
 
 export interface WorkflowManagerLike {
   on(event: string, listener: (...args: any[]) => void): unknown;
@@ -22,75 +23,19 @@ export interface OtelAttachment {
   detach(): void;
 }
 
-export interface RunPayload {
-  runId?: unknown;
-}
-
-export interface LogPayload extends RunPayload {
-  message?: unknown;
-}
-
-export interface PhasePayload extends RunPayload {
-  title?: unknown;
-}
-
-export interface AgentStartPayload extends RunPayload {
-  label?: unknown;
-  phase?: unknown;
-  prompt?: unknown;
-  model?: unknown;
-}
-
-export interface AgentEndPayload extends RunPayload {
-  label?: unknown;
-  phase?: unknown;
-  result?: unknown;
-  tokens?: unknown;
-  worktree?: unknown;
-  model?: unknown;
-  error?: unknown;
-  errorCode?: unknown;
-  recoverable?: unknown;
-}
-
-export interface TokenUsageSnapshot {
-  input?: unknown;
-  output?: unknown;
-  total?: unknown;
-  cost?: unknown;
-  cacheRead?: unknown;
-  cacheWrite?: unknown;
-}
-
-export interface TokenUsagePayload extends RunPayload {
-  usage?: TokenUsageSnapshot;
-}
-
-export interface WorkflowRunResultLike {
-  meta?: {
-    name?: unknown;
-  };
-  status?: unknown;
-  agentCount?: unknown;
-}
-
-export interface CompletePayload extends RunPayload {
-  result?: WorkflowRunResultLike;
-}
-
-export interface PausedPayload extends RunPayload {
-  reason?: unknown;
-  error?: unknown;
-  resetHint?: unknown;
-}
-
-export interface ErrorPayload extends RunPayload {
-  error?: unknown;
-}
-
-export interface StoppedPayload extends RunPayload {}
-
-export interface ResumedPayload extends RunPayload {}
+export type RunPayload = Pick<EngineRunEventPayloadMap["log"], "runId" | "scope">;
+export type LogPayload = EngineRunEventPayloadMap["log"];
+export type PhasePayload = EngineRunEventPayloadMap["phase"];
+export type AgentStartPayload = EngineRunEventPayloadMap["agentStart"];
+export type AgentEndPayload = EngineRunEventPayloadMap["agentEnd"];
+export type TokenUsageSnapshot = EngineRunEventPayloadMap["tokenUsage"]["usage"];
+export type TokenUsagePayload = EngineRunEventPayloadMap["tokenUsage"];
+export type WorkflowRunResultLike = EngineRunEventPayloadMap["complete"]["result"];
+export type CompletePayload = EngineRunEventPayloadMap["complete"];
+export type PausedPayload = EngineRunEventPayloadMap["paused"];
+export type ErrorPayload = EngineRunEventPayloadMap["error"];
+export type StoppedPayload = EngineRunEventPayloadMap["stopped"];
+export type ResumedPayload = EngineRunEventPayloadMap["resumed"];
 
 export interface ToolCallEventLike {
   toolCallId?: unknown;
@@ -103,6 +48,8 @@ export interface ToolCallEventLike {
   backendId?: unknown;
   label?: unknown;
   runId?: unknown;
+  scope?: unknown;
+  callIndex?: unknown;
 }
 
 export interface ToolCallUpdateEventLike {
@@ -114,13 +61,8 @@ export interface ToolCallUpdateEventLike {
   backendId?: unknown;
   label?: unknown;
   runId?: unknown;
+  scope?: unknown;
+  callIndex?: unknown;
 }
 
-export interface AgentEventPayloadLike<Name extends string = string> {
-  name?: Name;
-  event?: unknown;
-  backendId?: unknown;
-  sessionId?: unknown;
-  label?: unknown;
-  runId?: unknown;
-}
+export type AgentEventPayloadLike<Name extends string = string> = RunAgentEventPayload<Name>;

@@ -14,6 +14,7 @@ import {
   type Histogram,
   type Span,
 } from "@opentelemetry/api";
+import type { EngineRunEventPayloadMap } from "@automatalabs/shared-types";
 import {
   ATTR_AGENT_COUNT,
   ATTR_BACKEND_ID,
@@ -69,31 +70,23 @@ import {
   VERSION,
 } from "./constants.js";
 import type {
-  AgentEndPayload,
   AgentEventPayloadLike,
   AgentPrismOtelOptions,
-  AgentStartPayload,
-  CompletePayload,
-  ErrorPayload,
-  LogPayload,
   OtelAttachment,
-  PausedPayload,
-  PhasePayload,
-  ResumedPayload,
-  StoppedPayload,
-  TokenUsagePayload,
-  TokenUsageSnapshot,
   ToolCallEventLike,
   ToolCallUpdateEventLike,
   WorkflowManagerLike,
 } from "./types.js";
 
 type Listener = (...args: any[]) => void;
+type RunPayload<Name extends keyof EngineRunEventPayloadMap> = EngineRunEventPayloadMap[Name];
 
 interface AgentEntry {
   span: Span;
   startHrMs: number;
   toolSpans: Map<string, Span>;
+  label: string;
+  callKey?: string;
 }
 
 interface ToolEntry {
@@ -114,6 +107,7 @@ interface RunState {
   rootSpan: Span;
   rootContext: ReturnType<typeof trace.setSpan>;
   openAgents: Map<string, AgentEntry[]>;
+  openAgentsByCall: Map<string, AgentEntry>;
   openToolsBySessionTool: Map<string, ToolEntry>;
   lastUsage?: NormalizedUsage;
 }
@@ -171,6 +165,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
       rootSpan,
       rootContext,
       openAgents: new Map(),
+      openAgentsByCall: new Map(),
       openToolsBySessionTool: new Map(),
     };
     runs.set(runId, state);
@@ -191,7 +186,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   };
 
   subscribe("log", (payload) => {
-    const event = asRecord(payload) as LogPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"log"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const message = stringValue(event?.message);
@@ -200,7 +195,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("phase", (payload) => {
-    const event = asRecord(payload) as PhasePayload | undefined;
+    const event = asRecord(payload) as RunPayload<"phase"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const title = stringValue(event?.title);
@@ -211,7 +206,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("agentStart", (payload) => {
-    const event = asRecord(payload) as AgentStartPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"agentStart"> | undefined;
     const runId = stringValue(event?.runId);
     const label = stringValue(event?.label);
     if (!runId || !label) return;
@@ -229,14 +224,16 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
     if (captureContent) attributes[ATTR_PROMPT] = truncate(String(event?.prompt), contentLimit);
 
     const span = tracer.startSpan(`${SPAN_INVOKE_AGENT_PREFIX} ${label}`, { attributes }, run.rootContext);
-    const entry: AgentEntry = { span, startHrMs: nowMs(), toolSpans: new Map() };
+    const callKey = agentCallKey(event);
+    const entry: AgentEntry = { span, startHrMs: nowMs(), toolSpans: new Map(), label, callKey };
     const entries = run.openAgents.get(label) ?? [];
     entries.push(entry);
     run.openAgents.set(label, entries);
+    if (callKey !== undefined) run.openAgentsByCall.set(callKey, entry);
   });
 
   subscribe("agentEnd", (payload) => {
-    const event = asRecord(payload) as AgentEndPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"agentEnd"> | undefined;
     const runId = stringValue(event?.runId);
     const label = stringValue(event?.label);
     if (!runId || !label) return;
@@ -246,13 +243,13 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
     const status = hadError ? "error" : "ok";
     instruments.agentsCounter.add(1, { [ATTR_STATUS]: status });
 
-    const entries = run.openAgents.get(label);
-    const entry = entries?.shift();
-    if (entries && entries.length === 0) run.openAgents.delete(label);
+    const callKey = agentCallKey(event);
+    const entry = callKey === undefined ? run.openAgents.get(label)?.[0] : run.openAgentsByCall.get(callKey);
     if (!entry) {
-      diag.debug("agentprism-otel ignored unmatched agentEnd", { runId, label });
+      diag.debug("agentprism-otel ignored unmatched agentEnd", { runId, label, callIndex: event?.callIndex });
       return;
     }
+    unregisterAgent(run, entry);
 
     const tokens = numberValue(event?.tokens);
     const model = stringValue(event?.model);
@@ -278,7 +275,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("tokenUsage", (payload) => {
-    const event = asRecord(payload) as TokenUsagePayload | undefined;
+    const event = asRecord(payload) as RunPayload<"tokenUsage"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const run = getRun(runId, "tokenUsage");
@@ -295,7 +292,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("complete", (payload) => {
-    const event = asRecord(payload) as CompletePayload | undefined;
+    const event = asRecord(payload) as RunPayload<"complete"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const run = getRun(runId, "complete");
@@ -310,7 +307,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("paused", (payload) => {
-    const event = asRecord(payload) as PausedPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"paused"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const run = getRun(runId, "paused");
@@ -322,7 +319,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("error", (payload) => {
-    const event = asRecord(payload) as ErrorPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"error"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const run = getRun(runId, "error");
@@ -332,7 +329,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("stopped", (payload) => {
-    const event = asRecord(payload) as StoppedPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"stopped"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     const run = getRun(runId, "stopped");
@@ -342,7 +339,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   });
 
   subscribe("resumed", (payload) => {
-    const event = asRecord(payload) as ResumedPayload | undefined;
+    const event = asRecord(payload) as RunPayload<"resumed"> | undefined;
     const runId = stringValue(event?.runId);
     if (!runId) return;
     getRun(runId, "resumed").rootSpan.setAttribute(ATTR_RESUMED, true);
@@ -376,7 +373,10 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
     if (!toolCallId || !sessionId) return;
 
     const label = stringValue(payload.label ?? event?.label);
-    const parentEntry = label ? peek(run.openAgents.get(label)) : undefined;
+    const callKey = agentCallKey(payload);
+    const parentEntry = callKey === undefined
+      ? label ? peek(run.openAgents.get(label)) : undefined
+      : run.openAgentsByCall.get(callKey);
     const parentContext = parentEntry ? trace.setSpan(context.active(), parentEntry.span) : run.rootContext;
     const title = stringValue(event?.title);
     const kind = stringValue(event?.kind);
@@ -479,6 +479,7 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
       }
       run.openAgents.delete(label);
     }
+    run.openAgentsByCall.clear();
   }
 
   function forceEndAgentTools(run: RunState, entry: AgentEntry, attributes: Record<string, boolean>): void {
@@ -498,6 +499,17 @@ export function attachOtel(manager: WorkflowManagerLike, options: AgentPrismOtel
   function unregisterTool(run: RunState, key: string, tool: ToolEntry): void {
     run.openToolsBySessionTool.delete(key);
     tool.agentEntry?.toolSpans.delete(key);
+  }
+
+  function unregisterAgent(run: RunState, entry: AgentEntry): void {
+    if (entry.callKey !== undefined && run.openAgentsByCall.get(entry.callKey) === entry) {
+      run.openAgentsByCall.delete(entry.callKey);
+    }
+    const entries = run.openAgents.get(entry.label);
+    if (!entries) return;
+    const index = entries.indexOf(entry);
+    if (index !== -1) entries.splice(index, 1);
+    if (entries.length === 0) run.openAgents.delete(entry.label);
   }
 }
 
@@ -532,7 +544,7 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function normalizeUsage(usage: TokenUsageSnapshot | undefined): NormalizedUsage {
+function normalizeUsage(usage: RunPayload<"tokenUsage">["usage"] | undefined): NormalizedUsage {
   return {
     input: numberValue(usage?.input) ?? 0,
     output: numberValue(usage?.output) ?? 0,
@@ -549,6 +561,14 @@ function addPositiveDelta(counter: Counter, tokenType: string, delta: number): v
 
 function toolKey(sessionId: string, toolCallId: string): string {
   return `${sessionId}:${toolCallId}`;
+}
+
+function agentCallKey(payload: { scope?: unknown; runId?: unknown; callIndex?: unknown } | undefined): string | undefined {
+  if (payload === undefined) return undefined;
+  const scope = stringValue(payload.scope) ?? stringValue(payload.runId);
+  const callIndex = numberValue(payload.callIndex);
+  if (scope === undefined || callIndex === undefined || !Number.isSafeInteger(callIndex) || callIndex < 0) return undefined;
+  return JSON.stringify([scope, callIndex]);
 }
 
 function peek<T>(items: T[] | undefined): T | undefined {

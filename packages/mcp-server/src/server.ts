@@ -40,7 +40,8 @@ import type { TokenUsage } from "@automatalabs/shared-types";
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
 import type { WorkflowExecutionToolResult, WorkflowRunAwaitResult } from "./workflow-tool-output.js";
-import { createProgressReporter } from "./progress.js";
+import { createAwaitProgressReporter, createProgressReporter } from "./progress.js";
+import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 
 const SERVER_NAME = "agentprism-workflow";
@@ -533,6 +534,24 @@ function terminalOutcome(
 }
 
 const AWAIT_CANCELLED = Symbol("await-cancelled");
+const AWAIT_UNKNOWN_RUN = Symbol("await-unknown-run");
+
+const EVENT_LOG_POLL_FALLBACK_CODES = new Set([
+  "EVENT_LOG_UNAVAILABLE",
+  "WATERMARK_MISSING",
+  "STREAM_ID_MISSING",
+  "STREAM_MISMATCH",
+  "EVENT_LOG_INCOMPLETE",
+  "CORRUPT_LOG",
+  "UNSUPPORTED_VERSION",
+  "SNAPSHOT_AHEAD",
+  "CURSOR_AHEAD",
+  "RECORD_TOO_LARGE",
+  "IO_ERROR",
+]);
+
+const EVENT_LOG_UNKNOWN_RUN_CODES = new Set(["RUN_NOT_FOUND", "ORPHANED_LOG"]);
+const TERMINAL_RUN_EVENT_TYPES = new Set(["complete", "paused", "error", "stopped"]);
 
 async function waitForTerminal(
   manager: WorkflowManager,
@@ -540,21 +559,59 @@ async function waitForTerminal(
   waitMs: number,
   signal: AbortSignal,
   localPromise: Promise<WorkflowRunResult> | undefined,
-): Promise<"settled" | "timeout" | typeof AWAIT_CANCELLED> {
-  return await new Promise((resolve) => {
+  progress: AwaitProgressReporter,
+): Promise<"settled" | "timeout" | typeof AWAIT_CANCELLED | typeof AWAIT_UNKNOWN_RUN> {
+  return await new Promise((resolve, reject) => {
     let timer: NodeJS.Timeout | undefined;
     let poller: NodeJS.Timeout | undefined;
+    let stream: ReturnType<ReturnType<WorkflowManager["getPersistence"]>["watchEvents"]> | undefined;
     let done = false;
 
-    const finish = (result: "settled" | "timeout" | typeof AWAIT_CANCELLED) => {
-      if (done) return;
-      done = true;
+    const cleanup = () => {
       if (timer) clearTimeout(timer);
       if (poller) clearInterval(poller);
+      stream?.close();
       signal.removeEventListener("abort", cancelled);
+    };
+    const finish = (result: "settled" | "timeout" | typeof AWAIT_CANCELLED | typeof AWAIT_UNKNOWN_RUN) => {
+      if (done) return;
+      done = true;
+      cleanup();
       resolve(result);
     };
+    const fail = (error: unknown) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(error);
+    };
     const cancelled = () => finish(AWAIT_CANCELLED);
+
+    const startPollingFallback = () => {
+      if (done || poller !== undefined) return;
+      stream?.close();
+      stream = undefined;
+      poller = setInterval(() => {
+        const status = manager.inspectRun(runId, { lastN: 1, logLines: 0 });
+        if (status && isTerminalStatus(status.status)) finish("settled");
+      }, 250);
+    };
+
+    const handleEventLogError = (error: unknown) => {
+      const code = runEventLogErrorCode(error);
+      if (code !== undefined && EVENT_LOG_POLL_FALLBACK_CODES.has(code)) {
+        startPollingFallback();
+      } else if (code !== undefined && EVENT_LOG_UNKNOWN_RUN_CODES.has(code)) {
+        finish(AWAIT_UNKNOWN_RUN);
+      } else {
+        fail(error);
+      }
+    };
+
+    const consumeRecord = (record: Parameters<AwaitProgressReporter["record"]>[0]) => {
+      progress.record(record);
+      if (TERMINAL_RUN_EVENT_TYPES.has(record.event.type)) finish("settled");
+    };
 
     signal.addEventListener("abort", cancelled, { once: true });
     if (signal.aborted) {
@@ -568,14 +625,47 @@ async function waitForTerminal(
         () => finish("settled"),
         () => finish("settled"),
       );
-      return;
     }
 
-    poller = setInterval(() => {
-      const status = manager.inspectRun(runId, { lastN: 1, logLines: 0 });
-      if (status && isTerminalStatus(status.status)) finish("settled");
-    }, 250);
+    try {
+      const persistence = manager.getPersistence();
+      const snapshot = persistence.load(runId);
+      if (snapshot) progress.seed(snapshot);
+      const initial = persistence.readEvents(runId, {
+        after: snapshot?.eventSeq ?? 0,
+        streamId: snapshot?.eventStreamId,
+      });
+      for (const record of initial.events) {
+        consumeRecord(record);
+        if (done) return;
+      }
+      stream = persistence.watchEvents(runId, {
+        after: initial.cursor,
+        streamId: initial.streamId,
+      });
+      const activeStream = stream;
+      void (async () => {
+        try {
+          while (!done) {
+            const next = await activeStream.next();
+            if (next.done) break;
+            consumeRecord(next.value);
+          }
+          if (!done) startPollingFallback();
+        } catch (error) {
+          handleEventLogError(error);
+        }
+      })();
+    } catch (error) {
+      handleEventLogError(error);
+    }
   });
+}
+
+function runEventLogErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const candidate = error as { name?: unknown; code?: unknown };
+  return candidate.name === "RunEventLogError" && typeof candidate.code === "string" ? candidate.code : undefined;
 }
 
 function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
@@ -721,6 +811,7 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
             parsedInput.waitMs ?? 20_000,
             extra.signal,
             backgroundRuns.get(parsedInput.runId),
+            createAwaitProgressReporter(extra),
           );
           if (waited === AWAIT_CANCELLED) {
             return {
@@ -728,6 +819,17 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
                 {
                   type: "text",
                   text: `Workflow await for runId "${parsedInput.runId}" was cancelled; the workflow was not cancelled.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          if (waited === AWAIT_UNKNOWN_RUN) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
                 },
               ],
               isError: true,
