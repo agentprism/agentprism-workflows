@@ -66,6 +66,28 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
+    assert.deepEqual(field(tool.outputSchema, "required"), ["runId", "status", "scriptUri"]);
+    const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
+    assert.equal(variants.length, 5);
+    assert.deepEqual(variants.map((variant) => variant.required), [
+      ["scriptSource"],
+      ["scriptSource"],
+      ["workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
+      ["workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
+      [
+        "workflowName",
+        "phases",
+        "logTail",
+        "calls",
+        "filter",
+        "truncation",
+        "lineage",
+        "stopped",
+        "alreadyTerminal",
+      ],
+    ]);
+    const outcome = field(field(tool.outputSchema, "properties"), "outcome");
+    assert.deepEqual(field(outcome, "required"), ["runId", "status", "scriptSource", "scriptUri"]);
   } finally {
     await dispose();
   }

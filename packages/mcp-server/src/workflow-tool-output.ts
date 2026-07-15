@@ -121,91 +121,176 @@ const scriptLineageEntrySchema = z.object({
   available: z.boolean(),
 });
 
-const scriptResourceShape = {
-  scriptSource: scriptSourceSchema.optional(),
-  scriptUri: z.string().optional(),
-  lineage: z.array(scriptLineageEntrySchema).optional(),
+const executionScriptResourceShape = {
+  scriptSource: scriptSourceSchema,
+  scriptUri: z.string(),
 } as const;
-const executionResultSchema = z.object({
-  runId: z.string(),
-  status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
-  result: z.unknown().optional(),
-  tokenUsage: tokenUsageSchema.optional(),
-  logs: z.array(z.string()).optional(),
-  logTail: logTailSchema.optional(),
-  authContext: authContextSchema.optional(),
-  checkpointContext: checkpointContextSchema.optional(),
-  fallbacks: z.array(fallbackSchema).optional(),
-  checkpointsTaken: z.array(checkpointTakenSchema).optional(),
-  resumeReport: resumeReportSchema.optional(),
-  ...scriptResourceShape,
-});
 
-/** Common MCP output schema for legacy execution results and exact inspection statuses. */
-export const workflowToolOutputShape = {
+const inspectionScriptResourceShape = {
+  scriptUri: z.string(),
+  lineage: z.array(scriptLineageEntrySchema),
+} as const;
+
+const runStatusShape = {
   runId: z.string(),
   status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
-  result: z.unknown().optional(),
-  tokenUsage: tokenUsageSchema.optional(),
-  logs: z.array(z.string()).optional(),
-  authContext: authContextSchema.optional(),
-  checkpointContext: checkpointContextSchema.optional(),
-  fallbacks: z.array(fallbackSchema).optional(),
-  checkpointsTaken: z.array(checkpointTakenSchema).optional(),
-  resumeReport: resumeReportSchema.optional(),
-  ...scriptResourceShape,
-  stopped: z.boolean().optional(),
-  alreadyTerminal: z.boolean().optional(),
-  workflowName: z.string().optional(),
-  phases: z.array(z.string()).optional(),
+  workflowName: z.string(),
+  phases: z.array(z.string()),
   currentPhase: z.string().optional(),
   reason: z.string().optional(),
   errorCode: z.string().optional(),
-  logTail: logTailSchema.optional(),
-  calls: z
-    .array(
-      z.object({
-        index: z.number().int().nonnegative(),
-        kind: z.enum(["agent", "checkpoint", "unknown"]),
-        label: z.string().optional(),
-        phase: z.string().optional(),
-        model: z.string().optional(),
-        backendId: z.string().optional(),
-        resultPreview: z.string(),
-        resultRedacted: z.boolean(),
-        resultTruncated: z.boolean(),
-      }),
-    )
-    .optional(),
-  filter: z
-    .object({
-      lastN: z.number().int().min(1).max(50),
-      logLines: z.number().int().min(0).max(50),
-      labelGlob: z.string().optional(),
-    })
-    .optional(),
-  truncation: z
-    .object({
-      maxStructuredBytes: z.number().int().positive(),
-      byteCapApplied: z.boolean(),
-      phases: countSchema.extend({ shortened: z.number().int().nonnegative() }),
-      logs: countSchema.extend({ shortened: z.number().int().nonnegative(), redacted: z.number().int().nonnegative() }),
-      calls: countSchema.extend({
-        matched: z.number().int().nonnegative(),
-        shortenedResults: z.number().int().nonnegative(),
-        redactedResults: z.number().int().nonnegative(),
-      }),
-    })
-    .optional(),
-  wait: z
-    .object({
-      requestedMs: z.number().int().nonnegative(),
-      elapsedMs: z.number().int().nonnegative(),
-      returnedBecause: z.enum(["terminal", "timeout", "immediate"]),
-    })
-    .optional(),
-  outcome: executionResultSchema.optional(),
+  logTail: logTailSchema,
+  calls: z.array(
+    z.object({
+      index: z.number().int().nonnegative(),
+      kind: z.enum(["agent", "checkpoint", "unknown"]),
+      label: z.string().optional(),
+      phase: z.string().optional(),
+      model: z.string().optional(),
+      backendId: z.string().optional(),
+      resultPreview: z.string(),
+      resultRedacted: z.boolean(),
+      resultTruncated: z.boolean(),
+    }),
+  ),
+  filter: z.object({
+    lastN: z.number().int().min(1).max(50),
+    logLines: z.number().int().min(0).max(50),
+    labelGlob: z.string().optional(),
+  }),
+  truncation: z.object({
+    maxStructuredBytes: z.number().int().positive(),
+    byteCapApplied: z.boolean(),
+    phases: countSchema.extend({ shortened: z.number().int().nonnegative() }),
+    logs: countSchema.extend({
+      shortened: z.number().int().nonnegative(),
+      redacted: z.number().int().nonnegative(),
+    }),
+    calls: countSchema.extend({
+      matched: z.number().int().nonnegative(),
+      shortenedResults: z.number().int().nonnegative(),
+      redactedResults: z.number().int().nonnegative(),
+    }),
+  }),
 } as const;
+
+const executionDetailsShape = {
+  result: z.unknown().optional(),
+  tokenUsage: tokenUsageSchema.optional(),
+  logs: z.array(z.string()).optional(),
+  logTail: logTailSchema.optional(),
+  authContext: authContextSchema.optional(),
+  checkpointContext: checkpointContextSchema.optional(),
+  fallbacks: z.array(fallbackSchema).optional(),
+  checkpointsTaken: z.array(checkpointTakenSchema).optional(),
+  resumeReport: resumeReportSchema.optional(),
+} as const;
+
+const executionResultSchema = z
+  .object({
+    runId: z.string(),
+    status: z.enum(["paused", "completed", "failed", "aborted"]),
+    ...executionDetailsShape,
+    ...executionScriptResourceShape,
+  })
+  .strict();
+
+const waitSchema = z.object({
+  requestedMs: z.number().int().nonnegative(),
+  elapsedMs: z.number().int().nonnegative(),
+  returnedBecause: z.enum(["terminal", "timeout", "immediate"]),
+});
+
+const inspectionRequired = [
+  "workflowName",
+  "phases",
+  "logTail",
+  "calls",
+  "filter",
+  "truncation",
+  "lineage",
+] as const;
+
+const forbidsRequired = (...fields: string[]) => ({
+  not: { anyOf: fields.map((field) => ({ required: [field] })) },
+});
+
+/**
+ * The SDK's registerTool runtime accepts an arbitrary Zod schema in its types, but 1.29.0
+ * only publishes and validates object schemas. Keep an object schema for interoperability,
+ * attach the exact branch constraints as JSON Schema metadata, and mirror them at runtime.
+ */
+export const workflowToolOutputShape = z
+  .object({
+    runId: z.string(),
+    status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
+    ...executionDetailsShape,
+    scriptSource: scriptSourceSchema.optional(),
+    scriptUri: z.string(),
+    lineage: inspectionScriptResourceShape.lineage.optional(),
+    workflowName: runStatusShape.workflowName.optional(),
+    phases: runStatusShape.phases.optional(),
+    currentPhase: runStatusShape.currentPhase,
+    reason: runStatusShape.reason,
+    errorCode: runStatusShape.errorCode,
+    calls: runStatusShape.calls.optional(),
+    filter: runStatusShape.filter.optional(),
+    truncation: runStatusShape.truncation.optional(),
+    wait: waitSchema.optional(),
+    outcome: executionResultSchema.optional(),
+    stopped: z.boolean().optional(),
+    alreadyTerminal: z.boolean().optional(),
+  })
+  .superRefine((value, context) => {
+    const has = (field: keyof typeof value) => value[field] !== undefined;
+    const inspectionComplete = inspectionRequired.every((field) => has(field));
+    const execution = has("scriptSource");
+    const awaiting = has("wait");
+    const stopping = has("stopped") || has("alreadyTerminal");
+    const valid = execution
+      ? value.status !== "pending" && !has("lineage") && !awaiting && !stopping
+      : inspectionComplete &&
+        (!stopping ||
+          (has("stopped") &&
+            has("alreadyTerminal") &&
+            !awaiting &&
+            (value.status === "completed" || value.status === "failed" || value.status === "aborted")));
+    if (!valid) {
+      context.addIssue({ code: "custom", message: "output does not match a workflow result variant" });
+    }
+  })
+  .meta({
+    oneOf: [
+      {
+        title: "Workflow execution",
+        required: ["scriptSource"],
+        properties: { status: { enum: ["paused", "completed", "failed", "aborted"] } },
+        ...forbidsRequired("lineage", "wait", "stopped", "alreadyTerminal"),
+      },
+      {
+        title: "Workflow background admission",
+        required: ["scriptSource"],
+        properties: { status: { const: "running" } },
+        ...forbidsRequired("lineage", "wait", "stopped", "alreadyTerminal"),
+      },
+      {
+        title: "Workflow inspection",
+        required: [...inspectionRequired],
+        ...forbidsRequired("scriptSource", "wait", "stopped", "alreadyTerminal"),
+      },
+      {
+        title: "Workflow await",
+        required: [...inspectionRequired, "wait"],
+        ...forbidsRequired("scriptSource", "stopped", "alreadyTerminal"),
+      },
+      {
+        title: "Workflow stop acknowledgement",
+        required: [...inspectionRequired, "stopped", "alreadyTerminal"],
+        properties: { status: { enum: ["completed", "failed", "aborted"] } },
+        ...forbidsRequired("scriptSource", "wait"),
+      },
+    ],
+  });
 
 export type WorkflowScriptSource = z.infer<typeof scriptSourceSchema>;
 
@@ -216,14 +301,18 @@ export interface WorkflowScriptLineageEntry {
 }
 
 export interface WorkflowScriptResourceFields {
-  scriptSource?: WorkflowScriptSource;
-  scriptUri?: string;
-  lineage?: WorkflowScriptLineageEntry[];
+  scriptUri: string;
+  lineage: WorkflowScriptLineageEntry[];
 }
 
-export interface WorkflowExecutionToolResult<T = unknown> extends WorkflowScriptResourceFields {
+export interface WorkflowExecutionScriptResourceFields {
+  scriptSource: WorkflowScriptSource;
+  scriptUri: string;
+}
+
+export interface WorkflowExecutionToolResult<T = unknown> extends WorkflowExecutionScriptResourceFields {
   runId: string;
-  status: WorkflowRunResult["status"];
+  status: Exclude<WorkflowRunResult["status"], "pending" | "running">;
   result?: T;
   tokenUsage?: WorkflowRunResult["tokenUsage"];
   logs?: string[];
@@ -235,7 +324,7 @@ export interface WorkflowExecutionToolResult<T = unknown> extends WorkflowScript
   resumeReport?: WorkflowRunResult["resumeReport"];
 }
 
-export interface WorkflowBackgroundAccepted extends WorkflowScriptResourceFields {
+export interface WorkflowBackgroundAccepted extends WorkflowExecutionScriptResourceFields {
   runId: string;
   status: "running";
 }
@@ -246,17 +335,18 @@ export interface WorkflowAwaitMetadata {
   returnedBecause: "terminal" | "timeout" | "immediate";
 }
 
-export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
+export interface WorkflowInspectionToolResult extends WorkflowRunStatus, WorkflowScriptResourceFields {}
+
+export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus, WorkflowScriptResourceFields {
   wait: WorkflowAwaitMetadata;
   /** Cumulative usage observed for live calls in this execution; absent before any is known. */
   tokenUsage?: TokenUsage;
   /** Present exactly when status is paused/completed/failed/aborted. */
   outcome?: WorkflowExecutionToolResult<T>;
-  scriptUri?: string;
-  lineage?: WorkflowScriptLineageEntry[];
 }
 
 export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  status: "completed" | "failed" | "aborted";
   stopped: boolean;
   alreadyTerminal: boolean;
 }
@@ -264,11 +354,17 @@ export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptRes
 export type WorkflowToolResult<T = unknown> =
   | WorkflowExecutionToolResult<T>
   | WorkflowBackgroundAccepted
-  | WorkflowRunStatus
+  | WorkflowInspectionToolResult
   | WorkflowRunAwaitResult<T>
   | WorkflowStopResult;
 
-export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExecutionToolResult<T> {
+export function toWorkflowToolResult<T>(
+  run: WorkflowRunResult<T>,
+  resources: WorkflowExecutionScriptResourceFields,
+): WorkflowExecutionToolResult<T> {
+  if (run.status === "pending" || run.status === "running") {
+    throw new TypeError(`Workflow execution result must be terminal, received ${run.status}`);
+  }
   return {
     runId: run.runId,
     status: run.status,
@@ -281,5 +377,6 @@ export function toWorkflowToolResult<T>(run: WorkflowRunResult<T>): WorkflowExec
     ...(run.fallbacks === undefined ? {} : { fallbacks: run.fallbacks }),
     ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
     ...(run.resumeReport === undefined ? {} : { resumeReport: run.resumeReport }),
+    ...resources,
   };
 }

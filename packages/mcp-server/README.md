@@ -212,7 +212,7 @@ The tool returns both machine-readable `structuredContent` and a human-readable 
 ```ts
 interface WorkflowExecutionToolResult {
   runId: string;
-  status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  status: "paused" | "completed" | "failed" | "aborted";
   result?: unknown; // present only on a completed run — the script's resolved value
   tokenUsage?: {
     input: number;
@@ -267,10 +267,15 @@ interface WorkflowStopResult extends WorkflowRunStatus {
   lineage: WorkflowScriptLineageEntry[];
 }
 
+interface WorkflowInspectionToolResult extends WorkflowRunStatus {
+  scriptUri: string;
+  lineage: WorkflowScriptLineageEntry[];
+}
+
 type WorkflowToolResult =
   | WorkflowExecutionToolResult
   | WorkflowBackgroundAccepted
-  | WorkflowRunStatus
+  | WorkflowInspectionToolResult
   | WorkflowRunAwaitResult
   | WorkflowStopResult;
 ```
@@ -309,9 +314,12 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 `resultPreview`, and redaction/truncation flags. Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
 keys and credential-shaped strings are redacted before results are structurally compacted; every
-text scalar and preview is at most 512 UTF-8 bytes. The entire structured status is at most 24,576
-bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The accompanying
-text is formatted from that bounded status and capped at 8,192 bytes.
+text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
+24,576 bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The full
+oldest-to-newest script lineage is mandatory: if that lineage alone makes the augmented envelope
+larger, requested diagnostics are retained and `truncation.maxStructuredBytes` rises to the actual
+envelope size instead of claiming the 24,576-byte status limit. The accompanying text is formatted
+from the bounded status and capped at 8,192 bytes.
 
 An unknown, corrupt, or unreadable run returns `isError: true`, no `structuredContent`, and:
 
@@ -503,9 +511,11 @@ await server.connect(new StdioServerTransport());
 
 Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `clampWorkflowInput` (primitive schema, action discriminator, execution clamp),
+`CreateWorkflowServerOptions`,
 `WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowAwaitToolInput`, `WorkflowStopToolInput`,
 `WorkflowExecutionToolResult`, `WorkflowBackgroundAccepted`, `WorkflowAwaitMetadata`,
-`WorkflowRunAwaitResult`, `WorkflowStopResult`, `WorkflowScriptLineageEntry`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
+`WorkflowInspectionToolResult`, `WorkflowRunAwaitResult`, `WorkflowStopResult`,
+`WorkflowScriptLineageEntry`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
 `workflowToolOutputShape` / `toWorkflowToolResult`,
 `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond
 hosting this tool, prefer `@automatalabs/workflows`.

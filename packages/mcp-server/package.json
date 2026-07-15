@@ -44,7 +44,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"test/**/*.test.ts\"",
+    "test": "tsc -p tsconfig.type-tests.json && tsx --test \"test/**/*.test.ts\"",
     "prepublishOnly": "tsc -b"
   },
   "dependencies": {

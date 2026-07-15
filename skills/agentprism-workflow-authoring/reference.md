@@ -371,8 +371,10 @@ At most four background runs may be active or starting per server instance. Fore
 await, and stop consume no slot. A timeout returns the freshest status and partial cumulative usage; replay
 hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
 project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
-structured bytes and 8,192 text bytes. Terminal `outcome` preserves the raw authored result/full
-logs and has no new total cap, but it is never copied into text.
+structured bytes and 8,192 text bytes. The full script lineage is never truncated; when lineage
+alone exceeds the status budget, `truncation.maxStructuredBytes` reports the larger actual envelope
+limit. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap, but
+it is never copied into text.
 
 The background start has no enduring request signal, progress channel, or live checkpoint channel.
 It returns immediately and emits no progress after returning, even if the initiating request
@@ -475,7 +477,8 @@ interface WorkflowRunStatus {
 Inspection returns only this allowlisted projection: never raw script, args, prompts, histories,
 hashes, session IDs, cwd, checkpoint/auth details, or raw results. Credential-shaped data is
 redacted, results are structurally compacted, every outward text scalar/preview is capped at 512
-UTF-8 bytes, structured JSON at 24,576 bytes, and inspection text at 8,192 bytes. An unknown ID is
+UTF-8 bytes, inherited status JSON at 24,576 bytes, and inspection text at 8,192 bytes. Full lineage
+can raise the structured envelope limit as reported by `truncation.maxStructuredBytes`. An unknown ID is
 a tool error with no structured content; reading an existing failed run succeeds and reports
 `status:"failed"`. Every paused, failed, or aborted execution result also carries a redacted
 final-20 `logTail` (present when empty) and renders it in the immediate terminal text. Completed

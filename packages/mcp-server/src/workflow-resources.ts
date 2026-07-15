@@ -7,6 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { ResourceLink } from "@modelcontextprotocol/sdk/types.js";
 import type { PersistedRunState, WorkflowManager } from "@automatalabs/workflows";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import type {
   WorkflowScriptLineageEntry,
@@ -38,6 +39,7 @@ interface AdmissionMetadata extends StoredRunMetadata {
 
 export interface WorkflowAdmission extends AdmissionMetadata {
   runId?: string;
+  resourceAvailable?: boolean;
 }
 
 function resourceNotFound(uri: string): never {
@@ -65,7 +67,7 @@ function startedAtMillis(state: PersistedRunState): number {
 export class WorkflowScriptResources {
   private readonly persistence: ReturnType<WorkflowManager["getPersistence"]>;
   private readonly subscriptions = new Set<string>();
-  private readonly pendingAdmissions: WorkflowAdmission[] = [];
+  private readonly admissionContext = new AsyncLocalStorage<WorkflowAdmission>();
   private readonly metadataByRunId = new Map<string, StoredRunMetadata>();
 
   constructor(
@@ -78,17 +80,26 @@ export class WorkflowScriptResources {
   }
 
   beginAdmission(metadata: AdmissionMetadata): WorkflowAdmission {
-    const admission: WorkflowAdmission = { ...metadata };
-    this.pendingAdmissions.push(admission);
-    return admission;
+    return { ...metadata };
+  }
+
+  runAdmission<T>(admission: WorkflowAdmission, operation: () => T): T {
+    return this.admissionContext.run(admission, operation);
   }
 
   finishAdmission(admission: WorkflowAdmission): void {
-    const pendingIndex = this.pendingAdmissions.indexOf(admission);
-    if (pendingIndex >= 0) this.pendingAdmissions.splice(pendingIndex, 1);
     if (admission.runId) {
       const metadata = this.metadataByRunId.get(admission.runId);
       if (metadata) metadata.elicitationController = undefined;
+    }
+  }
+
+  admissionResourceAvailable(admission: WorkflowAdmission): boolean {
+    if (!admission.resourceAvailable || !admission.runId) return false;
+    try {
+      return this.persistence.load(admission.runId) !== null;
+    } catch {
+      return false;
     }
   }
 
@@ -97,34 +108,48 @@ export class WorkflowScriptResources {
   }
 
   scriptSource(runId: string): WorkflowScriptSource | undefined {
-    return (this.persistence.load(runId) as PersistedMcpRunState | null)?.scriptSource;
+    const state = this.persistence.load(runId) as PersistedMcpRunState | null;
+    return state ? state.scriptSource ?? "inline" : undefined;
   }
 
   lineage(runId: string): WorkflowScriptLineageEntry[] {
-    const newestToOldest: WorkflowScriptLineageEntry[] = [];
-    const visited = new Set<string>();
+    const newestToOldest: string[] = [];
+    const pointerVisited = new Set<string>();
     let currentRunId: string | undefined = runId;
 
-    while (currentRunId && !visited.has(currentRunId)) {
-      visited.add(currentRunId);
+    while (currentRunId && !pointerVisited.has(currentRunId)) {
+      pointerVisited.add(currentRunId);
       const state = this.persistence.load(currentRunId) as PersistedMcpRunState | null;
       if (state?.resumeSeed?.ancestorRunIds) {
-        return [...state.resumeSeed.ancestorRunIds, currentRunId].map((lineageRunId) => ({
-          runId: lineageRunId,
-          uri: workflowScriptUri(lineageRunId),
-          available: this.persistence.load(lineageRunId) !== null,
-        }));
+        const oldestToNewest = [
+          ...state.resumeSeed.ancestorRunIds,
+          state.resumeSeed.sourceRunId,
+          currentRunId,
+        ];
+        return this.projectLineage(oldestToNewest, runId);
       }
-      newestToOldest.push({
-        runId: currentRunId,
-        uri: workflowScriptUri(currentRunId),
-        available: state !== null,
-      });
+      newestToOldest.push(currentRunId);
       if (!state) break;
       currentRunId = state.resumeSeed?.sourceRunId;
     }
 
-    return newestToOldest.reverse();
+    return this.projectLineage(newestToOldest.reverse(), runId);
+  }
+
+  private projectLineage(oldestToNewest: string[], requestedRunId: string): WorkflowScriptLineageEntry[] {
+    const visited = new Set<string>();
+    const normalized: string[] = [];
+    for (const lineageRunId of oldestToNewest) {
+      if (lineageRunId === requestedRunId || visited.has(lineageRunId)) continue;
+      visited.add(lineageRunId);
+      normalized.push(lineageRunId);
+    }
+    normalized.push(requestedRunId);
+    return normalized.map((lineageRunId) => ({
+      runId: lineageRunId,
+      uri: workflowScriptUri(lineageRunId),
+      available: this.persistence.load(lineageRunId) !== null,
+    }));
   }
 
   links(lineage: WorkflowScriptLineageEntry[]): ResourceLink[] {
@@ -154,36 +179,39 @@ export class WorkflowScriptResources {
   private instrumentPersistence(): void {
     const save = this.persistence.save.bind(this.persistence);
     this.persistence.save = (state) => {
-      let metadata = this.metadataByRunId.get(state.runId);
-      let newlyAdmitted = false;
-      if (!metadata) {
-        const embedded = state as PersistedMcpRunState;
-        if (embedded.scriptSource || embedded.resumeSeed) {
-          metadata = {
-            scriptSource: embedded.scriptSource ?? "inline",
-            resumeSourceRunId: embedded.resumeSeed?.sourceRunId,
-            ancestorRunIds: embedded.resumeSeed?.ancestorRunIds,
-          };
-          this.metadataByRunId.set(state.runId, metadata);
-        } else {
-          const admissionIndex = this.pendingAdmissions.findIndex((candidate) => candidate.script === state.script);
-          if (admissionIndex >= 0) {
-            const admission = this.pendingAdmissions.splice(admissionIndex, 1)[0];
-            admission.runId = state.runId;
-            metadata = {
-              scriptSource: admission.scriptSource,
-              resumeSourceRunId: admission.resumeSourceRunId,
-              ancestorRunIds: admission.ancestorRunIds,
-              elicitationController: admission.elicitationController,
-            };
-            if (metadata.resumeSourceRunId && !metadata.ancestorRunIds) {
-              metadata.ancestorRunIds = this.lineage(metadata.resumeSourceRunId).map((entry) => entry.runId);
+      const committedMetadata = this.metadataByRunId.get(state.runId);
+      const embedded = state as PersistedMcpRunState;
+      const embeddedMetadata: StoredRunMetadata | undefined =
+        embedded.scriptSource || embedded.resumeSeed
+          ? {
+              scriptSource: embedded.scriptSource ?? "inline",
+              resumeSourceRunId: embedded.resumeSeed?.sourceRunId,
+              ancestorRunIds: embedded.resumeSeed?.ancestorRunIds,
             }
-            this.metadataByRunId.set(state.runId, metadata);
-            newlyAdmitted = true;
+          : undefined;
+      const admission = this.admissionContext.getStore();
+      const matchingAdmission =
+        admission && (admission.runId === undefined || admission.runId === state.runId)
+          ? admission
+          : undefined;
+      if (matchingAdmission && matchingAdmission.runId === undefined) matchingAdmission.runId = state.runId;
+
+      const admissionMetadata: StoredRunMetadata | undefined = matchingAdmission
+        ? {
+            scriptSource: matchingAdmission.scriptSource,
+            resumeSourceRunId: matchingAdmission.resumeSourceRunId,
+            ancestorRunIds: matchingAdmission.ancestorRunIds,
+            elicitationController: matchingAdmission.elicitationController,
           }
-        }
+        : undefined;
+      if (admissionMetadata?.resumeSourceRunId && !admissionMetadata.ancestorRunIds) {
+        admissionMetadata.ancestorRunIds = this.lineage(admissionMetadata.resumeSourceRunId).map(
+          (entry) => entry.runId,
+        );
       }
+      const metadata = committedMetadata ?? embeddedMetadata ?? admissionMetadata;
+      const newlyAdmitted =
+        committedMetadata === undefined && embeddedMetadata === undefined && matchingAdmission !== undefined;
 
       const persisted: PersistedMcpRunState = metadata
         ? {
@@ -200,7 +228,11 @@ export class WorkflowScriptResources {
           }
         : state;
       save(persisted);
-      if (newlyAdmitted) this.mcp.sendResourceListChanged();
+      if (metadata && committedMetadata === undefined) this.metadataByRunId.set(state.runId, metadata);
+      if (newlyAdmitted && matchingAdmission) {
+        matchingAdmission.resourceAvailable = true;
+        void this.mcp.sendResourceListChanged();
+      }
     };
 
     const remove = this.persistence.delete.bind(this.persistence);
@@ -210,7 +242,7 @@ export class WorkflowScriptResources {
         const uri = workflowScriptUri(runId);
         this.subscriptions.delete(uri);
         this.metadataByRunId.delete(runId);
-        this.mcp.sendResourceListChanged();
+        void this.mcp.sendResourceListChanged();
       }
       return deleted;
     };

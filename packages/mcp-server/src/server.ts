@@ -48,6 +48,7 @@ import { createAwaitProgressReporter, createProgressReporter } from "./progress.
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { WorkflowScriptResources, workflowScriptUri } from "./workflow-resources.js";
+import type { WorkflowAdmission } from "./workflow-resources.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
@@ -518,11 +519,11 @@ function formatInspectionSummary(status: WorkflowRunStatus): string {
 
 const MAX_INSPECTION_STRUCTURED_BYTES = 24_576;
 
-function addInspectionResourceFields(
-  status: WorkflowRunStatus,
-  fields: { scriptUri: string; lineage: ReturnType<WorkflowScriptResources["lineage"]> },
-): WorkflowRunStatus & typeof fields {
-  const projected: WorkflowRunStatus & typeof fields = {
+function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields extends object>(
+  status: Status,
+  fields: Fields,
+): Status & Fields {
+  const projected: Status & Fields = {
     ...status,
     calls: [...status.calls],
     logTail: { ...status.logTail, lines: [...status.logTail.lines] },
@@ -535,9 +536,31 @@ function addInspectionResourceFields(
     },
     ...fields,
   };
-  // Leave room for stop's two acknowledgement booleans, which extend the same projection.
-  const tooLarge = () =>
-    Buffer.byteLength(JSON.stringify(projected), "utf8") > MAX_INSPECTION_STRUCTURED_BYTES - 128;
+  const structuredBytes = () => Buffer.byteLength(JSON.stringify(projected), "utf8");
+  const mandatoryEnvelope = {
+    ...projected,
+    calls: [],
+    logTail: { ...projected.logTail, lines: [] },
+    phases: [],
+  };
+
+  if (
+    Buffer.byteLength(JSON.stringify(mandatoryEnvelope), "utf8") >
+    MAX_INSPECTION_STRUCTURED_BYTES
+  ) {
+    let previousLimit = -1;
+    while (projected.truncation.maxStructuredBytes !== previousLimit) {
+      previousLimit = projected.truncation.maxStructuredBytes;
+      projected.truncation.maxStructuredBytes = Math.max(
+        MAX_INSPECTION_STRUCTURED_BYTES,
+        structuredBytes(),
+      );
+    }
+    return projected;
+  }
+
+  projected.truncation.maxStructuredBytes = MAX_INSPECTION_STRUCTURED_BYTES;
+  const tooLarge = () => structuredBytes() > MAX_INSPECTION_STRUCTURED_BYTES;
 
   while (projected.calls.length > 0 && tooLarge()) {
     projected.calls.shift();
@@ -588,6 +611,29 @@ function readScriptAtAdmission(scriptPath: string): string {
   }
 }
 
+function requireAdmissionResource(
+  manager: WorkflowManager,
+  scriptResources: WorkflowScriptResources,
+  admission: WorkflowAdmission,
+): void {
+  if (scriptResources.admissionResourceAvailable(admission)) return;
+
+  if (admission.runId) {
+    const live = manager.getRun(admission.runId);
+    if (live?.status === "running" || live?.status === "paused") manager.stop(admission.runId);
+    try {
+      manager.deleteRun(admission.runId);
+    } catch {
+      // deleteRun's finally path still releases the lease and removes the in-process run.
+    }
+  }
+
+  throw new McpError(
+    ErrorCode.InternalError,
+    "Workflow admission failed because its script resource could not be persisted; no run was admitted.",
+  );
+}
+
 function normalizeTokenUsage(
   usage:
     | {
@@ -620,7 +666,11 @@ function currentTokenUsage(manager: WorkflowManager, runId: string): TokenUsage 
 function persistedOutcome(
   persisted: PersistedRunState,
   status: WorkflowRunStatus,
+  scriptResources: WorkflowScriptResources,
 ): WorkflowExecutionToolResult {
+  if (status.status === "pending" || status.status === "running") {
+    throw new TypeError(`Terminal workflow outcome cannot have status ${status.status}`);
+  }
   return {
     runId: persisted.runId,
     status: status.status,
@@ -633,18 +683,26 @@ function persistedOutcome(
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
     ...(persisted.resumeReport === undefined ? {} : { resumeReport: persisted.resumeReport }),
+    scriptSource: scriptResources.scriptSource(persisted.runId) ?? "inline",
+    scriptUri: workflowScriptUri(persisted.runId),
   };
 }
 
 function terminalOutcome(
   manager: WorkflowManager,
+  scriptResources: WorkflowScriptResources,
   runId: string,
   status: WorkflowRunStatus,
 ): WorkflowExecutionToolResult | undefined {
   const live = manager.getRun(runId)?.result;
-  if (live) return toWorkflowToolResult(live);
+  if (live) {
+    return toWorkflowToolResult(live, {
+      scriptSource: scriptResources.scriptSource(runId) ?? "inline",
+      scriptUri: workflowScriptUri(runId),
+    });
+  }
   const persisted = manager.getPersistence().load(runId);
-  return persisted ? persistedOutcome(persisted, status) : undefined;
+  return persisted ? persistedOutcome(persisted, status, scriptResources) : undefined;
 }
 
 const AWAIT_CANCELLED = Symbol("await-cancelled");
@@ -828,7 +886,14 @@ function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
  * through manager.runSync or startInBackground. The returned McpServer is not yet connected — the caller attaches a
  * transport (see index.ts).
  */
-export function createWorkflowServer(runner: AgentRunner): McpServer {
+export interface CreateWorkflowServerOptions {
+  manager?: WorkflowManager;
+}
+
+export function createWorkflowServer(
+  runner: AgentRunner,
+  options: CreateWorkflowServerOptions = {},
+): McpServer {
   const mcp = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
 
   // registerCapabilities is illegal after a transport attaches. Merge the complete resources
@@ -837,7 +902,7 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
 
   // Composition root: the ACP-backed AgentRunner is injected into the engine here. The
   // manager owns run lifecycle, status stamping, and the persisted journal used by resume.
-  const manager = new WorkflowManager({ agent: runner });
+  const manager = options.manager ?? new WorkflowManager({ agent: runner });
   const scriptResources = new WorkflowScriptResources(mcp, manager);
   const backgroundRuns = new BackgroundRunRegistry();
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
@@ -945,16 +1010,20 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
             `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
           );
         }
+        if (status.status === "pending" || status.status === "running" || status.status === "paused") {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Workflow stop did not produce a terminal snapshot for runId "${parsedInput.runId}".`,
+          );
+        }
         const lineage = scriptResources.lineage(parsedInput.runId);
         const projected = addInspectionResourceFields(status, {
           scriptUri: workflowScriptUri(parsedInput.runId),
           lineage,
-        });
-        const result: WorkflowStopResult = {
-          ...projected,
           stopped,
           alreadyTerminal,
-        };
+        });
+        const result: WorkflowStopResult = { ...projected, status: status.status };
         const currentLink = scriptResources
           .links(lineage)
           .filter((link) => link.uri === workflowScriptUri(parsedInput.runId));
@@ -1050,27 +1119,24 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
 
         const tokenUsage = currentTokenUsage(manager, parsedInput.runId);
         const baseOutcome = isTerminalStatus(status.status)
-          ? terminalOutcome(manager, parsedInput.runId, status)
+          ? terminalOutcome(manager, scriptResources, parsedInput.runId, status)
           : undefined;
-        const outcome = baseOutcome
-          ? {
-              ...baseOutcome,
-              scriptSource: scriptResources.scriptSource(parsedInput.runId),
-              scriptUri: workflowScriptUri(parsedInput.runId),
-            }
-          : undefined;
+        const outcome = baseOutcome;
         const lineage = scriptResources.lineage(parsedInput.runId);
-        const result: WorkflowRunAwaitResult = {
-          ...status,
-          wait: {
-            requestedMs: parsedInput.waitMs ?? 20_000,
-            elapsedMs: Math.max(0, Date.now() - startedAt),
-            returnedBecause,
-          },
+        const wait = {
+          requestedMs: parsedInput.waitMs ?? 20_000,
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          returnedBecause,
+        };
+        const projected = addInspectionResourceFields(status, {
+          wait,
           ...(tokenUsage === undefined ? {} : { tokenUsage }),
-          ...(outcome === undefined ? {} : { outcome }),
           scriptUri: workflowScriptUri(parsedInput.runId),
           lineage,
+        });
+        const result: WorkflowRunAwaitResult = {
+          ...projected,
+          ...(outcome === undefined ? {} : { outcome }),
         };
         return {
           structuredContent: { ...result },
@@ -1156,7 +1222,10 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
             resumeSourceRunId: input.resumeFromRunId,
           });
           try {
-            const started = manager.startInBackground(admittedScript, input.args, exec);
+            const started = scriptResources.runAdmission(admission, () =>
+              manager.startInBackground(admittedScript, input.args, exec),
+            );
+            requireAdmissionResource(manager, scriptResources, admission);
             const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
             backgroundRuns.track(started.runId, started.promise);
             backgroundReservation = false;
@@ -1201,7 +1270,10 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
         });
         let run: WorkflowRunResult;
         try {
-          run = await manager.runSync(admittedScript, input.args, exec);
+          run = await scriptResources.runAdmission(admission, () =>
+            manager.runSync(admittedScript, input.args, exec),
+          );
+          requireAdmissionResource(manager, scriptResources, admission);
         } finally {
           scriptResources.finishAdmission(admission);
           if (cancelElicitationFromRequest) {
@@ -1211,9 +1283,7 @@ export function createWorkflowServer(runner: AgentRunner): McpServer {
 
         const scriptUri = workflowScriptUri(run.runId);
         const structuredContent = {
-          ...toWorkflowToolResult(run),
-          scriptSource,
-          scriptUri,
+          ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
         };
         const isError = run.status === "failed" || run.status === "aborted";
         return {
