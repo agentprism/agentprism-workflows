@@ -56,7 +56,7 @@ const BACKEND_SCOPE: Record<Exclude<Backend, "opencode">, string> = {
   codex: "@automatalabs/",
 };
 
-const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/zai/glm-5.2";
+const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/google/gemini-2.5-flash";
 
 function resolveOpenCodeBin(): string {
   if (process.env.AGENTPRISM_OPENCODE_ACP_CMD) return process.env.AGENTPRISM_OPENCODE_ACP_CMD;
