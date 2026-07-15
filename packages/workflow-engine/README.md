@@ -125,7 +125,7 @@ Inside a workflow body these are available as globals (no imports):
 
 - `agent(prompt, opts?)` — run one subagent. `opts` includes `label`, `phase`, `schema`
   (typebox → validated object), `model`, `mode`, `tier`, `agentType`,
-  `isolation: "worktree"`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`,
+  `isolation: "worktree"`, `resume: { filesystem: "read-only" }`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`,
   `keepSession`, `timeoutMs`, `retries`. The single call into your `AgentRunner`.
 - `parallel([() => agent(...), ...])` — run thunks concurrently (bounded by the run's
   concurrency limiter).
@@ -148,16 +148,40 @@ throw, so a re-run reproduces the journaled values. Pass any timestamps/randomne
 
 ## Resume & token budget
 
-Every `agent()` / `checkpoint()` result is journaled by a deterministic call index. Feed
-the journal back (and the prior `runId`) to replay the unchanged prefix and only re-run
-what changed:
+Every `agent()` / `checkpoint()` result is journaled by a deterministic call index. For
+edited-script/current-args resume, name a terminal persisted source on a **new** manager run:
 
 ```ts
-const first = await runWorkflow(script, { agent: myRunner, args, onAgentJournal: save });
-// ...later, after an edit or a usage-limit pause:
-const resumeJournal = new Map(/* index -> { index, hash, result } */);
-const again = await runWorkflow(script, { agent: myRunner, args, resumeJournal, resumeFromRunId: first.runId });
+const first = await manager.runSync(script, { topic: "otters" });
+const again = await manager.runSync(script, { topic: "otters", expanded: true }, {
+  resumeFromRunId: first.runId,
+  resumePolicy: "auto", // default; "positional" is the migration escape hatch
+});
+console.log(again.resumeReport);
 ```
+
+The manager admits exact cwd/runtime/terminal-environment state, persists the candidate seed, and
+then matches safety-marked results by exact path/hash or unique hash+input fingerprint. Any
+uncertain, ambiguous, unsafe, or mismatched call runs live. Same-ID `manager.resume(runId)` and
+manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
+catalogs, checkpoint source-index rules, and filesystem preconditions are in the
+[incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
+
+Inside a script, a compact replay-safe fan-out looks like:
+
+```js
+const [audit, experiment] = await parallel([
+  () => agent("Audit src/api without changing files.", {
+    label: "audit:api", resume: { filesystem: "read-only" },
+  }),
+  () => agent("Try the worker fix in isolation; return a unified diff.", {
+    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+  }),
+]);
+```
+
+The worktree and its edits are discarded; return the diff as data. Isolation without the explicit
+declaration never enables non-contiguous replay.
 
 `tokenBudget` caps total spend (per-phase sub-budgets via `phase(title, { budget })`);
 `maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. Defaults
@@ -279,7 +303,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 
 - **Engine** — `runWorkflow`, `parseWorkflowScript`; types `EngineRunResult`,
   `WorkflowRunOptions`, `AgentOptions`, `CheckpointOptions`, `WorkflowAgentOptions`,
-  `SharedRuntime`.
+  `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
+  `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, and the resume policy/report types.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
   `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
   `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,

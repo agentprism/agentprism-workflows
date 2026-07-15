@@ -94,7 +94,8 @@ From [`src/index.ts`](./src/index.ts):
 **Workflow result**
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,
   `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`,
-  `authContext?`, `agentSessions?`, `fallbacks?`, `checkpointsTaken?`). Paused, failed, and aborted results additionally carry the
+  `authContext?`, `agentSessions?`, `fallbacks?`, `checkpointsTaken?`, `calls?`,
+  `resumeReport?`). Paused, failed, and aborted results additionally carry the
   optional redacted final-20 `logTail`; completed results omit it and `logs` remains the full
   compatibility array.
 - `WorkflowRunFallback` — `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?,
@@ -104,6 +105,16 @@ From [`src/index.ts`](./src/index.ts):
   `injected`). These result-only arrays are absent when empty and never widen `WorkflowRunStatus`.
 - `RunStatus`, `WorkflowMeta`, `WorkflowMetaPhase`, `WorkflowBackendConfig`, `TokenUsage`,
   `JournalEntry`, `AgentSessionRef`, `AgentSessionRecord`.
+- `ResumePolicy`, `WorkflowResumeStrategy`, `WorkflowResumeMatch`, `WorkflowResumeSafety`,
+  `WorkflowResumeFallbackReason`, `WorkflowResumeDisabledReason`,
+  `WorkflowResumeCallLiveReason`, `WorkflowResumeCallFailedReason`,
+  `WorkflowCallReplayProvenance`, `WorkflowResumeCallDecision`, and `WorkflowResumeReport` — the
+  additive content-addressed new-run replay contract. Runtime reason arrays live in
+  `@automatalabs/workflow-engine` and are re-exported by `@automatalabs/workflows`; see the
+  [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
+- `WorkflowCallRecord` — the terminal call manifest, including optional `path`, agent/checkpoint
+  `inputsHash`, `resumeSafety`, and manager-owned replay provenance. Old object literals remain
+  valid because every incremental-resume field is optional and omitted when unset.
 - `JournalCallMetadata` and optional `JournalEntry.call` — replay-neutral agent/checkpoint
   attribution (`kind`, label, phase, resolved model, actual backend). Legacy entries without it
   remain valid.

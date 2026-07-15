@@ -120,8 +120,9 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Per-agent timeout in ms. Omit or pass `null` for no hard timeout (the engine owns timeouts). |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
-| `resumeFromRunId` | string | no | — | Start a new run from this prior run's persisted journal. **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call. Re-send the script and desired args; the longest unchanged prefix replays for zero tokens and the first changed/new call plus its suffix runs live. |
-| `checkpointReplies` | object | no | — | With `resumeFromRunId`, map `checkpointContext.callIndex` to the durable checkpoint decision. JSON string keys are coerced to numeric indexes. |
+| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. The manager admits exact runtime/cwd/terminal environment and replays only uniquely matching safety-marked calls; uncertainty runs live. |
+| `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format input/safety/environment gates. Requires `resumeFromRunId`. |
+| `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. Wire keys must be canonical non-negative safe integers. |
 | `runId` | engine run ID | inspect/await only | — | Required for inspect/await; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
 | `lastN` | integer 1–50 | inspect/await only | `20` | Latest matching journal calls. Filtering happens before this selection. |
@@ -138,6 +139,24 @@ Example call arguments:
   "tokenBudget": 200000
 }
 ```
+
+Compact replay-safe read-only/worktree fan-out for `script`:
+
+```js
+export const meta = { name: "fan-out", description: "Audit and experiment independently" };
+return await parallel([
+  () => agent("Audit src/api without changing files.", {
+    label: "audit:api", resume: { filesystem: "read-only" },
+  }),
+  () => agent("Try the worker fix in isolation; return a unified diff.", {
+    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+  }),
+]);
+```
+
+The worktree edits are discarded. See the
+[incremental resume API](../../docs/api.md#content-addressed-incremental-resume) for the safety
+contract, admission gates, reports, and legacy fallback.
 
 Inspection example:
 
@@ -194,6 +213,7 @@ interface WorkflowExecutionToolResult {
   checkpointContext?: CheckpointContext;   // checkpoint_required pauses only
   fallbacks?: WorkflowRunFallback[];       // compatibility events; absent when empty
   checkpointsTaken?: WorkflowCheckpointTaken[]; // resolved checkpoints; absent when empty
+  resumeReport?: WorkflowResumeReport;     // resumeFromRunId correspondence; otherwise absent
 }
 
 interface WorkflowBackgroundAccepted {
@@ -224,6 +244,7 @@ type WorkflowToolResult =
 | --- | --- | --- |
 | `fallbacks` | `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }[]` | Compatibility surface for non-resolution subsystems or third-party runners; model selection emits none; absent when empty. |
 | `checkpointsTaken` | `{ callIndex, kind, decision, source }[]` | `source` is `"live"`, `"headless-default"`, `"journal-replay"`, or `"injected"`; paused checkpoints are omitted; absent when empty. |
+| `resumeReport` | `WorkflowResumeReport` | Exact strategy/count/per-current-call correspondence for a `resumeFromRunId` execution; absent on ordinary runs. |
 
 These fields appear on foreground execution results and terminal await `outcome` objects. They are
 persisted for cold await, but never copied onto the bounded top-level `WorkflowRunStatus` returned by
@@ -306,7 +327,7 @@ observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `ou
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed runs retain their completed journal too. Call `workflow` again with the script, the desired `args`, and `resumeFromRunId` set to the prior `runId`. `args` is not directly hashed: an orchestration-only cap change can reveal new calls while the unchanged prefix replays for zero tokens. If new args change a prompt or another hashed identity field, that call and the complete suffix run live. The resumed MCP request creates a new run ID; an empty or unknown prior ID loads no journal and runs fresh.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed terminal runs retain their completed journal too. Call `workflow` again with the current script/`args` and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. The new request creates a new run ID and returns `resumeReport`; terminal text includes only its compact strategy/count line.
 - **Checkpoints.** Foreground uses MCP elicitation when advertised. Background never retains that
   request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus

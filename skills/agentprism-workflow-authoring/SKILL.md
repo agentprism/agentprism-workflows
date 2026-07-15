@@ -39,7 +39,7 @@ Run it with the SDK —
 import { runDynamicWorkflow } from "@automatalabs/workflows";
 const run = await runDynamicWorkflow(script, { cwd: "/abs/project", args: { path: "." } });
 // run.status: "completed" | "paused" | "failed" | "aborted"; run.result: the script's return value
-// run.fallbacks (compatibility) / run.checkpointsTaken: optional result-only audit trails
+// run.resumeReport: optional new-run replay correspondence; run.fallbacks/checkpointsTaken: audit trails
 ```
 
 — or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes (`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
@@ -225,7 +225,7 @@ const proceed = await checkpoint(`Apply this plan?\n${JSON.stringify(plan, null,
 if (!proceed) return { applied: false, plan };
 ```
 
-`kind: "input"` resolves to free text, `kind: "select"` to one of `choices`. How the question reaches a human is the host's job (`ExecOptions.confirm` in the SDK; elicitation in the MCP server). With no live channel, `headless: "default"` (the default) takes `default ?? true`, `"abort"` aborts, and `"pause"` returns a managed run with `reason: "checkpoint_required"` plus non-secret `checkpointContext`. Resume the last mode with `checkpointReplies: { [context.callIndex]: decision }` or a live confirm; the answer is journaled and replayed. Put a checkpoint before anything hard to reverse — applying diffs, pushing, publishing.
+`kind: "input"` resolves to free text, `kind: "select"` to one of `choices`. How the question reaches a human is the host's job (`ExecOptions.confirm` in the SDK; elicitation in the MCP server). With no live channel, `headless: "default"` (the default) takes `default ?? true`, `"abort"` aborts, and `"pause"` returns a managed run with `reason: "checkpoint_required"` plus non-secret `checkpointContext`. Resume the last mode with `checkpointReplies: { [context.callIndex]: decision }` or a live confirm. For `resumeFromRunId`, that key is the source context index; an unambiguous identity match may journal the injected answer at a shifted current index. Put a checkpoint before anything hard to reverse — applying diffs, pushing, publishing.
 
 ## Budgets and phases
 
@@ -248,6 +248,7 @@ Guard budget-driven loops on `budget.total` being set — with no budget, `remai
 
 - Every agent session runs in the run's base `cwd` unless the call narrows it: `agent({ cwd: "packages/api" })` (relative resolves against the base).
 - `isolation: "worktree"` runs the agent in a **throwaway git worktree** (`<repoRoot>/.agentprism/worktrees/…`) so parallel agents can edit without colliding. The worktree and its branch are **always deleted when the call ends — an isolated agent's file edits are discarded**. Have isolated agents *return their work as data* (a unified diff, a file map, a report) and apply it in a later non-isolated step; use worktrees for experiments, builds, and verification, not for persistent edits. Outside a git repo, isolation degrades to the shared tree with a logged notice.
+- `resume: { filesystem: "read-only" }` is a contractual author assertion for content-addressed mainline replay, not a runner mode. Without worktree isolation the call must not mutate persistent filesystem/external state. With a successfully created throwaway worktree it may edit only that checkout, but still must not commit or touch shared git state, ignored/out-of-tree artifacts, or external resources. A degraded worktree loses this safety proof and runs live; isolation without the declaration never enables non-contiguous replay.
 - `mode` requests an agent-advertised ACP session mode and is **strict** — an unsupported mode fails the call rather than running unconfined. Mode ids are backend-specific (Claude-family: `plan`, `acceptEdits`, `bypassPermissions`; Codex-family: `read-only`, `agent`, `agent-full-access`; OpenCode via its mode option), so only set `mode` on calls whose `model` you also pin. Use read-only/plan modes for reviewers and auditors that must not write.
 - `agentType: "<name>"` binds a reusable subagent definition — a Markdown file at `<cwd>/.agentprism/agents/<name>.md` (project) or `~/.agentprism/agents/<name>.md` (user; project wins) whose frontmatter sets tool allow/deny lists, a model, and isolation, and whose body is the role prompt. An unknown name logs a warning and degrades to defaults.
 
@@ -289,16 +290,23 @@ Structured output works on custom backends through the same injected-tool/fallba
 
 ## Determinism and resume
 
-Runs are journaled: every `agent()` and `checkpoint()` result is recorded under a deterministic call index, and a paused, killed, or failed run can resume by replaying the completed prefix from the journal at zero token cost.
+Runs are journaled: every `agent()` and `checkpoint()` result is recorded under a deterministic call index. A new run may reuse eligible results from a terminal source, but uncertainty always means live execution.
 
-> **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
+> **Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.
 
 - Direct `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()` calls fail static validation. The realm also blocks aliased or computed forms at runtime (`new Date(isoString)` is fine). Need a timestamp or random seed? Pass it through `args`.
 - An `agent()` replay identity hashes the prompt, resolved `model`, `mode` when set, `configOptions` when non-empty (with sorted keys), `tier`, `phase`, `agentType`, the resolved agent definition, and `schema`. An omitted or empty config bag preserves existing hash bytes. The resolved definition covers its tool allowlist/denylist, model, isolation, and body prompt, so editing an agent definition invalidates calls that use it.
-- `args` is not hashed directly. If new args only raise a loop cap, earlier calls with the same prompts and other identity fields replay. If new args change a prompt, model selection, phase, schema, call order, or another hashed field, the first affected call is a miss.
-- Resume uses the longest unchanged prefix: the first changed or new call and every later call run live. This prevents an unchanged-looking downstream call from reusing a result produced from stale upstream state.
+- `args` is not hashed directly. If new args only raise a loop cap, earlier safe calls with the same identities and input fingerprints can replay. If new args change a prompt, model selection, phase, schema, call order, or runner-visible input, affected calls run live; unchanged independent calls may still replay.
+- Identity matching first tries a unique exact `(kind, call path, identity hash)` row (`"path-hash"`), then a unique `(kind, identity hash, input fingerprint)` row so unchanged calls can replay as `"unique-hash"` after insertions/deletions. Source and current input fingerprints must be equal. Duplicate exact identities, duplicate content, consumed candidates, missing facts, changed safety, and empty schema-less results run live—no source-order or occurrence guess.
+- Source admission requires exact `cwd`, full Node/V8 plus fingerprint-format equality, and an environment captured after the source settled with no engine-known work outstanding. Git identity is HEAD plus dirty digest; non-git hosts must provide the same `environmentKey`. A safe stable source gets identity replay; an unsafe stable source can get only a safety-checked positional prefix; nested/source-drifted fallback and every invalid/uncertain source are all-live.
+- After an unannotated live agent, nested workflow, live host checkpoint callback, or declared worktree that fails/degrades, every remaining candidate runs live. Declared non-worktree readers and successfully isolated declared worktrees may keep the cache open. Do not use unordered `parallel()` siblings to communicate through files or another ambient/persistent side channel.
+- Identity replay preserves budget-driven control flow: cached agents add their source logical debit to `budget.spent()`/`remaining()`, but add zero current provider/token usage. Replayed session records keep their backend/session identity and are rebound to the current call index, label, and phase.
+- Checkpoint identity replay is host-decision-only. `default`, `headless`, and `timeoutMs` form a separate options fingerprint that must match; source headless decisions run fresh. `checkpointReplies` keys always name the checkpoint index in the source run, even when identity matching injects the answer at a shifted current index.
+- `resumePolicy: "positional"` is a migration escape hatch for index/prefix matching, not permission to bypass new-format input, safety, cwd, runtime, or environment gates. Marker-less/manual/same-ID legacy journals keep historical hash-only positional behavior.
 - `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not hashed. Changing one does not rerun a cached call; the new value affects only calls that run live. Change a hashed field, normally the prompt, when a call must execute again.
 - Keep call order deterministic. Derive iteration from `args` and prior agent results, never from ambient state.
+
+Two all-live outcomes are expected calibration, not an engine error. If any source result lacks a captured path/input fact—possible when a call stack exceeds the raw-frame cap or `meta` is not strict JSON—the whole source is `"manifest-invalid"`; dropping that row could make an ambiguous sibling look unique. A Node or V8 upgrade likewise invalidates every new-format cache through exact runtime equality, while marker-less legacy journals keep historical positional replay. Any future relaxation needs a new format literal; identity-v1 bytes are never reinterpreted.
 
 ### Worked resume — raise a loop cap
 
@@ -321,7 +329,7 @@ for (let i = 0; i < maxRounds; i += 1) {
   rounds.push(
     await agent(
       `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
-      { label: `review:${i + 1}`, phase: "Review" },
+      { label: `review:${i + 1}`, phase: "Review", resume: { filesystem: "read-only" } },
     ),
   );
 }
@@ -330,7 +338,7 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same script with `args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 replay for zero tokens and only rounds 7–8 run live because the cap controls call count but is not interpolated into the round prompt. If the prompt included `maxRounds`, round 1 would change and the whole eight-call suffix would run live.
+With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same script with `args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 match uniquely and replay for zero current provider tokens; only rounds 7–8 run live because the cap controls call count but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all eight identities would change and all would run live.
 
 - Narrate decisions and round summaries with `log()`, and give repeated calls stable, descriptive
   labels. MCP hosts can safely retrieve the latest log lines and compact results by label after a
@@ -510,7 +518,9 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] Model specs only where a specific backend earns its keep; use a registered prefix plus a live-catalog-verified id (or backend-only form), and expect harness rejection rather than client fallback.
 - [ ] Every `configOptions` id/value comes verbatim from the validator's advertised-options table; `"model"` stays in the dedicated field.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
+- [ ] Every `resume: { filesystem: "read-only" }` assertion is true for all persistent/ambient effects; unordered parallel siblings do not communicate through files, and worktree calls do not commit or mutate outside the throwaway checkout.
 - [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
+- [ ] New-run `checkpointReplies` use source `checkpointContext.callIndex` keys; changed checkpoint defaults/headless modes/timeouts are expected to run fresh.
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.
 - [ ] `return` a compact, structured result — it is the run's `result`, not a transcript.
 - [ ] Boolean-controlled convergence branches are scripted with mock answers (including reject-then-approve), not left to the all-true default.

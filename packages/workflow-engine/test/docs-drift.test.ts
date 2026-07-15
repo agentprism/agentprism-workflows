@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 import {
   RECORDING_UNUSABLE_REASONS,
   REPLAY_DIVERGENCE_KINDS,
+  RESUME_CALL_FAILED_REASONS,
+  RESUME_CALL_LIVE_REASONS,
+  RESUME_DISABLED_REASONS,
+  RESUME_FALLBACK_REASONS,
 } from "../src/index.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -27,4 +31,17 @@ test("isolation documentation retains the canonical cost-surface warning", () =>
     ),
     "docs/api.md must retain the verbatim isolation cost-surface sentence",
   );
+});
+
+test("incremental resume documentation covers the frozen runtime vocabularies", () => {
+  for (const reasons of [
+    RESUME_FALLBACK_REASONS,
+    RESUME_DISABLED_REASONS,
+    RESUME_CALL_LIVE_REASONS,
+    RESUME_CALL_FAILED_REASONS,
+  ]) {
+    for (const reason of reasons) {
+      assert.ok(api.includes(`\`${reason}\``), `docs/api.md must document resume reason ${reason}`);
+    }
+  }
 });

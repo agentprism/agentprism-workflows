@@ -94,15 +94,18 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `agent` | Per-run `AgentRunner` override. |
 | `signal` / `externalSignal` | Host `AbortSignal` that aborts this run (aliases). |
 | `journaling` | Per-run journaling override. |
+| `environmentKey` | Host-supplied non-git environment identity. It must content-address every persistent resource replay-safe calls can observe and remain stable for the run; git workspaces use measured HEAD + dirty digest instead. |
 | `tokenBudget` | Hard cap; once spent, `agent()` throws `TOKEN_BUDGET_EXHAUSTED`. |
 | `maxAgents` | Cap on total agent calls for the run. |
 | `agentTimeoutMs` | Per-agent timeout (`null` = none). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
-| `checkpointReplies` | Durable-checkpoint answer channel for `resume()`: `{ [callIndex]: decision }`. The manager injects the matching persisted `checkpointContext` hash/index as a journal entry before replay. |
+| `resumeFromRunId` | Persisted source ID for a **new** managed execution. Requires journaling, must differ from a caller-supplied new `runId`, and is mutually exclusive with `resumeJournal`. Missing sources fail with `PERSISTENCE_ERROR`. |
+| `resumePolicy` | `"auto"` (default) or `"positional"`; requires `resumeFromRunId`. Positional is an index/prefix migration policy, not a bypass for new-format safety/input/environment gates. |
+| `checkpointReplies` | Durable-checkpoint answer channel. With `resumeFromRunId`, keys name call indexes in the **source** run; with same-ID `resume()` they name that persisted run's index. Values must be strict JSON. |
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
-| `resumeJournal` | Internal resume channel (set by `resume()`; don't pass manually). |
+| `resumeJournal` | Low-level legacy positional channel. Mutually exclusive with `resumeFromRunId`/`resumePolicy`; manual use permanently marks the result legacy. Prefer manager-owned `resumeFromRunId`. |
 
 ### `CheckpointOptions` — in-script human gates
 
@@ -130,8 +133,8 @@ explicitly selects `headless: "pause"`.
 | `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, read-only, live-first safe projection; falls back to the manager's project-scoped persistence. Never leases, saves, or changes status. |
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
 | `stop(runId)` | `boolean` | Terminal abort. Not resumable. |
-| `resume(runId, exec?)` | `Promise<boolean>` | Restarts a paused/failed run in the background: the journaled prefix replays without spending tokens; only un-run steps execute. Runs in the run's original per-run `cwd` unless `exec.cwd` overrides. Requires journaling. |
-| `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
+| `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
+| `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
 | `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all). |
 | `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
@@ -145,6 +148,212 @@ emit/add nothing. The unchanged successful final total is still emitted, so an o
 it twice. The latest snapshot is persisted at journal and settlement points and survives cold load.
 If a process dies, stale persisted `running` runs recover to `paused`; the durable prefix can then
 seed a new execution. An in-flight call without a journal result runs again.
+
+### Content-addressed incremental resume
+
+`resumeFromRunId` starts a new execution with the caller's current script and args while the
+manager owns source loading, admission, candidate persistence, and replay decisions:
+
+```ts
+const previous = await manager.runSync(script, { maxRounds: 6 });
+const next = await manager.runSync(script, { maxRounds: 8 }, {
+  resumeFromRunId: previous.runId,
+  resumePolicy: "auto", // default; use "positional" only as a migration escape hatch
+});
+
+next.resumeReport; // correspondence for this execution; absent on ordinary/same-ID runs
+```
+
+`runDynamicWorkflow(currentScript, { args: currentArgs, exec: { resumeFromRunId } })` exposes the
+same manager path. MCP execution accepts the same `resumeFromRunId`, optional `resumePolicy`, and
+`checkpointReplies`. `resumeFromRunId` must be a non-empty string; `resumePolicy` must be exactly
+`"auto" | "positional"`; `checkpointReplies` on a new-run API requires the source ID; journaling
+must be enabled; and a caller-minted target `runId` must differ from the source. Invalid
+combinations fail before target creation. The manager holds the source's cross-process lease
+through validation/cloning and the target's critical initial seed save, then releases it before
+execution or background acknowledgement. Every candidate removal/selection is likewise durably
+committed before the script can observe a replayed result or live delegation.
+
+Manager-prepared identity and positional hits re-journal the selected value under the target run's
+current index and emit the fresh call record/provenance; the source artifact is never mutated.
+Same-ID/manual legacy replay retains the historical seeded-prefix behavior: cached calls republish
+execution observations and a call record but do not emit a cached journal callback. This keeps the
+durable run-event ordering contract scoped to its existing recovery path while new-run artifacts
+become self-contained at their current indexes.
+
+The public correspondence types are exported by `@automatalabs/shared-types`,
+`@automatalabs/workflow-engine`, and the `@automatalabs/workflows` facade:
+
+```ts
+type ResumePolicy = "auto" | "positional";
+type WorkflowResumeStrategy = "identity-v1" | "positional-v1" | "live";
+type WorkflowResumeMatch = "path-hash" | "unique-hash" | "index-hash";
+type WorkflowResumeSafety = "declared-read-only" | "isolated-worktree";
+
+type WorkflowResumeCallDecision =
+  | {
+      index: number;
+      kind: "agent" | "checkpoint";
+      action: "replayed";
+      sourceRunId: string;
+      recordedIndex: number;
+      match: WorkflowResumeMatch;
+      logicalBudgetDebit?: number;
+      checkpointInjected?: true;
+    }
+  | {
+      index: number;
+      kind: "agent" | "checkpoint";
+      action: "live";
+      reason: WorkflowResumeCallLiveReason;
+    }
+  | {
+      index: number;
+      kind: "agent" | "checkpoint";
+      action: "failed";
+      reason: WorkflowResumeCallFailedReason;
+    };
+
+interface WorkflowResumeReportBase {
+  sourceRunId: string;
+  requestedPolicy: ResumePolicy;
+  replayed: number;
+  live: number;
+  failed: number;
+  calls: WorkflowResumeCallDecision[]; // current root indexes, ascending
+}
+
+type WorkflowResumeReport = WorkflowResumeReportBase &
+  (
+    | { strategy: "identity-v1" }
+    | {
+        strategy: "positional-v1";
+        fallbackReason: WorkflowResumeFallbackReason;
+        eligibility: "legacy" | "safe-prefix" | "all-live";
+      }
+    | { strategy: "live"; disabledReason: WorkflowResumeDisabledReason }
+  );
+```
+
+`WorkflowRunResult.resumeReport?` and persisted state carry this report for completed, paused, and
+failed resumed runs; ordinary and same-ID recovery runs omit it. MCP foreground results and
+terminal await `outcome` preserve the structured report, while human text contains only the
+compact `resume: <strategy> (<replayed> replayed, <live> live, <failed> failed)` line.
+
+#### Identity, safety, and filesystem boundary
+
+An author opts an agent result into non-contiguous reuse with the engine-owned DSL option:
+
+```js
+const findings = await parallel([
+  () => agent("Audit src/api without changing files.", {
+    label: "audit:api",
+    resume: { filesystem: "read-only" },
+  }),
+  () => agent("Try the fix in isolation; return a unified diff.", {
+    label: "try:worker",
+    isolation: "worktree",
+    resume: { filesystem: "read-only" },
+  }),
+]);
+```
+
+For a non-worktree call, the declaration promises that the call may read the admitted workspace
+but creates, modifies, or deletes no persistent filesystem/external state and has no load-bearing
+ambient dependency. For a successfully created engine worktree, ordinary edits inside that
+throwaway checkout are allowed and discarded; commits, shared `.git` mutations, ignored or
+out-of-tree artifacts, and external effects remain forbidden. A per-agent external `cwd`, failed
+or degraded worktree, missing declaration, mode, tool allowlist, or prose instruction proves no
+safety. The option never reaches `AgentRunner` and changes neither call-hash nor input-fingerprint
+bytes. Source and current rows must prove the same safety class, so adding the option cannot bless
+an old cached result.
+
+Identity matching first considers the original exact group `(kind, call path, identity hash)`. One
+candidate with an equal input fingerprint replays as `"path-hash"`; duplicates are permanently
+ambiguous. With no exact candidate, exactly one original `(kind, identity hash, inputsHash)` row
+may move after an insertion/deletion and replay as `"unique-hash"`. Missing/different inputs,
+duplicate content, consumed candidates, empty schema-less output, or changed safety run live. The
+matcher never pairs by occurrence ordinal/source order and never uses isolation's path-only
+fallback. Stable explicit labels matter because runner-visible label changes alter `inputsHash`.
+
+Before any new-format cache is considered, admission requires a terminal non-aborted,
+non-isolation source; exact `effectiveCwd`; exact full Node, V8, and fingerprint format versions;
+complete bijective journal/manifest data; and equality between the source's quiescent terminal
+environment and the environment measured at admission. Git identity is exact HEAD plus dirty
+digest. Non-git hosts must supply the same `environmentKey`, which must content-address every
+persistent resource safe calls can observe. The host must exclude other writers from source start
+through terminal capture and again from admission through the resumed run's terminal capture; a
+run-ID lease does not lock a workspace.
+
+Automatic policy selects:
+
+- `"identity-v1"` only for a stable source whose represented agent results are safety-marked and
+  whose checkpoint results are proven host decisions;
+- `"positional-v1"` / `"safe-prefix"` for a structurally valid, start-to-terminal stable source
+  that is unsafe for non-contiguous matching; only safety-marked agents and fingerprint-equal host
+  checkpoints replay until the first miss;
+- `"positional-v1"` / `"all-live"` for nested-workflow or start-to-terminal-drift fallback;
+- `"live"` for an invalid/unsupported/mismatched new-format source.
+
+In identity mode, allocation-ordered decisions close and durably clear the remaining cache before
+an unannotated live agent, nested workflow, live host checkpoint callback, or declared worktree
+that fails/degrades can act. Declared readers and successfully isolated declared worktrees keep it
+open; their runners may execute concurrently because the declaration forbids cross-call side
+channels. `parallel()` siblings that communicate through files or ambient resources violate this
+contract and must be sequenced instead.
+
+Identity replays add the preserved source logical debit once to script-visible
+`budget.spent()`/`remaining()` and phase/run gates, but current `tokenUsage`, provider cost, and the
+current physical `WorkflowCallRecord.budgetDebit` remain zero. Replayed agent sessions open no new
+session: their record keeps source session/backend/cwd/reopen fields and rebinds only the current
+call index, label, and phase. Proven host checkpoint decisions use the same identity rules plus an
+equal fingerprint of `default`, `headless`, and `timeoutMs`; source headless decisions always run
+fresh. New-run `checkpointReplies` keys name source indexes, and an unambiguous reply may be
+injected at a shifted current index.
+
+#### Positional and legacy compatibility
+
+`resumePolicy: "positional"` requests the index/hash prefix matcher, but a new-format source still
+must pass cwd/runtime/terminal-environment admission plus per-call input, safety, and host-checkpoint
+gates. There is no force-identity option. Marker-less recordings and permanent `legacyResume`
+artifacts use historical hash-only positional matching because their newer facts do not exist.
+Manual `resumeJournal` and same-ID `resume()`/`resumeInBackground()` always enter that legacy arm
+and cannot be laundered into an identity-capable hop.
+
+Two fail-safe compatibility changes are intentional. The common terminal gate now rejects aborted
+or `abortSignaled` marker-less/legacy sources instead of serving their journal (advertised MCP
+resume flows were already limited to paused runs). Also, a paused positional-v1 terminal save drops
+inherited source rows the current execution never visited. In a double-hop pause, that old bridged
+tail therefore runs live on hop two instead of replaying from a row absent from hop one's own
+manifest.
+
+Two source-wide all-live outcomes are normal calibration rather than operational errors. If any
+result row lacks a path/input fact—possible when a deep call stack passes the raw-frame cap or an
+agent `meta` value is not strict JSON—the source is `"manifest-invalid"`; ignoring that row could
+make an ambiguous sibling look unique. A Node or V8 upgrade causes `"runtime-mismatch"` for every
+new-format cache through exact equality, while marker-less legacy journals retain historical
+positional replay. Relaxing that asymmetry requires a new persisted format literal; identity-v1
+bytes are never reinterpreted.
+
+#### Frozen resume reason catalogs
+
+The runtime arrays below are exported by `@automatalabs/workflow-engine` and re-exported by the
+facade. Their literal unions live in `@automatalabs/shared-types`:
+
+- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `forced-positional`, `unsafe-recording`,
+  `nested-workflows`, `legacy-resume`.
+- `RESUME_DISABLED_REASONS`: `unsupported-format`, `source-not-terminal`, `abort-residue`,
+  `isolation-recording`, `resume-metadata-missing`, `manifest-invalid`, `cwd-mismatch`,
+  `runtime-mismatch`, `environment-missing`, `environment-mismatch`,
+  `source-environment-drift`, `resume-seed-invalid`.
+- `RESUME_CALL_LIVE_REASONS`: `strategy-live`, `positional-miss`, `positional-suffix`,
+  `not-recorded`, `path-missing`, `inputs-missing`, `inputs-changed`, `ambiguous-identity`,
+  `ambiguous-content`, `candidate-consumed`, `empty-output`, `safety-changed`, `unsafe-suffix`,
+  `worktree-degraded`.
+- `RESUME_CALL_FAILED_REASONS`: `seed-persistence-error`, `resume-fatal-latch`.
+
+Every branch follows fail-to-live: the report explains why a call ran or why resume was disabled;
+no reason authorizes a possibly stale value.
 
 ### Run inspection and terminal log tails
 
@@ -910,6 +1119,7 @@ interface WorkflowExecuteToolInput {
   agentTimeoutMs?: number | null;
   tokenBudget?: number | null;
   resumeFromRunId?: string;
+  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean; // default false
 }
@@ -923,6 +1133,20 @@ interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   action: "await";
   runId: string;
   waitMs?: number; // default 20_000; integer 0..25_000
+}
+
+interface WorkflowExecutionToolResult<T = unknown> {
+  runId: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  result?: T;                            // completed only
+  tokenUsage?: TokenUsage;
+  logs?: string[];
+  logTail?: WorkflowLogTail;             // paused/failed/aborted only
+  authContext?: AuthErrorContext;
+  checkpointContext?: CheckpointContext;
+  fallbacks?: WorkflowRunFallback[];
+  checkpointsTaken?: WorkflowCheckpointTaken[];
+  resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
 }
 ```
 
@@ -1016,7 +1240,7 @@ at 12,288 bytes; malformed pre-run scripts have no run ID or tail.
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, tier?, phase?, isolation?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
 
 `gate()` validators may return `{ ok: boolean, feedback?: string, ... }`, a bare boolean, or
 `null`. A fulfilled gate returns exactly `{ ok, value, verdict, attempts }`: `value` is the final

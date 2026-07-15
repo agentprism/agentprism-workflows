@@ -97,7 +97,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `checkpointReplies`, … |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
@@ -115,6 +115,23 @@ const run = await runDynamicWorkflow(script, {
 Every script **must** begin with `export const meta = { name, description, phases? }` as its first
 statement, and must be **deterministic** — `Date.now()`, `Math.random()`, and `new Date()` are
 unavailable inside the realm (they would break journal replay on resume).
+
+Replay-safe read-only/worktree fan-out is explicit:
+
+```js
+const [audit, experiment] = await parallel([
+  () => agent("Audit src/api without changing files.", {
+    label: "audit:api", resume: { filesystem: "read-only" },
+  }),
+  () => agent("Try the worker fix in isolation; return a unified diff.", {
+    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+  }),
+]);
+```
+
+The worktree and edits are discarded; return the diff as data. The declaration is required for
+content-addressed reuse in both arms—worktree isolation alone is not a safety proof. See the
+[incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 
 ### Substitution testing (isolation mode)
 
@@ -258,6 +275,13 @@ if (run.status === "paused") {
   const accepted = await manager.resume(run.runId);
   console.log(accepted); // true when the paused run was accepted for resume
 }
+
+// Edited-script/current-args resume is a NEW managed run with a correspondence report.
+const next = await manager.runSync(script, { repo: "agentprism", expanded: true }, {
+  resumeFromRunId: run.runId,
+  resumePolicy: "auto",
+});
+console.log(next.runId, next.resumeReport);
 ```
 
 `runSync(script, args?, exec?)` always resolves to a terminal `WorkflowRunResult`. A run **pauses**
@@ -284,12 +308,21 @@ per-execution `exec.agent` until that promise settles, including rejection. Read
 `getRun()`, `getSnapshot()`, or `inspectRun()`, and subscribe to cumulative `tokenUsage` events while
 work is running. Live attempts update `snapshot.tokenUsage` monotonically; replayed calls add zero.
 
-When `exec.resumeJournal` is preloaded, the underlying manager sorts and copies the inherited prefix
-into the child run before its fail-fast initial persistence. Cached replay does not re-emit journal
-events, but every subsequent live suffix write persists the complete prefix. This makes each new
-background run ID independently resumable across multiple pause/resume hops. Process loss can stop
-in-flight work; the next manager recovers a stale durable `running` record to `paused`, and an
-unjournaled in-flight call may run again.
+`exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
+under a new run ID, and match safe calls by exact path/hash or unique hash+input fingerprint.
+Uncertain, ambiguous, unsafe, or environment-mismatched calls run live. Identity hits preserve
+script-visible logical budget debit while adding zero current provider usage; replayed session
+records are rebound to the current call index/label/phase. `resumePolicy: "positional"` requests
+index/prefix matching but cannot bypass new-format input/safety/environment gates. The distinct
+same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
+emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
+
+The manager's critical initial save contains the complete inherited seed before a background
+acknowledgement. A manager-prepared `resumeFromRunId` hit re-journals the selected value under its
+current target index; same-ID/manual legacy cache hits retain the historical no-journal-callback
+behavior and rely on the already-seeded prefix. Each new run is independently resumable across
+multiple pause/resume hops. Process loss can stop in-flight work; the next manager recovers a stale
+durable `running` record to `paused`, and an unjournaled in-flight call may run again.
 
 `inspectRun(runId, options?)` is inherited through this facade and returns the shared
 `WorkflowRunStatus` without importing `@automatalabs/workflow-engine`. It reads the freshest live
@@ -426,9 +459,9 @@ Semantics worth knowing:
   script resolves from the same view. (Without it, `runDynamicWorkflow` has no saved-workflow
   resolver and nested names cannot resolve.) A top-level string containing `export const meta`
   is always treated as a verbatim script, never a name.
-- **Versioning is git's job.** A run persists its script content, so `resume()` replays the exact
-  script that started the run even if the file changed since; an edited file simply cache-misses
-  from the first changed call on the next fresh run.
+- **Versioning is git's job.** Same-ID `resume()` reloads the exact persisted script. A new
+  `resumeFromRunId` execution can use an edited script: changed calls run live, while uniquely
+  matching safety-marked calls may move and replay after admission.
 - **`resolve()` validates name shape strictly** (one flat path segment) — inline nested scripts
   fall through to verbatim parsing, and path traversal out of the configured dirs is impossible.
 
@@ -505,7 +538,7 @@ ships no runtime code).
 
 | global | what it does |
 |--------|--------------|
-| `agent(prompt, options?)` | Run ONE subagent to completion; returns its result (text, or the validated object with `options.schema`). |
+| `agent(prompt, options?)` | Run ONE subagent to completion; returns its result (text, or the validated object with `options.schema`). `options.resume: { filesystem: "read-only" }` is the author safety declaration for content-addressed replay. |
 | `parallel(thunks)` | Run an array of **thunks** (`() => Promise`) concurrently; resolves in input order. |
 | `pipeline(items, ...stages)` | Map `items` through sequential async stages, concurrently across items. |
 | `workflow(nameOrScript, args?)` | Run a saved (or inline) workflow nested in this run, sharing its limiter/budget. |
@@ -699,6 +732,8 @@ fabricateFromSchema,          // the dry run's JSON-Schema value fabricator
 formatValidateReport,         // render a ValidateWorkflowReport as CLI text
 openWorkflowDir,              // read-only view over folders of workflow scripts (name = filename stem)
 WorkflowManager,              // stateful / resumable run manager
+RESUME_FALLBACK_REASONS, RESUME_DISABLED_REASONS,
+RESUME_CALL_LIVE_REASONS, RESUME_CALL_FAILED_REASONS,
 
 // ── ACP backend ──
 createAcpRunner,              // () => AcpAgentRunner (the default AgentRunner; has .on(...) events)
@@ -729,6 +764,10 @@ ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,
 ValidatedAgentCall, ValidatedCheckpoint,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowRunFallback,
 WorkflowCheckpointTaken, WorkflowCheckpointSource, WorkflowSnapshot,
+ResumePolicy, WorkflowResumeStrategy, WorkflowResumeMatch, WorkflowResumeSafety,
+WorkflowResumeFallbackReason, WorkflowResumeDisabledReason,
+WorkflowResumeCallLiveReason, WorkflowResumeCallFailedReason,
+WorkflowCallReplayProvenance, WorkflowResumeCallDecision, WorkflowResumeReport,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
