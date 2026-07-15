@@ -158,8 +158,30 @@ const freshness = Promise.all(
 // ---- check 2: fork git sync with upstream --------------------------------------------------------
 const forkIssues = []; // { dep, where, branch, upstreamRef, missing, fix }
 
+// Git-location env vars that git exports into hook child processes (e.g. GIT_DIR in a pre-push
+// hook, pointing at THIS repo's .git). GIT_DIR overrides `-C <dir>` repo discovery, so a hook
+// caller's inherited GIT_DIR would silently redirect every `git -C <cloneDir>` below to the wrong
+// repo. Strip them from the child env so `-C <dir>` always wins (also protects future hook callers).
+const GIT_LOCATION_ENV = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_PREFIX",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
 function git(dir, ...args) {
-  return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const env = { ...process.env };
+  for (const key of GIT_LOCATION_ENV) delete env[key];
+  return execFileSync("git", ["-C", dir, ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+  }).trim();
 }
 
 // Default branch of a remote as the remote reports it (ls-remote --symref HEAD → refs/heads/<branch>).
@@ -173,9 +195,17 @@ function remoteDefaultBranch(dir, remote) {
 // Local-clone check: commits upstream/<branch> has that the fork's PUBLISHED main (origin/<branch>)
 // lacks. origin, not the local branch — releases are cut from the pushed fork main.
 function checkForkClone(dep, dir, upstreamRemote) {
-  const remotes = git(dir, "remote").split("\n");
+  const remotes = git(dir, "remote").split("\n").filter(Boolean);
   if (!remotes.includes(upstreamRemote)) {
-    throw new Error(`clone at ${dir} has no '${upstreamRemote}' remote`);
+    // Self-diagnose a recurrence: report the remotes we actually listed and the git dir git
+    // actually resolved. If a stray GIT_DIR/GIT_WORK_TREE ever leaks past the git() env scrub,
+    // the resolved dir won't match `dir` — making the misdirection unambiguous instead of
+    // masquerading as a genuinely missing remote.
+    const resolved = git(dir, "rev-parse", "--absolute-git-dir");
+    throw new Error(
+      `clone at ${dir} has no '${upstreamRemote}' remote ` +
+        `(remotes listed: ${remotes.join(", ") || "none"}; git resolved dir: ${resolved})`,
+    );
   }
   const upstreamBranch = remoteDefaultBranch(dir, upstreamRemote);
   const originBranch = remoteDefaultBranch(dir, "origin");
