@@ -20,6 +20,7 @@ import type {
   EngineRunEventPayloadMap,
   JournalEntry,
   PersistableEngineRunEvent,
+  ResumePolicy,
   TokenUsage,
   WorkflowBackendConfig,
   WorkflowCallRecord,
@@ -29,6 +30,8 @@ import type {
   WorkflowRunInspectionOptions,
   WorkflowRunResult,
   WorkflowRunStatus,
+  WorkflowResumeCallDecision,
+  WorkflowResumeReport,
 } from "@automatalabs/shared-types";
 import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
@@ -36,12 +39,20 @@ import { captureRunEnvironment, type RunEnvironmentIdentity } from "./run-enviro
 import {
   createRunPersistence,
   generateRunId,
+  type PersistedResumeSeed,
   type PersistedResumeFormat,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
+import {
+  admitResumeSource,
+  buildResumeReport,
+  type ResumeAdmissionDecision,
+  type ResumeReportPlan,
+} from "./resume-matcher.js";
+import type { PreparedResume } from "./resume.js";
 import { withRunEvents, type RunEventPersistence } from "./run-event-persistence.js";
 import { projectRecordedError } from "./recorded-error.js";
 import { workflowHomeDir } from "./workflow-paths.js";
@@ -109,6 +120,12 @@ export interface ManagedRun {
   legacyResume?: true;
   /** A fresh run seeded from another execution; terminal saves replace inherited rows. */
   newRunResume?: true;
+  /** Manager-owned remaining correspondence state for a new-run resume. */
+  resumeSeed?: PersistedResumeSeed;
+  /** Manager-owned report, incrementally updated while the engine is executing. */
+  resumeReport?: WorkflowResumeReport;
+  resumeReportPlan?: ResumeReportPlan;
+  resumeDecisions?: Map<number, WorkflowResumeCallDecision>;
   executionMode?: PersistedRunState["executionMode"];
   /**
    * False for host-owned transcript storage. The run stays fully tracked in memory,
@@ -143,6 +160,17 @@ interface RunEventPublicationActions {
   afterLive?: () => void;
 }
 
+interface ManagerResumeExecution {
+  preparedResume: PreparedResume;
+  resumeJournal?: Map<number, JournalEntry>;
+  injectedCheckpointReplies?: ReadonlySet<number>;
+}
+
+interface InitializedRun {
+  managed: ManagedRun;
+  resumeExecution?: ManagerResumeExecution;
+}
+
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
   /** Caller-minted run id. Collision checks happen under the run lease. */
@@ -168,6 +196,10 @@ export interface ExecOptions {
   cwd?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
+  /** Load this persisted run as the source for a new managed execution. */
+  resumeFromRunId?: string;
+  /** Default "auto". "positional" requests the historical index/prefix matcher. */
+  resumePolicy?: ResumePolicy;
   /** Durable-checkpoint answer channel: pending checkpoint call index to the host's decision. */
   checkpointReplies?: Record<number, unknown>;
   /**
@@ -475,6 +507,243 @@ export class WorkflowManager extends EventEmitter {
     }
   }
 
+  private scriptValidationError(message: string): WorkflowError {
+    return new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+  }
+
+  private persistenceError(message: string, error?: unknown): WorkflowError {
+    return new WorkflowError(message, WorkflowErrorCode.PERSISTENCE_ERROR, {
+      recoverable: false,
+      ...(error === undefined ? {} : { details: error }),
+    });
+  }
+
+  private validateNewRunOptions(exec: ExecOptions, journaling: boolean): void {
+    const hasSource = exec.resumeFromRunId !== undefined;
+    if (hasSource && (typeof exec.resumeFromRunId !== "string" || exec.resumeFromRunId.length === 0)) {
+      throw this.scriptValidationError("resumeFromRunId must be a non-empty string");
+    }
+    if (exec.resumePolicy !== undefined && exec.resumePolicy !== "auto" && exec.resumePolicy !== "positional") {
+      throw this.scriptValidationError('resumePolicy must be "auto" or "positional"');
+    }
+    if (exec.resumeJournal !== undefined && (hasSource || exec.resumePolicy !== undefined)) {
+      throw this.scriptValidationError(
+        "resumeJournal is mutually exclusive with resumeFromRunId and resumePolicy",
+      );
+    }
+    if (exec.resumePolicy !== undefined && !hasSource) {
+      throw this.scriptValidationError("resumePolicy requires resumeFromRunId");
+    }
+    if (exec.checkpointReplies !== undefined && !hasSource) {
+      throw this.scriptValidationError("checkpointReplies requires resumeFromRunId on new-run APIs");
+    }
+    if (hasSource && !journaling) {
+      throw this.scriptValidationError("resumeFromRunId requires journaling");
+    }
+    if (hasSource && exec.runId === exec.resumeFromRunId) {
+      throw this.scriptValidationError("runId must differ from resumeFromRunId");
+    }
+  }
+
+  private acquireResumeSource(runId: string): { lease: RunLease; source: PersistedRunState } {
+    let lease: RunLease | null;
+    try {
+      lease = this.persistence.acquireRunLease(runId);
+    } catch (error) {
+      throw this.persistenceError(`failed to acquire resume source lease for ${runId}: ${errorMessage(error)}`, error);
+    }
+    if (!lease) {
+      throw this.persistenceError(`resume source is currently leased: ${runId}`);
+    }
+    try {
+      const source = this.persistence.load(runId);
+      if (!source) throw this.persistenceError(`resume source does not exist: ${runId}`);
+      return { lease, source };
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      if (error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR) throw error;
+      throw this.persistenceError(`failed to load resume source ${runId}: ${errorMessage(error)}`, error);
+    }
+  }
+
+  private reportPlan(admission: ResumeAdmissionDecision): ResumeReportPlan {
+    return admission.strategy === "identity-v1"
+      ? {
+          strategy: admission.strategy,
+          sourceRunId: admission.sourceRunId,
+          requestedPolicy: admission.requestedPolicy,
+        }
+      : admission.strategy === "positional-v1"
+        ? {
+            strategy: admission.strategy,
+            sourceRunId: admission.sourceRunId,
+            requestedPolicy: admission.requestedPolicy,
+            fallbackReason: admission.fallbackReason,
+            eligibility: admission.eligibility,
+          }
+        : {
+            strategy: admission.strategy,
+            sourceRunId: admission.sourceRunId,
+            requestedPolicy: admission.requestedPolicy,
+            disabledReason: admission.disabledReason,
+          };
+  }
+
+  private commitResumeSeed(managed: ManagedRun, remaining: PersistedResumeSeed): void {
+    managed.resumeSeed = remaining;
+    try {
+      this.persistRunOrThrow(managed);
+    } catch (error) {
+      managed.resumeSeed = undefined;
+      throw error;
+    }
+  }
+
+  private cloneResumeSourceValue<T>(value: T, runId: string): T {
+    try {
+      return structuredClone(value);
+    } catch (error) {
+      throw this.persistenceError(`failed to clone resume source ${runId}: ${errorMessage(error)}`, error);
+    }
+  }
+
+  private prepareManagedResume(
+    managed: ManagedRun,
+    source: PersistedRunState,
+    exec: ExecOptions,
+  ): ManagerResumeExecution {
+    const requestedPolicy = exec.resumePolicy ?? "auto";
+    const admission = admitResumeSource({
+      source,
+      requestedPolicy,
+      current: {
+        effectiveCwd: managed.effectiveCwd,
+        runtime: {
+          node: managed.runtime.node,
+          v8: managed.runtime.v8,
+          pathFormat: managed.runtime.pathFormat,
+          inputsFormat: managed.runtime.inputsFormat,
+          checkpointInputsFormat: managed.runtime.checkpointInputsFormat as number,
+        },
+        environment: managed.environment,
+      },
+      checkpointReplies: exec.checkpointReplies as Record<string, unknown> | undefined,
+    });
+    managed.newRunResume = true;
+    if (source.resume === undefined || source.legacyResume === true) managed.legacyResume = true;
+    managed.resumeReportPlan = this.reportPlan(admission);
+    managed.resumeDecisions = new Map();
+    managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
+
+    if (admission.strategy === "identity-v1") {
+      managed.resumeSeed = admission.seed;
+      return {
+        preparedResume: {
+          strategy: admission.strategy,
+          sourceRunId: admission.sourceRunId,
+          requestedPolicy: admission.requestedPolicy,
+          seed: admission.seed,
+          commitSeed: (remaining) => this.commitResumeSeed(managed, remaining),
+        },
+      };
+    }
+
+    if (admission.strategy === "live") {
+      return {
+        preparedResume: {
+          strategy: admission.strategy,
+          sourceRunId: admission.sourceRunId,
+          requestedPolicy: admission.requestedPolicy,
+          disabledReason: admission.disabledReason,
+        },
+      };
+    }
+
+    const sourceJournalRows = this.cloneResumeSourceValue(source.journal ?? [], source.runId);
+    const sourceJournal = new Map(
+      latestRootRows(sourceJournalRows, source.runId).map((entry) => [entry.index, entry] as const),
+    );
+    const injectedCheckpointReplies = new Set<number>();
+    if (admission.legacyCheckpointReply) {
+      const syntheticEntry: JournalEntry = deepFreeze({
+        index: admission.legacyCheckpointReply.recordedIndex,
+        hash: source.checkpointContext?.hash ?? "",
+        result: admission.legacyCheckpointReply.decision,
+        kind: "checkpoint",
+        scope: managed.runId,
+        call: { kind: "checkpoint", label: "checkpoint", phase: source.currentPhase },
+      });
+      sourceJournal.set(syntheticEntry.index, syntheticEntry);
+      injectedCheckpointReplies.add(syntheticEntry.index);
+    }
+    managed.journal = latestRows([...sourceJournal.values()]);
+    managed.calls = latestRootRows(
+      this.cloneResumeSourceValue(source.calls ?? [], source.runId),
+      source.runId,
+    );
+    if (admission.checkpointSeed) managed.resumeSeed = admission.checkpointSeed;
+    const sourceCalls = admission.eligibility === "legacy"
+      ? new Map<number, WorkflowCallRecord>()
+      : new Map(managed.calls.map((call) => [call.index, call] as const));
+    return {
+      preparedResume: {
+        strategy: admission.strategy,
+        sourceRunId: admission.sourceRunId,
+        requestedPolicy: admission.requestedPolicy,
+        fallbackReason: admission.fallbackReason,
+        eligibility: admission.eligibility,
+        sourceCalls,
+        ...(admission.checkpointSeed
+          ? {
+              checkpoint: {
+                seed: admission.checkpointSeed,
+                commitSeed: (remaining: PersistedResumeSeed) => this.commitResumeSeed(managed, remaining),
+              },
+            }
+          : {}),
+      },
+      resumeJournal: sourceJournal,
+      ...(injectedCheckpointReplies.size === 0 ? {} : { injectedCheckpointReplies }),
+    };
+  }
+
+  private initializeRun(
+    script: string,
+    args: unknown | undefined,
+    exec: ExecOptions,
+    background: boolean,
+  ): InitializedRun {
+    const journaling = this.resolveJournaling(exec);
+    this.validateNewRunOptions(exec, journaling);
+    const source = exec.resumeFromRunId === undefined
+      ? undefined
+      : this.acquireResumeSource(exec.resumeFromRunId);
+    let identity: { runId: string; lease: RunLease } | undefined;
+    try {
+      identity = this.acquireNewRunIdentity(exec.runId);
+      const managed = this.createManaged(script, args, journaling, exec, background, identity);
+      const resumeExecution = source
+        ? this.prepareManagedResume(managed, source.source, exec)
+        : undefined;
+      if (!source && managed.journaling && exec.resumeJournal) {
+        managed.journal = latestRows([...exec.resumeJournal.values()]);
+      }
+      if (!source && managed.journaling && exec.resumeCalls) {
+        managed.calls = latestRows(exec.resumeCalls);
+      }
+      this.runs.set(managed.runId, managed);
+      if (source || (managed.journaling && exec.resumeJournal)) this.persistRunOrThrow(managed);
+      else this.persistRun(managed);
+      return { managed, resumeExecution };
+    } catch (error) {
+      if (identity) this.persistence.releaseRunLease(identity.lease);
+      if (identity) this.runs.delete(identity.runId);
+      throw error;
+    } finally {
+      if (source) this.persistence.releaseRunLease(source.lease);
+    }
+  }
+
   /**
    * Start a workflow in the background.
    * Returns immediately with a run ID; the workflow executes asynchronously.
@@ -484,32 +753,14 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
-    const journaling = this.resolveJournaling(exec);
-    const identity = this.acquireNewRunIdentity(exec.runId);
-    let managed: ManagedRun;
-    try {
-      managed = this.createManaged(script, args, journaling, exec, true, identity);
-      if (managed.journaling && exec.resumeJournal) {
-        managed.journal = latestRows([...exec.resumeJournal.values()]);
-      }
-      if (managed.journaling && exec.resumeCalls) {
-        managed.calls = latestRows(exec.resumeCalls);
-      }
-      this.runs.set(managed.runId, managed);
-      if (managed.journaling && exec.resumeJournal) this.persistRunOrThrow(managed);
-      else this.persistRun(managed);
-    } catch (err) {
-      this.persistence.releaseRunLease(identity.lease);
-      this.runs.delete(identity.runId);
-      throw err;
-    }
+    const { managed, resumeExecution } = this.initializeRun(script, args, exec, true);
 
     // Run workflow asynchronously.
     // Attach a side-channel catch to prevent Node.js unhandled-rejection crashes
     // when a workflow is aborted/paused/stopped — executeRun()'s catch block
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
-    const promise = this.executeRun(managed, script, exec);
+    const promise = this.executeRun(managed, script, exec, resumeExecution);
     promise.catch(() => {});
 
     return { runId: managed.runId, promise };
@@ -526,36 +777,9 @@ export class WorkflowManager extends EventEmitter {
    * so the MCP shell can project `run.status` without catching.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const identity = this.acquireNewRunIdentity(exec.runId);
-    let managed: ManagedRun;
+    const { managed, resumeExecution } = this.initializeRun(script, args, exec, false);
     try {
-      managed = this.createManaged(script, args, this.resolveJournaling(exec), exec, false, identity);
-    } catch (error) {
-      this.persistence.releaseRunLease(identity.lease);
-      throw error;
-    }
-    if (managed.journaling && exec.resumeJournal) {
-      // runSync is also the MCP shell's explicit-resume path. Replayed entries do not fire
-      // onAgentJournal, so carry the hydrated prefix into this new managed run up front; any
-      // synthetic checkpoint reply in the map must survive another cold resume from this run.
-      managed.journal = latestRows([...exec.resumeJournal.values()]);
-    }
-    if (managed.journaling && exec.resumeCalls) {
-      managed.calls = latestRows(exec.resumeCalls);
-    }
-    try {
-      this.runs.set(managed.runId, managed);
-      // Persist the initial state immediately so listRuns()/the task panel can see
-      // the run the moment it starts, not only after the first agent journals.
-      if (managed.journaling && exec.resumeJournal) this.persistRunOrThrow(managed);
-      else this.persistRun(managed);
-    } catch (error) {
-      this.releaseRunLease(managed);
-      this.runs.delete(managed.runId);
-      throw error;
-    }
-    try {
-      return await this.executeRun(managed, script, exec);
+      return await this.executeRun(managed, script, exec, resumeExecution);
     } catch (error) {
       const wfError =
         error instanceof WorkflowError
@@ -814,6 +1038,9 @@ export class WorkflowManager extends EventEmitter {
       ...(checkpointsTaken.length === 0 ? {} : { checkpointsTaken }),
       calls: engineResult?.calls ?? managed.calls,
       callsAllocated: engineResult?.callsAllocated ?? managed.callsAllocated,
+      ...(engineResult?.resumeReport ?? managed.resumeReport
+        ? { resumeReport: engineResult?.resumeReport ?? managed.resumeReport }
+        : {}),
       effectiveLimits: engineResult?.effectiveLimits ?? managed.limits,
       ...(engineResult?.abortSignaled || managed.abortSignaled ? { abortSignaled: true as const } : {}),
       ...(engineResult?.nestedWorkflows || managed.nestedWorkflows ? { nestedWorkflows: true as const } : {}),
@@ -824,9 +1051,9 @@ export class WorkflowManager extends EventEmitter {
     managed: ManagedRun,
     script: string,
     exec: ExecOptions = {},
+    resumeExecution?: ManagerResumeExecution,
   ): Promise<WorkflowRunResult> {
     const {
-      resumeJournal,
       maxAgents,
       agentTimeoutMs,
       externalSignal,
@@ -840,6 +1067,8 @@ export class WorkflowManager extends EventEmitter {
       onNestedWorkflow,
       scriptBackends,
     } = exec;
+    const resumeJournal = resumeExecution?.resumeJournal ?? exec.resumeJournal;
+    const preparedResume = resumeExecution?.preparedResume;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
@@ -897,7 +1126,10 @@ export class WorkflowManager extends EventEmitter {
         persistLogs: managed.journaling,
         persistenceRoot: this.persistenceRoot,
         resumeJournal: managed.journaling ? resumeJournal : undefined,
-        resumeFromRunId: managed.journaling && resumeJournal ? managed.runId : undefined,
+        resumeFromRunId: managed.journaling
+          ? preparedResume?.sourceRunId ?? (resumeJournal ? managed.runId : undefined)
+          : undefined,
+        preparedResume,
         runId: managed.runId,
         onResumeFilesystemTainted: () => {
           managed.resumeFilesystemTainted = true;
@@ -920,9 +1152,10 @@ export class WorkflowManager extends EventEmitter {
           }
           managed.callsAllocated = allocated;
         },
+        onResumeDecision: (decision) => this.recordResumeDecision(managed, decision),
         onAgentJournal: (entry) => this.recordJournalEntry(managed, entry),
-        injectedCheckpointReplies: new Set(
-          Object.keys(exec.checkpointReplies ?? {}).map((index) => Number(index)),
+        injectedCheckpointReplies: resumeExecution?.injectedCheckpointReplies ?? new Set(
+          Object.keys(preparedResume ? {} : exec.checkpointReplies ?? {}).map((index) => Number(index)),
         ),
         onFallback: (entry) => {
           managed.fallbacks.push(entry);
@@ -1045,6 +1278,7 @@ export class WorkflowManager extends EventEmitter {
       managed.executionSettled = true;
       managed.calls = engineResult.calls ?? [];
       managed.callsAllocated = engineResult.callsAllocated;
+      managed.resumeReport = engineResult.resumeReport;
       managed.limits = engineResult.effectiveLimits;
       if (engineResult.abortSignaled) managed.abortSignaled = true;
       if (engineResult.nestedWorkflows) managed.nestedWorkflows = true;
@@ -1164,6 +1398,16 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
+  private recordResumeDecision(managed: ManagedRun, decision: WorkflowResumeCallDecision): void {
+    if (!managed.resumeReportPlan || !managed.resumeDecisions) return;
+    managed.resumeDecisions.set(decision.index, decision);
+    managed.resumeReport = buildResumeReport(
+      managed.resumeReportPlan,
+      [...managed.resumeDecisions.values()],
+    );
+    this.persistRun(managed);
+  }
+
   private recordJournalEntry(managed: ManagedRun, entry: JournalEntry): void {
     if (this.dropPostTerminal(managed, "journal")) return;
     const rootScope = entry.scope === undefined || entry.scope === managed.runId;
@@ -1268,6 +1512,31 @@ export class WorkflowManager extends EventEmitter {
           return row !== undefined && entry.kind === row.kind && entry.hash === row.hash;
         }),
       );
+      if (managed.status === "completed") {
+        managed.resumeSeed = undefined;
+      } else if (managed.resumeSeed) {
+        managed.resumeSeed = deepFreeze({
+          ...managed.resumeSeed,
+          sourceRunId: managed.runId,
+        });
+      }
+      if (managed.resumeSeed?.checkpointInjections) {
+        const checkpointKeys = new Set(
+          managed.calls
+            .filter((row) => row.kind === "checkpoint")
+            .map((row) => `${row.hash}\u0000${row.inputsHash ?? ""}`),
+        );
+        const checkpointInjections = managed.resumeSeed.checkpointInjections.filter(
+          (injection) => !checkpointKeys.has(`${injection.hash}\u0000${injection.inputsHash}`),
+        );
+        if (checkpointInjections.length !== managed.resumeSeed.checkpointInjections.length) {
+          const { checkpointInjections: _discarded, ...remainingSeed } = managed.resumeSeed;
+          managed.resumeSeed = deepFreeze({
+            ...remainingSeed,
+            ...(checkpointInjections.length === 0 ? {} : { checkpointInjections }),
+          });
+        }
+      }
     }
     if (managed.resumeTerminalFinalized) return;
     managed.resumeTerminalFinalized = true;
@@ -1298,6 +1567,8 @@ export class WorkflowManager extends EventEmitter {
       runtime: managed.runtime,
       environment: managed.environment,
       ...(managed.resume ? { resume: managed.resume } : {}),
+      ...(managed.resumeSeed ? { resumeSeed: managed.resumeSeed } : {}),
+      ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
       mainModel: managed.mainModel,
       agentsDir: managed.agentsDir,
       executionMode: managed.executionMode,
@@ -1449,6 +1720,11 @@ export class WorkflowManager extends EventEmitter {
     | { accepted: false; promise?: undefined }
     | { accepted: true; promise: Promise<WorkflowRunResult> }
   > {
+    if (exec.resumeFromRunId !== undefined || exec.resumePolicy !== undefined) {
+      throw this.scriptValidationError(
+        "same-run resume does not accept resumeFromRunId or resumePolicy",
+      );
+    }
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
