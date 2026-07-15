@@ -257,6 +257,75 @@ test("repeated labels are matched FIFO on agentEnd", async () => {
   }
 });
 
+test("scope and callIndex pair duplicate labels and parent tool spans directly", async () => {
+  const h = createHarness({ captureContent: true });
+  try {
+    h.manager.emit("agentStart", {
+      runId: "run-correlated",
+      scope: "run-correlated-nested1",
+      callIndex: 0,
+      label: "same",
+      prompt: "first prompt",
+    });
+    h.manager.emit("agentStart", {
+      runId: "run-correlated",
+      scope: "run-correlated-nested2",
+      callIndex: 0,
+      label: "same",
+      prompt: "second prompt",
+    });
+    h.manager.emit("agentEvent", {
+      name: "tool_call",
+      runId: "run-correlated",
+      scope: "run-correlated-nested1",
+      callIndex: 0,
+      label: "same",
+      sessionId: "session-direct",
+      backendId: "fake",
+      event: { toolCallId: "tool-direct", title: "Direct tool" },
+    });
+    h.manager.emit("agentEvent", {
+      name: "tool_call_update",
+      runId: "run-correlated",
+      scope: "run-correlated-nested1",
+      callIndex: 0,
+      sessionId: "session-direct",
+      backendId: "fake",
+      event: { toolCallId: "tool-direct", status: "completed" },
+    });
+    h.manager.emit("agentEnd", {
+      runId: "run-correlated",
+      scope: "run-correlated-nested2",
+      callIndex: 0,
+      label: "same",
+      result: "second result",
+    });
+    h.manager.emit("agentEnd", {
+      runId: "run-correlated",
+      scope: "run-correlated-nested1",
+      callIndex: 0,
+      label: "same",
+      result: "first result",
+    });
+    h.manager.emit("complete", {
+      runId: "run-correlated",
+      result: { meta: { name: "correlated" }, status: "completed", agentCount: 2 },
+    });
+
+    await h.flush();
+    const spans = h.spanExporter.getFinishedSpans();
+    const first = spans.find((span) => span.attributes[ATTR_PROMPT] === "first prompt");
+    const second = spans.find((span) => span.attributes[ATTR_PROMPT] === "second prompt");
+    assert.ok(first);
+    assert.ok(second);
+    assert.equal(first.attributes[ATTR_RESULT], '"first result"');
+    assert.equal(second.attributes[ATTR_RESULT], '"second result"');
+    assert.equal(findSpan(spans, "execute_tool Direct tool").parentSpanContext?.spanId, first.spanContext().spanId);
+  } finally {
+    await h.shutdown();
+  }
+});
+
 test("agentEnd error attributes are recorded and unmatched endings only count metrics", async () => {
   const h = createHarness();
   try {

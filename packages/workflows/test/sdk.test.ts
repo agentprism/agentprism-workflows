@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,6 +44,15 @@ import {
   TypedEventEmitter,
   toJsonSchema,
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
+  // §2.10 host-seam re-exports — the durable event read/tail API and shared event contract the
+  // facade surfaces so SDK consumers never reach into package internals. Value exports below;
+  // the types they pair with are compile-gated in the `import type` block.
+  withRunEvents,
+  RunEventLogError,
+  RUN_EVENT_READ_LIMIT_DEFAULT,
+  RUN_EVENT_READ_LIMIT_MAX,
+  RUN_EVENT_MAX_RECORD_BYTES,
+  RUN_EVENT_LOG_VERSION,
 } from "../src/index.js";
 import type {
   AcpEventContext,
@@ -89,6 +98,26 @@ import type {
   WorkflowAgentEventPayload,
   WorkflowAgentEventPayloadMap,
   WorkflowRunEvent,
+  // §2.10 host-seam type re-exports — the shared live/persisted event unions + projections and the
+  // durable read/watch seam types. Compile-gated below so a dropped/renamed facade re-export fails tsc.
+  RunEvent,
+  EngineRunEvent,
+  EngineRunEventName,
+  EngineRunEventPayloadMap,
+  PersistableEngineRunEvent,
+  PersistedRunEvent,
+  RunEventLogRecord,
+  RunEventValueProjection,
+  RunEventErrorProjection,
+  RunEventCheckpointProjection,
+  PersistedRunAgentEndPayload,
+  RunEventPersistence,
+  RunEventStream,
+  AppendRunEventInput,
+  ReadRunEventsOptions,
+  ReadRunEventsResult,
+  WatchRunEventsOptions,
+  RunEventLogErrorCode,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -126,6 +155,31 @@ type IsolationTypeSurface = [
   WorkflowCallRecord,
   WorkflowRecordedError,
 ];
+
+// §2.10 host-seam TYPE surface: each name must resolve through the facade barrel or `tsc -p
+// tsconfig.test.json` (spawned below) fails. Covers the shared live/persisted event unions +
+// projections and the durable read/watch seam types.
+type RunEventSeamSurface = [
+  RunEvent,
+  EngineRunEvent,
+  EngineRunEventName,
+  EngineRunEventPayloadMap,
+  PersistableEngineRunEvent,
+  PersistedRunEvent,
+  RunEventLogRecord,
+  RunEventValueProjection,
+  RunEventErrorProjection,
+  RunEventCheckpointProjection,
+  PersistedRunAgentEndPayload,
+  RunEventPersistence,
+  RunEventStream,
+  AppendRunEventInput,
+  ReadRunEventsOptions,
+  ReadRunEventsResult,
+  WatchRunEventsOptions,
+  RunEventLogErrorCode,
+];
+void (undefined as unknown as RunEventSeamSurface);
 
 type Assert<T extends true> = T;
 type IsNever<T> = [T] extends [never] ? true : false;
@@ -540,6 +594,25 @@ test("facade re-exports the public surface", () => {
   assert.equal(checkpointTaken.source, "injected");
 });
 
+test("facade re-exports the §2.10 durable event read/tail host seam", () => {
+  assert.equal(typeof withRunEvents, "function");
+  assert.equal(typeof RunEventLogError, "function");
+  assert.equal(RUN_EVENT_READ_LIMIT_DEFAULT, 100);
+  assert.equal(RUN_EVENT_READ_LIMIT_MAX, 1_000);
+  assert.equal(RUN_EVENT_MAX_RECORD_BYTES, 65_536);
+  assert.equal(RUN_EVENT_LOG_VERSION, 1);
+  // The frozen error taxonomy is carried by the re-exported class; construct one through the facade.
+  const code: RunEventLogErrorCode = "CORRUPT_LOG";
+  const error = new RunEventLogError("boom", code, { runId: "r" });
+  assert.equal(error.name, "RunEventLogError");
+  assert.equal(error.code, code);
+  // EngineRunEventPayloadMap is the exact type the README typed-manager example imports from
+  // "@automatalabs/workflows": a facade consumer selects a payload by event name with no
+  // @automatalabs/workflow-engine import. Proving it resolves here compiles that example.
+  const logPayload: EngineRunEventPayloadMap["log"] = { runId: "r", scope: "r", message: "hi" };
+  assert.equal(logPayload.message, "hi");
+});
+
 test("facade WorkflowManager exposes inspectRun and shared status without engine imports", async () => {
   const manager = new WorkflowManager({ agent: okRunner() });
   const result = await manager.runSync(ONE_AGENT_SCRIPT);
@@ -870,6 +943,77 @@ test("WorkflowManager forwards injected runner live ACP events as agentEvent", a
   assert.equal(runner.listenerCount("session_update"), 1, "constructor bridge survives run settlement");
   manager.dispose();
   assert.equal(runner.listenerCount("session_update"), 0, "dispose removes constructor bridge");
+});
+
+/**
+ * A runner that BOTH streams live ACP traffic (bridged to `agentEvent`) and reports agent
+ * history (bridged to `agentHistory`). §2.6 fixes both as relay-only: neither may enter the
+ * durable `<runId>.events.jsonl` sidecar regardless of any host subscription.
+ */
+class LiveStreamAndHistoryRunner {
+  private readonly bus = new TypedEventEmitter<AcpRunnerEventMap>();
+  readonly sessionId = "history-session";
+  readonly backendId = "claude";
+
+  on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void {
+    return this.bus.on(name, listener);
+  }
+
+  async run(prompt: string, options?: RunOptions): Promise<unknown> {
+    const ctx: AcpEventContext = {
+      sessionId: this.sessionId,
+      backendId: this.backendId,
+      label: options?.label,
+      runId: options?.runId,
+      callIndex: options?.callIndex,
+    };
+    this.bus.emit("session_open", ctx);
+    const update = {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "streamed" },
+    } as AcpRunnerEventMap["session_update"]["update"];
+    this.bus.emit("session_update", { ...ctx, update });
+    options?.onHistory?.([{ role: "assistant", kind: "text", text: "captured turn" }]);
+    this.bus.emit("session_close", ctx);
+    return `streamed:${prompt}`;
+  }
+}
+
+test("the durable event log never persists agentEvent or agentHistory traffic (§2.6)", async () => {
+  const runner = new LiveStreamAndHistoryRunner();
+  const manager = new WorkflowManager({ agent: runner as unknown as AgentRunner });
+  const liveAgentEvents: string[] = [];
+  let liveHistory = 0;
+  manager.on("agentEvent", (event: AgentEventPayload) => liveAgentEvents.push(event.name));
+  manager.on("agentHistory", () => {
+    liveHistory++;
+  });
+
+  const result = await manager.runSync(ONE_AGENT_SCRIPT);
+  manager.dispose();
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.result, "streamed:hello");
+  // The live bridges must actually have fired, or the persistence assertion is vacuous.
+  assert.ok(liveAgentEvents.length > 0, "runner must emit live agentEvent traffic");
+  assert.ok(liveHistory > 0, "runner must emit live agentHistory traffic");
+
+  // Scan the run's structured sidecar directly (not via readEvents) per the §5 test plan.
+  const sidecar = join(manager.getPersistence().getRunsDir(), `${result.runId}.events.jsonl`);
+  assert.equal(existsSync(sidecar), true, "a journaling run writes the event sidecar");
+  const lines = readFileSync(sidecar, "utf8").split("\n").filter((line) => line.length > 0);
+  assert.ok(lines.length > 0, "the sidecar holds the persisted lifecycle events");
+  // `.type` is the persisted-only union (agentEvent/agentHistory are absent from it by
+  // construction — the type system already forbids them); widen to string so the runtime scan
+  // can still search for the forbidden relay names.
+  const types: string[] = lines.map((line) => (JSON.parse(line) as RunEventLogRecord).event.type);
+  assert.equal(types.includes("agentEvent"), false, "agentEvent is relay-only, never persisted");
+  assert.equal(types.includes("agentHistory"), false, "agentHistory is relay-only, never persisted");
+  // Positive control: the durable lifecycle events ARE present, so the scan is meaningful.
+  assert.ok(
+    types.includes("agentStart") && types.includes("agentEnd") && types.includes("complete"),
+    "the durable lifecycle events are persisted",
+  );
 });
 
 test("WorkflowManager agentEvent union exactly covers every bridged ACP event", () => {

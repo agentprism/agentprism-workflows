@@ -8,7 +8,7 @@ import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AgentUsage, RunOptions } from "@automatalabs/shared-types";
-import { WorkflowError, WorkflowErrorCode } from "@automatalabs/workflows";
+import { WorkflowError, WorkflowErrorCode, WorkflowManager } from "@automatalabs/workflows";
 import { createWorkflowServer, MAX_BACKGROUND_RUNS } from "../src/index.js";
 import {
   connect,
@@ -188,6 +188,202 @@ test("background acceptance is immediate and await reports immediate, timeout, c
       controlled.calls[index]?.resolve("cleanup");
     }
     await dispose();
+  }
+});
+
+test("await tails post-watermark progress while background admission stays silent", async () => {
+  const controlled = new ControlledRunner();
+  const { server, dispose } = await connect(controlled.runner, { listTools: true });
+  type ProgressParams = { progressToken: string | number; progress: number; total?: number; message?: string };
+  type DirectResult = {
+    structuredContent?: Record<string, unknown>;
+    content: Array<{ type: string; text?: string }>;
+    isError?: boolean;
+  };
+  type DirectHandler = (
+    args: Record<string, unknown>,
+    extra: {
+      signal: AbortSignal;
+      _meta?: { progressToken?: string | number };
+      sendNotification: (notification: { params: ProgressParams }) => Promise<void>;
+    },
+  ) => Promise<DirectResult>;
+  const registered = server as unknown as {
+    _registeredTools: Record<string, { handler: DirectHandler }>;
+  };
+  const handler = registered._registeredTools.workflow.handler;
+  const admissionProgress: ProgressParams[] = [];
+
+  try {
+    const accepted = await handler(
+      { script: TWO_AGENT_BACKGROUND, background: true },
+      {
+        signal: new AbortController().signal,
+        _meta: { progressToken: "admission" },
+        sendNotification: async (notification) => {
+          admissionProgress.push(notification.params);
+        },
+      },
+    );
+    const runId = accepted.structuredContent?.runId;
+    assert.equal(typeof runId, "string");
+    assert.deepEqual(admissionProgress, []);
+
+    const awaitProgress: ProgressParams[] = [];
+    const awaited = handler(
+      { action: "await", runId, waitMs: 5_000 },
+      {
+        signal: new AbortController().signal,
+        _meta: { progressToken: "await" },
+        sendNotification: async (notification) => {
+          awaitProgress.push(notification.params);
+        },
+      },
+    );
+
+    controlled.resolve(0, "first result");
+    await waitUntil(() => controlled.calls.length === 2, "the second agent should start");
+    await waitUntil(() => awaitProgress.length >= 5, "the await request should consume the first call's event suffix");
+    assert.deepEqual(awaitProgress.slice(0, 5), [
+      { progressToken: "await", progress: 0, message: "Explore" },
+      { progressToken: "await", progress: 0, total: 1, message: "Explore" },
+      { progressToken: "await", progress: 1, total: 1, message: "Explore" },
+      { progressToken: "await", progress: 1, total: 1, message: "Review" },
+      { progressToken: "await", progress: 1, total: 2, message: "Review" },
+    ]);
+
+    controlled.resolve(1, "second result");
+    const result = await awaited;
+    assert.equal(result.isError, false);
+    assert.equal(result.structuredContent?.status, "completed");
+    assert.deepEqual(admissionProgress, [], "the completed admission request never becomes a progress channel");
+    for (let index = 1; index < awaitProgress.length; index++) {
+      assert.ok(awaitProgress[index].progress >= awaitProgress[index - 1].progress);
+      assert.ok((awaitProgress[index].total ?? 0) >= (awaitProgress[index - 1].total ?? 0));
+    }
+  } finally {
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await dispose();
+  }
+});
+
+test("await cancellation closes its event watcher without cancelling the workflow", async () => {
+  const originalGetPersistence = WorkflowManager.prototype.getPersistence;
+  let watcherCloseCalls = 0;
+  WorkflowManager.prototype.getPersistence = function getPersistenceWithObservedWatch() {
+    const persistence = originalGetPersistence.call(this);
+    const originalWatchEvents = persistence.watchEvents.bind(persistence);
+    persistence.watchEvents = (...args) => {
+      const stream = originalWatchEvents(...args);
+      const originalClose = stream.close.bind(stream);
+      stream.close = () => {
+        watcherCloseCalls++;
+        originalClose();
+      };
+      return stream;
+    };
+    return persistence;
+  };
+
+  const controlled = new ControlledRunner();
+  const { client, server, dispose } = await connect(controlled.runner);
+  try {
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_BACKGROUND, background: true },
+    });
+    type DirectHandler = (
+      args: Record<string, unknown>,
+      extra: { signal: AbortSignal },
+    ) => Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }>;
+    const handler = (server as unknown as {
+      _registeredTools: Record<string, { handler: DirectHandler }>;
+    })._registeredTools.workflow.handler;
+    const controller = new AbortController();
+    const awaited = handler(
+      { action: "await", runId: runIdOf(accepted), waitMs: 5_000 },
+      { signal: controller.signal },
+    );
+    controller.abort();
+
+    const result = await awaited;
+    assert.equal(result.isError, true);
+    assert.equal(watcherCloseCalls, 1);
+    assert.equal(controlled.calls[0].options.signal?.aborted, false);
+  } finally {
+    WorkflowManager.prototype.getPersistence = originalGetPersistence;
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await dispose();
+  }
+});
+
+test("legacy and unsafe event logs fall back without await progress notifications", async () => {
+  const fixtures = ["legacy", "missing-stream", "mismatched-stream", "corrupt", "incomplete"] as const;
+
+  for (const fixture of fixtures) {
+    const controlled = new ControlledRunner();
+    const { client, server, dispose } = await connect(controlled.runner);
+    try {
+      const accepted = await client.callTool({
+        name: "workflow",
+        arguments: {
+          script: 'export const meta = { name: "fallback", description: "fallback" }; return await agent("wait");',
+          background: true,
+        },
+      });
+      const runId = runIdOf(accepted);
+      const snapshotFile = persistedRunFile(runId);
+      assert.ok(snapshotFile);
+      const eventFile = snapshotFile.replace(/\.json$/, ".events.jsonl");
+      const persisted = JSON.parse(readFileSync(snapshotFile, "utf8")) as Record<string, unknown>;
+      if (fixture === "legacy") {
+        delete persisted.eventSeq;
+        delete persisted.eventStreamId;
+        unlinkSync(eventFile);
+      } else if (fixture === "missing-stream") {
+        delete persisted.eventStreamId;
+      } else if (fixture === "mismatched-stream") {
+        persisted.eventStreamId = "b".repeat(32);
+      } else if (fixture === "corrupt") {
+        writeFileSync(eventFile, `${readFileSync(eventFile, "utf8")}{invalid}\n`, "utf8");
+      } else {
+        persisted.eventLogIncomplete = true;
+      }
+      if (fixture !== "corrupt") writeFileSync(snapshotFile, JSON.stringify(persisted), "utf8");
+
+      type ProgressParams = { progressToken: string | number; progress: number; total?: number; message?: string };
+      type DirectHandler = (
+        args: Record<string, unknown>,
+        extra: {
+          signal: AbortSignal;
+          _meta: { progressToken: string | number };
+          sendNotification: (notification: { params: ProgressParams }) => Promise<void>;
+        },
+      ) => Promise<{ structuredContent?: Record<string, unknown>; isError?: boolean }>;
+      const handler = (server as unknown as {
+        _registeredTools: Record<string, { handler: DirectHandler }>;
+      })._registeredTools.workflow.handler;
+      const progress: ProgressParams[] = [];
+      const awaited = handler(
+        { action: "await", runId, waitMs: 5_000 },
+        {
+          signal: new AbortController().signal,
+          _meta: { progressToken: fixture },
+          sendNotification: async (notification) => {
+            progress.push(notification.params);
+          },
+        },
+      );
+
+      controlled.resolve(0, fixture);
+      const result = await awaited;
+      assert.equal(result.isError, false, fixture);
+      assert.equal(result.structuredContent?.status, "completed", fixture);
+      assert.deepEqual(progress, [], fixture);
+    } finally {
+      for (const call of controlled.calls) call.resolve("cleanup");
+      await dispose();
+    }
   }
 });
 
