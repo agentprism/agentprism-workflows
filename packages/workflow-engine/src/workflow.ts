@@ -74,6 +74,8 @@ export interface SharedRuntime {
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
+  /** Root-run-wide workflow() invocation ordinal. Monotonic and never decremented. */
+  nestedSeq: number;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -130,6 +132,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Observability callbacks; neither participates in journal identity. */
   onFallback?: (entry: WorkflowRunFallback) => void;
   onCheckpointTaken?: (entry: WorkflowCheckpointTaken) => void;
+  /** Called synchronously when workflow() allocates a unique child-run ordinal. */
+  onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
@@ -147,7 +151,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * a UI-bearing tool context. Absent => the checkpoint's headless mode applies:
    * default (declared default/true), abort, or the opt-in durable pause.
    */
-  confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
+  confirm?: (
+    promptText: string,
+    options: CheckpointOptions,
+    context?: CheckpointCallContext,
+  ) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
@@ -270,6 +278,17 @@ export interface CheckpointOptions {
   timeoutMs?: number;
 }
 
+/** The engine-computed identity of one checkpoint() call, handed to the confirm
+ *  callback as its additive third argument. */
+export interface CheckpointCallContext {
+  callIndex: number;
+  hash: string;
+  /** The emitting engine run's runId (root, or `${root}-nested<ordinal>`). */
+  scope: string;
+  /** The structural call-path key, when captured. */
+  path?: string;
+}
+
 interface RuntimeState {
   currentPhase?: string;
   /**
@@ -334,6 +353,19 @@ const DETERMINISM_PRELUDE = [
   "}",
 ].join("\n");
 
+/** Observable call-path capture format. Bump when capture semantics change. */
+export const CALL_PATH_FORMAT = 1;
+/** Maximum unambiguous raw stack depth retained for call-path capture. */
+export const CALL_PATH_RAW_FRAMES = 64;
+/** Observable call-input fingerprint format. Bump when its inputs or encoding change. */
+export const CALL_INPUTS_FORMAT = 1;
+
+/** Convert a workflow name into the path-free base used for its vm filename. */
+export function sanitizeVmName(name: string): string {
+  const sanitized = name.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 64);
+  return sanitized || "workflow";
+}
+
 export async function runWorkflow<T = unknown>(
   script: string,
   options: WorkflowRunOptions,
@@ -355,6 +387,9 @@ export async function runWorkflow<T = unknown>(
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
+  const vmFilename = `${sanitizeVmName(meta.name)}.js`;
+  const preludeLines = DETERMINISM_PRELUDE.split("\n").length;
+  const backendsDigest = options.scriptBackends ? hashCanonicalStrictJson(options.scriptBackends) : null;
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it. The agents
   // directory is parameterized via options.agentsDir (defaults to AGENTS_DIR).
@@ -401,8 +436,10 @@ export async function runWorkflow<T = unknown>(
     spent: 0,
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
+    nestedSeq: 0,
   };
   const limiter = shared.limiter;
+  let nestedWorkflows = false;
 
   const log = (message: string) => {
     const text = String(message);
@@ -508,9 +545,13 @@ export async function runWorkflow<T = unknown>(
     // onModelResolved once the subagent session is created.
     let displayModel = modelSpec ?? options.mainModel;
 
-    // Deterministic resume key: assigned at lexical call time, before the limiter,
-    // so parallel()/pipeline() fan-out is reproducible for a fixed script.
-    const callIndex = state.callSeq++;
+    const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
+    const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
+    const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
+    const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
+
+    // Every identity component is computed before the index is allocated. A hash
+    // serialization failure therefore consumes no index and leaves no journal gap.
     const callHash = hashAgentCall(
       prompt,
       modelSpec,
@@ -519,6 +560,24 @@ export async function runWorkflow<T = unknown>(
       agentOptions,
       agentDefinitionKey(agentDef),
     );
+    const callPath = captureCallPath(vmFilename, preludeLines);
+    const callInputsHash = hashCallInputs({
+      cwd: agentOptions.cwd ?? null,
+      isolation: resolvedIsolation ?? null,
+      keepSession: agentOptions.keepSession === true,
+      images: agentOptions.images ?? null,
+      mcpServers: agentOptions.mcpServers ?? null,
+      meta: agentOptions.meta ?? null,
+      promptMeta: agentOptions.promptMeta ?? null,
+      label,
+      timeoutMs: timeout,
+      retries: retryAttempts,
+      backends: backendsDigest,
+    });
+
+    // Deterministic resume key: assigned at lexical call time, before the limiter,
+    // so parallel()/pipeline() fan-out is reproducible for a fixed script.
+    const callIndex = state.callSeq++;
 
     // Reserve the agent slot synchronously — atomic with the limit/budget gate
     // above (no await in between) — so a parallel() fan-out can't all observe the
@@ -526,7 +585,6 @@ export async function runWorkflow<T = unknown>(
     // spent accrues after each agent, matching Claude Code; in-flight agents may
     // push slightly past total, then further agent() calls throw.)
     shared.agentCount++;
-    const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
 
     // Longest-unchanged-prefix resume: replay a cached result only while the
     // prefix is still intact — this call's index is before the first changed/new
@@ -557,8 +615,6 @@ export async function runWorkflow<T = unknown>(
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
-      const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
-      const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
@@ -576,7 +632,6 @@ export async function runWorkflow<T = unknown>(
         );
       }
       let worktree: Worktree | undefined;
-      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
         if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
@@ -664,6 +719,10 @@ export async function runWorkflow<T = unknown>(
                 // Session hand-off pair: capture the re-attach ref, optionally skip the
                 // release-time close. Additive, NOT part of the resume identity (hashAgentCall).
                 keepSession: agentOptions.keepSession,
+                callIndex,
+                callHash,
+                callPath,
+                callInputsHash,
                 onSessionOpen: (ref: AgentSessionRef) => {
                   sessionRef = ref;
                 },
@@ -848,6 +907,10 @@ export async function runWorkflow<T = unknown>(
         recoverable: false,
       });
     }
+    const ordinal = ++shared.nestedSeq;
+    const childRunId = `${runId}-nested${ordinal}`;
+    nestedWorkflows = true;
+    options.onNestedWorkflow?.(ordinal, childRunId);
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
     shared.depth++;
@@ -865,7 +928,7 @@ export async function runWorkflow<T = unknown>(
         // A nested run is its own script; never reuse the parent's resume journal.
         resumeJournal: undefined,
         resumeFromRunId: undefined,
-        runId: `${runId}-nested${shared.depth}`,
+        runId: childRunId,
         persistLogs: false,
       });
       state.fallbacks.push(...(child.fallbacks ?? []));
@@ -1053,8 +1116,9 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     }
-    const callIndex = state.callSeq++;
     const callHash = hashCheckpoint(promptText, checkpointOptions);
+    const callPath = captureCallPath(vmFilename, preludeLines);
+    const callIndex = state.callSeq++;
     const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
@@ -1074,7 +1138,12 @@ export async function runWorkflow<T = unknown>(
     let reply: unknown;
     let source: WorkflowCheckpointTaken["source"];
     if (options.confirm) {
-      reply = await options.confirm(promptText, checkpointOptions);
+      reply = await options.confirm(promptText, checkpointOptions, {
+        callIndex,
+        hash: callHash,
+        scope: runId,
+        path: callPath,
+      });
       source = "live";
     } else if (checkpointOptions.headless === "abort") {
       throw new WorkflowError(
@@ -1178,9 +1247,7 @@ export async function runWorkflow<T = unknown>(
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   let result: unknown;
   try {
-    const scriptPromise = new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(
-      context,
-    ) as Promise<unknown>;
+    const scriptPromise = new vm.Script(wrapped, { filename: vmFilename }).runInContext(context) as Promise<unknown>;
     // If the tripwire fires while the script is still running, the run fails NOW with
     // SCRIPT_ERROR; the losing scriptPromise keeps its race handlers, so its own eventual
     // rejection (e.g. WORKFLOW_ABORTED from the fault-channel cancel) never floats.
@@ -1217,6 +1284,7 @@ export async function runWorkflow<T = unknown>(
     agentSessions: state.agentSessions,
     ...(state.fallbacks.length === 0 ? {} : { fallbacks: state.fallbacks }),
     ...(state.checkpointsTaken.length === 0 ? {} : { checkpointsTaken: state.checkpointsTaken }),
+    ...(nestedWorkflows ? { nestedWorkflows: true as const } : {}),
   };
 }
 
@@ -1412,6 +1480,136 @@ function createLimiter(limit: number) {
 
 function defaultAgentLabel(phase: string | undefined, index: number): string {
   return phase ? `${phase} agent ${index}` : `agent ${index}`;
+}
+
+function captureCallPath(vmFilename: string, preludeLines: number): string | undefined {
+  const originalPrepareStackTrace = Error.prepareStackTrace;
+  const originalStackTraceLimit = Error.stackTraceLimit;
+  try {
+    Error.stackTraceLimit = CALL_PATH_RAW_FRAMES + 1;
+    Error.prepareStackTrace = (_error, stack) => stack;
+    const raw = new Error().stack as unknown as NodeJS.CallSite[];
+    if (!Array.isArray(raw) || raw.length === CALL_PATH_RAW_FRAMES + 1) return undefined;
+
+    const selected: NodeJS.CallSite[] = [];
+    let selecting = false;
+    for (const frame of raw) {
+      const selectable = frame.getFileName() === vmFilename && !frame.isAsync();
+      if (!selecting) {
+        if (!selectable) continue;
+        selecting = true;
+      } else if (!selectable) {
+        break;
+      }
+      selected.push(frame);
+    }
+    if (selected.length === 0) return undefined;
+
+    const normalized: string[] = [];
+    for (const frame of selected) {
+      const frameLine = frame.getLineNumber();
+      const column = frame.getColumnNumber();
+      if (frameLine === null || column === null) return undefined;
+      normalized.push(`${frameLine - (preludeLines + 1)}:${column}`);
+    }
+    return normalized.join("<");
+  } catch {
+    return undefined;
+  } finally {
+    Error.prepareStackTrace = originalPrepareStackTrace;
+    Error.stackTraceLimit = originalStackTraceLimit;
+  }
+}
+
+const HOST_OBJECT_CONSTRUCTOR_SOURCE = Function.prototype.toString.call(Object);
+const INVALID_STRICT_JSON = Symbol("invalid-strict-json");
+type StrictJsonValue = null | boolean | number | string | StrictJsonValue[] | { [key: string]: StrictJsonValue };
+
+function isRealmNeutralPlainRecord(value: object): boolean {
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype === null) return true;
+  if (Object.getPrototypeOf(prototype) !== null) return false;
+  const constructor = Object.getOwnPropertyDescriptor(prototype, "constructor");
+  if (!constructor || !("value" in constructor)) return false;
+  const candidate = constructor.value;
+  return (
+    typeof candidate === "function" &&
+    candidate.prototype === prototype &&
+    Function.prototype.toString.call(candidate) === HOST_OBJECT_CONSTRUCTOR_SOURCE
+  );
+}
+
+function cloneStrictJson(value: unknown, ancestors: Set<object>): StrictJsonValue {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return value;
+    throw INVALID_STRICT_JSON;
+  }
+  if (typeof value !== "object" || ancestors.has(value)) throw INVALID_STRICT_JSON;
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.getOwnPropertySymbols(value).length !== 0) throw INVALID_STRICT_JSON;
+      const names = Object.getOwnPropertyNames(value);
+      if (names.length !== value.length + 1 || !names.includes("length")) throw INVALID_STRICT_JSON;
+      const clone: StrictJsonValue[] = [];
+      for (let index = 0; index < value.length; index++) {
+        const key = String(index);
+        if (!names.includes(key)) throw INVALID_STRICT_JSON;
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor?.enumerable || !("value" in descriptor)) throw INVALID_STRICT_JSON;
+        clone.push(cloneStrictJson(descriptor.value, ancestors));
+      }
+      return clone;
+    }
+
+    if (!isRealmNeutralPlainRecord(value)) throw INVALID_STRICT_JSON;
+    if (Object.getOwnPropertySymbols(value).length !== 0) throw INVALID_STRICT_JSON;
+    const clone: { [key: string]: StrictJsonValue } = {};
+    for (const key of Object.getOwnPropertyNames(value).sort()) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) throw INVALID_STRICT_JSON;
+      Object.defineProperty(clone, key, {
+        value: cloneStrictJson(descriptor.value, ancestors),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return clone;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function canonicalStrictJson(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(cloneStrictJson(value, new Set()));
+  } catch {
+    return undefined;
+  }
+}
+
+function hashCanonicalStrictJson(value: unknown): string | undefined {
+  const canonical = canonicalStrictJson(value);
+  return canonical === undefined ? undefined : createHash("sha256").update(canonical).digest("hex");
+}
+
+function hashCallInputs(inputs: {
+  cwd: unknown;
+  isolation: unknown;
+  keepSession: unknown;
+  images: unknown;
+  mcpServers: unknown;
+  meta: unknown;
+  promptMeta: unknown;
+  label: unknown;
+  timeoutMs: unknown;
+  retries: unknown;
+  backends: unknown;
+}): string | undefined {
+  return hashCanonicalStrictJson(inputs);
 }
 
 /** Stable identity hash for a checkpoint() call — a cache miss on resume when anything changes. */

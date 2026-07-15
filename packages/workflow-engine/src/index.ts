@@ -11,6 +11,7 @@ export {
   type WorkflowAgentOptions,
   type AgentOptions,
   type CheckpointOptions,
+  type CheckpointCallContext,
   type SharedRuntime,
 } from "./workflow.js";
 

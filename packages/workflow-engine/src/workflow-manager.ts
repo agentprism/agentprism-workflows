@@ -35,7 +35,13 @@ import {
   type RunStatus,
 } from "./run-persistence.js";
 import { workflowHomeDir } from "./workflow-paths.js";
-import { type EngineRunResult, parseWorkflowScript, runWorkflow } from "./workflow.js";
+import {
+  type CheckpointCallContext,
+  type CheckpointOptions,
+  type EngineRunResult,
+  parseWorkflowScript,
+  runWorkflow,
+} from "./workflow.js";
 import { createWorkflowLogTail, projectWorkflowRunStatus } from "./run-observability.js";
 
 export interface ManagedRun {
@@ -120,7 +126,13 @@ export interface ExecOptions {
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
-  confirm?: (promptText: string, options: unknown) => Promise<unknown>;
+  confirm?: (
+    promptText: string,
+    options: CheckpointOptions,
+    context?: CheckpointCallContext,
+  ) => Promise<unknown>;
+  /** Called synchronously when workflow() allocates a unique child-run ordinal. */
+  onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /**
    * APPROVED script-declared custom ACP backends (`meta.backends`) for this run. The
    * composition root owns the approval decision (MCP elicitation, SDK allowScriptBackends,
@@ -533,6 +545,7 @@ export class WorkflowManager extends EventEmitter {
       concurrency,
       agentRetries,
       confirm,
+      onNestedWorkflow,
       scriptBackends,
     } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
@@ -574,6 +587,7 @@ export class WorkflowManager extends EventEmitter {
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
         confirm,
+        onNestedWorkflow,
         scriptBackends,
         loadSavedWorkflow: this.loadSavedWorkflow,
         // Manager-level `journal` events are observation, not persistence. Keep the engine's
