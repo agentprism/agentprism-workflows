@@ -12,6 +12,12 @@
 // `import(...)` type queries, which do NOT turn this file into a module. Signatures
 // mirror workflow.ts exactly (verified against the injected vm context).
 
+type AgentPrismAgentOptions = import("@automatalabs/workflow-engine").AgentOptions & {
+  /** Contractual opt-in for content-addressed mainline replay. The call may read the
+   * admitted workspace but must not create, modify, or delete persistent shared state. */
+  resume?: { filesystem: "read-only" };
+};
+
 /**
  * Run ONE subagent to completion and return its result. With `options.schema` the
  * result is the validated object; otherwise it is the assistant's final text.
@@ -23,7 +29,7 @@
  */
 declare function agent(
   prompt: string,
-  options?: import("@automatalabs/workflow-engine").AgentOptions,
+  options?: AgentPrismAgentOptions,
 ): Promise<unknown>;
 
 /**

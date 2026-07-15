@@ -21,6 +21,7 @@ import type {
   WorkflowMetaPhase,
   WorkflowRecordedError,
   WorkflowResumeCallDecision,
+  WorkflowResumeSafety,
   WorkflowRunFallback,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
@@ -38,7 +39,7 @@ import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing
 import { loadModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { projectRecordedError } from "./recorded-error.js";
 import { registerRunTripwire } from "./rejection-tripwire.js";
-import type { PreparedResume } from "./resume.js";
+import { validateResumeSafetyMarker, type PreparedResume } from "./resume.js";
 import {
   canonicalStrictJson,
   cloneFrozenStrictJson,
@@ -88,6 +89,12 @@ export interface SharedRuntime {
   depth: number;
   /** Root-run-wide workflow() invocation ordinal. Monotonic and never decremented. */
   nestedSeq: number;
+  /** Root-execution activity shared by nested workflow engines. */
+  resumeActivity?: {
+    active: number;
+    invalid: boolean;
+    onActivity?: (active: number) => void;
+  };
 }
 
 export interface WorkflowCallbackContext {
@@ -272,6 +279,13 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    */
   tier?: string;
   isolation?: "worktree";
+  /** Contractual opt-in for content-addressed mainline replay. The call may read the
+   *  admitted workspace, but must not create, modify, or delete persistent state visible
+   *  to another workflow call. When isolation:"worktree" is requested, ordinary file
+   *  edits inside a successfully-created throwaway checkout are permitted; commits and
+   *  every effect outside that checkout remain forbidden. Its result must depend only on
+   *  the admitted workspace, hashAgentCall inputs, and hashCallInputs inputs. */
+  resume?: { filesystem: "read-only" };
   /**
    * Name of a registered subagent definition (`<AGENTS_DIR>/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
@@ -511,9 +525,58 @@ export async function runWorkflow<T = unknown>(
     depth: 0,
     nestedSeq: 0,
   };
+  const resumeActivity = shared.resumeActivity ?? {
+    active: 0,
+    invalid: false,
+    onActivity: options.onResumeActivity,
+  };
+  shared.resumeActivity = resumeActivity;
   const limiter = shared.limiter;
   let nestedWorkflows = false;
   let abortSignaled = false;
+  let rootCallsAllocated = 0;
+  let realmObjectPrototype: object | undefined;
+
+  const transitionResumeActivity = (delta: 1 | -1) => {
+    const next = resumeActivity.active + delta;
+    if (!Number.isSafeInteger(next) || next < 0) {
+      resumeActivity.invalid = true;
+      return;
+    }
+    resumeActivity.active = next;
+    try {
+      resumeActivity.onActivity?.(next);
+    } catch {
+      resumeActivity.invalid = true;
+    }
+  };
+
+  const beginResumeActivity = () => transitionResumeActivity(1);
+  const observeResumeActivity = <T>(promise: Promise<T>): Promise<T> => {
+    let observed = false;
+    const settleActivity = () => {
+      if (observed) return;
+      observed = true;
+      transitionResumeActivity(-1);
+    };
+    void promise.then(settleActivity, settleActivity);
+    return promise;
+  };
+
+  const reportRootCallAllocated = (callIndex: number) => {
+    if (options.sharedRuntime) return;
+    const allocated = callIndex + 1;
+    if (allocated !== rootCallsAllocated + 1) {
+      resumeActivity.invalid = true;
+      return;
+    }
+    rootCallsAllocated = allocated;
+    try {
+      options.onResumeCallAllocated?.(allocated);
+    } catch {
+      resumeActivity.invalid = true;
+    }
+  };
 
   const log = (message: string) => {
     const text = String(message);
@@ -615,7 +678,12 @@ export async function runWorkflow<T = unknown>(
     return captured.clone;
   };
 
-  const agent = async (prompt: string, agentOptions: AgentOptions = {}) => {
+  const agentImplementation = (
+    prompt: string,
+    agentOptions: AgentOptions,
+    onAllocated: (callIndex: number) => void,
+  ): Promise<unknown> => {
+    const resumeDeclared = validateResumeDeclaration(agentOptions, realmObjectPrototype);
     throwIfAborted();
 
     // Check agent limit
@@ -731,6 +799,8 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
+    onAllocated(callIndex);
+    reportRootCallAllocated(callIndex);
 
     let settled: WorkflowCallRecord | undefined;
     const settle = (
@@ -790,12 +860,38 @@ export async function runWorkflow<T = unknown>(
         const resultSnapshot = strictSnapshot(cached.result, `agent "${label}" replayed result`, label);
         const cachedSession = cached.session ? cloneTelemetry(cached.session) : undefined;
         const cachedUsage = cached.usage ? copyValidUsage(cached.usage) : undefined;
+        const sourceCall = positionalSourceCall(options.preparedResume, callIndex, "agent", callHash);
+        const currentReplaySafety: WorkflowResumeSafety | undefined = resumeDeclared
+          ? resolvedIsolation === "worktree" && agentOptions.cwd === undefined
+            ? "isolated-worktree"
+            : resolvedIsolation === undefined
+              ? "declared-read-only"
+              : undefined
+          : undefined;
+        const sourceResumeSafety = sourceCall &&
+          validateResumeSafetyMarker(sourceCall, false) &&
+          sourceCall.resumeSafety === currentReplaySafety
+          ? sourceCall.resumeSafety
+          : undefined;
+        const logicalBudgetDebit = sourceCall ? sourceLogicalBudgetDebit(sourceCall) : undefined;
         if (cachedSession) state.agentSessions.push(cachedSession);
         settle({
           outcome: "result",
           origin: "journal-replay",
           ...(cachedUsage ? { usage: cachedUsage } : {}),
           budgetDebit: 0,
+          ...(sourceResumeSafety ? { resumeSafety: sourceResumeSafety } : {}),
+          ...(sourceCall && options.preparedResume?.strategy === "positional-v1"
+            ? {
+                replay: {
+                  sourceRunId: options.preparedResume.sourceRunId,
+                  recordedIndex: callIndex,
+                  match: "index-hash" as const,
+                  ...(logicalBudgetDebit !== undefined ? { logicalBudgetDebit } : {}),
+                  ...(sourceResumeSafety ? { sourceResumeSafety } : {}),
+                },
+              }
+            : {}),
         });
         emitAgentEnd({
           label,
@@ -806,7 +902,7 @@ export async function runWorkflow<T = unknown>(
           session: cachedSession,
           usage: cachedUsage,
         });
-        return resultSnapshot;
+        return Promise.resolve(resultSnapshot);
       } catch (error) {
         const errorRecord = projectRecordedError(error);
         const workflowError = wrapError(error, { agentLabel: label });
@@ -828,6 +924,9 @@ export async function runWorkflow<T = unknown>(
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!resumeDeclared || (resolvedIsolation === "worktree" && agentOptions.cwd !== undefined)) {
+      options.onResumeFilesystemTainted?.();
+    }
 
     return limiter(async () => {
       const maxAttempts = retryAttempts + 1;
@@ -952,8 +1051,14 @@ export async function runWorkflow<T = unknown>(
           );
         }
         if (resolvedIsolation === "worktree") {
-          worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
+          try {
+            worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
+          } catch (error) {
+            if (resumeDeclared) options.onResumeFilesystemTainted?.();
+            throw error;
+          }
           if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+          if (resumeDeclared && !worktree.isolated) options.onResumeFilesystemTainted?.();
         }
         runCwd = worktree?.isolated ? worktree.cwd : resolvePath(baseCwd, agentOptions.cwd ?? ".");
 
@@ -966,8 +1071,10 @@ export async function runWorkflow<T = unknown>(
             attemptsRan++;
             let result: unknown;
             try {
-              result = await withTimeout(
-                agentRunner.run(prompt, {
+              let rawRunnerPromise: Promise<unknown>;
+              beginResumeActivity();
+              try {
+                rawRunnerPromise = agentRunner.run(prompt, {
                   label,
                   schema: agentOptions.schema,
                   signal: attemptSignal,
@@ -1057,7 +1164,14 @@ export async function runWorkflow<T = unknown>(
                       scope: runId,
                     }));
                   },
-                } as any),
+                } as any);
+              } catch (error) {
+                transitionResumeActivity(-1);
+                throw error;
+              }
+              observeResumeActivity(rawRunnerPromise);
+              result = await withTimeout(
+                rawRunnerPromise,
                 timeout,
                 label,
                 () => {
@@ -1093,6 +1207,14 @@ export async function runWorkflow<T = unknown>(
               ...(worktree?.isolated ? { worktree: true } : {}),
               resolvedCwd: runCwd,
               budgetDebit,
+              ...(resumeDeclared && resolvedIsolation === undefined
+                ? { resumeSafety: "declared-read-only" as const }
+                : resumeDeclared &&
+                    resolvedIsolation === "worktree" &&
+                    worktree?.isolated &&
+                    agentOptions.cwd === undefined
+                  ? { resumeSafety: "isolated-worktree" as const }
+                  : {}),
               ...(slot.provenance ? { provenance: slot.provenance } : {}),
             });
             if (journaling) {
@@ -1170,6 +1292,20 @@ export async function runWorkflow<T = unknown>(
     });
   };
 
+  const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    let allocated = false;
+    let promise: Promise<unknown>;
+    try {
+      promise = agentImplementation(prompt, agentOptions, () => {
+        allocated = true;
+        beginResumeActivity();
+      });
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    return allocated ? observeResumeActivity(promise) : promise;
+  };
+
   const parallel = async (thunks: Array<() => Promise<unknown>>) => {
     throwIfAborted();
     if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
@@ -1227,13 +1363,14 @@ export async function runWorkflow<T = unknown>(
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
   // run's limiter/counters/budget so the global caps hold. One level deep only.
-  const workflowFn = async (nameOrScript: string, childArgs?: unknown) => {
+  const workflowImplementation = async (nameOrScript: string, childArgs?: unknown) => {
     throwIfAborted();
     if (shared.depth >= 1) {
       throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
         recoverable: false,
       });
     }
+    options.onResumeFilesystemTainted?.();
     const ordinal = ++shared.nestedSeq;
     const childRunId = `${runId}-nested${ordinal}`;
     nestedWorkflows = true;
@@ -1255,6 +1392,9 @@ export async function runWorkflow<T = unknown>(
         // A nested run is its own script; never reuse the parent's resume journal.
         resumeJournal: undefined,
         resumeFromRunId: undefined,
+        preparedResume: undefined,
+        onResumeCallAllocated: undefined,
+        onResumeDecision: undefined,
         runId: childRunId,
         persistLogs: false,
       });
@@ -1264,6 +1404,17 @@ export async function runWorkflow<T = unknown>(
     } finally {
       shared.depth--;
     }
+  };
+
+  const workflowFn = (nameOrScript: string, childArgs?: unknown): Promise<unknown> => {
+    beginResumeActivity();
+    let promise: Promise<unknown>;
+    try {
+      promise = workflowImplementation(nameOrScript, childArgs);
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    return observeResumeActivity(promise);
   };
 
   // ── Quality-pattern stdlib: reusable, deterministic helpers built purely on
@@ -1433,7 +1584,11 @@ export async function runWorkflow<T = unknown>(
   // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
   // whose steering is in-session only. Headless defaults remain non-blocking; authors
   // can opt into a persisted pause with headless:"pause".
-  const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
+  const checkpointImplementation = async (
+    promptText: string,
+    checkpointOptions: CheckpointOptions,
+    onAllocated: (callIndex: number) => void,
+  ) => {
     throwIfAborted();
     if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
     if (shared.agentCount >= maxAgents) {
@@ -1443,14 +1598,29 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     }
-    const callHash = hashCheckpoint(promptText, checkpointOptions);
+    const checkpointDefault = checkpointOptions.default;
+    const checkpointHeadless = checkpointOptions.headless;
+    const checkpointTimeoutMs = checkpointOptions.timeoutMs;
+    const checkpointKind = checkpointOptions.kind;
+    const checkpointChoices = checkpointOptions.choices;
+    const capturedCheckpointOptions: CheckpointOptions = {
+      ...(checkpointDefault !== undefined ? { default: checkpointDefault } : {}),
+      ...(checkpointHeadless !== undefined ? { headless: checkpointHeadless } : {}),
+      ...(checkpointKind !== undefined ? { kind: checkpointKind } : {}),
+      ...(checkpointChoices !== undefined ? { choices: checkpointChoices } : {}),
+      ...(checkpointTimeoutMs !== undefined ? { timeoutMs: checkpointTimeoutMs } : {}),
+    };
+    const callHash = hashCheckpoint(promptText, capturedCheckpointOptions);
+    const callInputsHash = hashCheckpointInputs(capturedCheckpointOptions);
     const callPath = captureCallPath(vmFilename, preludeLines);
     const callIndex = state.callSeq++;
+    onAllocated(callIndex);
+    reportRootCallAllocated(callIndex);
     let settled: WorkflowCallRecord | undefined;
     const settle = (
       terminal: Omit<
         WorkflowCallRecord,
-        "index" | "kind" | "hash" | "path" | "scope" | "settlementOrdinal"
+        "index" | "kind" | "hash" | "path" | "inputsHash" | "scope" | "settlementOrdinal"
       >,
     ): WorkflowCallRecord => {
       if (settled) return settled;
@@ -1459,6 +1629,7 @@ export async function runWorkflow<T = unknown>(
         kind: "checkpoint",
         hash: callHash,
         ...(callPath !== undefined ? { path: callPath } : {}),
+        ...(callInputsHash !== undefined ? { inputsHash: callInputsHash } : {}),
         ...terminal,
       });
       return settled;
@@ -1468,10 +1639,26 @@ export async function runWorkflow<T = unknown>(
       shared.agentCount++;
       try {
         const resultSnapshot = strictSnapshot(cached.result, `checkpoint "${promptText}" replayed reply`);
-        settle({ outcome: "result", origin: "journal-replay" });
+        const sourceCall = positionalSourceCall(options.preparedResume, callIndex, "checkpoint", callHash);
+        const checkpointHostDecision = sourceCall?.origin === "confirm" ||
+          (sourceCall?.origin === "journal-replay" && sourceCall.replay?.checkpointHostDecision === true);
+        settle({
+          outcome: "result",
+          origin: "journal-replay",
+          ...(sourceCall && options.preparedResume?.strategy === "positional-v1"
+            ? {
+                replay: {
+                  sourceRunId: options.preparedResume.sourceRunId,
+                  recordedIndex: callIndex,
+                  match: "index-hash" as const,
+                  ...(checkpointHostDecision ? { checkpointHostDecision: true as const } : {}),
+                },
+              }
+            : {}),
+        });
         const entry: WorkflowCheckpointTaken = deepFreeze({
           callIndex,
-          kind: checkpointOptions.kind ?? "confirm",
+          kind: checkpointKind ?? "confirm",
           decision: resultSnapshot,
           source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
         });
@@ -1490,19 +1677,20 @@ export async function runWorkflow<T = unknown>(
     try {
       let reply: unknown;
       if (options.confirm) {
-        reply = await options.confirm(promptText, checkpointOptions, {
+        options.onResumeFilesystemTainted?.();
+        reply = await options.confirm(promptText, capturedCheckpointOptions, {
           callIndex,
           hash: callHash,
           scope: runId,
           path: callPath,
         });
-      } else if (checkpointOptions.headless === "abort") {
+      } else if (checkpointHeadless === "abort") {
         throw new WorkflowError(
           `checkpoint "${promptText}" needs human input but none is available (headless run)`,
           WorkflowErrorCode.WORKFLOW_ABORTED,
           { recoverable: false },
         );
-      } else if (checkpointOptions.headless === "pause") {
+      } else if (checkpointHeadless === "pause") {
         throw new WorkflowError(
           `checkpoint "${promptText}" awaits a human decision`,
           WorkflowErrorCode.CHECKPOINT_REQUIRED,
@@ -1512,14 +1700,14 @@ export async function runWorkflow<T = unknown>(
               callIndex,
               hash: callHash,
               prompt: promptText,
-              kind: checkpointOptions.kind ?? "confirm",
-              ...(checkpointOptions.choices === undefined ? {} : { choices: checkpointOptions.choices }),
-              ...(checkpointOptions.default === undefined ? {} : { default: checkpointOptions.default }),
+              kind: checkpointKind ?? "confirm",
+              ...(checkpointChoices === undefined ? {} : { choices: checkpointChoices }),
+              ...(checkpointDefault === undefined ? {} : { default: checkpointDefault }),
             },
           },
         );
       } else {
-        reply = checkpointOptions.default ?? true;
+        reply = checkpointDefault ?? true;
       }
       throwIfAborted();
       const replySnapshot = strictSnapshot(reply, `checkpoint "${promptText}" reply`);
@@ -1537,7 +1725,7 @@ export async function runWorkflow<T = unknown>(
       }
       const checkpointTaken: WorkflowCheckpointTaken = deepFreeze({
         callIndex,
-        kind: checkpointOptions.kind ?? "confirm",
+        kind: checkpointKind ?? "confirm",
         decision: replySnapshot,
         source: options.confirm ? "live" : "headless-default",
       });
@@ -1554,6 +1742,20 @@ export async function runWorkflow<T = unknown>(
       });
       throw error;
     }
+  };
+
+  const checkpoint = (promptText: string, checkpointOptions: CheckpointOptions = {}): Promise<unknown> => {
+    let allocated = false;
+    let promise: Promise<unknown>;
+    try {
+      promise = checkpointImplementation(promptText, checkpointOptions, () => {
+        allocated = true;
+        beginResumeActivity();
+      });
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    return allocated ? observeResumeActivity(promise) : promise;
   };
 
   // Adopt every engine-returned promise into the SCRIPT's realm at the context boundary.
@@ -1601,6 +1803,7 @@ export async function runWorkflow<T = unknown>(
   });
 
   realmPromiseCtor = new vm.Script("Promise").runInContext(context) as PromiseConstructor;
+  realmObjectPrototype = new vm.Script("Object.prototype").runInContext(context) as object;
   const tripwire = registerRunTripwire({
     realmPromise: realmPromiseCtor,
     // Cancel in-flight agents so a zombie script (still unwinding after the run already
@@ -1974,6 +2177,73 @@ function hashCallInputs(inputs: {
   backends: unknown;
 }): string | undefined {
   return hashCanonicalStrictJson(inputs);
+}
+
+export function hashCheckpointInputs(options: CheckpointOptions): string | undefined {
+  const defaultValue = options.default;
+  const headless = options.headless;
+  const timeoutMs = options.timeoutMs;
+  return hashCanonicalStrictJson({
+    ...(defaultValue !== undefined ? { default: defaultValue } : {}),
+    ...(headless !== undefined ? { headless } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  });
+}
+
+function validateResumeDeclaration(
+  options: AgentOptions,
+  realmObjectPrototype: object | undefined,
+): boolean {
+  let present: boolean;
+  let resume: unknown;
+  try {
+    present = Reflect.has(options, "resume");
+    if (!present) return false;
+    resume = Reflect.get(options, "resume");
+    if (resume === null || typeof resume !== "object") throw new Error("not an object");
+    const prototype = Reflect.getPrototypeOf(resume);
+    if (prototype !== null && prototype !== realmObjectPrototype) throw new Error("wrong prototype");
+    const keys = Reflect.ownKeys(resume);
+    if (keys.length !== 1 || keys[0] !== "filesystem") throw new Error("invalid keys");
+    const descriptor = Reflect.getOwnPropertyDescriptor(resume, "filesystem");
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      !("value" in descriptor) ||
+      descriptor.value !== "read-only"
+    ) {
+      throw new Error("invalid filesystem declaration");
+    }
+    return true;
+  } catch {
+    throw new WorkflowError(
+      'agent options.resume must be exactly { filesystem: "read-only" }',
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+}
+
+function positionalSourceCall(
+  prepared: PreparedResume | undefined,
+  index: number,
+  kind: "agent" | "checkpoint",
+  hash: string,
+): WorkflowCallRecord | undefined {
+  if (prepared?.strategy !== "positional-v1") return undefined;
+  const source = prepared.sourceCalls.get(index);
+  return source?.index === index && source.kind === kind && source.hash === hash && source.outcome === "result"
+    ? source
+    : undefined;
+}
+
+function sourceLogicalBudgetDebit(record: WorkflowCallRecord): number | undefined {
+  const debit = record.origin === "runner"
+    ? record.budgetDebit
+    : record.origin === "journal-replay"
+      ? record.replay?.logicalBudgetDebit
+      : undefined;
+  return typeof debit === "number" && Number.isFinite(debit) && debit >= 0 ? debit : undefined;
 }
 
 /** Stable identity hash for a checkpoint() call — a cache miss on resume when anything changes. */

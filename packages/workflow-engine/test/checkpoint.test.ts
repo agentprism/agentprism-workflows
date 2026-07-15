@@ -406,11 +406,15 @@ test(
 
     assert.equal(resumedEvent, false, "an immediate re-pause does not emit resumed");
     assert.deepEqual(coldAgent.prompts, [], "no agent calls are made");
-    assert.equal(store.saves.length, saveCount, "the script was not executed and persisted state was not rewritten");
+    assert.equal(store.saves.length, saveCount + 1, "same-ID resume durably marks the positional artifact");
     assert.equal(rePaused?.reason, "checkpoint_required");
     assert.equal(rePaused?.error?.code, WorkflowErrorCode.CHECKPOINT_REQUIRED);
     assert.deepEqual(rePaused?.checkpointContext, structuredClone(first.checkpointContext));
-    assert.deepEqual(store.persistence.load(first.runId), before, "the exact paused state and context are preserved");
+    assert.deepEqual(
+      store.persistence.load(first.runId),
+      { ...before, legacyResume: true },
+      "the paused state and context are preserved with the permanent legacy marker",
+    );
   }),
 );
 

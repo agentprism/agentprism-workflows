@@ -1,0 +1,12 @@
+{
+  "resume": {
+    "format": "identity-v1",
+    "terminalEnvironment": {
+      "key": "workspace-v1"
+    }
+  },
+  "runtime": {
+    "checkpointInputsFormat": 1
+  },
+  "callsAllocated": 1
+}
