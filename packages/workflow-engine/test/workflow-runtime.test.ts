@@ -1289,8 +1289,8 @@ return { err, val }`;
   return runWorkflow(script, { agent: noopAgent, persistLogs: false });
 }
 
-test("parse-time guard rejects literal Date.now / Math.random / new Date()", async () => {
-  for (const expr of ["Math.random()", "Date.now()", "new Date()"]) {
+test("parse-time guard rejects direct Date.now / Math.random / new Date() / Date() calls", async () => {
+  for (const expr of ["Math.random()", "Date.now()", "new Date()", "Date()"]) {
     await assert.rejects(
       () =>
         runWorkflow(
@@ -1298,12 +1298,12 @@ test("parse-time guard rejects literal Date.now / Math.random / new Date()", asy
           { agent: noopAgent, persistLogs: false },
         ),
       /deterministic|unavailable/i,
-      `${expr} literal should be rejected at parse time`,
+      `${expr} should be rejected at parse time`,
     );
   }
 });
 
-test("runtime guard neuters computed-access bypasses the parse regex misses", async () => {
+test("runtime guard catches computed access and aliases outside the direct AST check", async () => {
   const r1 = await probe('Math["random"]()');
   assert.match(r1.result.err ?? "", /unavailable|resume/i, 'Math["random"]() should throw at runtime');
   const r2 = await probe('Date["now"]()');
@@ -1322,11 +1322,11 @@ test("runtime determinism: new Date(arg) and Math.max still work", async () => {
 });
 
 test("vm-realm builtins work and the constructor escape hits the neutered Date.now", async () => {
-  // The escape string is split so the parse-time regex doesn't flag it; at runtime
-  // the vm Function runs in the vm realm where Date.now is neutered.
+  // Dynamically compiled source is not a call node in the parsed workflow AST; the vm
+  // Function still runs in the vm realm where Date.now is neutered.
   const script = `export const meta = { name: 'vm', description: 'vm realm' }
 let escaped = null
-try { escaped = ({}).constructor.constructor('return Da' + 'te.now()')() } catch (e) { escaped = 'blocked:' + String((e && e.message) || e) }
+try { escaped = ({}).constructor.constructor('return Date.now()')() } catch (e) { escaped = 'blocked:' + String((e && e.message) || e) }
 const arr = [1, 2, 3].map((x) => x * 2)
 const j = JSON.stringify({ a: 1 })
 const s = [...new Set([1, 1, 2])]

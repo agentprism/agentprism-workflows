@@ -293,7 +293,7 @@ Runs are journaled: every `agent()` and `checkpoint()` result is recorded under 
 
 > **Resume rule:** `args` changes don't invalidate the journal; prompt changes cache-miss from the first changed call.
 
-- `Date.now()`, `Math.random()`, and no-arg `new Date()` throw inside the realm (`new Date(isoString)` is fine). Need a timestamp or random seed? Pass it through `args`.
+- Direct `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()` calls fail static validation. The realm also blocks aliased or computed forms at runtime (`new Date(isoString)` is fine). Need a timestamp or random seed? Pass it through `args`.
 - An `agent()` replay identity hashes the prompt, resolved `model`, `mode` when set, `configOptions` when non-empty (with sorted keys), `tier`, `phase`, `agentType`, the resolved agent definition, and `schema`. An omitted or empty config bag preserves existing hash bytes. The resolved definition covers its tool allowlist/denylist, model, isolation, and body prompt, so editing an agent definition invalidates calls that use it.
 - `args` is not hashed directly. If new args only raise a loop cap, earlier calls with the same prompts and other identity fields replay. If new args change a prompt, model selection, phase, schema, call order, or another hashed field, the first affected call is a miss.
 - Resume uses the longest unchanged prefix: the first changed or new call and every later call run live. This prevents an unchanged-looking downstream call from reusing a result produced from stale upstream state.
@@ -482,7 +482,7 @@ The SDK ships a validator that costs **zero tokens** — always run it on a scri
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 ```
 
-It does three passes: a **static parse** (the `meta` literal, syntax, the determinism blocklist), a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results — then one no-prompt session on each distinct routed ACP harness. The last pass spends no tokens and surfaces each harness's full advertised config-options table in the human and JSON reports every time. Read that table before picking `configOptions` values. Unknown ids, bad select values, non-boolean boolean values, and the reserved `"model"` key fail validation with the call label, authored value, and advertised alternatives. If a harness cannot spawn or authenticate, validation emits one warning, marks it `probed:false`, skips only its checks, and stays valid; this is the offline degradation behavior. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
+It does three passes: a **static parse** (the `meta` literal, syntax, and direct nondeterministic call expressions), a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results — then one no-prompt session on each distinct routed ACP harness. The last pass spends no tokens and surfaces each harness's full advertised config-options table in the human and JSON reports every time. Read that table before picking `configOptions` values. Unknown ids, bad select values, non-boolean boolean values, and the reserved `"model"` key fail validation with the call label, authored value, and advertised alternatives. If a harness cannot spawn or authenticate, validation emits one warning, marks it `probed:false`, skips only its checks, and stays valid; this is the offline degradation behavior. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
 
 The default fabricator returns `true` for every boolean. Do not accept that all-true path as proof
 that a convergence loop works: script its control labels with `--mock-answers` or a reusable
@@ -497,7 +497,7 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 ## Pre-flight checklist
 
 - [ ] `export const meta = { name, description }` is the first statement, a pure literal.
-- [ ] No `Date.now()` / `Math.random()` / no-arg `new Date()`; no imports, no Node APIs — timestamps and randomness come in through `args`.
+- [ ] No `Date.now()` / `Math.random()` / no-arg `new Date()` / `Date()`; no imports, no Node APIs — timestamps and randomness come in through `args`.
 - [ ] Every `parallel` element is a **thunk**; results are `.filter(Boolean)`-ed or null-checked.
 - [ ] Every agent prompt is self-contained — prior results interpolated in, no "as discussed above".
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.

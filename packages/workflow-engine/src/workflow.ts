@@ -365,9 +365,6 @@ interface RuntimeState {
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
-// Parse-time author hint (fast feedback). The real enforcement is DETERMINISM_PRELUDE.
-const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\s+Date\s*\(\s*\)/;
-
 /**
  * Runtime determinism hardening, run inside the vm realm BEFORE the user script.
  * It neuters the nondeterministic builtins that would break resume (they'd make a
@@ -1654,21 +1651,28 @@ function sameFallback(left: WorkflowRunFallback, right: WorkflowRunFallback): bo
 }
 
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
-  if (DETERMINISM_BLOCKLIST.test(script)) {
-    throw new WorkflowError(
-      "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable",
-      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-      { recoverable: false },
-    );
-  }
-
   const ast = parse(script, {
     ecmaVersion: "latest",
     sourceType: "module",
     allowAwaitOutsideFunction: true,
     allowReturnOutsideFunction: true,
+    locations: true,
     ranges: false,
   }) as AnyNode;
+
+  // This direct-syntax check provides fast author feedback without chasing aliases.
+  // DETERMINISM_PRELUDE remains the authoritative runtime enforcement for aliases,
+  // computed access, and other forms that intentionally stay outside this AST check.
+  const violation = findDeterminismViolation(ast);
+  if (violation) {
+    const start = violation.node.loc?.start;
+    const location = start ? ` at line ${start.line}, column ${start.column + 1}` : "";
+    throw new WorkflowError(
+      `Workflow scripts must be deterministic: ${violation.api} is unavailable${location}`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
 
   const first = ast.body?.[0] as AnyNode | undefined;
   if (first?.type !== "ExportNamedDeclaration") {
@@ -1713,6 +1717,58 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     meta,
     body: script.slice(0, first.start) + script.slice(first.end),
   };
+}
+
+function findDeterminismViolation(ast: AnyNode): { api: string; node: AnyNode } | undefined {
+  const pending = [ast];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    const api = nondeterministicApi(node);
+    if (api) return { api, node };
+
+    const children: AnyNode[] = [];
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (item && typeof item === "object" && typeof (item as AnyNode).type === "string") {
+            children.push(item as AnyNode);
+          }
+        }
+      } else if (value && typeof value === "object" && typeof (value as AnyNode).type === "string") {
+        children.push(value as AnyNode);
+      }
+    }
+    for (let index = children.length - 1; index >= 0; index--) pending.push(children[index]);
+  }
+  return undefined;
+}
+
+function nondeterministicApi(node: AnyNode): string | undefined {
+  if (
+    (node.type === "CallExpression" || node.type === "NewExpression") &&
+    node.arguments.length === 0 &&
+    node.callee?.type === "Identifier" &&
+    node.callee.name === "Date"
+  ) {
+    return node.type === "NewExpression" ? "new Date()" : "Date()";
+  }
+  if (node.type !== "CallExpression" || node.callee?.type !== "MemberExpression" || node.callee.computed) {
+    return undefined;
+  }
+  const object = node.callee.object as AnyNode;
+  const property = node.callee.property as AnyNode;
+  if (object.type === "Identifier" && object.name === "Date" && property.type === "Identifier" && property.name === "now") {
+    return "Date.now()";
+  }
+  if (
+    object.type === "Identifier" &&
+    object.name === "Math" &&
+    property.type === "Identifier" &&
+    property.name === "random"
+  ) {
+    return "Math.random()";
+  }
+  return undefined;
 }
 
 function evaluateLiteral(node: AnyNode, path: string): unknown {

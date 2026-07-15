@@ -4,9 +4,9 @@
 //   agentprism-workflows validate <workflow-file> [options]
 //
 // Validates a workflow script without spending tokens: static parse (meta literal,
-// syntax, determinism blocklist), then a dry run over an in-process mock AgentRunner
-// that fabricates schema-conforming results, then one no-prompt option probe per routed
-// ACP harness. See
+// syntax, direct nondeterministic call expressions), then a dry run over an in-process
+// mock AgentRunner that fabricates schema-conforming results, then one no-prompt option
+// probe per routed ACP harness. See
 // ./validate.ts for the programmatic API (`validateWorkflowScript`).
 
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -18,7 +18,8 @@ import type { ValidateWorkflowOptions } from "./validate.js";
 const USAGE = `Usage: agentprism-workflows validate <workflow-file-or-name> [options]
 
 Validates an AgentPrism workflow script without spending tokens:
-  1. static parse — the meta literal, syntax, and the determinism blocklist
+  1. static parse — the meta literal, syntax, and direct nondeterministic call
+     expressions
   2. dry run — the script executes against a mock agent backend that fabricates
      schema-conforming results; no tokens are spent, and a mock live confirm
      resolves checkpoints to their declared defaults

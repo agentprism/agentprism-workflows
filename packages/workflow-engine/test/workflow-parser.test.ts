@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { parseWorkflowScript } from "../src/workflow.js";
 
 const validScript = `export const meta = {
@@ -169,17 +170,32 @@ test("parseWorkflowScript still parses a removed/unknown meta field (e.g. whenTo
   assert.equal(parsed.meta.name, "demo");
 });
 
-test("parseWorkflowScript rejects nondeterministic APIs", () => {
-  assert.throws(
-    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }\nreturn Date.now()"),
-    /must be deterministic/,
-  );
-  assert.throws(
-    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }\nreturn Math.random()"),
-    /must be deterministic/,
-  );
-  assert.throws(
-    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }\nreturn new Date()"),
-    /must be deterministic/,
-  );
+test("parseWorkflowScript accepts nondeterministic API names in non-executable text", () => {
+  const parsed = parseWorkflowScript(`export const meta = {
+  name: 'migration-notes',
+  description: 'Replace Math.random() with seeded RNG',
+}
+// migrate new Date() usages
+const guidance = \`Document Date.now(), Math.random(), and new Date() before editing\`
+await agent('Find and replace Date.now() calls', { label: 'migrate' })
+return "migrate new Date() usages"
+`);
+
+  assert.equal(parsed.meta.description, "Replace Math.random() with seeded RNG");
+  assert.match(parsed.body, /Find and replace Date\.now\(\) calls/);
+});
+
+test("parseWorkflowScript rejects direct nondeterministic calls with their API and location", () => {
+  for (const api of ["Date.now()", "Math.random()", "new Date()", "Date()"]) {
+    assert.throws(
+      () => parseWorkflowScript(`export const meta = { name: 'demo', description: 'desc' }\nreturn ${api}`),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.ok(error.message.includes(api), `${api} should be named in the validation error`);
+        assert.match(error.message, /line 2, column 8/);
+        return true;
+      },
+    );
+  }
 });
