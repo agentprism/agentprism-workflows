@@ -109,6 +109,27 @@ export {
   isAuthRequired,
 } from "@automatalabs/workflow-engine";
 
+// ── Durable run-event read/tail seam: the append/read/watch API over the per-run
+//    `<runId>.events.jsonl` sidecar, its error taxonomy, and the read caps (§2.10). A host
+//    attaches to a run's structured event log through these — and `withRunEvents` upgrades a
+//    custom RunPersistence into the seam — without reaching into package internals. ──
+export {
+  withRunEvents,
+  RunEventLogError,
+  RUN_EVENT_READ_LIMIT_DEFAULT,
+  RUN_EVENT_READ_LIMIT_MAX,
+  RUN_EVENT_MAX_RECORD_BYTES,
+} from "@automatalabs/workflow-engine";
+export type {
+  RunEventPersistence,
+  RunEventStream,
+  AppendRunEventInput,
+  ReadRunEventsOptions,
+  ReadRunEventsResult,
+  WatchRunEventsOptions,
+  RunEventLogErrorCode,
+} from "@automatalabs/workflow-engine";
+
 // ── ACP backend: the default AgentRunner implementation, interactive sessions, backend
 //    selection, the concrete backends (built-in + custom registry), the pool/runner options,
 //    capability helpers, client handlers, permission resolvers, and JSON-Schema helpers.
@@ -295,6 +316,25 @@ export type {
   JournalEntry,
   WorkflowBackendConfig,
   WorkflowMeta,
+} from "@automatalabs/shared-types";
+
+// ── Shared durable run-event contract: the live/persisted event unions, the engine
+//    event name/payload maps, and the bounded persisted projections (§2.2, §2.5). Re-exported
+//    through the facade so SDK consumers type a durable-log reader without reaching past the SDK
+//    (the ACP-specialized agentEvent branch is bound below as WorkflowAgentEvent/WorkflowRunEvent). ──
+export { RUN_EVENT_LOG_VERSION } from "@automatalabs/shared-types";
+export type {
+  RunEvent,
+  EngineRunEvent,
+  EngineRunEventName,
+  EngineRunEventPayloadMap,
+  PersistableEngineRunEvent,
+  PersistedRunEvent,
+  RunEventLogRecord,
+  RunEventValueProjection,
+  RunEventErrorProjection,
+  RunEventCheckpointProjection,
+  PersistedRunAgentEndPayload,
 } from "@automatalabs/shared-types";
 
 /** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */

@@ -3,7 +3,12 @@ import { existsSync, mkdtempSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentRunner, EngineRunEventPayloadMap } from "@automatalabs/shared-types";
+import type {
+  AgentRunner,
+  EngineRunEventName,
+  EngineRunEventPayloadMap,
+} from "@automatalabs/shared-types";
+import { WorkflowError, WorkflowErrorCode, type AuthErrorContext } from "../src/errors.js";
 import { RunEventLogError } from "../src/run-event-persistence.js";
 import {
   createRunPersistence,
@@ -420,6 +425,199 @@ test("deleting a running managed run prevents every later callback from recreati
     assert.equal((await background.promise).status, "completed");
     assert.equal(manager.getPersistence().load(background.runId), null);
     assert.equal(existsSync(eventPath), false);
+  });
+});
+
+const EXECUTION_EVENT_NAMES = [
+  "log",
+  "phase",
+  "agentStart",
+  "agentEnd",
+  "agentHistory",
+  "tokenUsage",
+  "journal",
+  "callRecord",
+  "complete",
+] as const satisfies readonly EngineRunEventName[];
+
+// The EXACT live payload key set the manager emits for each of the 13 §2.2 engine event names.
+// Keys are copied by `Object.assign({ type }, payload)`, so a key present in the emission literal
+// counts even when its value is undefined. Every array is pre-sorted to match Object.keys(...).sort().
+const EXPECTED_EVENT_KEYS: Record<string, string[]> = {
+  log: ["message", "runId", "scope"],
+  phase: ["runId", "scope", "title"],
+  agentStart: ["callIndex", "configOptions", "label", "model", "phase", "prompt", "runId", "scope"],
+  agentEnd: [
+    "backendId", "callIndex", "label", "model", "modelFallbacks", "modelResolved", "phase",
+    "provenance", "result", "runId", "scope", "session", "tokens", "usage", "worktree",
+  ],
+  agentHistory: ["callIndex", "history", "label", "phase", "runId", "scope"],
+  tokenUsage: ["runId", "scope", "usage"],
+  journal: ["entry", "runId", "scope"],
+  callRecord: ["record", "runId", "scope"],
+  complete: ["result", "runId", "scope"],
+  paused: ["runId", "scope"],
+  error: ["error", "errorRecord", "runId", "scope"],
+  stopped: ["runId", "scope"],
+  resumed: ["runId", "scope"],
+};
+
+function captureEventKeys(
+  manager: WorkflowManager,
+  names: readonly EngineRunEventName[],
+): Map<string, string[]> {
+  const seen = new Map<string, string[]>();
+  for (const name of names) {
+    manager.on(name, (payload) => {
+      if (!seen.has(name)) seen.set(name, Object.keys(payload as object).sort());
+    });
+  }
+  return seen;
+}
+
+test("each manager event carries exactly its §2.2 payload key set", async () => {
+  await withPersistenceDirs(async ({ cwd, root }) => {
+    // Scenario 1 — a successful agent run drives the nine execution/lifecycle events. The runner
+    // reports usage (→ tokenUsage and agentEnd.usage) and history (→ agentHistory).
+    const historyRunner: AgentRunner = {
+      async run(_prompt, options) {
+        options?.onUsage?.({ input: 3, output: 5, cacheRead: 0, cacheWrite: 0, total: 8, cost: 0 });
+        options?.onHistory?.([{ role: "assistant", kind: "text", text: "did the work" }]);
+        return "work-result";
+      },
+    };
+    const okManager = new WorkflowManager({ cwd, persistenceRoot: root, agent: historyRunner });
+    const execKeys = captureEventKeys(okManager, EXECUTION_EVENT_NAMES);
+    const okResult = await okManager.runSync(
+      script(`phase('Build')\nlog('note')\nreturn await agent('work', { label: 'work' })`, "exec-events"),
+    );
+    assert.equal(okResult.status, "completed");
+
+    // Scenario 2 — a thrown fault drives the listener-gated error event.
+    const errorManager = new WorkflowManager({ cwd, persistenceRoot: root, agent: { async run() { return "unused"; } } });
+    const errorKeys = captureEventKeys(errorManager, ["error"]);
+    const failed = await errorManager.runSync(script(`throw new Error('boom')`, "error-events"));
+    assert.equal(failed.status, "failed");
+
+    // Scenario 3 — a manual pause, then a warm stop of that same paused run.
+    const entered = deferred<void>();
+    const holdManager = new WorkflowManager({
+      cwd,
+      persistenceRoot: root,
+      agent: {
+        async run(_prompt, options) {
+          entered.resolve();
+          return await new Promise((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+          });
+        },
+      },
+    });
+    const pauseStopKeys = captureEventKeys(holdManager, ["paused", "stopped"]);
+    const background = holdManager.startInBackground(script(`return await agent('hold', { label: 'hold' })`, "hold-events"));
+    await entered.promise;
+    assert.equal(holdManager.pause(background.runId), true);
+    await assert.rejects(background.promise);
+    assert.equal(holdManager.stop(background.runId), true);
+
+    // Scenario 4 — resume a usage-limit-paused run so a fresh manager emits resumed.
+    const pausingManager = new WorkflowManager({
+      cwd,
+      persistenceRoot: root,
+      agent: {
+        async run() {
+          throw new WorkflowError("usage exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, { recoverable: false });
+        },
+      },
+    });
+    const pausedRun = await pausingManager.runSync(
+      script(`return await agent('resume-me', { label: 'resume-me' })`, "resume-events"),
+    );
+    assert.equal(pausedRun.status, "paused");
+    const resumeManager = new WorkflowManager({ cwd, persistenceRoot: root, agent: { async run() { return "recovered"; } } });
+    const resumeKeys = captureEventKeys(resumeManager, ["resumed"]);
+    const resumed = await resumeManager.resumeInBackground(pausedRun.runId);
+    assert.equal(resumed.accepted, true);
+    if (!resumed.accepted) assert.fail("usage-limit resume should be accepted");
+    await resumed.promise;
+
+    // Each of the 13 §2.2 engine event names carries exactly its frozen payload key set.
+    const actual = new Map<string, string[]>([...execKeys, ...errorKeys, ...pauseStopKeys, ...resumeKeys]);
+    for (const [name, expected] of Object.entries(EXPECTED_EVENT_KEYS)) {
+      assert.deepEqual(actual.get(name), expected, `event ${name} payload keys`);
+    }
+  });
+});
+
+test("automatic usage_limit and auth_required settlements carry reason + errorRecord on live and persisted surfaces", async () => {
+  await withPersistenceDirs(async ({ cwd, root }) => {
+    // usage_limit — the live paused payload carries reason + errorRecord + resetHint (and no
+    // authContext); the persisted record projects the same and drops the raw WorkflowError.
+    const usageManager = new WorkflowManager({
+      cwd,
+      persistenceRoot: root,
+      agent: {
+        async run() {
+          throw new WorkflowError("quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "retry after 17:00 UTC",
+          });
+        },
+      },
+    });
+    let liveUsage: EngineRunEventPayloadMap["paused"] | undefined;
+    usageManager.on("paused", (payload) => {
+      liveUsage = payload;
+    });
+    const usageResult = await usageManager.runSync(script(`return await agent('x', { label: 'x' })`, "usage-limit-events"));
+    assert.equal(usageResult.status, "paused");
+
+    if (!liveUsage || liveUsage.reason !== "usage_limit") assert.fail("live usage-limit pause missing reason");
+    assert.equal(liveUsage.resetHint, "retry after 17:00 UTC");
+    assert.equal(liveUsage.errorRecord.form, "workflow-error");
+    assert.equal(liveUsage.errorRecord.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+    assert.equal("authContext" in liveUsage, false);
+
+    const usagePersisted = usageManager.getPersistence().readEvents(usageResult.runId, { limit: 1_000 }).events.at(-1)?.event;
+    if (usagePersisted?.type !== "paused" || usagePersisted.reason !== "usage_limit") assert.fail("persisted usage-limit pause missing reason");
+    assert.equal(usagePersisted.resetHint, "retry after 17:00 UTC");
+    assert.equal(usagePersisted.errorRecord.form, "workflow-error");
+    assert.equal(usagePersisted.errorRecord.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+    assert.equal("error" in usagePersisted, false);
+
+    // auth_required — live and persisted carry reason + errorRecord + authContext (and no resetHint).
+    const authContext: AuthErrorContext = {
+      backendId: "claude",
+      methods: [{ id: "oauth", type: "agent", name: "Sign in" }],
+    };
+    const authManager = new WorkflowManager({
+      cwd,
+      persistenceRoot: root,
+      agent: {
+        async run() {
+          throw new WorkflowError("auth needed", WorkflowErrorCode.AUTH_REQUIRED, { recoverable: false, authContext });
+        },
+      },
+    });
+    let liveAuth: EngineRunEventPayloadMap["paused"] | undefined;
+    authManager.on("paused", (payload) => {
+      liveAuth = payload;
+    });
+    const authResult = await authManager.runSync(script(`return await agent('y', { label: 'y' })`, "auth-required-events"));
+    assert.equal(authResult.status, "paused");
+
+    if (!liveAuth || liveAuth.reason !== "auth_required") assert.fail("live auth pause missing reason");
+    assert.deepEqual(liveAuth.authContext, authContext);
+    assert.equal(liveAuth.errorRecord.form, "workflow-error");
+    assert.equal(liveAuth.errorRecord.code, WorkflowErrorCode.AUTH_REQUIRED);
+    assert.equal("resetHint" in liveAuth, false);
+
+    const authPersisted = authManager.getPersistence().readEvents(authResult.runId, { limit: 1_000 }).events.at(-1)?.event;
+    if (authPersisted?.type !== "paused" || authPersisted.reason !== "auth_required") assert.fail("persisted auth pause missing reason");
+    assert.deepEqual(authPersisted.authContext, authContext);
+    assert.equal(authPersisted.errorRecord.form, "workflow-error");
+    assert.equal(authPersisted.errorRecord.code, WorkflowErrorCode.AUTH_REQUIRED);
+    assert.equal("error" in authPersisted, false);
   });
 });
 

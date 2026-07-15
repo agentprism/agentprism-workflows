@@ -6,7 +6,9 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -544,6 +546,58 @@ test(
     assert.equal(persistence.delete(runId), true);
     assert.throws(() => statSync(eventPath(runId)), (error) => (error as { code?: string }).code === "ENOENT");
   }),
+);
+
+test(
+  "list() surfaces the snapshot run but never its .events.jsonl sidecar",
+  withPersistence(({ persistence, eventPath }) => {
+    const runId = "sidecar-excluded";
+    persistence.save(state(runId));
+    persistence.appendEvent(runId, { seq: 1, timestamp: TIMESTAMP, event: stopped(runId) });
+
+    // The sidecar is genuinely on disk beside the snapshot.
+    assert.equal(statSync(eventPath(runId)).isFile(), true);
+    assert.equal(readdirSync(persistence.getRunsDir()).includes(`${runId}.events.jsonl`), true);
+
+    // list() reads the directory back through the public API. The implementation filters on
+    // `.endsWith(".json")`, which the `.jsonl` sidecar fails, so exactly the snapshot run appears
+    // and no phantom entry is minted from the sidecar file name.
+    const listed = persistence.list();
+    assert.deepEqual(listed.map((snapshot) => snapshot.runId), [runId]);
+    assert.equal(
+      listed.some((snapshot) => snapshot.runId.endsWith(".events") || snapshot.runId.endsWith(".jsonl")),
+      false,
+    );
+  }),
+);
+
+// A COMPLETE legacy `FsLayer` value: every pre-existing member and NONE of the six hooks
+// (openSync/writeSync/closeSync/truncateSync/statSync/watch) added for the event sidecar. It must
+// still satisfy `FsLayer` — the new members are optional — so a pre-contract override annotated as
+// `FsLayer` stays source-compatible; making them required would be a type-level breaking change.
+const legacyFsLayer: FsLayer = {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+};
+
+test(
+  "a complete legacy FsLayer omitting the six new hooks compiles and falls back to node:fs",
+  withPersistence(({ persistence, eventPath }) => {
+    const runId = "legacy-fslayer";
+    persistence.save(state(runId));
+    // append/read exercise openSync/writeSync/closeSync/statSync — none supplied by legacyFsLayer,
+    // so the factory's node:fs fallback carries the verified append and the cursor read.
+    const record = persistence.appendEvent(runId, { seq: 1, timestamp: TIMESTAMP, event: stopped(runId) });
+    assert.equal(record.seq, 1);
+    assert.equal(statSync(eventPath(runId)).isFile(), true);
+    const page = persistence.readEvents(runId);
+    assert.deepEqual(page.events.map((entry) => entry.seq), [1]);
+  }, legacyFsLayer),
 );
 
 {
