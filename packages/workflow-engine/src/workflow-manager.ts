@@ -203,6 +203,12 @@ export interface ExecOptions {
   /** Durable-checkpoint answer channel: pending checkpoint call index to the host's decision. */
   checkpointReplies?: Record<number, unknown>;
   /**
+   * Optional host admission latch. Initialization and the first persisted save complete before
+   * startInBackground returns, but workflow VM evaluation waits for this decision. A denied
+   * admission settles through the normal abort/error path without evaluating authored code.
+   */
+  executionAdmission?: Promise<"admitted" | "denied">;
+  /**
    * Whether THIS run writes/reads the engine persistence journal. Default is the
    * manager setting. When false, no run-state/log files are written and resume
    * rejects with "journaling disabled for this run".
@@ -634,6 +640,11 @@ export class WorkflowManager extends EventEmitter {
     managed.resumeReportPlan = this.reportPlan(admission);
     managed.resumeDecisions = new Map();
     managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
+    managed.resumeSeed = deepFreeze({
+      format: "identity-v1",
+      sourceRunId: admission.sourceRunId,
+      candidates: [],
+    });
 
     if (admission.strategy === "identity-v1") {
       managed.resumeSeed = admission.seed;
@@ -1089,6 +1100,13 @@ export class WorkflowManager extends EventEmitter {
       else hostSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
     }
     try {
+      if (exec.executionAdmission && await exec.executionAdmission !== "admitted") {
+        throw new WorkflowError(
+          "workflow execution was denied because host admission did not become durable",
+          WorkflowErrorCode.PERSISTENCE_ERROR,
+          { recoverable: false },
+        );
+      }
       if (!managed.journaling && resumeJournal) {
         throw new WorkflowError("journaling disabled for this run", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
           recoverable: false,
@@ -1512,12 +1530,11 @@ export class WorkflowManager extends EventEmitter {
           return row !== undefined && entry.kind === row.kind && entry.hash === row.hash;
         }),
       );
-      if (managed.status === "completed") {
-        managed.resumeSeed = undefined;
-      } else if (managed.resumeSeed) {
+      if (managed.status === "completed" && managed.resumeSeed) {
         managed.resumeSeed = deepFreeze({
-          ...managed.resumeSeed,
-          sourceRunId: managed.runId,
+          format: "identity-v1",
+          sourceRunId: managed.resumeSeed.sourceRunId,
+          candidates: [],
         });
       }
       if (managed.resumeSeed?.checkpointInjections) {

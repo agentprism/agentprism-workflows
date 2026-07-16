@@ -97,8 +97,8 @@ export interface PersistedCheckpointInjection {
 
 export interface PersistedResumeSeed {
   format: "identity-v1";
-  /** Immediate run named by resumeFromRunId; individual candidates may originate in an
-   *  older hop and retain that run ID themselves. */
+  /** Immediate run named by resumeFromRunId. This engine-owned ancestry pointer remains
+   *  stable for the record's lifetime; individual candidates may originate in older hops. */
   sourceRunId: string;
   candidates: PersistedResumeCandidate[];
   checkpointInjections?: PersistedCheckpointInjection[];
@@ -322,8 +322,6 @@ export function createRunPersistence(
   };
 
   const lineageSourceRunId = (state: PersistedRunState): string | undefined => {
-    const reportSource = state.resumeReport?.sourceRunId;
-    if (reportSource) return reportSource;
     const seedSource = state.resumeSeed?.sourceRunId;
     return seedSource === state.runId ? undefined : seedSource;
   };

@@ -519,13 +519,13 @@ function validateInjection(value: unknown): PersistedCheckpointInjection | undef
   return strictClone(value as unknown as PersistedCheckpointInjection);
 }
 
-function validateSeed(source: PersistedRunState, sourceRunId: string): ValidatedSeed | undefined {
+function validateSeed(source: PersistedRunState): ValidatedSeed | undefined {
   if (source.resumeSeed === undefined) return { candidates: [], injections: [] };
   const seed = source.resumeSeed as unknown;
   if (
     !isRecord(seed) ||
     seed.format !== "identity-v1" ||
-    seed.sourceRunId !== sourceRunId ||
+    !isNonEmptyString(seed.sourceRunId) ||
     !Array.isArray(seed.candidates) ||
     (seed.checkpointInjections !== undefined && !Array.isArray(seed.checkpointInjections))
   ) {
@@ -814,7 +814,7 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   if (!manifest.calls.every(validateCallFacts)) {
     return liveDecision(sourceRunId, requestedPolicy, "manifest-invalid");
   }
-  const retained = validateSeed(source, sourceRunId);
+  const retained = validateSeed(source);
   if (!retained) return liveDecision(sourceRunId, requestedPolicy, "resume-seed-invalid");
   const preparedInjection = pendingInjection(source, manifest.calls, retained, reply);
   if (!preparedInjection.valid) return liveDecision(sourceRunId, requestedPolicy, "manifest-invalid");

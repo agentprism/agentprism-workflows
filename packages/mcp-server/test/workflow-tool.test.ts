@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
+import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation";
 import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
+
+import { workflowToolOutputShape } from "../src/workflow-tool-output.js";
 
 import {
   connect,
@@ -17,6 +21,70 @@ import {
 /** Read a nested field off an unknown object without `as any`. */
 function field(value: unknown, key: string): unknown {
   return value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
+}
+
+function inspectionFixture(status: "running" | "completed" | "aborted" = "running") {
+  return {
+    runId: "fixture-run",
+    status,
+    scriptUri: "workflow://runs/fixture-run/script",
+    workflowName: "fixture",
+    phases: [],
+    logTail: {
+      lines: [],
+      totalLines: 0,
+      omittedLines: 0,
+      truncatedLines: 0,
+      redactedLines: 0,
+    },
+    calls: [],
+    filter: { lastN: 10, logLines: 20 },
+    truncation: {
+      maxStructuredBytes: 24_576,
+      byteCapApplied: false,
+      phases: { total: 0, returned: 0, shortened: 0 },
+      logs: { total: 0, returned: 0, shortened: 0, redacted: 0 },
+      calls: { total: 0, matched: 0, returned: 0, shortenedResults: 0, redactedResults: 0 },
+    },
+    lineage: [
+      { runId: "fixture-run", uri: "workflow://runs/fixture-run/script", available: true },
+    ],
+  };
+}
+
+const terminalOutcomeFixture = {
+  runId: "fixture-run",
+  status: "completed" as const,
+  scriptUri: "workflow://runs/fixture-run/script",
+};
+
+function outputVariantFixtures() {
+  const inspection = inspectionFixture();
+  const terminalAwait = {
+    ...inspectionFixture("completed"),
+    wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "terminal" as const },
+    outcome: terminalOutcomeFixture,
+  };
+  const nonterminalAwait = {
+    ...inspection,
+    wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "timeout" as const },
+  };
+  const stop = {
+    ...inspectionFixture("aborted"),
+    stopped: true,
+    alreadyTerminal: false,
+  };
+  const background = {
+    runId: "fixture-run",
+    status: "running" as const,
+    scriptSource: "inline" as const,
+    scriptUri: "workflow://runs/fixture-run/script",
+  };
+  const execution = {
+    ...terminalOutcomeFixture,
+    scriptSource: "inline" as const,
+  };
+  return { execution, background, inspection, terminalAwait, nonterminalAwait, stop };
 }
 
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
@@ -88,6 +156,47 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     ]);
     const outcome = field(field(tool.outputSchema, "properties"), "outcome");
     assert.deepEqual(field(outcome, "required"), ["runId", "status", "scriptUri"]);
+  } finally {
+    await dispose();
+  }
+});
+
+test("runtime and advertised output schemas enforce exact result branches", async () => {
+  const fixtures = outputVariantFixtures();
+  for (const [name, fixture] of Object.entries(fixtures)) {
+    assert.equal(workflowToolOutputShape.safeParse(fixture).success, true, `${name} runtime fixture`);
+  }
+
+  const invalid = {
+    "background with execution logs": { ...fixtures.background, logs: [] },
+    "background with await outcome": { ...fixtures.background, outcome: terminalOutcomeFixture },
+    "inspection with execution result": { ...fixtures.inspection, result: 42 },
+    "inspection with await outcome": { ...fixtures.inspection, outcome: terminalOutcomeFixture },
+    "stop with execution logs": { ...fixtures.stop, logs: [] },
+    "stop with await outcome": { ...fixtures.stop, outcome: terminalOutcomeFixture },
+    "terminal await without outcome": (() => {
+      const { outcome: _outcome, ...withoutOutcome } = fixtures.terminalAwait;
+      return withoutOutcome;
+    })(),
+    "nonterminal await with outcome": { ...fixtures.nonterminalAwait, outcome: terminalOutcomeFixture },
+  };
+  for (const [name, fixture] of Object.entries(invalid)) {
+    assert.equal(workflowToolOutputShape.safeParse(fixture).success, false, `${name} runtime rejection`);
+  }
+
+  const { client, dispose } = await connect(okRunner(), { listTools: true });
+  try {
+    const workflow = (await client.listTools()).tools.find((tool) => tool.name === "workflow");
+    assert.ok(workflow?.outputSchema);
+    const validate = new AjvJsonSchemaValidator().getValidator(
+      workflow.outputSchema as JsonSchemaType,
+    );
+    for (const [name, fixture] of Object.entries(fixtures)) {
+      assert.equal(validate(fixture).valid, true, `${name} advertised-schema fixture`);
+    }
+    for (const [name, fixture] of Object.entries(invalid)) {
+      assert.equal(validate(fixture).valid, false, `${name} advertised-schema rejection`);
+    }
   } finally {
     await dispose();
   }

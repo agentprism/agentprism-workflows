@@ -34,7 +34,7 @@ import type {
   WorkflowRunStatus,
   WorkflowResumeReport,
 } from "@automatalabs/workflows";
-import type { AgentRunner, RunOptions, TokenUsage } from "@automatalabs/shared-types";
+import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import {
@@ -63,32 +63,25 @@ export const MAX_BACKGROUND_RUNS = 4;
 
 const TERMINAL_STATUSES = new Set(["paused", "completed", "failed", "aborted"]);
 
-interface AdmissionExecutionGate {
-  runner: AgentRunner;
+interface ExecutionAdmissionLatch {
+  decision: Promise<"admitted" | "denied">;
   admit(): void;
   deny(): void;
 }
 
-function createAdmissionExecutionGate(delegate: AgentRunner): AdmissionExecutionGate {
+function createExecutionAdmissionLatch(): ExecutionAdmissionLatch {
   let decision: "admitted" | "denied" | undefined;
-  let release!: () => void;
-  const decided = new Promise<void>((resolve) => {
+  let release!: (decision: "admitted" | "denied") => void;
+  const decided = new Promise<"admitted" | "denied">((resolve) => {
     release = resolve;
   });
-  const run = async (prompt: string, options?: RunOptions): Promise<unknown> => {
-    await decided;
-    if (decision !== "admitted") {
-      throw new Error("Workflow execution was denied because admission did not become durable");
-    }
-    return delegate.run(prompt, options);
-  };
   const settle = (next: "admitted" | "denied") => {
     if (decision !== undefined) return;
     decision = next;
-    release();
+    release(next);
   };
   return {
-    runner: { run } as AgentRunner,
+    decision: decided,
     admit: () => settle("admitted"),
     deny: () => settle("denied"),
   };
@@ -719,6 +712,7 @@ function requireAdmissionResource(
   scriptResources: WorkflowScriptResources,
   runId: string,
   admittedScript: string,
+  beforeCleanup: () => void,
 ): void {
   let failure: string;
   try {
@@ -734,6 +728,7 @@ function requireAdmissionResource(
     failure = `the persisted run record could not be read: ${error instanceof Error ? error.message : String(error)}`;
   }
 
+  beforeCleanup();
   try {
     const live = manager.getRun(runId);
     if (live?.status === "running" || live?.status === "paused") manager.stop(runId);
@@ -1332,6 +1327,10 @@ export function createWorkflowServer(
       const scriptSource = input.script === undefined ? "path" as const : "inline" as const;
       const admittedScript = input.script ?? readScriptAtAdmission(input.scriptPath);
       let backgroundReservation = false;
+      const executionLatch = createExecutionAdmissionLatch();
+      let elicitationController: AbortController | undefined;
+      let cancelElicitationFromRequest: (() => void) | undefined;
+      let foregroundRunId: string | undefined;
       if (input.background) {
         if (!backgroundRuns.reserve()) {
           return {
@@ -1359,6 +1358,8 @@ export function createWorkflowServer(
         }
 
         const exec: ExecOptions = {
+          agent: runner,
+          executionAdmission: executionLatch.decision,
           scriptBackends: backendsGate.backends,
           maxAgents: input.maxAgents,
           concurrency: input.concurrency,
@@ -1369,11 +1370,6 @@ export function createWorkflowServer(
           resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,
         };
-        const executionGate = createAdmissionExecutionGate(runner);
-        exec.agent = executionGate.runner;
-
-        let elicitationController: AbortController | undefined;
-        let cancelElicitationFromRequest: (() => void) | undefined;
         if (!input.background) {
           const reporter = createProgressReporter(extra);
           exec.signal = extra.signal;
@@ -1399,13 +1395,14 @@ export function createWorkflowServer(
 
         if (input.background) {
           const started = manager.startInBackground(admittedScript, input.args, exec);
-          try {
-            requireAdmissionResource(manager, scriptResources, started.runId, admittedScript);
-          } catch (error) {
-            executionGate.deny();
-            throw error;
-          }
-          executionGate.admit();
+          requireAdmissionResource(
+            manager,
+            scriptResources,
+            started.runId,
+            admittedScript,
+            executionLatch.deny,
+          );
+          executionLatch.admit();
           const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
           backgroundRuns.track(started.runId, started.promise);
           backgroundReservation = false;
@@ -1439,32 +1436,40 @@ export function createWorkflowServer(
         // Read that record back before awaiting the promise so no foreground result is acknowledged
         // unless its immutable script resource is already durable.
         const started = manager.startInBackground(admittedScript, input.args, exec);
+        foregroundRunId = started.runId;
         scriptResources.trackPendingElicitation(started.runId, elicitationController);
-        try {
-          requireAdmissionResource(manager, scriptResources, started.runId, admittedScript);
-          executionGate.admit();
-          const run = await settleForegroundRun(manager, started);
-          const scriptUri = workflowScriptUri(run.runId);
-          const structuredContent = {
-            ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
-          };
-          const isError = run.status === "failed" || run.status === "aborted";
-          return {
-            structuredContent: { ...structuredContent },
-            content: [
-              { type: "text", text: formatRunSummary(run) },
-              ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
-            ],
-            isError,
-          };
-        } finally {
-          executionGate.deny();
-          scriptResources.clearPendingElicitation(started.runId);
-          if (cancelElicitationFromRequest) {
-            extra.signal.removeEventListener("abort", cancelElicitationFromRequest);
-          }
-        }
+        requireAdmissionResource(
+          manager,
+          scriptResources,
+          started.runId,
+          admittedScript,
+          () => {
+            executionLatch.deny();
+            scriptResources.cancelPendingElicitation(started.runId);
+          },
+        );
+        executionLatch.admit();
+        const run = await settleForegroundRun(manager, started);
+        const scriptUri = workflowScriptUri(run.runId);
+        const structuredContent = {
+          ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
+        };
+        const isError = run.status === "failed" || run.status === "aborted";
+        return {
+          structuredContent: { ...structuredContent },
+          content: [
+            { type: "text", text: formatRunSummary(run) },
+            ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
+          ],
+          isError,
+        };
       } finally {
+        executionLatch.deny();
+        if (foregroundRunId) scriptResources.cancelPendingElicitation(foregroundRunId);
+        else elicitationController?.abort();
+        if (cancelElicitationFromRequest) {
+          extra.signal.removeEventListener("abort", cancelElicitationFromRequest);
+        }
         if (backgroundReservation) backgroundRuns.releaseReservation();
       }
     },

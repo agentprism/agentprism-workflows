@@ -194,7 +194,11 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       });
       const result = await started.promise;
       assert.equal(result.resumeReport?.replayed, 2);
-      assert.equal(store.persistence.load("durable-target")?.resumeSeed, undefined);
+      assert.deepEqual(store.persistence.load("durable-target")?.resumeSeed, {
+        format: "identity-v1",
+        sourceRunId,
+        candidates: [],
+      });
     } finally {
       dirs.cleanup();
     }
@@ -229,6 +233,7 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       }
       assert.equal(positional.resumeReport?.replayed, 1);
       assert.equal(store.persistence.load("forced-positional")?.legacyResume, undefined);
+      assert.equal(store.persistence.load("forced-positional")?.resumeSeed?.sourceRunId, identitySource);
 
       const legacyState = store.persistence.load(identitySource);
       assert.ok(legacyState);
@@ -254,6 +259,7 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       }
       assert.equal(legacy.resumeReport?.replayed, 1);
       assert.equal(store.persistence.load("legacy-target")?.legacyResume, true);
+      assert.equal(store.persistence.load("legacy-target")?.resumeSeed?.sourceRunId, "legacy-source");
 
       const unsupported = { ...legacyState, runId: "unsupported-source", resume: { format: "future" } };
       unsupported.journal = unsupported.journal?.map((entry) => ({ ...entry, scope: "unsupported-source" }));
@@ -274,6 +280,11 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       if (unsupportedResult.resumeReport?.strategy === "live") {
         assert.equal(unsupportedResult.resumeReport.disabledReason, "unsupported-format");
       }
+      assert.deepEqual(store.persistence.load("unsupported-target")?.resumeSeed, {
+        format: "identity-v1",
+        sourceRunId: "unsupported-source",
+        candidates: [],
+      });
     } finally {
       dirs.cleanup();
     }
@@ -318,7 +329,8 @@ describe("WorkflowManager durable identity execution", () => {
         decision.action === "replayed" && decision.recordedIndex !== decision.index).length, 38);
 
       const persisted = store.persistence.load("fanout-target");
-      assert.equal(persisted?.resumeSeed, undefined);
+      assert.equal(persisted?.resumeSeed?.sourceRunId, sourceRunId);
+      assert.equal(persisted?.resumeSeed?.candidates.length, 0);
       assert.deepEqual(persisted?.resumeReport, result.resumeReport);
       assert.equal(persisted?.journal?.length, 40);
       assert.equal(persisted?.calls?.length, 40);
@@ -381,7 +393,8 @@ return { one, approval, two }`, "replied-hop"), undefined, {
       const twoDecision = final.resumeReport?.calls[2];
       assert.equal(twoDecision?.action, "replayed");
       if (twoDecision?.action === "replayed") assert.equal(twoDecision.sourceRunId, sourceRunId);
-      assert.equal(store.persistence.load("replied-hop")?.resumeSeed, undefined);
+      assert.equal(store.persistence.load("replied-hop")?.resumeSeed?.sourceRunId, "paused-hop");
+      assert.equal(store.persistence.load("replied-hop")?.resumeSeed?.candidates.length, 0);
     } finally {
       dirs.cleanup();
     }
@@ -407,7 +420,7 @@ throw new Error("stop after one")`, "failed-hop"), undefined, {
       assert.equal(failed.status, "failed");
       assert.equal(failed.resumeReport?.replayed, 1);
       const failedState = store.persistence.load("failed-hop");
-      assert.equal(failedState?.resumeSeed?.sourceRunId, "failed-hop");
+      assert.equal(failedState?.resumeSeed?.sourceRunId, sourceRunId);
       assert.equal(failedState?.resumeSeed?.candidates.length, 1);
       assert.equal(failedState?.resumeSeed?.candidates[0]?.sourceRunId, sourceRunId);
 

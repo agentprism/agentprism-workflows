@@ -38,20 +38,8 @@ function startedAtMillis(state: PersistedRunState): number {
 }
 
 function lineageSourceRunId(state: PersistedRunState): string | undefined {
-  const reportSource = state.resumeReport?.sourceRunId;
-  if (reportSource) return reportSource;
   const seedSource = state.resumeSeed?.sourceRunId;
   return seedSource === state.runId ? undefined : seedSource;
-}
-
-function lineageFallbackRunIds(state: PersistedRunState): string[] {
-  const runIds = [
-    ...(state.resumeSeed?.candidates.map((candidate) => candidate.sourceRunId) ?? []),
-    ...(state.resumeSeed?.checkpointInjections?.map((injection) => injection.sourceRunId) ?? []),
-    ...(state.resumeReport?.calls.flatMap((decision) =>
-      decision.action === "replayed" ? [decision.sourceRunId] : []) ?? []),
-  ];
-  return [...new Set(runIds)];
 }
 
 /**
@@ -69,7 +57,7 @@ export class WorkflowScriptResources {
   private readonly onRunDeleted = ({ runId }: { runId: string }): void => {
     const uri = workflowScriptUri(runId);
     this.subscriptions.delete(uri);
-    this.elicitationControllers.delete(runId);
+    this.cancelPendingElicitation(runId);
     this.deletedRunIds.add(runId);
     const notify = !this.silentDeletionRunIds.delete(runId);
     if (notify) void this.mcp.sendResourceListChanged();
@@ -83,6 +71,8 @@ export class WorkflowScriptResources {
     this.manager.on("runDeleted", this.onRunDeleted);
     const previousOnClose = this.mcp.server.onclose;
     this.mcp.server.onclose = () => {
+      for (const controller of this.elicitationControllers.values()) controller.abort();
+      this.elicitationControllers.clear();
       this.manager.off("runDeleted", this.onRunDeleted);
       previousOnClose?.();
     };
@@ -98,10 +88,6 @@ export class WorkflowScriptResources {
   /** Bind the only request-lifetime admission state after the manager reveals the run ID. */
   trackPendingElicitation(runId: string, controller: AbortController | undefined): void {
     if (controller) this.elicitationControllers.set(runId, controller);
-  }
-
-  clearPendingElicitation(runId: string): void {
-    this.elicitationControllers.delete(runId);
   }
 
   cancelPendingElicitation(runId: string): void {
@@ -124,7 +110,6 @@ export class WorkflowScriptResources {
   lineage(runId: string): WorkflowScriptLineageEntry[] {
     const newestToOldest: WorkflowScriptLineageEntry[] = [];
     const visited = new Set<string>();
-    const fallbackRunIds: string[] = [];
     let currentRunId: string | undefined = runId;
 
     while (currentRunId && !visited.has(currentRunId)) {
@@ -138,13 +123,8 @@ export class WorkflowScriptResources {
       if (!state) {
         const tombstone: PersistedRunLineageTombstone | null | undefined =
           this.persistence.loadLineageTombstone?.(currentRunId);
-        currentRunId = tombstone?.sourceRunId ?? fallbackRunIds.find((candidate) => !visited.has(candidate));
+        currentRunId = tombstone?.sourceRunId;
         continue;
-      }
-      for (const fallbackRunId of lineageFallbackRunIds(state)) {
-        if (!visited.has(fallbackRunId) && !fallbackRunIds.includes(fallbackRunId)) {
-          fallbackRunIds.push(fallbackRunId);
-        }
       }
       currentRunId = lineageSourceRunId(state);
     }

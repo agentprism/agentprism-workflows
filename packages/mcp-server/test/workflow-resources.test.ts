@@ -8,9 +8,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
+  ElicitRequestSchema,
   ResourceListChangedNotificationSchema,
   ResourceUpdatedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   WorkflowManager,
   type PersistedRunState,
@@ -171,7 +173,7 @@ test("admission readback preserves authored args and the original persisted scri
   }
 });
 
-test("readback accepts a transient initial save failure once a later engine save is durable", async () => {
+test("readback rejects a transient initial save failure before execution can rescue it", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-transient-admission-"));
   const fault = saveFaultPersistence(root, (attempt) => attempt === 1);
   let runnerCalls = 0;
@@ -200,19 +202,86 @@ test("readback accepts a transient initial save failure once a later engine save
         ].join("\n"),
       },
     });
-    assert.equal(result.isError, false);
-    assert.equal(structured(result)?.status, "completed");
-    assert.equal(resourceLinks(result).length, 1);
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined);
+    assert.equal(resourceLinks(result).length, 0);
 
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
     const uri = `workflow://runs/${runId}/script`;
     assert.ok(fault.attempts() > 1);
-    assert.equal(runnerCalls, 1);
-    assert.equal(manager.getRun(runId)?.status, "completed");
-    assert.equal(fault.durable.load(runId)?.status, "completed");
-    assert.equal(resourceText(await client.readResource({ uri })), fault.durable.load(runId)?.script);
-    assert.equal(listChanged, 1);
+    assert.equal(runnerCalls, 0);
+    assert.equal(manager.getRun(runId), undefined);
+    assert.equal(fault.durable.load(runId), null);
+    await assert.rejects(client.readResource({ uri }), /resource not found/i);
+    assert.equal(listChanged, 0);
+    const lease = fault.durable.acquireRunLease(runId);
+    assert.ok(lease);
+    fault.durable.releaseRunLease(lease);
+  } finally {
+    await client.close();
+    await server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("failed foreground admission cannot enter the VM or abandon a checkpoint elicitation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-checkpoint-admission-"));
+  let failSaves = false;
+  const fault = saveFaultPersistence(root, () => failSaves);
+  const runner = okRunner();
+  const manager = new WorkflowManager({ cwd: root, agent: runner, persistence: fault.persistence });
+  const server = createWorkflowServer(runner, { manager });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client(
+    { name: "checkpoint-admission-client", version: "0.0.0" },
+    { capabilities: { elicitation: {} } },
+  );
+  let priming = true;
+  let elicitationRequests = 0;
+  let activeElicitations = 0;
+  let cancelledElicitations = 0;
+  client.setRequestHandler(ElicitRequestSchema, (_request, extra): ElicitResult | Promise<ElicitResult> => {
+    elicitationRequests++;
+    if (priming) return { action: "accept", content: { approve: true } };
+    activeElicitations++;
+    return new Promise<ElicitResult>((resolve) => {
+      extra.signal.addEventListener("abort", () => {
+        activeElicitations--;
+        cancelledElicitations++;
+        resolve({ action: "cancel" });
+      }, { once: true });
+    });
+  });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+  const checkpointScript = [
+    'export const meta = { name: "admission-checkpoint", description: "pre-VM admission" };',
+    'return await checkpoint("Ship?", { kind: "confirm" });',
+  ].join("\n");
+  try {
+    const primed = await client.callTool({ name: "workflow", arguments: { script: checkpointScript } });
+    assert.equal(primed.isError, false);
+    assert.equal(elicitationRequests, 1);
+
+    priming = false;
+    failSaves = true;
+    const failed = await client.callTool({ name: "workflow", arguments: { script: checkpointScript } });
+    assert.equal(failed.isError, true);
+    assert.equal(failed.structuredContent, undefined);
+    assert.equal(resourceLinks(failed).length, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(elicitationRequests, 1, "authored checkpoint code must not run before durable readback");
+    assert.equal(activeElicitations, 0, "the failed tool call must leave no elicitation unsettled");
+    assert.equal(cancelledElicitations, 0, "the pre-VM latch should prevent a request from needing cancellation");
+
+    const failedRunId = fault.acquiredRunIds.at(-1);
+    assert.ok(failedRunId);
+    assert.equal(manager.getRun(failedRunId), undefined);
+    assert.equal(fault.durable.load(failedRunId), null);
+    const lease = fault.durable.acquireRunLease(failedRunId);
+    assert.ok(lease, "failed checkpoint admission must release its lease");
+    fault.durable.releaseRunLease(lease);
   } finally {
     await client.close();
     await server.close();
@@ -555,6 +624,8 @@ test("actual manager-owned resume lineage retains its root after the middle reco
     const ids = [first.runId, second.runId, third.runId];
     assert.equal(second.resumeReport?.sourceRunId, first.runId);
     assert.equal(third.resumeReport?.sourceRunId, second.runId);
+    assert.equal(manager.getPersistence().load(second.runId)?.resumeSeed?.sourceRunId, first.runId);
+    assert.equal(manager.getPersistence().load(third.runId)?.resumeSeed?.sourceRunId, second.runId);
     assert.equal(manager.deleteRun(second.runId), true);
     assert.equal(manager.getPersistence().load(second.runId), null);
 
@@ -669,6 +740,49 @@ test("lineage normalizes engine-seed pointer cycles and missing ancestors", asyn
         available: true,
       },
     ]);
+  } finally {
+    await mcp.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resume reports and replay provenance never override the authoritative engine seed pointer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-precedence-"));
+  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const seedParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "seed-parent"));
+  const reportParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "report-parent"));
+  const child = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "lineage-child"));
+  const persistence = manager.getPersistence();
+  const childState = persistence.load(child.runId);
+  assert.ok(childState);
+  persistence.save({
+    ...childState,
+    resumeSeed: { format: "identity-v1", sourceRunId: seedParent.runId, candidates: [] },
+    resumeReport: {
+      strategy: "identity-v1",
+      sourceRunId: reportParent.runId,
+      requestedPolicy: "auto",
+      replayed: 0,
+      live: 0,
+      failed: 0,
+      calls: [],
+    },
+  });
+
+  const mcp = new McpServer({ name: "lineage-precedence", version: "0.0.0" }, { capabilities: {} });
+  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+  const resources = new WorkflowScriptResources(mcp, manager);
+  try {
+    assert.deepEqual(
+      resources.lineage(child.runId).map((entry) => entry.runId),
+      [seedParent.runId, child.runId],
+    );
+    assert.equal(manager.deleteRun(child.runId), true);
+    assert.equal(persistence.loadLineageTombstone?.(child.runId)?.sourceRunId, seedParent.runId);
+    assert.deepEqual(
+      resources.lineage(child.runId).map((entry) => entry.runId),
+      [seedParent.runId, child.runId],
+    );
   } finally {
     await mcp.close();
     rmSync(root, { recursive: true, force: true });

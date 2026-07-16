@@ -206,9 +206,50 @@ const inspectionRequired = [
   "lineage",
 ] as const;
 
+const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
+const nonterminalStatuses = ["pending", "running"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri"] as const;
+const executionDetailFields = [
+  "result",
+  "tokenUsage",
+  "logs",
+  "logTail",
+  "authContext",
+  "checkpointContext",
+  "fallbacks",
+  "checkpointsTaken",
+  "resumeReport",
+] as const;
+const inspectionFields = [
+  ...inspectionRequired,
+  "currentPhase",
+  "reason",
+  "errorCode",
+] as const;
+const variantOutputFields = [
+  ...executionDetailFields,
+  "scriptSource",
+  ...inspectionFields,
+  "wait",
+  "outcome",
+  "stopped",
+  "alreadyTerminal",
+] as const;
+
 const forbidsRequired = (...fields: string[]) => ({
   not: { anyOf: fields.map((field) => ({ required: [field] })) },
 });
+
+function forbidsOutside(allowed: readonly string[]) {
+  const allowedFields = new Set(allowed);
+  return forbidsRequired(...new Set(variantOutputFields.filter((field) => !allowedFields.has(field))));
+}
+
+function hasOnlyFields(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedFields = new Set<string>([...commonOutputFields, ...allowed]);
+  return Object.entries(value).every(([field, fieldValue]) =>
+    fieldValue === undefined || allowedFields.has(field));
+}
 
 /**
  * The SDK's registerTool runtime accepts an arbitrary Zod schema in its types, but 1.29.0
@@ -239,17 +280,27 @@ export const workflowToolOutputShape = z
   .superRefine((value, context) => {
     const has = (field: keyof typeof value) => value[field] !== undefined;
     const inspectionComplete = inspectionRequired.every((field) => has(field));
-    const execution = has("scriptSource");
-    const awaiting = has("wait");
-    const stopping = has("stopped") || has("alreadyTerminal");
-    const valid = execution
-      ? value.status !== "pending" && !has("lineage") && !awaiting && !stopping
-      : inspectionComplete &&
-        (!stopping ||
-          (has("stopped") &&
-            has("alreadyTerminal") &&
-            !awaiting &&
-            (value.status === "completed" || value.status === "failed" || value.status === "aborted")));
+    const terminal = terminalStatuses.includes(value.status as typeof terminalStatuses[number]);
+    let valid: boolean;
+    if (has("scriptSource")) {
+      valid = value.status === "running"
+        ? hasOnlyFields(value, ["scriptSource"])
+        : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]);
+    } else if (has("stopped") || has("alreadyTerminal")) {
+      valid =
+        inspectionComplete &&
+        has("stopped") &&
+        has("alreadyTerminal") &&
+        (value.status === "completed" || value.status === "failed" || value.status === "aborted") &&
+        hasOnlyFields(value, [...inspectionFields, "stopped", "alreadyTerminal"]);
+    } else if (has("wait")) {
+      valid =
+        inspectionComplete &&
+        hasOnlyFields(value, [...inspectionFields, "wait", "tokenUsage", "outcome"]) &&
+        (terminal ? has("outcome") : !has("outcome"));
+    } else {
+      valid = inspectionComplete && hasOnlyFields(value, inspectionFields);
+    }
     if (!valid) {
       context.addIssue({ code: "custom", message: "output does not match a workflow result variant" });
     }
@@ -259,30 +310,40 @@ export const workflowToolOutputShape = z
       {
         title: "Workflow execution",
         required: ["scriptSource"],
-        properties: { status: { enum: ["paused", "completed", "failed", "aborted"] } },
-        ...forbidsRequired("lineage", "wait", "stopped", "alreadyTerminal"),
+        properties: { status: { enum: terminalStatuses } },
+        ...forbidsOutside(["scriptSource", ...executionDetailFields]),
       },
       {
         title: "Workflow background admission",
         required: ["scriptSource"],
         properties: { status: { const: "running" } },
-        ...forbidsRequired("lineage", "wait", "stopped", "alreadyTerminal"),
+        ...forbidsOutside(["scriptSource"]),
       },
       {
         title: "Workflow inspection",
         required: [...inspectionRequired],
-        ...forbidsRequired("scriptSource", "wait", "stopped", "alreadyTerminal"),
+        ...forbidsOutside(inspectionFields),
       },
       {
         title: "Workflow await",
         required: [...inspectionRequired, "wait"],
-        ...forbidsRequired("scriptSource", "stopped", "alreadyTerminal"),
+        ...forbidsOutside([...inspectionFields, "wait", "tokenUsage", "outcome"]),
+        anyOf: [
+          {
+            required: ["outcome"],
+            properties: { status: { enum: terminalStatuses } },
+          },
+          {
+            properties: { status: { enum: nonterminalStatuses } },
+            ...forbidsRequired("outcome"),
+          },
+        ],
       },
       {
         title: "Workflow stop acknowledgement",
         required: [...inspectionRequired, "stopped", "alreadyTerminal"],
         properties: { status: { enum: ["completed", "failed", "aborted"] } },
-        ...forbidsRequired("scriptSource", "wait"),
+        ...forbidsOutside([...inspectionFields, "stopped", "alreadyTerminal"]),
       },
     ],
   });
