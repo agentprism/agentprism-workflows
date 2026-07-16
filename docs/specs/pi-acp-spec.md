@@ -360,7 +360,7 @@ import { agent as acpAgent, methods, ndJsonStream } from "@agentclientprotocol/s
 
 export function runAcp(options?: { deps?: Partial<PiAcpDeps>; stream?: Stream }) {
   const impl = new PiAcpAgent(resolveDeps(options?.deps));
-  const app = acpAgent({ name: "@automatalabs/pi-acp", version: PKG_VERSION })
+  const app = acpAgent({ name: "@automatalabs/pi-acp" })
     .onRequest(methods.agent.initialize,          (c) => impl.initialize(c))
     .onRequest(methods.agent.authenticate,        (c) => impl.authenticate(c))
     .onRequest(methods.agent.session.new,         (c) => impl.newSession(c))
