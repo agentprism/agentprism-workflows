@@ -1,5 +1,16 @@
 # @automatalabs/acp-agents
 
+## 0.29.0
+
+### Minor Changes
+
+- 023f552: Continue eligible usage-limit and authentication-paused agent turns from their recorded ACP sessions, with fail-to-fresh gates, durable diagnostics, and MCP output support.
+
+### Patch Changes
+
+- Updated dependencies [023f552]
+  - @automatalabs/shared-types@0.24.0
+
 ## 0.28.1
 
 ### Patch Changes
