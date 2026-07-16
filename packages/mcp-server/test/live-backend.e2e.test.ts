@@ -41,8 +41,11 @@ const SERVER_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url))
 
 // Resolve the backend ACP server bins exactly as the runner does (createRequire against the
 // acp-agents package), so the pooling marker is the SAME node_modules path that will appear
-// in the spawned subprocess's argv — and provably an npm install, not a vendored copy.
+// in the spawned subprocess's argv — and provably an npm install, not a vendored copy. Pi is
+// a workspace:* sibling, so in-repo it resolves to packages/pi-acp/dist (the exact artifact
+// npm publishes) instead of node_modules.
 const requireAcp = createRequire(new URL("../../acp-agents/package.json", import.meta.url));
+const PI_WORKSPACE_DIST = fileURLToPath(new URL("../../pi-acp/dist/", import.meta.url));
 const BACKEND_BIN: Record<Backend, string> = {
   claude: requireAcp.resolve("@agentclientprotocol/claude-agent-acp/dist/index.js"),
   codex: requireAcp.resolve("@automatalabs/codex-acp"),
@@ -335,8 +338,14 @@ function assertBackend(backend: Backend, out: LiveOutcome): void {
   // or a host-installed opencode-ai package.
   if (backend !== "opencode") {
     const scope = BACKEND_SCOPE[backend];
-    assert.ok(bin.includes("/node_modules/"), `${backend} bin must resolve under node_modules: ${bin}`);
-    assert.ok(bin.includes(scope), `${backend} bin must be the ${scope} npm package: ${bin}`);
+    if (backend === "pi" && !bin.includes("/node_modules/")) {
+      // workspace:* topology — acp-agents links the repo's own pi-acp package, the exact
+      // artifact npm publishes; consumer installs resolve it under node_modules instead.
+      assert.ok(bin.startsWith(PI_WORKSPACE_DIST), `pi bin must be the workspace @automatalabs/pi-acp dist: ${bin}`);
+    } else {
+      assert.ok(bin.includes("/node_modules/"), `${backend} bin must resolve under node_modules: ${bin}`);
+      assert.ok(bin.includes(scope), `${backend} bin must be the ${scope} npm package: ${bin}`);
+    }
     assert.ok(!bin.includes("/vendor/"), `${backend} must NOT use a vendored copy: ${bin}`);
   } else {
     assert.ok(bin.length > 0, "opencode spawn marker must be non-empty");
