@@ -16,6 +16,7 @@ const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../script
 
 const USER_REQUEST =
   "I want the fork gate to clone the repository to a temp directory and verify both remotes before diffing";
+const QUEUED_REQUEST = "Also please add a stop capability probe to the workflow server while the turn is still running";
 const OLD_SESSION_REQUEST = "Please archive all of the workflow scripts we used to plan and ship the repository work";
 const MULTILINE_REQUEST_RAW = "Ship the entire train end to end\nand publish every package when it is done";
 const SUMMARY_DECOY = "The user asked us to redesign the entire persistence layer from scratch this quarter";
@@ -51,6 +52,9 @@ function makeFixture(): { dir: string; current: string; older: string } {
       rec({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: ASSISTANT_DECOY }] } }),
       "not json at all",
       userTurn("short reply ok"),
+      // A mid-turn message: persists ONLY as a queue-operation until the turn boundary commits it.
+      rec({ type: "queue-operation", operation: "enqueue", content: QUEUED_REQUEST }),
+      rec({ type: "queue-operation", operation: "remove", content: "queued text that was recalled by the user" }),
     ].join("\n"),
   );
   writeFileSync(older, [userTurn(OLD_SESSION_REQUEST)].join("\n"));
@@ -97,6 +101,21 @@ test("string-form args and string[] sourceRequest are accepted", () => {
       args: JSON.stringify({ sourceRequest: [USER_REQUEST, OLD_SESSION_REQUEST] }),
     });
     assert.equal(res.status, 0, res.out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a queued mid-turn message verifies; a remove-only queue record does not", () => {
+  const { dir, current } = makeFixture();
+  try {
+    const queued = runGate(current, { scriptPath: "/w.js", args: { sourceRequest: QUEUED_REQUEST } });
+    assert.equal(queued.status, 0, queued.out);
+    const removed = runGate(current, {
+      scriptPath: "/w.js",
+      args: { sourceRequest: "queued text that was recalled by the user" },
+    });
+    assert.equal(removed.status, 2, removed.out);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -58,15 +58,21 @@ function stripMachineSpans(text) {
   return out;
 }
 
-/** Genuine user prose from one transcript record, or null. */
+/** Genuine user prose from one transcript record, or null. Two shapes qualify: committed user
+ *  turns (type:"user" with prose content) and queued mid-turn messages (type:"queue-operation",
+ *  operation:"enqueue", verbatim user text in .content — a message typed while the agent's turn
+ *  is still running persists ONLY as a queue record until the turn boundary commits it). */
 function userProse(rec) {
-  if (rec.type !== "user" || rec.isMeta || rec.isCompactSummary || rec.isSidechain) return null;
-  const content = rec.message?.content;
   let text = null;
-  if (typeof content === "string") text = content;
-  else if (Array.isArray(content)) {
-    const parts = content.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text);
-    if (parts.length > 0) text = parts.join("\n");
+  if (rec.type === "queue-operation") {
+    if (rec.operation === "enqueue" && typeof rec.content === "string") text = rec.content;
+  } else if (rec.type === "user" && !rec.isMeta && !rec.isCompactSummary && !rec.isSidechain) {
+    const content = rec.message?.content;
+    if (typeof content === "string") text = content;
+    else if (Array.isArray(content)) {
+      const parts = content.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text);
+      if (parts.length > 0) text = parts.join("\n");
+    }
   }
   if (text === null) return null;
   const cleaned = normalize(stripMachineSpans(text));
@@ -84,8 +90,14 @@ function scanTranscript(path, normalizedQuotes, unmatched) {
     return { matched, turns };
   }
   for (const line of raw.split("\n")) {
-    // Cheap pre-filter: only user records can carry user prose.
-    if (!line.includes('"type":"user"') && !line.includes('"type": "user"')) continue;
+    // Cheap pre-filter: only user turns and queued-message records can carry user prose.
+    if (
+      !line.includes('"type":"user"') &&
+      !line.includes('"type": "user"') &&
+      !line.includes('"type":"queue-operation"') &&
+      !line.includes('"type": "queue-operation"')
+    )
+      continue;
     let rec;
     try {
       rec = JSON.parse(line);
