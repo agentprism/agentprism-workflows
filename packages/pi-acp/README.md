@@ -12,7 +12,7 @@ The package entry exports the value APIs `runAcp(options?)`, `PiAcpAgent`, and `
 
 ## Custom backend registration
 
-Until the built-in `PiBackend` follow-up lands, register the generic custom backend with both required capability fields:
+With `@automatalabs/acp-agents`, register pi-acp through the custom-backend registry with both required capability fields (a built-in `pi` backend id is tracked in [VikashLoomba/agentprism-workflows#213](https://github.com/VikashLoomba/agentprism-workflows/issues/213)):
 
 ```json
 {
@@ -46,7 +46,7 @@ pi-acp owns the `mcp__` prefix for bridged MCP tools and the exact `__acp_struct
 
 ## Version 1 limitations
 
-Only stdio MCP servers are supported. Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. Audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed. Promotion to a built-in `PiBackend` is a follow-up.
+Only stdio MCP servers are supported. Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. Audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed. Promotion to a built-in `pi` backend id in `@automatalabs/acp-agents` is tracked in [VikashLoomba/agentprism-workflows#213](https://github.com/VikashLoomba/agentprism-workflows/issues/213).
 
 ## Development
 
