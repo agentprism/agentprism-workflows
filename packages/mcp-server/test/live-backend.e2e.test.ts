@@ -61,8 +61,8 @@ const BACKEND_SCOPE: Record<Exclude<Backend, "opencode">, string> = {
   pi: "@automatalabs/",
 };
 
-const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/google/gemini-2.5-flash";
-const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL;
+const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/openrouter/moonshotai/kimi-k3";
+const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL ?? "openrouter/moonshotai/kimi-k3";
 
 function resolveOpenCodeBin(): string {
   if (process.env.AGENTPRISM_OPENCODE_ACP_CMD) return process.env.AGENTPRISM_OPENCODE_ACP_CMD;
