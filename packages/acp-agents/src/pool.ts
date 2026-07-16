@@ -11,7 +11,12 @@
 // A crashed process is evicted (drop) and the next acquire spawns a fresh one. dispose() closes
 // every process. A process-exit safety net kills children if the host exits without disposing.
 import type { Backend, BackendId } from "./backend.js";
-import { PooledConnection, SessionHandle, type AcpSessionOptions } from "./acp-client.js";
+import {
+  PooledConnection,
+  ReattachCapabilityUnavailable,
+  SessionHandle,
+  type AcpSessionOptions,
+} from "./acp-client.js";
 import { validateClientHandlers, type ClientHandlers } from "./client-handlers.js";
 import { mapThrownError } from "./errors-map.js";
 import type { AcpEventSink } from "./events.js";
@@ -109,6 +114,29 @@ export class AcpAgentPool {
       return await connection.openPreparedSession(prepare);
     } catch (error) {
       if (context.signal?.aborted) throw error;
+      throw mapThrownError(error, {
+        label: context.label,
+        backendId: connection.backendId,
+        backend,
+        authMethods: connection.capabilities?.authMethods,
+      });
+    }
+  }
+
+  /** Acquire a ready connection slot and reattach by the best capability negotiated on it. */
+  async acquirePreparedReattach(
+    backend: Backend,
+    sessionId: string,
+    prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
+    context: { signal?: AbortSignal; label?: string } = {},
+  ): Promise<{ handle: SessionHandle; method: "resume" | "load" }> {
+    if (this.disposed) throw new Error("ACP agent pool is disposed");
+    const connection = this.selectConnection(backend);
+    try {
+      return await connection.openPreparedReattachedSession(sessionId, prepare);
+    } catch (error) {
+      if (context.signal?.aborted) throw error;
+      if (error instanceof ReattachCapabilityUnavailable) throw error;
       throw mapThrownError(error, {
         label: context.label,
         backendId: connection.backendId,

@@ -825,6 +825,21 @@ function lifecycleCapabilityError(
   );
 }
 
+/** Internal typed sentinel for the continuation path. It is deliberately thrown only after
+ * initialize completes and before any session/load or session/resume wire request is sent. */
+export class ReattachCapabilityUnavailable extends Error {
+  constructor(
+    readonly backendId: BackendId,
+    readonly sessionId: string,
+  ) {
+    super(
+      `ACP agent (${backendId}) cannot reattach session ${sessionId}: ` +
+        "neither session/resume nor session/load is advertised",
+    );
+    this.name = "ReattachCapabilityUnavailable";
+  }
+}
+
 function authProviderCapabilityError(
   backendId: BackendId,
   method: string,
@@ -1514,6 +1529,35 @@ export class PooledConnection {
     }
   }
 
+  /** Reserve one connection slot, await initialize, choose the best currently-advertised reopen
+   * method, prepare against that same ready connection, and reattach under the single reservation. */
+  async openPreparedReattachedSession(
+    sessionId: string,
+    prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
+  ): Promise<{ handle: SessionHandle; method: "resume" | "load" }> {
+    this._activeSessions += 1;
+    try {
+      await this.ready;
+      const caps = this.negotiated;
+      const method: "resume" | "load" | undefined = caps?.supportsResumeSession
+        ? "resume"
+        : caps?.supportsLoadSession
+          ? "load"
+          : undefined;
+      if (method === undefined) throw new ReattachCapabilityUnavailable(this.backendId, sessionId);
+      const opts = await prepare(this);
+      const handle = await this.reattachReadySession(
+        method === "resume" ? AGENT_METHODS.session_resume : AGENT_METHODS.session_load,
+        sessionId,
+        opts,
+      );
+      return { handle, method };
+    } catch (error) {
+      this._activeSessions -= 1;
+      throw error;
+    }
+  }
+
   private async openReadySession(opts: AcpSessionOptions): Promise<SessionHandle> {
     // Capability gate: reject a client-provided MCP server whose transport the connected agent
     // does not advertise (http/sse gated on mcpCapabilities; stdio is always serviceable).
@@ -1623,6 +1667,20 @@ export class PooledConnection {
     opts: AcpSessionOptions,
   ): Promise<SessionHandle> {
     this._activeSessions += 1;
+    try {
+      return await this.reattachReadySession(method, sessionId, opts);
+    } catch (error) {
+      this._activeSessions -= 1;
+      throw error;
+    }
+  }
+
+  /** Reattach under a reservation already owned by the caller. */
+  private async reattachReadySession(
+    method: typeof AGENT_METHODS.session_load | typeof AGENT_METHODS.session_resume,
+    sessionId: string,
+    opts: AcpSessionOptions,
+  ): Promise<SessionHandle> {
     let registered = false;
     const state = new SessionState(
       opts.cwd,
@@ -1671,7 +1729,6 @@ export class PooledConnection {
       return new SessionHandle(this, sessionId, state, response.configOptions ?? [], opts);
     } catch (error) {
       if (registered) this.client.unregister(sessionId);
-      this._activeSessions -= 1;
       throw error;
     }
   }

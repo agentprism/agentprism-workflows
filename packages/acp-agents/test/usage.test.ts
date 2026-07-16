@@ -131,3 +131,87 @@ test("recordContextTokens ignores negative/non-finite used (stays the zero senti
   acc.recordContextTokens(undefined);
   assert.equal(acc.toAgentUsage().total, 0);
 });
+
+test("baseline snapshots only cumulative cost and context gauge", () => {
+  const acc = new UsageAccumulator();
+  acc.recordCost({ amount: 1.25, currency: "USD" } as Cost);
+  acc.recordContextTokens(800, 200000);
+  assert.deepEqual(acc.baseline(), { costAmount: 1.25, contextUsedTokens: 800 });
+});
+
+test("delta keeps authoritative per-turn prompt usage unchanged and subtracts only cost", () => {
+  const acc = new UsageAccumulator();
+  acc.recordCost({ amount: 4, currency: "USD" } as Cost);
+  acc.recordContextTokens(1_000, 200000);
+  const baseline = acc.baseline();
+  acc.recordPromptUsage({
+    inputTokens: 12,
+    outputTokens: 8,
+    cachedReadTokens: 5,
+    cachedWriteTokens: 3,
+    totalTokens: 20,
+  });
+  acc.recordCost({ amount: 4.75, currency: "USD" } as Cost);
+  acc.recordContextTokens(1_900, 200000);
+
+  assert.deepEqual(acc.delta(baseline), {
+    input: 12,
+    output: 8,
+    cacheRead: 5,
+    cacheWrite: 3,
+    total: 20,
+    cost: 0.75,
+  });
+});
+
+test("delta without prompt usage reports context growth and cumulative cost growth", () => {
+  const acc = new UsageAccumulator();
+  acc.recordCost({ amount: 2, currency: "USD" } as Cost);
+  acc.recordContextTokens(400, 200000);
+  const baseline = acc.baseline();
+  acc.recordCost({ amount: 2.25, currency: "USD" } as Cost);
+  acc.recordContextTokens(525, 200000);
+
+  assert.deepEqual(acc.delta(baseline), {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: 125,
+    cost: 0.25,
+  });
+});
+
+test("delta clamps counter resets and context compaction to non-negative values", () => {
+  const acc = new UsageAccumulator();
+  acc.recordCost({ amount: 9, currency: "USD" } as Cost);
+  acc.recordContextTokens(5_000, 200000);
+  const baseline = acc.baseline();
+  acc.recordCost({ amount: 1, currency: "USD" } as Cost);
+  acc.recordContextTokens(4_000, 200000);
+
+  assert.deepEqual(acc.delta(baseline), {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: 0,
+    cost: 0,
+  });
+});
+
+test("delta with no post-baseline update preserves the all-zero sentinel", () => {
+  const acc = new UsageAccumulator();
+  acc.recordCost({ amount: 3, currency: "USD" } as Cost);
+  acc.recordContextTokens(700, 200000);
+  const baseline = acc.baseline();
+
+  assert.deepEqual(acc.delta(baseline), {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: 0,
+    cost: 0,
+  });
+});
