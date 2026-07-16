@@ -78,7 +78,13 @@ test("T4 prompt content fold is total, ordered, and accepts image-only", () => {
   for (const prompt of [
     [],
     [{ type: "text", text: "" }],
+    [{ type: "text", text: "" }, { type: "text", text: "" }],
+    [{ type: "text", text: " \t" }, { type: "text", text: "\n" }],
     [{ type: "resource", resource: { uri: "file:///empty", text: "" } }],
+    [
+      { type: "resource", resource: { uri: "file:///empty-1", text: "" } },
+      { type: "resource", resource: { uri: "file:///empty-2", text: "" } },
+    ],
   ] as const) {
     assert.throws(
       () => convertPromptContent(prompt),

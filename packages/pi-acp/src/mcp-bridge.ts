@@ -71,12 +71,20 @@ export async function connectDefaultMcpClient(
   try {
     await bounded(client.connect(transport), signal, timeoutMs, sleep);
   } catch (error) {
-    await bounded(
-      transport.close().catch(() => undefined),
-      new AbortController().signal,
-      timeoutMs,
-      sleep,
-    ).catch(() => undefined);
+    const pid = transport.pid;
+    const close = transport.close().catch(() => undefined);
+    try {
+      await bounded(close, new AbortController().signal, timeoutMs, sleep);
+    } catch {
+      if (pid !== null) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The child may have exited between the timeout and the kill.
+        }
+      }
+      await close;
+    }
     throw error;
   }
   let closed = false;

@@ -74,14 +74,14 @@ export class PiSession {
     this.mcpClients = options.mcpClients;
     this.structured = options.structured;
     this.onWedged = options.onWedged;
-    this.unsubscribe = this.pi.subscribe((event) => {
-      for (const update of translateEvent(event)) this.enqueue(update);
-    });
     installPermissionWrapper(this.pi, {
       sessionId: this.sessionId,
       client: this.client,
       drain: () => this.drain(),
       turnSignal: () => this.activeTurn?.controller.signal,
+    });
+    this.unsubscribe = this.pi.subscribe((event) => {
+      for (const update of translateEvent(event)) this.enqueue(update);
     });
   }
 

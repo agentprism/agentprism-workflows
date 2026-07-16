@@ -28,12 +28,16 @@ export interface FakeSessionControl {
   promptCalls: Array<{ text: string; options: unknown }>;
   disposeCalls: number;
   abortCalls: number;
+  listenerCount: number;
   tools: ToolDefinition[];
   resolvePrompt?: () => void;
   rejectPrompt?: (error: unknown) => void;
 }
 
-export function fakeSession(options: CreateAgentSessionOptions, behavior: "normal" | "wedged" | "preflight" = "normal"): FakeSessionControl {
+export function fakeSession(
+  options: CreateAgentSessionOptions,
+  behavior: "normal" | "wedged" | "preflight" | "tool" = "normal",
+): FakeSessionControl {
   const listeners = new Set<(event: AgentSessionEvent) => void>();
   const messages: unknown[] = [];
   const promptCalls: Array<{ text: string; options: unknown }> = [];
@@ -68,6 +72,44 @@ export function fakeSession(options: CreateAgentSessionOptions, behavior: "norma
           rejectPrompt = reject;
         });
         return;
+      }
+      if (behavior === "tool") {
+        const tool = tools.find(({ name }) => name.startsWith("mcp__"));
+        if (!tool) throw new Error("MCP tool missing from fake pi session");
+        const toolCallId = "mcp-call-1";
+        const args = { value: 1 };
+        const start = {
+          type: "tool_execution_start",
+          toolCallId,
+          toolName: tool.name,
+          args,
+        } as AgentSessionEvent;
+        for (const listener of listeners) listener(start);
+        let result: { content: Array<{ type: "text"; text: string }>; details?: unknown };
+        let isError = false;
+        try {
+          const decision = await (agent.beforeToolCall as
+            | ((context: unknown, signal: AbortSignal) => Promise<{ block?: boolean; reason?: string } | undefined>)
+            | undefined)?.(
+            { toolCall: { id: toolCallId, name: tool.name }, args },
+            new AbortController().signal,
+          );
+          if (decision?.block) throw new Error(decision.reason ?? "tool blocked");
+          result = await tool.execute(toolCallId, args, new AbortController().signal) as typeof result;
+        } catch (error) {
+          isError = true;
+          result = {
+            content: [{ type: "text", text: error instanceof Error ? error.message : "tool failed" }],
+          };
+        }
+        const end = {
+          type: "tool_execution_end",
+          toolCallId,
+          toolName: tool.name,
+          result,
+          isError,
+        } as AgentSessionEvent;
+        for (const listener of listeners) listener(end);
       }
       const assistant = {
         role: "assistant",
@@ -108,6 +150,7 @@ export function fakeSession(options: CreateAgentSessionOptions, behavior: "norma
     promptCalls,
     get disposeCalls() { return disposeCalls; },
     get abortCalls() { return abortCalls; },
+    get listenerCount() { return listeners.size; },
     tools,
     get resolvePrompt() { return resolvePrompt; },
     get rejectPrompt() { return rejectPrompt; },
@@ -123,7 +166,7 @@ export interface FakeDepsResult {
   sessionDir: string;
 }
 
-export function fakeDeps(behavior: "normal" | "wedged" | "preflight" = "normal"): FakeDepsResult {
+export function fakeDeps(behavior: "normal" | "wedged" | "preflight" | "tool" = "normal"): FakeDepsResult {
   const cwd = mkdtempSync(`${tmpdir()}/pi-acp-cwd-`);
   const sessionDir = mkdtempSync(`${tmpdir()}/pi-acp-sessions-`);
   const controls: FakeSessionControl[] = [];

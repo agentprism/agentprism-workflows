@@ -262,7 +262,9 @@ export class PiAcpAgent {
         );
         return { configOptions: session.configOptions(), modes: null };
       } catch (error) {
-        if (opening.id !== undefined) this.opening.delete(opening.id);
+        if (opening.id !== undefined && this.opening.get(opening.id) === opening.controller) {
+          this.opening.delete(opening.id);
+        }
         this.openingControllers.delete(opening.controller);
         return this.openingError(error);
       }
@@ -320,7 +322,9 @@ export class PiAcpAgent {
         return { sessionId: session.sessionId, configOptions: session.configOptions(), modes: null };
       } catch (error) {
         if (bridge) await disposeMcpBridge(bridge.clients, this.deps);
-        if (opening.id !== undefined) this.opening.delete(opening.id);
+        if (opening.id !== undefined && this.opening.get(opening.id) === opening.controller) {
+          this.opening.delete(opening.id);
+        }
         this.openingControllers.delete(opening.controller);
         return this.openingError(error);
       }
