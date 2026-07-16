@@ -1,6 +1,6 @@
 // ===== packages/shared-types/src/workflow-result.ts =====
 
-import type { AgentResultProvenance, AgentUsage } from "./agent-run.js";
+import type { AgentResultProvenance, AgentUsage, ContinuationSkipReason } from "./agent-run.js";
 import type { AuthErrorContext, CheckpointContext, WorkflowErrorCode, WorkflowRecordedError } from "./errors.js";
 
 /** Aggregate token/cost usage for a whole run (engine-summed; matches the
@@ -73,6 +73,20 @@ export interface AgentSessionRef {
   sessionId: string;
   /** The backend that owns the session (built-in id or registered custom name). */
   backendId: string;
+  /** The effective pool identity of the process that owns this session: the runner's resolved
+   *  Backend.poolKey (`backend.ts:60-66`). For a custom backend that is `name` + a spawn-config hash
+   *  over command/args/env; for a first-class backend it is deliberately the logical agent id
+   *  (backendId), matching the pool's own process-identity model, which keys built-ins by bare id
+   *  (`pool.ts:129`). A first-class backend's spawn config is NOT fixed — `spawnConfig()` varies with
+   *  `AGENTPRISM_*_ACP_CMD/ARGS` env overrides and with installed-bin-vs-npx resolution
+   *  (`backends/claude.ts:44-58`, and codex/opencode) and built-ins define no explicit `poolKey` — but
+   *  every such launch of the same first-class agent shares one agent-side session store, so reattach
+   *  stays semantically valid and the logical-agent identity is correct by design; a genuinely
+   *  different program bound behind an env override is caught at the reopen RPC (`reattach-failed` →
+   *  fresh), not by this field. Persisted so a COLD resume can prove the currently-resolved backend
+   *  is the SAME logical process identity that owns the recorded session. ADDITIVE and NOT a hash
+   *  input; absent on legacy pre-poolKey refs. */
+  poolKey?: string;
   /** ABSOLUTE working directory the session was opened with. Sessions are cwd-scoped on
    *  agents that key their stores by workspace — pass this back when re-opening. */
   cwd: string;
@@ -100,22 +114,29 @@ export interface AgentSessionRecord extends AgentSessionRef {
   keptOpen: boolean;
 }
 
-/** One model-selection degrade observed while serving an agent() call. */
+/** One notice observed while serving an agent() call: a model-selection degrade
+ *  (kind "model"/"modifier") OR a continuation attempt on resume (kind "continuation"). */
 export interface WorkflowRunFallback {
   /** The owning agent() call's deterministic index. */
   callIndex: number;
   label: string;
   phase?: string;
-  /** The model/tier spec the engine asked the runner to serve. */
+  /** For continuation: the model/tier spec the engine asked the runner to serve on the continued
+   *  call (identical to the interrupted call's — the hash proves it). */
   requestedSpec: string;
   /** Concrete model selected by the runner, when it reported one. */
   resolvedModel?: string;
   /** Actual backend that opened the session, when the runner reported one. */
   backendId?: string;
-  /** Whole-model fallback, or a bracket modifier that could not be applied. */
-  kind: "model" | "modifier";
+  kind: "model" | "modifier" | "continuation";
   /** The human-readable line emitted to the workflow log. */
   message: string;
+  /** Present when — and only when — the engine emits `kind: "continuation"`. See the emission
+   *  invariant; the type keeps it structurally optional so the flat interface stays non-breaking
+   *  and no consumer must switch on `kind` to parse. */
+  continuation?:
+    | { outcome: "reattached"; method: "resume" | "load" }
+    | { outcome: "skipped"; reason: ContinuationSkipReason };
 }
 
 /** How a checkpoint() decision was obtained in this execution. */
@@ -142,6 +163,11 @@ export type JournalCallMetadata =
       model?: string;
       /** Actual backend from onSessionOpen; absent when the runner supplied no session ref. */
       backendId?: string;
+      /** Diagnostic-only: present when this result was produced by reattaching to a paused session
+       *  and continuing the interrupted turn, and which reopen method reattached. NOT part of
+       *  replay identity — replay restores it verbatim (`workflow.ts` replayPreparedAgent) and never
+       *  consults it; the run-event journal projection preserves it (`run-observability.ts`). */
+      continuation?: { method: "resume" | "load" };
     }
   | {
       kind: "checkpoint";
