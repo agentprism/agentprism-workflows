@@ -5,6 +5,7 @@
     { "path": "packages/acp-agents" },
     { "path": "packages/workflow-engine" },
     { "path": "packages/mcp-server" },
+    { "path": "packages/pi-acp" },
     { "path": "packages/workflows" },
     { "path": "packages/agentprism-otel" }
   ]

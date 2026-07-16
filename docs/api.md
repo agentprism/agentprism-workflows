@@ -12,6 +12,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
 | `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, bounded await, resume, and inspect | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
+| `@automatalabs/pi-acp` | Standalone in-process pi coding-agent ACP server (bin `pi-acp`) with a side-effect-free library entry | You need to drive pi over ACP through a custom backend |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
 
 ---

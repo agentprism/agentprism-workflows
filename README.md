@@ -151,6 +151,7 @@ Two packages are the primary **user-facing entry points** — start with one of 
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
 | **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, await, resume, and inspect — built on `@automatalabs/workflows`. |
+| **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; usable today through the generic custom-backend registry. |
 
 One optional integration package attaches to the SDK's manager surface:
 
@@ -158,7 +159,7 @@ One optional integration package attaches to the SDK's manager surface:
 |---|---|
 | **`@automatalabs/agentprism-otel`** | OpenTelemetry traces and metrics for a `WorkflowManager`; peer-depends only on `@opentelemetry/api` and no-ops when the host has no OTel SDK. |
 
-The other three are **internal building blocks**, composed by the SDK. You normally don't depend on them directly: `@automatalabs/workflows` is the public entry point for the supported orchestration surface.
+The three packages below are **internal building blocks**, composed by the SDK. You normally don't depend on them directly: `@automatalabs/workflows` is the public entry point for the supported orchestration surface.
 
 | Package | What it is |
 |---|---|

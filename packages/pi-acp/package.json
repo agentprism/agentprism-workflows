@@ -1,0 +1,60 @@
+{
+  "name": "@automatalabs/pi-acp",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VikashLoomba/agentprism-workflows.git",
+    "directory": "packages/pi-acp"
+  },
+  "type": "module",
+  "bin": {
+    "pi-acp": "./dist/index.js"
+  },
+  "main": "./dist/lib.js",
+  "types": "./src/lib.ts",
+  "exports": {
+    ".": {
+      "types": "./src/lib.ts",
+      "import": "./dist/lib.js",
+      "default": "./dist/lib.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/lib.js",
+    "types": "./dist/lib.d.ts",
+    "bin": {
+      "pi-acp": "./dist/index.js"
+    },
+    "exports": {
+      ".": {
+        "types": "./dist/lib.d.ts",
+        "import": "./dist/lib.js",
+        "default": "./dist/lib.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.type-tests.json && tsx --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "tsc -b"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.2.1",
+    "@earendil-works/pi-coding-agent": "0.80.7",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "typebox": "1.3.2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.80.7",
+    "@earendil-works/pi-ai": "0.80.7"
+  }
+}

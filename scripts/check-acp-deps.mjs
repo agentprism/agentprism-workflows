@@ -34,6 +34,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ACP_DEP_MATCHERS = [
   (name) => name.startsWith("@agentclientprotocol/"),
   (name) => name === "@automatalabs/codex-acp",
+  (name) => name === "@earendil-works/pi-coding-agent",
 ];
 
 // Forks we maintain whose published default branch must contain their upstream's default branch.
