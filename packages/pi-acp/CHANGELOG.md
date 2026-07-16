@@ -1,5 +1,11 @@
 # @automatalabs/pi-acp
 
+## 0.1.1
+
+### Patch Changes
+
+- 03b10b2: README: the custom-backend registration guidance now describes the current integration state and links the tracked built-in-backend issue instead of referencing an unfiled follow-up.
+
 ## 0.1.0
 
 ### Minor Changes
