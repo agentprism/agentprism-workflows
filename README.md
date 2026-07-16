@@ -387,6 +387,12 @@ Exit codes: `0` valid, `1` parse failure, `2` dry-run failure. See the
 [workflows validator guide](packages/workflows/README.md#validating-scripts--agentprism-workflows-validate)
 for file fixtures, precedence, validation, limits, and reports.
 
+Discover what a harness will negotiate **before** authoring: `npx @automatalabs/workflows config`
+probes each routable harness (built-ins + registered customs) with one no-prompt, zero-token
+session and prints its advertised config-option catalog — model ids (including bracket variants
+like `opus[1m]`), effort levels, modes. Name harnesses to scope it (`config codex`), `--json` for
+machines; it is the same table every validate report includes.
+
 ---
 
 ## Structured output

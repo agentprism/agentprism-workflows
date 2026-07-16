@@ -646,6 +646,43 @@ report.warnings;           // approval reminders, phase mismatches, headless-abo
 
 ---
 
+## Discovering harness options — `agentprism-workflows config`
+
+Validate's sibling command runs the same no-prompt config probe **standalone** — no script
+required — so `model` / `configOptions` values can be read off the live catalog before a
+workflow exists:
+
+```bash
+npx @automatalabs/workflows config                  # every routable harness
+npx @automatalabs/workflows config codex opencode   # only the named harnesses
+npx @automatalabs/workflows config claude --json    # machine-readable report
+```
+
+Harness names are the routing names: built-in `claude` / `codex` / `opencode` plus any custom
+backend registered via `AGENTPRISM_BACKENDS` (registered customs also join the no-argument
+default set). Each harness opens one session without a prompt — zero tokens — and reports its
+advertised config-option catalog verbatim: model ids (including bracket variants), effort
+levels, modes, boolean knobs. A harness that cannot spawn or authenticate reports
+`probed: false` with the reason and never blocks the others. Flags: `--cwd <dir>` (probe
+session cwd; default the current directory), `--timeout-ms <n>` (per-harness bound, default
+60000), `--json`. Exit codes: `0` all probed, `1` at least one probe failed, `3` usage error.
+
+Programmatic:
+
+```ts
+import { probeHarnessConfig, formatHarnessConfigReport } from "@automatalabs/workflows";
+
+const report = await probeHarnessConfig({ harnesses: ["codex"] });
+report.ok;             // every requested harness probed
+report.harnessOptions; // [{ backendId, probed, options?: SessionConfigOption[], error?: string }]
+formatHarnessConfigReport(report); // the CLI's human table
+```
+
+`probeHarnessConfig({ harnesses?, backends?, cwd?, timeoutMs? })` — `backends` merges over
+`AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
+
+---
+
 ## Structured output
 
 Pass a JSON Schema to `agent({ schema })` (in a script) or `runner.run(prompt, { schema })` (direct)
@@ -728,8 +765,10 @@ createReplayRunner,           // backend-neutral in-memory replay composition pr
 runWorkflow,                  // the bare engine run (no status trio)
 parseWorkflowScript,          // parse a script's meta + body
 validateWorkflowScript,       // token-free parse + mock dry run + no-prompt harness option probes
+probeHarnessConfig,           // the same no-prompt option probe standalone (the `config` CLI command)
 fabricateFromSchema,          // the dry run's JSON-Schema value fabricator
 formatValidateReport,         // render a ValidateWorkflowReport as CLI text
+formatHarnessConfigReport,    // render a HarnessConfigReport as CLI text
 openWorkflowDir,              // read-only view over folders of workflow scripts (name = filename stem)
 WorkflowManager,              // stateful / resumable run manager
 RESUME_FALLBACK_REASONS, RESUME_DISABLED_REASONS,
@@ -762,6 +801,7 @@ MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,
 ValidatedAgentCall, ValidatedCheckpoint,
+ProbeHarnessConfigOptions, HarnessConfigReport,
 WorkflowManagerOptions, CheckpointOptions, WorkflowRunResult, WorkflowRunFallback,
 WorkflowCheckpointTaken, WorkflowCheckpointSource, WorkflowSnapshot,
 ResumePolicy, WorkflowResumeStrategy, WorkflowResumeMatch, WorkflowResumeSafety,

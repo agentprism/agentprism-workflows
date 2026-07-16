@@ -1201,6 +1201,35 @@ function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+/** Render the per-harness advertised config-option tables, one indent level below the
+ *  given prefix. Shared verbatim between the validate report and `agentprism-workflows
+ *  config` (./config.ts) so the two commands' tables never drift. */
+export function renderHarnessOptionLines(
+  harnesses: readonly ValidateHarnessOptions[],
+  indent: string,
+): string[] {
+  const lines: string[] = [];
+  for (const harness of harnesses) {
+    if (!harness.probed) {
+      lines.push(`${indent}${harness.backendId}: probe failed — ${harness.error ?? "unknown error"}`);
+      continue;
+    }
+    lines.push(`${indent}${harness.backendId}:`);
+    lines.push(`${indent}  id | type | current | choices`);
+    if ((harness.options ?? []).length === 0) {
+      lines.push(`${indent}  (none advertised)`);
+      continue;
+    }
+    for (const option of harness.options ?? []) {
+      const choices = option.type === "select" ? displayAlternatives(selectChoiceValues(option)) : "true, false";
+      lines.push(
+        `${indent}  ${option.id} | ${option.type} | ${displayValue(option.currentValue)} | ${choices}`,
+      );
+    }
+  }
+  return lines;
+}
+
 /** Render a ValidateWorkflowReport as the human-readable CLI output. */
 export function formatValidateReport(report: ValidateWorkflowReport): string {
   const lines: string[] = [];
@@ -1231,24 +1260,7 @@ export function formatValidateReport(report: ValidateWorkflowReport): string {
       lines.push(`    • ${call.label}  ${bits}`);
     }
     lines.push("    advertised config options:");
-    for (const harness of dry.harnessOptions ?? []) {
-      if (!harness.probed) {
-        lines.push(`      ${harness.backendId}: probe failed — ${harness.error ?? "unknown error"}`);
-        continue;
-      }
-      lines.push(`      ${harness.backendId}:`);
-      lines.push("        id | type | current | choices");
-      if ((harness.options ?? []).length === 0) {
-        lines.push("        (none advertised)");
-        continue;
-      }
-      for (const option of harness.options ?? []) {
-        const choices = option.type === "select" ? displayAlternatives(selectChoiceValues(option)) : "true, false";
-        lines.push(
-          `        ${option.id} | ${option.type} | ${displayValue(option.currentValue)} | ${choices}`,
-        );
-      }
-    }
+    lines.push(...renderHarnessOptionLines(dry.harnessOptions ?? [], "      "));
     if ((dry.harnessOptions ?? []).length === 0) lines.push("      (no routed harnesses)");
     for (const cp of dry.checkpoints) {
       lines.push(`    ◆ checkpoint [${cp.kind}] "${truncate(cp.prompt, 60)}" → ${JSON.stringify(cp.reply)}`);

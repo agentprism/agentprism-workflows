@@ -80,15 +80,25 @@ The backend is selected **per `agent()` call** from its effective `model` string
 
 The published examples use ids verified against live harness catalogs: `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer backend-only forms when the desired model is configured inside the harness.
 
+Never guess model ids, effort values, or option names from memory — read the live catalog first:
+
+```bash
+npx @automatalabs/workflows config                # every routable harness (claude, codex, opencode + registered customs)
+npx @automatalabs/workflows config codex --json   # one harness, machine-readable
+```
+
+One no-prompt session per harness, zero tokens: the table lists every negotiable session option — model ids (including bracket variants like `opus[1m]`), effort levels, modes — exactly as the installed harness advertises them. This is the same probe the validator runs, available before a script exists; do NOT write a throwaway probe workflow (or read package internals) to discover options.
+
 ```js
 const plan   = await agent(PLAN_PROMPT,          { label: "plan",      model: "opencode/zai/glm-5.2", schema: PLAN });
 const impl   = await agent(implPrompt(plan),     { label: "implement", model: "codex/gpt-5.6-sol" });
 const review = await agent(reviewPrompt(impl),   { label: "review",    model: "claude/opus[1m]", schema: REVIEW });
 ```
 
-Use `configOptions` only for exact ACP session options advertised by that routed harness. Run the
-validator first and read its per-harness advertised-options table before choosing ids or select
-values; catalogs vary by harness version, login, and machine.
+Use `configOptions` only for exact ACP session options advertised by that routed harness. Read the
+per-harness advertised-options table first — `npx @automatalabs/workflows config <harness>`, or the
+same table in every validator report — before choosing ids or select values; catalogs vary by
+harness version, login, and machine.
 
 ```js
 const impl = await agent(implPrompt(plan), {
@@ -577,6 +587,8 @@ fixture without printing answer bodies.
 
 Exit codes: `0` valid · `1` parse failure · `2` dry-run or config-option failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
 
+The third pass's table is also available standalone — before any script exists — as validate's sibling command: `npx @automatalabs/workflows config [harness ...]` (default: every routable harness; `--json`; exit `1` when a probe fails). Use `config` while authoring to pick values; validate's copy then confirms the script you wrote against the same live catalog.
+
 If the script nests saved workflows by name (`workflow("review-pr")`), pass the folder so names resolve — and the positional itself may then be a name: `npx @automatalabs/workflows validate review-pr --workflows-dir ./workflows`. A green dry run proves structure, not judgment — prompts and schemas still deserve review.
 
 ## Pre-flight checklist
@@ -587,7 +599,8 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] Every agent prompt is self-contained — prior results interpolated in, no "as discussed above".
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.
 - [ ] Model specs only where a specific backend earns its keep; use a registered prefix plus a live-catalog-verified id (or backend-only form), and expect harness rejection rather than client fallback.
-- [ ] Every `configOptions` id/value comes verbatim from the validator's advertised-options table; `"model"` stays in the dedicated field.
+- [ ] Model ids and effort values were read from `npx @automatalabs/workflows config` (or a validator report), not recalled from memory.
+- [ ] Every `configOptions` id/value comes verbatim from an advertised-options table (`config` or the validator's report); `"model"` stays in the dedicated field.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
 - [ ] Every `resume: { filesystem: "read-only" }` assertion is true for all persistent/ambient effects; unordered parallel siblings do not communicate through files, and worktree calls do not commit or mutate outside the throwaway checkout.
 - [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.

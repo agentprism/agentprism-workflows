@@ -28,7 +28,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
 | `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Claude-family: `default`, `plan`, `acceptEdits`, `bypassPermissions`. Codex-family: `read-only`, `agent`, `agent-full-access`. OpenCode: its mode config option. Part of the resume hash when set. |
-| `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. Run validation and read the advertised-options table before choosing values. |
+| `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. Read the advertised-options table first (`agentprism-workflows config <harness>`, or any validate report) before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
 | `resume` | `{ filesystem: "read-only" }` | Author assertion that the call is safe for content-addressed mainline replay. A non-worktree call must not mutate persistent state; a successfully isolated worktree may contain ordinary checkout edits, but commits and effects outside it remain forbidden. Engine-owned, not passed to the runner, and not hashed. |
@@ -72,8 +72,9 @@ Ids and values are verbatim: strings stay strings, booleans stay booleans, and t
 aliases, vocabulary, defaults, coercion, or catalog fallback. Entries are sent in ascending
 option-id order after model selection and before the prompt. A harness rejection follows the
 ordinary agent-error path. Never put `"model"` in this bag; the engine rejects it before opening a
-session. The catalog varies by harness version, login, and machine, so run the validator every
-time and read its advertised config options before picking an id or select value.
+session. The catalog varies by harness version, login, and machine, so read a live advertised
+config-options table — `agentprism-workflows config <harness>`, or any validate report — before
+picking an id or select value, and run the validator every time after authoring.
 
 ## Structured output channels
 
@@ -548,6 +549,28 @@ Limits: 256 KiB raw UTF-8 for either CLI source and canonical JSON for programma
 Exit codes: `0` valid · `1` parse/static failure · `2` dry-run failure · `3` usage error. The report also lists every checkpoint with the mock reply (`default ?? true`) and warnings for backend approval, phase mismatch, `headless: "abort"`, and agent-less scripts. `headless: "pause"` dry-runs cleanly. A saved nested workflow still needs `--workflows-dir`.
 
 Programmatic: `validateWorkflowScript(script, { args, workflows, dryRun, cwd, tokenBudget, maxAgents, timeoutMs, mockAnswers })` from `@automatalabs/workflows` returns the same report. Invalid workflow scripts resolve to reports; invalid `mockAnswers` supplied from untyped JavaScript throws `TypeError` before parsing.
+
+## Harness config discovery — `agentprism-workflows config`
+
+Validate's sibling: the same no-prompt config probe, standalone — no script required. Run it BEFORE authoring to read each harness's advertised, negotiable session surface (model ids including bracket variants, effort levels, modes, boolean knobs) instead of guessing values or writing a throwaway probe workflow.
+
+```bash
+npx @automatalabs/workflows config                  # every routable harness
+npx @automatalabs/workflows config codex opencode   # only the named harnesses
+npx @automatalabs/workflows config claude --json    # machine-readable report
+```
+
+Harness names are the routing names: built-in `claude` / `codex` / `opencode` plus any custom backend registered via the `AGENTPRISM_BACKENDS` env var (registered customs also join the no-argument default set). Each harness opens one session without a prompt — zero tokens — and its catalog is read fresh; a harness that cannot spawn or authenticate reports `probed: false` with the reason and never blocks the others.
+
+| flag | meaning |
+|---|---|
+| `--cwd <dir>` | session cwd for the probes (default: the current directory — harnesses may resolve project-level config, and hence their catalog, from it) |
+| `--timeout-ms <n>` | per-harness probe bound (default 60000); a timed-out harness reports `probed:false` |
+| `--json` | machine-readable `HarnessConfigReport` on stdout (`harnessOptions` uses the same per-harness shape as validate's report) |
+
+Exit codes: `0` all probed · `1` at least one probe failed · `3` usage error.
+
+Programmatic: `probeHarnessConfig({ harnesses, backends, cwd, timeoutMs })` from `@automatalabs/workflows` returns the same report (`backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`); `formatHarnessConfigReport(report)` renders the human table.
 
 ## Workflow folders — `openWorkflowDir`
 

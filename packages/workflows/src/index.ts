@@ -91,6 +91,12 @@ export type {
   ValidatedMockAnswers,
   ValidatedMockAnswerUse,
 } from "./validate.js";
+
+// ── Harness config discovery: validate's sibling (`agentprism-workflows config`) — probe
+//    any routable ACP harness's advertised config-option catalog (model ids, effort levels,
+//    modes, …) without authoring a script. ──
+export { probeHarnessConfig, formatHarnessConfigReport } from "./config.js";
+export type { ProbeHarnessConfigOptions, HarnessConfigReport } from "./config.js";
 export type {
   WorkflowRunOptions,
   AgentOptions,
