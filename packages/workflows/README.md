@@ -296,8 +296,15 @@ checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a de
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
-Every terminal result may also carry `fallbacks` (a compatibility audit surface for non-resolution
-subsystems or third-party runners) and `checkpointsTaken` (one
+Usage-limit and auth resumes are continuation-aware by default on both `resumeFromRunId` and
+same-ID `resume()` / `resumeInBackground()`: when the interrupted root call's index, identity hash,
+full execution-input fingerprint, backend identity, cwd, and reopen support still agree, the manager
+reattaches its recorded ACP session and continues the unfinished turn. Worktree calls, changed or
+legacy inputs, missing cwd, and every uncertain/rejected reopen run fresh. This is internal manager →
+engine plumbing; the public SDK accepts no continuation option.
+
+Every terminal result may also carry `fallbacks` (including `kind: "continuation"` notices that
+record a reattached `resume`/`load` method or an exact skip reason) and `checkpointsTaken` (one
 resolved checkpoint per call with the journaled decision and `live` / `headless-default` /
 `journal-replay` / `injected` source). They are absent when empty, persist for cold reads, never
 enter replay hashes, and are not part of `WorkflowRunStatus` inspection.
@@ -389,7 +396,9 @@ runner names.
 Every live ACP-backed `agent()` call records a non-secret re-attach handle in
 `run.agentSessions`. Set `agent(..., { keepSession: true })` to skip release-time `session/close`,
 then use the runner's `loadSession()` or `resumeSession()` host API with that record. Session
-handles are additive and are also preserved in journals; they do not change the deterministic
+handles are additive and are also preserved in journals; pause-class failures skip `session/close`
+automatically, and eligible managed resumes consume the recorded handle internally. A continued
+result carries a diagnostic journal marker, but neither the handle nor marker changes deterministic
 resume identity.
 
 ### d) Bring your own backend — implement the `AgentRunner` seam

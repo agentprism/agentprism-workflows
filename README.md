@@ -51,7 +51,7 @@ From an ask like that, the agent picks the primitives — `gate()` fix-loops wit
 
 ### Durable runs — resume without re-spending tokens
 
-Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution can replay unchanged, explicitly safe calls even after insertions or reordering; ambiguous, unsafe, or environment-mismatched calls run live. Provider quota walls don't fail the run either: the run **pauses** with the provider's reset hint and can continue from its durable journal.
+Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution can replay unchanged, explicitly safe calls even after insertions or reordering; ambiguous, unsafe, or environment-mismatched calls run live. Provider quota and authentication walls don't fail the run either: the run **pauses**, keeps the interrupted ACP session reopenable, and on resume reattaches to continue that exact turn when its call index, identity, execution inputs, backend, cwd, and reopen capability still match. Any uncertainty fails to a fresh live call, while completed prefix calls retain the ordinary journal replay rules.
 
 > **Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.
 >
@@ -100,10 +100,10 @@ One process plays **two protocol roles at once**: it's an **MCP server** (or a l
 │   • the deterministic engine runs the script  │
 │   • ACP CLIENT → drives agent servers         │
 └──────────────────────────────────────────────┘
-        │  session/new, session/prompt … (ACP, JSON-RPC over stdio)
+        │  session/new or resume/load, then session/prompt … (ACP over stdio)
         ▼
    claude-agent-acp / codex-acp / opencode acp   (long-lived, pooled subprocesses)
-        │  → real Claude / Codex / OpenCode agents, one session per agent() call
+        │  → real agents; paused occurrences may reopen their recorded session
 ```
 
 The deterministic engine (sandboxed `vm` realm, `parallel`/`pipeline`, journal/resume, token budget, worktree isolation) is independent of *how* a single agent runs and of *how* the tool is exposed. See [`docs/design-notes.md`](docs/design-notes.md) for the full protocol-level design.
@@ -206,7 +206,7 @@ console.log(run.result);   // [{ repo: "...", fileCount: 123 }, …] — schema-
 console.log(run.tokenUsage, run.runId);
 ```
 
-`runDynamicWorkflow` resolves to a **terminal** `WorkflowRunResult` even on pause/fail/abort — read `run.status` instead of catching. The result retains the optional `fallbacks` compatibility field, but model resolution no longer emits fallback entries: the selected harness accepts, ignores, or rejects the verbatim id. `checkpointsTaken` records every checkpoint resolved in that execution with its decision source (`live`, `headless-default`, `journal-replay`, or `injected`). Both fields are absent when empty and do not affect routing or replay identity. To swap the backend (or stub it in tests), pass your own runner: `runDynamicWorkflow(script, { runner })`. For lower-level control, use `WorkflowManager` / `runWorkflow` (also re-exported from the SDK).
+`runDynamicWorkflow` resolves to a **terminal** `WorkflowRunResult` even on pause/fail/abort — read `run.status` instead of catching. The optional `fallbacks` audit field records resume-continuation outcomes (`kind: "continuation"`, reattached method or skip reason); model resolution itself emits no entries because the selected harness accepts or rejects the verbatim id. `checkpointsTaken` records every checkpoint resolved in that execution with its decision source (`live`, `headless-default`, `journal-replay`, or `injected`). Both fields are absent when empty and do not affect routing or replay identity. To swap the backend (or stub it in tests), pass your own runner: `runDynamicWorkflow(script, { runner })`. For lower-level control, use `WorkflowManager` / `runWorkflow` (also re-exported from the SDK).
 
 ### Run a single agent directly
 
@@ -418,7 +418,7 @@ before choosing ids or select values.
 
 Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer the backend-only forms when the desired model is configured inside the harness.
 
-One long-lived ACP process per backend is **pooled** and reused across `agent()` calls (one spawn + one `initialize`), with a fresh session per call — so worktree isolation is preserved via each session's `cwd`.
+One long-lived ACP process per backend is **pooled** and reused across `agent()` calls (one spawn + one `initialize`). Calls normally open a fresh session; an eligible resume of a usage/auth-paused occurrence instead reopens that occurrence's recorded session and continues it. Worktree-isolated calls always stay on the fresh path, preserving isolation through each new session's `cwd`.
 
 ### Custom backends — run *any* ACP agent
 

@@ -167,6 +167,14 @@ manual `resumeJournal` remain permanently legacy positional paths. Full types, r
 catalogs, checkpoint source-index rules, and filesystem preconditions are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 
+Separately from replay correspondence, the manager builds a `PreparedContinuation` from a
+usage/auth-paused snapshot's coherent root `calls[]` × `agents[]` join. Both new-run and same-ID
+resume paths thread it to the live boundary. On attempt one, an exact call-index/hash/input/cwd
+match that is not worktree-isolated passes the recorded session ref to the runner; every failed
+gate runs fresh and emits a guarded `kind: "continuation"` notice with its exact reason. Candidates
+are rebuilt per execution, so multiple new-run consumers may independently reopen the same paused
+source session. Nested workflows receive no continuation channel.
+
 Inside a script, a compact replay-safe fan-out looks like:
 
 ```js
@@ -215,9 +223,10 @@ are unchanged. Terminal persisted states retain a safe run-level `reason` and `e
 inspection. Every paused, failed, or aborted `WorkflowRunResult` has a redacted final-20 `logTail`
 (present even when empty); completed results omit it and preserve the full raw `logs` array.
 
-Two optional terminal audit arrays are persisted alongside that state. `fallbacks` remains a
-compatibility surface for non-resolution subsystems and third-party runners; model selection no
-longer emits entries because harness errors propagate through the existing agent-error path.
+Two optional terminal audit arrays are persisted alongside that state. `fallbacks` records
+continuation reattach/skip outcomes (and remains compatible with model/modifier entries); model
+selection itself emits no entries because harness errors propagate through the existing
+agent-error path.
 `checkpointsTaken` records each checkpoint
 that resolved in this execution with its journaled decision and source: `live`, `headless-default`,
 `journal-replay`, or `injected` from `checkpointReplies`. Pausing checkpoints are omitted. Both
@@ -236,9 +245,11 @@ again. A detached run therefore never hangs or pauses for a checkpoint unless it
 chooses `headless: "pause"`.
 
 When a runner reports `onSessionOpen`, the engine records the non-secret re-attach handle on the
-journal entry and in `WorkflowRunResult.agentSessions`. `agent({ keepSession: true })` is forwarded
-to the runner so an ACP implementation can skip release-time `session/close`; re-attaching is a
-host/runner responsibility, not an in-script DSL operation.
+journal entry and in `WorkflowRunResult.agentSessions`. Auth/usage failures truthfully record
+`keptOpen: true` even without authored `keepSession`. A successful managed continuation journals
+the reattach method as diagnostic metadata, preserves it across replay/event projection, and debits
+only the continuation turn's reported usage. Scripts still cannot request reattach; the manager owns
+the resume directive and custom runners may decline it by running fresh.
 
 ## Durable run-event log
 
@@ -304,7 +315,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 - **Engine** — `runWorkflow`, `parseWorkflowScript`; types `EngineRunResult`,
   `WorkflowRunOptions`, `AgentOptions`, `CheckpointOptions`, `WorkflowAgentOptions`,
   `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
-  `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, and the resume policy/report types.
+  `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, `PreparedContinuation`,
+  `ContinuationCandidate`, and the resume policy/report types.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
   `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
   `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,

@@ -121,7 +121,7 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Per-agent timeout in ms. Omit or pass `null` for no hard timeout (the engine owns timeouts). |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
-| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits exact runtime/cwd/terminal environment and replays only uniquely matching safety-marked calls; uncertainty runs live. |
+| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits exact runtime/cwd/terminal environment and replays only uniquely matching safety-marked calls. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format input/safety/environment gates. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. Wire keys must be canonical non-negative safe integers. |
 | `runId` | engine run ID | inspect/await/stop only | — | Required for inspect/await/stop; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
@@ -226,12 +226,18 @@ interface WorkflowExecutionToolResult {
   logTail?: WorkflowLogTail;               // paused/failed/aborted only
   authContext?: AuthErrorContext;           // auth_required pauses only
   checkpointContext?: CheckpointContext;   // checkpoint_required pauses only
-  fallbacks?: WorkflowRunFallback[];       // compatibility events; absent when empty
+  fallbacks?: WorkflowRunFallback[];       // model/modifier/continuation audit; absent when empty
   checkpointsTaken?: WorkflowCheckpointTaken[]; // resolved checkpoints; absent when empty
   resumeReport?: WorkflowResumeReport;     // resumeFromRunId correspondence; otherwise absent
   scriptSource: "inline" | "path";
   scriptUri: string;
 }
+
+`WorkflowRunFallback.kind` is `"model" | "modifier" | "continuation"`. Continuation entries carry
+an optional flat detail of `{ outcome: "reattached", method: "resume" | "load" }` or
+`{ outcome: "skipped", reason }`; the MCP output schema deliberately also accepts a continuation
+kind without detail and a non-continuation kind with detail for backwards/forwards compatibility.
+Continuation is default-on manager behavior and adds no MCP input.
 
 interface WorkflowBackgroundAccepted {
   runId: string;

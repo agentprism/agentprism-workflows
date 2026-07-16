@@ -481,6 +481,9 @@ function projectProvenance(
       ...(provenance.overrideModel === undefined
         ? {}
         : { overrideModel: projectText(provenance.overrideModel, state) }),
+      ...(provenance.continuation === undefined
+        ? {}
+        : { continuation: provenance.continuation }),
     };
   }
   return {
@@ -731,6 +734,9 @@ export function projectRunEventForPersistence(
                     ...(event.entry.call.backendId === undefined
                       ? {}
                       : { backendId: projectText(event.entry.call.backendId, state) }),
+                    ...(event.entry.call.continuation === undefined
+                      ? {}
+                      : { continuation: event.entry.call.continuation }),
                   },
                 }
               : {

@@ -1,4 +1,5 @@
 import type {
+  AgentSessionRecord,
   ResumePolicy,
   WorkflowCallRecord,
   WorkflowResumeCallFailedReason,
@@ -7,6 +8,20 @@ import type {
   WorkflowResumeFallbackReason,
 } from "@automatalabs/shared-types";
 import type { PersistedResumeSeed } from "./run-persistence.js";
+
+/** One interrupted root agent occurrence that may be continued at its live boundary. */
+export interface ContinuationCandidate {
+  readonly callIndex: number;
+  readonly hash: string;
+  readonly inputsHash?: string;
+  readonly sessionRef: AgentSessionRecord;
+  readonly recordedCwd: string;
+}
+
+/** Manager-prepared continuation candidates for one resumed execution. */
+export interface PreparedContinuation {
+  readonly candidatesByIndex: ReadonlyMap<number, ContinuationCandidate>;
+}
 
 export const RESUME_FALLBACK_REASONS = Object.freeze([
   "legacy-recording",

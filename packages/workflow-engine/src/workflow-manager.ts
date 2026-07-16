@@ -52,7 +52,11 @@ import {
   type ResumeAdmissionDecision,
   type ResumeReportPlan,
 } from "./resume-matcher.js";
-import type { PreparedResume } from "./resume.js";
+import type {
+  ContinuationCandidate,
+  PreparedContinuation,
+  PreparedResume,
+} from "./resume.js";
 import { withRunEvents, type RunEventPersistence } from "./run-event-persistence.js";
 import { projectRecordedError } from "./recorded-error.js";
 import { workflowHomeDir } from "./workflow-paths.js";
@@ -124,6 +128,8 @@ export interface ManagedRun {
   readonly resumeSourceRunId?: string;
   /** Manager-owned remaining correspondence state for a new-run resume. */
   resumeSeed?: PersistedResumeSeed;
+  /** Resume-only interrupted root calls eligible for live session continuation. */
+  preparedContinuation?: PreparedContinuation;
   /** Manager-owned report, incrementally updated while the engine is executing. */
   resumeReport?: WorkflowResumeReport;
   resumeReportPlan?: ResumeReportPlan;
@@ -320,6 +326,38 @@ function latestRows<T extends { index: number }>(rows: T[]): T[] {
   const latest = new Map<number, T>();
   for (const row of rows) latest.set(row.index, row);
   return [...latest.values()].sort((a, b) => a.index - b.index);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isOptionalString(value: Record<string, unknown>, key: string): boolean {
+  return value[key] === undefined || typeof value[key] === "string";
+}
+
+function isContinuationSession(
+  value: unknown,
+): value is AgentSessionRecord & { cwd?: string } {
+  if (!isRecord(value) || !isRecord(value.reopen)) return false;
+  return (
+    typeof value.sessionId === "string" &&
+    typeof value.backendId === "string" &&
+    (value.cwd === undefined || typeof value.cwd === "string") &&
+    isOptionalString(value, "poolKey") &&
+    typeof value.reopen.load === "boolean" &&
+    typeof value.reopen.resume === "boolean" &&
+    typeof value.reopen.list === "boolean" &&
+    (value.reopen.fork === undefined || typeof value.reopen.fork === "boolean") &&
+    isNonNegativeSafeInteger(value.callIndex) &&
+    typeof value.label === "string" &&
+    isOptionalString(value, "phase") &&
+    typeof value.keptOpen === "boolean"
+  );
 }
 
 function runReason(status: RunStatus, error: WorkflowError | undefined): string | undefined {
@@ -615,6 +653,78 @@ export class WorkflowManager extends EventEmitter {
     }
   }
 
+  /** Build a defensive, snapshot-only continuation projection. Bad persistence can
+   *  only remove candidates; it can never make resume throw. */
+  private buildPreparedContinuation(
+    persisted: PersistedRunState,
+  ): PreparedContinuation | undefined {
+    if (
+      !isRecord(persisted) ||
+      persisted.status !== "paused" ||
+      (persisted.pauseReason !== "usage_limit" && persisted.pauseReason !== "auth_required") ||
+      typeof persisted.runId !== "string"
+    ) {
+      return undefined;
+    }
+
+    const agents = Array.isArray(persisted.agents) ? persisted.agents : [];
+    const joinedAgents = new Map<number, AgentSessionRecord & { cwd?: string }>();
+    for (const value of agents) {
+      if (!isRecord(value)) continue;
+      if (value.scope !== undefined && value.scope !== persisted.runId) continue;
+      if (value.status !== "error") continue;
+      if (!Object.prototype.hasOwnProperty.call(value, "callIndex")) continue;
+      if (!isNonNegativeSafeInteger(value.callIndex)) continue;
+      if (!isContinuationSession(value.session)) continue;
+      if (value.session.callIndex !== value.callIndex) continue;
+      if (
+        value.errorCode !== WorkflowErrorCode.PROVIDER_USAGE_LIMIT &&
+        value.errorCode !== WorkflowErrorCode.AUTH_REQUIRED
+      ) {
+        continue;
+      }
+      joinedAgents.set(value.callIndex, value.session);
+    }
+
+    const calls = Array.isArray(persisted.calls) ? persisted.calls : [];
+    const rootCalls = new Map<number, Record<string, unknown>>();
+    for (const value of calls) {
+      if (!isRecord(value) || !isNonNegativeSafeInteger(value.index)) continue;
+      if (value.scope !== undefined && value.scope !== persisted.runId) continue;
+      rootCalls.set(value.index, value);
+    }
+
+    const candidatesByIndex = new Map<number, ContinuationCandidate>();
+    for (const index of [...rootCalls.keys()].sort((left, right) => left - right)) {
+      const record = rootCalls.get(index) as Record<string, unknown>;
+      const joined = joinedAgents.get(index);
+      if (!joined || record.kind !== "agent" || record.outcome !== "error") continue;
+      if (typeof record.hash !== "string") continue;
+      if (record.inputsHash !== undefined && typeof record.inputsHash !== "string") continue;
+      if (typeof record.backendId !== "string" || joined.backendId !== record.backendId) continue;
+      if (record.resolvedCwd !== undefined && typeof record.resolvedCwd !== "string") continue;
+      if (
+        joined.cwd !== undefined &&
+        record.resolvedCwd !== undefined &&
+        joined.cwd !== record.resolvedCwd
+      ) {
+        continue;
+      }
+      if (joined.reopen.resume !== true && joined.reopen.load !== true) continue;
+      const recordedCwd = record.resolvedCwd ?? joined.cwd;
+      if (typeof recordedCwd !== "string") continue;
+      candidatesByIndex.set(index, {
+        callIndex: index,
+        hash: record.hash,
+        ...(typeof record.inputsHash === "string" ? { inputsHash: record.inputsHash } : {}),
+        sessionRef: joined,
+        recordedCwd,
+      });
+    }
+
+    return candidatesByIndex.size === 0 ? undefined : { candidatesByIndex };
+  }
+
   private prepareManagedResume(
     managed: ManagedRun,
     source: PersistedRunState,
@@ -642,6 +752,7 @@ export class WorkflowManager extends EventEmitter {
     managed.resumeReportPlan = this.reportPlan(admission);
     managed.resumeDecisions = new Map();
     managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
+    managed.preparedContinuation = this.buildPreparedContinuation(source);
 
     if (admission.strategy === "identity-v1") {
       managed.resumeSeed = admission.seed;
@@ -1078,6 +1189,7 @@ export class WorkflowManager extends EventEmitter {
     } = exec;
     const resumeJournal = resumeExecution?.resumeJournal ?? exec.resumeJournal;
     const preparedResume = resumeExecution?.preparedResume;
+    const preparedContinuation = managed.preparedContinuation;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
@@ -1146,6 +1258,7 @@ export class WorkflowManager extends EventEmitter {
           ? preparedResume?.sourceRunId ?? (resumeJournal ? managed.runId : undefined)
           : undefined,
         preparedResume,
+        preparedContinuation,
         runId: managed.runId,
         onResumeFilesystemTainted: () => {
           managed.resumeFilesystemTainted = true;
@@ -1950,6 +2063,7 @@ export class WorkflowManager extends EventEmitter {
       eventSeq: publication.eventSeq,
       eventLogIncomplete: publication.eventLogIncomplete,
     };
+    managed.preparedContinuation = this.buildPreparedContinuation(persisted);
     this.runs.set(runId, managed);
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
