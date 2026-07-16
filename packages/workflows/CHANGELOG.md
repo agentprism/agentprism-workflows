@@ -1,5 +1,20 @@
 # @automatalabs/workflows
 
+## 0.38.0
+
+### Minor Changes
+
+- 2beca1e: Promote Pi to a first-class built-in backend with exact-prefix model routing, native structured
+  output, categorical provider errors, complete auth descriptors, bundled spawning, configuration
+  discovery, and credential-free plus opt-in live end-to-end coverage. Update pi-acp's exact-pinned pi
+  runtime and hermetic test dependencies to 0.80.9.
+
+### Patch Changes
+
+- Updated dependencies [805c7b1]
+- Updated dependencies [2beca1e]
+  - @automatalabs/acp-agents@0.30.0
+
 ## 0.37.1
 
 ### Patch Changes
