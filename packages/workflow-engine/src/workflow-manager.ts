@@ -1933,6 +1933,7 @@ export class WorkflowManager extends EventEmitter {
       runtime: runtimeIdentity(),
       environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),
       ...(persisted.resume ? { resume: { format: "identity-v1" as const } } : {}),
+      ...(persisted.resumeSourceRunId ? { resumeSourceRunId: persisted.resumeSourceRunId } : {}),
       resumeActivity: 0,
       resumeFilesystemTainted: false,
       resumeTerminalFinalized: false,
