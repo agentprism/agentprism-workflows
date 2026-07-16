@@ -32,7 +32,12 @@ test("T1 bin reserves stdout and --version is exact", async () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0);
-  assert.equal(result.stdout, "0.0.0\n");
+  // The manifest is the version's single source of truth — a literal here breaks
+  // on every Version Packages bump.
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  };
+  assert.equal(result.stdout, `${manifest.version}\n`);
   assert.equal(result.stderr, "");
   const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
   assert.ok(source.indexOf("console.log = console.error") < source.indexOf('import("./server.js")'));
