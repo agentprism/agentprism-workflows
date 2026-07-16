@@ -883,7 +883,7 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
       async listTools() { return { tools: [{ name: "remote", inputSchema: { type: "object" } }] }; },
       async callTool() {
         if (mode === "timeout") return late.promise;
-        return { content: [{ type: "text", text: "RAW_PROVIDER_SECRET" }], isError: true };
+        return { content: [{ type: "text", text: "remote tool error detail" }], isError: true };
       },
     });
     const updates: SessionUpdate[] = [];
@@ -908,8 +908,8 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
       const failed = updates.find((update) => update.sessionUpdate === "tool_call_update" && update.status === "failed");
       assert.ok(failed && failed.sessionUpdate === "tool_call_update");
       const failedText = JSON.stringify(failed.content);
-      assert.match(failedText, mode === "timeout" ? /timed out/ : /returned an error result/);
-      assert.doesNotMatch(failedText, /RAW_PROVIDER_SECRET/);
+      assert.match(failedText, mode === "timeout" ? /timed out/ : /remote tool error detail/);
+      if (mode === "isError") assert.doesNotMatch(failedText, /returned an error result/);
       if (mode === "timeout") late.reject(new Error("late tools/call rejection"));
       await setImmediatePromise();
       assert.deepEqual(unhandled, []);

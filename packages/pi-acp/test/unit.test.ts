@@ -79,7 +79,6 @@ test("T4 prompt content fold is total, ordered, and accepts image-only", () => {
     [],
     [{ type: "text", text: "" }],
     [{ type: "text", text: "" }, { type: "text", text: "" }],
-    [{ type: "text", text: " \t" }, { type: "text", text: "\n" }],
     [{ type: "resource", resource: { uri: "file:///empty", text: "" } }],
     [
       { type: "resource", resource: { uri: "file:///empty-1", text: "" } },
@@ -91,6 +90,10 @@ test("T4 prompt content fold is total, ordered, and accepts image-only", () => {
       (error) => wire(error as RequestError).data.errorKind === "empty_prompt",
     );
   }
+  assert.equal(convertPromptContent([
+    { type: "text", text: " \t" },
+    { type: "text", text: "\n" },
+  ]).text, " \t\n\n\n");
 });
 
 test("T5 live translation and result projection cover the pinned rows", () => {

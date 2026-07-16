@@ -44,7 +44,17 @@ export class StructuredOutputState {
     const holder = this.schemaHolder as unknown as Record<string, unknown>;
     for (const key of Object.keys(holder)) delete holder[key];
     Object.assign(holder, schema);
-    session.setActiveToolsByName([...this.baseActive, STRUCTURED_TOOL_NAME]);
+    try {
+      session.setActiveToolsByName([...this.baseActive, STRUCTURED_TOOL_NAME]);
+    } catch (error) {
+      this.captured = undefined;
+      try {
+        session.setActiveToolsByName(this.baseActive);
+      } catch (rollbackError) {
+        console.error("pi-acp structured-output arm rollback error:", rollbackError);
+      }
+      throw error;
+    }
     return "Finish by calling __acp_structured_output with a value conforming to the requested output schema.";
   }
 

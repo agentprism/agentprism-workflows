@@ -16,7 +16,7 @@ interface ReplayMessage {
   display?: boolean;
   command?: string;
   output?: string;
-  exitCode?: number;
+  exitCode?: number | null;
   cancelled?: boolean;
   truncated?: boolean;
   fullOutputPath?: string;
@@ -31,11 +31,11 @@ function blocks(content: string | ContentItem[] | undefined): ContentBlock[] {
   );
 }
 
-function bashText(message: ReplayMessage): string {
+function bashExecutionToText(message: ReplayMessage): string {
   let text = `Ran \`${message.command ?? ""}\`\n`;
   text += message.output ? `\`\`\`\n${message.output}\n\`\`\`` : "(no output)";
   if (message.cancelled) text += "\n\n(command cancelled)";
-  else if (message.exitCode !== undefined && message.exitCode !== 0) {
+  else if (message.exitCode !== null && message.exitCode !== undefined && message.exitCode !== 0) {
     text += `\n\nCommand exited with code ${message.exitCode}`;
   }
   if (message.truncated && message.fullOutputPath) {
@@ -85,7 +85,7 @@ function replayMessage(message: ReplayMessage): SessionUpdate[] {
       return [update];
     }
     case "bashExecution":
-      return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: bashText(message) } }];
+      return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: bashExecutionToText(message) } }];
     case "custom":
       return message.display
         ? blocks(message.content as string | ContentItem[]).map((content) => ({

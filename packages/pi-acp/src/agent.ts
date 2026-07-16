@@ -158,14 +158,18 @@ export class PiAcpAgent {
         client,
         deps: this.deps,
         mcpClients: bridge.clients,
+        failedMcpResults: bridge.failedResults,
         structured,
         onWedged: (sessionId, session) => this.terminateWedged(sessionId, session),
       });
       structured.install(pi);
       const names = new Set(pi.getAllTools().map(({ name }) => name));
       if (!names.has(STRUCTURED_TOOL_NAME)) throw adapterError("structured_tool_collision");
-      if (bridge.aliases.some((alias) => !names.has(alias))) {
-        throw adapterError("mcp_init_error", { server: "tool-registry" });
+      const missingAlias = bridge.aliases.find((alias) => !names.has(alias));
+      if (missingAlias) {
+        throw adapterError("mcp_init_error", {
+          server: bridge.aliasServers.get(missingAlias) ?? "unknown",
+        });
       }
       if (replay) await wrapper.replay(manager.getBranch());
       this.gate(opening);
@@ -301,6 +305,8 @@ export class PiAcpAgent {
         this.gate(opening);
         bridge = await bridgeMcpServers(context.params.mcpServers ?? [], opening.controller.signal, this.deps);
         this.gate(opening);
+        if (this.tombstones.has(context.params.sessionId)) throw adapterError("session_terminated");
+        if (liveSource?.busy) throw adapterError("session_busy");
         let manager: SessionManager;
         try {
           manager = this.deps.sessions.forkFrom(sourcePath, context.params.cwd, this.deps.sessionDir);
@@ -333,7 +339,7 @@ export class PiAcpAgent {
   }
 
   async listSessions(context: AgentRequestContext<ListSessionsRequest>) {
-    if (context.params.cwd) validateCwd(context.params.cwd);
+    if (context.params.cwd !== undefined && context.params.cwd !== null) validateCwd(context.params.cwd);
     let offset = 0;
     const cursor = context.params.cursor;
     if (cursor) {

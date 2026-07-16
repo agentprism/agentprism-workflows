@@ -77,7 +77,7 @@ function translateAssistantEvent(event: Extract<AgentSessionEvent, { type: "mess
   }
 }
 
-export function translateEvent(event: AgentSessionEvent): SessionUpdate[] {
+export function translateEvent(event: AgentSessionEvent, failedResult?: PiResult): SessionUpdate[] {
   switch (event.type) {
     case "message_update":
       return translateAssistantEvent(event.assistantMessageEvent);
@@ -100,7 +100,7 @@ export function translateEvent(event: AgentSessionEvent): SessionUpdate[] {
         content: toContent(event.partialResult as PiResult),
       }];
     case "tool_execution_end": {
-      const result = event.result as PiResult;
+      const result = failedResult ?? event.result as PiResult;
       const update: SessionUpdate = {
         sessionUpdate: "tool_call_update",
         toolCallId: event.toolCallId,

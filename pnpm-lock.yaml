@@ -95,6 +95,13 @@ importers:
       typebox:
         specifier: 1.3.2
         version: 1.3.2
+    devDependencies:
+      '@earendil-works/pi-agent-core':
+        specifier: 0.80.7
+        version: 0.80.7(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.1)(zod@4.4.3)
+      '@earendil-works/pi-ai':
+        specifier: 0.80.7
+        version: 0.80.7(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.1)(zod@4.4.3)
 
   packages/shared-types:
     dependencies:

@@ -6,7 +6,20 @@ import {
   RequestError,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  AgentSession,
+  AuthStorage,
+  DefaultResourceLoader,
+  ModelRegistry,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import { Agent } from "@earendil-works/pi-agent-core";
+import {
+  createAssistantMessageEventStream,
+  type AssistantMessage,
+  type Model,
+} from "@earendil-works/pi-ai";
 import { PiAcpAgent } from "../src/agent.js";
 import { bridgeMcpServers } from "../src/mcp-bridge.js";
 import { runAcp } from "../src/server.js";
@@ -35,6 +48,118 @@ test("T14/T21 scripted ACP client observes ordered updates before the full-turn 
   assert.equal(response.stopReason, "end_turn");
   assert.deepEqual(updates.map(({ sessionUpdate }) => sessionUpdate), ["agent_message_chunk", "usage_update"]);
   assert.equal(setup.createOptions[0]?.modelRegistry, setup.deps.modelRegistry);
+  connection.close();
+  server.connection.close();
+  await server.agent.dispose();
+});
+
+test("T21 real AgentSession with an injected Agent streamFn completes a credential-free ACP turn", async () => {
+  const setup = fakeDeps();
+  const authStorage = AuthStorage.create(`${setup.sessionDir}/hermetic-auth.json`);
+  authStorage.set("openai", { type: "api_key", key: "hermetic-key" });
+  const modelRegistry = ModelRegistry.create(authStorage, `${setup.sessionDir}/missing-models.json`);
+  setup.deps.modelRegistry = modelRegistry;
+  const model: Model<"openai-completions"> = {
+    id: "hermetic-model",
+    name: "Hermetic model",
+    api: "openai-completions",
+    provider: "openai",
+    baseUrl: "https://example.invalid/v1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 8_192,
+    maxTokens: 1_024,
+  };
+  const settingsManager = SettingsManager.create(setup.cwd, setup.sessionDir);
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: setup.cwd,
+    agentDir: setup.sessionDir,
+    settingsManager,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  });
+  await resourceLoader.reload();
+  let constructedWithRegistry: ModelRegistry | undefined;
+  setup.deps.createAgentSession = async (options) => {
+    constructedWithRegistry = options.modelRegistry;
+    const streamFn = () => {
+      const stream = createAssistantMessageEventStream();
+      const message: AssistantMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: "hermetic pong" }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: {
+          input: 2,
+          output: 2,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 4,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+      queueMicrotask(() => {
+        stream.push({ type: "start", partial: { ...message, content: [] } });
+        const partial = { ...message, content: [{ type: "text" as const, text: "hermetic pong" }] };
+        stream.push({ type: "text_start", contentIndex: 0, partial: { ...message, content: [{ type: "text", text: "" }] } });
+        stream.push({ type: "text_delta", contentIndex: 0, delta: "hermetic pong", partial });
+        stream.push({ type: "text_end", contentIndex: 0, content: "hermetic pong", partial });
+        stream.push({ type: "done", reason: "stop", message });
+      });
+      return stream;
+    };
+    const agent = new Agent({
+      initialState: { model, systemPrompt: "Hermetic test", tools: [] },
+      getApiKey: () => "hermetic-key",
+      streamFn,
+    });
+    const session = new AgentSession({
+      agent,
+      sessionManager: options.sessionManager ?? SessionManager.inMemory(setup.cwd),
+      settingsManager,
+      cwd: setup.cwd,
+      resourceLoader,
+      customTools: options.customTools,
+      modelRegistry,
+      initialActiveToolNames: [],
+    });
+    return {
+      session,
+      extensionsResult: resourceLoader.getExtensions(),
+      modelFallbackMessage: undefined,
+    };
+  };
+
+  const pair = streamPair();
+  const updates: SessionUpdate[] = [];
+  const clientApp = client({ name: "pi-acp-hermetic-test" })
+    .onNotification(methods.client.session.update, ({ params }) => { updates.push(params.update); })
+    .onRequest(methods.client.session.requestPermission, () => ({
+      outcome: { outcome: "selected", optionId: "allow_once" },
+    }));
+  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const connection = clientApp.connect(pair.client);
+  await connection.agent.request(methods.agent.initialize, { protocolVersion: 1 });
+  const opened = await connection.agent.request(methods.agent.session.new, {
+    cwd: setup.cwd,
+    mcpServers: [],
+  });
+  const response = await connection.agent.request(methods.agent.session.prompt, {
+    sessionId: opened.sessionId,
+    prompt: [{ type: "text", text: "ping" }],
+  });
+  assert.equal(response.stopReason, "end_turn");
+  assert.equal(response.usage?.totalTokens, 4);
+  assert.equal(constructedWithRegistry, modelRegistry);
+  assert.ok(updates.some((update) =>
+    update.sessionUpdate === "agent_message_chunk" && update.content.text === "hermetic pong"));
   connection.close();
   server.connection.close();
   await server.agent.dispose();
@@ -145,6 +270,7 @@ test("T17 list pagination uses canonical base64url offsets and tolerates shrink 
   const shrunk = await agent.listSessions(context({ cursor: first.nextCursor }));
   assert.deepEqual(shrunk.sessions, []);
   await assert.rejects(agent.listSessions(context({ cursor: "MDE=" })), (error) => kind(error) === "invalid_cursor");
+  await assert.rejects(agent.listSessions(context({ cwd: "" })), (error) => kind(error) === "invalid_cwd");
 });
 
 test("T18/T22 scheduler-driven wedged cancel resolves once, tombstones, disposes, and close stays successful", async () => {

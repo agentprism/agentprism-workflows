@@ -43,6 +43,8 @@ export function convertPromptContent(blocks: readonly ContentBlock[]): Converted
     }
   }
   const joined = text.join("\n\n");
-  if (joined.trim() === "" && images.length === 0) throw adapterError("empty_prompt");
+  if (!text.some((segment) => segment.length > 0) && images.length === 0) {
+    throw adapterError("empty_prompt");
+  }
   return { text: joined, images };
 }

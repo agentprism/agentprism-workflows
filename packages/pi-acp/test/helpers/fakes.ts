@@ -52,6 +52,7 @@ export function fakeSession(
   const agent = {
     state: { messages },
     beforeToolCall: undefined as unknown,
+    afterToolCall: undefined as unknown,
     abort() { abortCalls += 1; },
   };
   const object = {
@@ -101,6 +102,24 @@ export function fakeSession(
           result = {
             content: [{ type: "text", text: error instanceof Error ? error.message : "tool failed" }],
           };
+        }
+        const afterResult = await (agent.afterToolCall as
+          | ((context: unknown, signal: AbortSignal) => Promise<{
+            content?: typeof result.content;
+            details?: unknown;
+            isError?: boolean;
+          } | undefined>)
+          | undefined)?.(
+          { toolCall: { id: toolCallId, name: tool.name }, args, result, isError },
+          new AbortController().signal,
+        );
+        if (afterResult) {
+          result = {
+            ...result,
+            content: afterResult.content ?? result.content,
+            details: afterResult.details ?? result.details,
+          };
+          isError = afterResult.isError ?? isError;
         }
         const end = {
           type: "tool_execution_end",

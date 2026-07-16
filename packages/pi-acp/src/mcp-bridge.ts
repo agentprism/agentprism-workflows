@@ -83,7 +83,11 @@ export async function connectDefaultMcpClient(
           // The child may have exited between the timeout and the kill.
         }
       }
-      await close;
+      try {
+        await bounded(close, new AbortController().signal, timeoutMs, sleep);
+      } catch {
+        close.then(() => undefined, () => undefined);
+      }
     }
     throw error;
   }
@@ -178,10 +182,14 @@ export function convertMcpResult(result: CallToolResult) {
   };
 }
 
+export type McpResultProjection = ReturnType<typeof convertMcpResult>;
+
 export interface McpBridge {
   clients: McpClientHandle[];
   tools: ToolDefinition[];
   aliases: string[];
+  aliasServers: Map<string, string>;
+  failedResults: Map<string, McpResultProjection>;
 }
 
 async function closeClients(clients: readonly McpClientHandle[], deps: PiAcpDeps): Promise<void> {
@@ -210,6 +218,8 @@ export async function bridgeMcpServers(
   const clients: McpClientHandle[] = [];
   const tools: ToolDefinition[] = [];
   const aliases: string[] = [];
+  const aliasServers = new Map<string, string>();
+  const failedResults = new Map<string, McpResultProjection>();
   const usedAliases = new Set<string>();
   try {
     for (const server of servers as readonly McpServerStdio[]) {
@@ -251,6 +261,7 @@ export async function bridgeMcpServers(
       for (const remoteTool of serverTools) {
         const alias = allocateAlias(server.name, remoteTool.name, usedAliases);
         aliases.push(alias);
+        aliasServers.set(alias, server.name);
         const tool = {
           name: alias,
           label: remoteTool.name,
@@ -269,14 +280,18 @@ export async function bridgeMcpServers(
             } catch {
               throw new Error(`MCP tool ${alias} timed out`);
             }
-            if (result.isError) throw new Error(`MCP tool ${alias} returned an error result`);
-            return convertMcpResult(result);
+            const converted = convertMcpResult(result);
+            if (result.isError) {
+              failedResults.set(_toolCallId, converted);
+              throw new Error(`MCP tool ${alias} returned an error result`);
+            }
+            return converted;
           },
         };
         tools.push(tool as ToolDefinition);
       }
     }
-    return { clients, tools, aliases };
+    return { clients, tools, aliases, aliasServers, failedResults };
   } catch (error) {
     await closeClients(clients, deps);
     throw error;

@@ -16,8 +16,10 @@ Until the built-in `PiBackend` follow-up lands, register the generic custom back
 
 ```json
 {
-  "namespace": "@automatalabs/pi-acp",
-  "gatedKeys": ["outputSchema"]
+  "customCapabilities": {
+    "namespace": "@automatalabs/pi-acp",
+    "gatedKeys": ["outputSchema"]
+  }
 }
 ```
 
