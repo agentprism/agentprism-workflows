@@ -6,11 +6,13 @@
 //   2. Fork git sync (FORK_SYNC): fork version lines diverge from upstream's, so versions can't be
 //      compared — instead check git ancestry: does the upstream repo have commits the fork's
 //      published default branch hasn't merged? Policy is merge (not rebase), so ancestry is the
-//      right signal. Preferred path: the local fork clone (its `upstream` remote) — fetch both
-//      remotes and count origin/<main>..upstream/<main>. Fallback when the clone isn't on this
-//      machine: the GitHub compare API against the fork's `parent` repo (same upstream).
-//      Unauthenticated GitHub API works but is rate-limited; the pre-push hook passes
-//      GITHUB_TOKEN from `gh auth token` when available.
+//      right signal. Always checked against a REAL clone (no API shortcut): the working clone
+//      (~/codex-acp, override AGENTPRISM_CODEX_ACP_DIR) when present, else a managed temp clone
+//      (<tmpdir>/codex-acp) created on demand. Either way the clone's remotes are VERIFIED first
+//      (origin must be our fork; upstream is added/corrected to the true upstream), both remotes
+//      are fetched, the checkout is put on origin's default branch and pulled current (working
+//      clones must be clean and fully pushed — releases are cut from the PUSHED fork main), and
+//      only then is upstream containment counted against the local checkout.
 //   3. Wrapped runtime freshness (WRAPPED_RUNTIMES): an adapter can be at npm latest while
 //      exact-pinning a stale agent runtime inside it (the runtime is what actually answers
 //      prompts), so check 1 is structurally blind to this axis. Compare the lockfile's
@@ -25,9 +27,9 @@
 // a blocker, not a warning — staleness we cannot rule out blocks the same as staleness we can see.
 // Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
@@ -42,11 +44,19 @@ const ACP_DEP_MATCHERS = [
 ];
 
 // Forks we maintain whose published default branch must contain their upstream's default branch.
-// envDir overrides the clone location; defaultDirs are tried in order; no clone → GitHub API.
+// envDir overrides the clone location entirely; otherwise defaultDirs are tried in order; when no
+// clone exists, one is created at <tmpdir>/<tempCloneName> and reused across runs (this is what CI
+// uses — the gate never trusts an API summary over a real clone). The *UrlEnv overrides are
+// hermetic test seams (like AGENTPRISM_NPM_REGISTRY); production runs never set them.
 const FORK_SYNC = {
   "@automatalabs/codex-acp": {
     envDir: "AGENTPRISM_CODEX_ACP_DIR",
     defaultDirs: [join(homedir(), "codex-acp")],
+    tempCloneName: "codex-acp",
+    originUrl: "https://github.com/VikashLoomba/codex-acp.git",
+    originUrlEnv: "AGENTPRISM_CODEX_ACP_ORIGIN_URL",
+    upstreamUrl: "https://github.com/agentclientprotocol/codex-acp.git",
+    upstreamUrlEnv: "AGENTPRISM_CODEX_ACP_UPSTREAM_URL",
     upstreamRemote: "upstream",
   },
 };
@@ -178,20 +188,6 @@ function fetchLatestManifest(dep) {
   return fetchManifest(dep, "latest");
 }
 
-async function ghApi(path) {
-  const headers = { accept: "application/vnd.github+json", "user-agent": "agentprism-acp-dep-check" };
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetchWithRetry(`https://api.github.com${path}`, { headers });
-  return res.json();
-}
-
-function githubSlug(repository) {
-  const url = typeof repository === "string" ? repository : repository?.url;
-  const m = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/.exec(url ?? "");
-  return m ? m[1] : null;
-}
-
 // ---- check 1: npm freshness ----------------------------------------------------------------------
 const outdated = []; // { dep, locked, latest, specifier, pkgName }
 const warnings = []; // advisory hints only — never affect the exit code
@@ -243,7 +239,7 @@ function git(dir, ...args) {
   for (const key of GIT_LOCATION_ENV) delete env[key];
   return execFileSync("git", ["-C", dir, ...args], {
     encoding: "utf8",
-    timeout: 60_000,
+    timeout: 120_000, // covers fetches and the on-demand temp clone
     stdio: ["ignore", "pipe", "pipe"],
     env,
   }).trim();
@@ -257,67 +253,115 @@ function remoteDefaultBranch(dir, remote) {
   return m[1];
 }
 
-// Local-clone check: commits upstream/<branch> has that the fork's PUBLISHED main (origin/<branch>)
-// lacks. origin, not the local branch — releases are cut from the pushed fork main.
-function checkForkClone(dep, dir, upstreamRemote) {
-  const remotes = git(dir, "remote").split("\n").filter(Boolean);
-  if (!remotes.includes(upstreamRemote)) {
-    // Self-diagnose a recurrence: report the remotes we actually listed and the git dir git
-    // actually resolved. If a stray GIT_DIR/GIT_WORK_TREE ever leaks past the git() env scrub,
-    // the resolved dir won't match `dir` — making the misdirection unambiguous instead of
-    // masquerading as a genuinely missing remote.
+// Repo identity as owner/repo, normalized across https/ssh/local-path remote forms — URL-string
+// equality would false-fail an ssh-configured origin (and hermetic tests use path remotes).
+function repoSlug(url) {
+  const segments = String(url).replace(/\.git$/, "").replace(/\\/g, "/").replaceAll(":", "/").split("/").filter(Boolean);
+  return segments.length >= 2 ? segments.slice(-2).join("/").toLowerCase() : null;
+}
+
+// Verify + prepare one fork clone, then count upstream containment against its local checkout.
+//
+// Order matters: origin identity is verified FIRST and read-only — this gate must never mutate a
+// repo that isn't provably the fork (it also self-diagnoses a GIT_DIR leak past the env scrub:
+// the "wrong" repo's origin won't be the fork). Only then is the upstream remote added when
+// missing or re-pointed when it names the wrong repo. After fetching both remotes the checkout is
+// put on origin's default branch and brought current: a managed temp clone is hard-reset to
+// origin; a working clone must be CLEAN (we never touch uncommitted work), is switched to the
+// branch if needed, fast-forward pulled, and must have NO unpushed commits — releases are cut
+// from the PUSHED fork main, so "merged upstream locally but never pushed" must stay a blocker
+// even though the local diff would look in-sync.
+function checkForkAt(dir, { originUrl, upstreamUrl, upstreamRemote, disposable }) {
+  const actualOrigin = git(dir, "remote", "get-url", "origin");
+  if (repoSlug(actualOrigin) !== repoSlug(originUrl)) {
     const resolved = git(dir, "rev-parse", "--absolute-git-dir");
-    throw new Error(
-      `clone at ${dir} has no '${upstreamRemote}' remote ` +
-        `(remotes listed: ${remotes.join(", ") || "none"}; git resolved dir: ${resolved})`,
-    );
+    throw new Error(`clone at ${dir} has origin ${actualOrigin} — expected the fork ${originUrl} (git resolved dir: ${resolved})`);
   }
-  const upstreamBranch = remoteDefaultBranch(dir, upstreamRemote);
-  const originBranch = remoteDefaultBranch(dir, "origin");
+
+  let actualUpstream = null;
+  try {
+    actualUpstream = git(dir, "remote", "get-url", upstreamRemote);
+  } catch {
+    // remote not configured yet
+  }
+  if (actualUpstream === null) {
+    git(dir, "remote", "add", upstreamRemote, upstreamUrl);
+    console.error(`acp-deps: added missing '${upstreamRemote}' remote (${upstreamUrl}) to ${dir}`);
+  } else if (repoSlug(actualUpstream) !== repoSlug(upstreamUrl)) {
+    git(dir, "remote", "set-url", upstreamRemote, upstreamUrl);
+    console.error(`acp-deps: re-pointed '${upstreamRemote}' remote of ${dir} (${actualUpstream} → ${upstreamUrl})`);
+  }
+
   git(dir, "fetch", "--quiet", upstreamRemote);
   git(dir, "fetch", "--quiet", "origin");
-  const missing = parseInt(
-    git(dir, "rev-list", "--count", `origin/${originBranch}..${upstreamRemote}/${upstreamBranch}`),
-    10,
-  );
+  const originBranch = remoteDefaultBranch(dir, "origin");
+  const upstreamBranch = remoteDefaultBranch(dir, upstreamRemote);
+
+  if (disposable) {
+    git(dir, "checkout", "--quiet", "-B", originBranch, `origin/${originBranch}`);
+  } else {
+    if (git(dir, "status", "--porcelain") !== "") {
+      throw new Error(`clone at ${dir} has uncommitted changes — commit or stash them so the gate can pull ${originBranch}`);
+    }
+    const current = git(dir, "rev-parse", "--abbrev-ref", "HEAD");
+    if (current !== originBranch) {
+      git(dir, "switch", "--quiet", originBranch);
+      console.error(`acp-deps: switched ${dir} from '${current}' to '${originBranch}'`);
+    }
+    git(dir, "pull", "--ff-only", "--quiet", "origin", originBranch);
+    const unpushed = parseInt(git(dir, "rev-list", "--count", `origin/${originBranch}..HEAD`), 10);
+    if (unpushed > 0) {
+      throw new Error(
+        `${dir} ${originBranch} has ${unpushed} commit(s) not pushed to origin — releases are cut from the pushed fork ${originBranch}; push first`,
+      );
+    }
+  }
+
+  const missing = parseInt(git(dir, "rev-list", "--count", `HEAD..${upstreamRemote}/${upstreamBranch}`), 10);
   return {
     where: dir,
-    branch: `origin/${originBranch}`,
-    upstreamRef: `${git(dir, "remote", "get-url", upstreamRemote).replace(/\.git$/, "")}#${upstreamBranch}`,
+    branch: originBranch,
+    upstreamRef: `${upstreamUrl.replace(/\.git$/, "")}#${upstreamBranch}`,
     missing,
     fix: `cd ${dir} && git merge ${upstreamRemote}/${upstreamBranch} && git push origin ${originBranch}`,
   };
 }
 
-// API fallback for machines without the clone. compare/BASE...HEAD: ahead_by = commits HEAD
-// (upstream parent) has that BASE (our fork's default branch) lacks.
-async function checkForkViaApi(dep) {
-  const slug = githubSlug((await fetchLatestManifest(dep)).repository);
-  if (!slug) throw new Error(`${dep} has no parseable GitHub repository URL`);
-  const repo = await ghApi(`/repos/${slug}`);
-  if (!repo.parent) throw new Error(`${slug} is not a GitHub fork (no parent)`);
-  const parentSlug = repo.parent.full_name;
-  const parentBranch = repo.parent.default_branch;
-  const cmp = await ghApi(`/repos/${slug}/compare/${repo.default_branch}...${parentSlug.split("/")[0]}:${parentBranch}`);
-  return {
-    where: slug,
-    branch: repo.default_branch,
-    upstreamRef: `${parentSlug}#${parentBranch}`,
-    missing: cmp.ahead_by,
-    fix: `clone the fork, add the upstream remote, merge ${parentSlug}#${parentBranch}, push fork ${repo.default_branch}`,
+// Resolve which clone to check: an explicit envDir wins outright, then the default working-clone
+// locations; with none on disk the gate clones the fork itself into <tmpdir>/<tempCloneName>
+// (blob-filtered — full commit graph for the containment count, no blob download) and reuses that
+// clone on later runs. A broken/hijacked temp clone is disposable: delete and re-clone once.
+function checkFork(cfg) {
+  const originUrl = process.env[cfg.originUrlEnv] || cfg.originUrl;
+  const upstreamUrl = process.env[cfg.upstreamUrlEnv] || cfg.upstreamUrl;
+  const opts = { originUrl, upstreamUrl, upstreamRemote: cfg.upstreamRemote };
+
+  const envDir = process.env[cfg.envDir];
+  const candidates = envDir ? [envDir] : cfg.defaultDirs;
+  const workingClone = candidates.find((d) => existsSync(join(d, ".git")));
+  if (workingClone) return checkForkAt(workingClone, { ...opts, disposable: false });
+
+  const tempClone = join(tmpdir(), cfg.tempCloneName);
+  const cloneFresh = () => {
+    console.error(`acp-deps: no local fork clone found — cloning ${originUrl} to ${tempClone}`);
+    git(tmpdir(), "clone", "--quiet", "--filter=blob:none", originUrl, tempClone);
   };
+  try {
+    if (!existsSync(join(tempClone, ".git"))) cloneFresh();
+    return checkForkAt(tempClone, { ...opts, disposable: true });
+  } catch {
+    rmSync(tempClone, { recursive: true, force: true });
+    cloneFresh();
+    return checkForkAt(tempClone, { ...opts, disposable: true });
+  }
 }
 
 const forkSync = Promise.all(
   Object.entries(FORK_SYNC)
     .filter(([dep]) => tracked.some((t) => t.dep === dep))
-    .map(async ([dep, { envDir, defaultDirs, upstreamRemote }]) => {
+    .map(async ([dep, cfg]) => {
       try {
-        const dirs = [process.env[envDir], ...defaultDirs].filter(Boolean);
-        const cloneDir = dirs.find((d) => existsSync(join(d, ".git")));
-        const result = cloneDir
-          ? checkForkClone(dep, cloneDir, upstreamRemote)
-          : await checkForkViaApi(dep);
+        const result = checkFork(cfg);
         if (result.missing > 0) {
           forkIssues.push({ dep, ...result });
         } else {
@@ -325,7 +369,7 @@ const forkSync = Promise.all(
         }
       } catch (err) {
         blockers.push(
-          `acp-deps: could not verify fork sync for ${dep} (${err.message}) — local clone via ${envDir}; API fallback needs gh auth login or GITHUB_TOKEN`,
+          `acp-deps: could not verify fork sync for ${dep} (${err.message}) — working clone via ${cfg.envDir} or ~/${cfg.tempCloneName}; otherwise the gate clones ${cfg.originUrl} itself`,
         );
       }
     }),

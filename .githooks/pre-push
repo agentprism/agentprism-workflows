@@ -7,12 +7,12 @@
 #         @automatalabs/codex-acp, @earendil-works/pi-coding-agent) must be at npm
 #         `latest`; policy is to bump them at every release.
 #      b. fork git sync — the codex-acp fork's published main must contain its upstream
-#         (agentclientprotocol/codex-acp) main. Checked via the local clone's `upstream`
-#         remote (~/codex-acp, override AGENTPRISM_CODEX_ACP_DIR) or the GitHub compare API
-#         when no clone exists (GITHUB_TOKEN passed from `gh auth token` below).
+#         (agentclientprotocol/codex-acp) main. Always checked against a real clone with
+#         verified remotes: ~/codex-acp (override AGENTPRISM_CODEX_ACP_DIR) when present,
+#         else a managed temp clone the gate creates itself.
 #      c. wrapped runtime freshness — adapters must not embed a stale agent runtime
 #         (claude-agent-acp wraps claude-agent-sdk).
-#    The gate FAILS CLOSED: unreachable registry/API after retries blocks the push.
+#    The gate FAILS CLOSED: an unreachable registry or unverifiable clone blocks the push.
 #    The same gate also runs in the required CI job (blocks every merge) and in
 #    release.yml (blocks publishing) — bypassing it locally only moves the failure there.
 #    Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
@@ -30,7 +30,7 @@ if [ -n "${CI:-}" ]; then exit 0; fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-if ! GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || true)}" node scripts/check-acp-deps.mjs; then
+if ! node scripts/check-acp-deps.mjs; then
   echo "" >&2
   echo "pre-push: ACP dependency check FAILED — push blocked." >&2
   echo "  Follow the fix steps listed above, then commit and push again." >&2
