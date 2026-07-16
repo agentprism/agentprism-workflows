@@ -36,6 +36,19 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # ACP dependency freshness gate — a step of the REQUIRED check on purpose:
+      # while any tracked ACP dependency (@agentclientprotocol/*, the codex-acp
+      # fork vs its upstream, the wrapped claude-agent-sdk runtime, or
+      # @earendil-works/pi-coding-agent) is stale, EVERY merge is blocked until
+      # a PR lands that does the maintenance (owner policy, 2026-07-16 — no
+      # bypasses). Fails closed if the registry/API cannot be reached. Needs no
+      # node_modules (zero-dep script), so it runs before the install. Triage:
+      # CONTRIBUTING.md "When the dependency gate blocks".
+      - name: ACP dependency freshness gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/check-acp-deps.mjs
+
       # --frozen-lockfile restores the exact dependency tree (incl. the
       # @automatalabs/codex-acp fork, which bakes the outputSchema forward into
       # its dist) AND fetches the linux-x64 codex/claude native binaries. Keep

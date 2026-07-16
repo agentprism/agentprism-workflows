@@ -13,8 +13,8 @@ import { fileURLToPath } from "node:url";
 // (claude-agent-sdk) inside it — the npm-freshness check is structurally blind to that axis.
 // These tests run the real script against a hermetic repo root (fixture lockfile + packages)
 // and a local stub registry (AGENTPRISM_NPM_REGISTRY), asserting: behind → fail with the right
-// remediation; equal → pass; missing from lockfile → warn-and-pass; override that upstream has
-// caught up with → redundancy warning.
+// remediation; equal → pass; missing from lockfile → fail closed (unverifiable = blocked);
+// override that upstream has caught up with → redundancy warning.
 
 const REAL_SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../scripts/check-acp-deps.mjs");
 const ADAPTER = "@agentclientprotocol/claude-agent-acp";
@@ -139,7 +139,7 @@ test("wrapped runtime at latest passes", { timeout: 30_000 }, async () => {
   }
 });
 
-test("wrapped runtime missing from the lockfile warns and passes", { timeout: 30_000 }, async () => {
+test("wrapped runtime missing from the lockfile fails closed", { timeout: 30_000 }, async () => {
   const root = makeFixtureRoot({});
   const registry = await startRegistry({
     [`/${ADAPTER}/latest`]: { version: "0.59.0", dependencies: { [SDK]: "0.3.207" } },
@@ -147,8 +147,9 @@ test("wrapped runtime missing from the lockfile warns and passes", { timeout: 30
   });
   try {
     const { out, status } = await runScript(root, registry.url);
-    assert.equal(status, 0, `warn-and-pass expected:\n${out}`);
+    assert.equal(status, 1, `fail-closed expected (staleness that cannot be ruled out blocks):\n${out}`);
     assert.ok(out.includes(`${SDK} (wrapped by ${ADAPTER}) not found in pnpm-lock.yaml`), out);
+    assert.ok(out.includes("the gate fails closed"), out);
   } finally {
     await registry.close();
     rmSync(root, { recursive: true, force: true });

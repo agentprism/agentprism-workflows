@@ -17,9 +17,13 @@
 //      *transitive* resolution of the wrapped runtime against the runtime's npm `latest` —
 //      lockfile-first, so a root pnpm override satisfies the check with no special-casing.
 //
-// Zero dependencies; run standalone with `node scripts/check-acp-deps.mjs` or via .githooks/pre-push.
-// A registry/API that can't be reached (offline, timeout, rate limit) WARNS and passes — it never
-// bricks a push.
+// Zero dependencies; run standalone with `node scripts/check-acp-deps.mjs`. Enforced in THREE
+// places, with no bypass: .githooks/pre-push (every dev push), the required "Build & test" CI job
+// (every PR — stale deps block ALL merges), and release.yml before version/publish (a dep going
+// stale between PR-green and publish blocks the release; the workflow reports and leaves the
+// Version PR open). The gate FAILS CLOSED: a registry/API that can't be reached after retries is
+// a blocker, not a warning — staleness we cannot rule out blocks the same as staleness we can see.
+// Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -138,14 +142,33 @@ function semverLt(a, b) {
 }
 
 // ---- registry / GitHub fetchers ------------------------------------------------------------------
+// The gate fails closed on unreachable endpoints, so transient hiccups get retried before they
+// become blockers (a 404 is a real answer, not a hiccup — no retry).
+const FETCH_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1_500;
+async function fetchWithRetry(url, init) {
+  let lastErr;
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (res.ok) return res;
+      if (res.status === 404) throw new Error(`HTTP 404 from ${url}`);
+      lastErr = new Error(`HTTP ${res.status} from ${url}`);
+    } catch (err) {
+      if (/HTTP 404 /.test(err.message)) throw err;
+      lastErr = err;
+    }
+    if (attempt < FETCH_ATTEMPTS) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
+  }
+  throw lastErr;
+}
+
 const manifestCache = new Map(); // "dep@ref" -> Promise<version manifest JSON>
 function fetchManifest(dep, ref) {
   const key = `${dep}@${ref}`;
   if (!manifestCache.has(key)) {
     manifestCache.set(key, (async () => {
-      const url = `${REGISTRY}/${dep.replace("/", "%2F")}/${ref}`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+      const res = await fetchWithRetry(`${REGISTRY}/${dep.replace("/", "%2F")}/${ref}`);
       return res.json();
     })());
   }
@@ -159,8 +182,7 @@ async function ghApi(path) {
   const headers = { accept: "application/vnd.github+json", "user-agent": "agentprism-acp-dep-check" };
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(`https://api.github.com${path}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from api.github.com${path}`);
+  const res = await fetchWithRetry(`https://api.github.com${path}`, { headers });
   return res.json();
 }
 
@@ -172,20 +194,21 @@ function githubSlug(repository) {
 
 // ---- check 1: npm freshness ----------------------------------------------------------------------
 const outdated = []; // { dep, locked, latest, specifier, pkgName }
-const warnings = [];
+const warnings = []; // advisory hints only — never affect the exit code
+const blockers = []; // unverifiable states — the gate FAILS CLOSED on these
 
 const freshness = Promise.all(
   tracked.map(async ({ dep, specifier, pkgName }) => {
     const locked = lockedVersion(dep);
     if (!locked) {
-      warnings.push(`acp-deps: ${dep} not found in pnpm-lock.yaml importers — is the lockfile in sync? (pnpm install)`);
+      blockers.push(`acp-deps: ${dep} not found in pnpm-lock.yaml importers — lockfile out of sync? (pnpm install)`);
       return;
     }
     let latest;
     try {
       latest = (await fetchLatestManifest(dep)).version;
     } catch (err) {
-      warnings.push(`acp-deps: could not reach registry for ${dep} (${err.message}) — SKIPPING freshness check for it`);
+      blockers.push(`acp-deps: could not verify ${dep} freshness — registry unreachable after ${FETCH_ATTEMPTS} attempts (${err.message})`);
       return;
     }
     const stale = locked.filter((v) => semverLt(v, latest));
@@ -301,8 +324,8 @@ const forkSync = Promise.all(
           console.error(`acp-deps: fork ${result.where} (${result.branch}) contains upstream ${result.upstreamRef} — in sync`);
         }
       } catch (err) {
-        warnings.push(
-          `acp-deps: fork-sync check for ${dep} failed (${err.message}) — SKIPPING it (local clone via ${envDir}; API fallback: gh auth login or GITHUB_TOKEN)`,
+        blockers.push(
+          `acp-deps: could not verify fork sync for ${dep} (${err.message}) — local clone via ${envDir}; API fallback needs gh auth login or GITHUB_TOKEN`,
         );
       }
     }),
@@ -322,8 +345,8 @@ const wrappedRuntimes = Promise.all(
     .map(async ([dep, { wraps }]) => {
       const locked = lockedTransitiveVersions(wraps);
       if (!locked) {
-        warnings.push(
-          `acp-deps: ${wraps} (wrapped by ${dep}) not found in pnpm-lock.yaml — is the lockfile in sync? (pnpm install)`,
+        blockers.push(
+          `acp-deps: ${wraps} (wrapped by ${dep}) not found in pnpm-lock.yaml — lockfile out of sync? (pnpm install)`,
         );
         return;
       }
@@ -331,8 +354,8 @@ const wrappedRuntimes = Promise.all(
       try {
         latest = (await fetchLatestManifest(wraps)).version;
       } catch (err) {
-        warnings.push(
-          `acp-deps: could not reach registry for ${wraps} (${err.message}) — SKIPPING wrapped-runtime check for it`,
+        blockers.push(
+          `acp-deps: could not verify ${wraps} (wrapped by ${dep}) — registry unreachable after ${FETCH_ATTEMPTS} attempts (${err.message})`,
         );
         return;
       }
@@ -411,4 +434,15 @@ if (wrappedIssues.length > 0) {
   }
 }
 
-process.exit(outdated.length > 0 || forkIssues.length > 0 || wrappedIssues.length > 0 ? 1 : 0);
+if (blockers.length > 0) {
+  console.error("");
+  console.error("acp-deps: freshness could NOT be verified — the gate fails closed:");
+  for (const b of blockers) console.error(`  ${b}`);
+}
+
+const failed = outdated.length > 0 || forkIssues.length > 0 || wrappedIssues.length > 0 || blockers.length > 0;
+if (failed) {
+  console.error("");
+  console.error('acp-deps: triage runbook: CONTRIBUTING.md "When the dependency gate blocks"');
+}
+process.exit(failed ? 1 : 0);

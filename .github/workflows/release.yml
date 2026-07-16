@@ -27,13 +27,15 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# Fallback-path Changesets release PR (contents + pull-requests) and npm
-# provenance via OIDC trusted publishing (id-token). The app-token path
-# carries its own permissions.
+# Fallback-path Changesets release PR (contents + pull-requests), npm
+# provenance via OIDC trusted publishing (id-token), and the dependency-gate
+# blocked-release report (issues). The app-token path carries its own
+# permissions.
 permissions:
   contents: write
   pull-requests: write
   id-token: write
+  issues: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -81,6 +83,42 @@ jobs:
       # hybrid install missing its `sigstore` module, failing every provenance
       # publish with MODULE_NOT_FOUND (runs 28982178371 / 28982372216). The
       # codex-acp fork publishes with the stock bundled npm — same here.
+
+      # ACP dependency freshness gate — runs BEFORE any version/publish work and
+      # fails closed. This closes the last staleness window: a tracked dependency
+      # (@agentclientprotocol/*, the codex-acp fork vs upstream, the wrapped
+      # claude-agent-sdk runtime, @earendil-works/pi-coding-agent) can go stale
+      # BETWEEN a Version PR's green check and its merge triggering this publish
+      # leg. When the gate fails, nothing is versioned or published, any open
+      # Version PR is left open, and the report step below files/updates a
+      # "Release blocked" issue so triage starts immediately (owner policy,
+      # 2026-07-16 — no bypasses).
+      - name: ACP dependency freshness gate
+        id: dep-gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          node scripts/check-acp-deps.mjs 2>&1 | tee /tmp/dep-gate-output.txt
+
+      - name: Report the blocked release
+        if: failure() && steps.dep-gate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="Release blocked: ACP dependency gate failed"
+          gate_output="$(cat /tmp/dep-gate-output.txt 2>/dev/null || echo 'gate output unavailable')"
+          body="$(printf 'release.yml refused to version/publish at %s because the ACP dependency gate failed.\n\n```\n%s\n```\n\nTriage runbook: CONTRIBUTING.md section "When the dependency gate blocks" — identify what is stale, read the upstream changes, decide whether the bump is mechanical or needs agentprism adaptation work, land that PR (it unblocks every gate at once), and the next push to main releases normally.\n' "$GITHUB_SHA" "$gate_output")"
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty' || true)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+          vp="$(gh pr list --state open --search "Version Packages in:title" --json number --jq '.[0].number // empty' || true)"
+          if [ -n "$vp" ]; then
+            gh pr comment "$vp" --body "The release run for $GITHUB_SHA was blocked by the ACP dependency gate — this PR stays open until the staleness is fixed on main. See the open \"$title\" issue for the gate output and triage runbook."
+          fi
 
       # Same frozen install as CI: restores the exact dependency tree (incl. the
       # @automatalabs/codex-acp fork) and fetches the linux-x64 native binaries
