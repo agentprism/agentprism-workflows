@@ -45,7 +45,7 @@
     "@agentclientprotocol/claude-agent-acp": "0.59.0",
     "@agentclientprotocol/sdk": "^1.2.1",
     "@automatalabs/codex-acp": "1.6.5",
-    "@automatalabs/pi-acp": "0.1.1",
+    "@automatalabs/pi-acp": "workspace:*",
     "@automatalabs/shared-types": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29",
     "typebox": "1.3.2"

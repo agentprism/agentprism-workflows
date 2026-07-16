@@ -34,7 +34,6 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ACP_DEP_MATCHERS = [
   (name) => name.startsWith("@agentclientprotocol/"),
   (name) => name === "@automatalabs/codex-acp",
-  (name) => name === "@automatalabs/pi-acp",
   (name) => name === "@earendil-works/pi-coding-agent",
 ];
 
