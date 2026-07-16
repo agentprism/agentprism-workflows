@@ -1,5 +1,17 @@
 # @automatalabs/mcp-server
 
+## 0.14.0
+
+### Minor Changes
+
+- 023f552: Continue eligible usage-limit and authentication-paused agent turns from their recorded ACP sessions, with fail-to-fresh gates, durable diagnostics, and MCP output support.
+
+### Patch Changes
+
+- Updated dependencies [023f552]
+  - @automatalabs/shared-types@0.24.0
+  - @automatalabs/workflows@0.37.1
+
 ## 0.13.1
 
 ### Patch Changes
