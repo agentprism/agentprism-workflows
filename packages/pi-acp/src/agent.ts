@@ -146,7 +146,7 @@ export class PiAcpAgent {
       const created = await this.deps.createAgentSession({
         cwd,
         sessionManager: manager,
-        modelRegistry: this.deps.modelRegistry,
+        modelRuntime: this.deps.modelRuntime,
         customTools: [...bridge.tools, structured.tool],
       });
       pi = created.session;

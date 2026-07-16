@@ -1,5 +1,5 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
-import type { AgentSession, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { adapterError } from "./errors.js";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -18,7 +18,7 @@ export function thinkingLevelOption(session: AgentSession): SessionConfigOption 
 
 export async function applyConfig(
   session: AgentSession,
-  registry: ModelRegistry,
+  modelRuntime: ModelRuntime,
   configId: string,
   value: string | boolean,
 ): Promise<SessionConfigOption[]> {
@@ -37,9 +37,9 @@ export async function applyConfig(
   if (separator <= 0 || separator === value.length - 1) throw adapterError("invalid_model");
   const provider = value.slice(0, separator);
   const modelId = value.slice(separator + 1);
-  const model = registry.find(provider, modelId);
+  const model = modelRuntime.getModel(provider, modelId);
   if (!model) throw adapterError("invalid_model");
-  if (!registry.hasConfiguredAuth(model)) throw adapterError("auth_error");
+  if (!modelRuntime.hasConfiguredAuth(model.provider)) throw adapterError("auth_error");
   try {
     await session.setModel(model);
   } catch (error) {

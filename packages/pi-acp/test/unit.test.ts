@@ -178,13 +178,13 @@ test("T8 all 26 error rows retain reserved codes, fixed labels, precedence, and 
 test("T9 thinking/model config is exact, auth-aware, and clamp-reflecting", async () => {
   const fake = fakeSession({});
   const model = { provider: "test", id: "model" };
-  const registry = { find: () => model, hasConfiguredAuth: () => true } as never;
+  const modelRuntime = { getModel: () => model, hasConfiguredAuth: () => true } as never;
   assert.deepEqual((thinkingLevelOption(fake.session).options as Array<{ value: string }>).map(({ value }) => value), THINKING_LEVELS);
-  assert.equal((await applyConfig(fake.session, registry, "thinkingLevel", "high"))[0]?.currentValue, "high");
-  await assert.rejects(applyConfig(fake.session, registry, "thinkingLevel", "bogus"), (error) => wire(error as RequestError).data.errorKind === "invalid_config_value");
-  await assert.rejects(applyConfig(fake.session, registry, "model", true), (error) => wire(error as RequestError).data.errorKind === "invalid_config_type");
-  await assert.rejects(applyConfig(fake.session, { find: () => undefined } as never, "model", "x/y"), (error) => wire(error as RequestError).data.errorKind === "invalid_model");
-  await assert.rejects(applyConfig(fake.session, { find: () => model, hasConfiguredAuth: () => false } as never, "model", "x/y"), (error) => (error as RequestError).code === -32000);
+  assert.equal((await applyConfig(fake.session, modelRuntime, "thinkingLevel", "high"))[0]?.currentValue, "high");
+  await assert.rejects(applyConfig(fake.session, modelRuntime, "thinkingLevel", "bogus"), (error) => wire(error as RequestError).data.errorKind === "invalid_config_value");
+  await assert.rejects(applyConfig(fake.session, modelRuntime, "model", true), (error) => wire(error as RequestError).data.errorKind === "invalid_config_type");
+  await assert.rejects(applyConfig(fake.session, { getModel: () => undefined } as never, "model", "x/y"), (error) => wire(error as RequestError).data.errorKind === "invalid_model");
+  await assert.rejects(applyConfig(fake.session, { getModel: () => model, hasConfiguredAuth: () => false } as never, "model", "x/y"), (error) => (error as RequestError).code === -32000);
 });
 
 test("T10 initialize advertises only the exact implemented capabilities", () => {

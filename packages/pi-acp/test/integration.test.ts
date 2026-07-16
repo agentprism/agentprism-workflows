@@ -8,15 +8,15 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   AgentSession,
-  AuthStorage,
   DefaultResourceLoader,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
   createAssistantMessageEventStream,
+  InMemoryCredentialStore,
   type AssistantMessage,
   type Model,
 } from "@earendil-works/pi-ai";
@@ -36,7 +36,7 @@ test("T14/T21 scripted ACP client observes ordered updates before the full-turn 
   const clientApp = client({ name: "pi-acp-test" })
     .onNotification(methods.client.session.update, ({ params }) => { updates.push(params.update); })
     .onRequest(methods.client.session.requestPermission, () => ({ outcome: { outcome: "selected", optionId: "allow_once" } }));
-  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
   const connection = clientApp.connect(pair.client);
   const initialized = await connection.agent.request(methods.agent.initialize, { protocolVersion: 1 });
   assert.equal(initialized.protocolVersion, 1);
@@ -47,7 +47,7 @@ test("T14/T21 scripted ACP client observes ordered updates before the full-turn 
   });
   assert.equal(response.stopReason, "end_turn");
   assert.deepEqual(updates.map(({ sessionUpdate }) => sessionUpdate), ["agent_message_chunk", "usage_update"]);
-  assert.equal(setup.createOptions[0]?.modelRegistry, setup.deps.modelRegistry);
+  assert.equal(setup.createOptions[0]?.modelRuntime, setup.deps.modelRuntime);
   connection.close();
   server.connection.close();
   await server.agent.dispose();
@@ -55,10 +55,10 @@ test("T14/T21 scripted ACP client observes ordered updates before the full-turn 
 
 test("T21 real AgentSession with an injected Agent streamFn completes a credential-free ACP turn", async () => {
   const setup = fakeDeps();
-  const authStorage = AuthStorage.create(`${setup.sessionDir}/hermetic-auth.json`);
-  authStorage.set("openai", { type: "api_key", key: "hermetic-key" });
-  const modelRegistry = ModelRegistry.create(authStorage, `${setup.sessionDir}/missing-models.json`);
-  setup.deps.modelRegistry = modelRegistry;
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify("openai", async () => ({ type: "api_key", key: "hermetic-key" }));
+  const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+  setup.deps.modelRuntime = modelRuntime;
   const model: Model<"openai-completions"> = {
     id: "hermetic-model",
     name: "Hermetic model",
@@ -83,9 +83,9 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
     noContextFiles: true,
   });
   await resourceLoader.reload();
-  let constructedWithRegistry: ModelRegistry | undefined;
+  let constructedWithRuntime: ModelRuntime | undefined;
   setup.deps.createAgentSession = async (options) => {
-    constructedWithRegistry = options.modelRegistry;
+    constructedWithRuntime = options.modelRuntime;
     const streamFn = () => {
       const stream = createAssistantMessageEventStream();
       const message: AssistantMessage = {
@@ -127,7 +127,7 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
       cwd: setup.cwd,
       resourceLoader,
       customTools: options.customTools,
-      modelRegistry,
+      modelRuntime,
       initialActiveToolNames: [],
     });
     return {
@@ -144,7 +144,7 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
     .onRequest(methods.client.session.requestPermission, () => ({
       outcome: { outcome: "selected", optionId: "allow_once" },
     }));
-  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
   const connection = clientApp.connect(pair.client);
   await connection.agent.request(methods.agent.initialize, { protocolVersion: 1 });
   const opened = await connection.agent.request(methods.agent.session.new, {
@@ -157,7 +157,7 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
   });
   assert.equal(response.stopReason, "end_turn");
   assert.equal(response.usage?.totalTokens, 4);
-  assert.equal(constructedWithRegistry, modelRegistry);
+  assert.equal(constructedWithRuntime, modelRuntime);
   assert.ok(updates.some((update) =>
     update.sessionUpdate === "agent_message_chunk" && update.content.text === "hermetic pong"));
   connection.close();
@@ -201,7 +201,7 @@ test("T15 lifecycle reservations serialize duplicate load and close is idempoten
   await agent.closeSession(context({ sessionId: id }));
   assert.throws(() => agent.prompt(context({ sessionId: "missing", prompt: [{ type: "text", text: "x" }] })), (error) => kind(error) === "unknown_session");
   assert.throws(() => agent.newSession(context({ cwd: "relative", mcpServers: [] })), (error) => kind(error) === "invalid_cwd");
-  assert.equal(setup.createOptions[0]?.modelRegistry, setup.deps.modelRegistry);
+  assert.equal(setup.createOptions[0]?.modelRuntime, setup.deps.modelRuntime);
 });
 
 test("T15b transactional create failure rolls back the reservation and permits a clean retry", async () => {

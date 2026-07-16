@@ -32,7 +32,7 @@ function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
 
 try {
   const { runAcp } = await import("./server.js");
-  const { connection, agent } = runAcp();
+  const { connection, agent } = await runAcp();
   let shuttingDown: Promise<void> | undefined;
   const shutdown = (code: number): Promise<void> => {
     shuttingDown ??= (async () => {

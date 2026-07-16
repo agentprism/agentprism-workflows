@@ -296,7 +296,7 @@ test("T16 replay projection is total for all message roles, entry kinds, and con
 test("T8 SDK pre-handler owns malformed prompt row 8 without an adapter errorKind", async () => {
   const setup = fakeDeps();
   const pair = streamPair();
-  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
   const connection = client({ name: "pi-acp-malformed-test" }).connect(pair.client);
   await assert.rejects(
     connection.agent.request(methods.agent.session.prompt, {
@@ -332,7 +332,7 @@ test("T15 row 25: $/cancel_request during open returns -32800 and rolls the rese
     });
   };
   const pair = streamPair();
-  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
   const connection = client({ name: "pi-acp-open-cancel-test" }).connect(pair.client);
   const cancellation = new AbortController();
   const opening = connection.agent.request(methods.agent.session.new, {
@@ -739,7 +739,7 @@ test("T16/T19 cross-cwd fork round-trips and additionalDirectories stay ignored 
   assert.equal(setup.createOptions.length, 4);
   for (const options of setup.createOptions) {
     assert.equal("additionalDirectories" in options, false);
-    assert.equal(options.modelRegistry, setup.deps.modelRegistry);
+    assert.equal(options.modelRuntime, setup.deps.modelRuntime);
   }
   await agent.dispose();
 });
@@ -920,7 +920,7 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
   }
 });
 
-test("T20 tools/call round-trips through new, load, resume, and fork with shared modelRegistry identity", async () => {
+test("T20 tools/call round-trips through new, load, resume, and fork with shared modelRuntime identity", async () => {
   const setup = fakeDeps("tool");
   let callCount = 0;
   setup.deps.connectMcpClient = async () => fakeMcpHandle({
@@ -971,7 +971,7 @@ test("T20 tools/call round-trips through new, load, resume, and fork with shared
   assert.equal(callCount, 4);
   assert.equal(setup.createOptions.length, 4);
   for (const options of setup.createOptions) {
-    assert.equal(options.modelRegistry, setup.deps.modelRegistry);
+    assert.equal(options.modelRuntime, setup.deps.modelRuntime);
     assert.ok(options.customTools?.some(({ name }) => name === "mcp__server__roundtrip"));
   }
   await agent.dispose();

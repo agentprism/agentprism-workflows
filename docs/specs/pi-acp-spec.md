@@ -1,6 +1,6 @@
 # `@automatalabs/pi-acp` — In-process ACP Server for the pi Coding Agent
 
-**Date:** 2026-07-15
+**Date:** 2026-07-16
 
 **Status:** Frozen implementation contract for issue #198. Freeze revision (supersedes rounds 1–3),
 closing the terminal adjudication's four blockers, six majors, and five minors as a single coherent
@@ -16,7 +16,7 @@ timeout/detach/orphan-child protocol); `allow_always` that still runs the extens
 fail-safe deny for malformed selections; exact auth-method `name` strings with a narrowed
 missing-credential claim; `agent_end`/`done`/`error` totality; and the three corrected SDK line numbers.
 This revision builds on round 3, which had already closed the round-2 adversarial-completeness findings
-(the pi-main forward-compat note, the real `CreateAgentSessionResult` DI type + shared `modelRegistry`
+(the pi-main forward-compat note, the real `CreateAgentSessionResult` DI type + shared `modelRuntime`
 threading, runtime-vs-compile-time library exports, a permission sequence built on pi's actual
 `tool_execution_start`→`beforeToolCall` order, the `session/cancel` vs `$/cancel_request` split with an
 injected scheduler, transactional lifecycle with pi `AgentSession.dispose()`, corrected usage
@@ -43,8 +43,8 @@ our repo — `packages/acp-agents/src/capabilities.ts`,
 `packages/mcp-server/package.json`;
 external — `@agentclientprotocol/sdk@1.2.1`,
 `@agentclientprotocol/claude-agent-acp@0.59.0` (packaging + bootstrap blueprint),
-`@earendil-works/pi-coding-agent@0.80.7` (repo `earendil-works/pi` tag `v0.80.7`,
-commit `818d67457cdd6b60bce6b121d16b23141c252dd8`), `@modelcontextprotocol/sdk@1.29.0`.
+`@earendil-works/pi-coding-agent@0.80.8` (repo `earendil-works/pi` tag `v0.80.8`,
+commit `fae7176cb9f7c4725a40d9d481d8d70b80f18086`), `@modelcontextprotocol/sdk@1.29.0`.
 
 ---
 
@@ -57,7 +57,7 @@ moved pin silently:
 1. Fresh temp clone of `https://github.com/earendil-works/pi`, then `git fetch --tags`.
 2. `gh api repos/earendil-works/pi/releases/latest --jq .tag_name` **and**
    `npm view @earendil-works/pi-coding-agent version`; the two MUST agree.
-3. Compare against the pin in §14 (`v0.80.7` / `818d674` / npm `0.80.7`). **If the pin is no longer the
+3. Compare against the pin in §14 (`v0.80.8` / `fae7176` / npm `0.80.8`). **If the pin is no longer the
    latest release, that is a STOP:** re-verify every pi citation in this contract (`sdk.ts`,
    `agent-session.ts`, `session-manager.ts`, `agent.ts`, `agent/types.ts`, `ai/types.ts`,
    `env-api-keys.ts`, `model-registry.ts`, `auth-storage.ts`, `extensions/types.ts`) against the new
@@ -69,29 +69,25 @@ moved pin silently:
 
 The freshness gate (§10.1) enforces the same discipline continuously after landing.
 
-### 0.1 pi-main forward-compatibility risk note (normative, from the focus.md step-4 comparison)
+### 0.1 pi v0.80.8 model-runtime erratum (normative)
 
-The implementation basis is the **released** pin `v0.80.7` (npm `@earendil-works/pi-coding-agent@0.80.7`)
-— that is what this contract's every pi citation was verified against and what pi-acp depends on
-(§2.3, §14). It is **not** pi's `origin/main`. At authoring, however, pi's unreleased `main`
-(commit `c6d8371`) is already **~143 files / +5,974 / −4,577 lines** ahead of `v0.80.7` across the cited
-packages (`git diff v0.80.7..origin/main --stat -- packages/{coding-agent,agent,ai}`), and the drift
-touches surfaces this contract cites directly:
+The implementation-time §0 check found that the model/auth rewrite flagged by the frozen contract had
+landed in the **released** pin `v0.80.8` (npm `@earendil-works/pi-coding-agent@0.80.8`, commit
+`fae7176cb9f7c4725a40d9d481d8d70b80f18086`). The affected citations were re-verified mechanically:
 
-- `packages/coding-agent/src/core/sdk.ts` (~56 lines) — the `createAgentSession` factory (§4.1, §5.2).
-- `packages/coding-agent/src/core/agent-session.ts` (~103 lines) — the event bus, `beforeToolCall`
-  install, `setModel`/`setThinkingLevel`, usage getters (§6, §9.2).
-- `packages/coding-agent/src/core/model-registry.ts` (~1,032 lines) and `auth-storage.ts` (~366 lines),
-  plus a wholesale `packages/ai/src/utils/oauth/*` → `packages/ai/src/auth/oauth/*` reorganization — the
-  model/auth runtime this contract touches through `ModelRegistry.create`/`AuthStorage.create` and the
-  env-key catalog (§5.2, §9.5).
+- `CreateAgentSessionOptions.modelRegistry` is replaced by `modelRuntime?: ModelRuntime`
+  (`sdk.ts:39-40`), and `createAgentSession` uses that runtime for restore, initial resolution,
+  stream-time auth, and the constructed `AgentSession` (`sdk.ts:171,192-210,307,371-385`).
+- The public `AuthStorage` export and `ModelRegistry.create` factory are gone. The canonical default is
+  `await ModelRuntime.create({ authPath?, modelsPath? })` (`model-runtime.ts:58-68,130-165`), which owns
+  credential storage and model configuration. `ModelRegistry` survives only as a synchronous
+  compatibility facade constructed with `new ModelRegistry(runtime)` (`model-registry.ts:16-49`).
+- Internal resolution and auth checks now use `ModelRuntime.getModel(provider, id)` and
+  `ModelRuntime.hasConfiguredAuth(provider)` directly (`model-runtime.ts:293-295,354-356`).
 
-pi releases every ~2–3 days, so a release folding this rewrite is likely imminent. This note is a
-**forward-compatibility risk flag, not a verification basis**: nothing here changes the frozen pin.
-Its consequence is operational — when the implementer runs the §0 re-verification and pi has moved
-past `v0.80.7` (which it almost certainly will have), the changed model/auth runtime and
-`createAgentSession`/`agent-session` surfaces are the **first** places to re-check, and any changed
-claim is a stop-and-report discrepancy per §0, never a silent re-implementation.
+This erratum changes only the adapter's model/auth dependency seam and the asynchronous construction
+needed by `ModelRuntime.create`; the ACP wire contract, error codes, ordering, and lifecycle behavior
+remain unchanged.
 
 ---
 
@@ -244,7 +240,7 @@ Mirrors the `main→lib / bin→index` split of `packages/mcp-server/package.jso
   "scripts": { "build": "tsc -b", "typecheck": "tsc --noEmit", "test": "tsx --test \"test/**/*.test.ts\"", "prepublishOnly": "tsc -b" },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.2.1",
-    "@earendil-works/pi-coding-agent": "0.80.7",
+    "@earendil-works/pi-coding-agent": "0.80.8",
     "@modelcontextprotocol/sdk": "1.29.0",
     "typebox": "1.3.2"
   }
@@ -294,7 +290,7 @@ console.warn = console.error; console.debug = console.error;   // invariant 1 �
 process.on("unhandledRejection", (reason) => { console.error("unhandledRejection:", reason); });
 
 const { runAcp } = await import("./server.js");                // side effects (if any) now land on stderr
-const { connection, agent } = runAcp();                        // real stdio stream (§4)
+const { connection, agent } = await runAcp();                  // real stdio stream (§4)
 let shuttingDown: Promise<void> | undefined;
 function shutdown(code: number): Promise<void> {
   shuttingDown ??= (async () => {                              // idempotent: one disposal, awaited
@@ -358,8 +354,8 @@ child process:
 ```ts
 import { agent as acpAgent, methods, ndJsonStream } from "@agentclientprotocol/sdk";
 
-export function runAcp(options?: { deps?: Partial<PiAcpDeps>; stream?: Stream }) {
-  const impl = new PiAcpAgent(resolveDeps(options?.deps));
+export async function runAcp(options?: { deps?: Partial<PiAcpDeps>; stream?: Stream }) {
+  const impl = new PiAcpAgent(await resolveDeps(options?.deps));
   const app = acpAgent({ name: "@automatalabs/pi-acp" })
     .onRequest(methods.agent.initialize,          (c) => impl.initialize(c))
     .onRequest(methods.agent.authenticate,        (c) => impl.authenticate(c))
@@ -411,19 +407,19 @@ permission request. All handler contexts wrap the same connection, so a `PiSessi
 
 ### 4.1 Dependency-injection seam (`src/deps.ts`) — resolves adversarial finding 13
 
-`PiAcpAgent` takes exactly one constructor argument, a fully-resolved `PiAcpDeps`. `resolveDeps(partial?)`
-fills each field with its real default; tests pass overrides. This is the ONLY seam tests use — no ESM
+`PiAcpAgent` takes exactly one constructor argument, a fully-resolved `PiAcpDeps`. The asynchronous
+`resolveDeps(partial?)` fills each field with its real default; tests pass overrides. This is the ONLY seam tests use — no ESM
 monkey-patching (unreliable) is required.
 
 ```ts
 export interface PiAcpDeps {
   /**
-   * Build a pi session. Default: pi's real createAgentSession (sdk.ts:167), which returns
+   * Build a pi session. Default: pi's real createAgentSession (sdk.ts:164), which returns
    * `Promise<CreateAgentSessionResult>` — NOT `Promise<AgentSession>` (resolves adversarial finding 2).
    * The adapter consumes `result.session` (the AgentSession) and `result.extensionsResult` (for the
    * post-construction tool-name reconciliation of §9.3.2). EVERY call site (new/load/resume/fork,
-   * §9.1) passes `modelRegistry: deps.modelRegistry` so resolution, restore, stream auth, and setModel
-   * all use the one injected registry.
+   * §9.1) passes `modelRuntime: deps.modelRuntime` so resolution, restore, stream auth, and setModel
+   * all use the one injected runtime.
    */
   createAgentSession(opts: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
   /** SessionManager statics. Default: the real class methods (§9.1 citations). */
@@ -435,14 +431,14 @@ export interface PiAcpDeps {
     listAll(sessionDir?: string): Promise<SessionInfo[]>;
   };
   /**
-   * Shared model registry, constructed ONCE per process. Default:
-   * ModelRegistry.create(AuthStorage.create(authPath)) (model-registry.ts:391; auth-storage.ts:215).
-   * `CreateAgentSessionOptions.modelRegistry` accepts it (sdk.ts:43), and pi's own restore/find/stream
-   * paths read it (sdk.ts:197,302-303). Passing it on every factory call is what keeps injected
+   * Shared model/auth runtime, constructed ONCE per process. Default:
+   * await ModelRuntime.create() (model-runtime.ts:130-165), using ~/.pi/agent/auth.json and models.json.
+   * `CreateAgentSessionOptions.modelRuntime` accepts it (sdk.ts:39-40), and pi's own restore/find/stream
+   * paths read it (sdk.ts:192-210,307). Passing it on every factory call is what keeps injected
    * custom-provider resolution, journal-restored model lookup, `setModel`, and stream-time auth all
-   * resolving against the SAME registry — the divergence adversarial finding 2 flags otherwise.
+   * resolving against the SAME runtime — the divergence adversarial finding 2 flags otherwise.
    */
-  modelRegistry: ModelRegistry;
+  modelRuntime: ModelRuntime;
   /** Root for session JSONL. Default: undefined => pi's ~/.pi/agent/sessions/<encoded-cwd>. */
   sessionDir?: string;
   /** MCP stdio client factory. Default: a real @modelcontextprotocol/sdk stdio client (§9.3). */
@@ -604,13 +600,13 @@ with its `currentValue`; `setModel` re-clamps thinking level to the new model
 (`agent-session.ts:1543-1549`), so the echoed `thinkingLevel.currentValue` reflects any clamp.
 
 **Auth on the `set_config_option("model", …)` path — the producing mechanism is named (resolves the
-setModel-auth gap).** `AgentSession.setModel` throws synchronously with the exact message
+setModel-auth gap).** `AgentSession.setModel` rejects with the exact message
 `` `No API key for ${model.provider}/${model.id}` `` when the model has no configured auth
-(`agent-session.ts:1537-1540`, guarded by `this._modelRegistry.hasConfiguredAuth(model)`). That message
+(`agent-session.ts:1566-1569`, guarded by `this._modelRuntime.checkAuth(model.provider)`). That message
 matches **none** of §8.2's `session.prompt()` pre-flight predicates (which look for `"no api key found"` /
 `"authentication failed for"` / `"run '/login"`), so this call site owns its own auth classifier — the
 handler does NOT rely on the prompt-path matcher. Concretely, after resolving the model (below), the
-handler **prechecks `deps.modelRegistry.hasConfiguredAuth(model)` (`model-registry.ts:702`)**; if `false`
+handler **prechecks `deps.modelRuntime.hasConfiguredAuth(model.provider)` (`model-runtime.ts:354-356`)**; if `false`
 it rejects `authRequired` (`-32000`, `errorKind:"auth_error"`, row 1) **without** calling `setModel` —
 the precheck IS the deterministic mechanism. It additionally wraps the `setModel` call in a `try/catch`
 that maps a thrown `` /^no api key for /i `` message to the same row 1 (a belt-and-suspenders guard for a
@@ -618,17 +614,17 @@ races-with-auth-change window); any other `setModel` throw falls to the row-23 c
 scoped to the `set_config_option("model")` handler only, never `invalidParams` (T9 covers a known model
 with missing auth).
 
-**Model resolution** (`registry`-first, decisive, non-deprecated):
+**Model resolution** (`ModelRuntime`-first, decisive, non-deprecated):
 
-1. Construct the registry once per process via the DI seam: `deps.modelRegistry` (default
-   `ModelRegistry.create(AuthStorage.create(authPath))`; `model-registry.ts:391`; `AuthStorage.create`
-   at `auth-storage.ts:215`).
+1. Construct the runtime once per process via the DI seam: `deps.modelRuntime` (default
+   `await ModelRuntime.create()`; `model-runtime.ts:130-165`; its `CreateModelRuntimeOptions`
+   `authPath`/`modelsPath` fields are at `:58-68`).
 2. For a spec `"<provider>/<model-id>"` (first `/` splits provider from the rest verbatim),
-   `registry.find(provider, modelId)` (`model-registry.ts:695-696`) — exactly what `createAgentSession`
-   uses internally (`sdk.ts:197`); covers builtin + custom-configured providers.
-3. Found → pass as `createAgentSession({ model, modelRegistry: deps.modelRegistry, … })` — always with
-   the injected registry so restore/find/stream-auth agree (§4.1); auth resolves at stream time via
-   `registry.getApiKeyAndHeaders(model)` (`sdk.ts:302-303`).
+   `modelRuntime.getModel(provider, modelId)` (`model-runtime.ts:293-295`) — exactly what
+   `createAgentSession` uses internally (`sdk.ts:192`); covers builtin + custom-configured providers.
+3. Found → pass as `createAgentSession({ model, modelRuntime: deps.modelRuntime, … })` — always with
+   the injected runtime so restore/find/stream-auth agree (§4.1); auth and streaming resolve through
+   `modelRuntime.streamSimple(model, …)` (`sdk.ts:297-324`).
 4. `undefined` → reject the originating request `invalidParams` (`-32602`, `errorKind:"invalid_model"`),
    naming the unknown `provider/id` (never a silent fallback).
 5. No spec supplied before the first prompt → omit `model`; pi picks its configured default
@@ -1073,7 +1069,7 @@ diagnostic `error.message` and `error.stack` both contain a sentinel secret asse
 **none** of `error.message`, `data.message`, or `data.details`.
 
 **The `set_config_option("model")` auth path** classifies at its own call site (§5.2): a
-`deps.modelRegistry.hasConfiguredAuth(model) === false` precheck → row 1 (`auth_error`, `-32000`), and a
+`deps.modelRuntime.hasConfiguredAuth(model.provider) === false` precheck → row 1 (`auth_error`, `-32000`), and a
 defensive `/^no api key for /i` catch on the `setModel` throw → the same row 1. That path does **not** use
 the `session.prompt()` pre-flight predicates above (the `setModel` message `No API key for
 <provider>/<id>` matches none of them).
@@ -1118,7 +1114,7 @@ every awaited stage. Because Node runs the handler body to its first `await` wit
 2. **Acquire in order, tracking each resource, honoring `openSignal`:** validate cwd (row 11) → obtain the
    `SessionManager` (create/open/forkFrom) → connect MCP (§9.3, all-or-nothing, each connect/list bounded
    by `deps.mcpTimeoutMs` **and** cancellable by `openSignal`) →
-   `deps.createAgentSession({ …, modelRegistry: deps.modelRegistry })` → install the permission wrapper
+   `deps.createAgentSession({ …, modelRuntime: deps.modelRuntime })` → install the permission wrapper
    + translator + (inactive) structured-output tool → (load only) replay + `drain()`. If `openSignal`
    aborts at or between any step, the in-flight step is cancelled and the transaction proceeds to
    rollback (step 4). `forkFrom`'s eager write is the one step that cannot be un-done (§9.1.4); an
@@ -1173,7 +1169,7 @@ hand-delete it (no pi delete API, §11). This satisfies "no half-initialized **l
 (`session-manager.ts:1441`; constructs in memory, writes no JSONL until the first append) → reserve the
 minted `getSessionId()` (§9.1.0 step 1) → connect the request's stdio MCP servers (§9.3; row 16/17 on
 failure, with rollback) → `deps.createAgentSession({ cwd, model?, thinkingLevel?, customTools,
-sessionManager, modelRegistry: deps.modelRegistry })` (§5.2) → install the permission wrapper (§9.2), the
+sessionManager, modelRuntime: deps.modelRuntime })` (§5.2) → install the permission wrapper (§9.2), the
 translator (§6.3), and the structured-output tool inactive (§9.4) → commit. Return
 `{ sessionId, configOptions: [thinkingLevelOption], modes: null }` (`NewSessionResponse`,
 `types.gen.d.ts:2556`).
@@ -1185,8 +1181,8 @@ translator (§6.3), and the structured-output tool inactive (§9.4) → commit. 
 `deps.sessions.list(request.cwd, deps.sessionDir)` (`session-manager.ts:1549`, → `SessionInfo{ id, path,
 … }`, `:170-184`); if absent → row 12. `deps.sessions.open(path)` (`:1452`; row 15 on corrupt JSONL);
 connect request MCP servers (§9.3, rolled back on failure); `deps.createAgentSession({ sessionManager,
-modelRegistry: deps.modelRegistry })` restores the model context internally via `buildSessionContext()`
-(`sdk.ts:188-204`). Then **replay the transcript to the client**: iterate
+modelRuntime: deps.modelRuntime })` restores the model context internally via `buildSessionContext()`
+(`sdk.ts:182-210`). Then **replay the transcript to the client**: iterate
 `SessionManager.getBranch()` (`session-manager.ts:1189` — the full active linear branch of
 `SessionEntry`, NOT the compaction-summarized `buildSessionContext()`), projecting each entry through
 `src/replay.ts` into `session/update` notifications, enqueued on the send queue, and `await drain()`
@@ -1228,7 +1224,7 @@ compaction-aware context pi feeds the model — a decisive v1 choice recorded in
 #### 9.1.3 `session/resume` (reopen without replay)
 
 Identical to load — `validateCwd` (row 11), atomic reservation (§9.1.0), open + MCP wiring, and
-`createAgentSession({ …, modelRegistry: deps.modelRegistry })` — but with **no** replay: restore into
+`createAgentSession({ …, modelRuntime: deps.modelRuntime })` — but with **no** replay: restore into
 `agent.state` and return immediately with the restored `configOptions`. Highest-value advertisement for
 our client (§5).
 
@@ -1260,8 +1256,8 @@ mid-turn). `validateCwd(request.cwd)` (target, row 11). Connect the request's MC
 (all-or-nothing, §9.3) so an MCP failure rolls back before anything is written. Then
 `deps.sessions.forkFrom(sourcePath, request.cwd, deps.sessionDir)` (`session-manager.ts:1490` — the
 irreversible JSONL write; §9.1.0 covers a post-write `createAgentSession` failure). Reserve the minted
-new `getSessionId()`, `deps.createAgentSession({ sessionManager: forked, modelRegistry:
-deps.modelRegistry })`, install wrapper/translator/structured tool, commit a **new** `PiSession` under
+new `getSessionId()`, `deps.createAgentSession({ sessionManager: forked, modelRuntime:
+deps.modelRuntime })`, install wrapper/translator/structured tool, commit a **new** `PiSession` under
 the new `sessionId`, and return it with fresh `configOptions`.
 
 #### 9.1.5 `session/list`
@@ -1659,7 +1655,7 @@ not implementer-invented:
 | `gemini-api-key` | `"Google Gemini API key"` | `env_var` | `[{ name:"GEMINI_API_KEY", secret:true }]` |
 | `xai-api-key` | `"xAI API key"` | `env_var` | `[{ name:"XAI_API_KEY", secret:true }]` |
 | `openrouter-api-key` | `"OpenRouter API key"` | `env_var` | `[{ name:"OPENROUTER_API_KEY", secret:true }]` |
-| `pi-stored-credentials` | `"pi stored credentials"` | `agent` | pi reads its own `~/.pi/agent/auth.json` (`AuthStorage`); the default `AuthMethodAgent` ("agent handles auth itself") with **no** `_meta` |
+| `pi-stored-credentials` | `"pi stored credentials"` | `agent` | pi's default `ModelRuntime` reads its own `~/.pi/agent/auth.json`; the default `AuthMethodAgent` ("agent handles auth itself") with **no** `_meta` |
 
 `env_var` methods use the SDK `AuthMethodEnvVar` shape (`{ id, name, vars:[{ name, label?, secret?,
 optional? }], link? }`, `types.gen.d.ts:2221`); the `agent` method uses `AuthMethodAgent` (`{ id, name,
@@ -1769,7 +1765,7 @@ const ACP_DEP_MATCHERS = [
 ];
 ```
 
-Rationale: pi releases every 2–3 days (~30 releases in 10 weeks; latest 0.80.7, 2026-07-14), so the
+Rationale: pi releases every 2–3 days (~30 releases in 10 weeks; v0.80.8 released 2026-07-16), so the
 pre-push freshness check must fail when pi-acp's pinned pi runtime falls behind npm `latest`.
 `@earendil-works/pi-coding-agent` is a **direct** dependency of a workspace package (pi-acp embeds it),
 so it belongs in `ACP_DEP_MATCHERS` (check 1, direct freshness), **not** `WRAPPED_RUNTIMES` (third-party
@@ -1849,8 +1845,8 @@ convention).
 4. **`getModel(provider, id)` from `@earendil-works/pi-ai/compat` as the primary model resolver** (the
    issue's suggestion). Rejected: that alias is `@deprecated` (`compat.ts:61`) and `getBuiltinModel` is
    strongly typed to generated catalog keys, so neither accepts arbitrary custom-provider strings.
-   `ModelRegistry.find(provider, id)` (`model-registry.ts:695`) — what `createAgentSession` itself uses —
-   is the runtime path covering builtin + custom-configured providers.
+   `ModelRuntime.getModel(provider, id)` (`model-runtime.ts:293`) — what `createAgentSession` itself
+   uses — is the runtime path covering builtin + custom-configured providers.
 5. **Returning `stopReason:"end_turn"` on provider error** (or minting a synthetic `error` stopReason).
    Rejected: the ACP `StopReason` enum has no error member (`types.gen.d.ts:3027`), and an error that
    looks like a normal turn defeats the client's pause/retry logic. Errors reject with `data.errorKind`;
@@ -1956,7 +1952,7 @@ cites the normative statement it covers.
 | # | covers | assertion |
 |---|---|---|
 | T14 | §6.2/§6.2.1, §6.6 | full turn: ordered `session/update` stream drained before `PromptResponse`; a notify-failure fixture aborts + **rejects `notification_error` (settlement input 3) with NO `usage_update`/`drain`**; a close racing an in-flight prompt still emits `usage_update`+`drain`+resolves `cancelled` **before** the queue is torn down (teardown-waits-for-settlement) |
-| T15 | §9.1.0-.6 | lifecycle + concurrency matrix: new→prompt→close; **two concurrent `load`s for one id** → exactly one wins, the other `session_already_open`, no leak (atomic reservation); unknown id (load/resume/prompt) → `unknown_session`; `close` on unknown/already-closed/**tombstoned** id → **success**, and **close whose `dispose()` throws → still success (entry dropped, retry clean)**; close-races-prompt → cancelled; busy fork/set_config → `session_busy`; cwd validation on **new/fork-target**/load/resume/list; **the same injected `deps.modelRegistry` object is passed on ALL FOUR `createAgentSession` call sites**; **open-time races: `$/cancel_request` during open → `-32800` + rollback (no leak); `close` during an opening txn → success + rollback (no resurrection); `dispose()` during an opening txn → rollback (no post-dispose commit)** |
+| T15 | §9.1.0-.6 | lifecycle + concurrency matrix: new→prompt→close; **two concurrent `load`s for one id** → exactly one wins, the other `session_already_open`, no leak (atomic reservation); unknown id (load/resume/prompt) → `unknown_session`; `close` on unknown/already-closed/**tombstoned** id → **success**, and **close whose `dispose()` throws → still success (entry dropped, retry clean)**; close-races-prompt → cancelled; busy fork/set_config → `session_busy`; cwd validation on **new/fork-target**/load/resume/list; **the same injected `deps.modelRuntime` object is passed on ALL FOUR `createAgentSession` call sites**; **open-time races: `$/cancel_request` during open → `-32800` + rollback (no leak); `close` during an opening txn → success + rollback (no resurrection); `dispose()` during an opening txn → rollback (no post-dispose commit)** |
 | T15b | §9.1.0 | transactional rollback: inject a failure after **each** acquisition stage (MCP connect, `createAgentSession`, wrapper install, load replay-`notify`) and assert no live registry entry, no MCP child, no listener, no pi resource (pi `dispose()` called), and no `opening` reservation remains; a post-rollback retry is a clean open, not `session_already_open`; **the irreversible-fork case: after `forkFrom` writes successfully, inject a `createAgentSession` failure → the new JSONL remains a complete, valid, listable/loadable session while no live/opening/MCP resource leaks** |
 | T16 | §9.1.2/.3/.4 | resume emits **no** replay; load replays the linear branch via the **total** SessionEntry/AgentMessage projection — user, assistant (text/thinking/toolCall), toolResult, `bashExecution`, `custom` display-true/false, `branchSummary`/`compactionSummary` (no update), `custom_message` display-true/false, and string-vs-array content; fork round-trips over a temp `sessionDir`, including **cross-cwd** source lookup via `listAll`; **fork of a live never-prompted (unpersisted) source → `session_not_forkable` (row 26), not `session_corrupt`** |
 | T17 | §9.1.5 | list with cwd vs `listAll` (no cwd); exact cursor codec (`base64url` of decimal offset, page 100) + `nextCursor` set/omitted; missing/empty cursor → offset 0; `offset===length` → empty page; undecodable / non-canonical → `invalid_cursor`; **a shrink-below-cursor mutation (150 → page-1 cursor 100 → remove 60 → length 90) returns an EMPTY page, NOT `invalid_cursor` or a crash** |
@@ -1968,7 +1964,7 @@ cites the normative statement it covers.
 
 | # | covers | assertion |
 |---|---|---|
-| T21 | §4.1 | inject a `createAgentSession` that wraps `new Agent({ streamFn: mockStream })` in an `AgentSession`; drive a full ACP conversation end-to-end with **zero credentials** — the substrate for future engine e2e; the spy asserts the injected `deps.modelRegistry` identity is threaded on every `createAgentSession` call |
+| T21 | §4.1 | inject a `createAgentSession` that wraps `new Agent({ streamFn: mockStream })` in an `AgentSession`; drive a full ACP conversation end-to-end with **zero external credentials** — the substrate for future engine e2e; the spy asserts the injected `deps.modelRuntime` identity is threaded on every `createAgentSession` call |
 | T22 | §9.6/§6.2.1 | `deps.sleep`/`deps.graceMs`-driven backstop against a **wedged** mock stream, driven **separately** per abort source: the **three cooperative sources** (`$/cancel_request`, `session/cancel`, `session/close`) each **force-resolve `cancelled`** when the injected `sleep` elapses (emit `usage_update`, tombstone, call pi `dispose()`); the **notify-failure** source instead **rejects `notification_error` (row 22) as the settlement, with the later backstop performing cleanup-only (no second settlement) and no `usage_update`**; every source produces **no** unhandled rejection when the detached pi promise later settles; a **non-wedged** abort (turn settles first) takes the normal path (sleep cancelled) |
 
 ### 13.4 Live e2e (gated on provider keys)
@@ -2007,13 +2003,12 @@ contract cites. All citations below therefore remain byte-accurate; the base is 
 merge-base this branch builds on, matching `.agentprism/design-198/base-sha.txt`).
 
 **pi source, all `packages/{ai,agent,coding-agent}/…` citations verified against:** repo
-`github.com/earendil-works/pi`, tag **`v0.80.7`**, commit
-**`818d67457cdd6b60bce6b121d16b23141c252dd8`**; npm `@earendil-works/pi-coding-agent@0.80.7`
-(lockstep with `@earendil-works/pi-agent-core@0.80.7`, `@earendil-works/pi-ai@0.80.7`). Freshness
-re-checked at the freeze revision: `releases/latest` = `v0.80.7`, `npm view … version` = `0.80.7` — pin is
-current. pi's **unreleased** `origin/main` (`c6d8371`) has meanwhile drifted heavily across the cited
-model/auth/session surfaces; that forward-compatibility risk is recorded in **§0.1** and does not change
-the frozen release pin.
+`github.com/earendil-works/pi`, tag **`v0.80.8`**, commit
+**`fae7176cb9f7c4725a40d9d481d8d70b80f18086`**; npm `@earendil-works/pi-coding-agent@0.80.8`
+(lockstep with `@earendil-works/pi-agent-core@0.80.8`, `@earendil-works/pi-ai@0.80.8`). Freshness
+re-checked for this erratum: `releases/latest` = `v0.80.8`, `npm view … version` = `0.80.8` — pin is
+current. The released model/auth refactor and its mechanical contract migration are recorded in
+**§0.1**.
 
 **ACP SDK, `@agentclientprotocol/sdk@1.2.1`**, verified against the installed dist at
 `node_modules/.pnpm/@agentclientprotocol+sdk@1.2.1_zod@4.4.3/node_modules/@agentclientprotocol/sdk/dist/`.
@@ -2129,22 +2124,24 @@ implementation time per §0.
   `RequestError.internalError(errorKindData(...), …)` :2044,2080.
 - `dist/lib.js` — `runAcp`/`ClaudeAcpAgent` library exports :2.
 
-### pi `v0.80.7` (commit `818d674`)
+### pi `v0.80.8` (commit `fae7176`)
 
 - `packages/coding-agent/package.json` — name `@earendil-works/pi-coding-agent`, `bin { pi:
   dist/cli.js }`, `exports { ".", "./rpc-entry" }`, `engines.node >=22.19.0`, deps
-  pi-agent-core/pi-ai/pi-tui `^0.80.7` + `typebox 1.1.38`.
-- `packages/coding-agent/src/core/sdk.ts` — `CreateAgentSessionOptions` :34-83 (cwd, agentDir,
-  authStorage, **`modelRegistry?` :43**, model, thinkingLevel, tools/excludeTools/customTools,
-  sessionManager; **no** beforeToolCall/streamFn), **`CreateAgentSessionResult { session, extensionsResult,
-  modelFallbackMessage? }` :86-93** (the real return type — `.session` is the `AgentSession`),
-  `createAgentSession(): Promise<CreateAgentSessionResult>` :167-406 (`const modelRegistry =
-  options.modelRegistry ?? ModelRegistry.create(...)`; `return { session, extensionsResult,
-  modelFallbackMessage }` :402), `registry.find` :197, internal `streamFn` + `getApiKeyAndHeaders`
-  :302-303, `buildSessionContext` restore :188-204, `findInitialModel` :207-222,
-  `new AgentSession({ agent, sessionManager, customTools, … })` :385-399.
+  pi-agent-core/pi-ai/pi-tui `^0.80.8` + `typebox 1.1.38`.
+- `packages/coding-agent/src/core/sdk.ts` — `CreateAgentSessionOptions` :33-80 (cwd, agentDir,
+  **`modelRuntime?` :39-40**, model, thinkingLevel, tools/excludeTools/customTools, sessionManager; **no**
+  beforeToolCall/streamFn), **`CreateAgentSessionResult { session, extensionsResult,
+  modelFallbackMessage? }` :83-91** (the real return type — `.session` is the `AgentSession`),
+  `createAgentSession(): Promise<CreateAgentSessionResult>` :164-393 (`const modelRuntime =
+  options.modelRuntime ?? await ModelRuntime.create(...)` :169-171; `return { session,
+  extensionsResult, modelFallbackMessage }` :388-392), `modelRuntime.getModel` restore :192,
+  internal `streamFn` → `modelRuntime.streamSimple` :297-324, `buildSessionContext` restore :182-210,
+  `findInitialModel` :201-217, `new AgentSession({ agent, sessionManager, customTools, modelRuntime, … })`
+  :371-385.
 - `packages/coding-agent/src/index.ts` — public exports of `AgentSession`/`AgentSessionEvent` :15-27,
-  `createAgentSession*` :204-207, `ModelRegistry` :172, `SessionManager` :240.
+  `ModelRegistry` compatibility facade :162, `ModelRuntime`/`CreateModelRuntimeOptions`/
+  `ModelRuntimeAuthOverrides` :171-175, `createAgentSession*` :188-214, `SessionManager` :235.
 - `packages/coding-agent/src/core/agent-session.ts` — `AgentSessionEvent` union :127-155,
   `AgentSessionEventListener = (e) => void` :156, `PromptOptions { images?, streamingBehavior?, … }`
   :204-215, `readonly agent: Agent` :270, `_eventListeners` :278, constructor `_installAgentToolHooks()`
@@ -2157,14 +2154,20 @@ implementation time per §0.
   :1140-1154, busy-throw :1121-1126, **user-message build `userContent = [{ type:"text", text:
   expandedText }, ...images]` :1167-1169** — grounds image-only prompts, §6.1), `_runAgentPrompt`
   finally→`agent_settled` :1023-1034,
-  `_handlePostAgentRun` :1037-1069, `_isRetryableError` :2577, `setModel` :1537-1552 (sync no-auth throw
-  :1538-1540), `setThinkingLevel` :1630-1640 (clamp :1632), `getContextUsage` :3078-3110
+  `_handlePostAgentRun` :1037-1069, `_isRetryableError` :2577, `setModel` :1566-1580 (async auth check and
+  no-auth throw :1567-1569), `setThinkingLevel` :1630-1640 (clamp :1632), `getContextUsage` :3078-3110
   (`ContextUsage.tokens` = current context, drops on compaction — NOT monotonic),
   `getSessionStats` :3023-3076 (cumulative `cost`/`tokens`, `contextUsage`; `cost` monotonic).
 - `packages/coding-agent/src/core/auth-guidance.ts` — `formatNoModelSelectedMessage` :18-20,
   `formatNoApiKeyFoundMessage` :22-25 (ground the §8.2 pre-flight predicates); OAuth "Authentication
-  failed for … Run '/login" throw at `agent-session.ts:1144-1150`.
-- `packages/coding-agent/src/core/auth-storage.ts` — `AuthStorage.create(authPath?)` :215.
+  failed for … Run '/login" throw at `agent-session.ts:1174-1182`.
+- `packages/coding-agent/src/core/model-runtime.ts` — `CreateModelRuntimeOptions` :58-68,
+  `ModelRuntimeAuthOverrides` :70-73, asynchronous `ModelRuntime.create` :130-165,
+  `getModel(provider, modelId)` :293-295, `hasConfiguredAuth(provider)` :354-356, `getAuth` overloads
+  :358-385, and `streamSimple` :472-474.
+- `packages/coding-agent/src/core/auth-storage.ts` — internal file-backed credential store factory
+  `AuthStorage.create(authPath?)` :180 (not exported from the package index; consumed by
+  `ModelRuntime.create` at `model-runtime.ts:131`).
 - `packages/agent/src/agent.ts` — `Agent` ctor + `streamFn`/`beforeToolCall`/`afterToolCall`
   :101-106,171-219, `streamFn` injection :214, `subscribe` :241, `steer` :274, `followUp` :279,
   `hasQueuedMessages` :300, `abort` :310-311, `waitForIdle` :319, `prompt`/`continue` (busy-throw)
@@ -2218,8 +2221,10 @@ implementation time per §0.
   contextWindow, percent }` :283-289.
 - `packages/coding-agent/examples/extensions/structured-output.ts` — terminating tool pattern
   (`defineTool` + `execute` returning `{ content, details, terminate: true }`).
-- `packages/coding-agent/src/core/model-registry.ts` — `static create` :391, `find(provider, modelId)`
-  :695-696, `hasConfiguredAuth` :702, `getApiKeyAndHeaders` :745, `isUsingOAuth` :860.
+- `packages/coding-agent/src/core/model-registry.ts` — synchronous extension compatibility facade,
+  constructed as `new ModelRegistry(runtime)` :16-25; `find(provider, modelId)` delegates to
+  `runtime.getModel` :44-45, `hasConfiguredAuth(model)` delegates to the provider-level runtime check
+  :48-49, `getApiKeyAndHeaders` :52-89, and `isUsingOAuth` :107-109.
 - `packages/ai/src/env-api-keys.ts` — `getApiKeyEnvVars` provider→env catalog (ANTHROPIC_API_KEY(+OAuth
   :71), OPENAI_API_KEY :76, GEMINI_API_KEY :80, XAI_API_KEY :84, OPENROUTER_API_KEY :86, …) :64-110,
   `findEnvKeys` :120-122.

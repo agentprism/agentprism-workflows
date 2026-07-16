@@ -179,8 +179,8 @@ test("T9 journal-restored model/thinking values are initial and later sets win a
     ["restored-model", { provider: "test", id: "restored-model", contextWindow: 100 }],
     ["later-model", { provider: "test", id: "later-model", contextWindow: 200 }],
   ]);
-  setup.deps.modelRegistry = {
-    find(provider: string, id: string) { return provider === "test" ? models.get(id) : undefined; },
+  setup.deps.modelRuntime = {
+    getModel(provider: string, id: string) { return provider === "test" ? models.get(id) : undefined; },
     hasConfiguredAuth() { return true; },
   } as never;
   setup.deps.createAgentSession = async (options: CreateAgentSessionOptions) => {
@@ -193,7 +193,7 @@ test("T9 journal-restored model/thinking values are initial and later sets win a
       .filter((entry) => entry.type === "model_change")
       .at(-1);
     const restoredModel = restoredModelEntry
-      ? setup.deps.modelRegistry.find(restoredModelEntry.provider, restoredModelEntry.modelId)
+      ? setup.deps.modelRuntime.getModel(restoredModelEntry.provider, restoredModelEntry.modelId)
       : undefined;
     const control = fakeSession({
       ...options,
@@ -277,7 +277,7 @@ test("T12 captured structured value is the final agent_message_chunk before usag
     .onRequest(methods.client.session.requestPermission, () => ({
       outcome: { outcome: "selected", optionId: "allow_once" },
     }));
-  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
   const connection = clientApp.connect(pair.client);
   try {
     await connection.agent.request(methods.agent.initialize, { protocolVersion: 1 });
@@ -371,7 +371,7 @@ test("T12 mixed unstructured/structured/unstructured session sequence does not l
     .onRequest(methods.client.session.requestPermission, () => ({
       outcome: { outcome: "selected", optionId: "allow_once" },
     }));
-  const server = runAcp({ deps: setup.deps, stream: pair.agent });
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
   const connection = clientApp.connect(pair.client);
   try {
     await connection.agent.request(methods.agent.initialize, { protocolVersion: 1 });
