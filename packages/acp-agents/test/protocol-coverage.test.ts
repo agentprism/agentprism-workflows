@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
 import {
   ACP_AUTH_REQUIRED_CODE_EXCLUSIVE,
@@ -12,6 +13,7 @@ import {
   CLIENT_METHOD_COVERAGE,
   CODEX_SPAWN_AUTH_ENV,
   HANDLED_AUTH_METHOD_TYPES,
+  PI_ACP_PROTOCOL_CONTRACT,
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
 } from "../src/index.js";
@@ -88,6 +90,10 @@ function readDist(spec: string): string {
 }
 const CLAUDE_DIST = readDist("@agentclientprotocol/claude-agent-acp/dist/acp-agent.js");
 const CODEX_DIST = readDist("@automatalabs/codex-acp");
+const PI_DIST_DIR = dirname(requireAcp.resolve("@automatalabs/pi-acp"));
+const PI_AGENT_DIST = readFileSync(join(PI_DIST_DIR, "agent.js"), "utf8");
+const PI_AUTH_DIST = readFileSync(join(PI_DIST_DIR, "auth.js"), "utf8");
+const PI_ERRORS_DIST = readFileSync(join(PI_DIST_DIR, "errors.js"), "utf8");
 
 test("the cross-agent _meta convention keys are pinned and still present in the agent dists", () => {
   // The literal key names the base layer keys on (§1 intro) — not SDK schema fields.
@@ -120,4 +126,30 @@ test("every dist-probed AUTH_META_MATRIX row's capability literal is present in 
 // §4.6.4 item 5 — the code-only matcher (§1.5) relies on `-32000` being auth-exclusive.
 test("the pinned auth-required code is the SDK's exclusively-reserved -32000", () => {
   assert.equal(ACP_AUTH_REQUIRED_CODE_EXCLUSIVE, -32000);
+});
+
+test("the first-class Pi backend pins the frozen pi-acp capability/auth/error surface", () => {
+  assert.deepEqual(PI_ACP_PROTOCOL_CONTRACT, {
+    customCapabilityNamespace: "@automatalabs/pi-acp",
+    outputSchemaKey: "outputSchema",
+    mcpCapabilities: {},
+    authMethodIds: [
+      "anthropic-api-key",
+      "openai-api-key",
+      "gemini-api-key",
+      "xai-api-key",
+      "openrouter-api-key",
+      "pi-stored-credentials",
+    ],
+    providerErrorKinds: ["auth_error", "rate_limit", "billing_error", "provider_error"],
+  });
+  assert.ok(PI_AGENT_DIST.includes(PI_ACP_PROTOCOL_CONTRACT.customCapabilityNamespace));
+  assert.ok(PI_AGENT_DIST.includes(PI_ACP_PROTOCOL_CONTRACT.outputSchemaKey));
+  assert.ok(PI_AGENT_DIST.includes("mcpCapabilities: {}"));
+  for (const methodId of PI_ACP_PROTOCOL_CONTRACT.authMethodIds) {
+    assert.ok(PI_AUTH_DIST.includes(methodId), `installed pi-acp auth dist must contain ${methodId}`);
+  }
+  for (const errorKind of PI_ACP_PROTOCOL_CONTRACT.providerErrorKinds) {
+    assert.ok(PI_ERRORS_DIST.includes(errorKind), `installed pi-acp errors dist must contain ${errorKind}`);
+  }
 });

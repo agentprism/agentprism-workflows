@@ -503,8 +503,8 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
         lines.push(`  - ${m.id} (${m.type})${m.name ? `: ${m.name}` : ""}`);
       }
       lines.push(
-        `Agents authenticate from their own CLI credentials: log that backend's CLI in on this ` +
-          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`), ` +
+        `Agents authenticate from their own credential sources: configure that backend on this ` +
+          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`, or a pi provider key / \`~/.pi/agent/auth.json\`), ` +
           `then re-call the workflow tool with resumeFromRunId="${run.runId}".`,
       );
     } else if (run.reason === "checkpoint_required" && run.checkpointContext) {
@@ -1016,8 +1016,8 @@ function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
         lines.push(`  - ${method.id} (${method.type})${method.name ? `: ${method.name}` : ""}`);
       }
       lines.push(
-        `Agents authenticate from their own CLI credentials: log that backend's CLI in on this ` +
-          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`), then start a new ` +
+        `Agents authenticate from their own credential sources: configure that backend on this ` +
+          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`, or a pi provider key / \`~/.pi/agent/auth.json\`), then start a new ` +
           `workflow run with resumeFromRunId="${result.runId}".`,
       );
     } else if (result.reason === "checkpoint_required" && result.outcome.checkpointContext) {
@@ -1077,8 +1077,8 @@ export function createWorkflowServer(
       title: "Run, inspect, await, or stop a dynamic agent workflow",
       description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
-        "script orchestrates agent() subagents (and optional checkpoint() gates) over the injected " +
-        "ACP agent backend. Supply exactly one of inline script or absolute scriptPath; path content is " +
+        "script orchestrates agent() subagents (and optional checkpoint() gates) over built-in Claude, Codex, OpenCode, or pi " +
+        "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
         "read once and snapshotted at admission. Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +
         "run from a prior journal prefix. " +

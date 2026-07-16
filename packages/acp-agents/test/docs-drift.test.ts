@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACP_CROSS_CUTTING_EVENT_NAMES, AUTH_META_MATRIX, CODEX_SPAWN_AUTH_ENV } from "../src/index.js";
+import {
+  ACP_CROSS_CUTTING_EVENT_NAMES,
+  AUTH_META_MATRIX,
+  CODEX_SPAWN_AUTH_ENV,
+  PI_ACP_PROTOCOL_CONTRACT,
+} from "../src/index.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -59,6 +64,7 @@ test("adapter versions cited in docs match the installed acp-agents dependencies
   const expected = new Map([
     ["@agentclientprotocol/claude-agent-acp", packageJson.dependencies["@agentclientprotocol/claude-agent-acp"]],
     ["@automatalabs/codex-acp", packageJson.dependencies["@automatalabs/codex-acp"]],
+    ["@automatalabs/pi-acp", packageJson.dependencies["@automatalabs/pi-acp"]],
   ]);
 
   for (const path of ["docs/api.md", "docs/design-notes.md"]) {
@@ -70,6 +76,23 @@ test("adapter versions cited in docs match the installed acp-agents dependencies
       assert.ok(cited.length > 0, `${path} must cite ${packageName}@${version}`);
       assert.deepEqual([...new Set(cited)], [version], `${path} ${packageName} version citations drifted`);
     }
+  }
+});
+
+test("the executable Pi contract stays grounded in the frozen pi-acp spec", () => {
+  const spec = readRepoFile("docs/specs/pi-acp-spec.md");
+  assert.ok(spec.includes("## 5. Capability advertisement (`initialize`)"));
+  assert.ok(spec.includes("## 8. Error taxonomy and pinned wire codes (`src/errors.ts`)"));
+  assert.ok(spec.includes("### 9.4 Structured output (`src/structured-output.ts`)"));
+  assert.ok(spec.includes("### 9.5 Auth (`src/auth.ts`)"));
+  assert.ok(spec.includes(`_meta["${PI_ACP_PROTOCOL_CONTRACT.customCapabilityNamespace}"]`));
+  assert.ok(spec.includes(`{ ${PI_ACP_PROTOCOL_CONTRACT.outputSchemaKey}: true }`));
+  assert.ok(spec.includes("mcpCapabilities: {}"));
+  for (const methodId of PI_ACP_PROTOCOL_CONTRACT.authMethodIds) {
+    assert.ok(spec.includes(methodId), `frozen pi-acp spec must contain auth method ${methodId}`);
+  }
+  for (const errorKind of PI_ACP_PROTOCOL_CONTRACT.providerErrorKinds) {
+    assert.ok(spec.includes(`errorKind:"${errorKind}"`), `frozen pi-acp spec must contain errorKind ${errorKind}`);
   }
 });
 

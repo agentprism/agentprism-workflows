@@ -49,7 +49,7 @@ export { ProviderStore } from "./provider-store.js";
 export type { ProviderIntent } from "./provider-store.js";
 // Per-agent auth profiles (§3): the pure-data adapters wired onto the built-in backends. Custom
 // backends supply none (conformance-by-absence, §3.5).
-export { claudeAuthProfile, codexAuthProfile, opencodeAuthProfile } from "./auth/auth-profiles.js";
+export { claudeAuthProfile, codexAuthProfile, opencodeAuthProfile, piAuthProfile } from "./auth/auth-profiles.js";
 export type { AuthProfile, TerminalLaunch } from "./auth/auth-profiles.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
@@ -144,6 +144,7 @@ export {
   CLIENT_METHOD_COVERAGE,
   CODEX_SPAWN_AUTH_ENV,
   HANDLED_AUTH_METHOD_TYPES,
+  PI_ACP_PROTOCOL_CONTRACT,
   assertAuthCapabilityShape,
 } from "./protocol-coverage.js";
 export type { AgentMethodCoverage, AuthMetaMatrixRow, ClientMethodCoverage } from "./protocol-coverage.js";
@@ -206,6 +207,7 @@ export type {
 export { ClaudeBackend } from "./backends/claude.js";
 export { CodexBackend } from "./backends/codex.js";
 export { OpenCodeBackend } from "./backends/opencode.js";
+export { PiBackend } from "./backends/pi.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
 export { decidePermission, resolvePermission, withPersist } from "./permissions.js";

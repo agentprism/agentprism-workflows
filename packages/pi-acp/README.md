@@ -10,20 +10,16 @@ Run the server with `npx @automatalabs/pi-acp` or an installed `pi-acp` binary. 
 
 The package entry exports the value APIs `runAcp(options?)`, `PiAcpAgent`, and `resolveDeps`, plus the TypeScript-only `PiAcpDeps` type. Importing it starts no server, opens no stdio connection, and does not mutate `console` or stdio. Call and await `runAcp()` explicitly to connect; pass a partial `PiAcpDeps` and/or an ACP stream for embedding and tests.
 
-## Custom backend registration
+## AgentPrism built-in backend
 
-With `@automatalabs/acp-agents`, register pi-acp through the custom-backend registry with both required capability fields (a built-in `pi` backend id is tracked in [VikashLoomba/agentprism-workflows#213](https://github.com/VikashLoomba/agentprism-workflows/issues/213)):
+`@automatalabs/acp-agents` ships pi-acp as the built-in `pi` backend. Route a call with the backend-only id to keep pi's configured default model, or include pi's exact `provider/model-id` after the routing prefix:
 
-```json
-{
-  "customCapabilities": {
-    "namespace": "@automatalabs/pi-acp",
-    "gatedKeys": ["outputSchema"]
-  }
-}
+```ts
+await runner.run("Review this change", { model: "pi" });
+await runner.run("Review this change", { model: "pi/openrouter/vendor/model-id" });
 ```
 
-Models use the exact `provider/model-id` format through ACP's reserved `model` config channel. An unknown model rejects with JSON-RPC `-32602` and `data.errorKind = "invalid_model"`.
+The runner strips exactly the first `pi/` segment and sends the remaining `provider/model-id` verbatim through ACP's reserved `model` config channel. An unknown model rejects with JSON-RPC `-32602` and `data.errorKind = "invalid_model"`. Hosts driving pi-acp directly can negotiate its native schema channel from `agentCapabilities._meta["@automatalabs/pi-acp"].outputSchema` and send the bare `_meta.outputSchema` key.
 
 ## Authentication
 
@@ -46,7 +42,7 @@ pi-acp owns the `mcp__` prefix for bridged MCP tools and the exact `__acp_struct
 
 ## Version 1 limitations
 
-Only stdio MCP servers are supported. Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. Audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed. Promotion to a built-in `pi` backend id in `@automatalabs/acp-agents` is tracked in [VikashLoomba/agentprism-workflows#213](https://github.com/VikashLoomba/agentprism-workflows/issues/213).
+Only stdio MCP servers are supported. Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. Audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed.
 
 ## Development
 
@@ -54,4 +50,4 @@ The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` befo
 
 ## Built on pi — THIRD-PARTY notice
 
-This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.80.8. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.
+This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.80.9. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.

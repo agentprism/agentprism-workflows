@@ -1,18 +1,18 @@
 // The internal Backend strategy (NOT part of @automatalabs/shared-types). One AcpAgentSession
 // transport drives either backend; the Backend supplies the three things that genuinely
-// differ between Claude, Codex, and OpenCode:
+// differ between Claude, Codex, OpenCode, and pi:
 //   1. how to spawn the ACP server subprocess,
 //   2. the vendor `_meta` that carries the schema IN (Claude: session/new
 //      _meta.claudeCode.options.outputFormat + emitRawSDKMessages; Codex: per-turn
 //      _meta["outputSchema"], strict-normalized; OpenCode: generic _meta.outputSchema),
 //   3. how to read the native structured result OUT (Claude: structured_output off the raw
-//      _claude/sdkMessage; Codex/OpenCode: JSON.parse the final assistant message off the stream).
+//      _claude/sdkMessage; Codex/OpenCode/Pi: JSON.parse the final assistant message off the stream).
 import type { TSchema } from "typebox";
 import type { ProviderUsageLimitContext } from "@automatalabs/shared-types";
 import type { AuthProfile } from "./auth/auth-profiles.js";
 
 /** The built-in backends. Custom registry backends extend the id space beyond these. */
-export type BuiltinBackendId = "claude" | "codex" | "opencode";
+export type BuiltinBackendId = "claude" | "codex" | "opencode" | "pi";
 /** A backend id: one of the built-ins, or the registered name of a custom ACP backend
  *  (see registry.ts). The pool keys connections by this id, so ids must be stable. */
 export type BackendId = string;
@@ -82,7 +82,7 @@ export interface Backend {
    *  no custom-capability contract (its custom `_meta`, if any, is never gated). */
   readonly customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
   /** Per-agent auth adapter (§3.1). UNDEFINED for custom backends → the type-driven base auth flow
-   *  runs verbatim (conformance-by-absence, §1.4). The three built-in backends wire their pure-data
+   *  runs verbatim (conformance-by-absence, §1.4). The four built-in backends wire their pure-data
    *  profile (§3.2–§3.4); the lifecycle spine (§2) reads it when computing `spawnEnvFor` (§2.8), the
    *  runner consults `profile.describe`/`buildMeta` (§1.3/§2.9), and the connection refines client
    *  auth capabilities through `profile.clientAuthCapabilities` (§1.2). */

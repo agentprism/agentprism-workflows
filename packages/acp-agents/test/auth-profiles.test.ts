@@ -11,9 +11,11 @@ import {
   CodexBackend,
   CustomAcpBackend,
   OpenCodeBackend,
+  PiBackend,
   claudeAuthProfile,
   codexAuthProfile,
   opencodeAuthProfile,
+  piAuthProfile,
   type AuthIntent,
   type AuthMethodDescriptor,
   type Backend,
@@ -60,6 +62,17 @@ test("opencodeAuthProfile.clientAuthCapabilities: terminal follows the host TTY;
   });
 });
 
+test("piAuthProfile.clientAuthCapabilities: env-var and stored credentials need no optional client gate", () => {
+  assert.deepEqual(piAuthProfile.clientAuthCapabilities({ onAuth: true, terminal: true }), {
+    terminal: false,
+    gateway: false,
+  });
+  assert.deepEqual(piAuthProfile.clientAuthCapabilities({ onAuth: false, terminal: false }), {
+    terminal: false,
+    gateway: false,
+  });
+});
+
 // -- describe: client-side identity (the base dispatcher already produces the correct descriptor) ----
 
 test("every built-in describe() is a pass-through of the base descriptor (label-only seam, §3.1)", () => {
@@ -74,6 +87,28 @@ test("every built-in describe() is a pass-through of the base descriptor (label-
   const method = { id: "gateway", name: "Custom gateway", _meta: { gateway: { protocol: "anthropic" } } } as AuthMethod;
   for (const profile of [claudeAuthProfile, codexAuthProfile, opencodeAuthProfile]) {
     assert.equal(profile.describe(method, base), base, `${profile.backendId} describe is identity`);
+  }
+});
+
+test("piAuthProfile describes every advertised method with non-secret remediation", () => {
+  const expected = new Map([
+    ["anthropic-api-key", "Set ANTHROPIC_API_KEY, then retry or resume the workflow."],
+    ["openai-api-key", "Set OPENAI_API_KEY, then retry or resume the workflow."],
+    ["gemini-api-key", "Set GEMINI_API_KEY, then retry or resume the workflow."],
+    ["xai-api-key", "Set XAI_API_KEY, then retry or resume the workflow."],
+    ["openrouter-api-key", "Set OPENROUTER_API_KEY, then retry or resume the workflow."],
+    ["pi-stored-credentials", "Configure pi credentials in ~/.pi/agent/auth.json, then retry or resume the workflow."],
+  ]);
+  for (const [id, description] of expected) {
+    const method = { id, name: id } as AuthMethod;
+    const base: AuthMethodDescriptor = {
+      type: "agent",
+      id,
+      name: id,
+      expectsMeta: false,
+      interactive: true,
+    };
+    assert.equal(piAuthProfile.describe(method, base).description, description);
   }
 });
 
@@ -128,9 +163,10 @@ test("codexAuthProfile.spawnAuthEnv emits DEFAULT_AUTH_REQUEST for api-key/gatew
   assert.equal(codexAuthProfile.spawnAuthEnv!({ ...base, methodId: "chat-gpt" }), undefined);
 });
 
-test("claude and opencode define NO spawnAuthEnv (no DEFAULT_AUTH_REQUEST analog — a truthful asymmetry)", () => {
+test("claude, opencode, and pi define NO spawnAuthEnv (no DEFAULT_AUTH_REQUEST analog — a truthful asymmetry)", () => {
   assert.equal(claudeAuthProfile.spawnAuthEnv, undefined);
   assert.equal(opencodeAuthProfile.spawnAuthEnv, undefined);
+  assert.equal(piAuthProfile.spawnAuthEnv, undefined);
 });
 
 // -- AuthStore.spawnEnvFor wires the codex profile lever into the spawn overlay (§2.8) --------------
@@ -182,12 +218,13 @@ test("AuthStore.spawnEnvFor yields no DEFAULT_AUTH_REQUEST for a claude gateway 
   assert.equal(store.spawnEnvFor("claude"), undefined);
 });
 
-// -- backend wiring: the three built-ins carry their profile; custom carries NONE (conformance) ------
+// -- backend wiring: the four built-ins carry their profile; custom carries NONE (conformance) -------
 
 test("built-in backends wire their profile; a custom backend leaves authProfile undefined (§3.5)", () => {
   assert.equal(new ClaudeBackend().authProfile, claudeAuthProfile);
   assert.equal(new CodexBackend().authProfile, codexAuthProfile);
   assert.equal(new OpenCodeBackend().authProfile, opencodeAuthProfile);
+  assert.equal(new PiBackend().authProfile, piAuthProfile);
   const custom: Backend = new CustomAcpBackend({ name: "acme", command: "acme-acp", args: [] });
   assert.equal(custom.authProfile, undefined);
 });

@@ -43,8 +43,8 @@ our repo — `packages/acp-agents/src/capabilities.ts`,
 `packages/mcp-server/package.json`;
 external — `@agentclientprotocol/sdk@1.2.1`,
 `@agentclientprotocol/claude-agent-acp@0.59.0` (packaging + bootstrap blueprint),
-`@earendil-works/pi-coding-agent@0.80.8` (repo `earendil-works/pi` tag `v0.80.8`,
-commit `fae7176cb9f7c4725a40d9d481d8d70b80f18086`), `@modelcontextprotocol/sdk@1.29.0`.
+`@earendil-works/pi-coding-agent@0.80.9` (repo `earendil-works/pi` tag `v0.80.9`,
+commit `2d16f92973230a7e095aa984f150ba8702784f50`), `@modelcontextprotocol/sdk@1.29.0`.
 
 ---
 
@@ -57,7 +57,7 @@ moved pin silently:
 1. Fresh temp clone of `https://github.com/earendil-works/pi`, then `git fetch --tags`.
 2. `gh api repos/earendil-works/pi/releases/latest --jq .tag_name` **and**
    `npm view @earendil-works/pi-coding-agent version`; the two MUST agree.
-3. Compare against the pin in §14 (`v0.80.8` / `fae7176` / npm `0.80.8`). **If the pin is no longer the
+3. Compare against the pin in §14 (`v0.80.9` / `2d16f92` / npm `0.80.9`). **If the pin is no longer the
    latest release, that is a STOP:** re-verify every pi citation in this contract (`sdk.ts`,
    `agent-session.ts`, `session-manager.ts`, `agent.ts`, `agent/types.ts`, `ai/types.ts`,
    `env-api-keys.ts`, `model-registry.ts`, `auth-storage.ts`, `extensions/types.ts`) against the new
@@ -89,6 +89,15 @@ This erratum changes only the adapter's model/auth dependency seam and the async
 needed by `ModelRuntime.create`; the ACP wire contract, error codes, ordering, and lifecycle behavior
 remain unchanged.
 
+### 0.2 pi v0.80.9 freshness repin (normative)
+
+The issue #213 implementation-time check found `v0.80.9` / npm `0.80.9` at commit
+`2d16f92973230a7e095aa984f150ba8702784f50`. A fresh-clone diff over every §14-cited pi surface found
+one additive optional field, `OpenAICompletionsCompat.deferredToolsMode?: "kimi"`, in
+`packages/ai/src/types.ts`; the provider-compat interface is not consumed by this contract. Every
+load-bearing cited surface is byte-identical to `v0.80.8`, so the runtime pin advances without changing
+the ACP wire contract or the claims below.
+
 ---
 
 ## 1. Problem and scope
@@ -116,10 +125,10 @@ output, auth, cancellation, the config surface, and the monorepo integration for
 (workspace/changesets/CI/tsconfig). The one client-repo change is adding the pi runtime to the ACP
 freshness gate (§10.1).
 
-**Out of scope (see §11 Non-goals):** promoting pi to a built-in `PiBackend` in `acp-agents` (a
-follow-up issue mirroring #197 — until it lands, the server is drivable through the existing
-custom-backend registry with zero client code); fs/terminal client-delegation; subprocess/RPC mode;
+**Out of scope (see §11 Non-goals):** fs/terminal client-delegation; subprocess/RPC mode;
 `additionalDirectories`; audio prompt content; mid-turn steering over ACP; branch-topology replay.
+Issue #213 consumes this frozen server contract from the first-class `PiBackend`; direct hosts can also
+drive the server through the generic custom-backend registry.
 
 ### 1.1 Verified baseline and invariants
 
@@ -169,7 +178,7 @@ elsewhere by number ("invariant N").
 
 - **npm name:** `@automatalabs/pi-acp` (scoped; unscoped `pi-acp` is the community bridge). Initial
   version `0.0.0`, first release driven by changesets in lockstep with the monorepo (§10).
-- **bin name:** `pi-acp` → `dist/index.js`. Spawn resolution for the follow-up built-in backend goes
+- **bin name:** `pi-acp` → `dist/index.js`. Spawn resolution for the first-class built-in backend goes
   through the resolved package bin under `process.execPath` (the claude/codex ladder,
   `backends/codex.ts:53-66`), never PATH, so ours cannot collide with the community `pi-acp` bin.
 - **License:** `Apache-2.0` (the monorepo license), with the MIT third-party notice of §15.
@@ -240,7 +249,7 @@ Mirrors the `main→lib / bin→index` split of `packages/mcp-server/package.jso
   "scripts": { "build": "tsc -b", "typecheck": "tsc --noEmit", "test": "tsx --test \"test/**/*.test.ts\"", "prepublishOnly": "tsc -b" },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.2.1",
-    "@earendil-works/pi-coding-agent": "0.80.8",
+    "@earendil-works/pi-coding-agent": "0.80.9",
     "@modelcontextprotocol/sdk": "1.29.0",
     "typebox": "1.3.2"
   }
@@ -859,7 +868,7 @@ Concurrency (resolves issue Open item 2, invariant 4): pi permits **one in-fligh
 in normal use; if a second `session/prompt` arrives for a busy session, the adapter rejects it with
 `invalidParams` (`-32602`, `errorKind:"session_busy"`) **without** calling `session.prompt` (it never
 supplies `streamingBehavior`, so pi's steer/followUp queue is never engaged). pi's mid-turn
-steering/follow-up (`steer`/`followUp`, `agent-session.ts:1294,1314`) is **not** exposed over ACP in v1
+steering/queued-message APIs (`steer`/`followUp`, `agent-session.ts:1294,1314`) are **not** exposed over ACP in v1
 (§11).
 
 ---
@@ -1075,10 +1084,9 @@ the `session.prompt()` pre-flight predicates above (the `setModel` message `No A
 <provider>/<id>` matches none of them).
 
 **Downstream client behavior.** `-32000` → `AUTH_REQUIRED` pause by code alone
-(`errors-map.ts:135-146`; `ACP_AUTH_REQUIRED_CODE_EXCLUSIVE`, `protocol-coverage.ts:152-154`). Until the
-follow-up `PiBackend` adds a `classifyProviderError` (`backends/codex.ts:39-51`) that promotes
-`rate_limit`/`billing_error` to `PROVIDER_USAGE_LIMIT` pauses, the generic client classifies rows 2/3/4
-as recoverable execution errors — correct default behavior.
+(`errors-map.ts:135-146`; `ACP_AUTH_REQUIRED_CODE_EXCLUSIVE`, `protocol-coverage.ts:152-154`). The
+first-class `PiBackend.classifyProviderError` promotes categorical `rate_limit`/`billing_error` values
+to `PROVIDER_USAGE_LIMIT` pauses; `provider_error` remains a recoverable execution error.
 
 ---
 
@@ -1565,8 +1573,8 @@ details? }`) is **total over every member**, in `content` order:
 **v1 serves stdio only.** `mcpCapabilities: {}` is advertised (§5), so our client rejects http/sse before
 sending them (`unsupportedMcpServer`, `capabilities.ts:278-300`). If **another** client sends a non-stdio
 (`http`/`sse`) server anyway, the bridge rejects that lifecycle request with `invalidParams` (`-32602`,
-`errorKind:"unsupported_mcp_transport"`, naming the server) — it does not silently drop it. http is a
-deferred item (§11).
+`errorKind:"unsupported_mcp_transport"`, naming the server) — it does not silently drop it. HTTP is
+outside the v1 transport surface (§11).
 
 ### 9.4 Structured output (`src/structured-output.ts`) — resolves adversarial finding 11
 
@@ -1617,26 +1625,29 @@ present:
    call's `params`; `terminate:true` normally ends the turn on the first call, so a second is only
    possible with a non-conforming loop — last-wins is deterministic and documented.
 
-#### 9.4.3 Current-path truth and registration (corrects the round-1 "no prompt-embedding" claim)
+#### 9.4.3 Built-in path and direct custom registration (corrects the round-1 "no prompt-embedding" claim)
 
-When pi-acp is driven through the existing generic `CustomAcpBackend` (the pre-`PiBackend` path), the
-runner **embeds the schema in the prompt text** (`embedSchemaInPrompt = true`, `custom.ts:33`,
-unconditional) **and** sends `_meta.outputSchema` (`promptMeta`, `custom.ts:72-78`, gated by the backend's
-`gatedKeys`). So pi-acp receives the schema on BOTH channels; it uses the `_meta` tool for capture and
-treats the embedded prompt text as harmless reinforcement (invariant 7). The custom-backend registration
-that drives pi-acp is therefore **exactly**:
+The first-class `PiBackend` negotiates
+`agentCapabilities._meta["@automatalabs/pi-acp"].outputSchema`, sends `_meta.outputSchema`, sets
+`embedSchemaInPrompt = false`, and disables client-hosted structured-output tool injection. The server's
+native terminating-tool path is therefore the sole schema channel on normal AgentPrism runs.
+
+A host that deliberately drives pi-acp through the generic `CustomAcpBackend` instead **embeds the
+schema in the prompt text** (`embedSchemaInPrompt = true`, `custom.ts:33`, unconditional) **and** sends
+`_meta.outputSchema` (`promptMeta`, `custom.ts:72-78`, gated by the backend's `gatedKeys`). The server
+uses the `_meta` tool for capture and treats the embedded text as harmless reinforcement. That direct
+custom registration is exactly:
 
 ```jsonc
 { "customCapabilities": { "namespace": "@automatalabs/pi-acp", "gatedKeys": ["outputSchema"] } }
 ```
 
-Both fields are **required**: the registry rejects an empty/missing `namespace` and an empty/missing
-`gatedKeys` (`registry.ts:149-161`). The round-1 claim that the custom backend "needs only
+Both fields are **required** for the generic custom path: the registry rejects an empty/missing
+`namespace` and an empty/missing `gatedKeys` (`registry.ts:149-161`). The round-1 claim that the custom backend "needs only
 `customCapabilities.namespace`" was wrong; `gatedKeys: ["outputSchema"]` is mandatory. The runner also
 does NOT inject its client-hosted StructuredOutput MCP tool, because that path gates on
 `mcpCapabilities.http === true` (`supportsStructuredOutputToolTransport`, `runner.ts:1294-1296`) and
-pi-acp advertises `mcpCapabilities: {}` (no http). The future `PiBackend` (§11) sets
-`embedSchemaInPrompt = false` to drop the redundant embed; until then the redundancy is inert.
+pi-acp advertises `mcpCapabilities: {}` (no http).
 
 ### 9.5 Auth (`src/auth.ts`) — resolves design-minimalism finding 1 / adversarial finding 12
 
@@ -1765,7 +1776,7 @@ const ACP_DEP_MATCHERS = [
 ];
 ```
 
-Rationale: pi releases every 2–3 days (~30 releases in 10 weeks; v0.80.8 released 2026-07-16), so the
+Rationale: pi releases every 2–3 days (~30 releases in 10 weeks; v0.80.9 released 2026-07-16), so the
 pre-push freshness check must fail when pi-acp's pinned pi runtime falls behind npm `latest`.
 `@earendil-works/pi-coding-agent` is a **direct** dependency of a workspace package (pi-acp embeds it),
 so it belongs in `ACP_DEP_MATCHERS` (check 1, direct freshness), **not** `WRAPPED_RUNTIMES` (third-party
@@ -1792,13 +1803,6 @@ convention).
 ---
 
 ## 11. Non-goals (v1) — with rationale
-
-- **`PiBackend` built-in backend in `acp-agents`** — a follow-up issue mirroring #197 (spawn ladder
-  `AGENTPRISM_PI_ACP_CMD` → resolved bin under `process.execPath` → npx; auth profile; native
-  structured-output posture with `embedSchemaInPrompt = false`; `classifyProviderError` for pi's
-  retry/errorKind signals; docs/skill/live e2e). Kept separate: client-repo work with its own review
-  surface. Until it lands, the server is drivable through the existing custom-backend registry
-  (`resolveModelRoute`, `runner.ts:1356-1370`) with the registration of §9.4.3.
 - **`session/delete`** — pi's `SessionManager` exposes no delete/unlink API; hand-unlinking `.jsonl`
   files risks corrupting the fork tree and would violate invariant 2. Revisit if pi adds a first-class
   delete.
@@ -1809,7 +1813,7 @@ convention).
 - **`additionalDirectories`** — not advertised; pi has no allowed-roots concept, so extra roots grant no
   capability pi lacks. A present field is accepted and ignored (§9.1.7).
 - **Audio prompt content** — no pi representation; not advertised; degraded to a text note (§6.1).
-- **Mid-turn steering / follow-up queue over ACP** — pi's `steer`/`followUp` have no in-band ACP
+- **Mid-turn steering / queued messages over ACP** — pi's `steer`/`followUp` have no in-band ACP
   surface; inventing one would be an unadvertised non-portable extension. One serialized turn per session
   (§6.6).
 - **fs/terminal client-delegation suite** — terminal output is surfaced via the shared `_meta` tool_call
@@ -1964,7 +1968,7 @@ cites the normative statement it covers.
 
 | # | covers | assertion |
 |---|---|---|
-| T21 | §4.1 | inject a `createAgentSession` that wraps `new Agent({ streamFn: mockStream })` in an `AgentSession`; drive a full ACP conversation end-to-end with **zero external credentials** — the substrate for future engine e2e; the spy asserts the injected `deps.modelRuntime` identity is threaded on every `createAgentSession` call |
+| T21 | §4.1 | inject a `createAgentSession` that wraps `new Agent({ streamFn: mockStream })` in an `AgentSession`; drive a full ACP conversation end-to-end with **zero external credentials** — the same seam consumed by the first-class engine e2e; the spy asserts the injected `deps.modelRuntime` identity is threaded on every `createAgentSession` call |
 | T22 | §9.6/§6.2.1 | `deps.sleep`/`deps.graceMs`-driven backstop against a **wedged** mock stream, driven **separately** per abort source: the **three cooperative sources** (`$/cancel_request`, `session/cancel`, `session/close`) each **force-resolve `cancelled`** when the injected `sleep` elapses (emit `usage_update`, tombstone, call pi `dispose()`); the **notify-failure** source instead **rejects `notification_error` (row 22) as the settlement, with the later backstop performing cleanup-only (no second settlement) and no `usage_update`**; every source produces **no** unhandled rejection when the detached pi promise later settles; a **non-wedged** abort (turn settles first) takes the normal path (sleep cancelled) |
 
 ### 13.4 Live e2e (gated on provider keys)
@@ -1980,7 +1984,7 @@ cites the normative statement it covers.
 | T24 | §2.3 | manifest pins are exact (no caret); `main`/`exports`→`dist/lib.js`, `bin`→`dist/index.js`; packed `files:["dist"]` |
 | T25 | §10.1 | `check-acp-deps.mjs` matches `@earendil-works/pi-coding-agent` (freshness matcher) |
 | T26 | §10.3, §15 | root `tsconfig.json` references `packages/pi-acp`; a changeset exists |
-| T27 | §15 | `README.md` exists and (a string/section assertion) covers every required topic: `pi-acp` bin invocation, the side-effect-free library API (`runAcp`/`PiAcpAgent`/`resolveDeps`/`PiAcpDeps`), the custom-backend registration `{ namespace:"@automatalabs/pi-acp", gatedKeys:["outputSchema"] }`, the `provider/id` model format, auth behavior (env-var/stored-credentials + the `-32000` pause), the reserved `mcp__`/`__acp_` tool namespaces, the v1 limitations list, and the "Built on pi" + THIRD-PARTY MIT notice |
+| T27 | §15 | `README.md` exists and (a string/section assertion) covers every required topic: `pi-acp` bin invocation, the side-effect-free library API (`runAcp`/`PiAcpAgent`/`resolveDeps`/`PiAcpDeps`), first-class `pi` routing and native capability discovery, the `provider/id` model format, auth behavior (env-var/stored-credentials + the `-32000` pause), the reserved `mcp__`/`__acp_` tool namespaces, the v1 limitations list, and the "Built on pi" + THIRD-PARTY MIT notice |
 
 The round-1 "http MCP rejected by capability gating" assertion is **removed** — that tested our client,
 not this server; T20's `unsupported_mcp_transport` is the server-side behavior instead.
@@ -2003,12 +2007,12 @@ contract cites. All citations below therefore remain byte-accurate; the base is 
 merge-base this branch builds on, matching `.agentprism/design-198/base-sha.txt`).
 
 **pi source, all `packages/{ai,agent,coding-agent}/…` citations verified against:** repo
-`github.com/earendil-works/pi`, tag **`v0.80.8`**, commit
-**`fae7176cb9f7c4725a40d9d481d8d70b80f18086`**; npm `@earendil-works/pi-coding-agent@0.80.8`
-(lockstep with `@earendil-works/pi-agent-core@0.80.8`, `@earendil-works/pi-ai@0.80.8`). Freshness
-re-checked for this erratum: `releases/latest` = `v0.80.8`, `npm view … version` = `0.80.8` — pin is
+`github.com/earendil-works/pi`, tag **`v0.80.9`**, commit
+**`2d16f92973230a7e095aa984f150ba8702784f50`**; npm `@earendil-works/pi-coding-agent@0.80.9`
+(lockstep with `@earendil-works/pi-agent-core@0.80.9`, `@earendil-works/pi-ai@0.80.9`). Freshness
+re-checked for issue #213: `releases/latest` = `v0.80.9`, `npm view … version` = `0.80.9` — pin is
 current. The released model/auth refactor and its mechanical contract migration are recorded in
-**§0.1**.
+**§0.1**; the byte-compatible v0.80.9 repin is recorded in **§0.2**.
 
 **ACP SDK, `@agentclientprotocol/sdk@1.2.1`**, verified against the installed dist at
 `node_modules/.pnpm/@agentclientprotocol+sdk@1.2.1_zod@4.4.3/node_modules/@agentclientprotocol/sdk/dist/`.
@@ -2124,11 +2128,11 @@ implementation time per §0.
   `RequestError.internalError(errorKindData(...), …)` :2044,2080.
 - `dist/lib.js` — `runAcp`/`ClaudeAcpAgent` library exports :2.
 
-### pi `v0.80.8` (commit `fae7176`)
+### pi `v0.80.9` (commit `2d16f92`)
 
 - `packages/coding-agent/package.json` — name `@earendil-works/pi-coding-agent`, `bin { pi:
   dist/cli.js }`, `exports { ".", "./rpc-entry" }`, `engines.node >=22.19.0`, deps
-  pi-agent-core/pi-ai/pi-tui `^0.80.8` + `typebox 1.1.38`.
+  pi-agent-core/pi-ai/pi-tui `^0.80.9` + `typebox 1.1.38`.
 - `packages/coding-agent/src/core/sdk.ts` — `CreateAgentSessionOptions` :33-80 (cwd, agentDir,
   **`modelRuntime?` :39-40**, model, thinkingLevel, tools/excludeTools/customTools, sessionManager; **no**
   beforeToolCall/streamFn), **`CreateAgentSessionResult { session, extensionsResult,
@@ -2270,16 +2274,14 @@ Zechner + Armin Ronacher). Obligations, satisfied in-package:
 ### 15.1 `packages/pi-acp/README.md` — normative published deliverable (resolves adversarial finding 12)
 
 The README is a **required file** (§2.2 layout) and a **published** doc (it ships in the npm tarball).
-Because the built-in `PiBackend` is a follow-up (§11), the README is — until that lands — the only
-place a consumer learns how to drive the server, so it MUST cover, at minimum (asserted by T27):
+It MUST cover, at minimum (asserted by T27):
 
 - **bin invocation** — `npx @automatalabs/pi-acp` (stdio ACP server; stdout is ACP ndjson only, §3) and
   `pi-acp --version`.
 - **library API** — the side-effect-free entry: `runAcp(options?)`, `PiAcpAgent`, `resolveDeps`, and the
   `PiAcpDeps` type; that importing the package starts no server and mutates no console/stdio (§3.1).
-- **custom-backend registration** — the exact object a host registers to drive pi-acp through the
-  existing generic custom backend: `{ namespace: "@automatalabs/pi-acp", gatedKeys: ["outputSchema"] }`
-  (both fields required, §9.4.3).
+- **first-class backend routing** — backend-only `pi`, explicit `pi/<provider>/<model-id>`, exact
+  one-segment stripping, and native capability discovery under `@automatalabs/pi-acp` (§9.4.3).
 - **model format** — `"<provider>/<model-id>"` set via the reserved config channel; unknown → `-32602`
   `invalid_model` (§5.2).
 - **auth behavior** — the advertised methods (five env-var providers + `pi-stored-credentials`, each with
@@ -2288,11 +2290,10 @@ place a consumer learns how to drive the server, so it MUST cover, at minimum (a
 - **reserved tool namespaces** — pi-acp owns the `mcp__` prefix (bridged MCP tools) and
   `__acp_structured_output`; extensions must not squat them (§9.3.2).
 - **v1 limitations** — stdio MCP only; no branch-topology/compaction-summary replay; no
-  `additionalDirectories`/audio/mid-turn steering/terminal-login; `PiBackend` built-in is a follow-up
-  (§11).
+  `additionalDirectories`/audio/mid-turn steering/terminal-login (§11).
 - **attribution** — a "Built on pi" note and a THIRD-PARTY notice naming pi
   (`@earendil-works/pi-coding-agent`/`-agent-core`/`-ai`), its authors, its MIT license, and the pinned
   version.
 
-The central backend docs page / authoring skill entry remains the explicitly deferred follow-up (§11,
-tied to the `PiBackend` promotion); only this package README is required at v1.
+The central backend docs and authoring skill also document the first-class `pi` route; this package
+README remains the normative server-level invocation and embedding reference.

@@ -98,6 +98,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     assert.equal(tools.length, 1, "exactly one tool is registered");
     const tool = tools[0];
     assert.equal(tool.name, "workflow");
+    assert.match(tool.description ?? "", /Claude, Codex, OpenCode, or pi/);
 
     assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
     const inputProps = Object.keys(tool.inputSchema.properties ?? {});

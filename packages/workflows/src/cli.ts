@@ -81,7 +81,7 @@ and every other session option — by opening one no-prompt session per harness.
 tokens. Run this BEFORE authoring a workflow so \`model\` / \`configOptions\` values come
 from the live catalog instead of guesswork (or a throwaway probe workflow).
 
-Harnesses: the built-in names (claude, codex, opencode) and any custom backend
+Harnesses: the built-in names (claude, codex, opencode, pi) and any custom backend
 registered via the AGENTPRISM_BACKENDS env var. Default: all of them. A harness that
 cannot spawn or authenticate reports \`probed: false\` with the reason and never blocks
 the others.

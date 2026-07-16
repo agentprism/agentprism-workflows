@@ -5,9 +5,9 @@
 // flow (Principle 1). The base dispatcher `buildAuthDescriptors` (§1.3) owns the `type` discriminant
 // and the terminal-vs-agent decision; a profile only re-labels the result.
 //
-// The profiles are pure data: `claudeAuthProfile`/`opencodeAuthProfile` are client-side adaptation
-// only (their `describe`/`buildMeta`/`clientAuthCapabilities` map host affordances onto each agent's
-// advertised methods), while `codexAuthProfile` additionally carries the `spawnAuthEnv`
+// The profiles are pure data: `claudeAuthProfile`/`opencodeAuthProfile`/`piAuthProfile` are
+// client-side adaptation only (their `describe`/`buildMeta`/`clientAuthCapabilities` map host
+// affordances onto each agent's advertised methods), while `codexAuthProfile` additionally carries the `spawnAuthEnv`
 // (`DEFAULT_AUTH_REQUEST`) lever — an EXISTING codex-acp spawn-time surface consumed client-side, on
 // top of the universal post-`initialize` replay (§2.5), never required for correctness (§3.3).
 //
@@ -98,4 +98,27 @@ export const opencodeAuthProfile: AuthProfile = {
   backendId: "opencode",
   clientAuthCapabilities: ({ terminal }) => ({ terminal, gateway: false }),
   describe: (_method, base) => base,
+};
+
+/** pi — `@automatalabs/pi-acp` (§9.5 of the frozen server contract). The server advertises five
+ *  `env_var` methods and one bare `agent` method for its ambient `~/.pi/agent/auth.json` store.
+ *  None is terminal- or gateway-gated, so the client advertises neither optional capability.
+ *  `describe` contributes method-specific remediation without changing the base dispatch type. */
+const PI_AUTH_REMEDIATION: Readonly<Record<string, string>> = {
+  "anthropic-api-key": "Set ANTHROPIC_API_KEY, then retry or resume the workflow.",
+  "openai-api-key": "Set OPENAI_API_KEY, then retry or resume the workflow.",
+  "gemini-api-key": "Set GEMINI_API_KEY, then retry or resume the workflow.",
+  "xai-api-key": "Set XAI_API_KEY, then retry or resume the workflow.",
+  "openrouter-api-key": "Set OPENROUTER_API_KEY, then retry or resume the workflow.",
+  "pi-stored-credentials":
+    "Configure pi credentials in ~/.pi/agent/auth.json, then retry or resume the workflow.",
+};
+
+export const piAuthProfile: AuthProfile = {
+  backendId: "pi",
+  clientAuthCapabilities: () => ({ terminal: false, gateway: false }),
+  describe: (method, base) => ({
+    ...base,
+    ...(PI_AUTH_REMEDIATION[method.id] ? { description: PI_AUTH_REMEDIATION[method.id] } : {}),
+  }),
 };

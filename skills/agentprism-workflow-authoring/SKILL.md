@@ -1,11 +1,11 @@
 ---
 name: agentprism-workflow-authoring
-description: Author, review, or debug AgentPrism workflow scripts — the `export const meta` + agent()/parallel()/pipeline() JavaScript DSL executed by @automatalabs/workflows (runDynamicWorkflow / WorkflowManager) and by the @automatalabs/mcp-server `workflow` tool. Use whenever writing or editing a workflow script. Covers routing each agent() call to a different ACP backend (Claude Code, Codex, OpenCode, or any custom ACP agent) within one script, structured outputs via JSON Schema, human checkpoints, token budgets, worktree isolation, and the resume-safe determinism rules.
+description: Author, review, or debug AgentPrism workflow scripts — the `export const meta` + agent()/parallel()/pipeline() JavaScript DSL executed by @automatalabs/workflows (runDynamicWorkflow / WorkflowManager) and by the @automatalabs/mcp-server `workflow` tool. Use whenever writing or editing a workflow script. Covers routing each agent() call to a different ACP backend (Claude Code, Codex, OpenCode, pi, or any custom ACP agent) within one script, structured outputs via JSON Schema, human checkpoints, token budgets, worktree isolation, and the resume-safe determinism rules.
 ---
 
 # Writing AgentPrism workflow scripts
 
-A workflow script is a small piece of plain JavaScript (passed around as a **string**, not a module) that orchestrates real, shipped coding agents. The engine runs the script in a deterministic sandboxed realm; every `agent()` call inside it fans out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend — Claude Code, OpenAI Codex, OpenCode, or any custom ACP agent server — which runs its own tool loop to completion and hands back the final text or a schema-validated object.
+A workflow script is a small piece of plain JavaScript (passed around as a **string**, not a module) that orchestrates real, shipped coding agents. The engine runs the script in a deterministic sandboxed realm; every `agent()` call inside it fans out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend — Claude Code, OpenAI Codex, OpenCode, pi, or any custom ACP agent server — which runs its own tool loop to completion and hands back the final text or a schema-validated object.
 
 This guide is **backend-agnostic**: everything here works the same regardless of which agent serves a given call, and one script can freely mix backends per call. `reference.md` (same directory) holds the exhaustive option tables, routing grammar, and error codes.
 
@@ -73,17 +73,17 @@ Per-agent model resolution order: explicit `agent({ model })` > `agent({ tier })
 The backend is selected **per `agent()` call** from its effective `model` string. This is the core capability: one script can plan on one vendor's agent, implement on another's, and review on a third's, handing structured results between them.
 
 - **Omit `model` entirely** for maximum portability — the call runs on whatever default backend the host configured (`AGENTPRISM_DEFAULT_BACKEND`, or the host's session model). A script with no model specs anywhere runs unchanged on any backend.
-- **Route by one registered first segment.** Split on the first `/`; ASCII-case-insensitive `claude`, `codex`, `opencode`, or a registered custom backend name selects that harness and is stripped exactly once. A custom registration wins on a built-in-name collision.
-- **Use a backend name alone** (`claude`, `codex`, `opencode`, or a custom name) to preserve the harness's configured default model. No model config call is made.
+- **Route by one registered first segment.** Split on the first `/`; ASCII-case-insensitive `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name selects that harness and is stripped exactly once. A custom registration wins on a built-in-name collision.
+- **Use a backend name alone** (`claude`, `codex`, `opencode`, `pi`, or a custom name) to preserve the harness's configured default model. No model config call is made.
 - **Everything else goes intact to the default backend.** `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases. When an id remains after routing, it is sent byte-for-byte: no catalog matching, case folding, bracket parsing, effort/Fast option driving, retry, or fallback. Brackets, dots, and provider prefixes are ordinary id characters; harness rejection is an agent error.
 - **`tier`** (`"small" | "medium" | "big"`) is a coarse alternative resolved from the host's tier config — use it when you want "a cheap model" without naming a vendor.
 
-The published examples use ids verified against live harness catalogs: `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer backend-only forms when the desired model is configured inside the harness.
+The published examples use ids verified against live harness catalogs: `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. For Pi, `pi/openrouter/vendor/model-id` strips only `pi/`; Pi then splits provider `openrouter` from model id `vendor/model-id`. Prefer backend-only forms when the desired model is configured inside the harness.
 
 Never guess model ids, effort values, or option names from memory — read the live catalog first:
 
 ```bash
-npx @automatalabs/workflows config                # every routable harness (claude, codex, opencode + registered customs)
+npx @automatalabs/workflows config                # every routable harness (claude, codex, opencode, pi + registered customs)
 npx @automatalabs/workflows config codex --json   # one harness, machine-readable
 ```
 
@@ -150,7 +150,7 @@ const report = await agent("Review the diff on this branch for correctness bugs.
 report.findings.forEach((f) => log(`${f.file}:${f.line} ${f.summary}`));
 ```
 
-The same schema works on **every** backend; only the fulfillment channel differs, and the runner picks it for you: Claude uses its native `outputFormat`, Codex its strict `outputSchema`, and OpenCode / custom ACP agents either get a client-hosted `StructuredOutput` MCP tool injected into the session (when the agent advertises HTTP MCP support) or fall back to a prompt-embedded schema with the final message parsed as JSON. In every channel the runner validates the value client-side (with type coercion) and re-prompts a bounded number of times before failing the call with non-recoverable `SCHEMA_NONCOMPLIANCE`.
+The same schema works on **every** backend; only the fulfillment channel differs, and the runner picks it for you: Claude uses its native `outputFormat`, Codex its strict `outputSchema`, Pi its native plain `_meta.outputSchema` with final-message JSON, and OpenCode / custom ACP agents either get a client-hosted `StructuredOutput` MCP tool injected into the session (when the agent advertises HTTP MCP support) or fall back to a prompt-embedded schema with the final message parsed as JSON. Pi's native path neither embeds the schema in the prompt nor injects an MCP tool. In every channel the runner validates the value client-side (with type coercion) and re-prompts a bounded number of times before failing the call with non-recoverable `SCHEMA_NONCOMPLIANCE`.
 
 Schema authoring rules that keep all channels healthy:
 
@@ -264,7 +264,7 @@ Guard budget-driven loops on `budget.total` being set — with no budget, `remai
 - Every agent session runs in the run's base `cwd` unless the call narrows it: `agent({ cwd: "packages/api" })` (relative resolves against the base).
 - `isolation: "worktree"` runs the agent in a **throwaway git worktree** (`<repoRoot>/.agentprism/worktrees/…`) so parallel agents can edit without colliding. The worktree and its branch are **always deleted when the call ends — an isolated agent's file edits are discarded**. Have isolated agents *return their work as data* (a unified diff, a file map, a report) and apply it in a later non-isolated step; use worktrees for experiments, builds, and verification, not for persistent edits. Outside a git repo, isolation degrades to the shared tree with a logged notice.
 - `resume: { filesystem: "read-only" }` is a contractual author assertion for content-addressed mainline replay, not a runner mode. Without worktree isolation the call must not mutate persistent filesystem/external state. With a successfully created throwaway worktree it may edit only that checkout, but still must not commit or touch shared git state, ignored/out-of-tree artifacts, or external resources. A degraded worktree loses this safety proof and runs live; isolation without the declaration never enables non-contiguous replay.
-- `mode` requests an agent-advertised ACP session mode and is **strict** — an unsupported mode fails the call rather than running unconfined. Mode ids are backend-specific (Claude-family: `plan`, `acceptEdits`, `bypassPermissions`; Codex-family: `read-only`, `agent`, `agent-full-access`; OpenCode via its mode option), so only set `mode` on calls whose `model` you also pin. Use read-only/plan modes for reviewers and auditors that must not write.
+- `mode` requests an agent-advertised ACP session mode and is **strict** — an unsupported mode fails the call rather than running unconfined. Mode ids are backend-specific (Claude-family: `plan`, `acceptEdits`, `bypassPermissions`; Codex-family: `read-only`, `agent`, `agent-full-access`; OpenCode via its mode option; Pi advertises thinking-level config rather than modes), so only set `mode` on calls whose `model` you also pin. Use read-only/plan modes for reviewers and auditors that must not write.
 - `agentType: "<name>"` binds a reusable subagent definition — a Markdown file at `<cwd>/.agentprism/agents/<name>.md` (project) or `~/.agentprism/agents/<name>.md` (user; project wins) whose frontmatter sets tool allow/deny lists, a model, and isolation, and whose body is the role prompt. An unknown name logs a warning and degrades to defaults.
 
 ## Wiring tools and inputs into a call
@@ -381,7 +381,7 @@ recovering a durable checkpoint). Resource content is the admission snapshot, ne
 
 To kill, patch, and resume a live run, call
 `{ action: "stop", runId, lastN?, labelGlob?, logLines? }`. The returned `aborted` snapshot is the
-authoritative durable acknowledgement: resume is safe immediately and a follow-up await adds
+authoritative durable acknowledgement: resume is safe immediately and an additional await adds
 nothing. Edit the file, then start a new run with its absolute `scriptPath` plus
 `resumeFromRunId: runId`. The manager replays only calls whose safety and environment facts remain
 provable; an in-flight stop may make the resumed run conservatively execute live, so read its

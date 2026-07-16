@@ -1,5 +1,5 @@
 // repo-triage — an autonomous, unattended triage of one repository, spread across
-// all three first-class backends (Claude Code, Codex, OpenCode) in a single run.
+// three complementary built-in backends (Claude Code, Codex, OpenCode) in a single run.
 // Stages: Map → Sweep → Verify → Hunt → Report. There is deliberately no
 // checkpoint(): every gate in this script is another agent, so the run needs no
 // human in the loop from start to finish.

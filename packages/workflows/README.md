@@ -6,7 +6,7 @@ The programmatic **SDK** for AgentPrism — run dynamic, multi-agent **workflow 
 
 You author a small JavaScript **script** (a string), the engine runs it in a deterministic,
 journaled, resumable realm, and every `agent()` call inside it is fanned out to a pooled ACP
-backend — **Claude** (`claude-agent-acp`), **Codex** (`codex-acp`), **OpenCode** (`opencode acp`),
+backend — **Claude** (`claude-agent-acp`), **Codex** (`codex-acp`), **OpenCode** (`opencode acp`), **pi** (`pi-acp`),
 or a registered custom ACP agent — driving the actual subprocess to completion.
 
 This package is the **canonical SDK** that the stdio MCP server
@@ -28,7 +28,7 @@ through this SDK's workflow/runner APIs rather than MCP server schemas.
 pnpm add @automatalabs/workflows
 ```
 
-> The Claude and Codex ACP servers ship as transitive dependencies and are spawned on demand.
+> The Claude, Codex, and pi ACP servers ship as transitive dependencies and are spawned on demand.
 > OpenCode is host-resolved: install `opencode-ai` or make `opencode` available on `PATH` before
 > routing a call to it.
 
@@ -43,6 +43,7 @@ pnpm add @automatalabs/workflows
     environment.
   - **Codex** — a logged-in Codex install (`~/.codex`).
   - **OpenCode** — credentials configured for the provider OpenCode will use.
+  - **pi** — a selected provider API key or credentials in `~/.pi/agent/auth.json`.
 
 You only need auth for the backend(s) your scripts actually route to. The default backend is
 Claude (override with `AGENTPRISM_DEFAULT_BACKEND`; see [Backend selection](#backend-selection)).
@@ -667,7 +668,7 @@ npx @automatalabs/workflows config codex opencode   # only the named harnesses
 npx @automatalabs/workflows config claude --json    # machine-readable report
 ```
 
-Harness names are the routing names: built-in `claude` / `codex` / `opencode` plus any custom
+Harness names are the routing names: built-in `claude` / `codex` / `opencode` / `pi` plus any custom
 backend registered via `AGENTPRISM_BACKENDS` (registered customs also join the no-argument
 default set). Each harness opens one session without a prompt — zero tokens — and reports its
 advertised config-option catalog verbatim: model ids (including bracket variants), effort
@@ -696,7 +697,7 @@ formatHarnessConfigReport(report); // the CLI's human table
 
 Pass a JSON Schema to `agent({ schema })` (in a script) or `runner.run(prompt, { schema })` (direct)
 and the result is a **validated object** instead of text. The backend constrains output natively
-(Claude `outputFormat`; Codex strict `outputSchema`; prompt/tool-assisted JSON for OpenCode and
+(Claude `outputFormat`; Codex strict `outputSchema`; pi native `_meta.outputSchema`; prompt/tool-assisted JSON for OpenCode and
 custom agents), then the value is coerced and validated client-side (typebox `Convert` → `Check`); on a miss the runner re-prompts a bounded number of
 times before failing with a non-recoverable `SCHEMA_NONCOMPLIANCE`.
 
@@ -734,7 +735,7 @@ toStrictJsonSchema(schema);  // OpenAI-strict-normalized (Codex outputSchema)
 
 The backend for each agent is chosen from its effective `model` (preferred) or `tier` string. Split
 the string on its first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`,
-`opencode`, or a registered custom backend name, it selects that harness and is stripped exactly
+`opencode`, `pi`, or a registered custom backend name, it selects that harness and is stripped exactly
 once; a custom registration wins on a built-in-name collision. A registered harness name alone is
 backend-only and preserves that harness's configured default model. Any other first segment sends
 the entire authored string unchanged to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). Omitting
@@ -746,6 +747,7 @@ import { selectBackend } from "@automatalabs/workflows";
 selectBackend({ model: "claude/opus[1m]" }).id;      // "claude"
 selectBackend({ model: "codex/gpt-5.6-sol" }).id;    // "codex"
 selectBackend({ model: "opencode/zai/glm-5.2" }).id; // "opencode"
+selectBackend({ model: "pi/openrouter/vendor/model" }).id; // "pi"
 ```
 
 When an id remains after routing, it becomes the exact ACP `session/set_config_option` value
@@ -788,7 +790,7 @@ createAcpRunner,              // () => AcpAgentRunner (the default AgentRunner; 
 AcpAgentRunner,               // class — implements AgentRunner over ACP
 InteractiveSession,           // held-open multi-turn ACP session returned by openSession()
 selectBackend,                // pick a built-in/custom backend from a model/tier spec
-ClaudeBackend, CodexBackend, CustomAcpBackend,
+ClaudeBackend, CodexBackend, OpenCodeBackend, PiBackend, CustomAcpBackend,
 resolveBackendRegistry, BACKENDS_ENV,
 AGENT_METHODS, CLIENT_METHODS, ACP_AUTH_REQUIRED_ERROR_CODE,
 clientCapabilitiesFor, adaptPromptContent,

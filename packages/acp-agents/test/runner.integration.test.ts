@@ -783,7 +783,7 @@ test("an unadvertised Fast-mode token stays inside the id without a fallback eve
 test("backend-only specs select no model for every built-in harness", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   const runner = makeRunner();
-  for (const model of ["claude", "codex", "opencode"]) {
+  for (const model of ["claude", "codex", "opencode", "pi"]) {
     assert.equal(await runner.run("hi", { model, cwd }), "ok");
   }
   assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 0);
@@ -797,6 +797,7 @@ test("routing strips at most one segment and sends authored brackets, dots, and 
     ["claude/anthropic/claude.4[high]", "anthropic/claude.4[high]"],
     ["codex/openai/gpt.5[high]", "openai/gpt.5[high]"],
     ["opencode/zai/glm.5[max]", "zai/glm.5[max]"],
+    ["pi/openrouter/vendor/model.5[max]", "openrouter/vendor/model.5[max]"],
     ["anthropic/claude.4[high]", "anthropic/claude.4[high]"],
     ["claude/codex/gpt.5[high]", "codex/gpt.5[high]"],
   ] as const;
