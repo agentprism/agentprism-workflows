@@ -43,8 +43,8 @@ our repo — `packages/acp-agents/src/capabilities.ts`,
 `packages/mcp-server/package.json`;
 external — `@agentclientprotocol/sdk@1.2.1`,
 `@agentclientprotocol/claude-agent-acp@0.59.0` (packaging + bootstrap blueprint),
-`@earendil-works/pi-coding-agent@0.80.9` (repo `earendil-works/pi` tag `v0.80.9`,
-commit `2d16f92973230a7e095aa984f150ba8702784f50`), `@modelcontextprotocol/sdk@1.29.0`.
+`@earendil-works/pi-coding-agent@0.80.10` (repo `earendil-works/pi` tag `v0.80.10`,
+commit `8dc78834cde4e329284cf505f9e3f99763df5529`), `@modelcontextprotocol/sdk@1.29.0`.
 
 ---
 
@@ -57,7 +57,7 @@ moved pin silently:
 1. Fresh temp clone of `https://github.com/earendil-works/pi`, then `git fetch --tags`.
 2. `gh api repos/earendil-works/pi/releases/latest --jq .tag_name` **and**
    `npm view @earendil-works/pi-coding-agent version`; the two MUST agree.
-3. Compare against the pin in §14 (`v0.80.9` / `2d16f92` / npm `0.80.9`). **If the pin is no longer the
+3. Compare against the pin in §14 (`v0.80.10` / `8dc7883` / npm `0.80.10`). **If the pin is no longer the
    latest release, that is a STOP:** re-verify every pi citation in this contract (`sdk.ts`,
    `agent-session.ts`, `session-manager.ts`, `agent.ts`, `agent/types.ts`, `ai/types.ts`,
    `env-api-keys.ts`, `model-registry.ts`, `auth-storage.ts`, `extensions/types.ts`) against the new
@@ -97,6 +97,14 @@ one additive optional field, `OpenAICompletionsCompat.deferredToolsMode?: "kimi"
 `packages/ai/src/types.ts`; the provider-compat interface is not consumed by this contract. Every
 load-bearing cited surface is byte-identical to `v0.80.8`, so the runtime pin advances without changing
 the ACP wire contract or the claims below.
+
+### 0.3 pi v0.80.10 freshness repin (normative)
+
+The 2026-07-16 dependency-gate check found `v0.80.10` / npm `0.80.10` at commit
+`8dc78834cde4e329284cf505f9e3f99763df5529`. The upstream diff `v0.80.9..v0.80.10` touches only
+`packages/ai` provider model catalogs (Kimi/Moonshot/xAI/openrouter metadata, pricing, thinking
+levels) plus changelogs and lockfiles; no §14-cited surface changed. The runtime pin advances
+without changing the ACP wire contract or the claims below.
 
 ---
 
@@ -249,7 +257,7 @@ Mirrors the `main→lib / bin→index` split of `packages/mcp-server/package.jso
   "scripts": { "build": "tsc -b", "typecheck": "tsc --noEmit", "test": "tsx --test \"test/**/*.test.ts\"", "prepublishOnly": "tsc -b" },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.2.1",
-    "@earendil-works/pi-coding-agent": "0.80.9",
+    "@earendil-works/pi-coding-agent": "0.80.10",
     "@modelcontextprotocol/sdk": "1.29.0",
     "typebox": "1.3.2"
   }
@@ -1776,7 +1784,7 @@ const ACP_DEP_MATCHERS = [
 ];
 ```
 
-Rationale: pi releases every 2–3 days (~30 releases in 10 weeks; v0.80.9 released 2026-07-16), so the
+Rationale: pi releases every 2–3 days (~30 releases in 10 weeks; v0.80.10 released 2026-07-16), so the
 pre-push freshness check must fail when pi-acp's pinned pi runtime falls behind npm `latest`.
 `@earendil-works/pi-coding-agent` is a **direct** dependency of a workspace package (pi-acp embeds it),
 so it belongs in `ACP_DEP_MATCHERS` (check 1, direct freshness), **not** `WRAPPED_RUNTIMES` (third-party
@@ -2007,12 +2015,12 @@ contract cites. All citations below therefore remain byte-accurate; the base is 
 merge-base this branch builds on, matching `.agentprism/design-198/base-sha.txt`).
 
 **pi source, all `packages/{ai,agent,coding-agent}/…` citations verified against:** repo
-`github.com/earendil-works/pi`, tag **`v0.80.9`**, commit
-**`2d16f92973230a7e095aa984f150ba8702784f50`**; npm `@earendil-works/pi-coding-agent@0.80.9`
-(lockstep with `@earendil-works/pi-agent-core@0.80.9`, `@earendil-works/pi-ai@0.80.9`). Freshness
-re-checked for issue #213: `releases/latest` = `v0.80.9`, `npm view … version` = `0.80.9` — pin is
+`github.com/earendil-works/pi`, tag **`v0.80.10`**, commit
+**`8dc78834cde4e329284cf505f9e3f99763df5529`**; npm `@earendil-works/pi-coding-agent@0.80.10`
+(lockstep with `@earendil-works/pi-agent-core@0.80.10`, `@earendil-works/pi-ai@0.80.10`). Freshness
+re-checked 2026-07-16: `releases/latest` = `v0.80.10`, `npm view … version` = `0.80.10` — pin is
 current. The released model/auth refactor and its mechanical contract migration are recorded in
-**§0.1**; the byte-compatible v0.80.9 repin is recorded in **§0.2**.
+**§0.1**; the byte-compatible v0.80.9 repin in **§0.2**; the catalog-only v0.80.10 repin in **§0.3**.
 
 **ACP SDK, `@agentclientprotocol/sdk@1.2.1`**, verified against the installed dist at
 `node_modules/.pnpm/@agentclientprotocol+sdk@1.2.1_zod@4.4.3/node_modules/@agentclientprotocol/sdk/dist/`.
@@ -2128,11 +2136,11 @@ implementation time per §0.
   `RequestError.internalError(errorKindData(...), …)` :2044,2080.
 - `dist/lib.js` — `runAcp`/`ClaudeAcpAgent` library exports :2.
 
-### pi `v0.80.9` (commit `2d16f92`)
+### pi `v0.80.10` (commit `8dc7883`)
 
 - `packages/coding-agent/package.json` — name `@earendil-works/pi-coding-agent`, `bin { pi:
   dist/cli.js }`, `exports { ".", "./rpc-entry" }`, `engines.node >=22.19.0`, deps
-  pi-agent-core/pi-ai/pi-tui `^0.80.9` + `typebox 1.1.38`.
+  pi-agent-core/pi-ai/pi-tui `^0.80.10` + `typebox 1.1.38`.
 - `packages/coding-agent/src/core/sdk.ts` — `CreateAgentSessionOptions` :33-80 (cwd, agentDir,
   **`modelRuntime?` :39-40**, model, thinkingLevel, tools/excludeTools/customTools, sessionManager; **no**
   beforeToolCall/streamFn), **`CreateAgentSessionResult { session, extensionsResult,
