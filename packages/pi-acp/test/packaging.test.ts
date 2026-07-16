@@ -28,9 +28,16 @@ test("T25 freshness gate tracks the direct pi runtime", async () => {
 test("T26 root project references pi-acp and a publishing changeset exists", async () => {
   const config = JSON.parse(await readFile(new URL("tsconfig.json", root), "utf8"));
   assert.ok(config.references.some(({ path }: { path: string }) => path === "packages/pi-acp"));
+  // A Version Packages merge CONSUMES changesets into the changelog, so on a release
+  // branch the guard is satisfied by the recorded release instead of a pending changeset.
   const changesets = await readdir(new URL(".changeset/", root));
   const bodies = await Promise.all(changesets.filter((name) => name.endsWith(".md")).map((name) => readFile(new URL(`.changeset/${name}`, root), "utf8")));
-  assert.ok(bodies.some((body) => body.includes('"@automatalabs/pi-acp"')));
+  const pendingChangeset = bodies.some((body) => body.includes('"@automatalabs/pi-acp"'));
+  const releasedChangelog = await readFile(new URL("CHANGELOG.md", packageRoot), "utf8").then(
+    (log) => /^## \d+\.\d+\.\d+/m.test(log),
+    () => false,
+  );
+  assert.ok(pendingChangeset || releasedChangelog);
 });
 
 test("T27 README covers invocation, API, registration, T2b disclosure, limits, and attribution", async () => {
