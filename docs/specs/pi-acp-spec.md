@@ -2,8 +2,15 @@
 
 **Date:** 2026-07-15
 
-**Status:** Frozen implementation contract for issue #198. Round 2 (supersedes round 1; addresses the
-references-accuracy, adversarial-completeness, and design-minimalism review boards).
+**Status:** Frozen implementation contract for issue #198. Round 3 (supersedes rounds 1–2; the
+references-accuracy and design-minimalism boards passed round 2, and this round closes every
+round-2 adversarial-completeness finding: the pi-main forward-compat note, the real
+`CreateAgentSessionResult` DI type + shared `modelRegistry` threading, runtime-vs-compile-time library
+exports, a permission sequence built on pi's actual `tool_execution_start`→`beforeToolCall` order, the
+`session/cancel` vs `$/cancel_request` split with an injected scheduler, a reconciled and complete error
+table, transactional lifecycle with pi `AgentSession.dispose()`, total session/cursor/cross-cwd-fork
+semantics, total MCP naming with bounded timeouts, total live/replay projections, corrected usage
+monotonicity, and a normative package README).
 
 **References (summary — full file:line + version pins in §14):**
 our repo — `packages/acp-agents/src/capabilities.ts`,
@@ -51,6 +58,30 @@ moved pin silently:
    citation (§14) against the new dist and re-pin §2.3 before building.
 
 The freshness gate (§10.1) enforces the same discipline continuously after landing.
+
+### 0.1 pi-main forward-compatibility risk note (normative, from the focus.md step-4 comparison)
+
+The implementation basis is the **released** pin `v0.80.7` (npm `@earendil-works/pi-coding-agent@0.80.7`)
+— that is what this contract's every pi citation was verified against and what pi-acp depends on
+(§2.3, §14). It is **not** pi's `origin/main`. At authoring, however, pi's unreleased `main`
+(commit `c6d8371`) is already **~143 files / +5,974 / −4,577 lines** ahead of `v0.80.7` across the cited
+packages (`git diff v0.80.7..origin/main --stat -- packages/{coding-agent,agent,ai}`), and the drift
+touches surfaces this contract cites directly:
+
+- `packages/coding-agent/src/core/sdk.ts` (~56 lines) — the `createAgentSession` factory (§4.1, §5.2).
+- `packages/coding-agent/src/core/agent-session.ts` (~103 lines) — the event bus, `beforeToolCall`
+  install, `setModel`/`setThinkingLevel`, usage getters (§6, §9.2).
+- `packages/coding-agent/src/core/model-registry.ts` (~1,032 lines) and `auth-storage.ts` (~366 lines),
+  plus a wholesale `packages/ai/src/utils/oauth/*` → `packages/ai/src/auth/oauth/*` reorganization — the
+  model/auth runtime this contract touches through `ModelRegistry.create`/`AuthStorage.create` and the
+  env-key catalog (§5.2, §9.5).
+
+pi releases every ~2–3 days, so a release folding this rewrite is likely imminent. This note is a
+**forward-compatibility risk flag, not a verification basis**: nothing here changes the frozen pin.
+Its consequence is operational — when the implementer runs the §0 re-verification and pi has moved
+past `v0.80.7` (which it almost certainly will have), the changed model/auth runtime and
+`createAgentSession`/`agent-session` surfaces are the **first** places to re-check, and any changed
+claim is a stop-and-report discrepancy per §0, never a silent re-implementation.
 
 ---
 
@@ -147,6 +178,7 @@ elsewhere by number ("invariant N").
 packages/pi-acp/
   package.json
   tsconfig.json                # extends root config; composite project reference
+  README.md                    # NORMATIVE deliverable (§15) — bin/library use, backend registration, limits
   src/
     index.ts                   # BIN entry ONLY: console redirect + dynamic import + bootstrap + shutdown
     lib.ts                     # LIBRARY entry: side-effect-free re-exports (runAcp, PiAcpAgent, deps types)
@@ -268,17 +300,25 @@ process.on("SIGINT", () => shutdown(0));
 process.stdin.resume();                                        // keep the loop alive while the stream is open
 ```
 
-### 3.1 Library entry (`src/lib.ts`)
+### 3.1 Library entry (`src/lib.ts`) — resolves adversarial finding 3
 
 ```ts
-export { runAcp, PiAcpAgent } from "./server.js";              // server.js re-exports PiAcpAgent
-export type { PiAcpDeps } from "./deps.js";
-export { resolveDeps } from "./deps.js";
+export { runAcp, PiAcpAgent } from "./server.js";              // server.js re-exports PiAcpAgent (VALUE exports)
+export { resolveDeps } from "./deps.js";                       // VALUE export (the DI-default builder, §4.1)
+export type { PiAcpDeps } from "./deps.js";                    // TYPE-ONLY export (erased at runtime)
 ```
 
 `lib.ts` performs **no** console mutation, opens **no** stdio, and starts **no** server on import.
-Importing `@automatalabs/pi-acp` yields `runAcp`/`PiAcpAgent`/`PiAcpDeps` with zero process side effects
-(tested per §13.1 T2). `runAcp` only connects a stream when *called*.
+`runAcp` only connects a stream when *called*.
+
+**Runtime vs compile-time exports are distinct and tested distinctly.** `runAcp`, `PiAcpAgent`, and
+`resolveDeps` are **value** exports: a runtime `await import("@automatalabs/pi-acp")` yields all three as
+own enumerable bindings (T2 asserts `typeof runAcp === "function"`, etc., and that neither `console` nor
+stdio was mutated — no server started). `PiAcpDeps` is an `export type` that TypeScript **erases** — it
+is **not** present on the runtime module object and a test MUST NOT assert it there. Its export is
+verified at **compile time**: a `.test-d.ts` file does `import type { PiAcpDeps } from
+"@automatalabs/pi-acp"` and type-asserts the interface shape under `tsc --noEmit` (T2b). The round-2
+claim that a runtime import "yields `PiAcpDeps`" was impossible and is corrected here.
 
 ### 3.2 Shutdown state machine (resolves adversarial finding 2)
 
@@ -332,14 +372,28 @@ export function runAcp(options?: { deps?: Partial<PiAcpDeps>; stream?: Stream })
 Method names come verbatim from the SDK `methods` registry (`acp.d.ts:17-79`). The server registers
 **only** the handlers above; unregistered methods (`session/set_mode`, `providers/*`, `logout`, `nes/*`,
 `document/*`, `session/delete`) are answered by the SDK as JSON-RPC method-not-found (`-32601`), the
-truthful response for a method whose capability is not advertised (§5). `$/cancel_request` and
-`session/cancel` share one abort path (§9.6): the SDK aborts the in-flight request's `context.signal`,
-which the adapter has wired to `agent.abort()`.
+truthful response for a method whose capability is not advertised (§5).
+
+**The two cancellation sources are NOT the same and are handled by different code (resolves adversarial
+finding 5).** Only `$/cancel_request` aborts the in-flight request's `context.signal`: the SDK's
+`handleProtocolNotification` looks up the incoming request by `requestId` and calls
+`controller.abort(...)` on that request's `AbortController` (`jsonrpc.js:640-652`,
+`CANCEL_REQUEST_METHOD = "$/cancel_request"` at `:1`). `session/cancel` is an **ordinary ACP
+notification** delivered to `impl.cancel(context)` via `.onNotification(methods.agent.session.cancel,
+…)`; the SDK does **not** wire it to any request's `context.signal` (the SDK's own `examples/agent.js`
+keeps a per-session `pendingPrompt` `AbortController` and aborts it in its `session/cancel` handler,
+`:41-42,215-216`). §9.6 therefore composes both sources — plus close/dispose and notify-failure — into
+one per-turn controller.
 
 Each handler receives an `AgentRequestContext` exposing `context.params` (schema-parsed request),
-`context.signal` (aborted on cancel), and `context.client` (an `AgentContext` with `notify(...)` for
-`session/update` and `request(...)` for `session/request_permission`) (`acp.d.ts:142-206,367-396`).
-All handler contexts wrap the same connection, so a `PiSession` captures its
+`context.signal` (aborts on `$/cancel_request` for this request, or the connection signal for
+notifications, `acp.d.ts:373-376`), `context.requestId`, and `context.client` (an `AgentContext` with
+generic `notify(method, params)` and `request(method, params, options?)`, `acp.d.ts:142-197`; the
+handler is registered as `(ctx) => impl.method(ctx)`). `context.client.request` accepts
+`SendRequestOptions.cancellationSignal` — "Aborting this signal sends `$/cancel_request` for the
+outgoing request. Cancellation is cooperative: the returned promise is still settled by the peer's
+eventual response" (`jsonrpc.d.ts:64-72`) — the mechanism §9.2/§9.6 use to tear down a parked
+permission request. All handler contexts wrap the same connection, so a `PiSession` captures its
 `notify(update) = context.client.notify(methods.client.session.update, { sessionId, update })` at
 `session/new` (or reattach) and reuses it for the session's lifetime.
 
@@ -351,8 +405,15 @@ monkey-patching (unreliable) is required.
 
 ```ts
 export interface PiAcpDeps {
-  /** Build an AgentSession. Default: pi's real createAgentSession (sdk.ts:167). */
-  createAgentSession(opts: CreateAgentSessionOptions): Promise<AgentSession>;
+  /**
+   * Build a pi session. Default: pi's real createAgentSession (sdk.ts:167), which returns
+   * `Promise<CreateAgentSessionResult>` — NOT `Promise<AgentSession>` (resolves adversarial finding 2).
+   * The adapter consumes `result.session` (the AgentSession) and `result.extensionsResult` (for the
+   * post-construction tool-name reconciliation of §9.3.2). EVERY call site (new/load/resume/fork,
+   * §9.1) passes `modelRegistry: deps.modelRegistry` so resolution, restore, stream auth, and setModel
+   * all use the one injected registry.
+   */
+  createAgentSession(opts: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
   /** SessionManager statics. Default: the real class methods (§9.1 citations). */
   sessions: {
     create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager;
@@ -361,25 +422,48 @@ export interface PiAcpDeps {
     list(cwd: string, sessionDir?: string): Promise<SessionInfo[]>;
     listAll(sessionDir?: string): Promise<SessionInfo[]>;
   };
-  /** Shared model registry. Default: ModelRegistry.create(AuthStorage.create(authPath)). */
+  /**
+   * Shared model registry, constructed ONCE per process. Default:
+   * ModelRegistry.create(AuthStorage.create(authPath)) (model-registry.ts:391; auth-storage.ts:215).
+   * `CreateAgentSessionOptions.modelRegistry` accepts it (sdk.ts:43), and pi's own restore/find/stream
+   * paths read it (sdk.ts:197,302-303). Passing it on every factory call is what keeps injected
+   * custom-provider resolution, journal-restored model lookup, `setModel`, and stream-time auth all
+   * resolving against the SAME registry — the divergence adversarial finding 2 flags otherwise.
+   */
   modelRegistry: ModelRegistry;
   /** Root for session JSONL. Default: undefined => pi's ~/.pi/agent/sessions/<encoded-cwd>. */
   sessionDir?: string;
   /** MCP stdio client factory. Default: a real @modelcontextprotocol/sdk stdio client (§9.3). */
   connectMcpClient(server: McpServerStdio, signal: AbortSignal): Promise<McpClientHandle>;
-  /** Monotonic clock for the wedged-agent grace timer. Default: () => Date.now(). */
-  now(): number;
-  /** Grace window after abort before force-resolve (§9.6). Default: 5000. */
+  /**
+   * Cancellable timer for the wedged-agent grace window and MCP bounded liveness (§9.6, §9.3).
+   * `sleep(ms, signal)` resolves after `ms` unless `signal` aborts first, in which case it rejects
+   * with the signal reason. Injecting the scheduler is what makes the backstop and MCP timeouts
+   * DETERMINISTIC in tests (a monotonic clock alone cannot control when a timer fires — the round-2
+   * `now()` seam is removed). Default: a real `setTimeout`-based sleep with `clearTimeout` on abort.
+   */
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+  /** Grace window after abort before the §9.6 backstop force-resolves. Default: 5000. */
   graceMs: number;
+  /**
+   * Bounded liveness for each MCP `connect`, `tools/list`, and `tools/call` (§9.3). A hung MCP server
+   * must never wedge a lifecycle request, its rollback, or a turn. Default: 30000. Injectable (not a
+   * hardcoded constant) so it mirrors `graceMs` and legitimately-slow MCP tools can be given room; it
+   * is a liveness bound, not a data cap (a timed-out `tools/call` becomes a failed tool result the
+   * model sees, §9.3.3; a timed-out connect/list rolls the lifecycle request back per §9.3.2).
+   */
+  mcpTimeoutMs: number;
 }
 ```
 
-The hermetic e2e substrate (§13.3): a test `createAgentSession` builds
-`new AgentSession({ agent: new Agent({ streamFn: mockStream, … }), sessionManager, … })` — the
-pi-agent-core injectable `streamFn` (`agent.ts:214`) wrapped in an `AgentSession` (its constructor takes
-`agent`, `agent-session.ts:343`) — driven with zero credentials. `now`/`graceMs` make the §9.6 backstop
-deterministic; `sessionDir` points at a temp dir; `stream` (runAcp arg) is an in-memory paired ndjson
-stream.
+The hermetic e2e substrate (§13.3): a test `createAgentSession` returns
+`{ session: new AgentSession({ agent: new Agent({ streamFn: mockStream, … }), sessionManager, … }),
+extensionsResult: { extensions: [], errors: [], runtime }, modelFallbackMessage: undefined }` — a real
+`CreateAgentSessionResult` — the pi-agent-core injectable `streamFn` (`agent.ts:214`) wrapped in an
+`AgentSession` (its constructor takes `agent`, `agent-session.ts:343`), driven with zero credentials.
+`sleep`/`graceMs` make the §9.6 backstop deterministic (a test injects a `sleep` that resolves when it
+chooses, forcing the wedged path); `mcpTimeoutMs` does the same for MCP hangs; `sessionDir` points at a
+temp dir; `stream` (runAcp arg) is an in-memory paired ndjson stream.
 
 ---
 
@@ -510,7 +594,8 @@ throw is caught and re-mapped to `authRequired` (`-32000`, §8), not `invalidPar
 2. For a spec `"<provider>/<model-id>"` (first `/` splits provider from the rest verbatim),
    `registry.find(provider, modelId)` (`model-registry.ts:695-696`) — exactly what `createAgentSession`
    uses internally (`sdk.ts:197`); covers builtin + custom-configured providers.
-3. Found → pass as `createAgentSession({ model })`; auth resolves at stream time via
+3. Found → pass as `createAgentSession({ model, modelRegistry: deps.modelRegistry, … })` — always with
+   the injected registry so restore/find/stream-auth agree (§4.1); auth resolves at stream time via
    `registry.getApiKeyAndHeaders(model)` (`sdk.ts:302-303`).
 4. `undefined` → reject the originating request `invalidParams` (`-32602`, `errorKind:"invalid_model"`),
    naming the unknown `provider/id` (never a silent fallback).
@@ -588,14 +673,35 @@ pi-ai `AssistantMessageEvent` token-delta union (`ai/types.ts:464-476`).
 |---|---|---|
 | `message_update` → `assistantMessageEvent` `text_delta` | `agent_message_chunk` | `content: { type:"text", text: delta }` |
 | `message_update` → `assistantMessageEvent` `thinking_delta` | `agent_thought_chunk` | separate thinking stream — the bridge folds this into message chunks; we do not |
-| `tool_execution_start` `{toolCallId,toolName,args}` | `tool_call` | `{ toolCallId, title: toolName, kind: mapKind(toolName), status:"pending", rawInput: args, locations: fileLocations(args), _meta:{ toolName } }` (§6.4, §9.2) |
-| `tool_execution_update` `{toolCallId,toolName,args,partialResult}` | `tool_call_update` | `{ toolCallId, status:"in_progress", content: toContent(partialResult) }` |
-| `tool_execution_end` `{toolCallId,toolName,result,isError}` | `tool_call_update` | `{ toolCallId, status: isError?"failed":"completed", rawOutput: result, content: toContent(result) }`; `read`/`edit`/`write` emit `type:"diff"` content with old/new text when the result exposes it |
+| `tool_execution_start` `{toolCallId,toolName,args}` | `tool_call` (**the SOLE `pending`**) | `{ toolCallId, title: toolName, kind: mapKind(toolName), status:"pending", rawInput: args, locations: fileLocations(args), _meta:{ toolName } }` (§6.4). This event is emitted by pi's loop **before** `beforeToolCall` runs (`agent-loop.ts:389/447/502` vs `:621`), so the translator — not the permission wrapper — owns the single pending `tool_call` for each `toolCallId` (§9.2) |
+| `tool_execution_update` `{toolCallId,toolName,args,partialResult}` | `tool_call_update` | `{ toolCallId, status:"in_progress", content: toContent(partialResult) }` (§6.3.1) |
+| `tool_execution_end` `{toolCallId,toolName,result,isError}` | `tool_call_update` (**the SOLE terminal**) | `{ toolCallId, status: isError?"failed":"completed", content: toContent(result), rawOutput: result.details }` (§6.3.1). pi's loop emits exactly one `tool_execution_end` per call on **every** path — normal, immediate-error, and permission block/abort (`agent-loop.ts` `emitToolExecutionEnd`) — so this is the sole terminal update; the permission wrapper adds none (§9.2) |
 | terminal `Usage` (on the terminal `AssistantMessage`) + session stats | `usage_update` (once per turn) + accumulate into `PromptResponse.usage` | §6.5 |
 | `compaction_start`/`compaction_end`, `queue_update`, `auto_retry_start`/`auto_retry_end`, `agent_settled`, `session_info_changed`, `thinking_level_changed`, `entry_appended`, `agent_start`, `turn_start`/`turn_end`, `message_start`/`message_end` | **no fabricated `session/update`** | v1 emits none of these as content; `auto_retry_*` and `compaction_*` surface only through the terminal stopReason/usage. No invented updates. |
 
 The `assistantMessageEvent` `*_start`/`*_end` boundary markers sequence chunks (via `contentIndex`) but
 emit no standalone update beyond the `*_delta` rows above.
+
+#### 6.3.1 Tool-result content projection (`toContent`, total) — resolves adversarial finding 10
+
+pi's `tool_execution_update.partialResult` and `tool_execution_end.result` are both `AgentToolResult`
+values shaped `{ content: (TextContent | ImageContent)[]; details?: unknown }` (grounded: pi's own
+`createErrorToolResult` returns `{ content:[{type:"text",text}], details:{} }`, `agent-loop.ts`;
+`ToolResultMessage.content` is `(TextContent | ImageContent)[]`, `ai/types.ts:403-418`). The projection
+is total and identical for live and replay:
+
+- `toContent(r)` maps `r.content` in order: `TextContent` → `{ type:"text", text }`; `ImageContent` →
+  `{ type:"image", data, mimeType }`. `r.content` is always an array here (pi normalizes tool results,
+  `createToolResultMessage` `content: result.content ?? []`); an empty array → an empty `content` array
+  (a valid, terminal `tool_call_update` with no content blocks).
+- `rawOutput` = `r.details` when `details` is a non-`undefined` value, else the field is **omitted**
+  (never `null`, never the whole message). `details` is pi's structured tool payload — exactly what ACP
+  `rawOutput` ("raw structured output") is for.
+- **No `type:"diff"` projection.** pi's `AgentToolResult` exposes no standardized old-text/new-text pair
+  (only `content` + arbitrary `details`), so a diff content block would be fabricated. `read`/`edit`/
+  `write` results are projected uniformly through `toContent` (pi renders a human-readable summary into
+  `content`); the round-2 "emit `type:"diff"` when the result exposes it" clause is **removed** as
+  ungrounded (recorded in §12).
 
 ### 6.4 Tool-call metadata mapping (`mapKind`)
 
@@ -636,11 +742,28 @@ aggregators:
   `agent-session.ts:3023-3060`; the method's own doc: "totals reflect what was actually billed across
   the session").
 
-Emit exactly one `usage_update` per turn, after the turn settles and before `drain()`. Because
-`getSessionStats().cost` and `getContextUsage()` aggregate over the whole session, `used` and
-`cost.amount` are monotonic/context-correct across multi-message turns, multiple turns, and after
-load/resume (the restored journal is included). Our client reads `cost.amount` into `AgentUsage.cost`
-(`usage.ts:11-17,28-59`) and treats `PromptResponse.usage` as authoritative for the token breakdown.
+**Monotonicity — corrected (resolves adversarial finding 11).** `cost.amount` is
+`getSessionStats().cost`, a sum of `usage.cost.total` over **all** persisted assistant entries, so it is
+**monotonically non-decreasing** across messages, turns, and after load/resume. `used` is
+`getContextUsage().tokens`, the tokens **currently in the context window**, and is **NOT monotonic**: a
+compaction that summarizes history **reduces** `used` on the next `usage_update`. The contract makes no
+monotonicity claim about `used`; only cumulative `cost.amount` is monotonic. Our client reads
+`cost.amount` into `AgentUsage.cost` (`usage.ts:11-17,28-59`) and treats `PromptResponse.usage` as
+authoritative for the per-turn token breakdown.
+
+**Per-outcome usage behavior (pinned, one row per §7/§8/§9.6 exit):**
+
+| turn outcome | `usage_update` | `PromptResponse.usage` |
+|---|---|---|
+| normal completion (`end_turn`/`max_tokens`) | emit once, from the post-settle `getContextUsage()`/`getSessionStats()` snapshot, then `drain()` | per-turn breakdown Σ over the turn's assistant messages |
+| normal cancel (turn settled `aborted` via §9.6) | emit once from the post-settle snapshot, then `drain()` | per-turn breakdown over whatever assistant messages accumulated before the abort (may be all-zero) |
+| provider error (terminal `stopReason "error"`, §8 reject) | emit once from the post-settle snapshot **before** rejecting (so cumulative cost includes the billed failed attempts), then `drain()` | n/a — the request rejects (no `usage`) |
+| pre-flight throw (synchronous, nothing streamed) | **none** — no assistant message and no new billed tokens exist | n/a — the request rejects |
+| forced cancel (wedged backstop, §9.6 — turn never settled) | emit once from the **current** `getContextUsage()`/`getSessionStats()` snapshot (best-effort; may equal the pre-turn values), then `drain()` | per-turn breakdown over any assistant messages captured so far (commonly all-zero) |
+
+`usage_update` is always emitted **before** `drain()` and before the request resolves/rejects, so the
+client observes usage in order. A compaction-drop case is tested (T6): two turns where the second's
+`used` is **lower** than the first's while `cost.amount` still rises.
 
 ### 6.6 Turn lifecycle and concurrency
 
@@ -700,6 +823,11 @@ JSON-RPC codes are pinned; `data.errorKind` is the categorical convention claude
 
 ### 8.1 Complete failure table
 
+This is the **canonical, complete** table: every hard failure introduced by any normative section
+appears here exactly once, and every `errorKind` string is exactly one of these. `data.message` is
+always a fixed category label; `data.details` is only ever pi-redacted `diagnostics` (redaction rule,
+§8.2).
+
 | # | condition | constructor | code | `data` |
 |---|---|---|---|---|
 | 1 | auth required / missing-or-invalid provider credential (pre-flight throw OR classified terminal error) | `authRequired` | **`-32000`** (auth-exclusive) | `{ errorKind:"auth_error" }` |
@@ -708,25 +836,51 @@ JSON-RPC codes are pinned; `data.errorKind` is the categorical convention claude
 | 4 | other terminal `stopReason "error"` | `internalError` | `-32603` | `{ errorKind:"provider_error", details?: redactedDiagnostics }` |
 | 5 | unknown model spec (§5.2) | `invalidParams` | `-32602` | `{ errorKind:"invalid_model" }` |
 | 6 | no model selected before first prompt and pi has no default | `invalidParams` | `-32602` | `{ errorKind:"invalid_model" }` |
-| 7 | empty prompt (§6.1) | `invalidParams` | `-32602` | `{ errorKind:"empty_prompt" }` |
-| 8 | invalid content block (missing image `data`/`mimeType`; malformed block) | `invalidParams` | `-32602` | `{ errorKind:"invalid_content" }` |
-| 9 | second concurrent prompt on a busy session (invariant 4) | `invalidParams` | `-32602` | `{ errorKind:"session_busy" }` |
+| 7 | empty prompt — the §6.1 fold yields no text **and** no images (schema-valid but semantically empty) | `invalidParams` | `-32602` | `{ errorKind:"empty_prompt" }` |
+| 8 | **structurally-malformed prompt content** (bad `ContentBlock` discriminant, missing required image `data`/`mimeType`, etc.) | **SDK pre-handler** — `invalidParams` from `zPromptRequest` | `-32602` | SDK Zod-format `data` (**no** `errorKind`; see note) |
+| 9 | second concurrent prompt on a busy session (invariant 4), **or** `fork` of a busy source (§9.1.4) | `invalidParams` | `-32602` | `{ errorKind:"session_busy" }` |
 | 10 | set_config_option: unknown id / bad value / wrong type / busy (§5.2) | `invalidParams` | `-32602` | `{ errorKind: as in §5.2 }` |
-| 11 | invalid cwd (not absolute / does not exist / not a directory) on new/fork | `invalidParams` | `-32602` | `{ errorKind:"invalid_cwd" }` |
-| 12 | unknown session id (load/resume/fork/close/prompt/set_config) | `invalidParams` | `-32602` | `{ errorKind:"unknown_session" }` |
-| 13 | poisoned/tombstoned session reopen or use (§9.1.6) | `invalidParams` | `-32602` | `{ errorKind:"session_terminated" }` |
-| 14 | malformed/corrupt session JSONL on open | `internalError` | `-32603` | `{ errorKind:"session_corrupt" }` |
-| 15 | MCP connect/list failure on a lifecycle method (§9.3) | `internalError` | `-32603` | `{ errorKind:"mcp_init_error", server: <name> }` |
-| 16 | structured-tool reserved-name collision (§9.4) | `internalError` | `-32603` | `{ errorKind:"structured_tool_collision" }` |
-| 17 | invalid `_meta.outputSchema` (non-object / not a schema) | `invalidParams` | `-32602` | `{ errorKind:"invalid_output_schema" }` |
-| 18 | notification delivery failure mid-turn/replay (§6.2) | `internalError` | `-32603` | `{ errorKind:"notification_error" }` |
-| 19 | permission `client.request` transport failure (§9.2) | treated as deny → turn continues; if the abort also fails, `internalError` | `-32603` | `{ errorKind:"permission_error" }` |
-| 20 | unknown/unsupported method | SDK default | `-32601` | — |
+| 11 | invalid cwd (not absolute / does not exist / not a directory) — on new/fork(target)/load/resume/list whenever `cwd` is present | `invalidParams` | `-32602` | `{ errorKind:"invalid_cwd" }` |
+| 12 | unknown session id — load / resume / prompt / set_config / fork **source** (§9.1.4). **Not `close`** (row 24) | `invalidParams` | `-32602` | `{ errorKind:"unknown_session" }` |
+| 13 | duplicate open — `load`/`resume` for an id already live **or reserved-opening** (§9.1.6) | `invalidParams` | `-32602` | `{ errorKind:"session_already_open" }` |
+| 14 | poisoned/tombstoned session reopen or use (§9.1.6) | `invalidParams` | `-32602` | `{ errorKind:"session_terminated" }` |
+| 15 | malformed/corrupt session JSONL on open (`SessionManager.open`/`forkFrom` throw) | `internalError` | `-32603` | `{ errorKind:"session_corrupt" }` |
+| 16 | MCP connect / `tools/list` failure **or timeout** (`deps.mcpTimeoutMs`) on a lifecycle method, or a duplicate MCP server name (§9.3) | `internalError` | `-32603` | `{ errorKind:"mcp_init_error", server: <name> }` |
+| 17 | non-stdio (`http`/`sse`/`acp`) MCP server sent to a lifecycle method (§9.3.4) | `invalidParams` | `-32602` | `{ errorKind:"unsupported_mcp_transport", server: <name> }` |
+| 18 | structured-tool reserved-name collision (§9.4, a pi built-in/extension already owns `__acp_structured_output`) | `internalError` | `-32603` | `{ errorKind:"structured_tool_collision" }` |
+| 19 | invalid `_meta.outputSchema` (non-object / not a schema) | `invalidParams` | `-32602` | `{ errorKind:"invalid_output_schema" }` |
+| 20 | invalid `session/list` cursor (undecodable / not a canonical non-negative integer / out of range, §9.1.5) | `invalidParams` | `-32602` | `{ errorKind:"invalid_cursor" }` |
+| 21 | `authenticate` with an unknown `methodId` (§9.5) | `invalidParams` | `-32602` | `{ errorKind:"unknown_auth_method" }` |
+| 22 | notification delivery failure mid-turn/replay (§6.2) | `internalError` | `-32603` | `{ errorKind:"notification_error" }` |
+| 23 | **catch-all** — any other unexpected error from `SessionManager`, `createAgentSession`, replay, config, MCP result conversion, or `dispose` not classified above | `internalError` | `-32603` | `{ errorKind:"internal_error" }` (redacted message; **no** raw text) |
+| 24 | unknown/unsupported method | SDK default | `-32601` | — |
+
+**Row 8 (structural prompt malformation) is the SDK's, not the handler's.** The agent builder registers
+`prompt` with the Zod parser `zPromptRequest` (`acp.js:599`), so a `PromptRequest` whose `ContentBlock`s
+are structurally invalid is rejected by the SDK with `invalidParams` (`-32602`) carrying the SDK's
+Zod-format `data` **before** `impl.prompt` runs — the handler cannot attach an `errorKind` and MUST NOT
+try. The adapter's own content checks are therefore only the **semantic** ones the schema permits: the
+`empty_prompt` fold (row 7) and `invalid_output_schema` (row 19). The round-2 `invalid_content`
+errorKind was **unreachable** (nothing schema-valid remained for it to catch) and is **removed**;
+schema-valid image `data` is passed to pi as-is (pi does not pre-decode base64 either), so no residual
+handler check exists. T8 asserts the SDK pre-handler shape for a malformed block.
+
+**`close` is never an error (resolves the row-12 contradiction).** `session/close` for an unknown,
+already-closed, or tombstoned id returns **success** (idempotent, §9.1.6) — it is deliberately absent
+from rows 12/14. Only load/resume/prompt/set_config/fork-source reach `unknown_session`.
+
+**Permission transport failure is not a reject.** If the `session/request_permission` `client.request`
+rejects (transport broken/closed), the permission wrapper treats it as a **fail-safe deny** for that one
+tool and **returns `{ block:true }`** to pi; the turn continues and settles normally (§9.2.1 step 4). It
+does **not** reject `session/prompt` and has **no** `errorKind` — the round-2 "row 19 … if the abort also
+fails" clause referenced an abort that path never performs and is removed. (A genuinely broken transport
+surfaces instead as row 22 when a subsequent `notify` fails, or as the turn settling and resolving
+normally.)
 
 Reserved-code facts (verified in the installed SDK `jsonrpc.js`): `-32700` parseError, `-32600`
 invalidRequest, `-32601` methodNotFound, `-32602` invalidParams, `-32603` internalError, `-32800`
 requestCancelled, **`-32000` authRequired (exclusive)**, `-32002` resourceNotFound. `-32002` is used by
-no row above — pi surfaces "not found" for sessions as `invalidParams`/`unknown_session` (rows 12/13),
+no row above — pi surfaces "not found" for sessions as `invalidParams`/`unknown_session` (rows 12/14),
 because our client's generic mapper routes ONLY `-32000` to pause-for-auth and treats every other
 reserved code as non-auth (`OTHER_RESERVED`, `errors-map.ts:23`; `isAcpAuthRequired` code-only,
 `:135-146`), so `unknown_session` on `-32602` cannot mis-route.
@@ -756,11 +910,16 @@ The precedence is fixed (auth > billing > rate > generic) so two implementations
 identically. This uses the same `internalError`+`errorKind` shape claude-agent-acp emits
 (`dist/acp-agent.js:2044,2080`).
 
-**Redaction rule.** The haystack used for classification is **never** echoed on the wire. `data.message`
-is set to a fixed category label (e.g. `"provider rate limit"`), never the raw `errorMessage`.
-`data.details`, when present, is set ONLY to `message.diagnostics` (pi-redacted) — never `errorMessage`,
-which may contain request echoes or key fragments. Our generic mapper folds `data.message`/`data.details`
-into the classifiable error text (`errors-map.ts:33-71`) without needing the raw provider string.
+**Redaction rule (applies to every row, including the row-23 catch-all).** The haystack used for
+classification is **never** echoed on the wire. `data.message` is set to a fixed category label (e.g.
+`"provider rate limit"`, or `"internal error"` for row 23), never the raw `errorMessage` and never a
+caught exception's `.message`/`.stack`. `data.details`, when present, is set ONLY to
+`message.diagnostics` (pi-redacted) — never `errorMessage` or a raw exception, which may carry request
+echoes, file paths, or key fragments. The row-23 catch-all wraps ANY unclassified throw
+(`SessionManager`, `createAgentSession`, replay, config, MCP conversion, `dispose`) as
+`internalError` + `{ errorKind:"internal_error" }` with the fixed label, logging the raw error to stderr
+only. Our generic mapper folds `data.message`/`data.details` into the classifiable error text
+(`errors-map.ts:33-71`) without needing the raw provider string.
 
 **Downstream client behavior.** `-32000` → `AUTH_REQUIRED` pause by code alone
 (`errors-map.ts:135-146`; `ACP_AUTH_REQUIRED_CODE_EXCLUSIVE`, `protocol-coverage.ts:152-154`). Until the
@@ -774,45 +933,99 @@ as recoverable execution errors — correct default behavior.
 
 ### 9.1 Sessions (`src/session.ts`, `src/replay.ts`) — resolves adversarial findings 4, 5, 6
 
-The adapter holds a per-connection `Map<sessionId, PiSession>` (live) plus a per-connection
-`Set<sessionId>` of **tombstones** (§9.1.6). Each `PiSession` owns one `AgentSession`, its translator
-subscription, its send queue (§6.2), its permission wrapper (§9.2), its bridged MCP clients (§9.3), and
-(when armed) its structured-output tool (§9.4). `sessionId` is pi's `SessionManager.getSessionId()`.
+The adapter holds three per-connection structures: a `Map<sessionId, PiSession>` (**live**), a
+`Set<sessionId>` (**opening** — reservations held during async acquisition), and a `Set<sessionId>`
+(**tombstones**, §9.1.6). Each `PiSession` owns one `AgentSession`, its translator subscription, its
+send queue (§6.2), its permission wrapper (§9.2), its bridged MCP clients (§9.3), and (when armed) its
+structured-output tool (§9.4). `sessionId` is pi's `SessionManager.getSessionId()`.
+
+#### 9.1.0 Transactional acquisition and atomic reservation (resolves adversarial findings 7, 8)
+
+Every session-opening method (new/load/resume/fork) runs one all-or-nothing transaction. Because Node
+runs the handler body to its first `await` without interleaving, the **reservation is atomic**:
+
+1. **Reserve synchronously, before any `await`.** For load/resume the id is `request.sessionId`; for
+   new/fork the id is not known until pi mints it, so those reserve on the minted id at the first sync
+   point after minting. Check `live.has(id) || opening.has(id)` → if set, reject `session_already_open`
+   (row 13); check `tombstones.has(id)` → reject `session_terminated` (row 14). Otherwise
+   `opening.add(id)`. This closes the round-2 check-then-await-then-register race in which two concurrent
+   `load`s for the same id could both pass a live-map check and both register (leaking one).
+2. **Acquire in order, tracking each resource:** validate cwd (row 11) → obtain the `SessionManager`
+   (create/open/forkFrom) → connect MCP (§9.3, all-or-nothing, bounded by `deps.mcpTimeoutMs`) →
+   `deps.createAgentSession({ …, modelRegistry: deps.modelRegistry })` → install the permission wrapper
+   + translator + (inactive) structured-output tool → (load only) replay + `drain()`.
+3. **Commit:** move `id` from `opening` to `live`; return the response.
+4. **Rollback on ANY failure at any stage** (reverse order, best-effort, each step guarded and bounded):
+   call pi's **`AgentSession.dispose()`** (`agent-session.ts:799` — aborts pi's retry/compaction/bash
+   hooks + `agent.abort()`, invalidates extensions, cleans pi resources; abort/unsubscribe alone would
+   leak them), unsubscribe the translator, cancel + drop the send queue, disconnect every MCP client
+   already connected (each bounded by `deps.mcpTimeoutMs` so a hung `close()` cannot wedge rollback),
+   and `opening.delete(id)`. **No live registry entry, MCP child, listener, pi resource, or structured
+   tool remains.** A replay-`notify` failure (§6.2) is a stage-2 failure: it rolls back fully, so the id
+   is NOT left live and a retry is a clean `session/load`, never a spurious `session_already_open`.
+   Disposal/disconnect errors during rollback are logged to stderr and never mask the original
+   rejection.
+
+**The one irreversible step is `forkFrom` (§9.1.4).** It writes the new JSONL eagerly
+(`session-manager.ts:1490`, `writeFileSync` + `appendFileSync`, flag `wx`). MCP is connected **before**
+`forkFrom`, so an MCP failure rolls back with nothing written. If the only post-write step
+(`createAgentSession`) then fails, the forked JSONL is a **complete, valid, loadable** session (pi copied
+the full source history) — it is never registered live and is not corrupt; we cannot and do not
+hand-delete it (no pi delete API, §11). This satisfies "no half-initialized **live** session" (invariant
+2) without hand-editing journals.
 
 #### 9.1.1 `session/new`
 
-`validateCwd(request.cwd)` (row 11 on failure) → `deps.sessions.create(cwd, deps.sessionDir)`
-(`session-manager.ts:1441`) → connect the request's stdio MCP servers (§9.3; row 15 on failure, with
-rollback) → `deps.createAgentSession({ cwd, model?, thinkingLevel?, customTools, sessionManager })`
-(§5.2) → register the permission wrapper (§9.2), the translator (§6.3), and the structured-output tool
-inactive (§9.4). Return `{ sessionId, configOptions: [thinkingLevelOption], modes: null }`
-(`NewSessionResponse`, `types.gen.d.ts:2556`).
+`validateCwd(request.cwd)` (row 11) → `deps.sessions.create(cwd, deps.sessionDir)`
+(`session-manager.ts:1441`; constructs in memory, writes no JSONL until the first append) → reserve the
+minted `getSessionId()` (§9.1.0 step 1) → connect the request's stdio MCP servers (§9.3; row 16/17 on
+failure, with rollback) → `deps.createAgentSession({ cwd, model?, thinkingLevel?, customTools,
+sessionManager, modelRegistry: deps.modelRegistry })` (§5.2) → install the permission wrapper (§9.2), the
+translator (§6.3), and the structured-output tool inactive (§9.4) → commit. Return
+`{ sessionId, configOptions: [thinkingLevelOption], modes: null }` (`NewSessionResponse`,
+`types.gen.d.ts:2556`).
 
 #### 9.1.2 `session/load` (reopen + replay)
 
-Resolve the session file for `sessionId` via `deps.sessions.list(request.cwd, deps.sessionDir)`
-(`session-manager.ts:1549`, → `SessionInfo{ id, path, … }`, `:170-184`); if absent → row 12.
-`deps.sessions.open(path)` (`:1452`; row 14 on corrupt JSONL); connect request MCP servers (§9.3);
-`deps.createAgentSession({ sessionManager })` restores the model context internally via
-`buildSessionContext()` (`sdk.ts:188-204`). Then **replay the transcript to the client**: iterate
+`validateCwd(request.cwd)` when present (row 11) → reserve `request.sessionId` atomically (§9.1.0 step 1;
+`session_already_open`/`session_terminated` guards). Resolve the session file for `sessionId` via
+`deps.sessions.list(request.cwd, deps.sessionDir)` (`session-manager.ts:1549`, → `SessionInfo{ id, path,
+… }`, `:170-184`); if absent → row 12. `deps.sessions.open(path)` (`:1452`; row 15 on corrupt JSONL);
+connect request MCP servers (§9.3, rolled back on failure); `deps.createAgentSession({ sessionManager,
+modelRegistry: deps.modelRegistry })` restores the model context internally via `buildSessionContext()`
+(`sdk.ts:188-204`). Then **replay the transcript to the client**: iterate
 `SessionManager.getBranch()` (`session-manager.ts:1189` — the full active linear branch of
 `SessionEntry`, NOT the compaction-summarized `buildSessionContext()`), projecting each entry through
 `src/replay.ts` into `session/update` notifications, enqueued on the send queue, and `await drain()`
 before returning. Response mirrors `session/new`: `{ configOptions, modes: null }` with restored
 `currentValue` (§5.2).
 
-**Replay projection (`src/replay.ts`)** — `SessionEntry` (`session-manager.ts:140-152`) → ACP updates.
-This is a distinct table from the live one (§6.3): stored entries are `SessionEntry`/`AgentMessage`
-values, not live delta events, and the SDK `SessionUpdate` union DOES include `user_message_chunk`
-(`types.gen.d.ts:3437`) for the user side.
+**Replay projection (`src/replay.ts`) — total over the pinned `SessionEntry` union and the
+`AgentMessage` sub-union (resolves adversarial finding 10).** `getBranch()` returns
+`SessionEntry[]` (`session-manager.ts:140-152`). A `SessionMessageEntry.message` is the **extensible
+`AgentMessage`** union (`agent/src/types.ts:314` = `Message | CustomAgentMessages[keyof …]`), whose role
+is one of `user | assistant | toolResult | bashExecution | custom | branchSummary | compactionSummary`
+(`ai/types.ts:382-419`; `agent/src/harness/messages.ts:19-60`). The table below is **exhaustive** over
+both unions — every entry type and every message role has a pinned projection or an explicit no-update
+rule, so two implementations produce the identical transcript. `UserMessage.content`,
+`CustomMessage.content`, and `CustomMessageEntry.content` are each `string | (TextContent |
+ImageContent)[]`; the `contentItems(c)` helper normalizes: a `string` → one text item; an array → its
+items in order (text → `{type:"text"}`, image → `{type:"image", data, mimeType}`). `toContent`/`rawOutput`
+are exactly §6.3.1.
 
-| `SessionEntry` | projection |
+| `SessionEntry` / message role | projection |
 |---|---|
-| `message`, `message.role:"user"` (`UserMessage`) | `user_message_chunk` per content item — text → `{type:"text"}`, image → `{type:"image", data, mimeType}` |
-| `message`, `message.role:"assistant"` (`AssistantMessage`) | for each content item in order: `TextContent`→`agent_message_chunk`; `ThinkingContent`→`agent_thought_chunk`; `ToolCall`→`tool_call` `{ toolCallId: id, title:name, kind:mapKind(name), status:"pending", rawInput:arguments, _meta:{toolName:name} }` |
-| `message`, `message.role:"toolResult"` (`ToolResultMessage`) | `tool_call_update` `{ toolCallId, status: isError?"failed":"completed", content: toContent(content), rawOutput }` |
-| `custom_message` with `display:true` (`CustomMessageEntry`) | `user_message_chunk` (it participates in LLM context as a user message) |
-| `thinking_level_change`, `model_change`, `compaction`, `branch_summary`, `custom`, `label`, `session_info`, `custom_message` with `display:false` | **no update** (internal bookkeeping; model/level land in `configOptions.currentValue`; §11 records that branch-topology and compaction summaries are not replayed) |
+| `message`, role `user` (`UserMessage`) | one `user_message_chunk` per `contentItems(message.content)` |
+| `message`, role `assistant` (`AssistantMessage`) | for each content item in order: `TextContent`→`agent_message_chunk`; `ThinkingContent`→`agent_thought_chunk`; `ToolCall`→`tool_call` `{ toolCallId:id, title:name, kind:mapKind(name), status:"pending", rawInput:arguments, _meta:{toolName:name} }` |
+| `message`, role `toolResult` (`ToolResultMessage`) | `tool_call_update` `{ toolCallId, status: isError?"failed":"completed", content: toContent(message), rawOutput: message.details }` |
+| `message`, role `bashExecution` (`BashExecutionMessage`) | one `agent_message_chunk` with text `bashExecutionToText(message)` (pi's own rendering, `messages.ts:63-80`) — agent-side shell activity shown as an assistant chunk |
+| `message`, role `custom` (`CustomMessage`), `display:true` | one `agent_message_chunk` per `contentItems(message.content)` (agent-displayed custom text) |
+| `message`, role `custom` (`CustomMessage`), `display:false` | **no update** (hidden from the transcript, as in pi's TUI) |
+| `message`, role `branchSummary` (`BranchSummaryMessage`) | **no update** (branch topology not replayed, §11) |
+| `message`, role `compactionSummary` (`CompactionSummaryMessage`) | **no update** (compaction summary is model-facing, §11) |
+| `custom_message` entry, `display:true` (`CustomMessageEntry`) | one `user_message_chunk` per `contentItems(content)` (it is injected into LLM context as a user message, `session-manager.ts:127-138`) |
+| `custom_message` entry, `display:false` | **no update** (hidden) |
+| `thinking_level_change`, `model_change`, `compaction`, `branch_summary`, `custom` (entry), `label`, `session_info` | **no update** (internal bookkeeping; model/level land in `configOptions.currentValue`) |
 
 Message IDs: tool calls/updates use pi's `ToolCall.id`/`ToolResultMessage.toolCallId` (stable); message
 chunks carry content only and need no id. Ordering is `getBranch()` array order (append order along the
@@ -821,53 +1034,89 @@ compaction-aware context pi feeds the model — a decisive v1 choice recorded in
 
 #### 9.1.3 `session/resume` (reopen without replay)
 
-Identical open + MCP wiring as load, but **no** replay: restore into `agent.state` and return
-immediately with the restored `configOptions`. Highest-value advertisement for our client (§5).
+Identical to load — `validateCwd` (row 11), atomic reservation (§9.1.0), open + MCP wiring, and
+`createAgentSession({ …, modelRegistry: deps.modelRegistry })` — but with **no** replay: restore into
+`agent.state` and return immediately with the restored `configOptions`. Highest-value advertisement for
+our client (§5).
 
 #### 9.1.4 `session/fork`
 
-If the source `sessionId` is unknown → row 12; if the source is **busy** (in-flight turn) → reject
-`invalidParams` (`-32602`, `errorKind:"session_busy"`) — do not fork a session mid-turn. Otherwise
-resolve the source path (list lookup), `deps.sessions.forkFrom(sourcePath, request.cwd ?? sourceCwd,
-deps.sessionDir)` (`session-manager.ts:1490`), connect request MCP servers, wrap in a fresh
-`AgentSession`, register a **new** `PiSession` under the new `sessionId`, and return it with fresh
-`configOptions`.
+`ForkSessionRequest.cwd` is the **target** cwd (required by the SDK, `types.gen.d.ts:4923`) — it does
+**not** identify the source file — so the source must be resolved by id. **Source lookup order
+(pinned):**
+
+1. If `request.sessionId` is a **live** `PiSession`, use its `SessionManager` file path.
+2. Otherwise `deps.sessions.listAll(deps.sessionDir)` (`session-manager.ts:1564`, all project dirs —
+   this is what makes **cross-cwd** forks work: the source may live under a different cwd than the
+   target) and select the `SessionInfo` whose `id === request.sessionId`. If **multiple** match
+   (duplicate ids across dirs), pick the most-recently-`modified` (the list is already sorted `modified`
+   desc, `:1556`) — deterministic. If **none** → row 12 (`unknown_session`).
+
+Then: if the source is a live **busy** session (in-flight turn) → reject `session_busy` (do not fork
+mid-turn). `validateCwd(request.cwd)` (target, row 11). Connect the request's MCP servers **first**
+(all-or-nothing, §9.3) so an MCP failure rolls back before anything is written. Then
+`deps.sessions.forkFrom(sourcePath, request.cwd, deps.sessionDir)` (`session-manager.ts:1490` — the
+irreversible JSONL write; §9.1.0 covers a post-write `createAgentSession` failure). Reserve the minted
+new `getSessionId()`, `deps.createAgentSession({ sessionManager: forked, modelRegistry:
+deps.modelRegistry })`, install wrapper/translator/structured tool, commit a **new** `PiSession` under
+the new `sessionId`, and return it with fresh `configOptions`.
 
 #### 9.1.5 `session/list`
 
-`request.cwd` present → `deps.sessions.list(cwd, deps.sessionDir)` (`session-manager.ts:1549`); **absent**
-→ `deps.sessions.listAll(deps.sessionDir)` (`:1564`, all project dirs) — this is the optional-cwd policy
+`validateCwd(request.cwd)` when present (row 11). `request.cwd` present →
+`deps.sessions.list(cwd, deps.sessionDir)` (`session-manager.ts:1549`); **absent** →
+`deps.sessions.listAll(deps.sessionDir)` (`:1564`, all project dirs) — this is the optional-cwd policy
 (SDK `ListSessionsRequest.cwd` is optional, `types.gen.d.ts:4852`). Map each `SessionInfo` to the ACP
 list entry (`sessionId: id`, `cwd`, title from `name ?? firstMessage`). pi returns the full list sorted
-by `modified` desc; there is no native pagination. **Cursor policy (pinned):** the adapter paginates in
-memory over the sorted list with a fixed page size of **100**. The opaque `cursor`
-(`ListSessionsRequest.cursor`, `:4858`) is the base64 of the 0-based offset into that stable sort;
-`nextCursor` (`ListSessionsResponse.nextCursor`, `:2816`) is set when more remain, omitted otherwise. An
-undecodable/out-of-range cursor → reject `invalidParams` (`-32602`, `errorKind:"invalid_cursor"`).
+by `modified` desc; there is no native pagination.
+
+**Cursor encoding and pagination semantics (pinned, exact).** The adapter paginates in memory over the
+freshly-read, `modified`-desc-sorted list with a fixed page size of **100**.
+
+- **Encoding:** the opaque `cursor` (`ListSessionsRequest.cursor`, `:4858`) is
+  `base64url(utf8(decimalString(offset)))` — the canonical base64url (no padding) of the ASCII decimal
+  of the 0-based offset (e.g. offset `100` → `"MTAw"`). `nextCursor` (`ListSessionsResponse.nextCursor`,
+  `:2816`) is the encoding of `offset + 100` when `offset + 100 < length`, and is **omitted** otherwise
+  (SDK permits omission → "no more pages").
+- **Decoding & validation:** a missing/`null`/empty cursor → offset `0`. Otherwise base64url-decode, and
+  the bytes MUST be a canonical non-negative decimal integer (`/^(0|[1-9][0-9]*)$/`, no leading zeros,
+  no sign, no whitespace) with `0 ≤ offset ≤ length`. `offset === length` is valid and returns an empty
+  page with no `nextCursor`. Anything else (undecodable, non-canonical, negative, `> length`) → reject
+  `invalid_cursor` (row 20).
+- **Weak pagination (pinned).** pi exposes no list snapshot, so each page re-reads and re-sorts the
+  directory; pagination is **weak/offset-based**, not a stable snapshot. Between pages a
+  session added/removed/re-`modified` can shift entries by offset, so a caller MAY observe a duplicate
+  or skipped entry at a page boundary. This is acceptable: sessions are append-mostly, the sort is
+  deterministic per call, and no entry is silently truncated (paging to the end returns every session).
+  Recorded, not hidden.
+
 `getTree()` (`session-manager.ts:1239`) is **not** consulted for `session/list` (list reads
 `listSessionsFromDir`, `:747,1553`) — correcting the round-1 claim.
 
 #### 9.1.6 `session/close`, idempotency, and the concurrency matrix
 
-`session/close` disposes the `PiSession` (abort any in-flight turn, cancel+drop the send queue,
-unsubscribe, disconnect MCP clients, drop from the registry) and returns success. Pinned behaviors:
+`session/close` **disposes** the `PiSession` and returns success. Disposal (the same routine §3.2/§9.6
+call): call pi's **`AgentSession.dispose()`** (`agent-session.ts:799`), abort the per-turn controller
+(§9.6), cancel + drop the send queue, unsubscribe the translator, disconnect every MCP client (each
+bounded by `deps.mcpTimeoutMs`), and drop from `live`. Pinned behaviors:
 
 | situation | behavior |
 |---|---|
-| close an unknown/already-closed id | success (idempotent; close is not observable-failing) |
-| duplicate `load`/`resume` for an already-live id | reject the second `invalidParams` (`-32602`, `errorKind:"session_already_open"`) — never overwrite a live wrapper (its subscription/MCP clients would leak) |
-| `close` racing an in-flight `prompt` | close aborts the turn; the racing `prompt` resolves `cancelled` (§9.6) |
+| close an unknown / already-closed / tombstoned id | **success** (idempotent; close is never observable-failing — never rows 12/14) |
+| duplicate `load`/`resume` for an id already **live or reserved-opening** | reject the second `session_already_open` (row 13) — never overwrite a live/opening wrapper (its subscription/MCP clients would leak) |
+| `close` racing an in-flight `prompt` | close aborts the per-turn controller (§9.6); the racing `prompt` resolves `cancelled` |
 | `set_config_option`/`fork` racing an in-flight `prompt` | rejected `session_busy` (§5.2, §9.1.4) |
-| `load`/`resume` racing each other for the same id | first wins and registers; the second sees a live id → `session_already_open` |
-| use of a poisoned/tombstoned id (below) | reject `session_terminated` (row 13) |
+| `load`/`resume` racing each other for the same id | the atomic §9.1.0 reservation makes the first win; the second sees `opening.has(id)` synchronously → `session_already_open` — neither leaks |
+| use of a poisoned/tombstoned id (below) | reject `session_terminated` (row 14) |
 
 **Poisoned-journal guard (resolves the concurrent-writer hole).** When the §9.6 backstop force-resolves
 a wedged turn, the underlying pi run may still be alive and could later append to the session's JSONL.
 The adapter therefore records the `sessionId` in the per-connection **tombstone** set and rejects any
 subsequent `load`/`resume`/`fork`/`prompt`/`set_config_option`/reopen for that id with
-`session_terminated` (row 13) for the remainder of the process — preventing a second writer from
-corrupting the journal a wedged writer may still touch. Tombstones are per connection and cleared only on
-connection teardown.
+`session_terminated` (row 14) for the remainder of the process — preventing a second writer from
+corrupting the journal a wedged writer may still touch. (`session/close` on a tombstoned id still
+succeeds idempotently, §9.1.6 table.) Tombstones are per connection and cleared only on connection
+teardown.
 
 #### 9.1.7 `additionalDirectories` (accept-and-ignore, documented)
 
@@ -884,47 +1133,69 @@ undefined>` (`agent.ts:105,183-186`; `BeforeToolCallContext = { assistantMessage
 context }`, `BeforeToolCallResult = { block?, reason? }`, `agent/types.ts:60-98`). **The `AgentSession`
 constructor already installs `agent.beforeToolCall`** to dispatch extension `tool_call` handlers
 (`agent-session.ts:361` → `_installAgentToolHooks` → sets `agent.beforeToolCall` at `:424`) — so the
-adapter must **wrap**, not overwrite it:
+adapter must **wrap**, not overwrite it. **The wrapper emits NO wire updates; it is a pure decision
+function.**
 
 ```ts
 const inner = session.agent.beforeToolCall;                 // extension dispatch installed by AgentSession
 session.agent.beforeToolCall = async (ctx, signal) => {
-  const decision = await requestAcpPermission(ctx, signal); // ACP round-trip, wired to `signal`
+  const decision = await requestAcpPermission(ctx);         // ACP round-trip only — NO session/update
   if (decision.block) return { block: true, reason: decision.reason };
   return inner ? inner(ctx, signal) : undefined;            // preserve the extension chain
 };
 ```
 
-#### 9.2.1 Frozen event/status sequence
+#### 9.2.1 Frozen event/status sequence — rebuilt on pi's real ordering (resolves adversarial finding 4)
 
-For each tool call, in this exact order (no duplicate `tool_call`, no stranded pending):
+**pi emits `tool_execution_start` BEFORE it runs `beforeToolCall`.** In pi's loop, each tool call is
+`emit("tool_execution_start", {toolCallId, toolName, args})` (`agent-loop.ts:389/447/502`) **then**
+`prepareToolCall(...)`, which is the only place `config.beforeToolCall` runs (`:602,621-643`); and on
+**every** outcome — allow, deny/`block`, abort, or an inner-hook throw — pi always emits exactly one
+`tool_execution_end` afterward (immediate error result for a block/abort/throw, real result otherwise;
+`emitToolExecutionEnd`). Consequences the sequence is built on:
 
-1. **Eager `tool_call`** enqueued with `status:"pending"`, `toolCallId: ctx.toolCall.id`, title/kind/
-   `_meta.toolName`. A per-session `Set<toolCallId>` marks it emitted.
-2. **`allow_always` cache check** (§9.2.2): a cached allow for this tool → skip the round-trip, go to
-   step 5-allow.
-3. `context.client.request(methods.client.session.requestPermission, req)` with the **standard
-   three-option shape** (`PermissionOption`, `types.gen.d.ts:591`; `PermissionOptionKind`, `:624`):
+- **The translator (§6.3) owns the single `tool_call` pending** (from `tool_execution_start`) **and the
+  single terminal `tool_call_update`** (from `tool_execution_end`), each keyed by `toolCallId`. The
+  permission wrapper enqueues **nothing** — so a duplicate `tool_call` and a double-`failed` update are
+  structurally impossible (the round-2 eager-pending design produced both).
+- **`beforeToolCall` runs after the pending `tool_call` was already enqueued** (pi's per-event `emit` is
+  awaited and the bus is synchronous, invariant 5), so the pending is on the send queue before the
+  wrapper acts.
+
+Per tool call, the wrapper does, in order:
+
+1. **`allow_always` cache check** (§9.2.2): a cached allow for `ctx.toolCall.name` → return `undefined`
+   (allow) immediately, **no** round-trip. pi executes; `tool_execution_end` yields the terminal update.
+2. **`await drain()`** (§6.2) so the already-enqueued pending `tool_call` for this `toolCallId` is
+   **on the wire before** the permission request is issued — this is the enforced ordering the SDK's send
+   queue alone does not guarantee.
+3. `context.client.request(methods.client.session.requestPermission, req, { cancellationSignal:
+   turnSignal })` (§9.6 per-turn signal) with the **standard three-option shape** (`PermissionOption`,
+   `types.gen.d.ts:591`; `PermissionOptionKind`, `:624`):
    `[{ optionId:"allow_always", name:"Always allow <toolName>", kind:"allow_always" },
    { optionId:"allow_once", name:"Allow once", kind:"allow_once" },
    { optionId:"reject_once", name:"Reject", kind:"reject_once" }]`. The request `toolCall` is a
    `ToolCallUpdate` (`RequestPermissionRequest.toolCall`, `types.gen.d.ts:108`) carrying `title`, `kind`,
    `_meta.toolName = ctx.toolCall.name` (our client's auto-responder reads `_meta.*.toolName`,
-   `permissions.ts:164-186`, and matches exact-then-substring, `:88-135`).
-4. Wire `signal` (the turn's `AbortSignal`) to abort the permission `request`, so an aborted turn
-   dismisses the dialog.
-5. **Terminal transition on the SAME `toolCallId`** (never a new pending):
-   - **allow** (`outcome:"selected"`, an allow option): return `{}` (no block). pi proceeds; the streamed
-     `tool_execution_start` refines the already-emitted call (dedup by `toolCallId` → mapped to
-     `tool_call_update`, not a second `tool_call`, §6.3).
-   - **allow_always**: cache (§9.2.2), then allow as above.
-   - **reject** (`reject_once`): enqueue `tool_call_update { toolCallId, status:"failed" }` (closes the
-     eager pending — no stranded UI), return `{ block:true, reason:"denied by user" }`.
-   - **cancelled** (`outcome:"cancelled"`) or **abort**: enqueue `tool_call_update { status:"failed" }`,
-     return `{ block:true, reason:"cancelled" }`.
-   - **resolver/transport failure** (the `client.request` rejects): treat as **deny** (fail-safe) —
-     enqueue `tool_call_update { status:"failed" }`, return `{ block:true, reason:"permission
-     unavailable" }`; the turn continues. (Row 19 applies only if a subsequent abort also fails.)
+   `permissions.ts:164-186`, matches exact-then-substring, `:88-135`). Because ACP cancellation is
+   cooperative (`SendRequestOptions.cancellationSignal`, §4), the wrapper **races** the request against
+   `turnSignal` so an abort resolves the wrapper even if the client never responds; a late response to
+   the abandoned request is swallowed (no unhandled rejection).
+4. **Return the decision to pi** (no wire update — pi's `tool_execution_end` carries the terminal state):
+   - **allow_once** (`outcome:"selected"`, `allow_once`) → return `undefined` (allow). pi executes;
+     `tool_execution_end {isError:false}` → `tool_call_update {status:"completed"}`.
+   - **allow_always** → cache (§9.2.2), then return `undefined` (allow), same as above.
+   - **reject_once** → return `{ block:true, reason:"denied by user" }`. pi's `prepareToolCall` returns
+     an immediate error result → `tool_execution_end {isError:true}` → `tool_call_update {status:"failed"}`.
+   - **cancelled** (`outcome:"cancelled"`) or **turn abort won the race** → return
+     `{ block:true, reason:"cancelled" }`. pi (which sees `signal.aborted`) yields "Operation aborted" →
+     `tool_execution_end {isError:true}` → one `tool_call_update {status:"failed"}`.
+   - **transport failure** (the `client.request` rejects) → **fail-safe deny**: return
+     `{ block:true, reason:"permission unavailable" }`; the turn continues. No wire update, no
+     `session/prompt` rejection (error table note under §8.1).
+   - The **inner extension hook** (`inner(ctx, signal)`) runs only after an allow; if it returns `block`
+     or throws, that likewise flows through pi's single `tool_execution_end {isError:true}` — the wrapper
+     adds nothing. Exactly one pending + one terminal update per `toolCallId` on every path.
 
 #### 9.2.2 `allow_always` scope and lifetime (pinned)
 
@@ -943,33 +1214,64 @@ lifecycle method that carries them — our client sends `mcpServers` on `session
 load/resume/fork (`reattachSession`/`forkSession`, `acp-client.ts:1533,1587,1647`), so all four apply
 the bridge.
 
-#### 9.3.1 Connect and register
+#### 9.3.1 Connect and register (bounded)
 
 For each `request.mcpServers` entry of **stdio** transport (`McpServerStdio`, `types.gen.d.ts:4779`),
-`deps.connectMcpClient(server, signal)` connects a `@modelcontextprotocol/sdk` stdio client, `tools/list`
-enumerates its tools, and each is registered as a pi `defineTool` customTool
-(`extensions/types.ts:437-495`): the MCP tool's JSON-Schema `inputSchema` becomes the pi tool
-`parameters` (raw JSON Schema accepted — §2.3), and `execute` forwards to the MCP `tools/call`, converting
-the result (§9.3.3).
+`deps.connectMcpClient(server, signal)` connects a `@modelcontextprotocol/sdk` stdio client and
+`tools/list` enumerates its tools — **each of connect and `tools/list` bounded by `deps.mcpTimeoutMs`**
+(§4.1; a timeout is a stage failure → rollback + row 16). **Duplicate server names within one request →
+reject** row 16 (`mcp_init_error`, naming the duplicate): the ACP contract sends unique server names, so
+a duplicate is a client error, not something to silently merge. Each enumerated tool is registered as a
+pi `defineTool` customTool (`extensions/types.ts:437-495`): the MCP tool's JSON-Schema `inputSchema`
+becomes the pi tool `parameters` (raw JSON Schema accepted — §2.3), and `execute` forwards to the MCP
+`tools/call` (also bounded by `deps.mcpTimeoutMs`), converting the result (§9.3.3).
 
-#### 9.3.2 Failure, partial-init rollback, collisions, cleanup
+#### 9.3.2 Naming, collisions, partial-init rollback, cleanup (total — resolves adversarial finding 9)
 
-- **Partial-init rollback (all-or-nothing).** If any server's connect or `tools/list` fails, disconnect
-  every already-connected client for this request and reject the lifecycle request with row 15
-  (`mcp_init_error`, naming the failed server). No half-initialized session is registered; no child
-  processes leak.
-- **Name collisions (deterministic precedence).** A registered set is built in order: pi built-ins
-  (`read/edit/write/bash/grep/find/ls`) first, then MCP tools in server-then-tool order, then the
-  reserved `__acp_structured_output` (§9.4) last. An MCP tool whose name collides with a pi built-in or a
-  previously-registered MCP tool is registered under a namespaced alias `mcp__<serverName>__<toolName>`
-  (the well-known MCP prefixing convention); a collision with the reserved
-  `__acp_structured_output` name is likewise aliased. A built-in is never shadowed. The alias is what the
-  model sees and what `tool_call._meta.toolName` reports.
-- **Cancellation + timeout.** Each `tools/call` is passed the turn `signal`; on abort the call is
-  cancelled. A per-call timeout (30 s) rejects a hung `tools/call`; the tool result becomes an error
-  result (pi surfaces it as a failed tool, not a crashed session).
+**Extensions stay enabled and are part of collision discovery.** A pi user's configured extensions must
+keep working through the ACP server (disabling them would make pi-acp a lesser pi), so extension tools
+coexist with our injected ones. But pi's `_refreshToolRegistry` composes tools as
+`Map(builtins)` then `Map.set` over `[...extensionTools, ...customTools]` (`agent-session.ts:2459-2463`),
+so an injected customTool that **shares a name** with a built-in or extension **silently overrides** it.
+Naming is therefore made total so no injected name can ever occupy a built-in/extension name:
+
+- **MCP tools are ALWAYS namespaced** (not only on collision): `mcp__<serverSlug>__<toolSlug>`, where
+  each slug replaces every char outside `[A-Za-z0-9_-]` with `_`, collapses runs of `_`, and the whole
+  alias is truncated to ≤ 128 chars. The `mcp__` prefix is a pi-acp **reserved namespace** that pi's
+  built-ins (`read/bash/edit/write/grep/find/ls`) and standard extensions do not use, so an MCP tool can
+  never shadow one. The alias is what the model sees and what `tool_call._meta.toolName` reports.
+- **Alias uniqueness (deterministic suffixing).** Build the MCP alias set in (serverIndex, toolIndex)
+  order over an initially-empty `Set`; if a computed alias is already present (sanitization collapsed two
+  distinct names, or two tools map alike), append the smallest `_<n>` (n ≥ 2) that makes it unique. Fully
+  deterministic → two implementations produce identical names.
+- **Structured-output reserved name** `__acp_structured_output` (double-underscore `__acp_` prefix,
+  another reserved namespace, §9.4).
+- **Reserved namespaces + post-construction verification.** The built-in catalog is the known set
+  `{read,bash,edit,write,grep,find,ls}` (none of which use a reserved prefix), so an injected name — an
+  `mcp__…` alias or `__acp_structured_output` — is **disjoint from every built-in by construction**
+  (asserted as a guard against a future pi built-in that adopts a reserved prefix: if that ever holds,
+  reject row 18/16). Extensions are the only entities that could use a reserved prefix; pi-acp
+  **reserves** `mcp__` and `__acp_` (declared in the README, §15), so a compliant extension never does.
+  If a non-compliant extension registers such a name, pi's `Map.set` composition
+  (`[...extensionTools, ...customTools]`, `agent-session.ts:2459-2463`) makes **our** tool win
+  deterministically — pi-acp's reserved tool is never shadowed (the extension's squatting tool is the one
+  dropped); that is the documented, safe-for-us consequence of the reservation, not a silent pi-acp
+  failure. The one positively-detectable defect is checked via `session.getAllTools()`
+  (`agent-session.ts:868`): if `getToolDefinition("__acp_structured_output")` is **absent** after
+  construction (an allow/exclude filter or a pi change removed it), the structured-output channel cannot
+  function → dispose + reject row 18 (`structured_tool_collision`); likewise every `mcp__…` alias MUST be
+  present (else the bridge is broken) → dispose + reject row 16 (`mcp_init_error`).
+- **Partial-init rollback (all-or-nothing).** If any server's connect/`tools/list`/duplicate check or the
+  reserved-name verification fails, run the full §9.1.0 rollback (disconnect every already-connected
+  client — each bounded by `deps.mcpTimeoutMs` — dispose the session if constructed, drop the
+  reservation) and reject with row 16 (or 18 for the structured-name clash). No half-initialized session
+  is registered; no child processes leak.
+- **Cancellation + timeout.** Each `tools/call` is passed the turn signal (§9.6); on abort the call is
+  cancelled. `deps.mcpTimeoutMs` also bounds each `tools/call`; a timeout/abort becomes an error result
+  (pi surfaces it as a failed tool, §9.3.3, not a crashed session).
 - **Cleanup.** MCP clients are disconnected on `session/close`, on the §9.6 backstop, and on connection
-  teardown (§3.2 disposal), each disconnect bounded so a hung `close()` cannot wedge shutdown.
+  teardown (§3.2 disposal), each disconnect bounded by `deps.mcpTimeoutMs` so a hung `close()` cannot
+  wedge shutdown.
 
 #### 9.3.3 Result conversion
 
@@ -996,7 +1298,7 @@ as a per-turn `try/finally` state machine.
 #### 9.4.1 Registration (once, at session creation)
 
 Register a customTool `__acp_structured_output` (reserved name; a client/MCP tool of the same name is
-aliased away, §9.3.2 — if pi itself ever ships a built-in of that exact name, row 16). Its `parameters`
+aliased away, §9.3.2 — if a pi built-in/extension already owns that exact name, row 18). Its `parameters`
 reference a **mutable schema holder**; its `execute` captures `params` into a per-turn slot and returns
 `{ content:[{ type:"text", text:"(structured output captured)" }], details: params, terminate: true }`.
 It starts **inactive** (removed from the active set via `setActiveToolsByName`, `agent-session.ts:888`).
@@ -1007,7 +1309,7 @@ On a `session/prompt` whose `_meta.outputSchema` (bare `META_KEYS.outputSchema`,
 present:
 
 1. **Validate** the schema: it MUST be a JSON object (an object/typed schema). A non-object / top-level
-   scalar / null → reject `invalidParams` (row 17, `invalid_output_schema`) before the turn starts.
+   scalar / null → reject `invalidParams` (row 19, `invalid_output_schema`) before the turn starts.
 2. In a `try`: set the holder's schema (assigned directly as `parameters`; providers consume it as raw
    JSON Schema — `openai-completions.ts:1110` et al.), **clear** the capture slot, arm via
    `setActiveToolsByName([...base, "__acp_structured_output"])`, and prepend the one-line instruction to
@@ -1093,21 +1395,50 @@ surface we serve; §11).
 
 ### 9.6 Cancellation and the wedged-agent backstop (`src/session.ts`)
 
-The SDK aborts the in-flight `session/prompt` request's `context.signal` on `session/cancel` **or**
-`$/cancel_request` (both wired to the same abort, §4). The adapter registers, for each prompt turn,
-`signal.addEventListener("abort", () => session.agent.abort())` (`agent.abort()` aborts the active run's
-controller, `agent.ts:310-311`). pi settles the turn with a terminal `aborted` assistant message; the
-adapter resolves the ACP request `{ stopReason:"cancelled", usage }` (§7) after `drain()`. Any parked
-`session/request_permission` for that turn is dismissed via the same signal (§9.2 step 4).
+**One per-turn controller, four abort sources (resolves adversarial finding 5).** Each `session/prompt`
+creates a fresh `turnController = new AbortController()` stored on the `PiSession` for the turn's
+duration. `turnSignal = turnController.signal` is the single cancellation axis threaded through the whole
+turn: `agent.abort()`, the parked `session/request_permission` (§9.2.1 step 3, via `cancellationSignal` +
+the wrapper's race), and each MCP `tools/call` (§9.3). Four sources abort it, all entering **one
+idempotent path** (`turnController.abort()` is naturally idempotent):
 
-**Wedged-agent backstop.** `agent.abort()` is cooperative; a provider stream stuck below the abort point
-could leave `session.prompt()` unresolved. The adapter races settlement against a bounded timer using the
-DI clock: if the turn has not settled within `deps.graceMs` (default 5000, `deps.now()`-driven) after
-`agent.abort()`, the adapter force-resolves the ACP request `{ stopReason:"cancelled", usage }`,
-**tombstones** the `sessionId` (§9.1.6), and disposes the `PiSession` (unsubscribe, cancel+drop the send
-queue, disconnect MCP, abort again) so no later event from the wedged run reaches the connection and no
-second writer can reopen the journal. A subsequent request for that id → `session_terminated` (row 13).
-This guarantees an aborted turn always returns promptly even if pi's stream hangs.
+1. **`$/cancel_request`** — the SDK aborts the request's `context.signal` (`jsonrpc.js:640-652`); the
+   prompt handler does `context.signal.addEventListener("abort", () => turnController.abort())`.
+2. **`session/cancel`** — the ordinary notification `impl.cancel(context)` looks up the `PiSession` by
+   `context.params.sessionId` and calls its `turnController.abort()` (no-op if no turn is in flight).
+   This is a **separate** mechanism from (1): the SDK does not wire `session/cancel` to any
+   `context.signal` (§4).
+3. **`session/close` / dispose** — aborts `turnController` before tearing the session down (§9.1.6).
+4. **Notification-delivery failure** mid-turn (§6.2) — aborts `turnController`, then rejects the request
+   `notification_error` (row 22).
+
+On abort, `turnController.signal` fires `session.agent.abort()` (`agent.abort()` aborts the active run's
+controller, `agent.ts:310-311`). pi settles the turn with a terminal `aborted` assistant message;
+`session.prompt()` resolves; the adapter emits `usage_update` (§6.5), `await drain()`, and resolves
+`{ stopReason:"cancelled", usage }` (§7) — unless a non-cancel rejection (row 22) already claimed the
+request.
+
+**Wedged-agent backstop (scheduler-driven, deterministic).** `agent.abort()` is cooperative; a provider
+stream stuck below the abort point could leave `session.prompt()` unresolved. When `turnController`
+aborts, the adapter starts `deps.sleep(deps.graceMs, settledSignal)` (default `graceMs` 5000);
+`settledSignal` is aborted the moment `session.prompt()` settles (either outcome), which cancels the
+sleep. If the sleep **elapses first** (the turn is wedged), the adapter:
+
+- **force-resolves** the ACP request `{ stopReason:"cancelled", usage }` — `usage` is the best-effort
+  snapshot of §6.5's forced-cancel row (per-turn breakdown over any assistant messages so far, commonly
+  all-zero), after emitting a `usage_update` from the current context/cost snapshot and `drain()`;
+- **detaches the pi promise safely:** `session.prompt()` is left with an attached
+  `.then(() => {}, () => {})` so a late resolve/reject after force-resolution produces **no unhandled
+  rejection** and does not touch the already-resolved request;
+- **tombstones** the `sessionId` (§9.1.6) and **disposes** the `PiSession` — pi's `AgentSession.dispose()`
+  (`agent-session.ts:799`), unsubscribe, cancel + drop the send queue, disconnect MCP (bounded by
+  `deps.mcpTimeoutMs`), `turnController.abort()` again — so no later event from the wedged run reaches the
+  connection and no second writer can reopen the journal. A subsequent request for that id →
+  `session_terminated` (row 14).
+
+Because the timer is `deps.sleep` (not a wall clock), a test injects a `sleep` it resolves on demand to
+drive the wedged path deterministically (T22). This guarantees an aborted turn always returns promptly
+even if pi's stream hangs, from **any** of the four abort sources.
 
 ---
 
@@ -1216,11 +1547,21 @@ convention).
    advertisement (`acp-client.ts:1986-1993`), so advertising is unneeded surface; worse, a partial
    "representative" list would mislead the `config-options.md` §2.3 validate probe. We only *handle*
    `set_config_option("model", …)` (§5.2).
-7. **Gating auth-method advertisement on client auth capabilities** (the round-1 rule). Rejected
-   (design-minimalism finding 1): SDK `AuthCapabilities` gates only `terminal`; the frozen acp-auth-spec
-   makes `env_var`/bare-`agent` methods always visible; gating would return an empty `authMethods` to our
-   own default client (whose default omits the `auth` key). All six methods are advertised
-   unconditionally (§9.5).
+7. **Gating auth-method advertisement on client auth capabilities** (the round-1 rule; also the literal
+   phrasing of the focus.md auth directive, "gated on advertised client auth capabilities"). Rejected —
+   and this resolves, decisively and from the repo, the tension the round-2 adversarial board routed as
+   an owner decision. The frozen house contract `docs/specs/acp-auth-spec.md` §1.2 (verified) states
+   `env_var` methods "are always visible on the wire" and bare-`_meta` `agent` methods "need no client
+   capability and work with nothing advertised — base-spec-first"; the SDK's typed
+   `AuthCapabilities = { terminal?, _meta? }` (`types.gen.d.ts:4318`) has **no** `env_var` or
+   generic-`agent` gate to key off; and gating would return an **empty** `authMethods` to our own default
+   client (whose default advertisement omits the `auth` key), starving the very client this contract must
+   serve maximally. The focus.md phrasing is satisfied in substance for the *only* gate that exists:
+   `terminal`-type methods would gate on `auth.terminal` and gateway-`_meta` `agent` methods on
+   `auth._meta.gateway` — and pi-acp advertises **neither**. All six methods are therefore advertised
+   **unconditionally** (§9.5). No `ownerQuestion` is raised: the frozen house auth spec plus the SDK's
+   typed capabilities settle it. (Consistent with [never flag-gate features]: safety comes from behavior
+   — the `-32000` pause on a missing credential — not from hiding the method.)
 8. **`allow_always` cached per (tool, arguments)** or persisted across sessions. Rejected (§9.2.2):
    argument-scoping re-prompts on every distinct command (false economy); cross-session persistence
    over-grants. Name-scoped, single-session, in-memory is the truthful minimum.
@@ -1235,6 +1576,36 @@ convention).
 12. **Replaying `buildSessionContext()` (compaction-aware) on `session/load`.** Rejected: that is the
     model-facing compacted context (summaries replace history), not the human transcript. `getBranch()`
     replays the full active branch (§9.1.2), which is what a client rehydrating a conversation wants.
+13. **Aliasing MCP tools only on collision** (the round-2 rule) instead of unconditional `mcp__…`
+    prefixing. Rejected (§9.3.2): "only on collision" requires knowing the built-in + extension name set
+    to detect a collision, but customTools are fixed at `createAgentSession` construction and pi has no
+    post-hoc registration API — a chicken-and-egg the unconditional prefix avoids. Unconditional
+    `mcp__<server>__<tool>` (the well-known MCP convention) puts every bridged tool in a reserved
+    namespace pi built-ins/extensions never use, making MCP-vs-builtin/extension collisions structurally
+    impossible and the naming fully deterministic (`_meta.toolName` still carries the alias for the
+    permission matcher).
+14. **Disabling pi extensions to sidestep tool-name collisions.** Rejected (§9.3.2): a pi user's
+    configured extensions must keep working through the ACP server — disabling them makes pi-acp a lesser
+    pi. Extensions stay enabled and are part of collision discovery; the reserved `mcp__`/`__acp_`
+    namespaces + the `getAllTools()` reserved-name verification make coexistence safe without disabling
+    anything.
+15. **`session/list` returns the full sorted list with no pagination** (omitting `nextCursor`, which the
+    SDK permits). Considered (it is strictly less surface: no cursor codec, no `invalid_cursor` row) and
+    rejected: `listAll` (no cwd) can return a user's **entire** cross-project session history — potentially
+    thousands of entries — so an unbounded single response is a real memory/latency hazard for our own
+    client. Offset pagination (page 100, exact base64url cursor, §9.1.5) bounds each response while
+    returning every session across pages (it chunks, never truncates) — the bounded-liveness choice,
+    consistent with the injectable MCP/backstop timeouts.
+16. **Emitting `type:"diff"` tool-call content for `read`/`edit`/`write`.** Rejected (§6.3.1): pi's
+    `AgentToolResult` exposes no standardized old-text/new-text pair (only `content` + arbitrary
+    `details`), so a diff block would be fabricated. All tool results project uniformly through
+    `toContent` + `rawOutput = details`; the round-2 conditional-diff clause was ungrounded and removed.
+17. **Hardcoding the MCP `tools/call` timeout at 30 s** (the round-2 value) instead of an injectable
+    `deps.mcpTimeoutMs`. Rejected (design-minimalism owner-point A): a hardcoded 30 s is inconsistent with
+    the spec's own injectable-liveness pattern (`deps.graceMs`) and too short for legitimately slow MCP
+    servers (build/test/scrape), which would surface a correct-but-slow tool as failed.
+    `deps.mcpTimeoutMs` (default 30000) applies to connect, `tools/list`, **and** `tools/call` — one
+    documented, injectable bound; it is liveness, not a data cap (§4.1).
 
 ---
 
@@ -1249,17 +1620,18 @@ cites the normative statement it covers.
 | # | covers | assertion |
 |---|---|---|
 | T1 | §3, invariant 1 | `pi-acp --version` writes only the version to stdout and exits 0; with a bin that logs on import, stdout stays clean (redirect precedes the dynamic import) |
-| T2 | §3.1 | `import("@automatalabs/pi-acp")` yields `runAcp`/`PiAcpAgent`/`PiAcpDeps` and mutates neither `console` nor stdio (no server started) |
+| T2 | §3.1 | runtime `await import("@automatalabs/pi-acp")` yields the **value** exports `runAcp`/`PiAcpAgent`/`resolveDeps` (each `typeof === "function"`), `PiAcpDeps` is **absent** at runtime, and neither `console` nor stdio was mutated (no server started) |
+| T2b | §3.1 | compile-time: a `.test-d.ts` does `import type { PiAcpDeps }` and type-asserts its shape; `tsc --noEmit` passes (the erased type-only export exists) |
 | T3 | §3.2 | double `shutdown()` disposes once (awaited); `connection.closed` reject → exit code 1; teardown timeout still exits |
-| T4 | §6.1 | ContentBlock fold: multi-text join, image→`options.images`, resource_link/resource/audio projections, empty-input → `empty_prompt` (`-32602`), invalid image → `invalid_content` |
-| T5 | §6.3 | live translation table row-by-row incl. `agent_thought_chunk` for thinking and `tool_call` `_meta.toolName`/`kind`/`locations`; no update for the "no fabricated" set |
-| T6 | §6.5 | per-turn `PromptResponse.usage` field map + multi-message accumulation; `usage_update.used` = context tokens, `cost.amount` = cumulative `getSessionStats().cost`; monotonic across two turns |
-| T7 | §7 | stopReason table `stop|length|toolUse|aborted|error` → `end_turn|max_tokens|end_turn|cancelled|REJECT`; error rejects, never a stopReason |
-| T8 | §8.1/§8.2 | every failure row: pinned code + `errorKind`; classification precedence (auth>billing>rate>generic) over fixture messages; redaction (raw `errorMessage` never on the wire; only `diagnostics`) |
+| T4 | §6.1 | ContentBlock fold: multi-text join, image→`options.images` (base64 `data` passed as-is), resource_link/resource/audio projections, empty-input → `empty_prompt` (`-32602`); a structurally-malformed block is rejected by the SDK `zPromptRequest` parser pre-handler (no `invalid_content` errorKind — the handler never sees it, row 8) |
+| T5 | §6.3/§6.3.1 | live translation row-by-row incl. `agent_thought_chunk` for thinking; the SOLE `tool_call` pending comes from `tool_execution_start` and the SOLE terminal `tool_call_update` from `tool_execution_end` (translator-owned); `toContent(result)` text+image mapping, `rawOutput = result.details` (omitted when `undefined`), empty-content → empty array, **no** `type:"diff"`; no update for the "no fabricated" set |
+| T6 | §6.5 | per-turn `PromptResponse.usage` field map + multi-message accumulation; `usage_update.used` = `getContextUsage().tokens`, `cost.amount` = cumulative `getSessionStats().cost`; **cost.amount monotonic across two turns, and a compaction-drop turn where `used` DECREASES while `cost.amount` rises**; per-outcome usage (provider-error emits before reject; pre-flight emits none; forced-cancel best-effort) |
+| T7 | §7 | stopReason table `stop\|length\|toolUse\|aborted\|error` → `end_turn\|max_tokens\|end_turn\|cancelled\|REJECT`; error rejects, never a stopReason |
+| T8 | §8.1/§8.2 | **every canonical row (1–24)**: pinned code + `errorKind`; a structurally-malformed prompt block is rejected by the SDK `zPromptRequest` parser with `invalidParams` and **no** `errorKind` (row 8, pre-handler); `close` on unknown/tombstoned id **succeeds** (not row 12/14); the row-23 catch-all wraps an injected unexpected throw as `internal_error`; classification precedence (auth>billing>rate>generic); redaction (raw `errorMessage`/exception never on the wire; only `diagnostics`) |
 | T9 | §5.1/§5.2 | `initialize` advertises exactly `thinkingLevel` (no `model` option); set thinkingLevel valid/invalid/wrong-type; set model hit/miss/busy; unknown configId |
 | T10 | §5 | `initialize` returns the exact `agentCapabilities` (loadSession top-level; resume/fork/list/close; `mcpCapabilities:{}`; `_meta` namespace; no delete; no additionalDirectories) |
-| T11 | §9.2 | permission sequence: eager `tool_call` → request → allow/allow_always/reject/cancel/abort/resolver-failure → correct terminal status + `{block}`; wrapper delegates to inner; abort dismisses; `allow_always` name-scoped single-session cache |
-| T12 | §9.4 | outputSchema armed only when `_meta.outputSchema` present; non-object schema → `invalid_output_schema`; capture → final `agent_message_chunk`; `finally` disarms after auth throw / cancel / notify failure; mixed structured/unstructured sequence; reserved-name collision |
+| T11 | §9.2 | permission wire order + exactly-once: for each `toolCallId`, the pending `tool_call` (from `tool_execution_start`) is on the wire **before** `session/request_permission` (drain enforced), and the wrapper emits **no** `session/update`; exactly one pending + one terminal `tool_call_update` on **every** path — allow_once, allow_always, reject_once, cancelled-outcome, turn-abort-wins-race, transport-failure(fail-safe deny, turn continues), inner-hook block, inner-hook throw; wrapper delegates to `inner` only after allow; `allow_always` name-scoped single-session cache skips the round-trip |
+| T12 | §9.4 | outputSchema armed only when `_meta.outputSchema` present; non-object schema → `invalid_output_schema`; capture → final `agent_message_chunk`; `finally` disarms after auth throw / cancel / notify failure; mixed structured/unstructured sequence; the reserved `__acp_structured_output` **absent** from an injected `getAllTools` (e.g. filtered out) → `structured_tool_collision` |
 | T13 | §9.5 | six auth methods advertised **unconditionally** (incl. when client sends no `auth` capability); `authenticate(env_var/agent)` no-op success; unknown method → `unknown_auth_method` |
 
 ### 13.2 Integration (scripted ACP client over the injected stream)
@@ -1267,19 +1639,20 @@ cites the normative statement it covers.
 | # | covers | assertion |
 |---|---|---|
 | T14 | §6.2, §6.6 | full turn: ordered `session/update` stream drained before `PromptResponse`; a notify-failure fixture aborts + rejects `notification_error` |
-| T15 | §9.1.1-.6 | lifecycle + concurrency matrix: new→prompt→close; duplicate load → `session_already_open`; unknown id → `unknown_session`; repeated close idempotent; close-races-prompt → cancelled; busy fork/set_config → `session_busy` |
-| T16 | §9.1.2/.3/.4 | resume emits **no** replay; load replays the linear branch via the SessionEntry projection (user/assistant/thinking/toolCall/toolResult); fork round-trips over a temp `sessionDir` |
-| T17 | §9.1.5 | list with cwd vs `listAll` (no cwd); pagination cursor (page size 100) + `nextCursor`; undecodable cursor → `invalid_cursor` |
-| T18 | §9.1.6 | poisoned/tombstoned reopen after backstop → `session_terminated` |
+| T15 | §9.1.0-.6 | lifecycle + concurrency matrix: new→prompt→close; **two concurrent `load`s for one id** → exactly one wins, the other `session_already_open`, no leak (atomic reservation); unknown id (load/resume/prompt) → `unknown_session`; `close` on unknown/already-closed/**tombstoned** id → **success**; close-races-prompt → cancelled; busy fork/set_config → `session_busy`; cwd validation on load/resume/list |
+| T15b | §9.1.0 | transactional rollback: inject a failure after **each** acquisition stage (MCP connect, `createAgentSession`, wrapper install, load replay-`notify`) and assert no live registry entry, no MCP child, no listener, no pi resource (pi `dispose()` called), and no `opening` reservation remains; a post-rollback retry is a clean open, not `session_already_open` |
+| T16 | §9.1.2/.3/.4 | resume emits **no** replay; load replays the linear branch via the **total** SessionEntry/AgentMessage projection — user, assistant (text/thinking/toolCall), toolResult, `bashExecution`, `custom` display-true/false, `branchSummary`/`compactionSummary` (no update), `custom_message` display-true/false, and string-vs-array content; fork round-trips over a temp `sessionDir`, including **cross-cwd** source lookup via `listAll` |
+| T17 | §9.1.5 | list with cwd vs `listAll` (no cwd); exact cursor codec (`base64url` of decimal offset, page 100) + `nextCursor` set/omitted; missing/empty cursor → offset 0; `offset===length` → empty page; undecodable / non-canonical / out-of-range → `invalid_cursor`; a between-page mutation is tolerated (no crash) |
+| T18 | §9.1.6 | poisoned/tombstoned reopen after backstop → `session_terminated`; `close` on it still succeeds |
 | T19 | §9.1.7 | non-empty `additionalDirectories` accepted and ignored (session still created) |
-| T20 | §9.3 | stdio stub MCP: tools appear as pi customTools + `tools/call` round-trips (on new AND on load/resume/fork); partial-init rollback disconnects earlier clients + rejects `mcp_init_error`; name collision → `mcp__server__tool` alias; non-stdio → `unsupported_mcp_transport`; `tools/call` timeout → failed tool |
+| T20 | §9.3 | stdio stub MCP: tools appear as pi customTools under **unconditional** `mcp__server__tool` aliases + `tools/call` round-trips (on new AND on load/resume/fork); partial-init rollback disconnects earlier clients + rejects `mcp_init_error`; **duplicate server name → `mcp_init_error`**; alias-vs-alias → deterministic `_2` suffix; a missing injected `mcp__` alias in an injected `getAllTools` → `mcp_init_error`; non-stdio → `unsupported_mcp_transport`; connect/list/call bounded by injected `mcpTimeoutMs` (hung connect → rollback+reject; hung call → failed tool) |
 
 ### 13.3 Hermetic e2e
 
 | # | covers | assertion |
 |---|---|---|
 | T21 | §4.1 | inject a `createAgentSession` that wraps `new Agent({ streamFn: mockStream })` in an `AgentSession`; drive a full ACP conversation end-to-end with **zero credentials** — the substrate for future engine e2e |
-| T22 | §9.6 | `deps.now`/`deps.graceMs`-driven backstop: a wedged mock stream force-resolves `cancelled` within the grace window and tombstones the session |
+| T22 | §9.6 | `deps.sleep`/`deps.graceMs`-driven backstop against a **wedged** mock stream, driven **separately** from each of the four abort sources — `$/cancel_request`, `session/cancel`, `session/close`, and a notify-failure — each force-resolves `cancelled` when the injected `sleep` elapses, emits `usage_update`, tombstones the session, calls pi `dispose()`, and produces **no** unhandled rejection when the detached pi promise later settles; a **non-wedged** abort (turn settles first) takes the normal path (sleep cancelled) |
 
 ### 13.4 Live e2e (gated on provider keys)
 
@@ -1293,7 +1666,8 @@ cites the normative statement it covers.
 |---|---|---|
 | T24 | §2.3 | manifest pins are exact (no caret); `main`/`exports`→`dist/lib.js`, `bin`→`dist/index.js`; packed `files:["dist"]` |
 | T25 | §10.1 | `check-acp-deps.mjs` matches `@earendil-works/pi-coding-agent` (freshness matcher) |
-| T26 | §10.3, §15 | root `tsconfig.json` references `packages/pi-acp`; a changeset exists; README carries the "Built on pi" + THIRD-PARTY MIT notice |
+| T26 | §10.3, §15 | root `tsconfig.json` references `packages/pi-acp`; a changeset exists |
+| T27 | §15 | `README.md` exists and (a string/section assertion) covers every required topic: `pi-acp` bin invocation, the side-effect-free library API (`runAcp`/`PiAcpAgent`/`resolveDeps`/`PiAcpDeps`), the custom-backend registration `{ namespace:"@automatalabs/pi-acp", gatedKeys:["outputSchema"] }`, the `provider/id` model format, auth behavior (env-var/stored-credentials + the `-32000` pause), the reserved `mcp__`/`__acp_` tool namespaces, the v1 limitations list, and the "Built on pi" + THIRD-PARTY MIT notice |
 
 The round-1 "http MCP rejected by capability gating" assertion is **removed** — that tested our client,
 not this server; T20's `unsupported_mcp_transport` is the server-side behavior instead.
@@ -1305,20 +1679,22 @@ not this server; T20's `unsupported_mcp_transport` is the server-side behavior i
 **Base commit (this repo), all `packages/…`/`scripts/…`/`docs/…`/config citations verified against:**
 `c06d1e3a5a4363d42b892df1d4d12a5e9c5b94b2` (branch `spec/pi-acp`, based on `origin/main`).
 
-**Base-freshness note:** at round-2 authoring `origin/main` had advanced to
-`7dd17af1c285322844f4bd7c97b7236b6497ab96`. `git diff c06d1e3..7dd17af --stat` touches ONLY
-`packages/mcp-server`, `packages/workflow-engine`, `packages/workflows`, and
-`skills/agentprism-workflow-authoring` — **none** of the `packages/acp-agents`, `packages/shared-types`,
-`scripts/check-acp-deps.mjs`, `docs/specs`, or config files this contract cites (mcp-server's
-`package.json` changed only its version, and is cited only as a bin/publishConfig shape blueprint). All
-citations below therefore remain byte-accurate; the base is pinned at `c06d1e3` (the merge-base this
-branch builds on).
+**Base-freshness note:** at round-3 authoring `origin/main` has advanced to
+`e9c94aa537b2ed75c81cf73eeb303cb9441bd346` (from `7dd17af…` at round 2). `git diff c06d1e3..origin/main
+--name-only -- packages/acp-agents packages/shared-types scripts/check-acp-deps.mjs docs/specs` is
+**empty** — the advance touches **none** of the `packages/acp-agents`, `packages/shared-types`,
+`scripts/check-acp-deps.mjs`, `docs/specs`, or config files this contract cites. All citations below
+therefore remain byte-accurate; the base is pinned at `c06d1e3` (the merge-base this branch builds on,
+matching `.agentprism/design-198/base-sha.txt`).
 
 **pi source, all `packages/{ai,agent,coding-agent}/…` citations verified against:** repo
 `github.com/earendil-works/pi`, tag **`v0.80.7`**, commit
 **`818d67457cdd6b60bce6b121d16b23141c252dd8`**; npm `@earendil-works/pi-coding-agent@0.80.7`
 (lockstep with `@earendil-works/pi-agent-core@0.80.7`, `@earendil-works/pi-ai@0.80.7`). Freshness
-re-checked at authoring: `releases/latest` = `v0.80.7`, `npm view … version` = `0.80.7` — pin is current.
+re-checked at round-3 authoring: `releases/latest` = `v0.80.7`, `npm view … version` = `0.80.7` — pin is
+current. pi's **unreleased** `origin/main` (`c6d8371`) has meanwhile drifted heavily across the cited
+model/auth/session surfaces; that forward-compatibility risk is recorded in **§0.1** and does not change
+the frozen release pin.
 
 **ACP SDK, `@agentclientprotocol/sdk@1.2.1`**, verified against the installed dist at
 `node_modules/.pnpm/@agentclientprotocol+sdk@1.2.1_zod@4.4.3/node_modules/@agentclientprotocol/sdk/dist/`.
@@ -1390,8 +1766,21 @@ re-checked at authoring: `releases/latest` = `v0.80.7`, `npm view … version` =
   :2975, `ListSessionsRequest` (`cwd?` :4852, `cursor?` :4858), `ListSessionsResponse` (`nextCursor?`
   :2816) :2807, `McpServerStdio` :4779, additionalDirectories on new/load/fork/resume :4633,4831,4923,4964.
 - `dist/acp.d.ts` — `methods` registry :17-79, `agent()` builder :588, `AgentApp.onRequest` :637,
-  `AgentContext`/handler contexts :142-206,367-396, `AgentSideConnection` :735, `sessionUpdate` sender
-  :765, `requestPermission` sender :778.
+  `AgentContext` (generic `request(method, params, options?: SendRequestOptions)` :188-189, `notify` :196)
+  :142-197, `AgentHandlerContext { params, signal (aborts on `$/cancel_request`), client }` :367-382,
+  `AgentRequestContext` (+`requestId`) :385-391, `SessionCapabilities` re-export, `AgentSideConnection`
+  :735 (named `sessionUpdate` :765 / `requestPermission` :778).
+- `dist/jsonrpc.d.ts` / `dist/jsonrpc.js` — `SendRequestOptions.cancellationSignal` ("aborting sends
+  `$/cancel_request`; cancellation is cooperative — promise still settled by the peer") jsonrpc.d.ts
+  :64-72; `CANCEL_REQUEST_METHOD = "$/cancel_request"` jsonrpc.js:1; `handleProtocolNotification` aborts
+  the incoming request's controller by `requestId` (`$/cancel_request` only) jsonrpc.js:640-652;
+  per-request `AbortController` in `toIncomingMessage` :589-603.
+- `dist/acp.js` — `prompt: requestSpec(session_prompt, validate.zPromptRequest)` :599 (the SDK
+  Zod-parses `PromptRequest` and rejects malformed content with `invalidParams` **before** the handler,
+  grounding error-table row 8).
+- `dist/examples/agent.js` — per-session `pendingPrompt` `AbortController` created in `prompt` :41-42 and
+  aborted in the `session/cancel` handler :215-216 (`.onNotification("session/cancel", …)` :230) — the
+  reference pattern for §9.6's session/cancel-is-separate handling.
 - `dist/stream.d.ts` — `ndJsonStream` :30.
 - `dist/jsonrpc.js` — `RequestError` static constructors (at their `static` line): parseError -32700
   :783, invalidRequest -32600 :789, methodNotFound -32601 :795, invalidParams -32602 :803, internalError
@@ -1414,9 +1803,13 @@ re-checked at authoring: `releases/latest` = `v0.80.7`, `npm view … version` =
   dist/cli.js }`, `exports { ".", "./rpc-entry" }`, `engines.node >=22.19.0`, deps
   pi-agent-core/pi-ai/pi-tui `^0.80.7` + `typebox 1.1.38`.
 - `packages/coding-agent/src/core/sdk.ts` — `CreateAgentSessionOptions` :34-83 (cwd, agentDir,
-  authStorage, model, thinkingLevel, tools/excludeTools/customTools, sessionManager; **no**
-  beforeToolCall/streamFn), `createAgentSession` :167-406, `registry.find` :197, internal `streamFn` +
-  `getApiKeyAndHeaders` :302-303, `buildSessionContext` restore :188-204, `findInitialModel` :207-222,
+  authStorage, **`modelRegistry?` :43**, model, thinkingLevel, tools/excludeTools/customTools,
+  sessionManager; **no** beforeToolCall/streamFn), **`CreateAgentSessionResult { session, extensionsResult,
+  modelFallbackMessage? }` :86-93** (the real return type — `.session` is the `AgentSession`),
+  `createAgentSession(): Promise<CreateAgentSessionResult>` :167-406 (`const modelRegistry =
+  options.modelRegistry ?? ModelRegistry.create(...)`; `return { session, extensionsResult,
+  modelFallbackMessage }` :402), `registry.find` :197, internal `streamFn` + `getApiKeyAndHeaders`
+  :302-303, `buildSessionContext` restore :188-204, `findInitialModel` :207-222,
   `new AgentSession({ agent, sessionManager, customTools, … })` :385-399.
 - `packages/coding-agent/src/index.ts` — public exports of `AgentSession`/`AgentSessionEvent` :15-27,
   `createAgentSession*` :204-207, `ModelRegistry` :172, `SessionManager` :240.
@@ -1424,11 +1817,16 @@ re-checked at authoring: `releases/latest` = `v0.80.7`, `npm view … version` =
   `AgentSessionEventListener = (e) => void` :156, `PromptOptions { images?, streamingBehavior?, … }`
   :204-215, `readonly agent: Agent` :270, `_eventListeners` :278, constructor `_installAgentToolHooks()`
   at :361 (sets `agent.beforeToolCall` at :424), `_emit` (synchronous, no await) :501-505, `subscribe`
-  :762, `getActiveToolNames`/`setActiveToolsByName` :861-888, `prompt` :1076-1224 (sync auth throws
+  :762, `getActiveToolNames` :861, `getAllTools(): ToolInfo[]` (name + `sourceInfo.source`) :868,
+  `getToolDefinition` :878, `setActiveToolsByName` :888, `dispose(): void` (abortRetry/Compaction/Bash +
+  `agent.abort()` + extension invalidate + disconnect + `cleanupSessionResources`) :799-816,
+  `_refreshToolRegistry` (builtins `Map`, then `Map.set` over `[...extensionTools, ...customTools]`)
+  :2397-2489, `prompt` :1076-1224 (sync auth throws
   :1140-1154, busy-throw :1121-1126), `_runAgentPrompt` finally→`agent_settled` :1023-1034,
   `_handlePostAgentRun` :1037-1069, `_isRetryableError` :2577, `setModel` :1537-1552 (sync no-auth throw
-  :1538-1540), `setThinkingLevel` :1630-1640 (clamp :1632), `getContextUsage` :3078-3110,
-  `getSessionStats` :3023-3076 (cumulative `cost`/`tokens`, `contextUsage`).
+  :1538-1540), `setThinkingLevel` :1630-1640 (clamp :1632), `getContextUsage` :3078-3110
+  (`ContextUsage.tokens` = current context, drops on compaction — NOT monotonic),
+  `getSessionStats` :3023-3076 (cumulative `cost`/`tokens`, `contextUsage`; `cost` monotonic).
 - `packages/coding-agent/src/core/auth-guidance.ts` — `formatNoModelSelectedMessage` :18-20,
   `formatNoApiKeyFoundMessage` :22-25 (ground the §8.2 pre-flight predicates); OAuth "Authentication
   failed for … Run '/login" throw at `agent-session.ts:1144-1150`.
@@ -1437,16 +1835,28 @@ re-checked at authoring: `releases/latest` = `v0.80.7`, `npm view … version` =
   :101-106,171-219, `streamFn` injection :214, `subscribe` :241, `steer` :274, `followUp` :279,
   `hasQueuedMessages` :300, `abort` :310-311, `waitForIdle` :319, `prompt`/`continue` (busy-throw)
   :335-348.
+- `packages/agent/src/agent-loop.ts` — `tool_execution_start` emitted **before** `prepareToolCall`
+  (sequential :447-454, parallel :502-509, truncated :389-396); `prepareToolCall` runs
+  `config.beforeToolCall` :602,621-643 (block → immediate error result :639-642; abort → :629-635);
+  `executePreparedToolCall` emits `tool_execution_update {partialResult}` :672-696; `emitToolExecutionEnd`
+  (one per call, every path) :764-772; `createErrorToolResult` = `{content:[{type:text}],details:{}}`.
 - `packages/agent/src/types.ts` — `BeforeToolCallResult { block?, reason? }` :60-63,
-  `BeforeToolCallContext { assistantMessage, toolCall, args, context }` :89-98, `AgentEvent` union
+  `BeforeToolCallContext { assistantMessage, toolCall, args, context }` :89-98, **`AgentMessage = Message |
+  CustomAgentMessages[keyof CustomAgentMessages]` :314**, `AgentEvent` union
   (`message_update { message, assistantMessageEvent }`; `tool_execution_start { toolCallId, toolName,
   args }`; `tool_execution_update { …, partialResult }`; `tool_execution_end { …, result, isError }`)
   :415-430, `ThinkingLevel` (off,minimal,low,medium,high,xhigh,max) :289.
+- `packages/agent/src/harness/messages.ts` — `BashExecutionMessage` :19-29, `CustomMessage
+  { role:"custom", content:string|(text|image)[], display, details? }` :31-38, `BranchSummaryMessage`
+  :40-45, `CompactionSummaryMessage` :47-52, `CustomAgentMessages` declare-module :54-61,
+  `bashExecutionToText` :63-80 (grounds the replay projection of §9.1.2).
 - `packages/ai/src/types.ts` — `TextContent` :327, `ThinkingContent` :334, `ImageContent { type:"image",
   data, mimeType }` :343, `ToolCall { id, name, arguments }` :349, `Usage` :357-379, `StopReason`
-  (stop|length|toolUse|error|aborted) :380, `UserMessage { role:"user", content }` :382-386,
-  `AssistantMessage { content, usage, stopReason, errorMessage, diagnostics? }` :388-401,
-  `ToolResultMessage { toolCallId, toolName, content, isError }` :403-418, `AssistantMessageEvent`
+  (stop|length|toolUse|error|aborted) :380, `UserMessage { role:"user", content: string | (TextContent |
+  ImageContent)[] }` :382-386, `AssistantMessage { content: (TextContent | ThinkingContent | ToolCall)[],
+  usage, stopReason, errorMessage, diagnostics? }` :388-401, `ToolResultMessage<TDetails> { toolCallId,
+  toolName, content: (TextContent | ImageContent)[], details?, isError }` :403-418, `Message = UserMessage
+  | AssistantMessage | ToolResultMessage` :419, `AssistantMessageEvent`
   (text/thinking/toolcall start/delta/end; `done {reason: stop|length|toolUse}`; `error {reason:
   aborted|error}`) :464-476.
 - `packages/coding-agent/src/core/session-manager.ts` — `SessionEntryBase` :46-52, entry interfaces
@@ -1488,9 +1898,36 @@ Zechner + Armin Ronacher). Obligations, satisfied in-package:
 
 - The MIT license text and copyright notice of the pi packages are retained (they ship in the installed
   dependency's `node_modules`; no source is vendored).
-- `packages/pi-acp/README.md` includes a "Built on pi" attribution and a THIRD-PARTY notice naming pi,
-  its authors, its MIT license, and the pinned version.
 - pi-acp itself is `Apache-2.0` (the monorepo license); Apache-2.0 and MIT are compatible for this
   depend-and-embed relationship. No pi source is copied into pi-acp; the `findJsonBlock`/`extractValidated`
   helpers already in `acp-agents/src/structured-output.ts` were ported from pi under our existing
   attribution and are not re-copied here.
+
+### 15.1 `packages/pi-acp/README.md` — normative published deliverable (resolves adversarial finding 12)
+
+The README is a **required file** (§2.2 layout) and a **published** doc (it ships in the npm tarball).
+Because the built-in `PiBackend` is a follow-up (§11), the README is — until that lands — the only
+place a consumer learns how to drive the server, so it MUST cover, at minimum (asserted by T27):
+
+- **bin invocation** — `npx @automatalabs/pi-acp` (stdio ACP server; stdout is ACP ndjson only, §3) and
+  `pi-acp --version`.
+- **library API** — the side-effect-free entry: `runAcp(options?)`, `PiAcpAgent`, `resolveDeps`, and the
+  `PiAcpDeps` type; that importing the package starts no server and mutates no console/stdio (§3.1).
+- **custom-backend registration** — the exact object a host registers to drive pi-acp through the
+  existing generic custom backend: `{ namespace: "@automatalabs/pi-acp", gatedKeys: ["outputSchema"] }`
+  (both fields required, §9.4.3).
+- **model format** — `"<provider>/<model-id>"` set via the reserved config channel; unknown → `-32602`
+  `invalid_model` (§5.2).
+- **auth behavior** — the advertised methods (five env-var providers + `pi-stored-credentials`),
+  ambient-credential resolution, and the `-32000` pause on a missing credential (§9.5).
+- **reserved tool namespaces** — pi-acp owns the `mcp__` prefix (bridged MCP tools) and
+  `__acp_structured_output`; extensions must not squat them (§9.3.2).
+- **v1 limitations** — stdio MCP only; no branch-topology/compaction-summary replay; no
+  `additionalDirectories`/audio/mid-turn steering/terminal-login; `PiBackend` built-in is a follow-up
+  (§11).
+- **attribution** — a "Built on pi" note and a THIRD-PARTY notice naming pi
+  (`@earendil-works/pi-coding-agent`/`-agent-core`/`-ai`), its authors, its MIT license, and the pinned
+  version.
+
+The central backend docs page / authoring skill entry remains the explicitly deferred follow-up (§11,
+tied to the `PiBackend` promotion); only this package README is required at v1.
