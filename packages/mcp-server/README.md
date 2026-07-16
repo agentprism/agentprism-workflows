@@ -374,8 +374,8 @@ it is absent from the listing.
 Run/background results contain a `resource_link` for the newly admitted script. Inspect/await
 results contain available links for the full resume lineage, oldest to newest, and duplicate that
 history in structured `lineage`. A deleted revision remains listed as `available: false` without a
-fabricated link. Lineage is reconstructed at read time from the engine's durable resume source and
-candidate provenance; the MCP layer stores no script, args, or synthetic lineage metadata. Every
+fabricated link. Lineage is reconstructed at read time from the engine's durable ancestry pointer
+(`resumeSourceRunId`); the MCP layer stores no script, args, or synthetic lineage metadata. Every
 URI is also present in structured output.
 
 Clients need MCP protocol revision **2025-06-18 or newer** to consume `resource_link` content
