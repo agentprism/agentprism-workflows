@@ -75,7 +75,16 @@ test("T4 prompt content fold is total, ordered, and accepts image-only", () => {
     images: [{ type: "image", data: "AA==", mimeType: "image/png" }],
   });
   assert.equal(convertPromptContent([{ type: "image", data: "raw", mimeType: "image/png" }]).text, "");
-  assert.throws(() => convertPromptContent([]), (error) => wire(error as RequestError).data.errorKind === "empty_prompt");
+  for (const prompt of [
+    [],
+    [{ type: "text", text: "" }],
+    [{ type: "resource", resource: { uri: "file:///empty", text: "" } }],
+  ] as const) {
+    assert.throws(
+      () => convertPromptContent(prompt),
+      (error) => wire(error as RequestError).data.errorKind === "empty_prompt",
+    );
+  }
 });
 
 test("T5 live translation and result projection cover the pinned rows", () => {

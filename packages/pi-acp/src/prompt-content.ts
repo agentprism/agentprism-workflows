@@ -42,6 +42,7 @@ export function convertPromptContent(blocks: readonly ContentBlock[]): Converted
       }
     }
   }
-  if (text.length === 0 && images.length === 0) throw adapterError("empty_prompt");
-  return { text: text.join("\n\n"), images };
+  const joined = text.join("\n\n");
+  if (joined === "" && images.length === 0) throw adapterError("empty_prompt");
+  return { text: joined, images };
 }
