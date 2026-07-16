@@ -104,6 +104,17 @@ export interface PersistedResumeSeed {
   checkpointInjections?: PersistedCheckpointInjection[];
 }
 
+/**
+ * Content-free ancestry retained after a run record is deleted. The engine owns this
+ * tombstone so read-only projections can walk an admitted resume chain without keeping
+ * scripts, arguments, or synthetic lineage in process memory.
+ */
+export interface PersistedRunLineageTombstone {
+  runId: string;
+  sourceRunId?: string;
+  deletedAt: string;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -125,6 +136,8 @@ export interface PersistedRunState {
   };
   environment?: RunEnvironmentIdentity;
   resume?: PersistedResumeFormat;
+  /** Immediate run named by resumeFromRunId, written once by the engine at admission. */
+  readonly resumeSourceRunId?: string;
   resumeSeed?: PersistedResumeSeed;
   resumeReport?: WorkflowResumeReport;
   /** The session this run belongs to. Runs persist on disk across sessions but
@@ -207,6 +220,8 @@ export interface RunPersistence {
   list(): PersistedRunState[];
   /** Delete a persisted run. */
   delete(runId: string): boolean;
+  /** Load content-free ancestry for a deleted run, when the persistence supports it. */
+  loadLineageTombstone?(runId: string): PersistedRunLineageTombstone | null;
   /**
    * Acquire an exclusive cross-process lease for a run. Returns null when another
    * live process owns the run; stale/corrupt lock files are removed and retried.
@@ -283,9 +298,35 @@ export function createRunPersistence(
   const primaryRunPath = (runId: string) => runPath(runsDir, runId);
   const legacyRunPath = (runId: string) => runPath(legacyRunsDir, runId);
   const lockPath = (dir: string, runId: string) => join(dir, `${runId}.lock`);
+  const lineagePath = (dir: string, runId: string) => join(dir, `${runId}.lineage`);
   const primaryLockPath = (runId: string) => lockPath(runsDir, runId);
   const legacyLockPath = (runId: string) => lockPath(legacyRunsDir, runId);
+  const primaryLineagePath = (runId: string) => lineagePath(runsDir, runId);
   const candidateRunPaths = (runId: string) => [primaryRunPath(runId), legacyRunPath(runId)];
+  const candidateLineagePaths = (runId: string) => [
+    primaryLineagePath(runId),
+    lineagePath(legacyRunsDir, runId),
+  ];
+
+  const loadState = (runId: string): PersistedRunState | null => {
+    // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
+    for (const path of candidateRunPaths(runId)) {
+      for (const candidate of [path, `${path}.bak`]) {
+        try {
+          if (!_existsSync(candidate)) continue;
+          return JSON.parse(_readFileSync(candidate, "utf-8")) as PersistedRunState;
+        } catch {
+          // corrupt candidate -> fall through to the next candidate
+        }
+      }
+    }
+    return null;
+  };
+
+  const lineageSourceRunId = (state: PersistedRunState): string | undefined => {
+    const sourceRunId = state.resumeSourceRunId;
+    return sourceRunId === state.runId ? undefined : sourceRunId;
+  };
 
   const pidIsAlive = (pid: number): boolean => {
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -336,21 +377,16 @@ export function createRunPersistence(
       } catch {
         // backup is best-effort; the primary write already succeeded
       }
+      try {
+        const tombstonePath = primaryLineagePath(state.runId);
+        if (_existsSync(tombstonePath)) _unlinkSync(tombstonePath);
+      } catch {
+        // The live record wins over a stale tombstone; cleanup is best-effort.
+      }
     },
 
     load(runId: string): PersistedRunState | null {
-      // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
-      for (const path of candidateRunPaths(runId)) {
-        for (const candidate of [path, `${path}.bak`]) {
-          try {
-            if (!_existsSync(candidate)) continue;
-            return JSON.parse(_readFileSync(candidate, "utf-8")) as PersistedRunState;
-          } catch {
-            // corrupt candidate -> fall through to the next candidate
-          }
-        }
-      }
-      return null;
+      return loadState(runId);
     },
 
     list(): PersistedRunState[] {
@@ -376,7 +412,22 @@ export function createRunPersistence(
 
     delete(runId: string): boolean {
       let deleted = false;
+      let wroteTombstone = false;
       try {
+        const state = loadState(runId);
+        if (state) {
+          ensureDir();
+          const sourceRunId = lineageSourceRunId(state);
+          const tombstone: PersistedRunLineageTombstone = {
+            runId,
+            ...(sourceRunId ? { sourceRunId } : {}),
+            deletedAt: new Date().toISOString(),
+          };
+          const path = primaryLineagePath(runId);
+          _writeFileSync(`${path}.tmp`, JSON.stringify(tombstone, null, 2));
+          _renameSync(`${path}.tmp`, path);
+          wroteTombstone = true;
+        }
         for (const path of candidateRunPaths(runId)) {
           try {
             if (_existsSync(path)) {
@@ -404,10 +455,49 @@ export function createRunPersistence(
             // ignore lock cleanup failures
           }
         }
+        if (!deleted && wroteTombstone) {
+          try {
+            _unlinkSync(primaryLineagePath(runId));
+          } catch {
+            // A failed delete must not manufacture a deleted-run tombstone.
+          }
+        }
         return deleted;
       } catch {
+        if (!deleted && wroteTombstone) {
+          try {
+            _unlinkSync(primaryLineagePath(runId));
+          } catch {
+            // Best-effort rollback; the still-live record remains authoritative.
+          }
+        }
         return deleted;
       }
+    },
+
+    loadLineageTombstone(runId: string): PersistedRunLineageTombstone | null {
+      for (const path of candidateLineagePaths(runId)) {
+        try {
+          if (!_existsSync(path)) continue;
+          const value = JSON.parse(_readFileSync(path, "utf-8")) as Partial<PersistedRunLineageTombstone>;
+          if (
+            value.runId !== runId ||
+            typeof value.deletedAt !== "string" ||
+            (value.sourceRunId !== undefined &&
+              (typeof value.sourceRunId !== "string" || value.sourceRunId.length === 0))
+          ) {
+            continue;
+          }
+          return {
+            runId,
+            ...(value.sourceRunId === undefined ? {} : { sourceRunId: value.sourceRunId }),
+            deletedAt: value.deletedAt,
+          };
+        } catch {
+          // corrupt candidate -> fall through to the next candidate
+        }
+      }
+      return null;
     },
 
     acquireRunLease(runId: string): RunLease | null {

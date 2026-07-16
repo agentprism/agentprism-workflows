@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-A **stdio [MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, and safe inspection of dynamic multi-agent workflows. Its whole tool surface is the single **`workflow`** tool, with run/resume/inspect/await branches: agent backends authenticate from their own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits an expired/missing login pauses with `authContext` and resumes (`resumeFromRunId`) after you log the backend's CLI in. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+A **stdio [MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Its whole tool surface is the single **`workflow`** tool, with run/resume/inspect/await/stop branches. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits an expired/missing login pauses with `authContext` and resumes (`resumeFromRunId`) after you log the backend's CLI in. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. All of the real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool, and serves it over stdin/stdout.
 
@@ -106,13 +106,14 @@ After your host reloads, the `workflow` tool appears in its tool list.
 
 ### Input parameters
 
-The tool uses a run/inspect/await union. Execution resource maxima remain runtime clamps;
+The tool uses a run/inspect/await/stop union. Execution resource maxima remain runtime clamps;
 inspection/await limits are contract bounds and invalid values are MCP Invalid Params (`-32602`).
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `action` | `"run" \| "inspect" \| "await"` | no | run | Omit for every legacy execution request. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state. |
-| `script` | string (non-empty) | run only | — | Raw JavaScript workflow script (no Markdown fences). The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await. |
+| `action` | `"run" \| "inspect" \| "await" \| "stop"` | no | run | Omit for execution. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state; `"stop"` durably aborts a live run. |
+| `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
+| `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/stop. |
 | `background` | boolean | run only | `false` | Acknowledge after admission and execute in this server process. |
 | `args` | any JSON value | no | — | Optional value exposed to the script as the global `args`. |
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
@@ -120,14 +121,14 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Per-agent timeout in ms. Omit or pass `null` for no hard timeout (the engine owns timeouts). |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
-| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. The manager admits exact runtime/cwd/terminal environment and replays only uniquely matching safety-marked calls; uncertainty runs live. |
+| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits exact runtime/cwd/terminal environment and replays only uniquely matching safety-marked calls; uncertainty runs live. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format input/safety/environment gates. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. Wire keys must be canonical non-negative safe integers. |
-| `runId` | engine run ID | inspect/await only | — | Required for inspect/await; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
+| `runId` | engine run ID | inspect/await/stop only | — | Required for inspect/await/stop; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
-| `lastN` | integer 1–50 | inspect/await only | `20` | Latest matching journal calls. Filtering happens before this selection. |
-| `labelGlob` | string | inspect/await only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
-| `logLines` | integer 0–50 | inspect/await only | `20` | Latest run-log lines. |
+| `lastN` | integer 1–50 | inspect/await/stop only | `20` | Latest matching journal calls. Filtering happens before this selection. |
+| `labelGlob` | string | inspect/await/stop only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
+| `logLines` | integer 0–50 | inspect/await/stop only | `20` | Latest run-log lines. |
 
 Example call arguments:
 
@@ -158,6 +159,14 @@ The worktree edits are discarded. See the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume) for the safety
 contract, admission gates, reports, and legacy fallback.
 
+The same run delivered from disk:
+
+```json
+{
+  "scriptPath": "/absolute/path/to/review.workflow.js",
+  "args": { "target": "src/auth.ts" }
+}
+```
 Inspection example:
 
 ```json
@@ -190,6 +199,12 @@ Background start and bounded collection:
 { "action": "await", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
 ```
 
+Stop a live run and return its final bounded snapshot:
+
+```json
+{ "action": "stop", "runId": "mabc1234-k9x2pq", "lastN": 10, "logLines": 20 }
+```
+
 ### Output
 
 The tool returns both machine-readable `structuredContent` and a human-readable text block. The structured shape pins the durable core of the engine's run result:
@@ -197,7 +212,7 @@ The tool returns both machine-readable `structuredContent` and a human-readable 
 ```ts
 interface WorkflowExecutionToolResult {
   runId: string;
-  status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  status: "paused" | "completed" | "failed" | "aborted";
   result?: unknown; // present only on a completed run — the script's resolved value
   tokenUsage?: {
     input: number;
@@ -214,11 +229,15 @@ interface WorkflowExecutionToolResult {
   fallbacks?: WorkflowRunFallback[];       // compatibility events; absent when empty
   checkpointsTaken?: WorkflowCheckpointTaken[]; // resolved checkpoints; absent when empty
   resumeReport?: WorkflowResumeReport;     // resumeFromRunId correspondence; otherwise absent
+  scriptSource: "inline" | "path";
+  scriptUri: string;
 }
 
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
+  scriptSource: "inline" | "path";
+  scriptUri: string;
 }
 
 interface WorkflowAwaitMetadata {
@@ -230,14 +249,35 @@ interface WorkflowAwaitMetadata {
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
-  outcome?: WorkflowExecutionToolResult<T>; // exactly when lifecycle status is terminal
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
+  scriptUri: string;
+  lineage: WorkflowScriptLineageEntry[];
+}
+
+interface WorkflowScriptLineageEntry {
+  runId: string;
+  uri: string;
+  available: boolean;
+}
+
+interface WorkflowStopResult extends WorkflowRunStatus {
+  stopped: boolean;
+  alreadyTerminal: boolean;
+  scriptUri: string;
+  lineage: WorkflowScriptLineageEntry[];
+}
+
+interface WorkflowInspectionToolResult extends WorkflowRunStatus {
+  scriptUri: string;
+  lineage: WorkflowScriptLineageEntry[];
 }
 
 type WorkflowToolResult =
   | WorkflowExecutionToolResult
   | WorkflowBackgroundAccepted
-  | WorkflowRunStatus
-  | WorkflowRunAwaitResult;
+  | WorkflowInspectionToolResult
+  | WorkflowRunAwaitResult
+  | WorkflowStopResult;
 ```
 
 | Execution output field | Shape | Notes |
@@ -250,9 +290,13 @@ These fields appear on foreground execution results and terminal await `outcome`
 persisted for cold await, but never copied onto the bounded top-level `WorkflowRunStatus` returned by
 inspect/await.
 
+`scriptSource` is an admission-time fact on the direct foreground result or background
+acknowledgement. It is not persisted, so terminal await outcomes expose `scriptUri` but do not infer
+an inline/path source in a later request or fresh server process.
+
 `status` lets a host distinguish a `completed` run from a `paused` one (resumable via `resumeFromRunId`) without parsing logs. The tool result is flagged `isError` when `status` is `failed` or `aborted`. A `result` field is only present when `status === "completed"`.
 
-An inspect response is exactly the shared `WorkflowRunStatus`:
+An inspect response extends the shared `WorkflowRunStatus` with `scriptUri` and `lineage`:
 
 ```ts
 interface WorkflowRunStatus {
@@ -274,9 +318,12 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 `resultPreview`, and redaction/truncation flags. Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
 keys and credential-shaped strings are redacted before results are structurally compacted; every
-text scalar and preview is at most 512 UTF-8 bytes. The entire structured status is at most 24,576
-bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The accompanying
-text is formatted from that bounded status and capped at 8,192 bytes.
+text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
+24,576 bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The full
+oldest-to-newest script lineage is mandatory: if that lineage alone makes the augmented envelope
+larger, requested diagnostics are retained and `truncation.maxStructuredBytes` rises to the actual
+envelope size instead of claiming the 24,576-byte status limit. The accompanying text is formatted
+from the bounded status and capped at 8,192 bytes.
 
 An unknown, corrupt, or unreadable run returns `isError: true`, no `structuredContent`, and:
 
@@ -292,9 +339,48 @@ redaction, compaction, filtering, and truncation counters, and its text is cappe
 Before terminal state, optional `tokenUsage` is the cumulative live work observed in this execution;
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
 the authored `result` and full `logs` remain raw and unbounded, and are not duplicated into text.
-Top-level and outcome token usage are identical. Paused outcomes carry the existing non-secret
+It omits the admission-only `scriptSource` while retaining `scriptUri`. Top-level and outcome token
+usage are identical. Paused outcomes carry the existing non-secret
 `authContext` or `checkpointContext` used for CLI-login/resume or checkpoint-reply handling. Result
 observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `outcome`.
+
+---
+
+## Script resources
+
+Every admitted manager run has one immutable, persistence-backed resource:
+
+```text
+workflow://runs/{runId}/script
+```
+
+`resources/read` returns the exact UTF-8 content snapshotted at admission with MIME type
+`text/javascript`. This applies equally to inline and `scriptPath` delivery and works for any
+persisted run in the project namespace, across MCP sessions and server processes. The original path
+is not persisted or re-read. A run record deletion removes the resource; stopping a run does not.
+
+The server advertises and implements `resources: { subscribe: true, listChanged: true }`.
+Subscriptions are process-local. Script content never changes after admission, so
+`notifications/resources/updated` never fires. `notifications/resources/list_changed` fires when a
+run is admitted and when a run record is deleted; deletion also drops that URI's subscription.
+Unsubscribing after that deletion (including a deletion race) is an idempotent empty success for a
+URI this process knew existed. A malformed resource URI or a run ID that never existed is rejected.
+
+`resources/list` is discovery convenience, not a complete index: it returns at most the **50 newest
+runs by `startedAt` descending**. Resource-template completion uses that same bounded set. Direct
+URI reads are the unbounded retrieval contract, so a known older run ID remains readable even when
+it is absent from the listing.
+
+Run/background results contain a `resource_link` for the newly admitted script. Inspect/await
+results contain available links for the full resume lineage, oldest to newest, and duplicate that
+history in structured `lineage`. A deleted revision remains listed as `available: false` without a
+fabricated link. Lineage is reconstructed at read time from the engine's durable ancestry pointer
+(`resumeSourceRunId`); the MCP layer stores no script, args, or synthetic lineage metadata. Every
+URI is also present in structured output.
+
+Clients need MCP protocol revision **2025-06-18 or newer** to consume `resource_link` content
+blocks. The structured URI fields remain available independently of link rendering. MCP defines no
+client `resources` capability to gate these server-offered primitives.
 
 ---
 
@@ -303,12 +389,14 @@ observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `ou
 - **Foreground by default.** Omitted/false `background` preserves the synchronous behavior,
   request cancellation, progress notifications, live checkpoint elicitation, terminal `isError`,
   and result shape.
-- **Detached admission.** `background:true` returns the exact two-field running acknowledgement
+- **Detached admission.** `background:true` returns a running acknowledgement with `runId`,
+  `status`, `scriptSource`, `scriptUri`, and the script resource link
   after parsing, backend approval, one of four process-local slot reservations, lease acquisition,
-  and fail-fast initial persistence. It never awaits agent or script-body completion. A fifth
+  and successful persistence readback. It never awaits agent or script-body completion. A fifth
   active-or-starting request returns
   `Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
-  There is no queue. Foreground, inspect, and await consume no slot.
+  There is no queue. Foreground, inspect, and await consume no slot; a durably stopped background
+  run frees its slot immediately even if backend session wind-down is still pending.
 - **Bounded await.** `action:"await"` waits only for terminal status. `waitMs:0` returns
   `immediate` while pending/running; a positive deadline returns `timeout` if still live; an
   already/newly terminal run returns `terminal`. Same-process awaits wake on the background promise;
@@ -327,7 +415,18 @@ observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `ou
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed terminal runs retain their completed journal too. Call `workflow` again with the current script/`args` and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. The new request creates a new run ID and returns `resumeReport`; terminal text includes only its compact strategy/count line.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `resumeReport`; terminal text includes only its compact strategy/count line.
+- **Authoritative stop.** `action:"stop"` acts on `running` and `paused` runs live in this server
+  process, cancels their agent/checkpoint work, persists `aborted`, appends the durable `stopped`
+  event, releases the lease, and returns the final inspection projection inline. Resume is safe
+  immediately and a follow-up await adds nothing. Only backend agent-session wind-down can remain;
+  use inspect's per-agent states if that cleanup appears hung. Repeating stop on a terminal run is a
+  successful no-op (`stopped:false`, `alreadyTerminal:true`). Unknown runs are not found; a cold
+  persisted `running`/`paused` record has nothing live to stop in this process and should be resumed.
+  Stop retains the journal, record, and script resource, so the kill-patch-resume loop is: stop,
+  edit the file, then call run with `scriptPath` plus `resumeFromRunId`. Because an in-flight stop
+  cannot capture a quiescent terminal environment, the manager may conservatively run that resumed
+  script live; the `resumeReport` is authoritative about any calls it could safely replay.
 - **Checkpoints.** Foreground uses MCP elicitation when advertised. Background never retains that
   request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus
@@ -424,9 +523,11 @@ await server.connect(new StdioServerTransport());
 
 Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `clampWorkflowInput` (primitive schema, action discriminator, execution clamp),
-`WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowAwaitToolInput`,
+`CreateWorkflowServerOptions`,
+`WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowAwaitToolInput`, `WorkflowStopToolInput`,
 `WorkflowExecutionToolResult`, `WorkflowBackgroundAccepted`, `WorkflowAwaitMetadata`,
-`WorkflowRunAwaitResult`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
+`WorkflowInspectionToolResult`, `WorkflowRunAwaitResult`, `WorkflowStopResult`,
+`WorkflowScriptLineageEntry`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
 `workflowToolOutputShape` / `toWorkflowToolResult`,
 `createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond
 hosting this tool, prefer `@automatalabs/workflows`.

@@ -200,6 +200,82 @@ describe("WorkflowManager resumeFromRunId admission", () => {
     }
   });
 
+  it("persists an immutable immediate ancestry pointer without changing matcher seed lifecycle", async () => {
+    const dirs = tempDirs();
+    try {
+      const store = memoryStore(dirs.root);
+      const manager = new WorkflowManager({
+        cwd: dirs.cwd,
+        persistence: store.persistence,
+        environmentKey: ENVIRONMENT_KEY,
+        agent: { async run(prompt) { return `recorded:${prompt}`; } },
+      });
+      const sourceRunId = await recordSafeSource(manager, ["one", "two"]);
+      const started = manager.startInBackground(safeCalls(["one", "two"]), undefined, {
+        runId: "ancestry-target",
+        resumeFromRunId: sourceRunId,
+      });
+
+      const admitted = store.history.find((state) => state.runId === "ancestry-target");
+      assert.equal(admitted?.resumeSourceRunId, sourceRunId);
+      assert.equal(admitted?.resumeSeed?.sourceRunId, sourceRunId);
+      assert.equal(admitted?.resumeSeed?.candidates.length, 2);
+
+      const completed = await started.promise;
+      assert.equal(completed.status, "completed");
+      const terminal = store.persistence.load("ancestry-target");
+      assert.equal(terminal?.resumeSourceRunId, sourceRunId);
+      assert.equal(terminal?.resumeSeed, undefined, "completion keeps the upstream matcher compaction contract");
+      assert.ok(
+        store.history
+          .filter((state) => state.runId === "ancestry-target")
+          .every((state) => state.resumeSourceRunId === sourceRunId),
+        "the engine pointer must never change after admission",
+      );
+    } finally {
+      dirs.cleanup();
+    }
+  });
+
+  it("carries the ancestry pointer through legacy same-ID resume", async () => {
+    const dirs = tempDirs();
+    try {
+      const store = memoryStore(dirs.root);
+      const manager = new WorkflowManager({
+        cwd: dirs.cwd,
+        persistence: store.persistence,
+        environmentKey: ENVIRONMENT_KEY,
+        agent: { async run(prompt) { return `source:${prompt}`; } },
+      });
+      const sourceRunId = await recordSafeSource(manager, ["one"]);
+      const paused = await manager.runSync(workflow(`
+await agent("one", { label: "one", resume: { filesystem: "read-only" } })
+return await checkpoint("approve", { headless: "pause" })`, "legacy-ancestry"), undefined, {
+        runId: "legacy-ancestry",
+        resumeFromRunId: sourceRunId,
+      });
+      assert.equal(paused.status, "paused");
+      assert.ok(paused.checkpointContext);
+      assert.equal(store.persistence.load("legacy-ancestry")?.resumeSourceRunId, sourceRunId);
+
+      const resumed = await manager.resumeInBackground("legacy-ancestry", {
+        checkpointReplies: { [paused.checkpointContext.callIndex]: true },
+      });
+      if (!resumed.accepted) assert.fail("legacy resume was not accepted");
+      const final = await resumed.promise;
+      assert.equal(final.status, "completed");
+      assert.equal(store.persistence.load("legacy-ancestry")?.resumeSourceRunId, sourceRunId);
+      assert.ok(
+        store.history
+          .filter((state) => state.runId === "legacy-ancestry")
+          .every((state) => state.resumeSourceRunId === sourceRunId),
+        "every save across legacy resume retains the engine ancestry pointer",
+      );
+    } finally {
+      dirs.cleanup();
+    }
+  });
+
   it("activates legacy, forced-positional, and unknown-format rollout paths", async () => {
     const dirs = tempDirs();
     try {

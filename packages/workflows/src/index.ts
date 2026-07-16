@@ -108,6 +108,7 @@ export type {
   PersistedResumeCandidate,
   PersistedCheckpointInjection,
   PersistedResumeSeed,
+  PersistedRunLineageTombstone,
   PreparedResume,
   WorkflowLogTail,
   WorkflowRunCallStatus,

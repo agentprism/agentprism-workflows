@@ -13,20 +13,36 @@ import { createAcpRunner } from "@automatalabs/workflows";
 import { createWorkflowServer } from "./server.js";
 
 export { createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
-export type { WorkflowConfirmCallback, WorkflowCheckpointOptions } from "./server.js";
+export type {
+  CreateWorkflowServerOptions,
+  WorkflowConfirmCallback,
+  WorkflowCheckpointOptions,
+} from "./server.js";
 export { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 export type {
   WorkflowAwaitToolInput,
   WorkflowExecuteToolInput,
   WorkflowInspectToolInput,
+  WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
-export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
+export {
+  toWorkflowExecutionOutcome,
+  toWorkflowToolResult,
+  workflowToolOutputShape,
+} from "./workflow-tool-output.js";
 export type {
   WorkflowAwaitMetadata,
   WorkflowBackgroundAccepted,
+  WorkflowExecutionOutcome,
+  WorkflowExecutionScriptResourceFields,
   WorkflowExecutionToolResult,
+  WorkflowInspectionToolResult,
   WorkflowRunAwaitResult,
+  WorkflowScriptLineageEntry,
+  WorkflowScriptResourceFields,
+  WorkflowScriptSource,
+  WorkflowStopResult,
   WorkflowToolResult,
 } from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";

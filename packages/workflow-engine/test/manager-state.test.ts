@@ -28,6 +28,66 @@ function tempDirs(): { cwd: string; root: string; cleanup: () => void } {
 }
 
 describe("WorkflowManager PR3 state", () => {
+  it("waits for an optional execution admission decision before evaluating authored code", async () => {
+    const dirs = tempDirs();
+    try {
+      let runnerCalls = 0;
+      let confirmCalls = 0;
+      const manager = new WorkflowManager({
+        cwd: dirs.cwd,
+        persistenceRoot: dirs.root,
+        agent: { async run() { runnerCalls++; return "ran"; } },
+      });
+
+      const ordinary = await manager.runSync(script(`return await agent('ordinary')`, "ordinary-admission"));
+      assert.equal(ordinary.status, "completed");
+      assert.equal(runnerCalls, 1, "omitting the option preserves immediate execution");
+
+      let admit!: (decision: "admitted") => void;
+      const admittedDecision = new Promise<"admitted">((resolve) => { admit = resolve; });
+      const admitted = manager.startInBackground(
+        script(`log('admitted-authored-log')\nreturn await agent('admitted')`, "admitted-latch"),
+        undefined,
+        { executionAdmission: admittedDecision },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(runnerCalls, 1);
+      assert.deepEqual(manager.getSnapshot(admitted.runId)?.logs, []);
+      admit("admitted");
+      assert.equal((await admitted.promise).status, "completed");
+      assert.equal(runnerCalls, 2);
+      assert.equal(manager.getSnapshot(admitted.runId)?.logs.includes("admitted-authored-log"), true);
+
+      let deny!: (decision: "denied") => void;
+      const deniedDecision = new Promise<"denied">((resolve) => { deny = resolve; });
+      const denied = manager.startInBackground(
+        script(
+          `log('denied-authored-log')\nreturn await checkpoint('denied checkpoint')`,
+          "denied-latch",
+        ),
+        undefined,
+        {
+          executionAdmission: deniedDecision,
+          confirm: async () => { confirmCalls++; return true; },
+        },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(manager.getSnapshot(denied.runId)?.logs, []);
+      assert.equal(confirmCalls, 0);
+      deny("denied");
+      await assert.rejects(
+        denied.promise,
+        (error: unknown) =>
+          error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR,
+      );
+      assert.equal(manager.getRun(denied.runId)?.status, "failed");
+      assert.deepEqual(manager.getSnapshot(denied.runId)?.logs, []);
+      assert.equal(confirmCalls, 0, "denial must not enter a checkpoint or any other authored code");
+    } finally {
+      dirs.cleanup();
+    }
+  });
+
   it("snapshots strict args before execution on runSync and startInBackground", async () => {
     const dirs = tempDirs();
     try {

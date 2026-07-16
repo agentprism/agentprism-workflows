@@ -120,6 +120,8 @@ export interface ManagedRun {
   legacyResume?: true;
   /** A fresh run seeded from another execution; terminal saves replace inherited rows. */
   newRunResume?: true;
+  /** Immediate resumeFromRunId ancestor, fixed when the new run is admitted. */
+  readonly resumeSourceRunId?: string;
   /** Manager-owned remaining correspondence state for a new-run resume. */
   resumeSeed?: PersistedResumeSeed;
   /** Manager-owned report, incrementally updated while the engine is executing. */
@@ -202,6 +204,12 @@ export interface ExecOptions {
   resumePolicy?: ResumePolicy;
   /** Durable-checkpoint answer channel: pending checkpoint call index to the host's decision. */
   checkpointReplies?: Record<number, unknown>;
+  /**
+   * Optional host admission latch. Initialization and the first persisted save complete before
+   * startInBackground returns, but workflow VM evaluation waits for this decision. A denied
+   * admission settles through the normal abort/error path without evaluating authored code.
+   */
+  executionAdmission?: Promise<"admitted" | "denied">;
   /**
    * Whether THIS run writes/reads the engine persistence journal. Default is the
    * manager setting. When false, no run-state/log files are written and resume
@@ -851,6 +859,7 @@ export class WorkflowManager extends EventEmitter {
       mainModel: this.mainModel,
       agentsDir: this.agentsDir,
       executionMode: exec.executionMode,
+      ...(exec.resumeFromRunId ? { resumeSourceRunId: exec.resumeFromRunId } : {}),
       ...(exec.resumeJournal ? { legacyResume: true as const, newRunResume: true as const } : {}),
       journaling,
       background,
@@ -1089,6 +1098,13 @@ export class WorkflowManager extends EventEmitter {
       else hostSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
     }
     try {
+      if (exec.executionAdmission && await exec.executionAdmission !== "admitted") {
+        throw new WorkflowError(
+          "workflow execution was denied because host admission did not become durable",
+          WorkflowErrorCode.PERSISTENCE_ERROR,
+          { recoverable: false },
+        );
+      }
       if (!managed.journaling && resumeJournal) {
         throw new WorkflowError("journaling disabled for this run", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
           recoverable: false,
@@ -1567,6 +1583,7 @@ export class WorkflowManager extends EventEmitter {
       runtime: managed.runtime,
       environment: managed.environment,
       ...(managed.resume ? { resume: managed.resume } : {}),
+      ...(managed.resumeSourceRunId ? { resumeSourceRunId: managed.resumeSourceRunId } : {}),
       ...(managed.resumeSeed ? { resumeSeed: managed.resumeSeed } : {}),
       ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
       mainModel: managed.mainModel,
@@ -1916,6 +1933,7 @@ export class WorkflowManager extends EventEmitter {
       runtime: runtimeIdentity(),
       environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),
       ...(persisted.resume ? { resume: { format: "identity-v1" as const } } : {}),
+      ...(persisted.resumeSourceRunId ? { resumeSourceRunId: persisted.resumeSourceRunId } : {}),
       resumeActivity: 0,
       resumeFilesystemTainted: false,
       resumeTerminalFinalized: false,
@@ -2129,13 +2147,16 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     const lease = managed?.lease ?? this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+    let deleted = false;
     try {
-      return this.persistence.delete(runId);
+      deleted = this.persistence.delete(runId);
     } finally {
       this.persistence.releaseRunLease(lease);
       if (managed) managed.lease = undefined;
       this.runs.delete(runId);
     }
+    if (deleted) this.emit("runDeleted", { runId });
+    return deleted;
   }
 
   /**

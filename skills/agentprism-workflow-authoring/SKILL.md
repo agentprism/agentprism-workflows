@@ -42,7 +42,12 @@ const run = await runDynamicWorkflow(script, { cwd: "/abs/project", args: { path
 // run.resumeReport: optional new-run replay correspondence; run.fallbacks/checkpointsTaken: audit trails
 ```
 
-— or pass the same script string to the `workflow` MCP tool served by `@automatalabs/mcp-server`. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes (`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
+— or pass it to the `workflow` MCP tool served by `@automatalabs/mcp-server`, using exactly one of
+`script` (the source string) or `scriptPath` (an absolute path on the server's filesystem). A path
+is read once at admission and its content is snapshotted, so later edits affect only a new run.
+`args` arrives in the script as the `args` global; the run's base directory is the `cwd` global.
+Some hosts hand `args` through as a JSON **string** — a robust script tolerates both shapes
+(`typeof args === "string" ? JSON.parse(args) : args`) before reading knobs off it.
 
 ## The `meta` header
 
@@ -338,7 +343,13 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same script with `args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 match uniquely and replay for zero current provider tokens; only rounds 7–8 run live because the cap controls call count but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all eight identities would change and all would run live.
+With the MCP `workflow` tool, run it first with `args: { "maxRounds": 6 }`. Then send the same
+content (again via `script`, or via the absolute `scriptPath` you are editing) with
+`args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 replay
+for zero current provider tokens and only rounds 7–8 run live because the cap controls call count
+but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all
+eight identities would change and all would run live. Resume always states its content; a bare
+`resumeFromRunId` never silently reuses the old script.
 
 - Narrate decisions and round summaries with `log()`, and give repeated calls stable, descriptive
   labels. MCP hosts can safely retrieve the latest log lines and compact results by label after a
@@ -351,8 +362,26 @@ still unclear, call the same single `workflow` tool with
 label glob and latest-N tail to identify the last relevant work before deciding whether to resume,
 edit, or stop. `resumeFromRunId` executes a new run; inspection does not.
 
-Choose `background: true` for work that may outlive one MCP request. The start call returns exactly
-`{ runId, status: "running" }` after durable admission; retain that new ID and normally collect with
+Every admitted script is also an immutable MCP resource at
+`workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the complete
+resume lineage oldest-to-newest. If a later session has lost an inline script, read that URI and
+explicitly send the retrieved text as `script` with `resumeFromRunId` (and `checkpointReplies` when
+recovering a durable checkpoint). Resource content is the admission snapshot, never a re-read path.
+
+To kill, patch, and resume a live run, call
+`{ action: "stop", runId, lastN?, labelGlob?, logLines? }`. The returned `aborted` snapshot is the
+authoritative durable acknowledgement: resume is safe immediately and a follow-up await adds
+nothing. Edit the file, then start a new run with its absolute `scriptPath` plus
+`resumeFromRunId: runId`. The manager replays only calls whose safety and environment facts remain
+provable; an in-flight stop may make the resumed run conservatively execute live, so read its
+`resumeReport` instead of assuming a prefix hit.
+Only backend session wind-down can remain after stop, so inspect per-agent states only if cleanup
+appears hung. The stopped run frees its background slot immediately. A repeated stop of a terminal
+run is a successful no-op.
+
+Choose `background: true` for work that may outlive one MCP request. The start call returns
+`{ runId, status: "running", scriptSource, scriptUri }` plus a script resource link after durable
+admission; retain that new ID and normally collect with
 20-second bounded calls: `{ action: "await", runId, waitMs: 20000 }`. A timeout is progress, not
 failure: it returns the newest safe status and cumulative usage, so call await again. Use
 `action:"inspect"` (or `waitMs:0`) when you need an immediate filtered diagnostic instead of waiting.
@@ -363,7 +392,8 @@ coarse phase and distinct started/ended-call progress while pending. A legacy/in
 polling fallback still returns bounded status without progress notifications.
 At terminal status await adds `outcome`, the foreground-equivalent authored result/pause context.
 That outcome carries optional `fallbacks` and `checkpointsTaken`; inspect and the top-level await
-status intentionally do not. `checkpointsTaken` identifies resolved live, headless-default,
+status intentionally do not. It carries `scriptUri` but not the admission-only, unpersisted
+`scriptSource`. `checkpointsTaken` identifies resolved live, headless-default,
 journal-replay, and injected `checkpointReplies` decisions without repeating prompt text.
 
 Background is detached from the initiating request, not from the MCP server process; a stdio child
@@ -372,6 +402,47 @@ headless checkpoint modes apply. Resume only a paused durable journal: submit a 
 script, `resumeFromRunId`, and any `checkpointReplies`. That execution gets a new run ID and
 durably inherits the complete replay prefix. Await and inspect are read-only and never resume
 anything.
+
+## Long-running implementation workflows
+
+Hard-won rules for workflows whose implement/review rounds span hours against a repository that
+keeps moving. Each of these prevented — or would have prevented — a real terminal-verdict blocker:
+
+- **Pin a base and check it every round.** A brief that says "based on origin/main" names a moving
+  target. Have the implementer record the exact base SHA it built against (e.g. into a gitignored
+  `base-sha.txt`), and make every reviewer run `git fetch` + compare `git rev-parse origin/<default>`
+  against it as a structured verdict field. Reviewers grounded in a stale worktree will confidently
+  "verify" claims against the wrong tree — in one run, fourteen of fifteen agents (including the
+  final adjudicator's first pass) validated against a base nine commits behind, and the decisive
+  blocker was visible only to the single reviewer that fetched. At least one gate lens should
+  build/test against the LIVE default branch, where upstream drift surfaces as a compile failure
+  instead of an opinion.
+- **A missing cited mechanism means stop, never re-implement.** If the spec cites an engine field or
+  API that does not exist on the implementer's tree, the correct move is to halt and report the
+  discrepancy — the overwhelmingly likely cause is a stale base, not a wrong spec. The plausible
+  fallback ("build the equivalent at my own layer") produces a parallel implementation that collides
+  with the real mechanism on rebase. Put that instruction in the implementer's prompt verbatim.
+- **Reconcile contradictory reviewer directives before obeying either.** With multiple independent
+  lenses across rounds, one reviewer can demand a subsystem that another later demands removed. The
+  implementer will obey whichever spoke last; the conflict then lands unresolved on the terminal
+  adjudicator. When a round's feedback contradicts an earlier round's, the workflow owner (or an
+  explicit adjudication step) decides — not the implementer.
+- **Never hand the adjudicator unaddressed final-round blockers.** A gate capped at N rounds ends
+  with round N's findings unfixed by construction. Budget one bounded post-gate fix pass (judged by
+  the terminal adjudicator directly, no re-review) or run the adjudicator before the final round.
+- **The report and HEAD must be the same commit.** An implementer that keeps committing after filing
+  its structured report makes the review target a moving object — reviewers certify a branch state
+  that no longer exists. Require the report's SHAs to be the branch tip, and treat post-report
+  commits as a blocking process violation.
+- **Verify the brief's own premises against the live tree.** A brief assertion about engine behavior
+  ("seeds persist on every resumed run") that is false at HEAD forces the implementer into
+  ungrounded redesigns mid-flight. Cited behaviors deserve the same file:line grounding the spec
+  gets.
+- **No uninvited resource caps.** A structurally bounded workflow (fixed rounds × fixed fan-out +
+  one adjudication) cannot run away; a token budget adds no protection but adds a new failure mode —
+  the mid-flight kill that wastes live work. Add caps only when the structure itself is unbounded,
+  sized from per-role estimates (one xhigh implement + one four-reviewer verify round with full test
+  suites ≈ 3M tokens).
 
 ## Worked example — cross-vendor build with every major primitive
 

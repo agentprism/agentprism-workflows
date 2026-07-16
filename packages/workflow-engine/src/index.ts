@@ -39,6 +39,7 @@ export {
   type PersistedResumeCandidate,
   type PersistedCheckpointInjection,
   type PersistedResumeSeed,
+  type PersistedRunLineageTombstone,
   type FsLayer,
   type RunPersistenceOptions,
 } from "./run-persistence.js";

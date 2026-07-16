@@ -1061,6 +1061,9 @@ function withRunEventsInternal(persistence: RunPersistence, fs: ResolvedEventFs)
       }
       return persistence.delete(runId);
     },
+    loadLineageTombstone(runId) {
+      return persistence.loadLineageTombstone?.(runId) ?? null;
+    },
     acquireRunLease(runId) {
       return persistence.acquireRunLease(runId);
     },

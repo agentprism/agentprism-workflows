@@ -3,6 +3,7 @@
 // bounds are rejected at the Zod boundary because they are wire-contract limits.
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { WorkflowRunInspectionOptions } from "@automatalabs/workflows";
+import { isAbsolute } from "node:path";
 import { z } from "zod";
 
 const checkpointRepliesSchema = z
@@ -26,15 +27,27 @@ const checkpointRepliesSchema = z
 
 export const workflowToolInputShape = {
   action: z
-    .enum(["run", "inspect", "await"])
+    .enum(["run", "inspect", "await", "stop"])
     .optional()
-    .describe("Operation. Omit or use run to execute; inspect reads immediately; await waits for terminal status."),
+    .describe(
+      "Operation. Omit or use run to execute; inspect reads immediately; await waits for terminal status; stop aborts a live run and returns its final snapshot.",
+    ),
   script: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Required for run; forbidden for inspect. First statement MUST be `export const meta = { name, description, phases? }`.",
+      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for inspect/await/stop. First statement MUST be `export const meta = { name, description, phases? }`.",
+    ),
+  scriptPath: z
+    .string()
+    .min(1)
+    .refine((value) => isAbsolute(value), "scriptPath must be an absolute path")
+    .optional()
+    .describe(
+      "Absolute path, on the server's filesystem, to a workflow script file read once at admission. " +
+        "Exactly one of script or scriptPath is required for run; both are forbidden for inspect/await/stop. " +
+        "Relative paths are rejected.",
     ),
   args: z.unknown().optional().describe("Optional JSON value exposed to the script as the global `args`."),
   maxAgents: z
@@ -74,7 +87,7 @@ export const workflowToolInputShape = {
     .min(1)
     .optional()
     .describe(
-      "Start a new run from this persisted source run. The manager validates replay eligibility and runs live wherever reuse is uncertain. The source ID must exist in this project namespace.",
+      "Start a new run from this persisted source run. Re-send the script via script or scriptPath and the desired args; the manager validates replay eligibility and runs live wherever reuse is uncertain. The source ID must exist in this project namespace.",
     ),
   resumePolicy: z
     .enum(["auto", "positional"])
@@ -92,7 +105,7 @@ export const workflowToolInputShape = {
     .max(128)
     .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
     .optional()
-    .describe("Project-scoped workflow run ID. Required for inspect; forbidden for run."),
+    .describe("Project-scoped workflow run ID. Required for inspect/await/stop; forbidden for run."),
   lastN: z.number().int().min(1).max(50).optional().describe("Latest matching calls. Default 20; range 1..50."),
   labelGlob: z
     .string()
@@ -111,9 +124,8 @@ export const workflowToolInputShape = {
     .describe("Await duration in milliseconds. Default 20000; range 0..25000. Zero reads without blocking."),
 } as const;
 
-export interface WorkflowExecuteToolInput {
+interface WorkflowExecuteToolInputBase {
   action?: "run";
-  script: string;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -132,10 +144,17 @@ export interface WorkflowExecuteToolInput {
   logLines?: never;
 }
 
+export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
+  (
+    | { script: string; scriptPath?: never }
+    | { script?: never; scriptPath: string }
+  );
+
 export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   action: "inspect";
   runId: string;
   script?: never;
+  scriptPath?: never;
   background?: never;
   waitMs?: never;
   resumeFromRunId?: never;
@@ -149,17 +168,35 @@ export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   /** Default 20_000; integer range 0..25_000. Zero is a non-blocking status read. */
   waitMs?: number;
   script?: never;
+  scriptPath?: never;
   background?: never;
   resumeFromRunId?: never;
   resumePolicy?: never;
   checkpointReplies?: never;
 }
 
-export type WorkflowToolInput = WorkflowExecuteToolInput | WorkflowInspectToolInput | WorkflowAwaitToolInput;
+export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
+  action: "stop";
+  runId: string;
+  script?: never;
+  scriptPath?: never;
+  background?: never;
+  waitMs?: never;
+  resumeFromRunId?: never;
+  resumePolicy?: never;
+  checkpointReplies?: never;
+}
+
+export type WorkflowToolInput =
+  | WorkflowExecuteToolInput
+  | WorkflowInspectToolInput
+  | WorkflowAwaitToolInput
+  | WorkflowStopToolInput;
 
 interface RawWorkflowToolInput {
-  action?: "run" | "inspect" | "await";
+  action?: "run" | "inspect" | "await" | "stop";
   script?: string;
+  scriptPath?: string;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -177,6 +214,23 @@ interface RawWorkflowToolInput {
   waitMs?: number;
 }
 
+function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
+  return (
+    raw.script !== undefined ||
+    raw.scriptPath !== undefined ||
+    raw.args !== undefined ||
+    raw.maxAgents !== undefined ||
+    raw.concurrency !== undefined ||
+    raw.agentRetries !== undefined ||
+    raw.agentTimeoutMs !== undefined ||
+    raw.tokenBudget !== undefined ||
+    raw.resumeFromRunId !== undefined ||
+    raw.resumePolicy !== undefined ||
+    raw.checkpointReplies !== undefined ||
+    raw.background !== undefined
+  );
+}
+
 function invalid(message: string): never {
   throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
 }
@@ -185,20 +239,7 @@ function invalid(message: string): never {
 export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolInput {
   if (raw.action === "inspect") {
     if (!raw.runId) invalid('action="inspect" requires runId');
-    if (
-      raw.script !== undefined ||
-      raw.args !== undefined ||
-      raw.maxAgents !== undefined ||
-      raw.concurrency !== undefined ||
-      raw.agentRetries !== undefined ||
-      raw.agentTimeoutMs !== undefined ||
-      raw.tokenBudget !== undefined ||
-      raw.resumeFromRunId !== undefined ||
-      raw.resumePolicy !== undefined ||
-      raw.checkpointReplies !== undefined ||
-      raw.background !== undefined ||
-      raw.waitMs !== undefined
-    ) {
+    if (hasExecutionFields(raw) || raw.waitMs !== undefined) {
       invalid('action="inspect" cannot include execution fields');
     }
     return {
@@ -212,25 +253,27 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
 
   if (raw.action === "await") {
     if (!raw.runId) invalid('action="await" requires runId');
-    if (
-      raw.script !== undefined ||
-      raw.args !== undefined ||
-      raw.maxAgents !== undefined ||
-      raw.concurrency !== undefined ||
-      raw.agentRetries !== undefined ||
-      raw.agentTimeoutMs !== undefined ||
-      raw.tokenBudget !== undefined ||
-      raw.resumeFromRunId !== undefined ||
-      raw.resumePolicy !== undefined ||
-      raw.checkpointReplies !== undefined ||
-      raw.background !== undefined
-    ) {
+    if (hasExecutionFields(raw)) {
       invalid('action="await" cannot include execution fields');
     }
     return {
       action: "await",
       runId: raw.runId,
       waitMs: raw.waitMs ?? 20_000,
+      lastN: raw.lastN,
+      labelGlob: raw.labelGlob,
+      logLines: raw.logLines,
+    };
+  }
+
+  if (raw.action === "stop") {
+    if (!raw.runId) invalid('action="stop" requires runId');
+    if (hasExecutionFields(raw) || raw.waitMs !== undefined) {
+      invalid('action="stop" cannot include execution fields or waitMs');
+    }
+    return {
+      action: "stop",
+      runId: raw.runId,
       lastN: raw.lastN,
       labelGlob: raw.labelGlob,
       logLines: raw.logLines,
@@ -246,16 +289,17 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
   ) {
     invalid("run inputs cannot include inspection fields");
   }
-  if (!raw.script) invalid(raw.action === "run" ? 'action="run" requires script' : "script or an explicit action is required");
+  const hasScript = raw.script !== undefined;
+  const hasScriptPath = raw.scriptPath !== undefined;
+  if (hasScript === hasScriptPath) invalid("exactly one of script or scriptPath is required");
   if (raw.resumePolicy !== undefined && raw.resumeFromRunId === undefined) {
     invalid("resumePolicy requires resumeFromRunId");
   }
   if (raw.checkpointReplies !== undefined && raw.resumeFromRunId === undefined) {
     invalid("checkpointReplies requires resumeFromRunId");
   }
-  return {
+  const common = {
     action: raw.action,
-    script: raw.script,
     args: raw.args,
     maxAgents: raw.maxAgents,
     concurrency: raw.concurrency,
@@ -267,6 +311,9 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
     checkpointReplies: raw.checkpointReplies,
     background: raw.background ?? false,
   };
+  return hasScript
+    ? { ...common, script: raw.script as string }
+    : { ...common, scriptPath: raw.scriptPath as string };
 }
 
 /** Clamp only execution resource knobs; inspection values are rejected rather than clamped. */

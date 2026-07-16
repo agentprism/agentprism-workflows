@@ -645,6 +645,38 @@ test(
 );
 
 test(
+  "createRunPersistence retains only content-free lineage after delete and clears it on run-id reuse",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const state = {
+      runId: "lineage-child",
+      workflowName: "lineage",
+      script: "secret script content",
+      args: { secret: "argument content" },
+      resumeSourceRunId: "lineage-root",
+      resumeSeed: { format: "identity-v1" as const, sourceRunId: "matcher-parent", candidates: [] },
+      status: "paused" as const,
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    rp.save(state);
+
+    assert.equal(rp.delete(state.runId), true);
+    const tombstone = rp.loadLineageTombstone?.(state.runId);
+    assert.equal(tombstone?.runId, state.runId);
+    assert.equal(tombstone?.sourceRunId, "lineage-root");
+    assert.equal(typeof tombstone?.deletedAt, "string");
+    assert.deepEqual(Object.keys(tombstone ?? {}).sort(), ["deletedAt", "runId", "sourceRunId"]);
+
+    rp.save({ ...state, script: "replacement content" });
+    assert.equal(rp.loadLineageTombstone?.(state.runId), null);
+  }),
+);
+
+test(
   "createRunPersistence delete removes legacy project run files",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
