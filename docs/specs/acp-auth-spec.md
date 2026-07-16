@@ -879,7 +879,7 @@ No advertised `env_var` method, but the child `@anthropic-ai/claude-agent-sdk` s
 
 ---
 
-### 3.3 Codex — `@automatalabs/codex-acp` 1.6.5 (our fork)
+### 3.3 Codex — `@automatalabs/codex-acp` 1.6.6 (our fork)
 
 The installed fork version is 1.5.2. The detailed offsets in this subsection were originally captured against 1.4.0 and are retained as snapshot evidence; the current dependency is additionally covered by the executable dist probes and live tests described in §4.6. `protocolVersion: 1` (snapshot `dist/index.js:3744,27335`). Persistence is delegated to the bundled `@openai/codex@0.142.5` Rust app-server, spawned as `codex app-server` (`:21703-21706`). The auth-required factory uses `-32000` (`:20628-20632`).
 
