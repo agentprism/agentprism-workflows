@@ -1,5 +1,13 @@
 # @automatalabs/mcp-server
 
+## 0.13.1
+
+### Patch Changes
+
+- f6d96bc: The `author-workflow` prompt now teaches harness config discovery: regenerated guide content covers the new `agentprism-workflows config` command, and the closing instruction tells the assistant to read the live catalog before pinning models, efforts, or configOptions — instead of guessing ids or probing with a throwaway workflow.
+- Updated dependencies [f6d96bc]
+  - @automatalabs/workflows@0.37.0
+
 ## 0.13.0
 
 ### Minor Changes
