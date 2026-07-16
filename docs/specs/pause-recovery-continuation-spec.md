@@ -3,11 +3,17 @@
 **Date:** 2026-07-15
 
 **Status:** Frozen implementation contract for issue #183. Verified against base commit
-`7dd17af1c285322844f4bd7c97b7236b6497ab96` (branch `spec/pause-recovery-continuation`, rebased onto
-`origin/main`). Every file:line citation in this document was read at that SHA; see §9. This revision
-rebased off the earlier base `c06d1e3` after the #184 train (PRs #200–#202) advanced `origin/main` and
-restructured `run-persistence.ts`, `workflow-manager.ts`, and `workflow-tool-output.ts`; §2.12 accounts
-for the two new engine surfaces (`resumeSourceRunId`, `ExecOptions.executionAdmission`) that train added.
+`e9c94aa537b2ed75c81cf73eeb303cb9441bd346` (branch `spec/pause-recovery-continuation`, rebased onto
+`origin/main`). Every file:line citation in this document was read at that SHA; see §9. The prior
+freeze round pinned `7dd17af` and this revision mechanically re-pinned forward onto `origin/main` at
+`e9c94aa`: the intervening commits (PRs #203/#204 — the `workflows config` command and a Version
+Packages bump) touch no file this spec cites (`git diff 7dd17af..e9c94aa` over
+`packages/{workflow-engine,acp-agents,shared-types}` is empty and `workflow-tool-output.ts` is
+byte-identical), and the two doc surfaces they did shift (`docs/api.md`, root `README.md`) had their
+§8 citations re-verified against the new tree. That earlier `7dd17af` base itself rebased off `c06d1e3`
+after the #184 train (PRs #200–#202) advanced `origin/main` and restructured `run-persistence.ts`,
+`workflow-manager.ts`, and `workflow-tool-output.ts`; §2.12 accounts for the two new engine surfaces
+(`resumeSourceRunId`, `ExecOptions.executionAdmission`) that train added.
 
 **References (files):** `packages/shared-types/src/agent-run.ts`;
 `packages/shared-types/src/workflow-result.ts`; `packages/shared-types/src/errors.ts`;
@@ -94,9 +100,11 @@ load-bearing:
 **Continuation is a cheaper way to finish an interrupted live call. It never changes what a call
 *is*.** The call's identity hash (`hashAgentCall`, `workflow.ts:2949-2975`), journal semantics, and
 replay eligibility are untouched — same prompt, same hash; continuation only changes how the live
-execution reaches its result. Every uncertainty falls back to a fresh `session/new` + original
+execution reaches its result. Every uncertainty about a candidate's eligibility or reattachability —
+each gate up to and including the reopen RPC resolving — falls back to a fresh `session/new` + original
 prompt (fail-to-fresh), mirroring the engine's fail-to-live posture: a skipped continuation costs
-tokens, never correctness.
+tokens, never correctness. (Once the reopen boundary is crossed the run is committed to the continuation
+turn; a failure there is an ordinary live-call outcome, not a fresh fallback — §2.6, §3.)
 
 ---
 
@@ -116,12 +124,16 @@ The implementation preserves these named invariants. Each has a test in §7.
    `hashCallInputs()` (`workflow.ts:2865-2879`) is likewise unchanged; continuation **reads** it
    (§2.8) but does not add to it.
 
-2. **Fail-to-fresh.** Every continuation eligibility gate (§2.8) and every runner-side reattach step
-   (§2.5, §2.6) that is not fully satisfied — for any reason other than caller cancellation (§2.6) —
-   discards the continuation attempt and runs the call fresh (`session/new` + the original prompt)
-   within the *same* attempt or a later retry of the *same* `run()`/`runLive()` invocation. A skipped
-   or failed continuation never returns a guessed result, never aborts the call, and never changes
-   the call's journaled identity.
+2. **Fail-to-fresh.** Every continuation eligibility gate (§2.8) and every runner-side reattach gate
+   **up to and including the reopen RPC resolving** (§2.5, §2.6) that is not fully satisfied — for any
+   reason other than caller cancellation (§2.6) — discards the continuation attempt and runs the call
+   fresh (`session/new` + the original prompt) within the *same* attempt or a later retry of the *same*
+   `run()`/`runLive()` invocation. A skipped or failed continuation never returns a guessed result,
+   never aborts the call, and never changes the call's journaled identity. **Once the reopen boundary
+   is crossed** the run is committed to the continuation turn; a later failure there (re-pause,
+   empty-output, schema-noncompliance, abort) is an ordinary live-call outcome, **not** a fresh
+   fallback (§2.6 post-boundary contract, §3). Fail-to-fresh is thus the pre-reopen-boundary posture,
+   not a universal one.
 
 3. **Continuation is strategy- and PreparedResume-independent.** A continued call is served at the
    `runLive()` live boundary (`workflow.ts:1684`, `workflow.ts:1759`), which both `identity-v1` and
@@ -198,9 +210,12 @@ continuation adds neither a per-candidate `sourceRunId` field nor any read/write
 `AgentSessionRef`/`AgentSessionRecord` and the `reopen` surface are unchanged apart from the additive
 `poolKey` field (§2.3g, `workflow-result.ts:71-101`). The candidate carries no secrets and is
 JSON-round-trippable — it is a projection of already-persisted data. Because the key space is the
-unique call-index space, there is no ambiguity set and no cross-occurrence consumption set: each index
-is reached at most once per execution (retries reuse the same index but are handled attempt-locally,
-§2.8, §2.11).
+unique call-index space, there is no ambiguity set and no cross-occurrence consumption set **within one
+execution**: each index is reached at most once per execution (retries reuse the same index but are
+handled attempt-locally, §2.8, §2.11). Consumption is **per-execution**, not global: several
+`resumeFromRunId` executions that target the same still-paused source each build their own
+`PreparedContinuation` from that snapshot and may each reattach the same recorded session — an
+explicitly-permitted fan-out, §2.11.
 
 ### 2.3 Additive `shared-types` surface
 
@@ -328,7 +343,7 @@ engine's `WorkflowRunOptions` (`workflow.ts:169` neighborhood) and on the manage
 (`workflow-manager.ts:124` neighborhood): `preparedContinuation?: PreparedContinuation`. It is
 engine/manager-internal wiring — never a `hashAgentCall`/`hashCallInputs` input, never surfaced to
 `@automatalabs/workflows` or `@automatalabs/mcp-server` callers. It is **not** added to
-`ManagerResumeExecution` (`workflow-manager.ts:165-172`): both resume entry points populate
+`ManagerResumeExecution` (`workflow-manager.ts:165-169`): both resume entry points populate
 `ManagedRun.preparedContinuation`, and `executeRun` reads exactly that one field (§2.7). Unlike
 `resumeJournal`, `preparedContinuation` is journaling-independent — it carries persisted session
 refs, not journal state, and is consulted purely at the live boundary — so it is **not** subject to
@@ -344,10 +359,18 @@ added to `AgentSessionRef` (`workflow-result.ts:71-90`) and thereby inherited by
 
 ```ts
   /** The effective pool identity of the process that owns this session: the runner's resolved
-   *  Backend.poolKey (custom backends: name + a spawn-config hash over command/args/env), falling
-   *  back to backendId for first-class backends whose spawn config is fixed. Persisted so a COLD
-   *  resume can prove the currently-resolved backend is the SAME process identity that owns the
-   *  recorded session (§2.6). ADDITIVE and NOT a hash input; absent on legacy pre-poolKey refs. */
+   *  Backend.poolKey (`backend.ts:60-66`). For a custom backend that is `name` + a spawn-config hash
+   *  over command/args/env; for a first-class backend it is deliberately the logical agent id
+   *  (backendId), matching the pool's own process-identity model, which keys built-ins by bare id
+   *  (`pool.ts:129`). A first-class backend's spawn config is NOT fixed — `spawnConfig()` varies with
+   *  `AGENTPRISM_*_ACP_CMD/ARGS` env overrides and with installed-bin-vs-npx resolution
+   *  (`backends/claude.ts:44-58`, and codex/opencode) and built-ins define no explicit `poolKey` — but
+   *  every such launch of the same first-class agent shares one agent-side session store, so reattach
+   *  stays semantically valid and the logical-agent identity is correct by design; a genuinely
+   *  different program bound behind an env override is caught at the reopen RPC (`reattach-failed` →
+   *  fresh, §2.6), not by this field. Persisted so a COLD resume can prove the currently-resolved
+   *  backend is the SAME logical process identity that owns the recorded session (§2.6). ADDITIVE and
+   *  NOT a hash input; absent on legacy pre-poolKey refs. */
   poolKey?: string;
 ```
 
@@ -484,9 +507,17 @@ async acquirePreparedReattach(
 because `acquirePreparedReattach` rethrows it unmapped, the runner maps it to `capability-missing`,
 and every other non-cancellation throw to `reattach-failed`.
 
-**`run()` reattach path.** Replacing the single `acquirePrepared` call at `runner.ts:791` with a
-guarded reattach-then-fresh sequence, all inside the existing `try` that already holds the
-structured-tool state (`runner.ts:749-752`):
+**`run()` reattach path — attempted at most once, before/outside the inline-auth retry loop.** The
+fresh `acquirePrepared` call at `runner.ts:791` sits **inside** a `for (;;)` inline-auth retry loop
+(`runner.ts:789-816`) whose `authRetried` latch resolves one `AUTH_REQUIRED` thrown by the fresh
+`session/new` and `continue`s the loop exactly once (§2.11). The reattach acquisition is **not** placed
+inside that loop — a reattach re-run after an inline-auth `continue` would re-open a session the run
+already discarded, double-report provenance, and violate discard semantics (Invariant §2.1.2) and
+attempt-locality (§2.11). Instead, gated on `opts.continueFromSession`, a **single** reattach
+acquisition runs **once, before the `for (;;)` loop is entered**, inside the existing `try` that
+already holds the structured-tool state (`runner.ts:749-752`). It is attempted **at most once per
+`run()` invocation**; on fall-to-fresh the run enters the unchanged `for (;;)` loop and from there
+acquires only fresh `session/new`, never re-attempting the reattach on any iteration:
 
 1. **Backend-identity gate (§2.6 `backend-mismatch`).** Resolve the call's backend from its model
    spec via the existing `prepareSession` (`prepared.backend`, `runner.ts:743`). Reattach only when
@@ -496,8 +527,10 @@ structured-tool state (`runner.ts:749-752`):
    (§2.3g; `Backend.poolKey`, `backend.ts:60-66`; a custom backend's `poolKey` hashes command/args/env,
    `backends/custom.ts:29`/`:46`). Otherwise report `{ reattached: false, reason: "backend-mismatch" }`
    and take the fresh path. The normalized comparison is total: for a first-class backend both sides
-   collapse to `backendId` (no false mismatch, and no drift is possible); for a custom backend both
-   sides are the spawn hash (a host-registry command change → different hash → mismatch → fresh, §2.6);
+   collapse to `backendId` (no false mismatch — an env-override relaunch of the same first-class agent
+   is deliberately the same logical identity, §2.3g, and a genuinely different program bound behind an
+   override is caught at the reopen RPC, not here); for a custom backend both sides are the spawn hash
+   (a host-registry command change → different hash → mismatch → fresh, §2.6);
    a legacy ref (no `poolKey`) collapses to `backendId` on the left and so reattaches only to a
    first-class backend, never to a custom one whose identity it cannot prove.
 2. **Reattach (§2.6 `capability-missing`/`reattach-failed`).** Call
@@ -505,14 +538,23 @@ structured-tool state (`runner.ts:749-752`):
    reusing the **same** `prepare` closure the fresh path uses (so structured-output MCP injection,
    `mcpServers`, and `runId` stamping are identical). On success it returns `{ handle, method }`; the
    reattach acquisition is the **mechanically observable fail-to-fresh boundary** — the reopen RPC
-   resolved and returned a `SessionHandle`. On any throw:
+   resolved and returned a `SessionHandle` — and the run proceeds directly to the continuation turn
+   (below) and **never enters the fresh `for (;;)` loop**. On any throw:
    - the caller's `signal` is aborted → **cancellation wins**: rethrow raw, run no fresh `session/new`
      (§2.6).
    - `ReattachCapabilityUnavailable` → report `{ reattached: false, reason: "capability-missing" }`.
-   - anything else (RPC rejection, session-gone, spawn/auth error) → report
-     `{ reattached: false, reason: "reattach-failed" }`.
-   For the two report cases, run the **fail-to-fresh cleanup** (below) and take the fresh acquire path
-   within the same `run()` invocation.
+   - anything else (RPC rejection, session-gone, spawn/auth error — **including an `AUTH_REQUIRED`
+     thrown by the reopen RPC itself**) → report `{ reattached: false, reason: "reattach-failed" }`.
+     The reattach never enters the inline-auth resolve-and-retry-once machinery: an `AUTH_REQUIRED` at
+     the `session/resume`/`session/load` reopen is a plain `reattach-failed` fall-to-fresh, not a
+     reattach retry.
+   For the two report cases, run the **fail-to-fresh cleanup** (below), then **fall through into the
+   unchanged `for (;;)` loop, which from here acquires only fresh `session/new`** — the reattach is
+   attempted at most once per `run()` invocation and is never re-attempted on a later loop iteration.
+   The fresh loop's own inline-auth behavior on the fresh `session/new` is **entirely unchanged** from
+   today (an `AUTH_REQUIRED` there is resolved and retried once by the existing `authRetried` latch, or
+   propagates as the PR4 pause when `onAuth` is unset); the reattach one-shot and the fresh inline-auth
+   one-shot are independent and never compound.
 
 **Fail-to-fresh cleanup (§2.6, closes the schema-run deadlock).** The `prepare` closure may have
 acquired the per-connection structured-tool turn (`releaseStructuredToolTurn`) and registered an MCP
@@ -525,6 +567,11 @@ structuredTool = undefined; structuredToolActive = false;`), and discard any ret
 the fresh `acquirePrepared` → `prepare` → `acquireStructuredToolTurn` on the same connection would
 await a turn this run still holds and deadlock (`runner.ts:926-935`). Each cleanup action is
 best-effort and its own throw is swallowed — a throwing cleanup never masks or blocks the fresh path.
+**After the cleanup and immediately before entering the fresh `for (;;)` acquire, the runner runs one
+explicit `opts.signal?.throwIfAborted()` — the existing pattern at `runner.ts:818` — so a caller
+cancellation that landed during the reattach acquire or its cleanup is caught at that checkpoint and
+wins outright (raw abort, no fresh `session/new`, no skip notice, §2.6), never letting a fresh session
+open after a cancellation this checked boundary observes.**
 
 **On a successful reattach**, the run proceeds through the identical post-open sequence as a fresh
 run and a mirror of `createInteractiveSession`'s reattach assembly (`runner.ts:954-1005`, model/config/mode
@@ -586,12 +633,19 @@ call fresh in the same `run()` invocation. The runner reports the reason on
 | Reopen capability (current connection) | the selected pooled connection, once `ready`, advertises `session/resume` or `session/load` | report `capability-missing`; cleanup; fresh path |
 | Reattach accepted | the `resume`/`load` RPC resolves and returns a `SessionHandle` (no capability error, no RPC rejection, no session-gone, no spawn/auth error) | report `reattach-failed`; cleanup; fresh path |
 
-**Cancellation wins at every phase.** A caller `signal` abort during connection initialize, `prepare`,
-the reopen RPC, or any post-open step is **not** a fail-to-fresh case: the run performs best-effort
-partial cleanup (the same release actions above, each swallowing its own throw), emits **no** fresh
-`session/new`, records **no** continuation skip notice, and propagates the abort **raw** — matching
-the existing runner posture (`runner.ts:883`; the pool and `acquirePreparedReattach` rethrow raw when
-`signal.aborted`). The fail-to-fresh summary in §3 and Invariant §2.1.2 govern only non-cancellation
+**Cancellation wins at the checked boundaries.** A caller `signal` abort during connection initialize,
+`prepare`, the reopen RPC, or any post-open step is **not** a fail-to-fresh case: the run performs
+best-effort partial cleanup (the same release actions above, each swallowing its own throw), emits
+**no** continuation skip notice, and propagates the abort **raw** — matching the existing runner
+posture (`runner.ts:883`; the pool and `acquirePreparedReattach` rethrow raw when `signal.aborted`).
+The guarantee that a cancelled reattach **never opens a fresh `session/new`** is enforced by the
+explicit checkpoint mandated above — the `opts.signal?.throwIfAborted()` run after fail-to-fresh
+cleanup and immediately before the fresh acquire (`runner.ts:818` pattern) — plus the existing
+pre/post-prompt `throwIfAborted` checks (`runner.ts:818`,`:832`,`:834`,`:844`): an abort observed at
+any of those checked boundaries aborts before the fresh acquire runs. The categorical claim scopes to
+those checked boundaries; a `signal` that fires and is cleared in the sub-millisecond window between
+the check and the acquire is the same theoretical race the fresh path already carries today and is not
+made worse here. The fail-to-fresh summary in §3 and Invariant §2.1.2 govern only non-cancellation
 failures before the reopen boundary.
 
 **The fail-to-fresh window is exactly the reattach acquisition** — from the `continueFromSession`
@@ -661,9 +715,11 @@ defensively and a bad row can only reduce eligibility, never crash resume:
    `persisted.agents` (`run-persistence.ts:165`; treat a missing/non-array `agents` as empty) whose
    `scope` is undefined or equals `persisted.runId` (root scope, mirroring `latestRootRows`) and that
    has a `session` (`run-persistence.ts:57`) with a safe-integer `session.callIndex`, an `errorCode`
-   (`run-persistence.ts:52`), and an **own `callIndex` that is a non-negative safe integer equal to
-   `session.callIndex`** (`run-persistence.ts:64`; a row whose two indexes disagree, or whose index is
-   absent/non-integer, is dropped — it cannot be safely joined), key it by that shared index. **Root-scope
+   (`run-persistence.ts:52`), a terminal **`status === "error"`** (`run-persistence.ts:47`; a row that
+   did not settle as an error is not an interrupted call and is dropped), and an **own `callIndex` that
+   is a non-negative safe integer equal to `session.callIndex`** (`run-persistence.ts:64`; a row whose
+   two indexes disagree, or whose index is absent/non-integer, is dropped — it cannot be safely joined),
+   key it by that shared index. **Root-scope
    filtering is mandatory:** nested `workflow()` agents are recorded with child-local indexes and a
    child `scope` (`onAgentStart` stamps `callIndex`/`scope`, `workflow-manager.ts:1215-1216`;
    `onAgentEnd` matches on the `(scope, callIndex)` pair, `:1233-1234`), so a child `callIndex: 0`
@@ -687,7 +743,15 @@ defensively and a bad row can only reduce eligibility, never crash resume:
      disagreement bug when the two disagree (tested, §7.3).
    - the joined session ref advertises `reopen.resume === true || reopen.load === true`
      (`workflow-result.ts:80-90`), and is otherwise well-formed (a non-object/malformed ref is
-     dropped, not thrown on).
+     dropped, not thrown on);
+   - **cross-field coherence:** the joined `session.backendId` equals `record.backendId`
+     (`workflow-result.ts:346`; a call record whose backend disagrees with its session ref's backend is
+     incoherent and dropped), and — **when both are present** — the joined `session.cwd`
+     (`workflow-result.ts:78`) equals `record.resolvedCwd` (`workflow-result.ts:354`; a divergent
+     recorded cwd pair is incoherent and dropped). These are the settle-time record↔ref consistency
+     checks; the *live*-value gates (runner backend/`poolKey`, engine cwd equality+existence) still run
+     downstream at reattach (§2.6/§2.8), and a missing side of the cwd pair is tolerated and left to
+     those gates rather than dropping the candidate.
    Form `ContinuationCandidate` with `callIndex = record.index`, `hash = record.hash`
    (`workflow-result.ts:317`), `inputsHash = record.inputsHash` (`workflow-result.ts:322`),
    `sessionRef = <the joined AgentSessionRecord>`, `recordedCwd = record.resolvedCwd ?? sessionRef.cwd`
@@ -874,9 +938,21 @@ never aborts the call (Invariant §2.1.2). Exactly one continuation notice fires
   reason: "runner-declined" }, … }`, so an eligible candidate is never silently consumed without a
   notice.
 
-A cancelled attempt (caller abort, §2.6) emits **no** continuation notice. No notice fires for the
-ordinary no-candidate live call, so continuation adds no per-call noise to runs that were never
-paused. `requestedSpec` is `modelSpec ?? agentOptions.tier ?? "(default)"`, matching the model-fallback
+A cancelled attempt (caller abort, §2.6) emits **no** continuation notice — with one carve-out: an
+engine-gate `skipped` notice is emitted at gate time, *before* the fresh `agentRunner.run`, and records
+a final, true fact (a candidate existed at this index and that engine gate rejected it). That fact does
+not become false if the subsequent fresh call is later cancelled, so the already-emitted engine-gate
+skip notice stands. The "cancelled attempt emits no notice" rule governs the reattach/continuation
+attempt *outcome* (the `reattached`/runner-`skipped`/`runner-declined` notices, all tied to the
+attempt-1 runner settle), not a gate rejection that settled before any runner call began. No notice
+fires for the ordinary no-candidate live call, so continuation adds no per-call noise to runs that were
+never paused. When a paused-run resume produces **no attempt at all** for a call — no candidate was
+constructed, e.g. the source agent row advertised no reopen surface or carried a non-pause `errorCode`
+(§2.7) — that construction-time ineligibility is deliberately silent on the per-call notice channel
+(the notice channel reports *attempt outcomes*, per the issue), but it is inspectable post-hoc from the
+persisted source snapshot (`agents[].session.reopen`, `agents[].errorCode`, via
+`getPersistedAgentSessions`), so a host can always answer "why was there no continuation attempt here."
+`requestedSpec` is `modelSpec ?? agentOptions.tier ?? "(default)"`, matching the model-fallback
 emission (`workflow.ts:1254`).
 
 **Marker propagation (closes lost-on-replay/projection).** The `continuation` journal marker is
@@ -915,13 +991,35 @@ preserved across every path that reconstructs journal/provenance metadata:
   `runLive()` runs once per execution, no cross-occurrence consumption set is needed. A same-prompt
   loop assigns distinct indices; only the interrupted occurrence's index has a candidate, so only it
   reattaches — every other occurrence runs fresh with no notice.
+- **Multi-consumer fan-out is permitted; consumption is per-execution (the contract).** The manager
+  releases the **source** run's lease immediately after candidate/seed preparation — `initializeRun`'s
+  `finally` (`workflow-manager.ts:751`), which runs after `prepareManagedResume` builds the candidate
+  (`:733-734`) and **before** the target execution runs. Two sequential or concurrent `resumeFromRunId`
+  targets of one still-paused source therefore each build the same `PreparedContinuation` from the same
+  snapshot and **MAY each reattach the same recorded ACP session** — and that is permitted by design.
+  It mirrors the existing claim-free host-facing reattach surfaces exactly:
+  `getPersistedAgentSessions` + `runner.loadSession`/`resumeSession`, and `forkSession`, already let any
+  number of consumers reopen a persisted session ref with no lease held. Serialization and
+  session-store semantics are **agent-owned**: the runner drives one reopen RPC per execution and the
+  agent's own on-disk store decides how concurrent reopens interleave; a sequential second consumer
+  receives a **genuine live answer** computed over the completed turn's history (continuation only ever
+  asks the agent to finish the interrupted turn — it never mutates shared state under a promise of
+  exclusivity, and every gate still fails safe at the reopen RPC, §2.6). Continuation adds **no**
+  durable per-source claim, lease, or lock (rejected alternatives #12, #13); the lease-exclusive
+  same-ID `resume()`/`resumeInBackground()` recovery API remains the path with no sharing for callers
+  who want it. Correctness never depends on exclusivity: each consumer's candidate is index-keyed to
+  its own execution and every uncertainty falls to fresh.
 - **Correctness across resume hops comes from the persisted rebuild, not from carrying state.** Each
   resume hop rebuilds the candidate map from the latest `PersistedRunState` snapshot (§2.7) — never
   from the `resumeSourceRunId` ancestry chain (§2.12). If a prior hop completed the continued call,
   the new source records it as `outcome: "result"` with the agent row's `errorCode` cleared → no
-  candidate. If a prior hop re-paused on it, the new snapshot holds the re-recorded session ref and
-  pause-class `errorCode` → a fresh candidate for the next hop. Chained continuation therefore needs
-  no cross-hop bookkeeping and no walk of the resume ancestry.
+  candidate. If a prior hop re-paused on it **after `onSessionOpen` recorded a session ref**, the new
+  snapshot holds the re-recorded session ref and pause-class `errorCode` → a fresh candidate for the
+  next hop. One corner is **savings-only, not a correctness gap**: if the fresh fallback re-pauses
+  *before* `onSessionOpen` fires (e.g. an `AUTH_REQUIRED` at the fresh `session/new` with no `onAuth`),
+  no new ref is recorded for that call, so the next hop finds no candidate and runs fresh — the still
+  agent-reopenable prior session is simply not reattached (a missed saving), never a wrong result.
+  Chained continuation therefore needs no cross-hop bookkeeping and no walk of the resume ancestry.
 
 ### 2.12 Interaction with the #200 engine surfaces (`resumeSourceRunId`, `executionAdmission`)
 
@@ -962,9 +1060,14 @@ for here explicitly so no implementer discovers the overlap during PR4.
 
 ## 3. Failure-contract summary
 
-Every non-cancellation deviation from the happy path runs the call fresh (`session/new` + original
-prompt) and never changes the call's journaled identity; a caller cancellation instead wins outright
-(propagates raw, opens no fresh session, records no notice, §2.6). Consolidated:
+Every non-cancellation deviation that occurs **at or before the reattach boundary** — an engine
+eligibility gate (§2.8) or a runner-side gate up to and including the reopen RPC resolving (§2.6) —
+runs the call fresh (`session/new` + original prompt) and never changes the call's journaled identity.
+**Once the reattach boundary is crossed** (the reopen RPC resolved and the run is committed to the
+continuation turn), a later failure is a genuine live-call outcome — re-pause, empty-output,
+schema-noncompliance, or abort — and does **not** fall to fresh (items 14–15; §2.6 post-boundary
+contract). A caller cancellation instead wins outright at every checked boundary (propagates raw, opens
+no fresh session, records no notice, §2.6). Consolidated:
 
 1. Source not paused on `usage_limit`/`auth_required` → no candidate map; every call fresh (§2.7.1).
 2. No root-scope agent row with a coherent `(scope, callIndex)`↔`session.callIndex`↔`record.index`
@@ -1113,6 +1216,23 @@ prompt) and never changes the call's journaled identity; a caller cancellation i
     behavior ships default-on, and safety comes from the fail-to-fresh gates (§2.6, §2.8), not from a
     toggle. There is no configuration surface (Invariant §2.1.6).
 
+12. **Serialize fan-out reattach behind a durable per-source claim (lease/lock).** Rejected: this is
+    the safest guard against two concurrent `resumeFromRunId` consumers reopening one still-paused
+    source's recorded session, but it adds new persisted lease/claim state plus crash-recovery
+    semantics the issue never requested — against the house no-uninvited-machinery posture — and it
+    cannot be enforced across processes without real distributed locking. Per-execution consumption
+    (§2.11) is the adopted contract instead: it matches the existing claim-free host-facing reattach
+    surfaces (`getPersistedAgentSessions`, `loadSession`/`resumeSession`, `forkSession`), which already
+    permit unclaimed multi-consumer reopen, and correctness never depends on exclusivity because every
+    gate fails safe at the reopen RPC (§2.6).
+
+13. **Restrict continuation to the lease-exclusive same-ID recovery path only (no fan-out sharing).**
+    Rejected: gating continuation on the same-ID `resume()`/`resumeInBackground()` API would add zero
+    machinery but would silently disable continuation on the new-run `resumeFromRunId` / MCP entry
+    point, contradicting default-on on **both** entry points (Invariant §2.1.6). The adopted contract
+    permits fan-out and documents per-execution consumption (§2.11); the same-ID API still remains
+    available as the exclusive recovery path for callers who want no sharing.
+
 ---
 
 ## 6. Compatibility & semver
@@ -1196,6 +1316,14 @@ Every normative statement above has coverage. Gated live suites follow the exist
   `capability-missing` (ready connection advertises neither); `reattach-failed` (mock rejects
   `session/resume`; and mock reports the session gone). Each asserts a subsequent `session/new` +
   original prompt runs and the reported provenance reason matches.
+- **Reattach is attempted at most once, outside the inline-auth retry loop (§2.5 blocker).** A run with
+  `onAuth` set whose reattach RPC rejects (`reattach-failed`) → falls to fresh; the fresh `session/new`
+  then throws `AUTH_REQUIRED` exactly once and `onAuth` resolves it so the fresh acquire retries and
+  succeeds. Assert the reattach acquire (`session/resume`/`session/load`) fired **exactly once** across
+  the whole `run()` — the inline-auth `continue` re-attempts only the fresh `session/new`, never the
+  reattach — the run reports `reattached: false, reason: "reattach-failed"`, and the final result is
+  served by the fresh session. Separately, a reattach RPC that itself throws `AUTH_REQUIRED` asserts
+  `reattach-failed` → fresh (the reattach never enters the inline-auth resolve-and-retry-once path).
 - **Host-registry custom-backend drift (§2.6, §2.8, closes alt #10 hole).** A cold resume where a
   host-registered custom backend shadows the script name with a changed command (same `backendId`,
   unchanged `scriptBackends`/`inputsHash`): the recorded ref's `poolKey` ≠ the resolved backend's
@@ -1213,8 +1341,12 @@ Every normative statement above has coverage. Gated live suites follow the exist
   provenance; best-effort cleanup runs.
 - **Reattach-failure cleanup, no leak/deadlock (§2.5, §2.6).** A schema run whose reattach RPC rejects
   after `prepare` registered the structured-output MCP tool and acquired the tool turn: assert the
-  fresh `session/new` completes (no self-deadlock on the held turn) and the structured tool is
-  registered exactly once. A variant where a cleanup action itself throws still reaches the fresh path.
+  fresh `session/new` completes (no self-deadlock on the held turn). The cleanup releases the failed
+  reattach's registration before the fresh path re-registers, so across the whole `run()` there are
+  **two** registrations (reattach then fresh) with **at most one active at a time**, and the fresh
+  session that ultimately serves the call carries **exactly one** structured-output MCP server entry
+  (matching §2.5's release-then-re-register cleanup). A variant where a cleanup action itself throws
+  still reaches the fresh path.
 - **Structured-output ladder over a continuation turn (§2.5).** A schema run that reattaches and
   continues drives the repair ladder and empty-output guard identically to a fresh schema run.
 - **Second pause / AUTH_REQUIRED during continuation (§2.5, §2.11).** A continuation turn that hits
@@ -1247,6 +1379,12 @@ Every normative statement above has coverage. Gated live suites follow the exist
   `agents` or `calls`, an agent row whose own `callIndex` ≠ its `session.callIndex`, a non-integer or
   negative index, and a malformed session ref each produce **no candidate** for that index and **no
   throw**; a well-formed sibling row in the same snapshot still forms its candidate.
+- **Cross-field coherence checks (§2.7.3).** A row whose `status !== "error"` (a pause-class `errorCode`
+  present but the agent row not settled as an error), a row whose `session.backendId` ≠ the joined
+  `record.backendId`, and a row whose `session.cwd` ≠ `record.resolvedCwd` (both present) each yield
+  **no candidate** for that index; a missing side of the cwd pair is tolerated and the candidate still
+  forms (left to the downstream live-value gates). A snapshot where every row is coherent forms its
+  candidates.
 - **Scope-safe join (§2.7.2).** A snapshot with a nested child agent at `(scope: child, callIndex: 0)`
   and a root agent at `(scope: root, callIndex: 0)` builds a candidate only for the root row; the
   child row never overwrites or joins to the root. A pause inside `workflow()` yields no candidate for
@@ -1357,17 +1495,24 @@ downstream schema would reject:
    PR3 already accept it. It also updates every authoritative doc surface whose current text becomes
    false — that fallbacks are model-only, that one-shot/`run()` sessions are always `session/new`, and
    that pause resume merely re-runs — namely:
+   - the root `README.md` (durable-journal resume narrative `:54`; "model resolution no longer emits
+     fallback entries" `:209` — false once a `kind: "continuation"` fallback ships; "a fresh session
+     per call" `:421` — false for a reattached occurrence; line `:421` was `:415` at the prior base and
+     shifted +6 under PRs #203/#204, re-verified here);
    - `packages/shared-types/README.md` (`onSessionOpen` `:82`; `WorkflowRunFallback` kind
      `model | modifier` `:101-102`);
    - `packages/acp-agents/README.md` (`RunOptions` seam `:51`; `keepSession`/`onSessionOpen` reopen
      narrative `:173-179`);
    - `packages/workflows/README.md` (fallbacks `:299`; `keepSession`/session `:390`);
    - `packages/mcp-server/README.md` (resume `:124`; fallback output shape `:229`);
-   - `docs/api.md` (fallback kinds + pause-resume narrative `:425-426`);
+   - `docs/api.md` (fallback-kind enum `:427-428` — was `:425-426` at the prior base, shifted +2 under
+     PRs #203/#204; the `onSessionOpen`-always-after-`session/new` session-handoff narrative `:878`; the
+     auth-pause "rather than re-running into the same wall" narrative `:441`);
    - `docs/design-notes.md` (the `session/new` acquisition diagrams, §5.x);
-   - the workflow-authoring skill `skills/agentprism-workflow-authoring/SKILL.md` + `reference.md`, and
-     — if it references fallback kinds or fresh-only resume — the generated MCP authoring prompt
-     regenerated via `scripts/generate-authoring-prompt.mjs` with its CI drift test;
+   - the workflow-authoring skill `skills/agentprism-workflow-authoring/SKILL.md` (the "every `agent()`
+     call is a fresh session with no memory" claim `:15`, false for a reattached occurrence) +
+     `reference.md`, and — **regenerated unconditionally** (any skill-source edit forces it via the CI
+     drift test) — the generated MCP authoring prompt via `scripts/generate-authoring-prompt.mjs`;
    - add coordinated changesets for all four packages.
 
 No stage changes synchronous `callSeq` allocation, `hashAgentCall`/`hashCallInputs` bytes,
@@ -1378,7 +1523,7 @@ resume-matcher policy selection, isolation behavior, or the engine-owned `resume
 ## 9. References
 
 All citations verified by reading the file at base commit
-`7dd17af1c285322844f4bd7c97b7236b6497ab96` (branch `spec/pause-recovery-continuation`, rebased onto
+`e9c94aa537b2ed75c81cf73eeb303cb9441bd346` (branch `spec/pause-recovery-continuation`, rebased onto
 `origin/main`; `docs/specs/incremental-resume-spec.md` and `docs/specs/acp-auth-spec.md` are the
 house-format exemplars). External dependency: `@agentclientprotocol/sdk` declared `^1.2.1`
 (`packages/acp-agents/package.json:46`; `@agentclientprotocol/claude-agent-acp` `0.59.0` at `:45`);
@@ -1423,6 +1568,11 @@ the reopen RPC method constants used are `AGENT_METHODS.session_new` / `session_
 
 **`packages/acp-agents/src/backends/custom.ts`**
 - `CustomAcpBackend.poolKey` = `name#sha256(command/args/env)` — `:29`, hash `:46`
+
+**`packages/acp-agents/src/backends/claude.ts`** (built-in spawn identity is NOT fixed)
+- `spawnConfig()` varies with `AGENTPRISM_CLAUDE_ACP_CMD`/`_ARGS` env override (`:46-48`) and
+  installed-bin (`require.resolve`, `:53-54`) vs `npx` (`:56`) — codex/opencode mirror this; built-ins
+  define no explicit `poolKey`, so their effective identity is the logical agent id (§2.3g) — `:44-58`
 
 **`packages/acp-agents/src/registry.ts`**
 - `registryWithRunBackends` (host registration wins on a name conflict) — `:81-92` (`host wins` `:90`)
@@ -1480,11 +1630,13 @@ the reopen RPC method constants used are `AGENT_METHODS.session_new` / `session_
 - `runReason` pause mapping (usage_limit `:328`, auth_required `:329`, checkpoint_required `:330`) —
   `:325-331`
 - `prepareManagedResume` — `:618-716` (identity-v1 `:646-656`, live `:659-668`, positional-v1
-  `:696-715`; `managed.journal`/`managed.calls` via `latestRootRows` `:687-691`)
+  `:696-715`; `managed.journal` via `latestRows` `:687`, `managed.calls` via `latestRootRows`
+  `:688-691`)
 - `initializeRun` (calls `prepareManagedResume` `:733-735`; returns `{ managed, resumeExecution }`
-  `:745`) — `:718-750`
+  `:745`; `finally` releases the **source** resume lease `:751`, after candidate prep and before target
+  execution — the multi-consumer fan-out basis, §2.11) — `:718-752`
 - `resumeSourceRunId` written at admission (`createManaged`) — `:862`
-- `ManagerResumeExecution` interface — `:165-172`
+- `ManagerResumeExecution` interface — `:165-169`
 - `executeRun` (signature/`resumeExecution` param `:1059-1063`; `resumeJournal` read `:1079`;
   `preparedResume` read `:1080`; `executionAdmission` await `:1101`; journaling+resumeJournal reject
   `:1108`; `runWorkflow` call `:1118`; engine options bag `resumeJournal`/`preparedResume` pass `:1144`,
