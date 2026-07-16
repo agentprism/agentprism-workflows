@@ -1,5 +1,20 @@
 # @automatalabs/acp-agents
 
+## 0.30.0
+
+### Minor Changes
+
+- 2beca1e: Promote Pi to a first-class built-in backend with exact-prefix model routing, native structured
+  output, categorical provider errors, complete auth descriptors, bundled spawning, configuration
+  discovery, and credential-free plus opt-in live end-to-end coverage. Update pi-acp's exact-pinned pi
+  runtime and hermetic test dependencies to 0.80.9.
+
+### Patch Changes
+
+- 805c7b1: Declare the built-in `@automatalabs/pi-acp` dependency via the `workspace:*` protocol (exact version stamped at publish) so joint release PRs resolve before the new pi-acp version is published; the ACP dep gate no longer tracks the workspace sibling and docs cite it unversioned.
+- Updated dependencies [2beca1e]
+  - @automatalabs/pi-acp@0.1.2
+
 ## 0.29.0
 
 ### Minor Changes

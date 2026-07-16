@@ -1,5 +1,14 @@
 # @automatalabs/pi-acp
 
+## 0.1.2
+
+### Patch Changes
+
+- 2beca1e: Promote Pi to a first-class built-in backend with exact-prefix model routing, native structured
+  output, categorical provider errors, complete auth descriptors, bundled spawning, configuration
+  discovery, and credential-free plus opt-in live end-to-end coverage. Update pi-acp's exact-pinned pi
+  runtime and hermetic test dependencies to 0.80.9.
+
 ## 0.1.1
 
 ### Patch Changes
