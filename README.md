@@ -12,7 +12,7 @@
 
 Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, and OpenCode), with deterministic journaling, resume, token budgets, and git-worktree isolation.
 
-You author a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
+**Your agent authors** a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
 
 - **As a TypeScript SDK** — `@automatalabs/workflows` — embed the runner in your own program.
 - **As a stdio MCP server** — `@automatalabs/mcp-server`, built on the SDK — expose a `workflow` tool to any MCP host (Claude Code, Zed, …).
@@ -30,6 +30,24 @@ Each `agent()` call runs on a **shipped coding agent** — Claude Code, Codex, o
 ### Many agents, one workflow
 
 The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a `codex/gpt-5.6-sol` implementation step, an `opencode/zai/glm-5.2` planning step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
+
+### Have your agent write the workflow
+
+You describe the workflow in plain language; your agent designs it with the right APIs, validates it, and runs it. Two ways to arm the agent:
+
+- **Agent skill** — install the bundled authoring skill into any skills-capable agent CLI:
+
+  ```bash
+  npx skills add VikashLoomba/agentprism-workflows
+  ```
+
+- **MCP prompt** — on prompt-capable MCP hosts, invoke the **`author-workflow`** prompt served by `@automatalabs/mcp-server` (in Claude Code it surfaces as a slash command, with an optional `task` argument). It injects the same authoring guide, so the agent targets the DSL that will actually execute the script.
+
+A representative ask:
+
+> Implement the spec in docs/specs/my-feature.md as a robust workflow of sequential stages. For each stage, have gpt-5.6-sol implement at xhigh effort and claude opus verify it at xhigh — it should re-run the builds and tests itself instead of trusting the implementer's claims — with the two going back and forth until the stage is green. Then a single final review phase that returns its findings; the workflow shouldn't loop back at all once it reaches the final review. Validate the workflow before launching it, then run it in the background and see it through to the end.
+
+From an ask like that, the agent picks the primitives — `gate()` fix-loops with the reviewer's feedback threaded into fresh attempts, structured-output verdicts, self-contained prompts, per-call model routing and effort via `configOptions` — and the validator (static parse → mock dry run → per-harness config probe) proves the script's structure and its model/config choices for zero tokens before any real run.
 
 ### Durable runs — resume without re-spending tokens
 
