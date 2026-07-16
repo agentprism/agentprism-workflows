@@ -6,7 +6,7 @@ package-specific API references (field/method names, file:line, versions). For i
 usage, start with the README; read this when you need the protocol-level mechanics (ACP lifecycle,
 the structured-output crux, model/permission/usage wiring, the engine lineage).
 
-> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in six
+> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in seven
 > `@automatalabs/*` packages — see [§2](#2-codebase--module-structure). The Pi `src/…` citations
 > throughout are provenance for the lifted engine, not paths in this repo.
 
@@ -63,7 +63,7 @@ This is a **new, greenfield codebase** — not a fork, a patch, or a runtime dep
 extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (copy + adapt the
 source) and write the rest fresh. Nothing imports Pi at runtime.
 
-The code is published as **six packages** with a one-way dependency direction. The three lower
+The code is published as **seven packages** with a one-way dependency direction. The three lower
 layers remain independently usable — in particular, the ACP agent logic and workflow engine both
 work **with no MCP server at all** — while the facade and integration leaves stay thin.
 
@@ -152,10 +152,11 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **six** published packages —
+> Packaging (as implemented): a pnpm monorepo of **seven** published packages —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
 > `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade), and
-> `@automatalabs/agentprism-otel` (the optional telemetry bridge).
+> `@automatalabs/agentprism-otel` (the optional telemetry bridge), and `@automatalabs/pi-acp`
+> (the standalone in-process pi ACP server).
 > The dependency direction and the `AgentRunner` seam are the contract.
 
 ### Lifted from `pi-dynamic-workflows` → `workflow-engine` (copied/adapted, mostly unchanged)
