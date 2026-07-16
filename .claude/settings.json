@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__agentprism-workflows__workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/workflow-source-gate.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}
