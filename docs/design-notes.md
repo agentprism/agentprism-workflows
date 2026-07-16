@@ -114,7 +114,7 @@ published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `ou
 (§6.3) into its shipped dist. It's an exact-pinned dependency, so Codex ships on a clean
 `git clone && pnpm install && pnpm build` — no pnpm patch, no `patches/` file, no vendored tree.
 
-The Pi backend exact-pins **`@automatalabs/pi-acp@0.1.1`** and resolves its `dist/index.js` bin
+The Pi backend depends on the workspace **`@automatalabs/pi-acp`** (`workspace:*`, rewritten to the exact lockstep version at publish) and resolves its `dist/index.js` bin
 under `process.execPath`. Its complete fallback ladder is
 `AGENTPRISM_PI_ACP_CMD`/`AGENTPRISM_PI_ACP_ARGS` → installed package bin →
 `npx -y @automatalabs/pi-acp`; it never relies on a `pi-acp` PATH executable.
@@ -225,7 +225,7 @@ All versions below were re-verified from the installed workspace dependency grap
   > The Rust `zed-industries/codex-acp` is the deprecated predecessor; development moved to the
   > `agentclientprotocol/codex-acp` TypeScript package (which this fork tracks).
 
-- **`@automatalabs/pi-acp@0.1.1`** — ACP server wrapping the Pi coding agent. Bin: `pi-acp`
+- **`@automatalabs/pi-acp`** — ACP server wrapping the Pi coding agent. Bin: `pi-acp`
   (`dist/index.js`). It advertises native turn-level `_meta.outputSchema`, an empty
   `mcpCapabilities` object, Pi model/thinking config options, and six unconditional authentication
   methods. `acp-agents` exact-pins and spawns this package as the first-class `pi` backend.
@@ -657,7 +657,7 @@ Keep the validate→re-prompt guard regardless.
 
 > Source (codex-acp): [`Tool.ts:9`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/Tool.ts#L9), [`ToolOutputSchema.ts:6-10`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/ToolOutputSchema.ts#L6-L10), [`CallToolResult.ts:9`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/CallToolResult.ts#L9), [`McpToolCallResult.ts:6`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/v2/McpToolCallResult.ts#L6), [`McpServerToolCallResponse.ts:6`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/v2/McpServerToolCallResponse.ts#L6).
 
-### 6.4 Pi — `@automatalabs/pi-acp@0.1.1`
+### 6.4 Pi — `@automatalabs/pi-acp`
 
 Pi exposes a native, turn-scoped output-schema dialect. `PiBackend.promptMeta()` sends the user's
 plain JSON Schema under `_meta.outputSchema`; it does not apply Codex's OpenAI-strict
@@ -891,7 +891,7 @@ resurrect a snapshot or sidecar after the run was removed.
   host-installed `opencode-ai` launcher, then `opencode` from PATH. The package is deliberately not
   a dependency because its platform binaries are large.
 - **Pi is bundled as an exact pin.** `PiBackend` resolves `AGENTPRISM_PI_ACP_CMD` and its optional
-  args first, then the installed `@automatalabs/pi-acp@0.1.1` `dist/index.js` under
+  args first, then the installed `@automatalabs/pi-acp` `dist/index.js` under
   `process.execPath`, then `npx -y @automatalabs/pi-acp`. Authentication is surfaced as five
   provider env-key methods plus Pi's ambient `~/.pi/agent/auth.json` store.
 - **Concurrency** is bound by provider API rate limits + per-session memory, not the protocol;
@@ -915,7 +915,7 @@ resurrect a snapshot or sidecar after the run was removed.
 - `@agentclientprotocol/sdk@1.2.1` — https://github.com/agentclientprotocol
 - `@agentclientprotocol/claude-agent-acp@0.59.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.207`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp@1.6.5` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
-- `@automatalabs/pi-acp@0.1.1` (Pi ACP server; exact-pinned built-in dependency) — `packages/pi-acp`
+- `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai
 
 **ACP spec:**

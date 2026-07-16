@@ -64,7 +64,6 @@ test("adapter versions cited in docs match the installed acp-agents dependencies
   const expected = new Map([
     ["@agentclientprotocol/claude-agent-acp", packageJson.dependencies["@agentclientprotocol/claude-agent-acp"]],
     ["@automatalabs/codex-acp", packageJson.dependencies["@automatalabs/codex-acp"]],
-    ["@automatalabs/pi-acp", packageJson.dependencies["@automatalabs/pi-acp"]],
   ]);
 
   for (const path of ["docs/api.md", "docs/design-notes.md"]) {
