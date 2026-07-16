@@ -514,6 +514,14 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
       client.readResource({ uri: "workflow://runs/no-such/script" }),
       /resource not found/i,
     );
+    await assert.rejects(
+      client.readResource({ uri: "not a uri" }),
+      (error: unknown) => {
+        assert.equal((error as { code?: number }).code, -32602);
+        assert.match(String((error as Error).message), /resource not found/i);
+        return true;
+      },
+    );
 
     const beforeDeleteNotifications = listChanged;
     await client.subscribeResource({ uri });
@@ -537,57 +545,80 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
   }
 });
 
-test("lineage retains a deleted middle revision as unavailable and omits only its resource link", async () => {
+test("actual manager-owned resume lineage retains its root after the middle record is deleted", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-store-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-  const mcp = new McpServer({ name: "lineage-test", version: "0.0.0" }, { capabilities: {} });
-  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
-  const resources = new WorkflowScriptResources(mcp, manager);
   try {
-    const runs = await Promise.all([
-      manager.runSync(TWO_AGENT_SCRIPT),
-      manager.runSync(TWO_AGENT_SCRIPT),
-      manager.runSync(TWO_AGENT_SCRIPT),
-    ]);
-    const ids = runs.map((run) => run.runId);
-    const persistence = manager.getPersistence();
-    const states = ids.map((runId) => persistence.load(runId));
-    assert.ok(states.every((state) => state !== null));
-    const sourceEntry = states[0]!.journal?.[0];
-    const sourceCall = states[0]!.calls?.[0];
-    assert.ok(sourceEntry && sourceCall);
-    persistence.save({
-      ...states[1]!,
-      resumeSeed: { format: "identity-v1", sourceRunId: ids[0]!, candidates: [] },
-    });
-    persistence.save({
-      ...states[2]!,
-      resumeSeed: {
-        format: "identity-v1",
-        sourceRunId: ids[1]!,
-        candidates: [{
-          sourceRunId: ids[0]!,
-          recordedIndex: sourceEntry.index,
-          entry: sourceEntry,
-          call: sourceCall,
-        }],
-      },
-    });
-    assert.equal(resources.deleteRun(ids[1]!, false), true);
-    assert.deepEqual(
-      resources.lineage(ids[2]!),
-      ids.map((runId, index) => ({
-        runId,
-        uri: `workflow://runs/${runId}/script`,
-        available: index !== 1,
-      })),
-    );
-    assert.deepEqual(
-      resources.links(resources.lineage(ids[2])).map((link) => link.uri),
-      [ids[0], ids[2]].map((runId) => `workflow://runs/${runId}/script`),
-    );
+    const first = await manager.runSync(TWO_AGENT_SCRIPT);
+    const second = await manager.runSync(TWO_AGENT_SCRIPT, undefined, { resumeFromRunId: first.runId });
+    const third = await manager.runSync(TWO_AGENT_SCRIPT, undefined, { resumeFromRunId: second.runId });
+    const ids = [first.runId, second.runId, third.runId];
+    assert.equal(second.resumeReport?.sourceRunId, first.runId);
+    assert.equal(third.resumeReport?.sourceRunId, second.runId);
+    assert.equal(manager.deleteRun(second.runId), true);
+    assert.equal(manager.getPersistence().load(second.runId), null);
+
+    const tombstone = manager.getPersistence().loadLineageTombstone?.(second.runId);
+    assert.equal(tombstone?.sourceRunId, first.runId);
+    assert.deepEqual(Object.keys(tombstone ?? {}).sort(), ["deletedAt", "runId", "sourceRunId"]);
+
+    const coldManager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+    const mcp = new McpServer({ name: "lineage-test", version: "0.0.0" }, { capabilities: {} });
+    mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+    const resources = new WorkflowScriptResources(mcp, coldManager);
+    try {
+      assert.deepEqual(
+        resources.lineage(third.runId),
+        ids.map((runId, index) => ({
+          runId,
+          uri: `workflow://runs/${runId}/script`,
+          available: index !== 1,
+        })),
+      );
+      assert.deepEqual(
+        resources.links(resources.lineage(third.runId)).map((link) => link.uri),
+        [first.runId, third.runId].map((runId) => `workflow://runs/${runId}/script`),
+      );
+    } finally {
+      await mcp.close();
+    }
   } finally {
-    await mcp.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("createWorkflowServer observes injected-manager deletion exactly once and keeps unsubscribe idempotent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-manager-delete-"));
+  const runner = okRunner();
+  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
+  const server = createWorkflowServer(runner, { manager });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "manager-delete-client", version: "0.0.0" }, { capabilities: {} });
+  let listChanged = 0;
+  client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+    listChanged++;
+  });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const admitted = await client.callTool({
+      name: "workflow",
+      arguments: { script: NO_AGENT_SCRIPT },
+    });
+    const runId = String(structured(admitted)?.runId);
+    const uri = `workflow://runs/${runId}/script`;
+    await waitUntil(() => listChanged === 1, "admission should emit one resources/list_changed notification");
+    await client.subscribeResource({ uri });
+
+    assert.equal(manager.deleteRun(runId), true);
+    await waitUntil(() => listChanged === 2, "manager deletion should emit one resources/list_changed notification");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(listChanged, 2, "manager deletion must not emit duplicate list changes");
+    await assert.rejects(client.readResource({ uri }), /resource not found/i);
+    assert.deepEqual(await client.unsubscribeResource({ uri }), {});
+    assert.deepEqual(await client.unsubscribeResource({ uri }), {});
+  } finally {
+    await client.close();
+    await server.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

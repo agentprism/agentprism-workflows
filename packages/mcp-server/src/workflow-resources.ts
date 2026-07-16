@@ -2,11 +2,16 @@ import { ResourceTemplate, type McpServer } from "@modelcontextprotocol/sdk/serv
 import {
   ErrorCode,
   McpError,
+  ReadResourceRequestSchema,
   SubscribeRequestSchema,
   UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { ResourceLink } from "@modelcontextprotocol/sdk/types.js";
-import type { PersistedRunState, WorkflowManager } from "@automatalabs/workflows";
+import type {
+  PersistedRunLineageTombstone,
+  PersistedRunState,
+  WorkflowManager,
+} from "@automatalabs/workflows";
 
 import type { WorkflowScriptLineageEntry } from "./workflow-tool-output.js";
 
@@ -58,13 +63,29 @@ export class WorkflowScriptResources {
   private readonly persistence: ReturnType<WorkflowManager["getPersistence"]>;
   private readonly subscriptions = new Set<string>();
   private readonly deletedRunIds = new Set<string>();
+  private readonly silentDeletionRunIds = new Set<string>();
   private readonly elicitationControllers = new Map<string, AbortController>();
+
+  private readonly onRunDeleted = ({ runId }: { runId: string }): void => {
+    const uri = workflowScriptUri(runId);
+    this.subscriptions.delete(uri);
+    this.elicitationControllers.delete(runId);
+    this.deletedRunIds.add(runId);
+    const notify = !this.silentDeletionRunIds.delete(runId);
+    if (notify) void this.mcp.sendResourceListChanged();
+  };
 
   constructor(
     private readonly mcp: McpServer,
     private readonly manager: WorkflowManager,
   ) {
     this.persistence = manager.getPersistence();
+    this.manager.on("runDeleted", this.onRunDeleted);
+    const previousOnClose = this.mcp.server.onclose;
+    this.mcp.server.onclose = () => {
+      this.manager.off("runDeleted", this.onRunDeleted);
+      previousOnClose?.();
+    };
     this.registerProtocolSurface();
   }
 
@@ -93,14 +114,10 @@ export class WorkflowScriptResources {
    * sync. Failed-admission cleanup passes notify=false because that resource was never announced.
    */
   deleteRun(runId: string, notify = true): boolean {
+    if (!notify) this.silentDeletionRunIds.add(runId);
     const deleted = this.manager.deleteRun(runId);
-    if (!deleted) return false;
-    const uri = workflowScriptUri(runId);
-    this.subscriptions.delete(uri);
-    this.elicitationControllers.delete(runId);
-    this.deletedRunIds.add(runId);
-    if (notify) void this.mcp.sendResourceListChanged();
-    return true;
+    if (!deleted) this.silentDeletionRunIds.delete(runId);
+    return deleted;
   }
 
   /** Pure projection over the engine-owned durable resume source pointers. */
@@ -119,7 +136,9 @@ export class WorkflowScriptResources {
         available: state !== null,
       });
       if (!state) {
-        currentRunId = fallbackRunIds.find((candidate) => !visited.has(candidate));
+        const tombstone: PersistedRunLineageTombstone | null | undefined =
+          this.persistence.loadLineageTombstone?.(currentRunId);
+        currentRunId = tombstone?.sourceRunId ?? fallbackRunIds.find((candidate) => !visited.has(candidate));
         continue;
       }
       for (const fallbackRunId of lineageFallbackRunIds(state)) {
@@ -182,22 +201,13 @@ export class WorkflowScriptResources {
           "Immutable admitted workflow scripts. Listing is discovery-only and contains at most the 50 newest runs by startedAt; direct workflow://runs/{runId}/script reads are unbounded.",
         mimeType: SCRIPT_RESOURCE_MIME_TYPE,
       },
-      (uri) => {
-        const runId = workflowRunIdFromScriptUri(uri.toString());
-        if (!runId) resourceNotFound(uri.toString());
-        const state = this.persistence.load(runId);
-        if (!state) resourceNotFound(uri.toString());
-        return {
-          contents: [
-            {
-              uri: workflowScriptUri(runId),
-              mimeType: SCRIPT_RESOURCE_MIME_TYPE,
-              text: state.script,
-            },
-          ],
-        };
-      },
+      (uri) => this.readResource(uri.toString()),
     );
+
+    // The SDK's registerResource handler constructs URL before invoking the template callback.
+    // Validate the raw wire string here so malformed input stays an InvalidParams client error.
+    this.mcp.server.setRequestHandler(ReadResourceRequestSchema, (request) =>
+      this.readResource(request.params.uri));
 
     this.mcp.server.setRequestHandler(SubscribeRequestSchema, (request) => {
       const uri = request.params.uri;
@@ -212,6 +222,7 @@ export class WorkflowScriptResources {
       if (!runId) resourceNotFound(uri);
       if (
         !this.persistence.load(runId) &&
+        !this.persistence.loadLineageTombstone?.(runId) &&
         !this.deletedRunIds.has(runId) &&
         !this.subscriptions.has(uri)
       ) {
@@ -220,5 +231,23 @@ export class WorkflowScriptResources {
       this.subscriptions.delete(uri);
       return {};
     });
+  }
+
+  private readResource(uri: string): {
+    contents: Array<{ uri: string; mimeType: string; text: string }>;
+  } {
+    const runId = workflowRunIdFromScriptUri(uri);
+    if (!runId) resourceNotFound(uri);
+    const state = this.persistence.load(runId);
+    if (!state) resourceNotFound(uri);
+    return {
+      contents: [
+        {
+          uri: workflowScriptUri(runId),
+          mimeType: SCRIPT_RESOURCE_MIME_TYPE,
+          text: state.script,
+        },
+      ],
+    };
   }
 }

@@ -2129,13 +2129,16 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     const lease = managed?.lease ?? this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+    let deleted = false;
     try {
-      return this.persistence.delete(runId);
+      deleted = this.persistence.delete(runId);
     } finally {
       this.persistence.releaseRunLease(lease);
       if (managed) managed.lease = undefined;
       this.runs.delete(runId);
     }
+    if (deleted) this.emit("runDeleted", { runId });
+    return deleted;
   }
 
   /**
