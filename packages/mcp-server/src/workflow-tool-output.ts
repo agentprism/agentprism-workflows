@@ -50,8 +50,30 @@ const fallbackSchema = z.object({
   requestedSpec: z.string(),
   resolvedModel: z.string().optional(),
   backendId: z.string().optional(),
-  kind: z.enum(["model", "modifier"]),
+  kind: z.enum(["model", "modifier", "continuation"]),
   message: z.string(),
+  continuation: z
+    .discriminatedUnion("outcome", [
+      z.object({
+        outcome: z.literal("reattached"),
+        method: z.enum(["resume", "load"]),
+      }),
+      z.object({
+        outcome: z.literal("skipped"),
+        reason: z.enum([
+          "hash-mismatch",
+          "inputs-mismatch",
+          "worktree-isolated",
+          "cwd-mismatch",
+          "cwd-missing",
+          "backend-mismatch",
+          "capability-missing",
+          "reattach-failed",
+          "runner-declined",
+        ]),
+      }),
+    ])
+    .optional(),
 });
 
 const checkpointTakenSchema = z.object({
