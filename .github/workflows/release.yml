@@ -95,8 +95,6 @@ jobs:
       # 2026-07-16 — no bypasses).
       - name: ACP dependency freshness gate
         id: dep-gate
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
           node scripts/check-acp-deps.mjs 2>&1 | tee /tmp/dep-gate-output.txt
