@@ -1,5 +1,11 @@
 # @automatalabs/pi-acp
 
+## 0.1.3
+
+### Patch Changes
+
+- 0470ed1: Bump the embedded pi runtime to `@earendil-works/pi-coding-agent@0.80.10` (lockstep dev deps `pi-agent-core`/`pi-ai` included). Catalog-only upstream release — provider model metadata for Kimi/Moonshot/xAI/openrouter; no §14-cited surface changed (spec §0.3 repin note).
+
 ## 0.1.2
 
 ### Patch Changes

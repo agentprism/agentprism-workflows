@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 0.30.1
+
+### Patch Changes
+
+- 0470ed1: Bump the codex-acp fork pin to 1.6.6 (upstream sync: CI-only publish-workflow change; no adapter behavior change).
+- Updated dependencies [0470ed1]
+  - @automatalabs/pi-acp@0.1.3
+
 ## 0.30.0
 
 ### Minor Changes

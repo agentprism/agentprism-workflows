@@ -1,5 +1,12 @@
 # @automatalabs/workflows
 
+## 0.38.1
+
+### Patch Changes
+
+- Updated dependencies [0470ed1]
+  - @automatalabs/acp-agents@0.30.1
+
 ## 0.38.0
 
 ### Minor Changes
