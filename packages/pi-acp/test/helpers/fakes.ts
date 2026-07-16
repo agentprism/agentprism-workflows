@@ -26,6 +26,7 @@ export interface FakeSessionControl {
   session: AgentSession;
   emit(event: AgentSessionEvent): void;
   promptCalls: Array<{ text: string; options: unknown }>;
+  activeToolsAtPrompt: string[][];
   disposeCalls: number;
   abortCalls: number;
   listenerCount: number;
@@ -34,13 +35,23 @@ export interface FakeSessionControl {
   rejectPrompt?: (error: unknown) => void;
 }
 
+export type FakeBehavior =
+  | "normal"
+  | "wedged"
+  | "preflight"
+  | "auth-preflight"
+  | "tool"
+  | "provider-error"
+  | "structured";
+
 export function fakeSession(
   options: CreateAgentSessionOptions,
-  behavior: "normal" | "wedged" | "preflight" | "tool" = "normal",
+  behavior: FakeBehavior = "normal",
 ): FakeSessionControl {
   const listeners = new Set<(event: AgentSessionEvent) => void>();
   const messages: unknown[] = [];
   const promptCalls: Array<{ text: string; options: unknown }> = [];
+  const activeToolsAtPrompt: string[][] = [];
   const tools = [...(options.customTools ?? [])];
   let active = tools.map(({ name }) => name);
   let thinkingLevel = options.thinkingLevel ?? "medium";
@@ -66,7 +77,9 @@ export function fakeSession(
     },
     async prompt(text: string, promptOptions: unknown) {
       promptCalls.push({ text, options: promptOptions });
+      activeToolsAtPrompt.push([...active]);
       if (behavior === "preflight") throw new Error("No model selected");
+      if (behavior === "auth-preflight") throw new Error("No API key found for test/model");
       if (behavior === "wedged") {
         await new Promise<void>((resolve, reject) => {
           resolvePrompt = resolve;
@@ -130,6 +143,16 @@ export function fakeSession(
         } as AgentSessionEvent;
         for (const listener of listeners) listener(end);
       }
+      if (behavior === "structured") {
+        const tool = tools.find(({ name }) => name === "__acp_structured_output");
+        if (tool && active.includes(tool.name)) {
+          await tool.execute(
+            "structured-call",
+            { answer: promptCalls.length },
+            new AbortController().signal,
+          );
+        }
+      }
       const assistant = {
         role: "assistant",
         content: [{ type: "text", text: "hello" }],
@@ -141,16 +164,21 @@ export function fakeSession(
           totalTokens: 6,
           cost: { total: 0.001 },
         },
-        stopReason: "stop",
+        stopReason: behavior === "provider-error" ? "error" : "stop",
+        ...(behavior === "provider-error"
+          ? { errorMessage: "opaque provider failure", diagnostics: [] }
+          : {}),
         timestamp: Date.now(),
       };
       messages.push(assistant);
-      for (const listener of listeners) {
-        listener({
-          type: "message_update",
-          message: assistant,
-          assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello", partial: assistant },
-        } as AgentSessionEvent);
+      if (behavior !== "provider-error") {
+        for (const listener of listeners) {
+          listener({
+            type: "message_update",
+            message: assistant,
+            assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello", partial: assistant },
+          } as AgentSessionEvent);
+        }
       }
     },
     getContextUsage() { return { tokens: 6, contextWindow: 100, percent: 6 }; },
@@ -167,6 +195,7 @@ export function fakeSession(
     session: object as unknown as AgentSession,
     emit(event) { for (const listener of listeners) listener(event); },
     promptCalls,
+    activeToolsAtPrompt,
     get disposeCalls() { return disposeCalls; },
     get abortCalls() { return abortCalls; },
     get listenerCount() { return listeners.size; },
@@ -185,7 +214,7 @@ export interface FakeDepsResult {
   sessionDir: string;
 }
 
-export function fakeDeps(behavior: "normal" | "wedged" | "preflight" | "tool" = "normal"): FakeDepsResult {
+export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
   const cwd = mkdtempSync(`${tmpdir()}/pi-acp-cwd-`);
   const sessionDir = mkdtempSync(`${tmpdir()}/pi-acp-sessions-`);
   const controls: FakeSessionControl[] = [];

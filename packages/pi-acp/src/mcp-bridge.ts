@@ -277,8 +277,11 @@ export async function bridgeMcpServers(
                 deps.mcpTimeoutMs,
                 deps.sleep,
               );
-            } catch {
-              throw new Error(`MCP tool ${alias} timed out`);
+            } catch (error) {
+              if (error instanceof McpTimeoutError) {
+                throw new Error(`MCP tool ${alias} timed out`);
+              }
+              throw new Error(`MCP tool ${alias} failed`);
             }
             const converted = convertMcpResult(result);
             if (result.isError) {

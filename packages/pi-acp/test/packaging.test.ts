@@ -33,7 +33,7 @@ test("T26 root project references pi-acp and a publishing changeset exists", asy
   assert.ok(bodies.some((body) => body.includes('"@automatalabs/pi-acp"')));
 });
 
-test("T27 README covers invocation, API, registration, model/auth, namespaces, limits, and attribution", async () => {
+test("T27 README covers invocation, API, registration, T2b disclosure, limits, and attribution", async () => {
   const readme = await readFile(new URL("README.md", packageRoot), "utf8");
   for (const required of [
     "npx @automatalabs/pi-acp",
@@ -49,6 +49,8 @@ test("T27 README covers invocation, API, registration, model/auth, namespaces, l
     "pi-stored-credentials",
     "mcp__",
     "__acp_structured_output",
+    "tsc -p tsconfig.type-tests.json",
+    "small deviation from the test-script example",
     "Version 1 limitations",
     "Built on pi",
     "THIRD-PARTY notice",

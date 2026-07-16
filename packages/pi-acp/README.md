@@ -48,6 +48,10 @@ pi-acp owns the `mcp__` prefix for bridged MCP tools and the exact `__acp_struct
 
 Only stdio MCP servers are supported. Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. Audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed. Promotion to a built-in `PiBackend` is a follow-up.
 
+## Development
+
+The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` before the runtime test suite. This is a small deviation from the test-script example in the frozen specification and ensures the T2b public type-contract check is enforced in local and CI test runs.
+
 ## Built on pi — THIRD-PARTY notice
 
 This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.80.7. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.
