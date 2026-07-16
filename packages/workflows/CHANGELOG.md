@@ -1,5 +1,16 @@
 # @automatalabs/workflows
 
+## 0.36.0
+
+### Minor Changes
+
+- aac11d8: Add absolute `scriptPath` delivery, persistence-backed workflow script resources and lineage links, full resource subscription/list-change capabilities, and the `workflow` tool's durable `stop` action. Gate workflow VM execution on durable resource readback, preserve engine-owned content-free resume ancestry across run deletion, expose manager deletion observability for resource consumers, and publish exact structured-output variants.
+
+### Patch Changes
+
+- Updated dependencies [aac11d8]
+  - @automatalabs/workflow-engine@0.25.0
+
 ## 0.35.0
 
 ### Minor Changes
