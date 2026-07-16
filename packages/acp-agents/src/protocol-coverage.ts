@@ -153,6 +153,24 @@ export const CODEX_SPAWN_AUTH_ENV = "DEFAULT_AUTH_REQUEST" as const;
  *  guarantee the code-only §1.5 matcher relies on (§4.6.4 item 5). */
 export const ACP_AUTH_REQUIRED_CODE_EXCLUSIVE = -32000 as const;
 
+/** Frozen pi-acp wire surface consumed by the first-class backend. Keeping these literals in the
+ *  executable protocol-coverage module makes capability/auth/error drift visible in tests instead
+ *  of leaving the built-in coupled only through prose. */
+export const PI_ACP_PROTOCOL_CONTRACT = {
+  customCapabilityNamespace: "@automatalabs/pi-acp",
+  outputSchemaKey: "outputSchema",
+  mcpCapabilities: {},
+  authMethodIds: [
+    "anthropic-api-key",
+    "openai-api-key",
+    "gemini-api-key",
+    "xai-api-key",
+    "openrouter-api-key",
+    "pi-stored-credentials",
+  ],
+  providerErrorKinds: ["auth_error", "rate_limit", "billing_error", "provider_error"],
+} as const;
+
 /** One row of the §3.6 full `_meta` support matrix, landed as executable data (not prose) so an
  *  SDK/agent bump that changes a `_meta` surface trips the drift suite (§4.6.4 item 4). */
 export interface AuthMetaMatrixRow {

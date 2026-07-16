@@ -47,9 +47,9 @@ A `model` string is resolved solely from its first segment, then delegated to th
 
 | spec shape | routes to | notes |
 |---|---|---|
-| *(omitted)* | host default backend | `AGENTPRISM_DEFAULT_BACKEND` (`claude` \| `codex` \| `opencode` \| custom name; default `claude`), session default model. Most portable. |
-| `claude`, `codex`, `opencode`, or `<custom-name>` | that registered harness | Backend-only: no model config call; the harness default remains active. |
-| `claude/<id>`, `codex/<id>`, `opencode/<id>`, or `<custom-name>/<id>` | that registered harness | Match the first segment ASCII-case-insensitively and strip exactly one segment. Custom names take priority on collision. The remaining `<id>` is sent verbatim, including further `/` characters. |
+| *(omitted)* | host default backend | `AGENTPRISM_DEFAULT_BACKEND` (`claude` \| `codex` \| `opencode` \| `pi` \| custom name; default `claude`), session default model. Most portable. |
+| `claude`, `codex`, `opencode`, `pi`, or `<custom-name>` | that registered harness | Backend-only: no model config call; the harness default remains active. |
+| `claude/<id>`, `codex/<id>`, `opencode/<id>`, `pi/<id>`, or `<custom-name>/<id>` | that registered harness | Match the first segment ASCII-case-insensitively and strip exactly one segment. Custom names take priority on collision. The remaining `<id>` is sent verbatim, including further `/` characters. For Pi, that remainder is its `<provider>/<model-id>` and Pi preserves any further slashes in the model id. |
 | any other string, including `anthropic/…`, `openai/…`, bare `opus`, or bare `gpt-…` | host default backend | The **entire** authored string is sent verbatim; these are not routing aliases. |
 
 Selection is a single `session/set_config_option` with `configId: "model"` and the exact remaining string. There is no catalog matching, case folding, normalization, bracket parsing, nearest-neighbor selection, sibling effort/Fast option driving, retry, or echo verification. Brackets, dots, and provider-style prefixes are ordinary model-id characters. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; prefer backend-only forms for harness-configured models.
@@ -78,12 +78,13 @@ picking an id or select value, and run the validator every time after authoring.
 
 ## Structured output channels
 
-One author API (`schema`), three fulfillment paths — chosen automatically per backend:
+One author API (`schema`), four fulfillment paths — chosen automatically per backend:
 
 | backend | channel |
 |---|---|
 | Claude | native `outputFormat`, schema normalized to Anthropic's structured-outputs subset (e.g. `oneOf` → `anyOf`; unsupported keywords/formats stripped on the wire) |
 | Codex | native strict `outputSchema` (OpenAI strict subset normalization) |
+| Pi | native turn-level `_meta.outputSchema` with plain JSON Schema; final-message JSON is parsed; no schema prompt embedding and no injected MCP tool |
 | OpenCode / custom ACP | a client-hosted **`StructuredOutput` MCP tool** injected into the session when the agent advertises HTTP MCP support (an agent may show it as `structured_output_StructuredOutput`); otherwise prompt-embedded schema + JSON parse of the final message. Custom backends can opt out of tool injection with `structuredOutputTool: false`. |
 
 In every channel the runner coerces + validates client-side and re-prompts a bounded number of times; the final miss fails the call with non-recoverable `SCHEMA_NONCOMPLIANCE`. Constraints stripped from the wire are still enforced client-side — an exotic schema keyword shows up as re-prompt churn, so keep schemas simple.
@@ -295,8 +296,9 @@ get this entire guide from the server itself as the **`author-workflow`** prompt
 `task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`,
 `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool,
 one injected-tool registry per process), `AGENTPRISM_BACKENDS`,
-`AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend
-`*_CMD`/`_ARGS`/`_BIN` overrides.
+`AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend spawn
+overrides. Pi uses `AGENTPRISM_PI_ACP_CMD` with optional `AGENTPRISM_PI_ACP_ARGS`; otherwise the
+installed exact-pinned package bin is used before the `npx -y @automatalabs/pi-acp` fallback.
 
 Exact detached host types:
 
@@ -493,7 +495,7 @@ a tool error with no structured content; reading an existing failed run succeeds
 final-20 `logTail` (present when empty) and renders it in the immediate terminal text. Completed
 execution results omit that extra field while retaining their full `logs` array.
 
-Backend auth comes from the machine the host runs on: Claude via a logged-in Claude Code install or `ANTHROPIC_API_KEY`; Codex via `~/.codex/auth.json`; OpenCode via `opencode auth login` (its CLI must be installed — it is not bundled). A script only needs auth for the backends it actually routes to.
+Backend auth comes from the machine the host runs on: Claude via a logged-in Claude Code install or `ANTHROPIC_API_KEY`; Codex via `~/.codex/auth.json`; OpenCode via `opencode auth login` (its CLI must be installed — it is not bundled); Pi via one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, or ambient credentials in `~/.pi/agent/auth.json`. A script only needs auth for the backends it actually routes to.
 
 ## The validator — `agentprism-workflows validate`
 
@@ -563,7 +565,7 @@ npx @automatalabs/workflows config codex opencode   # only the named harnesses
 npx @automatalabs/workflows config claude --json    # machine-readable report
 ```
 
-Harness names are the routing names: built-in `claude` / `codex` / `opencode` plus any custom backend registered via the `AGENTPRISM_BACKENDS` env var (registered customs also join the no-argument default set). Each harness opens one session without a prompt — zero tokens — and its catalog is read fresh; a harness that cannot spawn or authenticate reports `probed: false` with the reason and never blocks the others.
+Harness names are the routing names: built-in `claude` / `codex` / `opencode` / `pi` plus any custom backend registered via the `AGENTPRISM_BACKENDS` env var (registered customs also join the no-argument default set). Each harness opens one session without a prompt — zero tokens — and its catalog is read fresh; a harness that cannot spawn or authenticate reports `probed: false` with the reason and never blocks the others.
 
 | flag | meaning |
 |---|---|

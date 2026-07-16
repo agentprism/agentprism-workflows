@@ -1,6 +1,6 @@
 // Drives the PROFILE-LESS conformant fake-auth-agent (§3.5) over the REAL pool — the executable
 // proof of Principle 1. Every behavior here traverses the identical dispatcher, class inference,
-// advertisement, and error taxonomy the three first-class agents use, with ZERO agent-specific code.
+// advertisement, and error taxonomy the four first-class agents use, with ZERO agent-specific code.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, existsSync, readFileSync } from "node:fs";

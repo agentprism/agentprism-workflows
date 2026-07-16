@@ -1,8 +1,8 @@
 # repo-triage — a standalone project on the workflows SDK
 
 A complete, copy-out-able **project** (own `package.json`, TypeScript host, external
-workflow scripts) that runs an **autonomous, unattended repo triage** across all three
-first-class backends — Claude Code, Codex, and OpenCode — in a single run. The host
+workflow scripts) that runs an **autonomous, unattended repo triage** across three selected
+built-in backends — Claude Code, Codex, and OpenCode — in a single run. The host
 (`src/main.ts`) loads a workflow **by name** from `./workflows/` via the SDK, runs it
 against a target repository, prints the structured result, and writes the gated
 markdown report to disk.

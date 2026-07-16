@@ -79,7 +79,7 @@ export interface AgentSessionRef {
    *  (backendId), matching the pool's own process-identity model, which keys built-ins by bare id
    *  (`pool.ts:129`). A first-class backend's spawn config is NOT fixed — `spawnConfig()` varies with
    *  `AGENTPRISM_*_ACP_CMD/ARGS` env overrides and with installed-bin-vs-npx resolution
-   *  (`backends/claude.ts:44-58`, and codex/opencode) and built-ins define no explicit `poolKey` — but
+   *  (`backends/claude.ts:44-58`, and codex/opencode/pi) and built-ins define no explicit `poolKey` — but
    *  every such launch of the same first-class agent shares one agent-side session store, so reattach
    *  stays semantically valid and the logical-agent identity is correct by design; a genuinely
    *  different program bound behind an env override is caught at the reopen RPC (`reattach-failed` →

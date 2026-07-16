@@ -14,9 +14,9 @@ import { renderHarnessOptionLines } from "./validate.js";
 import type { ValidateHarnessOptions } from "./validate.js";
 
 export interface ProbeHarnessConfigOptions {
-  /** Harness names to probe (built-in `claude` / `codex` / `opencode` or a registered
+  /** Harness names to probe (built-in `claude` / `codex` / `opencode` / `pi` or a registered
    *  custom name; any model spec routes like an agent() call's). Default: every routable
-   *  harness — the three built-ins plus each registered custom backend. */
+   *  harness — the four built-ins plus each registered custom backend. */
   harnesses?: string[];
   /** Programmatic custom-backend registry, merged over the AGENTPRISM_BACKENDS env var
    *  exactly like `createAcpRunner({ backends })`. */
@@ -38,7 +38,7 @@ export interface HarnessConfigReport {
   harnessOptions: ValidateHarnessOptions[];
 }
 
-const BUILTIN_HARNESSES = ["claude", "codex", "opencode"] as const;
+const BUILTIN_HARNESSES = ["claude", "codex", "opencode", "pi"] as const;
 const DEFAULT_PROBE_TIMEOUT_MS = 60_000;
 
 /**

@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
-import { ClaudeBackend, CodexBackend, OpenCodeBackend, selectBackend, toStrictJsonSchema } from "../src/index.js";
+import { ClaudeBackend, CodexBackend, OpenCodeBackend, PiBackend, selectBackend, toStrictJsonSchema } from "../src/index.js";
 import type { Backend, StructuredSource } from "../src/index.js";
 
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
@@ -141,10 +141,16 @@ test("OpenCodeBackend is the third built-in backend", () => {
 
 // ---- selectBackend cross-provider routing -------------------------------------------
 
+test("PiBackend is the fourth built-in backend", () => {
+  const backend: Backend = new PiBackend();
+  assert.equal(backend.id, "pi");
+});
+
 test("selectBackend routes only by a registered first segment", () => {
   assert.equal(selectBackend({ model: "codex/whatever" }).id, "codex");
   assert.equal(selectBackend({ model: "opencode" }).id, "opencode");
   assert.equal(selectBackend({ model: "opencode/zai/glm-5.2" }).id, "opencode");
+  assert.equal(selectBackend({ model: "pi/openrouter/anthropic/claude-sonnet" }).id, "pi");
   assert.equal(selectBackend({ model: "claude/sonnet" }).id, "claude");
   assert.equal(selectBackend({ model: "CoDeX/gpt-5.6-luna" }).id, "codex");
   // Aliases and bare family names are unregistered, so they use the default (Claude here).
@@ -174,6 +180,9 @@ test("selectBackend honors AGENTPRISM_DEFAULT_BACKEND when nothing else matches"
     assert.equal(selectBackend({ model: "unknownish" }).id, "opencode");
     assert.equal(selectBackend({ model: "anthropic/claude-opus" }).id, "opencode");
     assert.equal(selectBackend({ model: "claude/claude-opus" }).id, "claude");
+    process.env.AGENTPRISM_DEFAULT_BACKEND = "pi";
+    assert.equal(selectBackend({}).id, "pi");
+    assert.equal(selectBackend({ model: "openrouter/vendor/model" }).id, "pi");
   } finally {
     if (prev === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
     else process.env.AGENTPRISM_DEFAULT_BACKEND = prev;

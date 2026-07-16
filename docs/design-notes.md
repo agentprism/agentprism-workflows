@@ -14,12 +14,14 @@ the structured-output crux, model/permission/usage wiring, the engine lineage).
 
 ## 1. Goal
 
-Rebuild the dynamic-workflow orchestrator so it has **no dependency on Pi**:
+Rebuild the dynamic-workflow orchestrator so the engine has **no dependency on Pi** while Pi is
+available as an isolated, first-class ACP leaf:
 
 - The **`workflow` tool** is exposed by a **stdio MCP server** (instead of a Pi extension's
   `registerTool`). Any MCP-capable host (Claude Code, Zed, etc.) can call it.
 - Each **`agent()` call inside a workflow script** is backed by an **ACP agent server**
-  (`claude-agent-acp` for Claude, `codex-acp` for Codex, `opencode acp` for OpenCode) over the **Agent Client Protocol**
+  (`claude-agent-acp` for Claude, `codex-acp` for Codex, `opencode acp` for OpenCode,
+  `pi-acp` for pi) over the **Agent Client Protocol**
   (instead of Pi's in-process `createAgentSession`).
 
 The deterministic orchestration engine (the JS `vm` realm, `parallel`/`pipeline`, the
@@ -28,7 +30,8 @@ unchanged** from `pi-dynamic-workflows` — only the *leaf* (how one subagent ru
 *shell* (how the tool is exposed) change.
 
 This is built as a **new, standalone codebase** that *lifts* the reused pieces (copy + adapt the
-source) rather than modifying the Pi extension; nothing imports Pi at runtime. Three core layers
+source) rather than modifying the Pi extension; the engine never imports Pi at runtime. The
+first-class Pi integration remains behind the spawned `pi-acp` process boundary. Three core layers
 (`shared-types`, `workflow-engine`, `acp-agents`) stay independently usable, while the SDK facade,
 MCP shell, and optional OTel leaf compose them for hosts — see §2 for the package layout.
 
@@ -48,8 +51,8 @@ The orchestrator process plays **two protocol roles at once**:
 └──────────────────────────────────────────────┘
         │  session/new, session/prompt … (ACP, JSON-RPC over stdio)
         ▼
-   claude-agent-acp / codex-acp / opencode acp  (one or more long-lived subprocesses)
-        │  → real Claude / Codex / OpenCode agents, each in its own session
+   claude-agent-acp / codex-acp / opencode acp / pi-acp  (one or more long-lived subprocesses)
+        │  → real Claude / Codex / OpenCode / pi agents, each in its own session
 ```
 
 ACP and MCP are sibling JSON-RPC protocols from the same design space (ACP = host↔agent,
@@ -61,7 +64,8 @@ MCP = agent↔tools), so this is a clean composition, not a hack.
 
 This is a **new, greenfield codebase** — not a fork, a patch, or a runtime dependency of the Pi
 extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (copy + adapt the
-source) and write the rest fresh. Nothing imports Pi at runtime.
+source) and write the rest fresh. The engine imports no Pi code; `acp-agents` reaches Pi only by
+spawning the exact-pinned `@automatalabs/pi-acp` package as an ACP server.
 
 The code is published as **seven packages** with a one-way dependency direction. The three lower
 layers remain independently usable — in particular, the ACP agent logic and workflow engine both
@@ -80,7 +84,7 @@ work **with no MCP server at all** — while the facade and integration leaves s
                   ▼                       ▼
  ┌──────────────────────────┐  ┌───────────────────────────────┐
  │ workflow-engine          │  │ acp-agents                    │
- │ vm, journal, budgets,    │  │ pooled Claude/Codex/OpenCode │
+ │ vm, journal, budgets,    │  │ pooled built-in ACP agents  │
  │ resume, worktrees        │  │ + custom ACP, auth, sessions │
  └────────────┬─────────────┘  └──────────────┬────────────────┘
               └──────────────┬────────────────┘
@@ -95,19 +99,25 @@ engine never names a concrete backend; the agents module never knows it's inside
 ### `acp-agents` — *the internal ACP backend (an `AgentRunner`), not the public SDK*
 
 All the logic for actually using the ACP agents: opening and holding ACP client connections to
-`claude-agent-acp` / `codex-acp` / `opencode acp`, the `ClaudeBackend` / `CodexBackend` /
-`OpenCodeBackend` / `CustomAcpBackend`, model selection (§5.4), permission allow/deny (§5.5),
+`claude-agent-acp` / `codex-acp` / `opencode acp` / `pi-acp`, the `ClaudeBackend` /
+`CodexBackend` / `OpenCodeBackend` / `PiBackend` / `CustomAcpBackend`, model selection (§5.4),
+permission allow/deny (§5.5),
 usage extraction (§5.6), cancellation (§5.7), auth, session lifecycle, and structured-output
 vendor wiring (§6). It implements the one-method `AgentRunner` seam (`run(prompt, opts)`) and adds
 host-facing event, auth, and interactive/reattach APIs. Its runtime deps are
 `@agentclientprotocol/sdk`, `@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`,
-`@modelcontextprotocol/sdk`, `typebox`, and `@automatalabs/shared-types`; OpenCode is resolved from
-the host and deliberately is not bundled.
+`@automatalabs/pi-acp`, `@modelcontextprotocol/sdk`, `typebox`, and
+`@automatalabs/shared-types`; OpenCode is resolved from the host and deliberately is not bundled.
 
 The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.6.5` — a
 published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `outputSchema` forward
 (§6.3) into its shipped dist. It's an exact-pinned dependency, so Codex ships on a clean
 `git clone && pnpm install && pnpm build` — no pnpm patch, no `patches/` file, no vendored tree.
+
+The Pi backend exact-pins **`@automatalabs/pi-acp@0.1.1`** and resolves its `dist/index.js` bin
+under `process.execPath`. Its complete fallback ladder is
+`AGENTPRISM_PI_ACP_CMD`/`AGENTPRISM_PI_ACP_ARGS` → installed package bin →
+`npx -y @automatalabs/pi-acp`; it never relies on a `pi-acp` PATH executable.
 
 It is its own module (it imports neither the engine nor the MCP server), but it is an **internal**
 building block — **not** the importable public SDK. The canonical, importable SDK is
@@ -176,11 +186,11 @@ outside the engine/runner dependency chain.
 
 | Module | Piece | Replaces (Pi) | New |
 |---|---|---|---|
-| `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives Claude, Codex, OpenCode, or custom ACP agents |
+| `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives Claude, Codex, OpenCode, pi, or custom ACP agents |
 | `workflows` | **Facade** — compose + validate | no Pi equivalent | public SDK, one-shot helper, workflow folders/validator, manager ACP-event bridge |
 | `mcp-server` | **Shell** — expose tools | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering `workflow` plus conditional auth tools; progress via MCP notifications |
 | `agentprism-otel` | **Observability** | no Pi equivalent | OTel trace/metric mapping over manager events |
-| `acp-agents` | **Structured output** | injected `structured_output` tool ([`src/structured-output.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/structured-output.ts)) | native backend schema constraint for Claude/Codex plus client-hosted StructuredOutput MCP capture for eligible custom ACP backends (§6) |
+| `acp-agents` | **Structured output** | injected `structured_output` tool ([`src/structured-output.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/structured-output.ts)) | native backend schema constraint for Claude/Codex/pi plus client-hosted StructuredOutput MCP capture for OpenCode and eligible custom ACP backends (§6) |
 
 ---
 
@@ -214,6 +224,11 @@ All versions below were re-verified from the installed workspace dependency grap
   Ref: https://github.com/VikashLoomba/codex-acp (fork) · https://github.com/agentclientprotocol/codex-acp (upstream)
   > The Rust `zed-industries/codex-acp` is the deprecated predecessor; development moved to the
   > `agentclientprotocol/codex-acp` TypeScript package (which this fork tracks).
+
+- **`@automatalabs/pi-acp@0.1.1`** — ACP server wrapping the Pi coding agent. Bin: `pi-acp`
+  (`dist/index.js`). It advertises native turn-level `_meta.outputSchema`, an empty
+  `mcpCapabilities` object, Pi model/thinking config options, and six unconditional authentication
+  methods. `acp-agents` exact-pins and spawns this package as the first-class `pi` backend.
 
 ### Engine support (lifted from pi-dynamic-workflows; no Pi runtime needed)
 
@@ -344,11 +359,14 @@ advertises:
   `setConfigOption` is just the ACP SDK's JS accessor for it).
 - `opencode acp`: model values are OpenCode catalog ids like `provider/model` (for example
   `zai/glm-5.2`) under a `model` select. The public routing prefix is stripped at the first slash:
-  `opencode/zai/glm-5.2[high]` routes to the OpenCode backend, selects `zai/glm-5.2`, and applies
-  `[high]` to its `thought_level`/effort option when advertised.
+  `opencode/zai/glm-5.2[high]` routes to the OpenCode backend and selects
+  `zai/glm-5.2[high]` verbatim.
+- `pi-acp`: the public `pi/` prefix is stripped once and the remainder is sent verbatim to Pi's
+  `model` select. Pi then interprets `<provider>/<model-id>` by splitting the first slash, so
+  `pi/openrouter/vendor/model-id` selects provider `openrouter` and model id `vendor/model-id`.
 
 > The **catalog** belongs to the server (Claude models on `claude-agent-acp`, Codex models on
-> `codex-acp`, OpenCode models on `opencode acp`), so cross-**provider** routing = choosing which server; within a provider,
+> `codex-acp`, OpenCode models on `opencode acp`, Pi models on `pi-acp`), so cross-**provider** routing = choosing which server; within a provider,
 > per-call tiering works. This is what the engine's `tier: small/medium/big` maps onto.
 
 ### 5.5 Permissions → tool allow/deny — supported
@@ -372,6 +390,8 @@ Ref: https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permissio
 - `codex-acp` reports **tokens/quota only** (no dollar cost).
 - OpenCode reports per-turn `PromptResponse.usage` plus cumulative `usage_update` cost/context;
   the existing accumulator combines the latest cumulative cost with the per-turn token split.
+- Pi reports per-turn `PromptResponse.usage` and can emit cumulative `usage_update` notifications;
+  the runner applies the same ACP usage accumulator.
 
 This maps onto the engine's `onUsage` / token accounting; no need for the chars/4 estimator
 fallback in the normal case.
@@ -395,12 +415,14 @@ in ACP (the client does not hand the agent a tool object directly).
 - `codex-acp`: supports stdio + http (rejects `acp`/`sse`).
 - `opencode acp`: advertises http + sse; this is what enables the runner-hosted
   StructuredOutput MCP tool for schema runs.
+- `pi-acp`: advertises `mcpCapabilities: {}` and accepts stdio MCP servers only; native structured
+  output therefore never injects the runner-hosted MCP tool.
 Ref: https://agentclientprotocol.com/protocol/v1/session-setup#mcp-servers
 
 ### 5.9 Custom backends & the generic `_meta` passthrough
 
 ACP is a *unified* protocol — nothing about the runner is backend-specific except the built-in
-`Backend` strategies for Claude, Codex, and OpenCode. Two additive surfaces open the seam to **any** ACP agent:
+`Backend` strategies for Claude, Codex, OpenCode, and Pi. Two additive surfaces open the seam to **any** ACP agent:
 
 - **The backend registry** (`acp-agents/src/registry.ts`): named spawn configs
   (`{ command, args?, env?, sessionMeta?, structuredOutputTool? }`), registered programmatically
@@ -408,7 +430,7 @@ ACP is a *unified* protocol — nothing about the runner is backend-specific exc
   registered names FIRST (`model: "browser"` or `"browser/<inner-model>"` — the name is
   routing; the part after the slash is selected via Session Config Options), then the
   built-in heuristics. `AGENTPRISM_DEFAULT_BACKEND` may name a registry entry.
-  `"claude"`/`"codex"`/`"opencode"` are reserved. A custom backend speaks the repo's published generic
+  `"claude"`/`"codex"`/`"opencode"`/`"pi"` are reserved. A custom backend speaks the repo's published generic
   dialect: schema IN as turn-level `_meta.outputSchema` (plain JSON Schema, not
   OpenAI-strict), optionally a client-hosted StructuredOutput MCP tool when HTTP MCP is
   negotiated, and result OUT as captured tool args or final-text JSON — with the client-side
@@ -435,7 +457,8 @@ ACP is a *unified* protocol — nothing about the runner is backend-specific exc
   Session/new `_meta` layers lowest→highest: registry `sessionMeta` defaults → per-call `meta`
   → backend protocol-critical keys (Claude `claudeCode` schema channel, Codex
   base/developer-instruction forwards) → the engine `runId` stamp. Turn `_meta` layers
-  per-call `promptMeta` under backend-computed keys (`outputSchema`). Both are ADDITIVE run
+  per-call `promptMeta` under backend-computed keys (`outputSchema`, including Pi's native
+  channel). Both are ADDITIVE run
   inputs — like `mcpServers`, they never enter `hashAgentCall`, so resume keys are stable
   across meta changes.
 
@@ -443,7 +466,7 @@ ACP is a *unified* protocol — nothing about the runner is backend-specific exc
 
 ## 6. Structured output (the crux)
 
-**Both backends natively constrain a result to a JSON Schema.** What differs is *scope* and the
+**Claude, Codex, and Pi natively constrain a result to a JSON Schema.** What differs is *scope* and the
 *vendor channel* used to reach it. ACP **core** models none of it — only an open `_meta`
 extension point — so each backend tunnels its native support through a vendor-specific path.
 
@@ -622,7 +645,7 @@ strict mode — `CodexBackend` must normalize the engine's JSON Schema to OpenAI
 property `required`, `additionalProperties:false`, supported types/keywords only) before sending.
 Keep the validate→re-prompt guard regardless.
 
-**Tool-level structured output also exists, but it's the wrong lever for a client (see §6.4):**
+**Tool-level structured output also exists, but it's the wrong lever for a client (see §6.5):**
 
 ```ts
 // src/app-server/Tool.ts:9            outputSchema?: JsonValue   (on the tool definition)
@@ -634,7 +657,17 @@ Keep the validate→re-prompt guard regardless.
 
 > Source (codex-acp): [`Tool.ts:9`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/Tool.ts#L9), [`ToolOutputSchema.ts:6-10`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/ToolOutputSchema.ts#L6-L10), [`CallToolResult.ts:9`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/CallToolResult.ts#L9), [`McpToolCallResult.ts:6`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/v2/McpToolCallResult.ts#L6), [`McpServerToolCallResponse.ts:6`](https://github.com/agentclientprotocol/codex-acp/blob/5506fbae85878013c6eb40ae540ea21a607d9334/src/app-server/v2/McpServerToolCallResponse.ts#L6).
 
-### 6.4 Why tool-level structured output is the wrong lever for a *client*
+### 6.4 Pi — `@automatalabs/pi-acp@0.1.1`
+
+Pi exposes a native, turn-scoped output-schema dialect. `PiBackend.promptMeta()` sends the user's
+plain JSON Schema under `_meta.outputSchema`; it does not apply Codex's OpenAI-strict
+normalization. The server captures the final structured object and emits its JSON in the terminal
+`agent_message_chunk`, so `PiBackend.nativeStructured()` parses the final assistant message. The
+backend sets `embedSchemaInPrompt:false` and `injectStructuredOutputMcp:false`: the schema is not
+duplicated in prose and Pi's advertised `mcpCapabilities: {}` is honored without injecting a
+client-hosted structured-output tool.
+
+### 6.5 Why tool-level structured output is the wrong lever for a *client*
 
 For both backends, a tool's `structuredContent` flows back to **the model**, not to your
 orchestrator. The SDK's in-process `tool()` helper exposes **no `outputSchema`**
@@ -643,9 +676,9 @@ tool's **inputSchema** (the *args* the model passes when it calls a client-hoste
 schema-conformance for a subagent **result** should use the turn/session output format, not a
 tool.
 
-### 6.5 Client-hosted StructuredOutput MCP tool for custom ACP backends
+### 6.6 Client-hosted StructuredOutput MCP tool for custom ACP backends
 
-Native output-format channels remain authoritative for Claude and Codex. OpenCode and custom ACP
+Native output-format channels remain authoritative for Claude, Codex, and Pi. OpenCode and custom ACP
 backends without a native result channel can inject a runner-hosted MCP server through
 `session/new.mcpServers` when all gates hold: `RunOptions.schema` is present, the custom backend's
 registry config did not set `structuredOutputTool:false` (default true; OpenCode always opts in),
@@ -662,20 +695,22 @@ Invalid calls return a tool error with TypeBox validation details and do not clo
 capture. The resolution ladder is captured tool args → native/final-text parse → prose JSON
 extraction → repair prompt.
 
-### 6.6 What this means for us
+### 6.7 What this means for us
 
 - **Keep native channels primary where they exist.** Claude constrains out-of-the-box via `_meta`;
-  Codex constrains after the ~1-line adapter patch (§6.3). OpenCode has no native result channel,
-  so it uses the client-hosted MCP tool plus generic `_meta.outputSchema`/prompt fallback.
+  Codex constrains after the ~1-line adapter patch (§6.3); Pi consumes turn-level
+  `_meta.outputSchema` directly (§6.4). OpenCode has no native result channel, so it uses the
+  client-hosted MCP tool plus generic `_meta.outputSchema`/prompt fallback.
 - **Keep `resolveStructuredOutput`'s validate-then-re-prompt ([`src/agent.ts:113`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts#L113)) as a guard**,
   because `structured_output` is typed `unknown` and the constraint can still fail
   (`error_max_structured_output_retries`) and tool arguments are still untrusted. Ladder:
   captured tool args → native constraint/final-text parse → client-side validate → re-prompt on
   failure.
-- **Abstract behind a per-backend adapter** — the two paths genuinely differ (Claude:
+- **Abstract behind a per-backend adapter** — the three native paths genuinely differ (Claude:
   session-scoped vendor `_meta.claudeCode` + `emitRawSDKMessages`, read off the raw message stream;
   Codex: per-turn `outputSchema` forwarded by the **forked** adapter, read off the normal message
-  stream, with strict-schema normalization). Same `run(prompt, { schema })` interface above them.
+  stream, with strict-schema normalization; Pi: per-turn `outputSchema`, read off the final normal
+  message stream with plain JSON Schema). Same `run(prompt, { schema })` interface above them.
 
 ---
 
@@ -683,12 +718,12 @@ extraction → repair prompt.
 
 This lives in the **`acp-agents`** module (§2) and is usable on its own — no `workflow-engine`,
 no `mcp-server`. It drives `claude-agent-acp`, the `@automatalabs/codex-acp` fork (patch baked
-into its dist, §2, §6.3), and `opencode acp` as ACP server subprocesses. It implements the `AgentRunner` seam the engine injects against (today
+into its dist, §2, §6.3), `opencode acp`, and `pi-acp` as ACP server subprocesses. It implements the `AgentRunner` seam the engine injects against (today
 `Pick<WorkflowAgent, "run">`, [`src/workflow.ts:59`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts#L59)). One method, backend strategies behind it:
 
 ```
 run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
-  1. pick backend (Claude vs Codex vs OpenCode/custom) by agentType/model
+  1. pick backend (Claude vs Codex vs OpenCode vs Pi/custom) by agentType/model
   2. if continueFromSession is eligible:
        session/resume({ sessionId }) else session/load({ sessionId })
        on reopen failure → clean up and session/new({ cwd }) with the ORIGINAL prompt
@@ -697,6 +732,7 @@ run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
   4. apply schema:
        Claude → already set in session/new _meta.claudeCode.options.outputFormat (+ emitRawSDKMessages)
        Codex  → outputSchema on the turn params
+       Pi     → outputSchema on the turn _meta; no MCP injection or prompt embedding
        OpenCode/custom → generic outputSchema + optional StructuredOutput MCP tool
   5. session/prompt(continued ? CONTINUATION_INSTRUCTION : prompt); drain session/update:
        • agent_message_chunk → assistant text
@@ -704,7 +740,8 @@ run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
        • usage_update → token accounting (§5.6)
   6. on stopReason:
        schema set → extract structured result
-                     (Claude: structured_output off _claude/sdkMessage; Codex/OpenCode: final text/tool capture),
+                     (Claude: structured_output off _claude/sdkMessage; Codex/Pi: final text;
+                      OpenCode/custom: final text/tool capture),
                      then VALIDATE; re-prompt on failure (guard)
        no schema   → final assistant text (empty ⇒ recoverable retry)
   7. signal.aborted → session/cancel (§5.7)
@@ -853,6 +890,10 @@ resurrect a snapshot or sidecar after the run was removed.
 - **OpenCode is not bundled.** `OpenCodeBackend` resolves `AGENTPRISM_OPENCODE_ACP_CMD`, then a
   host-installed `opencode-ai` launcher, then `opencode` from PATH. The package is deliberately not
   a dependency because its platform binaries are large.
+- **Pi is bundled as an exact pin.** `PiBackend` resolves `AGENTPRISM_PI_ACP_CMD` and its optional
+  args first, then the installed `@automatalabs/pi-acp@0.1.1` `dist/index.js` under
+  `process.execPath`, then `npx -y @automatalabs/pi-acp`. Authentication is surfaced as five
+  provider env-key methods plus Pi's ambient `~/.pi/agent/auth.json` store.
 - **Concurrency** is bound by provider API rate limits + per-session memory, not the protocol;
   intra-session prompts serialize.
 - **Per-turn token-usage breakdown** on `PromptResponse` is still a Draft ACP RFD (servers emit
@@ -874,6 +915,7 @@ resurrect a snapshot or sidecar after the run was removed.
 - `@agentclientprotocol/sdk@1.2.1` — https://github.com/agentclientprotocol
 - `@agentclientprotocol/claude-agent-acp@0.59.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.207`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp@1.6.5` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
+- `@automatalabs/pi-acp@0.1.1` (Pi ACP server; exact-pinned built-in dependency) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai
 
 **ACP spec:**

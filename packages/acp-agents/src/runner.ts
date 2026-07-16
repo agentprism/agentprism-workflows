@@ -65,6 +65,7 @@ import { InteractiveSession, type InteractiveSessionOptions } from "./interactiv
 import { ClaudeBackend } from "./backends/claude.js";
 import { CodexBackend } from "./backends/codex.js";
 import { OpenCodeBackend } from "./backends/opencode.js";
+import { PiBackend } from "./backends/pi.js";
 import { CustomAcpBackend } from "./backends/custom.js";
 import {
   registryWithRunBackends,
@@ -528,7 +529,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
   /** Ids of every configured backend (built-ins + AcpRunnerOptions.backends). */
   listBackends(): string[] {
-    const ids = new Set<string>(["claude", "codex", "opencode"]);
+    const ids = new Set<string>(["claude", "codex", "opencode", "pi"]);
     for (const name of this.backends.keys()) ids.add(name);
     return [...ids];
   }
@@ -1453,6 +1454,8 @@ function builtinBackend(id: BuiltinBackendId): Backend {
       return new CodexBackend();
     case "opencode":
       return new OpenCodeBackend();
+    case "pi":
+      return new PiBackend();
   }
 }
 
@@ -1472,7 +1475,12 @@ function resolveModelRoute(spec: string | undefined, registry?: BackendRegistry)
   const custom = registry?.get(firstSegment);
   if (custom) return { backend: new CustomAcpBackend(custom), modelSpec: inner };
 
-  if (firstSegment === "claude" || firstSegment === "codex" || firstSegment === "opencode") {
+  if (
+    firstSegment === "claude" ||
+    firstSegment === "codex" ||
+    firstSegment === "opencode" ||
+    firstSegment === "pi"
+  ) {
     return { backend: builtinBackend(firstSegment), modelSpec: inner };
   }
 
@@ -1609,7 +1617,7 @@ function defaultBackend(registry?: BackendRegistry): Backend {
     const config = registry.get(name);
     if (config) return new CustomAcpBackend(config);
   }
-  if (name === "opencode" || name === "codex") return builtinBackend(name);
+  if (name === "opencode" || name === "codex" || name === "pi") return builtinBackend(name);
   return builtinBackend("claude");
 }
 

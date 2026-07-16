@@ -1,5 +1,5 @@
 // Per-first-class-backend LIVE auth e2e (§4.6.3) — env-GATED, skip-by-default. Every OTHER auth suite
-// drives the profile-less fake agent; this one drives the REAL claude / codex / opencode ACP servers
+// drives the profile-less fake agent; this one drives the REAL claude / codex / opencode / pi ACP servers
 // with REAL credentials so each first-class integration's auth path has a re-runnable guard with
 // EQUAL structural depth (Principle 1 — no backend is privileged).
 //
@@ -92,6 +92,45 @@ test(
 
     // With the provider key present the ProviderAuthError→-32000 path (service.ts:856-858) must NOT fire.
     assertPong(await runner.run(PING_PROMPT, { model: model ?? "opencode" }));
+  },
+);
+
+// ---- pi — one of five provider env keys (all six methods are advertised unconditionally) ----
+const PI_PROVIDER_KEY = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "XAI_API_KEY",
+  "OPENROUTER_API_KEY",
+].find((name) => Boolean(process.env[name]));
+
+test(
+  "pi: six unconditional methods, inherited provider credential, real prompt completes",
+  { skip: gate("set a supported Pi provider API key to run the pi auth e2e", Boolean(PI_PROVIDER_KEY)) },
+  async () => {
+    const runner = makeRunner();
+    const model = process.env.AGENTPRISM_PI_E2E_MODEL ?? "pi";
+    const methods = await runner.describeAuthMethods({ model });
+    assert.deepEqual(methods.map(({ id }) => id), [
+      "anthropic-api-key",
+      "openai-api-key",
+      "gemini-api-key",
+      "xai-api-key",
+      "openrouter-api-key",
+      "pi-stored-credentials",
+    ]);
+
+    const methodId = PI_PROVIDER_KEY === "ANTHROPIC_API_KEY"
+      ? "anthropic-api-key"
+      : PI_PROVIDER_KEY === "OPENAI_API_KEY"
+        ? "openai-api-key"
+        : PI_PROVIDER_KEY === "GEMINI_API_KEY"
+          ? "gemini-api-key"
+          : PI_PROVIDER_KEY === "XAI_API_KEY"
+            ? "xai-api-key"
+            : "openrouter-api-key";
+    await runner.authenticate({ model, methodId });
+    assertPong(await runner.run(PING_PROMPT, { model }));
   },
 );
 

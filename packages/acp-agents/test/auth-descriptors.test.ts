@@ -113,3 +113,60 @@ test("buildAuthDescriptors maps a mixed method list in order", () => {
     ["agent", "env_var", "terminal"],
   );
 });
+
+test("Pi's six advertised auth methods become five env-var descriptors and one ambient agent descriptor", () => {
+  const methods: AuthMethod[] = [
+    {
+      id: "anthropic-api-key",
+      name: "Anthropic API key",
+      type: "env_var",
+      vars: [{ name: "ANTHROPIC_API_KEY", secret: true }],
+    },
+    {
+      id: "openai-api-key",
+      name: "OpenAI API key",
+      type: "env_var",
+      vars: [{ name: "OPENAI_API_KEY", secret: true }],
+    },
+    {
+      id: "gemini-api-key",
+      name: "Google Gemini API key",
+      type: "env_var",
+      vars: [{ name: "GEMINI_API_KEY", secret: true }],
+    },
+    {
+      id: "xai-api-key",
+      name: "xAI API key",
+      type: "env_var",
+      vars: [{ name: "XAI_API_KEY", secret: true }],
+    },
+    {
+      id: "openrouter-api-key",
+      name: "OpenRouter API key",
+      type: "env_var",
+      vars: [{ name: "OPENROUTER_API_KEY", secret: true }],
+    },
+    { id: "pi-stored-credentials", name: "pi stored credentials" },
+  ];
+
+  const descriptors = buildAuthDescriptors(methods, SPAWN);
+  assert.deepEqual(descriptors.map(({ id, type }) => [id, type]), [
+    ["anthropic-api-key", "env_var"],
+    ["openai-api-key", "env_var"],
+    ["gemini-api-key", "env_var"],
+    ["xai-api-key", "env_var"],
+    ["openrouter-api-key", "env_var"],
+    ["pi-stored-credentials", "agent"],
+  ]);
+  assert.deepEqual(
+    descriptors.slice(0, 5).map((descriptor) => descriptor.type === "env_var" && descriptor.vars[0]?.name),
+    ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY"],
+  );
+  assert.deepEqual(descriptors[5], {
+    type: "agent",
+    id: "pi-stored-credentials",
+    name: "pi stored credentials",
+    expectsMeta: false,
+    interactive: true,
+  });
+});

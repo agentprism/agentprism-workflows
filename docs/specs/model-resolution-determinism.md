@@ -23,7 +23,7 @@ definition model, tier mapping, phase/meta route — and the host tier configura
 `small`/`medium`/`big` to a full spec string that then follows these same rules):
 
 1. **Routing.** Split `S` on its first `/`. If the first segment, ASCII-case-insensitively, is a
-   registered harness name — the first-class prefixes `claude`, `codex`, `opencode`, or any
+   registered harness name — the first-class prefixes `claude`, `codex`, `opencode`, `pi`, or any
    registered custom backend name (custom names keep priority over built-ins on collision) — route
    to that harness and strip exactly that one segment. Otherwise route the **entire string,
    unmodified, to the configured default backend** (`AGENTPRISM_DEFAULT_BACKEND`, historical
@@ -67,7 +67,8 @@ Default backend `claude` unless noted:
 
 | Authored spec | Today | New behavior |
 | --- | --- | --- |
-| `claude` / `codex` / `opencode` / custom name | backend-only; session default | unchanged |
+| `claude` / `codex` / `opencode` / `pi` / custom name | backend-only; session default | unchanged |
+| `pi/openrouter/vendor/model-id` | first-class Pi route | strips `pi/` once; sends `openrouter/vendor/model-id` verbatim so Pi splits provider `openrouter` from model id `vendor/model-id` |
 | `opencode/zai/glm-5.2` | routes to OpenCode; ladder match | unchanged route; `zai/glm-5.2` verbatim |
 | `codex/gpt-5.5[high]` | route + ladder + effort option | route; `gpt-5.5[high]` verbatim — works where the harness catalog encodes effort in the id (codex-acp does); otherwise the harness decides |
 | `opencode/zai/glm-5.2[max]` | thought-level driven by client | `zai/glm-5.2[max]` verbatim — effort moves to harness-side configuration; example specs migrate |

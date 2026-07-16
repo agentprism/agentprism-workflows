@@ -113,7 +113,7 @@ export interface ValidatedAgentCall {
   mode?: string;
   /** The verbatim session config options authored for this call. */
   configOptions?: Record<string, string | boolean>;
-  /** Which concrete backend the spec routes to: "claude" | "codex" | "opencode" | a custom
+  /** Which concrete backend the spec routes to: "claude" | "codex" | "opencode" | "pi" | a custom
    *  backend name (suffixed " (script-declared)" when it comes from meta.backends). */
   backend: string;
   /** True when the call requested structured output. */

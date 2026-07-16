@@ -21,7 +21,7 @@ secret handling.
   with `reason:"auth_required"`; cold resume re-arms via `runner.auth.canResume`.
 - The default MCP server registers `workflow_auth_status` and `workflow_authenticate` alongside
   `workflow`; `AGENTPRISM_MCP_INLINE_AUTH=1` optionally adds masked elicitation collection.
-- Claude, Codex, and OpenCode profiles plus the profile-less custom-agent fixture are implemented,
+- Claude, Codex, OpenCode, and Pi profiles plus the profile-less custom-agent fixture are implemented,
   with executable `_meta`/method drift tripwires and credential-gated live suites.
 
 The original five gaps were: no client auth advertisement, no type-dispatched terminal/env
@@ -35,7 +35,7 @@ dist investigations are snapshot evidence from the 2026-07-08 design freeze and 
 not navigation pointers into today's edited source.
 
 The design is held to nine non-negotiable principles — equal first-class integrations (Codex,
-OpenCode, Claude, and custom agents), base-spec-first, full `_meta` capability support, no deferred
+OpenCode, Claude, Pi, and custom agents), base-spec-first, full `_meta` capability support, no deferred
 work, headless-library host hooks, the codex-acp fork as a constraint (not a priority ranking),
 resume/pool safety, engine pause-for-auth, and strict secret hygiene.
 
@@ -67,6 +67,7 @@ resume/pool safety, engine pause-for-auth, and strict secret hygiene.
    - 3.2 Claude Code — `@agentclientprotocol/claude-agent-acp` 0.58.1
    - 3.3 Codex — `@automatalabs/codex-acp` 1.6.3 (our fork)
    - 3.4 OpenCode — `opencode-ai` 1.17.14
+   - 3.4.1 Pi — `@automatalabs/pi-acp` 0.1.1
    - 3.5 Custom agent conformance profile
    - 3.6 Full `_meta` capability support matrix
 4. **Host surfaces, testing, and delivery**
@@ -756,9 +757,16 @@ Credential material — API keys, gateway headers, `authenticate` `_meta` payloa
 
 ## 3. Integration profiles
 
-This section records the per-agent behavior of the three first-class ACP servers — Claude Code (`@agentclientprotocol/claude-agent-acp` 0.57.0), Codex (`@automatalabs/codex-acp` 1.5.2, our fork), and OpenCode (`opencode-ai` 1.17.14) — plus the custom-agent conformance profile and the complete `_meta` support matrix. Every profile is **pure data layered on top of the type-driven base flow**; a profile may enrich, label, or contribute a spawn overlay, but it **never gates the flow** (Principle 1). Conformance is defined by the *absence* of a profile.
+This section records the per-agent behavior of the four first-class ACP servers — Claude Code
+(`@agentclientprotocol/claude-agent-acp` 0.57.0), Codex (`@automatalabs/codex-acp` 1.5.2, our fork),
+OpenCode (`opencode-ai` 1.17.14), and Pi (`@automatalabs/pi-acp` 0.1.1) — plus the custom-agent
+conformance profile and the complete `_meta` support matrix. Every profile is **pure data layered on
+top of the type-driven base flow**; a profile may enrich, label, or contribute a spawn overlay, but it
+**never gates the flow** (Principle 1). Conformance is defined by the *absence* of a profile.
 
-Each of the three agent profiles below uses the identical six-facet structure — **advertised methods + gates**, **per-method completion path**, **persistence semantics**, **logout**, **spawn-time auth**, **quirks** — with equal depth.
+Each agent profile uses the same six-facet structure — **advertised methods + gates**, **per-method
+completion path**, **persistence semantics**, **logout**, **spawn-time auth**, **quirks** — with equal
+depth. Pi's server-side wire details remain frozen in `docs/specs/pi-acp-spec.md` §9.5.
 
 ### 3.1 The `AuthProfile` seam
 
@@ -802,6 +810,7 @@ export interface AuthProfile {
 export const claudeAuthProfile: AuthProfile = { /* §3.2 */ };
 export const codexAuthProfile: AuthProfile = { /* §3.3 */ };
 export const opencodeAuthProfile: AuthProfile = { /* §3.4 */ };
+export const piAuthProfile: AuthProfile = { /* §3.4.1 */ };
 ```
 
 **`Backend` gains one optional field** (`packages/acp-agents/src/backend.ts`, appended to the `Backend` interface at the `readonly authProfile?` slot):
@@ -816,7 +825,15 @@ export interface Backend {
 }
 ```
 
-Built-ins wire theirs with a single line each: `packages/acp-agents/src/backends/claude.ts` sets `readonly authProfile = claudeAuthProfile;`, `packages/acp-agents/src/backends/codex.ts` sets `codexAuthProfile`, `packages/acp-agents/src/backends/opencode.ts` sets `opencodeAuthProfile`. `packages/acp-agents/src/backends/custom.ts` leaves it undefined. Delivered in **PR7** (§4.7). The lifecycle spine (§2) reads `backend.authProfile` when computing `spawnEnvFor` (§2.8) and when the runner derives client capabilities (§1.2); `describeAuthMethods`/`completeAuth` (§1.3, §2.9) consult `profile.describe`/`buildMeta`. The base dispatcher `buildAuthDescriptors` (§1.3) is authoritative for the `type` discriminant and the terminal-vs-agent decision below; a profile only re-labels the result.
+Built-ins wire theirs with a single line each: `packages/acp-agents/src/backends/claude.ts` sets
+`readonly authProfile = claudeAuthProfile;`, `packages/acp-agents/src/backends/codex.ts` sets
+`codexAuthProfile`, `packages/acp-agents/src/backends/opencode.ts` sets `opencodeAuthProfile`, and
+`packages/acp-agents/src/backends/pi.ts` sets `piAuthProfile`. `packages/acp-agents/src/backends/custom.ts`
+leaves it undefined. The lifecycle spine (§2) reads `backend.authProfile` when computing `spawnEnvFor`
+(§2.8) and when the runner derives client capabilities (§1.2); `describeAuthMethods`/`completeAuth`
+(§1.3, §2.9) consult `profile.describe`/`buildMeta`. The base dispatcher `buildAuthDescriptors` (§1.3)
+is authoritative for the `type` discriminant and the terminal-vs-agent decision below; a profile only
+re-labels the result.
 
 **Decision — terminal classification (owned by §1.3, relied on by all profiles).** `buildAuthDescriptors` yields a `terminal` descriptor **iff** `method.type === "terminal"` **or** the method carries `_meta["terminal-auth"] = {command,args,label}`. This is why OpenCode's bare-`agent` `opencode-login` (which carries only a `terminal-auth` hint, opencode `packages/opencode/src/acp/service.ts:101-107`) becomes a `terminal` descriptor for us, while Codex's bare-`agent` `gateway` (which carries `_meta.gateway`, codex-acp `dist/index.js:24176`) does not.
 
@@ -954,6 +971,53 @@ No CLI pre-auth flags and no startup authenticate request (`acp.ts:12-18`). Auth
 
 ---
 
+### 3.4.1 Pi — `@automatalabs/pi-acp` 0.1.1
+
+Agent identity is `@automatalabs/pi-acp`; the exact server advertisement and error behavior are frozen
+in `docs/specs/pi-acp-spec.md` §5/§8/§9.5.
+
+#### Advertised methods + gates
+
+Pi advertises six methods unconditionally: five `env_var` methods for `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, and `OPENROUTER_API_KEY`, plus the bare `agent`
+method `pi-stored-credentials` for `~/.pi/agent/auth.json`. None is terminal- or gateway-gated, so
+`piAuthProfile.clientAuthCapabilities` advertises neither optional capability.
+
+#### Per-method completion path
+
+All six `authenticate` calls are ambient no-op acknowledgements. The base descriptor dispatcher keeps
+the five provider methods as `env_var` and the stored-credentials method as `agent`; the Pi profile adds
+method-specific, non-secret remediation text without changing those base types.
+
+#### Persistence semantics
+
+Provider keys arrive from the inherited/spawn environment. `pi-stored-credentials` is disk-backed and
+read by Pi's `ModelRuntime`; the server stores no credential from the ACP request. A known model with a
+missing credential rejects `-32000`/`auth_error`, while no selected model rejects
+`-32602`/`invalid_model` and must not be misclassified as authentication.
+
+#### Logout
+
+Unadvertised. Pi exposes no ACP logout method; hosts manage provider environment keys and Pi's native
+credential store out of band.
+
+#### Spawn-time auth
+
+`PiBackend` inherits `process.env` and defines no `spawnAuthEnv` adapter. Its spawn ladder is
+`AGENTPRISM_PI_ACP_CMD`/`_ARGS` override, resolved `@automatalabs/pi-acp` bin under
+`process.execPath`, then `npx -y @automatalabs/pi-acp`.
+
+#### Quirks
+
+- All methods are visible even when the client omits `ClientCapabilities.auth`; SDK 1.2.1 has no gate
+  for `env_var` or bare `agent` methods.
+- `pi-stored-credentials` describes already-provisioned ambient disk credentials, not an interactive
+  login flow.
+- The `PiBackend` consumes categorical `data.errorKind`; auth remains code-first, while
+  `rate_limit`/`billing_error` become provider-usage-limit pauses.
+
+---
+
 ### 3.5 Custom agent conformance profile
 
 A custom ACP agent supplies **no `AuthProfile`** (`Backend.authProfile` undefined) and runs the base flow verbatim. This subsection states exactly what the base guarantees, what the agent must implement, and the executable proof.
@@ -985,7 +1049,11 @@ For any spec-conformant agent (`@agentclientprotocol/sdk` 1.2.1 schema, agentcli
 
 ### 3.6 Full `_meta` capability support matrix
 
-Every `_meta` capability the three servers expose — auth and non-auth — is either **supported-today** (cited) or a **work item in this spec** (with owning §/PR). Nothing is out-of-scope. These rows land as executable drift-tripwire assertions in `packages/acp-agents/src/protocol-coverage.ts` (PR7, §4.6.4), not as prose alone. Direction: `A→C` = agent emits to client; `C→A` = client sends to / gates agent.
+Every `_meta` capability the four servers expose — auth and non-auth — is supported and cited or
+represented by an executable drift tripwire in `packages/acp-agents/src/protocol-coverage.ts`. Pi's
+six auth methods carry no auth `_meta`; its non-auth structured-output namespace is pinned by
+`PI_ACP_PROTOCOL_CONTRACT`. Direction: `A→C` = agent emits to client; `C→A` = client sends to / gates
+agent.
 
 #### Auth `_meta`
 

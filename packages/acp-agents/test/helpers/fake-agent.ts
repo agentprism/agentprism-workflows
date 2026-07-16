@@ -13,6 +13,8 @@ export const TEST_ENV_VARS = [
   "AGENTPRISM_CODEX_ACP_ARGS",
   "AGENTPRISM_OPENCODE_ACP_CMD",
   "AGENTPRISM_OPENCODE_ACP_ARGS",
+  "AGENTPRISM_PI_ACP_CMD",
+  "AGENTPRISM_PI_ACP_ARGS",
   "AGENTPRISM_FAKE_LOG",
   "AGENTPRISM_FAKE_SCENARIO",
   "AGENTPRISM_FAKE_CRASH_SENTINEL",
@@ -20,7 +22,7 @@ export const TEST_ENV_VARS = [
   "AGENTPRISM_DEFAULT_BACKEND",
 ] as const;
 
-type FakeBackend = "claude" | "codex" | "opencode";
+type FakeBackend = "claude" | "codex" | "opencode" | "pi";
 
 export interface FakeAgentConfigureOptions {
   /** Prefix for the per-test temp worktree/log directory. */
@@ -55,7 +57,7 @@ export function configure<TLogEntry = { method: string }>(
 ): FakeAgentConfig<TLogEntry> {
   const dir = mkdtempSync(path.join(tmpdir(), options.prefix ?? "acp-it-"));
   const log = path.join(dir, "log.jsonl");
-  const backends = options.backends ?? ["claude", "codex", "opencode"];
+  const backends = options.backends ?? ["claude", "codex", "opencode", "pi"];
   if (backends.includes("claude")) {
     process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
     process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FAKE_AGENT_FIXTURE;
@@ -67,6 +69,10 @@ export function configure<TLogEntry = { method: string }>(
   if (backends.includes("opencode")) {
     process.env.AGENTPRISM_OPENCODE_ACP_CMD = process.execPath;
     process.env.AGENTPRISM_OPENCODE_ACP_ARGS = FAKE_AGENT_FIXTURE;
+  }
+  if (backends.includes("pi")) {
+    process.env.AGENTPRISM_PI_ACP_CMD = process.execPath;
+    process.env.AGENTPRISM_PI_ACP_ARGS = FAKE_AGENT_FIXTURE;
   }
   process.env.AGENTPRISM_FAKE_LOG = log;
   process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify(scenario);

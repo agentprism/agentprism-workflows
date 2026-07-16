@@ -10,7 +10,7 @@
   <a href="https://deepwiki.com/VikashLoomba/agentprism-workflows"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
 </p>
 
-Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, and OpenCode), with deterministic journaling, resume, token budgets, and git-worktree isolation.
+Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, OpenCode, and pi), with deterministic journaling, resume, token budgets, and git-worktree isolation.
 
 **Your agent authors** a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
 
@@ -25,11 +25,11 @@ Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipe
 
 ### Real harnesses, driven over an open protocol
 
-Each `agent()` call runs on a **shipped coding agent** — Claude Code, Codex, or OpenCode — driven over [ACP](https://agentclientprotocol.com), rather than a reimplementation of an agent loop around raw model APIs. You get each backend's own tool loop, permissions, and context management, plus the auth you already have on your machine (`~/.claude/.credentials.json`, `~/.codex/auth.json`, or `opencode auth login`). When the harness improves, your workflows improve with no code change here.
+Each `agent()` call runs on a **shipped coding agent** — Claude Code, Codex, OpenCode, or pi — driven over [ACP](https://agentclientprotocol.com), rather than a reimplementation of an agent loop around raw model APIs. You get each backend's own tool loop, permissions, and context management, plus the auth you already have on your machine (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`). When the harness improves, your workflows improve with no code change here.
 
 ### Many agents, one workflow
 
-The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a `codex/gpt-5.6-sol` implementation step, an `opencode/zai/glm-5.2` planning step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
+The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a `codex/gpt-5.6-sol` implementation step, an `opencode/zai/glm-5.2` planning step, a backend-default `pi` research step, and a custom `browser` QA agent can share one script, hand each other structured results, and be swapped independently. Any ACP server registers as a named backend — the built-ins are defaults, not a boundary.
 
 ### Have your agent write the workflow
 
@@ -75,11 +75,11 @@ declaration is not replay-safe.
 
 ### Structured output as validated objects
 
-`agent({ schema })` returns a schema-validated object, not text to parse. Claude and Codex constrain generation natively; OpenCode and eligible custom ACP agents get a client-hosted `StructuredOutput` MCP tool injected automatically when they advertise HTTP MCP support. The runner still validates and re-prompts on mismatch, so the same API works for native, tool-capture, and final-text JSON fallback paths.
+`agent({ schema })` returns a schema-validated object, not text to parse. Claude, Codex, and pi use native ACP schema channels; OpenCode and eligible custom ACP agents get a client-hosted `StructuredOutput` MCP tool injected automatically when they advertise HTTP MCP support. The runner still validates and re-prompts on mismatch, so the same API works for native, tool-capture, and final-text JSON fallback paths.
 
 ### The full ACP spec, enforced by the build
 
-Every client-side ACP method is served (`fs/*`, `terminal/*`, permission requests, elicitation, MCP-over-ACP) and the agent-side surface — session modes, session lifecycle, auth/providers — is driven, not stubbed. A coverage manifest keyed off the SDK's method constants breaks the build on protocol drift, and a live end-to-end suite against real Claude, Codex, and OpenCode backends gates every push.
+Every client-side ACP method is served (`fs/*`, `terminal/*`, permission requests, elicitation, MCP-over-ACP) and the agent-side surface — session modes, session lifecycle, auth/providers — is driven, not stubbed. A coverage manifest keyed off the SDK's method constants breaks the build on protocol drift; the end-to-end suite covers real Claude, Codex, OpenCode, and pi providers when gated, plus a credential-free pi leg through pi-acp's injected runtime.
 
 ### Controls for unattended runs
 
@@ -102,7 +102,7 @@ One process plays **two protocol roles at once**: it's an **MCP server** (or a l
 └──────────────────────────────────────────────┘
         │  session/new or resume/load, then session/prompt … (ACP over stdio)
         ▼
-   claude-agent-acp / codex-acp / opencode acp   (long-lived, pooled subprocesses)
+   claude-agent-acp / codex-acp / opencode acp / pi-acp   (long-lived, pooled subprocesses)
         │  → real agents; paused occurrences may reopen their recorded session
 ```
 
@@ -117,6 +117,7 @@ The deterministic engine (sandboxed `vm` realm, `parallel`/`pipeline`, journal/r
   - **Claude** — via the bundled `@agentclientprotocol/claude-agent-acp`; auth from `~/.claude/.credentials.json` or `ANTHROPIC_API_KEY` (the orchestrator inherits your environment).
   - **Codex** — via `@automatalabs/codex-acp` (+ the `@openai/codex` binary, installed as a dependency); auth from `~/.codex/auth.json`.
   - **OpenCode** — supported but **not bundled**. Install the `opencode` CLI on PATH or add `opencode-ai` to your own project (its platform binaries are large), then authenticate with `opencode auth login`.
+  - **pi** — via the bundled `@automatalabs/pi-acp`; auth from the selected provider's API key or pi's `~/.pi/agent/auth.json`.
 
 You only need auth for the backend(s) you actually call.
 
@@ -151,7 +152,7 @@ Two packages are the primary **user-facing entry points** — start with one of 
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
 | **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, await, resume, and inspect — built on `@automatalabs/workflows`. |
-| **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; usable today through the generic custom-backend registry. |
+| **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; exact-pinned and spawned by the first-class `pi` backend. |
 
 One optional integration package attaches to the SDK's manager surface:
 
@@ -163,7 +164,7 @@ The three packages below are **internal building blocks**, composed by the SDK. 
 
 | Package | What it is |
 |---|---|
-| **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
+| **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, budgets, worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/shared-types`** | The `AgentRunner` seam + shared types the others compose against. Internal — public entry is `@automatalabs/workflows`. |
 
@@ -347,7 +348,7 @@ Inspection returns lifecycle status, ordered phases, a redacted log tail, and at
 call previews. Its structured payload is capped at 24,576 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
-The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' own CLI credential stores (`claude /login`, `codex login`, `opencode auth login`) — logged-in CLIs need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; log that CLI in out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -398,7 +399,7 @@ machines; it is the same table every validate report includes.
 
 ## Structured output
 
-Pass a JSON Schema as `agent({ schema })` and the result is a **validated object**, not text. Claude and Codex constrain generation natively (Claude via its output-format channel; Codex via a turn-level `outputSchema`), while OpenCode uses the injected client-hosted `StructuredOutput` MCP tool when it advertises HTTP MCP support. Generic ACP agents get that same tool when opted in. The runner validates and re-prompts on mismatch; the public `agent({ schema })` API is unchanged. See [`docs/design-notes.md` §6](docs/design-notes.md) for the per-backend mechanics.
+Pass a JSON Schema as `agent({ schema })` and the result is a **validated object**, not text. Claude, Codex, and pi constrain generation through native channels (pi uses turn-level `_meta.outputSchema` and returns the captured value in the final message), while OpenCode uses the injected client-hosted `StructuredOutput` MCP tool when it advertises HTTP MCP support. Generic ACP agents get that same tool when opted in. The runner validates and re-prompts on mismatch; the public `agent({ schema })` API is unchanged. See [`docs/design-notes.md` §6](docs/design-notes.md) for the per-backend mechanics.
 
 ---
 
@@ -406,8 +407,8 @@ Pass a JSON Schema as `agent({ schema })` and the result is a **validated object
 
 The backend is chosen per `agent()` call from the effective `model`/`tier` spec with one deterministic rule:
 
-- Split on the first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`, `opencode`, or a registered custom backend name, route there and strip exactly that segment. Custom registrations take priority on a name collision.
-- A backend name alone (`claude`, `codex`, `opencode`, or a custom name) selects no model, leaving that harness's configured default untouched.
+- Split on the first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name, route there and strip exactly that segment. Custom registrations take priority on a name collision.
+- A backend name alone (`claude`, `codex`, `opencode`, `pi`, or a custom name) selects no model, leaving that harness's configured default untouched.
 - Otherwise route the entire authored string, unchanged, to `AGENTPRISM_DEFAULT_BACKEND` (historical default `claude`). `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases.
 - When a model id remains, it is sent byte-for-byte through `session/set_config_option`: no catalog matching, case folding, bracket parsing, or fallback. Brackets, dots, and provider prefixes are ordinary id characters, and a harness rejection follows the existing agent-error path.
 
@@ -417,7 +418,7 @@ selection and before the prompt, with no aliases or coercion. The `"model"` key 
 the dedicated `model` field. Run the validator and read each harness's advertised-options table
 before choosing ids or select values.
 
-Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Prefer the backend-only forms when the desired model is configured inside the harness.
+Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Pi model specs use `pi/<provider>/<model-id>`; prefer backend-only forms when the desired model is configured inside the harness.
 
 One long-lived ACP process per backend is **pooled** and reused across `agent()` calls (one spawn + one `initialize`). Calls normally open a fresh session; an eligible resume of a usage/auth-paused occurrence instead reopens that occurrence's recorded session and continues it. Worktree-isolated calls always stay on the fresh path, preserving isolation through each new session's `cwd`.
 
@@ -441,7 +442,7 @@ const runner = createAcpRunner({
 await runDynamicWorkflow(script, { runner });
 ```
 
-Inside a script: `agent("Verify the checkout flow…", { model: "browser", schema: VERDICT, meta: { credsRef: "vault://qa" } })`. `model: "browser/vision-large"` sends `vision-large` verbatim as the model id. The same registry can be declared without code via the `AGENTPRISM_BACKENDS` env var (JSON of the same shape) — which is how the MCP server picks it up. Names are ASCII-case-insensitive, and a registered custom name takes priority even when it matches `claude`, `codex`, or `opencode`.
+Inside a script: `agent("Verify the checkout flow…", { model: "browser", schema: VERDICT, meta: { credsRef: "vault://qa" } })`. `model: "browser/vision-large"` sends `vision-large` verbatim as the model id. The same registry can be declared without code via the `AGENTPRISM_BACKENDS` env var (JSON of the same shape) — which is how the MCP server picks it up. Names are ASCII-case-insensitive, and a registered custom name takes priority even when it matches `claude`, `codex`, `opencode`, or `pi`.
 
 Custom backends speak a generic dialect: a `schema` is forwarded as turn-level `_meta.outputSchema` (plain JSON Schema), and when the initialized agent advertises HTTP MCP support the runner injects a localhost `StructuredOutput` MCP tool whose input schema is that same schema. Without HTTP MCP, or when `structuredOutputTool:false` is set on the backend config, the schema is stated in the prompt and the result is read by JSON-parsing the final assistant message. Per-call `meta` merges over the registry's `sessionMeta` defaults; protocol-critical keys (schema channels, `runId`) always win.
 
@@ -472,7 +473,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| a registered custom name). |
+| `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| `pi` \| a registered custom name). |
 | `AGENTPRISM_BACKENDS` | (none) | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Programmatic `createAcpRunner({ backends })` wins per name. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | (unset) | MCP server only: `1`/`true` approves **script-declared** `meta.backends` headlessly (for clients without elicitation support). |
 | `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run state, logs, journals, and resume data. |
@@ -481,13 +482,14 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 | `AGENTPRISM_CLAUDE_ACP_CMD` / `…_ARGS` | (bundled) | Override the Claude ACP server command/args. |
 | `AGENTPRISM_CODEX_ACP_CMD` / `…_ARGS` / `…_BIN` | (bundled) | Override the Codex ACP server command/args/binary. |
 | `AGENTPRISM_OPENCODE_ACP_CMD` / `…_ARGS` | `opencode acp` | Override the OpenCode ACP server command/args. With `…_CMD` set, args come only from `…_ARGS`. |
+| `AGENTPRISM_PI_ACP_CMD` / `…_ARGS` | bundled `@automatalabs/pi-acp` | Override the pi ACP server command/args. With `…_CMD` set, args come only from `…_ARGS`. |
 | `AGENTPRISM_OPENCODE_E2E_MODEL` | `opencode/zai/glm-5.2` | Live e2e OpenCode model spec. |
 
 ---
 
 ## Documentation
 
-- [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes all three backends in one autonomous multi-stage run.
+- [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes three selected backends in one autonomous multi-stage run.
 - [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, MCP auth tools, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
 - [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add VikashLoomba/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.

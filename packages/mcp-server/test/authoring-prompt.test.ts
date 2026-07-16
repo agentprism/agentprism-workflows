@@ -60,6 +60,8 @@ test("generated authoring-prompt teaches registered-prefix routing and verbatim 
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("sent byte-for-byte"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("no catalog matching, case folding, bracket parsing"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`codex/gpt-5.6-sol`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`pi/openrouter/vendor/model-id`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi's native path neither embeds the schema in the prompt nor injects an MCP tool."));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("model resolution does not emit them"));
 });
 

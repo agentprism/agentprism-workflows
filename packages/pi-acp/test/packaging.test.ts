@@ -9,7 +9,7 @@ test("T24 manifest has exact runtime pins and split packed entries", async () =>
   const manifest = JSON.parse(await readFile(new URL("package.json", packageRoot), "utf8"));
   assert.deepEqual(manifest.dependencies, {
     "@agentclientprotocol/sdk": "1.2.1",
-    "@earendil-works/pi-coding-agent": "0.80.8",
+    "@earendil-works/pi-coding-agent": "0.80.9",
     "@modelcontextprotocol/sdk": "1.29.0",
     typebox: "1.3.2",
   });
@@ -40,7 +40,7 @@ test("T26 root project references pi-acp and a publishing changeset exists", asy
   assert.ok(pendingChangeset || releasedChangelog);
 });
 
-test("T27 README covers invocation, API, registration, T2b disclosure, limits, and attribution", async () => {
+test("T27 README covers invocation, API, built-in routing, T2b disclosure, limits, and attribution", async () => {
   const readme = await readFile(new URL("README.md", packageRoot), "utf8");
   for (const required of [
     "npx @automatalabs/pi-acp",
@@ -49,8 +49,10 @@ test("T27 README covers invocation, API, registration, T2b disclosure, limits, a
     "PiAcpAgent",
     "resolveDeps",
     "PiAcpDeps",
-    '"namespace": "@automatalabs/pi-acp"',
-    '"gatedKeys": ["outputSchema"]',
+    "AgentPrism built-in backend",
+    'model: "pi"',
+    'model: "pi/openrouter/vendor/model-id"',
+    'agentCapabilities._meta["@automatalabs/pi-acp"].outputSchema',
     "provider/model-id",
     "-32000",
     "pi-stored-credentials",

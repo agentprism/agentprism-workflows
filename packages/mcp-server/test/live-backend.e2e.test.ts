@@ -2,7 +2,7 @@
 //
 // Every OTHER suite in this repo speaks ACP to a FAKE (stub AgentRunner / in-memory
 // transport). This one drives the REAL built mcp-server over stdio and the REAL backend
-// ACP servers (claude-agent-acp, the de-vendored npm dep codex-acp, and OpenCode), so
+// ACP servers (claude-agent-acp, the npm deps codex-acp and pi-acp, and OpenCode), so
 // the two structured-output cruxes — (1) a schema'd agent yields a typebox-validated
 // structured OBJECT (not text), and (2) ONE long-lived pooled backend subprocess serves
 // every session — have a re-runnable guard against the actual adapters.
@@ -27,7 +27,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-type Backend = "claude" | "codex" | "opencode";
+type Backend = "claude" | "codex" | "opencode" | "pi";
 
 // Skip-by-default gate. node:test treats a string `skip` as the skip reason.
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
@@ -47,6 +47,7 @@ const BACKEND_BIN: Record<Backend, string> = {
   claude: requireAcp.resolve("@agentclientprotocol/claude-agent-acp/dist/index.js"),
   codex: requireAcp.resolve("@automatalabs/codex-acp"),
   opencode: resolveOpenCodeBin(),
+  pi: join(dirname(requireAcp.resolve("@automatalabs/pi-acp")), "index.js"),
 };
 
 // Each backend's ACP server is a published npm package under its own scope: Claude stays on the
@@ -54,9 +55,11 @@ const BACKEND_BIN: Record<Backend, string> = {
 const BACKEND_SCOPE: Record<Exclude<Backend, "opencode">, string> = {
   claude: "@agentclientprotocol/",
   codex: "@automatalabs/",
+  pi: "@automatalabs/",
 };
 
 const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/google/gemini-2.5-flash";
+const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL;
 
 function resolveOpenCodeBin(): string {
   if (process.env.AGENTPRISM_OPENCODE_ACP_CMD) return process.env.AGENTPRISM_OPENCODE_ACP_CMD;
@@ -165,7 +168,8 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
   const { Check, Convert } = tbValue;
 
   const MARKER = pkgTail(BACKEND_BIN[backend]);
-  const script = buildScript(backend, backend === "opencode" ? OPENCODE_E2E_MODEL : undefined);
+  const model = backend === "opencode" ? OPENCODE_E2E_MODEL : backend === "pi" ? PI_E2E_MODEL : undefined;
+  const script = buildScript(backend, model);
 
   const out: LiveOutcome = {
     ran: false,
@@ -326,7 +330,7 @@ function assertBackend(backend: Backend, out: LiveOutcome): void {
   const d = () => diag(backend, out);
   const bin = BACKEND_BIN[backend];
 
-  // De-vendor proof for bundled adapters: Claude/Codex spawn targets are npm installs under
+  // De-vendor proof for bundled adapters: Claude/Codex/Pi spawn targets are npm installs under
   // their published scopes. OpenCode is explicitly not bundled; it may be PATH, env override,
   // or a host-installed opencode-ai package.
   if (backend !== "opencode") {
@@ -381,7 +385,7 @@ test("live-backend e2e: claude drives schema'd structured output with single-pro
   assertBackend("claude", out);
 });
 
-test("live-backend e2e: codex (npm-installed + pnpm-patched) drives schema'd structured output with single-process pooling reuse", {
+test("live-backend e2e: codex npm package drives schema'd structured output with single-process pooling reuse", {
   skip: SKIP,
   timeout: 300_000,
 }, async () => {
@@ -397,4 +401,13 @@ test("live-backend e2e: opencode drives schema'd structured output through the i
   assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
   const out = await runLiveBackend("opencode");
   assertBackend("opencode", out);
+});
+
+test("live-backend e2e: pi drives native schema output with single-process pooling reuse", {
+  skip: SKIP,
+  timeout: 300_000,
+}, async () => {
+  assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
+  const out = await runLiveBackend("pi");
+  assertBackend("pi", out);
 });

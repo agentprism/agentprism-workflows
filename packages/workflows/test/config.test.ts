@@ -87,11 +87,11 @@ test("default targets are the built-ins; catalogs and probe cwd flow through", a
       const report = await probeHarnessConfig({ cwd: HOME });
       assert.equal(report.ok, true);
       assert.equal(report.exitCode, 0);
-      assert.deepEqual(probes.map((probe) => probe.spec), ["claude", "codex", "opencode"]);
+      assert.deepEqual(probes.map((probe) => probe.spec), ["claude", "codex", "opencode", "pi"]);
       assert.ok(probes.every((probe) => probe.cwd === HOME));
       assert.deepEqual(
         report.harnessOptions.map((harness) => harness.backendId),
-        ["claude", "codex", "opencode"],
+        ["claude", "codex", "opencode", "pi"],
       );
       assert.ok(report.harnessOptions.every((harness) => harness.probed));
       assert.deepEqual(report.harnessOptions[0].options, ADVERTISED_OPTIONS);
@@ -117,7 +117,7 @@ test("registered custom backends join the default target list (env and programma
   try {
     await withEnv("AGENTPRISM_BACKENDS", JSON.stringify({ browser: { command: "browser-acp" } }), async () => {
       const report = await probeHarnessConfig({ backends: { visual: { command: "visual-acp" } } });
-      assert.deepEqual(probes, ["claude", "codex", "opencode", "browser", "visual"]);
+      assert.deepEqual(probes, ["claude", "codex", "opencode", "pi", "browser", "visual"]);
       assert.equal(report.ok, true);
     });
   } finally {
@@ -230,6 +230,8 @@ function runCli(args: string[], env: Record<string, string | undefined> = {}) {
       AGENTPRISM_CODEX_ACP_ARGS: FAKE_AGENT,
       AGENTPRISM_OPENCODE_ACP_CMD: process.execPath,
       AGENTPRISM_OPENCODE_ACP_ARGS: FAKE_AGENT,
+      AGENTPRISM_PI_ACP_CMD: process.execPath,
+      AGENTPRISM_PI_ACP_ARGS: FAKE_AGENT,
       ...env,
     },
   });
@@ -242,7 +244,7 @@ test("CLI: no-arg config probes every built-in harness and exits 0", () => {
   assert.equal(report.ok, true);
   assert.deepEqual(
     report.harnessOptions.map((harness: { backendId: string }) => harness.backendId),
-    ["claude", "codex", "opencode"],
+    ["claude", "codex", "opencode", "pi"],
   );
   const model = report.harnessOptions[0].options.find((option: { id: string }) => option.id === "model");
   assert.ok(
@@ -273,7 +275,7 @@ test("CLI: an env-registered custom backend is probeable by name and joins the d
   assert.equal(all.status, 0, all.stderr);
   assert.deepEqual(
     JSON.parse(all.stdout).harnessOptions.map((harness: { backendId: string }) => harness.backendId),
-    ["claude", "codex", "opencode", "browser"],
+    ["claude", "codex", "opencode", "pi", "browser"],
   );
 });
 

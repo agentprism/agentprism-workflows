@@ -278,7 +278,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   phase?: string;
   schema?: TSchemaDef;
   /**
-   * Run this agent with a model spec. `claude`, `codex`, `opencode`, or a registered custom
+   * Run this agent with a model spec. `claude`, `codex`, `opencode`, `pi`, or a registered custom
    * name may prefix an id and is stripped once; the remainder is sent byte-for-byte. A backend
    * name alone preserves its harness default. Unregistered prefixes go intact to the default.
    */
