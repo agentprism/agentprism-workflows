@@ -80,6 +80,20 @@ The gate failing anywhere — pre-push, a PR's required check, or the release wo
    - *Upstream added capability we should exploit*: land the mechanical bump first to unblock the gate, and file an issue for the capability work so it is tracked, not lost.
 3. **Land the maintenance PR** — its own CI passes because its tree carries the fixed pins, which is exactly why a stale gate never wedges the repo: the fix PR is always mergeable. Once it merges, every blocked PR unblocks on rebase/re-run, and the next push to `main` versions and publishes normally.
 
+## Workflow launches carry the user's verbatim request (source gate)
+
+Agent-driven development in this repo runs through AgentPrism workflows, and the highest-leverage failure observed to date is not inside any workflow — it is the seam **between the user's request and the prose the driving agent writes into the workflow's prompts**. Once a paraphrase or a silently narrowed scope enters at authoring time, every downstream gate faithfully verifies against the authored framing (spec, brief, frozen contract) rather than the request, and the error is amplified instead of caught.
+
+That seam now has a deterministic gate: a Claude Code `PreToolUse` hook (`.claude/settings.json` → `scripts/hooks/workflow-source-gate.mjs`) intercepts every `workflow` tool **run** and blocks it unless `args.sourceRequest` (string or `string[]`) carries the user's request sentences and each one is found — whitespace-normalized, role-verified — in a **genuine user-authored turn** of this project's session transcripts (current session first, then the 100 most recent). Agent-authored text structurally cannot pass: assistant records, tool results, sidechain (subagent) prompts, `isMeta` records, the compaction summary (which quotes user sentences but is agent-authored), and machine-injected spans (`<system-reminder>`, command wrappers) are all excluded from the search space. No transcript ⇒ fails closed. `inspect`/`await`/`stop` are ungated. There is no bypass.
+
+The gate verifies **authenticity, not relevance** — choosing the right sentences and honoring them is the launcher's contract:
+
+1. Quote the exact request sentence(s) the workflow serves, including scope-bearing follow-ups from the conversation (e.g. a later "I want it to be a first class backend" belongs next to the original ask). Over-inclusion is cheap; selection bias is the failure mode.
+2. Before launching, reconcile the script's prompts against the quoted source: remove additions the user never asked for, restore pieces the prompts dropped, and put every genuine ambiguity to the user as a binary question — *"Your request was: ⟨verbatim X⟩. The workflow says: ⟨Y⟩. Correct?"* — while corrections are still free.
+3. Propagate the quote: derived artifacts (issues, specs, briefs, focus files) carry the verbatim source block so later stages — and later workflow launches — re-anchor to what the user said, not to the previous derivation. Avoid interpolating `sourceRequest` into `agent()` prompt strings unless intended: prompts are replay-identity-hashed, focus files are not.
+
+Tests: `packages/mcp-server/test/workflow-source-gate.test.ts` (hermetic fixture transcripts covering every provenance trap).
+
 ## Releasing
 
 Versioning is managed with **[Changesets](https://github.com/changesets/changesets)**.
