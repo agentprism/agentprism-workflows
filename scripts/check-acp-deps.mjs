@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ACP dependency freshness gate (policy: bump ACP deps at every release — see CONTRIBUTING.md).
-// Two checks, exit 1 if either fails:
+// Three checks, exit 1 if any fails:
 //   1. npm freshness: the pnpm-lock.yaml-resolved versions of the ACP client/agent libraries must
 //      match the npm registry's `latest` dist-tag (prints the exact bump command per dep).
 //   2. Fork git sync (FORK_SYNC): fork version lines diverge from upstream's, so versions can't be
@@ -11,6 +11,11 @@
 //      machine: the GitHub compare API against the fork's `parent` repo (same upstream).
 //      Unauthenticated GitHub API works but is rate-limited; the pre-push hook passes
 //      GITHUB_TOKEN from `gh auth token` when available.
+//   3. Wrapped runtime freshness (WRAPPED_RUNTIMES): an adapter can be at npm latest while
+//      exact-pinning a stale agent runtime inside it (the runtime is what actually answers
+//      prompts), so check 1 is structurally blind to this axis. Compare the lockfile's
+//      *transitive* resolution of the wrapped runtime against the runtime's npm `latest` —
+//      lockfile-first, so a root pnpm override satisfies the check with no special-casing.
 //
 // Zero dependencies; run standalone with `node scripts/check-acp-deps.mjs` or via .githooks/pre-push.
 // A registry/API that can't be reached (offline, timeout, rate limit) WARNS and passes — it never
@@ -41,7 +46,16 @@ const FORK_SYNC = {
   },
 };
 
-const REGISTRY = "https://registry.npmjs.org";
+// Adapter packages that wrap an agent runtime whose freshness matters independently of the
+// adapter's own version. Fix when behind: bump the adapter if its latest already wraps a current
+// runtime, else pin a root pnpm override until upstream catches up (and drop the override once it
+// does — the check warns when an override has become redundant).
+const WRAPPED_RUNTIMES = {
+  "@agentclientprotocol/claude-agent-acp": { wraps: "@anthropic-ai/claude-agent-sdk" },
+};
+
+// Env override exists for hermetic tests (point at a local stub registry); production runs never set it.
+const REGISTRY = process.env.AGENTPRISM_NPM_REGISTRY || "https://registry.npmjs.org";
 const FETCH_TIMEOUT_MS = 10_000;
 
 function isTracked(name) {
@@ -84,6 +98,29 @@ function lockedVersion(dep) {
   return versions.size > 0 ? [...versions] : null;
 }
 
+// Transitive resolution: what the lockfile actually installs for `dep`, from the top-level
+// `packages:`/`snapshots:` section keys ("  '@scope/name@1.2.3':" / "  name@1.2.3:" /
+// "  '@scope/name@1.2.3(peer@x)':"). Importer blocks only cover direct deps, so wrapped
+// runtimes never appear there. Anchoring on `@` after the full name keeps platform
+// sub-packages (name-darwin-arm64@…) from matching.
+function lockedTransitiveVersions(dep) {
+  const escaped = dep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^ {2}'?${escaped}@([0-9][^'(:\\n]*)`, "gm");
+  const versions = new Set([...lockfile.matchAll(re)].map((m) => m[1].trim()));
+  return versions.size > 0 ? [...versions] : null;
+}
+
+// Root pnpm overrides (package.json "pnpm".overrides) — consulted only to warn when an override
+// that carried the wrapped runtime forward has become redundant.
+function rootPnpmOverrides() {
+  try {
+    const manifest = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+    return manifest.pnpm?.overrides ?? {};
+  } catch {
+    return {};
+  }
+}
+
 // ---- semver ------------------------------------------------------------------------------------
 function parseVer(v) {
   const [core, pre] = v.split("-", 2);
@@ -100,17 +137,21 @@ function semverLt(a, b) {
 }
 
 // ---- registry / GitHub fetchers ------------------------------------------------------------------
-const manifestCache = new Map(); // dep -> Promise<latest manifest JSON>
-function fetchLatestManifest(dep) {
-  if (!manifestCache.has(dep)) {
-    manifestCache.set(dep, (async () => {
-      const url = `${REGISTRY}/${dep.replace("/", "%2F")}/latest`;
+const manifestCache = new Map(); // "dep@ref" -> Promise<version manifest JSON>
+function fetchManifest(dep, ref) {
+  const key = `${dep}@${ref}`;
+  if (!manifestCache.has(key)) {
+    manifestCache.set(key, (async () => {
+      const url = `${REGISTRY}/${dep.replace("/", "%2F")}/${ref}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
       return res.json();
     })());
   }
-  return manifestCache.get(dep);
+  return manifestCache.get(key);
+}
+function fetchLatestManifest(dep) {
+  return fetchManifest(dep, "latest");
 }
 
 async function ghApi(path) {
@@ -266,7 +307,69 @@ const forkSync = Promise.all(
     }),
 );
 
-await Promise.all([freshness, forkSync]);
+// ---- check 3: wrapped runtime freshness ----------------------------------------------------------
+const wrappedIssues = []; // { dep, wraps, locked, latest, viaAdapterBump }
+
+// Exact-pin version string (e.g. "0.3.207") vs range — only exact pins are comparable.
+function exactPin(spec) {
+  return typeof spec === "string" && /^[0-9]/.test(spec) ? spec : null;
+}
+
+const wrappedRuntimes = Promise.all(
+  Object.entries(WRAPPED_RUNTIMES)
+    .filter(([dep]) => tracked.some((t) => t.dep === dep))
+    .map(async ([dep, { wraps }]) => {
+      const locked = lockedTransitiveVersions(wraps);
+      if (!locked) {
+        warnings.push(
+          `acp-deps: ${wraps} (wrapped by ${dep}) not found in pnpm-lock.yaml — is the lockfile in sync? (pnpm install)`,
+        );
+        return;
+      }
+      let latest;
+      try {
+        latest = (await fetchLatestManifest(wraps)).version;
+      } catch (err) {
+        warnings.push(
+          `acp-deps: could not reach registry for ${wraps} (${err.message}) — SKIPPING wrapped-runtime check for it`,
+        );
+        return;
+      }
+      const stale = locked.filter((v) => semverLt(v, latest));
+      if (stale.length > 0) {
+        // Pick the remediation: if the adapter's latest already pins a current runtime, the fix
+        // is the ordinary adapter bump (check 1 is firing too); otherwise a root pnpm override.
+        let viaAdapterBump = false;
+        try {
+          const pin = exactPin((await fetchLatestManifest(dep)).dependencies?.[wraps]);
+          viaAdapterBump = pin !== null && !semverLt(pin, latest);
+        } catch {
+          // Registry hiccup on the adapter manifest — the override remediation below stays valid.
+        }
+        wrappedIssues.push({ dep, wraps, locked: stale[0], latest, viaAdapterBump });
+        return;
+      }
+      console.error(`acp-deps: ${wraps} ${locked.join(", ")} (wrapped by ${dep}) == latest — ok`);
+      const override = rootPnpmOverrides()[wraps];
+      if (override !== undefined) {
+        try {
+          const adapterLocked = lockedVersion(dep)?.[0];
+          const pin = adapterLocked
+            ? exactPin((await fetchManifest(dep, adapterLocked)).dependencies?.[wraps])
+            : null;
+          if (pin !== null && !semverLt(pin, latest)) {
+            warnings.push(
+              `acp-deps: root pnpm override ${wraps}@${override} is redundant (${dep}@${adapterLocked} already pins ${pin}) — remove it from package.json pnpm.overrides and pnpm install`,
+            );
+          }
+        } catch {
+          // Best-effort hint only — never noise a push over an unreachable manifest.
+        }
+      }
+    }),
+);
+
+await Promise.all([freshness, forkSync, wrappedRuntimes]);
 
 for (const w of warnings) console.error(w);
 
@@ -292,4 +395,19 @@ if (forkIssues.length > 0) {
   }
 }
 
-process.exit(outdated.length > 0 || forkIssues.length > 0 ? 1 : 0);
+if (wrappedIssues.length > 0) {
+  console.error("");
+  console.error("acp-deps: wrapped agent runtime(s) BEHIND npm latest — update before pushing:");
+  for (const { dep, wraps, locked, latest, viaAdapterBump } of wrappedIssues) {
+    console.error(`  ${wraps} (wrapped by ${dep}): installed ${locked}, latest ${latest}`);
+    if (viaAdapterBump) {
+      console.error(`    → ${dep}@latest already wraps a current ${wraps}: bump ${dep} (check 1 above prints the command)`);
+    } else {
+      console.error(`    → ${dep}@latest still pins an older ${wraps} — add a root override in package.json:`);
+      console.error(`      "pnpm": { "overrides": { "${wraps}": "${latest}" } }`);
+      console.error(`      then pnpm install, run the acp-agents live e2e, and push (drop the override once ${dep} catches up)`);
+    }
+  }
+}
+
+process.exit(outdated.length > 0 || forkIssues.length > 0 || wrappedIssues.length > 0 ? 1 : 0);
