@@ -624,8 +624,8 @@ test("actual manager-owned resume lineage retains its root after the middle reco
     const ids = [first.runId, second.runId, third.runId];
     assert.equal(second.resumeReport?.sourceRunId, first.runId);
     assert.equal(third.resumeReport?.sourceRunId, second.runId);
-    assert.equal(manager.getPersistence().load(second.runId)?.resumeSeed?.sourceRunId, first.runId);
-    assert.equal(manager.getPersistence().load(third.runId)?.resumeSeed?.sourceRunId, second.runId);
+    assert.equal(manager.getPersistence().load(second.runId)?.resumeSourceRunId, first.runId);
+    assert.equal(manager.getPersistence().load(third.runId)?.resumeSourceRunId, second.runId);
     assert.equal(manager.deleteRun(second.runId), true);
     assert.equal(manager.getPersistence().load(second.runId), null);
 
@@ -694,7 +694,7 @@ test("createWorkflowServer observes injected-manager deletion exactly once and k
   }
 });
 
-test("lineage normalizes engine-seed pointer cycles and missing ancestors", async () => {
+test("lineage normalizes engine ancestry pointer cycles and missing ancestors", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-normalization-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
   const first = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "cycle-first"));
@@ -707,20 +707,16 @@ test("lineage normalizes engine-seed pointer cycles and missing ancestors", asyn
   assert.ok(firstState && secondState && flattenedState);
   persistence.save({
     ...firstState,
-    resumeSeed: { format: "identity-v1", sourceRunId: second.runId, candidates: [] },
+    resumeSourceRunId: second.runId,
   });
   persistence.save({
     ...secondState,
-    resumeSeed: { format: "identity-v1", sourceRunId: first.runId, candidates: [] },
+    resumeSourceRunId: first.runId,
   });
   const missingRunId = "missing-ancestor";
   persistence.save({
     ...flattenedState,
-    resumeSeed: {
-      format: "identity-v1",
-      sourceRunId: missingRunId,
-      candidates: [],
-    },
+    resumeSourceRunId: missingRunId,
   });
 
   const mcp = new McpServer({ name: "lineage-normalization", version: "0.0.0" }, { capabilities: {} });
@@ -746,18 +742,33 @@ test("lineage normalizes engine-seed pointer cycles and missing ancestors", asyn
   }
 });
 
-test("resume reports and replay provenance never override the authoritative engine seed pointer", async () => {
+test("resume reports, matcher seeds, and replay provenance never override engine ancestry", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-precedence-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const authoritativeParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "authoritative-parent"));
   const seedParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "seed-parent"));
   const reportParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "report-parent"));
+  const provenanceParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "provenance-parent"));
   const child = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "lineage-child"));
   const persistence = manager.getPersistence();
   const childState = persistence.load(child.runId);
   assert.ok(childState);
   persistence.save({
     ...childState,
-    resumeSeed: { format: "identity-v1", sourceRunId: seedParent.runId, candidates: [] },
+    resumeSourceRunId: authoritativeParent.runId,
+    resumeSeed: {
+      format: "identity-v1",
+      sourceRunId: seedParent.runId,
+      candidates: [],
+      checkpointInjections: [{
+        sourceRunId: provenanceParent.runId,
+        recordedIndex: 0,
+        hash: "provenance-hash",
+        path: "checkpoint:0",
+        inputsHash: "provenance-inputs",
+        decision: true,
+      }],
+    },
     resumeReport: {
       strategy: "identity-v1",
       sourceRunId: reportParent.runId,
@@ -775,13 +786,13 @@ test("resume reports and replay provenance never override the authoritative engi
   try {
     assert.deepEqual(
       resources.lineage(child.runId).map((entry) => entry.runId),
-      [seedParent.runId, child.runId],
+      [authoritativeParent.runId, child.runId],
     );
     assert.equal(manager.deleteRun(child.runId), true);
-    assert.equal(persistence.loadLineageTombstone?.(child.runId)?.sourceRunId, seedParent.runId);
+    assert.equal(persistence.loadLineageTombstone?.(child.runId)?.sourceRunId, authoritativeParent.runId);
     assert.deepEqual(
       resources.lineage(child.runId).map((entry) => entry.runId),
-      [seedParent.runId, child.runId],
+      [authoritativeParent.runId, child.runId],
     );
   } finally {
     await mcp.close();
@@ -789,7 +800,7 @@ test("resume reports and replay provenance never override the authoritative engi
   }
 });
 
-test("lineage walks every engine-seed pointer oldest to newest", async () => {
+test("lineage walks every engine ancestry pointer oldest to newest", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-mixed-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
   const runs = await Promise.all(
@@ -803,15 +814,15 @@ test("lineage walks every engine-seed pointer oldest to newest", async () => {
   assert.ok(states.every((state) => state !== null));
   persistence.save({
     ...states[1]!,
-    resumeSeed: { format: "identity-v1", sourceRunId: ids[0]!, candidates: [] },
+    resumeSourceRunId: ids[0]!,
   });
   persistence.save({
     ...states[2]!,
-    resumeSeed: { format: "identity-v1", sourceRunId: ids[1]!, candidates: [] },
+    resumeSourceRunId: ids[1]!,
   });
   persistence.save({
     ...states[3]!,
-    resumeSeed: { format: "identity-v1", sourceRunId: ids[2]!, candidates: [] },
+    resumeSourceRunId: ids[2]!,
   });
 
   const mcp = new McpServer({ name: "lineage-mixed", version: "0.0.0" }, { capabilities: {} });
@@ -864,13 +875,9 @@ test("public inspect lineage compaction retains newest diagnostics and recompute
       runId: ancestors[index]!,
       workflowName: `lineage-ancestor-${index}`,
       ...(index === 0
-        ? { resumeSeed: undefined }
+        ? { resumeSourceRunId: undefined }
         : {
-            resumeSeed: {
-              format: "identity-v1" as const,
-              sourceRunId: ancestors[index - 1]!,
-              candidates: [],
-            },
+            resumeSourceRunId: ancestors[index - 1]!,
           }),
     });
   }
@@ -879,11 +886,7 @@ test("public inspect lineage compaction retains newest diagnostics and recompute
     phases,
     logs,
     journal,
-    resumeSeed: {
-      format: "identity-v1",
-      sourceRunId: ancestors.at(-1)!,
-      candidates: [],
-    },
+    resumeSourceRunId: ancestors.at(-1)!,
   });
 
   const inspectionManager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });

@@ -194,11 +194,44 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       });
       const result = await started.promise;
       assert.equal(result.resumeReport?.replayed, 2);
-      assert.deepEqual(store.persistence.load("durable-target")?.resumeSeed, {
-        format: "identity-v1",
-        sourceRunId,
-        candidates: [],
+      assert.equal(store.persistence.load("durable-target")?.resumeSeed, undefined);
+    } finally {
+      dirs.cleanup();
+    }
+  });
+
+  it("persists an immutable immediate ancestry pointer without changing matcher seed lifecycle", async () => {
+    const dirs = tempDirs();
+    try {
+      const store = memoryStore(dirs.root);
+      const manager = new WorkflowManager({
+        cwd: dirs.cwd,
+        persistence: store.persistence,
+        environmentKey: ENVIRONMENT_KEY,
+        agent: { async run(prompt) { return `recorded:${prompt}`; } },
       });
+      const sourceRunId = await recordSafeSource(manager, ["one", "two"]);
+      const started = manager.startInBackground(safeCalls(["one", "two"]), undefined, {
+        runId: "ancestry-target",
+        resumeFromRunId: sourceRunId,
+      });
+
+      const admitted = store.history.find((state) => state.runId === "ancestry-target");
+      assert.equal(admitted?.resumeSourceRunId, sourceRunId);
+      assert.equal(admitted?.resumeSeed?.sourceRunId, sourceRunId);
+      assert.equal(admitted?.resumeSeed?.candidates.length, 2);
+
+      const completed = await started.promise;
+      assert.equal(completed.status, "completed");
+      const terminal = store.persistence.load("ancestry-target");
+      assert.equal(terminal?.resumeSourceRunId, sourceRunId);
+      assert.equal(terminal?.resumeSeed, undefined, "completion keeps the upstream matcher compaction contract");
+      assert.ok(
+        store.history
+          .filter((state) => state.runId === "ancestry-target")
+          .every((state) => state.resumeSourceRunId === sourceRunId),
+        "the engine pointer must never change after admission",
+      );
     } finally {
       dirs.cleanup();
     }
@@ -233,7 +266,6 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       }
       assert.equal(positional.resumeReport?.replayed, 1);
       assert.equal(store.persistence.load("forced-positional")?.legacyResume, undefined);
-      assert.equal(store.persistence.load("forced-positional")?.resumeSeed?.sourceRunId, identitySource);
 
       const legacyState = store.persistence.load(identitySource);
       assert.ok(legacyState);
@@ -259,7 +291,6 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       }
       assert.equal(legacy.resumeReport?.replayed, 1);
       assert.equal(store.persistence.load("legacy-target")?.legacyResume, true);
-      assert.equal(store.persistence.load("legacy-target")?.resumeSeed?.sourceRunId, "legacy-source");
 
       const unsupported = { ...legacyState, runId: "unsupported-source", resume: { format: "future" } };
       unsupported.journal = unsupported.journal?.map((entry) => ({ ...entry, scope: "unsupported-source" }));
@@ -280,11 +311,6 @@ describe("WorkflowManager resumeFromRunId admission", () => {
       if (unsupportedResult.resumeReport?.strategy === "live") {
         assert.equal(unsupportedResult.resumeReport.disabledReason, "unsupported-format");
       }
-      assert.deepEqual(store.persistence.load("unsupported-target")?.resumeSeed, {
-        format: "identity-v1",
-        sourceRunId: "unsupported-source",
-        candidates: [],
-      });
     } finally {
       dirs.cleanup();
     }
@@ -329,8 +355,7 @@ describe("WorkflowManager durable identity execution", () => {
         decision.action === "replayed" && decision.recordedIndex !== decision.index).length, 38);
 
       const persisted = store.persistence.load("fanout-target");
-      assert.equal(persisted?.resumeSeed?.sourceRunId, sourceRunId);
-      assert.equal(persisted?.resumeSeed?.candidates.length, 0);
+      assert.equal(persisted?.resumeSeed, undefined);
       assert.deepEqual(persisted?.resumeReport, result.resumeReport);
       assert.equal(persisted?.journal?.length, 40);
       assert.equal(persisted?.calls?.length, 40);
@@ -393,8 +418,7 @@ return { one, approval, two }`, "replied-hop"), undefined, {
       const twoDecision = final.resumeReport?.calls[2];
       assert.equal(twoDecision?.action, "replayed");
       if (twoDecision?.action === "replayed") assert.equal(twoDecision.sourceRunId, sourceRunId);
-      assert.equal(store.persistence.load("replied-hop")?.resumeSeed?.sourceRunId, "paused-hop");
-      assert.equal(store.persistence.load("replied-hop")?.resumeSeed?.candidates.length, 0);
+      assert.equal(store.persistence.load("replied-hop")?.resumeSeed, undefined);
     } finally {
       dirs.cleanup();
     }
@@ -420,7 +444,7 @@ throw new Error("stop after one")`, "failed-hop"), undefined, {
       assert.equal(failed.status, "failed");
       assert.equal(failed.resumeReport?.replayed, 1);
       const failedState = store.persistence.load("failed-hop");
-      assert.equal(failedState?.resumeSeed?.sourceRunId, sourceRunId);
+      assert.equal(failedState?.resumeSeed?.sourceRunId, "failed-hop");
       assert.equal(failedState?.resumeSeed?.candidates.length, 1);
       assert.equal(failedState?.resumeSeed?.candidates[0]?.sourceRunId, sourceRunId);
 

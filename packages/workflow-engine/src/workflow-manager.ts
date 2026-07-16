@@ -120,6 +120,8 @@ export interface ManagedRun {
   legacyResume?: true;
   /** A fresh run seeded from another execution; terminal saves replace inherited rows. */
   newRunResume?: true;
+  /** Immediate resumeFromRunId ancestor, fixed when the new run is admitted. */
+  readonly resumeSourceRunId?: string;
   /** Manager-owned remaining correspondence state for a new-run resume. */
   resumeSeed?: PersistedResumeSeed;
   /** Manager-owned report, incrementally updated while the engine is executing. */
@@ -640,11 +642,6 @@ export class WorkflowManager extends EventEmitter {
     managed.resumeReportPlan = this.reportPlan(admission);
     managed.resumeDecisions = new Map();
     managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
-    managed.resumeSeed = deepFreeze({
-      format: "identity-v1",
-      sourceRunId: admission.sourceRunId,
-      candidates: [],
-    });
 
     if (admission.strategy === "identity-v1") {
       managed.resumeSeed = admission.seed;
@@ -862,6 +859,7 @@ export class WorkflowManager extends EventEmitter {
       mainModel: this.mainModel,
       agentsDir: this.agentsDir,
       executionMode: exec.executionMode,
+      ...(exec.resumeFromRunId ? { resumeSourceRunId: exec.resumeFromRunId } : {}),
       ...(exec.resumeJournal ? { legacyResume: true as const, newRunResume: true as const } : {}),
       journaling,
       background,
@@ -1530,11 +1528,12 @@ export class WorkflowManager extends EventEmitter {
           return row !== undefined && entry.kind === row.kind && entry.hash === row.hash;
         }),
       );
-      if (managed.status === "completed" && managed.resumeSeed) {
+      if (managed.status === "completed") {
+        managed.resumeSeed = undefined;
+      } else if (managed.resumeSeed) {
         managed.resumeSeed = deepFreeze({
-          format: "identity-v1",
-          sourceRunId: managed.resumeSeed.sourceRunId,
-          candidates: [],
+          ...managed.resumeSeed,
+          sourceRunId: managed.runId,
         });
       }
       if (managed.resumeSeed?.checkpointInjections) {
@@ -1584,6 +1583,7 @@ export class WorkflowManager extends EventEmitter {
       runtime: managed.runtime,
       environment: managed.environment,
       ...(managed.resume ? { resume: managed.resume } : {}),
+      ...(managed.resumeSourceRunId ? { resumeSourceRunId: managed.resumeSourceRunId } : {}),
       ...(managed.resumeSeed ? { resumeSeed: managed.resumeSeed } : {}),
       ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
       mainModel: managed.mainModel,

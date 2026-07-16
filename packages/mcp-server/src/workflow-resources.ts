@@ -38,8 +38,8 @@ function startedAtMillis(state: PersistedRunState): number {
 }
 
 function lineageSourceRunId(state: PersistedRunState): string | undefined {
-  const seedSource = state.resumeSeed?.sourceRunId;
-  return seedSource === state.runId ? undefined : seedSource;
+  const sourceRunId = state.resumeSourceRunId;
+  return sourceRunId === state.runId ? undefined : sourceRunId;
 }
 
 /**
@@ -106,7 +106,7 @@ export class WorkflowScriptResources {
     return deleted;
   }
 
-  /** Pure projection over the engine-owned durable resume source pointers. */
+  /** Pure projection over the engine-owned durable ancestry pointers. */
   lineage(runId: string): WorkflowScriptLineageEntry[] {
     const newestToOldest: WorkflowScriptLineageEntry[] = [];
     const visited = new Set<string>();

@@ -68,6 +68,7 @@ function outputVariantFixtures() {
   const nonterminalAwait = {
     ...inspection,
     wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "timeout" as const },
+    tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
   };
   const stop = {
     ...inspectionFixture("aborted"),
@@ -169,15 +170,29 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
 
   const invalid = {
     "background with execution logs": { ...fixtures.background, logs: [] },
+    "background with execution usage": {
+      ...fixtures.background,
+      tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
+    },
     "background with await outcome": { ...fixtures.background, outcome: terminalOutcomeFixture },
     "inspection with execution result": { ...fixtures.inspection, result: 42 },
+    "inspection with execution usage": {
+      ...fixtures.inspection,
+      tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
+    },
     "inspection with await outcome": { ...fixtures.inspection, outcome: terminalOutcomeFixture },
     "stop with execution logs": { ...fixtures.stop, logs: [] },
+    "stop with execution usage": {
+      ...fixtures.stop,
+      tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
+    },
     "stop with await outcome": { ...fixtures.stop, outcome: terminalOutcomeFixture },
+    "terminal await with top-level logs": { ...fixtures.terminalAwait, logs: [] },
     "terminal await without outcome": (() => {
       const { outcome: _outcome, ...withoutOutcome } = fixtures.terminalAwait;
       return withoutOutcome;
     })(),
+    "nonterminal await with execution logs": { ...fixtures.nonterminalAwait, logs: [] },
     "nonterminal await with outcome": { ...fixtures.nonterminalAwait, outcome: terminalOutcomeFixture },
   };
   for (const [name, fixture] of Object.entries(invalid)) {

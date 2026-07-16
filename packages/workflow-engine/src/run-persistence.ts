@@ -97,8 +97,8 @@ export interface PersistedCheckpointInjection {
 
 export interface PersistedResumeSeed {
   format: "identity-v1";
-  /** Immediate run named by resumeFromRunId. This engine-owned ancestry pointer remains
-   *  stable for the record's lifetime; individual candidates may originate in older hops. */
+  /** Immediate run named by resumeFromRunId; individual candidates may originate in an
+   *  older hop and retain that run ID themselves. */
   sourceRunId: string;
   candidates: PersistedResumeCandidate[];
   checkpointInjections?: PersistedCheckpointInjection[];
@@ -136,6 +136,8 @@ export interface PersistedRunState {
   };
   environment?: RunEnvironmentIdentity;
   resume?: PersistedResumeFormat;
+  /** Immediate run named by resumeFromRunId, written once by the engine at admission. */
+  readonly resumeSourceRunId?: string;
   resumeSeed?: PersistedResumeSeed;
   resumeReport?: WorkflowResumeReport;
   /** The session this run belongs to. Runs persist on disk across sessions but
@@ -322,8 +324,8 @@ export function createRunPersistence(
   };
 
   const lineageSourceRunId = (state: PersistedRunState): string | undefined => {
-    const seedSource = state.resumeSeed?.sourceRunId;
-    return seedSource === state.runId ? undefined : seedSource;
+    const sourceRunId = state.resumeSourceRunId;
+    return sourceRunId === state.runId ? undefined : sourceRunId;
   };
 
   const pidIsAlive = (pid: number): boolean => {

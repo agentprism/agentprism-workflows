@@ -409,23 +409,10 @@ describe("incremental resume admission", () => {
     assert.equal(admitted.strategy, "identity-v1");
     assert.equal(admitted.strategy === "identity-v1" && admitted.seed.candidates.length, 2);
 
-    const differentParent = sourceState(undefined, {
+    const invalidImmediate = sourceState(undefined, {
       resumeSeed: { format: "identity-v1", sourceRunId: "wrong", candidates: [] },
     });
-    const admittedDifferentParent = admission(differentParent);
-    assert.equal(admittedDifferentParent.strategy, "identity-v1");
-    assert.equal(
-      admittedDifferentParent.strategy === "identity-v1" && admittedDifferentParent.seed.sourceRunId,
-      SOURCE_RUN_ID,
-    );
-
-    const invalidAncestry = sourceState(undefined, {
-      resumeSeed: { format: "identity-v1", sourceRunId: "", candidates: [] },
-    });
-    assert.equal(
-      admission(invalidAncestry).strategy === "live" && admission(invalidAncestry).disabledReason,
-      "resume-seed-invalid",
-    );
+    assert.equal(admission(invalidImmediate).strategy === "live" && admission(invalidImmediate).disabledReason, "resume-seed-invalid");
 
     const collision = normalizeResumeSeed({
       sourceRunId: SOURCE_RUN_ID,
