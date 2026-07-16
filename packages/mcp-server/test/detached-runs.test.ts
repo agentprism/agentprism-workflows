@@ -315,8 +315,8 @@ test("await cancellation closes its event watcher without cancelling the workflo
     assert.equal(result.isError, true);
     assert.equal(
       watcherCloseCalls,
-      2,
-      "the resource projection and await path each obtain the instrumented shared persistence instance",
+      3,
+      "admission readback, resource projection, and await each obtain the shared persistence instance",
     );
     assert.equal(controlled.calls[0].options.signal?.aborted, false);
   } finally {

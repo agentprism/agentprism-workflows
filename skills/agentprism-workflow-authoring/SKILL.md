@@ -372,9 +372,12 @@ To kill, patch, and resume a live run, call
 `{ action: "stop", runId, lastN?, labelGlob?, logLines? }`. The returned `aborted` snapshot is the
 authoritative durable acknowledgement: resume is safe immediately and a follow-up await adds
 nothing. Edit the file, then start a new run with its absolute `scriptPath` plus
-`resumeFromRunId: runId`; the unchanged journal prefix replays and the changed suffix runs live.
+`resumeFromRunId: runId`. The manager replays only calls whose safety and environment facts remain
+provable; an in-flight stop may make the resumed run conservatively execute live, so read its
+`resumeReport` instead of assuming a prefix hit.
 Only backend session wind-down can remain after stop, so inspect per-agent states only if cleanup
-appears hung. A repeated stop of a terminal run is a successful no-op.
+appears hung. The stopped run frees its background slot immediately. A repeated stop of a terminal
+run is a successful no-op.
 
 Choose `background: true` for work that may outlive one MCP request. The start call returns
 `{ runId, status: "running", scriptSource, scriptUri }` plus a script resource link after durable
@@ -389,7 +392,8 @@ coarse phase and distinct started/ended-call progress while pending. A legacy/in
 polling fallback still returns bounded status without progress notifications.
 At terminal status await adds `outcome`, the foreground-equivalent authored result/pause context.
 That outcome carries optional `fallbacks` and `checkpointsTaken`; inspect and the top-level await
-status intentionally do not. `checkpointsTaken` identifies resolved live, headless-default,
+status intentionally do not. It carries `scriptUri` but not the admission-only, unpersisted
+`scriptSource`. `checkpointsTaken` identifies resolved live, headless-default,
 journal-replay, and injected `checkpointReplies` decisions without repeating prompt text.
 
 Background is detached from the initiating request, not from the MCP server process; a stdio child

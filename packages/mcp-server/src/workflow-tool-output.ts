@@ -121,11 +121,6 @@ const scriptLineageEntrySchema = z.object({
   available: z.boolean(),
 });
 
-const executionScriptResourceShape = {
-  scriptSource: scriptSourceSchema,
-  scriptUri: z.string(),
-} as const;
-
 const inspectionScriptResourceShape = {
   scriptUri: z.string(),
   lineage: z.array(scriptLineageEntrySchema),
@@ -191,7 +186,7 @@ const executionResultSchema = z
     runId: z.string(),
     status: z.enum(["paused", "completed", "failed", "aborted"]),
     ...executionDetailsShape,
-    ...executionScriptResourceShape,
+    scriptUri: z.string(),
   })
   .strict();
 
@@ -310,9 +305,10 @@ export interface WorkflowExecutionScriptResourceFields {
   scriptUri: string;
 }
 
-export interface WorkflowExecutionToolResult<T = unknown> extends WorkflowExecutionScriptResourceFields {
+export interface WorkflowExecutionOutcome<T = unknown> {
   runId: string;
   status: Exclude<WorkflowRunResult["status"], "pending" | "running">;
+  scriptUri: string;
   result?: T;
   tokenUsage?: WorkflowRunResult["tokenUsage"];
   logs?: string[];
@@ -323,6 +319,9 @@ export interface WorkflowExecutionToolResult<T = unknown> extends WorkflowExecut
   checkpointsTaken?: WorkflowRunResult["checkpointsTaken"];
   resumeReport?: WorkflowRunResult["resumeReport"];
 }
+
+export interface WorkflowExecutionToolResult<T = unknown>
+  extends WorkflowExecutionOutcome<T>, WorkflowExecutionScriptResourceFields {}
 
 export interface WorkflowBackgroundAccepted extends WorkflowExecutionScriptResourceFields {
   runId: string;
@@ -342,7 +341,7 @@ export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus, 
   /** Cumulative usage observed for live calls in this execution; absent before any is known. */
   tokenUsage?: TokenUsage;
   /** Present exactly when status is paused/completed/failed/aborted. */
-  outcome?: WorkflowExecutionToolResult<T>;
+  outcome?: WorkflowExecutionOutcome<T>;
 }
 
 export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
@@ -358,10 +357,10 @@ export type WorkflowToolResult<T = unknown> =
   | WorkflowRunAwaitResult<T>
   | WorkflowStopResult;
 
-export function toWorkflowToolResult<T>(
+export function toWorkflowExecutionOutcome<T>(
   run: WorkflowRunResult<T>,
-  resources: WorkflowExecutionScriptResourceFields,
-): WorkflowExecutionToolResult<T> {
+  resources: Pick<WorkflowExecutionScriptResourceFields, "scriptUri">,
+): WorkflowExecutionOutcome<T> {
   if (run.status === "pending" || run.status === "running") {
     throw new TypeError(`Workflow execution result must be terminal, received ${run.status}`);
   }
@@ -378,5 +377,15 @@ export function toWorkflowToolResult<T>(
     ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
     ...(run.resumeReport === undefined ? {} : { resumeReport: run.resumeReport }),
     ...resources,
+  };
+}
+
+export function toWorkflowToolResult<T>(
+  run: WorkflowRunResult<T>,
+  resources: WorkflowExecutionScriptResourceFields,
+): WorkflowExecutionToolResult<T> {
+  return {
+    ...toWorkflowExecutionOutcome(run, resources),
+    scriptSource: resources.scriptSource,
   };
 }

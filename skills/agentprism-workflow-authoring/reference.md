@@ -342,7 +342,7 @@ interface WorkflowAwaitMetadata {
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
-  outcome?: WorkflowExecutionToolResult<T>; // present exactly when lifecycle is terminal
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
   scriptUri: string;
   lineage: Array<{ runId: string; uri: string; available: boolean }>;
 }
@@ -368,13 +368,15 @@ resolution pipeline no longer produces entries.
 appear in foreground results plus terminal await `outcome`; neither appears on `WorkflowRunStatus`.
 
 At most four background runs may be active or starting per server instance. Foreground, inspect,
-await, and stop consume no slot. A timeout returns the freshest status and partial cumulative usage; replay
+await, and stop consume no slot; a durably stopped background run frees its slot immediately even
+while backend session wind-down remains. A timeout returns the freshest status and partial cumulative usage; replay
 hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
 project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
 structured bytes and 8,192 text bytes. The full script lineage is never truncated; when lineage
 alone exceeds the status budget, `truncation.maxStructuredBytes` reports the larger actual envelope
 limit. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap, but
-it is never copied into text.
+it is never copied into text. It includes `scriptUri` but not the unpersisted admission-only
+`scriptSource`.
 
 The background start has no enduring request signal, progress channel, or live checkpoint channel.
 It returns immediately and emits no progress after returning, even if the initiating request
@@ -390,8 +392,8 @@ recovers to `paused`.
 `action:"await"` and `action:"inspect"` are read-only: they never replay the script, spend tokens,
 or acquire the run lease. `resumeFromRunId` executes a new run with the caller's current script or
 path snapshot and args, and a new run ID. Every resumed background run durably seeds its inherited prefix (including a
-synthetic checkpoint answer) beneath that new ID before acknowledgement, so later resume hops remain
-self-contained.
+manager-owned checkpoint injection) beneath that new ID before acknowledgement, so later resume
+hops remain self-contained. The MCP layer never rewrites that seed.
 
 Every admitted script is an immutable persistence-backed MCP resource at
 `workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the full resume
@@ -399,13 +401,16 @@ lineage oldest-to-newest and expose structured `{ runId, uri, available }` entri
 can read a lost inline script and explicitly send that text back with `resumeFromRunId`; a path is
 never persisted or implicitly re-read. Listing/completion include only the 50 newest runs, but a
 direct URI read works for any retained project run.
+The MCP layer retains no scripts, args, or synthetic lineage metadata in process memory.
 
 `action:"stop"` durably aborts a `running` or `paused` run live in this server process, cancels any
 pending agent/checkpoint request, appends `stopped`, releases the lease, and returns the final
 inspection projection with `stopped:true`. Resume is safe immediately; await adds nothing. Only
 backend session wind-down can remain, observable through inspect's agent states. A repeated stop on
 a terminal run succeeds with `stopped:false, alreadyTerminal:true`. For the kill-patch-resume loop:
-stop, edit the file, then submit its `scriptPath` with `resumeFromRunId`.
+stop, edit the file, then submit its `scriptPath` with `resumeFromRunId`. An in-flight stop may lack
+a quiescent terminal-environment proof, so the manager can conservatively run that resume live;
+inspect `resumeReport` rather than assuming a prefix replay.
 
 Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
 

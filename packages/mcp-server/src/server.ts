@@ -29,7 +29,6 @@ import type {
   ExecOptions,
   PersistedRunState,
   WorkflowSnapshot,
-  JournalEntry,
   WorkflowBackendConfig,
   WorkflowRunResult,
   WorkflowRunStatus,
@@ -38,9 +37,13 @@ import type {
 import type { AgentRunner, RunOptions, TokenUsage } from "@automatalabs/shared-types";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
-import { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
+import {
+  toWorkflowExecutionOutcome,
+  toWorkflowToolResult,
+  workflowToolOutputShape,
+} from "./workflow-tool-output.js";
 import type {
-  WorkflowExecutionToolResult,
+  WorkflowExecutionOutcome,
   WorkflowRunAwaitResult,
   WorkflowStopResult,
 } from "./workflow-tool-output.js";
@@ -48,11 +51,9 @@ import { createAwaitProgressReporter, createProgressReporter } from "./progress.
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import {
-  prepareWorkflowAdmissionExecution,
   WorkflowScriptResources,
   workflowScriptUri,
 } from "./workflow-resources.js";
-import type { WorkflowAdmission } from "./workflow-resources.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
@@ -126,6 +127,10 @@ class BackgroundRunRegistry {
 
   get(runId: string): Promise<WorkflowRunResult> | undefined {
     return this.active.get(runId);
+  }
+
+  evict(runId: string): void {
+    this.active.delete(runId);
   }
 }
 
@@ -712,27 +717,51 @@ function readScriptAtAdmission(scriptPath: string): string {
 function requireAdmissionResource(
   manager: WorkflowManager,
   scriptResources: WorkflowScriptResources,
-  admission: WorkflowAdmission,
-  rejectExecution: () => void,
+  runId: string,
+  admittedScript: string,
 ): void {
-  if (scriptResources.admissionResourceAvailable(admission)) return;
-
-  rejectExecution();
-
-  if (admission.runId) {
-    const live = manager.getRun(admission.runId);
-    if (live?.status === "running" || live?.status === "paused") manager.stop(admission.runId);
-    try {
-      manager.deleteRun(admission.runId);
-    } catch {
-      // deleteRun's finally path still releases the lease and removes the in-process run.
+  let failure: string;
+  try {
+    const persisted = manager.getPersistence().load(runId);
+    if (persisted && persisted.script === admittedScript) {
+      scriptResources.notifyRunAdmitted(runId);
+      return;
     }
+    failure = persisted
+      ? "the persisted script did not match the admitted snapshot"
+      : "the persisted run record was unreadable";
+  } catch (error) {
+    failure = `the persisted run record could not be read: ${error instanceof Error ? error.message : String(error)}`;
   }
 
+  try {
+    const live = manager.getRun(runId);
+    if (live?.status === "running" || live?.status === "paused") manager.stop(runId);
+  } catch {
+    // Cleanup continues through deletion so the manager can still release its run lease.
+  }
+  try {
+    scriptResources.deleteRun(runId, false);
+  } catch {
+    // Best-effort cleanup has already attempted stop, terminal persistence, and lease release.
+  }
   throw new McpError(
     ErrorCode.InternalError,
-    "Workflow admission failed because its script resource could not be persisted; no run was admitted.",
+    `Workflow admission failed for runId "${runId}" because ${failure}; the run was not acknowledged.`,
   );
+}
+
+async function settleForegroundRun(
+  manager: WorkflowManager,
+  started: { runId: string; promise: Promise<WorkflowRunResult> },
+): Promise<WorkflowRunResult> {
+  try {
+    return await started.promise;
+  } catch (error) {
+    const settled = manager.getRun(started.runId)?.result;
+    if (settled) return settled;
+    throw error;
+  }
 }
 
 function requireDurableStoppedRun(manager: WorkflowManager, runId: string): void {
@@ -809,8 +838,7 @@ function currentTokenUsage(manager: WorkflowManager, runId: string): TokenUsage 
 function persistedOutcome(
   persisted: PersistedRunState,
   status: WorkflowRunStatus,
-  scriptResources: WorkflowScriptResources,
-): WorkflowExecutionToolResult {
+): WorkflowExecutionOutcome {
   if (status.status === "pending" || status.status === "running") {
     throw new TypeError(`Terminal workflow outcome cannot have status ${status.status}`);
   }
@@ -826,26 +854,21 @@ function persistedOutcome(
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
     ...(persisted.resumeReport === undefined ? {} : { resumeReport: persisted.resumeReport }),
-    scriptSource: scriptResources.scriptSource(persisted.runId) ?? "inline",
     scriptUri: workflowScriptUri(persisted.runId),
   };
 }
 
 function terminalOutcome(
   manager: WorkflowManager,
-  scriptResources: WorkflowScriptResources,
   runId: string,
   status: WorkflowRunStatus,
-): WorkflowExecutionToolResult | undefined {
+): WorkflowExecutionOutcome | undefined {
   const live = manager.getRun(runId)?.result;
   if (live) {
-    return toWorkflowToolResult(live, {
-      scriptSource: scriptResources.scriptSource(runId) ?? "inline",
-      scriptUri: workflowScriptUri(runId),
-    });
+    return toWorkflowExecutionOutcome(live, { scriptUri: workflowScriptUri(runId) });
   }
   const persisted = manager.getPersistence().load(runId);
-  return persisted ? persistedOutcome(persisted, status, scriptResources) : undefined;
+  return persisted ? persistedOutcome(persisted, status) : undefined;
 }
 
 const AWAIT_CANCELLED = Symbol("await-cancelled");
@@ -1164,6 +1187,7 @@ export function createWorkflowServer(
             `Workflow stop did not produce a terminal snapshot for runId "${parsedInput.runId}".`,
           );
         }
+        backgroundRuns.evict(parsedInput.runId);
         const lineage = scriptResources.lineage(parsedInput.runId);
         const projected = addInspectionResourceFields(
           status,
@@ -1271,7 +1295,7 @@ export function createWorkflowServer(
 
         const tokenUsage = currentTokenUsage(manager, parsedInput.runId);
         const baseOutcome = isTerminalStatus(status.status)
-          ? terminalOutcome(manager, scriptResources, parsedInput.runId, status)
+          ? terminalOutcome(manager, parsedInput.runId, status)
           : undefined;
         const outcome = baseOutcome;
         const lineage = scriptResources.lineage(parsedInput.runId);
@@ -1307,8 +1331,6 @@ export function createWorkflowServer(
       const input = clampWorkflowInput(parsedInput);
       const scriptSource = input.script === undefined ? "path" as const : "inline" as const;
       const admittedScript = input.script ?? readScriptAtAdmission(input.scriptPath);
-      const parsedScript = parseWorkflowScript(admittedScript);
-      const execution = prepareWorkflowAdmissionExecution(admittedScript, parsedScript.body, input.args);
       let backgroundReservation = false;
       if (input.background) {
         if (!backgroundRuns.reserve()) {
@@ -1347,16 +1369,14 @@ export function createWorkflowServer(
           resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,
         };
-        const admissionController = new AbortController();
         const executionGate = createAdmissionExecutionGate(runner);
         exec.agent = executionGate.runner;
-        exec.signal = admissionController.signal;
 
         let elicitationController: AbortController | undefined;
         let cancelElicitationFromRequest: (() => void) | undefined;
         if (!input.background) {
           const reporter = createProgressReporter(extra);
-          exec.signal = AbortSignal.any([extra.signal, admissionController.signal]);
+          exec.signal = extra.signal;
           // The engine drives progress with the live snapshot; project it onto the MCP wire
           // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
           exec.onProgress = (snapshot: WorkflowSnapshot) => {
@@ -1378,98 +1398,72 @@ export function createWorkflowServer(
         }
 
         if (input.background) {
-          const admission = scriptResources.beginAdmission({
-            script: admittedScript,
-            args: input.args,
-            scriptSource,
-            resumeSourceRunId: input.resumeFromRunId,
-          });
+          const started = manager.startInBackground(admittedScript, input.args, exec);
           try {
-            const started = scriptResources.runAdmission(admission, () =>
-              manager.startInBackground(execution.script, execution.args, exec),
-            );
-            requireAdmissionResource(manager, scriptResources, admission, () => {
-              scriptResources.rejectAdmission(admission);
-              executionGate.deny();
-              admissionController.abort();
-            });
-            executionGate.admit();
-            const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
-            backgroundRuns.track(started.runId, started.promise);
-            backgroundReservation = false;
-            const scriptUri = workflowScriptUri(started.runId);
-            const links = scriptResources.links([
-              { runId: started.runId, uri: scriptUri, available: true },
-            ]);
-            return {
-              structuredContent: {
-                runId: started.runId,
-                status: "running" as const,
-                scriptSource,
-                scriptUri,
-              },
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Workflow "${workflowName}" started in the background.\n` +
-                    `runId: ${started.runId}\n` +
-                    `Call workflow with action="await" and this runId to wait for its result, or ` +
-                    `action="inspect" for an immediate status snapshot.`,
-                },
-                ...links,
-              ],
-              isError: false,
-            };
-          } finally {
-            scriptResources.finishAdmission(admission);
+            requireAdmissionResource(manager, scriptResources, started.runId, admittedScript);
+          } catch (error) {
+            executionGate.deny();
+            throw error;
           }
+          executionGate.admit();
+          const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
+          backgroundRuns.track(started.runId, started.promise);
+          backgroundReservation = false;
+          const scriptUri = workflowScriptUri(started.runId);
+          const links = scriptResources.links([
+            { runId: started.runId, uri: scriptUri, available: true },
+          ]);
+          return {
+            structuredContent: {
+              runId: started.runId,
+              status: "running" as const,
+              scriptSource,
+              scriptUri,
+            },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Workflow "${workflowName}" started in the background.\n` +
+                  `runId: ${started.runId}\n` +
+                  `Call workflow with action="await" and this runId to wait for its result, or ` +
+                  `action="inspect" for an immediate status snapshot.`,
+              },
+              ...links,
+            ],
+            isError: false,
+          };
         }
 
-        // runSync RESOLVES to a terminal WorkflowRunResult (status already stamped); it does not
-        // throw on pause/fail/abort, so there is no shell-side status composition. A malformed
-        // script throws BEFORE a run exists (no runId) — that propagates to the SDK, which
-        // surfaces it as a tool error.
-        const admission = scriptResources.beginAdmission({
-          script: admittedScript,
-          args: input.args,
-          scriptSource,
-          resumeSourceRunId: input.resumeFromRunId,
-          elicitationController,
-        });
-        let run: WorkflowRunResult;
+        // startInBackground reveals the manager-owned run ID immediately after the initial save.
+        // Read that record back before awaiting the promise so no foreground result is acknowledged
+        // unless its immutable script resource is already durable.
+        const started = manager.startInBackground(admittedScript, input.args, exec);
+        scriptResources.trackPendingElicitation(started.runId, elicitationController);
         try {
-          const pendingRun = scriptResources.runAdmission(admission, () =>
-            manager.runSync(execution.script, execution.args, exec),
-          );
-          requireAdmissionResource(manager, scriptResources, admission, () => {
-            scriptResources.rejectAdmission(admission);
-            executionGate.deny();
-            admissionController.abort();
-          });
+          requireAdmissionResource(manager, scriptResources, started.runId, admittedScript);
           executionGate.admit();
-          run = await pendingRun;
+          const run = await settleForegroundRun(manager, started);
+          const scriptUri = workflowScriptUri(run.runId);
+          const structuredContent = {
+            ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
+          };
+          const isError = run.status === "failed" || run.status === "aborted";
+          return {
+            structuredContent: { ...structuredContent },
+            content: [
+              { type: "text", text: formatRunSummary(run) },
+              ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
+            ],
+            isError,
+          };
         } finally {
           executionGate.deny();
-          scriptResources.finishAdmission(admission);
+          scriptResources.clearPendingElicitation(started.runId);
           if (cancelElicitationFromRequest) {
             extra.signal.removeEventListener("abort", cancelElicitationFromRequest);
           }
         }
-
-        const scriptUri = workflowScriptUri(run.runId);
-        const structuredContent = {
-          ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
-        };
-        const isError = run.status === "failed" || run.status === "aborted";
-        return {
-          structuredContent: { ...structuredContent },
-          content: [
-            { type: "text", text: formatRunSummary(run) },
-            ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
-          ],
-          isError,
-        };
       } finally {
         if (backgroundReservation) backgroundRuns.releaseReservation();
       }

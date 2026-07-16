@@ -60,11 +60,9 @@ test("input shape: one tool advertises the exact run, inspect, await, and stop f
 });
 
 test("resume inputs advertise manager-owned fail-to-live admission", () => {
-  assert.ok(
-    workflowToolInputShape.resumeFromRunId.description?.includes(
-      "The manager validates replay eligibility and runs live wherever reuse is uncertain.",
-    ),
-  );
+  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /Re-send the script via script or scriptPath/);
+  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /manager validates replay eligibility/);
+  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /runs live wherever reuse is uncertain/);
   assert.match(workflowToolInputShape.resumePolicy.description ?? "", /requires resumeFromRunId/);
 });
 

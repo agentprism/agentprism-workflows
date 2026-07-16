@@ -145,7 +145,7 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
   }
 });
 
-test("the admission guard preserves authored args while persistence retains the original script and args", async () => {
+test("admission readback preserves authored args and the original persisted script", async () => {
   const script = [
     "// leading author note",
     "/* another leading note */",
@@ -171,7 +171,7 @@ test("the admission guard preserves authored args while persistence retains the 
   }
 });
 
-test("a transient initial save failure rejects admission before execution or a later cleanup save", async () => {
+test("readback accepts a transient initial save failure once a later engine save is durable", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-transient-admission-"));
   const fault = saveFaultPersistence(root, (attempt) => attempt === 1);
   let runnerCalls = 0;
@@ -196,28 +196,23 @@ test("a transient initial save failure rejects admission before execution or a l
       arguments: {
         script: [
           'export const meta = { name: "failed-admission", description: "must not execute" };',
-          'log("authored body executed");',
           'return await agent("must not start");',
         ].join("\n"),
       },
     });
-    assert.equal(result.isError, true);
-    assert.equal(result.structuredContent, undefined);
-    assert.equal(resourceLinks(result).length, 0);
-    assert.match(
-      String((result.content as Array<{ text?: string }>)[0]?.text),
-      /script resource could not be persisted; no run was admitted/i,
-    );
+    assert.equal(result.isError, false);
+    assert.equal(structured(result)?.status, "completed");
+    assert.equal(resourceLinks(result).length, 1);
 
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
     const uri = `workflow://runs/${runId}/script`;
     assert.ok(fault.attempts() > 1);
-    assert.equal(runnerCalls, 0, "a later successful cleanup save must not release execution");
-    assert.equal(manager.getRun(runId), undefined);
-    assert.equal(fault.durable.load(runId), null);
-    await assert.rejects(client.readResource({ uri }), /resource not found/i);
-    assert.equal(listChanged, 0, "cleanup saves for a rejected admission are not resource admissions");
+    assert.equal(runnerCalls, 1);
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.equal(fault.durable.load(runId)?.status, "completed");
+    assert.equal(resourceText(await client.readResource({ uri })), fault.durable.load(runId)?.script);
+    assert.equal(listChanged, 1);
   } finally {
     await client.close();
     await server.close();
@@ -234,10 +229,6 @@ test("persistent foreground admission failure never starts the runner and leaves
     return "unexpected";
   });
   const manager = new WorkflowManager({ cwd: root, agent: runner, persistence: fault.persistence });
-  let workflowLogs = 0;
-  manager.on("log", () => {
-    workflowLogs++;
-  });
   const server = createWorkflowServer(runner, { manager });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "persistent-foreground-client", version: "0.0.0" }, { capabilities: {} });
@@ -250,7 +241,6 @@ test("persistent foreground admission failure never starts the runner and leaves
       arguments: {
         script: [
           'export const meta = { name: "failed-admission", description: "must not execute" };',
-          'log("authored body executed");',
           'return await agent("must not start");',
         ].join("\n"),
       },
@@ -259,7 +249,6 @@ test("persistent foreground admission failure never starts the runner and leaves
     assert.equal(result.structuredContent, undefined);
     assert.equal(resourceLinks(result).length, 0);
     assert.equal(runnerCalls, 0, "durable admission must be established before the runner starts");
-    assert.equal(workflowLogs, 0, "a failed durable admission must not execute authored statements");
 
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
@@ -304,7 +293,7 @@ test("persistent admission save failure returns no URI and cleans the run, resou
     assert.equal(resourceLinks(result).length, 0);
     assert.match(
       String((result.content as Array<{ text?: string }>)[0]?.text),
-      /script resource could not be persisted; no run was admitted/i,
+      /persisted run record was unreadable; the run was not acknowledged/i,
     );
 
     const runId = fault.acquiredRunIds[0];
@@ -344,12 +333,14 @@ test("path and inline delivery share journal identity and changed path content r
     const secondRunId = String(structured(inlineResume)?.runId);
     assert.equal(calls(), 2, "identical inline content replays a path-delivered journal byte-for-byte");
 
-    const changed = TWO_AGENT_SCRIPT.replace('agent("beta")', 'agent("beta changed")');
+    const changed = TWO_AGENT_SCRIPT.replace('agent("beta",', 'agent("beta changed",');
     writeFileSync(scriptPath, changed, "utf8");
     const changedResume = await client.callTool({
       name: "workflow",
       arguments: { scriptPath, resumeFromRunId: secondRunId },
     });
+    assert.equal(changedResume.isError, false, JSON.stringify(structured(changedResume)));
+    assert.equal(structured(changedResume)?.status, "completed", JSON.stringify(structured(changedResume)));
     const thirdRunId = String(structured(changedResume)?.runId);
     assert.equal(calls(), 3, "the unchanged first call replays and the changed second call runs live");
     assert.equal(
@@ -378,7 +369,7 @@ test("path and inline delivery share journal identity and changed path content r
   }
 });
 
-test("concurrent identical inline and path admissions retain their own persisted script source", async () => {
+test("concurrent inline and path results report source without persisting it into await", async () => {
   const dir = mkdtempSync(join(tmpdir(), "agentprism-mcp-concurrent-source-"));
   const scriptPath = join(dir, "same.workflow.js");
   writeFileSync(scriptPath, TWO_AGENT_SCRIPT, "utf8");
@@ -405,6 +396,8 @@ test("concurrent identical inline and path admissions retain their own persisted
     pending.splice(0).forEach((resolve) => resolve());
 
     const [inlineResult, pathResult] = await Promise.all([inlinePromise, pathPromise]);
+    assert.equal(structured(inlineResult)?.scriptSource, "inline");
+    assert.equal(structured(pathResult)?.scriptSource, "path");
     const inlineRunId = String(structured(inlineResult)?.runId);
     const pathRunId = String(structured(pathResult)?.runId);
     const inlineAwait = await client.callTool({
@@ -415,12 +408,37 @@ test("concurrent identical inline and path admissions retain their own persisted
       name: "workflow",
       arguments: { action: "await", runId: pathRunId, waitMs: 0 },
     });
-    assert.equal((structured(inlineAwait)?.outcome as Record<string, unknown>).scriptSource, "inline");
-    assert.equal((structured(pathAwait)?.outcome as Record<string, unknown>).scriptSource, "path");
+    assert.equal((structured(inlineAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
+    assert.equal((structured(pathAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
   } finally {
     pending.splice(0).forEach((resolve) => resolve());
     await dispose();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resource composition neither patches persistence nor retains scripts or args", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-resource-memory-"));
+  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const persistence = manager.getPersistence();
+  const originalSave = persistence.save;
+  const originalDelete = persistence.delete;
+  const mcp = new McpServer({ name: "resource-memory", version: "0.0.0" }, { capabilities: {} });
+  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+  const resources = new WorkflowScriptResources(mcp, manager);
+  try {
+    assert.equal(persistence.save, originalSave);
+    assert.equal(persistence.delete, originalDelete);
+    const fields = Object.keys(resources as unknown as Record<string, unknown>);
+    assert.equal(fields.includes("metadataByRunId"), false);
+    assert.equal(fields.includes("pendingAdmissions"), false);
+
+    const run = await manager.runSync(NO_AGENT_SCRIPT, { secret: "must stay in persistence only" });
+    resources.notifyRunAdmitted(run.runId);
+    assert.equal(Object.hasOwn(manager.getPersistence().load(run.runId) ?? {}, "scriptSource"), false);
+  } finally {
+    await mcp.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -446,17 +464,13 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
   try {
     for (let index = 0; index < 55; index++) {
       const script = NO_AGENT_SCRIPT.replace("no-agent", `resource-${index}`);
-      const admission = resources.beginAdmission({ script, scriptSource: "inline" });
-      try {
-        const run = await resources.runAdmission(admission, () => manager.runSync(script));
-        runIds.push(run.runId);
-        const state = manager.getPersistence().load(run.runId);
-        assert.ok(state);
-        state.startedAt = new Date(Date.UTC(2100, 0, index + 1)).toISOString();
-        manager.getPersistence().save(state);
-      } finally {
-        resources.finishAdmission(admission);
-      }
+      const run = await manager.runSync(script);
+      runIds.push(run.runId);
+      const state = manager.getPersistence().load(run.runId);
+      assert.ok(state);
+      state.startedAt = new Date(Date.UTC(2100, 0, index + 1)).toISOString();
+      manager.getPersistence().save(state);
+      resources.notifyRunAdmitted(run.runId);
     }
     await waitUntil(() => listChanged >= 55, "every admission should emit resources/list_changed");
 
@@ -503,13 +517,18 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
 
     const beforeDeleteNotifications = listChanged;
     await client.subscribeResource({ uri });
-    assert.equal(manager.deleteRun(newest), true);
+    assert.equal(resources.deleteRun(newest), true);
     await waitUntil(
       () => listChanged === beforeDeleteNotifications + 1,
       "deletion should emit exactly one resources/list_changed notification",
     );
     await assert.rejects(client.readResource({ uri }), /resource not found/i);
-    await assert.rejects(client.unsubscribeResource({ uri }), /resource not found/i);
+    assert.deepEqual(await client.unsubscribeResource({ uri }), {});
+
+    const racedUri = `workflow://runs/${runIds[0]}/script`;
+    await client.subscribeResource({ uri: racedUri });
+    assert.equal(manager.deleteRun(runIds[0]!), true);
+    assert.deepEqual(await client.unsubscribeResource({ uri: racedUri }), {});
     assert.equal(updated, 0, "immutable script resources never emit resources/updated");
   } finally {
     await client.close();
@@ -524,24 +543,39 @@ test("lineage retains a deleted middle revision as unavailable and omits only it
   const mcp = new McpServer({ name: "lineage-test", version: "0.0.0" }, { capabilities: {} });
   mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
   const resources = new WorkflowScriptResources(mcp, manager);
-  const ids: string[] = [];
   try {
-    for (let index = 0; index < 3; index++) {
-      const script = NO_AGENT_SCRIPT.replace("no-agent", `lineage-${index}`);
-      const admission = resources.beginAdmission({
-        script,
-        scriptSource: "inline",
-        resumeSourceRunId: ids.at(-1),
-      });
-      try {
-        ids.push((await resources.runAdmission(admission, () => manager.runSync(script))).runId);
-      } finally {
-        resources.finishAdmission(admission);
-      }
-    }
-    assert.equal(manager.deleteRun(ids[1]), true);
+    const runs = await Promise.all([
+      manager.runSync(TWO_AGENT_SCRIPT),
+      manager.runSync(TWO_AGENT_SCRIPT),
+      manager.runSync(TWO_AGENT_SCRIPT),
+    ]);
+    const ids = runs.map((run) => run.runId);
+    const persistence = manager.getPersistence();
+    const states = ids.map((runId) => persistence.load(runId));
+    assert.ok(states.every((state) => state !== null));
+    const sourceEntry = states[0]!.journal?.[0];
+    const sourceCall = states[0]!.calls?.[0];
+    assert.ok(sourceEntry && sourceCall);
+    persistence.save({
+      ...states[1]!,
+      resumeSeed: { format: "identity-v1", sourceRunId: ids[0]!, candidates: [] },
+    });
+    persistence.save({
+      ...states[2]!,
+      resumeSeed: {
+        format: "identity-v1",
+        sourceRunId: ids[1]!,
+        candidates: [{
+          sourceRunId: ids[0]!,
+          recordedIndex: sourceEntry.index,
+          entry: sourceEntry,
+          call: sourceCall,
+        }],
+      },
+    });
+    assert.equal(resources.deleteRun(ids[1]!, false), true);
     assert.deepEqual(
-      resources.lineage(ids[2]),
+      resources.lineage(ids[2]!),
       ids.map((runId, index) => ({
         runId,
         uri: `workflow://runs/${runId}/script`,
@@ -558,7 +592,7 @@ test("lineage retains a deleted middle revision as unavailable and omits only it
   }
 });
 
-test("lineage normalizes pointer cycles, flattened duplicates, current IDs, and missing ancestors", async () => {
+test("lineage normalizes engine-seed pointer cycles and missing ancestors", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-normalization-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
   const first = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "cycle-first"));
@@ -571,28 +605,21 @@ test("lineage normalizes pointer cycles, flattened duplicates, current IDs, and 
   assert.ok(firstState && secondState && flattenedState);
   persistence.save({
     ...firstState,
-    resumeSeed: { sourceRunId: second.runId },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string; ancestorRunIds?: string[] } });
+    resumeSeed: { format: "identity-v1", sourceRunId: second.runId, candidates: [] },
+  });
   persistence.save({
     ...secondState,
-    resumeSeed: { sourceRunId: first.runId },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string; ancestorRunIds?: string[] } });
+    resumeSeed: { format: "identity-v1", sourceRunId: first.runId, candidates: [] },
+  });
   const missingRunId = "missing-ancestor";
   persistence.save({
     ...flattenedState,
     resumeSeed: {
+      format: "identity-v1",
       sourceRunId: missingRunId,
-      ancestorRunIds: [
-        first.runId,
-        second.runId,
-        first.runId,
-        flattened.runId,
-        second.runId,
-        missingRunId,
-        missingRunId,
-      ],
+      candidates: [],
     },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string; ancestorRunIds: string[] } });
+  });
 
   const mcp = new McpServer({ name: "lineage-normalization", version: "0.0.0" }, { capabilities: {} });
   mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
@@ -604,8 +631,6 @@ test("lineage normalizes pointer cycles, flattened duplicates, current IDs, and 
       "a pointer cycle terminates with the requested run exactly once",
     );
     assert.deepEqual(resources.lineage(flattened.runId), [
-      { runId: first.runId, uri: `workflow://runs/${first.runId}/script`, available: true },
-      { runId: second.runId, uri: `workflow://runs/${second.runId}/script`, available: true },
       { runId: missingRunId, uri: `workflow://runs/${missingRunId}/script`, available: false },
       {
         runId: flattened.runId,
@@ -619,7 +644,7 @@ test("lineage normalizes pointer cycles, flattened duplicates, current IDs, and 
   }
 });
 
-test("lineage merges a cached prefix with every pointer-only descendant above it", async () => {
+test("lineage walks every engine-seed pointer oldest to newest", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-mixed-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
   const runs = await Promise.all(
@@ -633,16 +658,16 @@ test("lineage merges a cached prefix with every pointer-only descendant above it
   assert.ok(states.every((state) => state !== null));
   persistence.save({
     ...states[1]!,
-    resumeSeed: { sourceRunId: ids[0]!, ancestorRunIds: [ids[0]!] },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string; ancestorRunIds: string[] } });
+    resumeSeed: { format: "identity-v1", sourceRunId: ids[0]!, candidates: [] },
+  });
   persistence.save({
     ...states[2]!,
-    resumeSeed: { sourceRunId: ids[1]! },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string } });
+    resumeSeed: { format: "identity-v1", sourceRunId: ids[1]!, candidates: [] },
+  });
   persistence.save({
     ...states[3]!,
-    resumeSeed: { sourceRunId: ids[2]! },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string } });
+    resumeSeed: { format: "identity-v1", sourceRunId: ids[2]!, candidates: [] },
+  });
 
   const mcp = new McpServer({ name: "lineage-mixed", version: "0.0.0" }, { capabilities: {} });
   mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
@@ -688,16 +713,33 @@ test("public inspect lineage compaction retains newest diagnostics and recompute
     { length: 100 },
     (_, index) => `ancestor${String(index).padStart(3, "0")}-revision${"x".repeat(20)}`,
   );
+  for (let index = 0; index < ancestors.length; index++) {
+    persistence.save({
+      ...state,
+      runId: ancestors[index]!,
+      workflowName: `lineage-ancestor-${index}`,
+      ...(index === 0
+        ? { resumeSeed: undefined }
+        : {
+            resumeSeed: {
+              format: "identity-v1" as const,
+              sourceRunId: ancestors[index - 1]!,
+              candidates: [],
+            },
+          }),
+    });
+  }
   persistence.save({
     ...state,
     phases,
     logs,
     journal,
     resumeSeed: {
+      format: "identity-v1",
       sourceRunId: ancestors.at(-1)!,
-      ancestorRunIds: ancestors.slice(0, -1),
+      candidates: [],
     },
-  } as PersistedRunState & { resumeSeed: { sourceRunId: string; ancestorRunIds: string[] } });
+  });
 
   const inspectionManager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
   assert.equal(inspectionManager.getPersistence().load(run.runId)?.phases?.[0], phases[0]);
@@ -864,7 +906,7 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
       name: "workflow",
       arguments: { action: "await", runId: resumedRunId, waitMs: 0 },
     });
-    assert.equal((structured(coldAwait)?.outcome as Record<string, unknown>).scriptSource, "inline");
+    assert.equal((structured(coldAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
     assert.equal(
       (structured(coldAwait)?.outcome as Record<string, unknown>).scriptUri,
       `workflow://runs/${resumedRunId}/script`,
@@ -874,7 +916,7 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
   }
 });
 
-test("cold await treats an origin-main-shaped persisted record as inline", async () => {
+test("cold await does not infer an admission-only script source", async () => {
   const first = await connect(okRunner());
   let runId: string;
   try {
@@ -901,7 +943,7 @@ test("cold await treats an origin-main-shaped persisted record as inline", async
       arguments: { action: "await", runId: runId!, waitMs: 0 },
     });
     assert.equal(awaited.isError, false);
-    assert.equal((structured(awaited)?.outcome as Record<string, unknown>).scriptSource, "inline");
+    assert.equal((structured(awaited)?.outcome as Record<string, unknown>).scriptSource, undefined);
   } finally {
     await second.dispose();
   }

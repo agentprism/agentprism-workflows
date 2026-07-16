@@ -127,8 +127,8 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
   const scriptPath = join(dir, "stop-loop.workflow.js");
   const original = [
     'export const meta = { name: "stop-loop", description: "stop and resume" };',
-    'const first = await agent("first", { label: "first" });',
-    'const second = await agent("second", { label: "second" });',
+    'const first = await agent("first", { label: "first", resume: { filesystem: "read-only" } });',
+    'const second = await agent("second", { label: "second", resume: { filesystem: "read-only" } });',
     "return { first, second };",
   ].join("\n");
   writeFileSync(scriptPath, original, "utf8");
@@ -190,18 +190,24 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     writeFileSync(scriptPath, changed, "utf8");
     const resumedPromise = client.callTool({
       name: "workflow",
-      arguments: { scriptPath, resumeFromRunId: runId },
+      arguments: { scriptPath, resumeFromRunId: runId, resumePolicy: "positional" },
     });
-    await waitUntil(() => controlled.calls.length === 3, "only the patched suffix should run live");
-    assert.equal(controlled.calls[2].prompt, "second patched");
-    controlled.calls[2].resolve("patched result");
+    await waitUntil(() => controlled.calls.length === 3, "the stopped source should fail live safely");
+    assert.equal(controlled.calls[2].prompt, "first");
+    controlled.calls[2].resolve("first rerun");
+    await waitUntil(() => controlled.calls.length === 4, "the patched call should run after the live prefix");
+    assert.equal(controlled.calls[3].prompt, "second patched");
+    controlled.calls[3].resolve("patched result");
     const resumed = await resumedPromise;
     const resumedRunId = runIdOf(resumed);
-    assert.equal(structured(resumed)?.status, "completed");
+    assert.equal(structured(resumed)?.status, "completed", JSON.stringify(structured(resumed)));
     assert.equal(
       JSON.stringify(structured(resumed)?.result),
-      JSON.stringify({ first: "first result", second: "patched result" }),
+      JSON.stringify({ first: "first rerun", second: "patched result" }),
     );
+    const resumeReport = structured(resumed)?.resumeReport as Record<string, unknown>;
+    assert.equal(resumeReport.replayed, 0);
+    assert.equal(resumeReport.live, 2);
     const inspected = await client.callTool({
       name: "workflow",
       arguments: { action: "inspect", runId: resumedRunId },
@@ -214,6 +220,52 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     for (const call of controlled.calls) call.resolve("cleanup");
     await dispose();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("four stopped background runs immediately free every registry slot", async () => {
+  const pending: Array<(value: string) => void> = [];
+  let calls = 0;
+  const runner = makeRunner(
+    () =>
+      new Promise<string>((resolve) => {
+        calls++;
+        pending.push(resolve);
+      }),
+  );
+  const { client, dispose } = await connect(runner);
+  const script = [
+    'export const meta = { name: "registry-stop", description: "slot eviction" };',
+    'return await agent("block until cleanup");',
+  ].join("\n");
+  try {
+    const runIds: string[] = [];
+    for (let index = 0; index < 4; index++) {
+      const accepted = await client.callTool({
+        name: "workflow",
+        arguments: { script, background: true },
+      });
+      assert.equal(accepted.isError, false);
+      runIds.push(runIdOf(accepted));
+    }
+    await waitUntil(() => calls === 4, "all four background calls should occupy the registry");
+
+    for (const runId of runIds) {
+      const stopped = await client.callTool({ name: "workflow", arguments: { action: "stop", runId } });
+      assert.equal(structured(stopped)?.status, "aborted");
+      assert.equal(structured(stopped)?.stopped, true);
+    }
+
+    const fifth = await client.callTool({
+      name: "workflow",
+      arguments: { script, background: true },
+    });
+    assert.equal(fifth.isError, false);
+    assert.equal(structured(fifth)?.status, "running");
+    await waitUntil(() => calls === 5, "the fifth run should start before stopped backends wind down");
+  } finally {
+    for (const resolve of pending) resolve("cleanup");
+    await dispose();
   }
 });
 

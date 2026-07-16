@@ -26,10 +26,15 @@ export type {
   WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
-export { toWorkflowToolResult, workflowToolOutputShape } from "./workflow-tool-output.js";
+export {
+  toWorkflowExecutionOutcome,
+  toWorkflowToolResult,
+  workflowToolOutputShape,
+} from "./workflow-tool-output.js";
 export type {
   WorkflowAwaitMetadata,
   WorkflowBackgroundAccepted,
+  WorkflowExecutionOutcome,
   WorkflowExecutionScriptResourceFields,
   WorkflowExecutionToolResult,
   WorkflowInspectionToolResult,

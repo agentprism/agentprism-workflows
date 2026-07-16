@@ -87,7 +87,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
       ],
     ]);
     const outcome = field(field(tool.outputSchema, "properties"), "outcome");
-    assert.deepEqual(field(outcome, "required"), ["runId", "status", "scriptSource", "scriptUri"]);
+    assert.deepEqual(field(outcome, "required"), ["runId", "status", "scriptUri"]);
   } finally {
     await dispose();
   }

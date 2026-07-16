@@ -249,7 +249,7 @@ interface WorkflowAwaitMetadata {
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
-  outcome?: WorkflowExecutionToolResult<T>; // exactly when lifecycle status is terminal
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
   scriptUri: string;
   lineage: WorkflowScriptLineageEntry[];
 }
@@ -289,6 +289,10 @@ type WorkflowToolResult =
 These fields appear on foreground execution results and terminal await `outcome` objects. They are
 persisted for cold await, but never copied onto the bounded top-level `WorkflowRunStatus` returned by
 inspect/await.
+
+`scriptSource` is an admission-time fact on the direct foreground result or background
+acknowledgement. It is not persisted, so terminal await outcomes expose `scriptUri` but do not infer
+an inline/path source in a later request or fresh server process.
 
 `status` lets a host distinguish a `completed` run from a `paused` one (resumable via `resumeFromRunId`) without parsing logs. The tool result is flagged `isError` when `status` is `failed` or `aborted`. A `result` field is only present when `status === "completed"`.
 
@@ -335,7 +339,8 @@ redaction, compaction, filtering, and truncation counters, and its text is cappe
 Before terminal state, optional `tokenUsage` is the cumulative live work observed in this execution;
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
 the authored `result` and full `logs` remain raw and unbounded, and are not duplicated into text.
-Top-level and outcome token usage are identical. Paused outcomes carry the existing non-secret
+It omits the admission-only `scriptSource` while retaining `scriptUri`. Top-level and outcome token
+usage are identical. Paused outcomes carry the existing non-secret
 `authContext` or `checkpointContext` used for CLI-login/resume or checkpoint-reply handling. Result
 observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `outcome`.
 
@@ -358,6 +363,8 @@ The server advertises and implements `resources: { subscribe: true, listChanged:
 Subscriptions are process-local. Script content never changes after admission, so
 `notifications/resources/updated` never fires. `notifications/resources/list_changed` fires when a
 run is admitted and when a run record is deleted; deletion also drops that URI's subscription.
+Unsubscribing after that deletion (including a deletion race) is an idempotent empty success for a
+URI this process knew existed. A malformed resource URI or a run ID that never existed is rejected.
 
 `resources/list` is discovery convenience, not a complete index: it returns at most the **50 newest
 runs by `startedAt` descending**. Resource-template completion uses that same bounded set. Direct
@@ -367,7 +374,9 @@ it is absent from the listing.
 Run/background results contain a `resource_link` for the newly admitted script. Inspect/await
 results contain available links for the full resume lineage, oldest to newest, and duplicate that
 history in structured `lineage`. A deleted revision remains listed as `available: false` without a
-fabricated link. Every URI is also present in structured output.
+fabricated link. Lineage is reconstructed at read time from the engine's durable resume source and
+candidate provenance; the MCP layer stores no script, args, or synthetic lineage metadata. Every
+URI is also present in structured output.
 
 Clients need MCP protocol revision **2025-06-18 or newer** to consume `resource_link` content
 blocks. The structured URI fields remain available independently of link rendering. MCP defines no
@@ -383,10 +392,11 @@ client `resources` capability to gate these server-offered primitives.
 - **Detached admission.** `background:true` returns a running acknowledgement with `runId`,
   `status`, `scriptSource`, `scriptUri`, and the script resource link
   after parsing, backend approval, one of four process-local slot reservations, lease acquisition,
-  and fail-fast initial persistence. It never awaits agent or script-body completion. A fifth
+  and successful persistence readback. It never awaits agent or script-body completion. A fifth
   active-or-starting request returns
   `Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
-  There is no queue. Foreground, inspect, and await consume no slot.
+  There is no queue. Foreground, inspect, and await consume no slot; a durably stopped background
+  run frees its slot immediately even if backend session wind-down is still pending.
 - **Bounded await.** `action:"await"` waits only for terminal status. `waitMs:0` returns
   `immediate` while pending/running; a positive deadline returns `timeout` if still live; an
   already/newly terminal run returns `terminal`. Same-process awaits wake on the background promise;
@@ -414,7 +424,9 @@ client `resources` capability to gate these server-offered primitives.
   successful no-op (`stopped:false`, `alreadyTerminal:true`). Unknown runs are not found; a cold
   persisted `running`/`paused` record has nothing live to stop in this process and should be resumed.
   Stop retains the journal, record, and script resource, so the kill-patch-resume loop is: stop,
-  edit the file, then call run with `scriptPath` plus `resumeFromRunId`.
+  edit the file, then call run with `scriptPath` plus `resumeFromRunId`. Because an in-flight stop
+  cannot capture a quiescent terminal environment, the manager may conservatively run that resumed
+  script live; the `resumeReport` is authoritative about any calls it could safely replay.
 - **Checkpoints.** Foreground uses MCP elicitation when advertised. Background never retains that
   request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus
