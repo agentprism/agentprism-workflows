@@ -167,7 +167,7 @@ export class PiSession {
 
   async setConfig(configId: string, value: string | boolean) {
     if (this.busy) throw adapterError("session_busy");
-    return applyConfig(this.pi, this.deps.modelRegistry, configId, value);
+    return applyConfig(this.pi, this.deps.modelRuntime, configId, value);
   }
 
   private disarm(turn: ActiveTurn): void {

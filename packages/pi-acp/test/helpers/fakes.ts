@@ -11,7 +11,7 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   type CreateAgentSessionOptions,
-  type ModelRegistry,
+  type ModelRuntime,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 /*
@@ -220,10 +220,10 @@ export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
   const controls: FakeSessionControl[] = [];
   const createOptions: CreateAgentSessionOptions[] = [];
   const model = { provider: "test", id: "model", contextWindow: 100 };
-  const registry = {
-    find(provider: string, id: string) { return provider === "test" && id === "model" ? model : undefined; },
+  const modelRuntime = {
+    getModel(provider: string, id: string) { return provider === "test" && id === "model" ? model : undefined; },
     hasConfiguredAuth() { return true; },
-  } as unknown as ModelRegistry;
+  } as unknown as ModelRuntime;
   const deps: PiAcpDeps = {
     async createAgentSession(options) {
       createOptions.push(options);
@@ -242,7 +242,7 @@ export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
       list: (target, dir) => SessionManager.list(target, dir),
       listAll: (dir) => SessionManager.listAll(dir),
     },
-    modelRegistry: registry,
+    modelRuntime,
     sessionDir,
     async connectMcpClient() { throw new Error("unexpected MCP connect"); },
     sleep: realSleep,

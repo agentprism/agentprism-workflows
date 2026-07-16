@@ -1,6 +1,5 @@
 import {
-  AuthStorage,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   createAgentSession,
   type CreateAgentSessionOptions,
@@ -21,7 +20,7 @@ export interface PiAcpDeps {
     list(cwd: string, sessionDir?: string): Promise<SessionInfo[]>;
     listAll(sessionDir?: string): Promise<SessionInfo[]>;
   };
-  modelRegistry: ModelRegistry;
+  modelRuntime: ModelRuntime;
   sessionDir?: string;
   connectMcpClient(server: McpServerStdio, signal: AbortSignal): Promise<McpClientHandle>;
   sleep(ms: number, signal: AbortSignal): Promise<void>;
@@ -47,10 +46,10 @@ export function realSleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export function resolveDeps(partial: Partial<PiAcpDeps> = {}): PiAcpDeps {
+export async function resolveDeps(partial: Partial<PiAcpDeps> = {}): Promise<PiAcpDeps> {
   const sleep = partial.sleep ?? realSleep;
   const mcpTimeoutMs = partial.mcpTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MSEC;
-  const modelRegistry = partial.modelRegistry ?? ModelRegistry.create(AuthStorage.create());
+  const modelRuntime = partial.modelRuntime ?? await ModelRuntime.create();
   const sessions = partial.sessions ?? {
     create: SessionManager.create,
     open: SessionManager.open,
@@ -61,7 +60,7 @@ export function resolveDeps(partial: Partial<PiAcpDeps> = {}): PiAcpDeps {
   return {
     createAgentSession: partial.createAgentSession ?? createAgentSession,
     sessions,
-    modelRegistry,
+    modelRuntime,
     sessionDir: partial.sessionDir,
     sleep,
     graceMs: partial.graceMs ?? 5_000,

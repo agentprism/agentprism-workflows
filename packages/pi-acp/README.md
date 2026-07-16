@@ -8,7 +8,7 @@ Run the server with `npx @automatalabs/pi-acp` or an installed `pi-acp` binary. 
 
 ## Side-effect-free library API
 
-The package entry exports the value APIs `runAcp(options?)`, `PiAcpAgent`, and `resolveDeps`, plus the TypeScript-only `PiAcpDeps` type. Importing it starts no server, opens no stdio connection, and does not mutate `console` or stdio. Call `runAcp()` explicitly to connect; pass a partial `PiAcpDeps` and/or an ACP stream for embedding and tests.
+The package entry exports the value APIs `runAcp(options?)`, `PiAcpAgent`, and `resolveDeps`, plus the TypeScript-only `PiAcpDeps` type. Importing it starts no server, opens no stdio connection, and does not mutate `console` or stdio. Call and await `runAcp()` explicitly to connect; pass a partial `PiAcpDeps` and/or an ACP stream for embedding and tests.
 
 ## Custom backend registration
 
@@ -54,4 +54,4 @@ The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` befo
 
 ## Built on pi — THIRD-PARTY notice
 
-This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.80.7. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.
+This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.80.8. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.

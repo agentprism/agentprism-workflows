@@ -15,8 +15,8 @@ export interface RunAcpOptions {
   stream?: Stream;
 }
 
-export function runAcp(options: RunAcpOptions = {}) {
-  const impl = new PiAcpAgent(resolveDeps(options.deps));
+export async function runAcp(options: RunAcpOptions = {}) {
+  const impl = new PiAcpAgent(await resolveDeps(options.deps));
   const app = acpAgent({ name: "@automatalabs/pi-acp" })
     .onRequest(methods.agent.initialize, (context) => impl.initialize(context))
     .onRequest(methods.agent.authenticate, (context) => impl.authenticate(context))
