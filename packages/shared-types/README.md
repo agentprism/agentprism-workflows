@@ -79,7 +79,10 @@ From [`src/index.ts`](./src/index.ts):
   `mode`, `tier`, `cwd`, `toolNames`, `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`,
   `images`, `runId`, `backends`, `meta`, `promptMeta`, the Codex-only `baseInstructions` /
   `developerInstructions`, `keepSession`, and the out-of-band callbacks `onUsage`,
-  `onModelResolved`, `onModelFallback`, `onHistory`, `onSessionOpen`.
+  `onModelResolved`, `onModelFallback`, `onHistory`, `onSessionOpen`. The resume-only
+  `continueFromSession` directive is advisory: a capable runner reopens that exact session and
+  reports the attempt through `AgentResultProvenance.continuation`; otherwise it runs fresh.
+  `onSessionOpen` fires exactly once for whichever acquisition wins (fresh, resumed, or loaded).
 - `AgentResult<S>` — `S extends TSchema ? Static<S> : string`.
 - `AgentUsage` — per-run token/cost: `input`, `output`, `cacheRead`, `cacheWrite`, `total`, `cost`.
 - `AgentRunOptions` / `AgentRunResult` — lift-compat aliases for `RunOptions` / `AgentResult`.
@@ -99,12 +102,16 @@ From [`src/index.ts`](./src/index.ts):
   optional redacted final-20 `logTail`; completed results omit it and `logs` remains the full
   compatibility array.
 - `WorkflowRunFallback` — `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?,
-  kind: "model" | "modifier", message }` for a live model-selection degrade.
+  kind: "model" | "modifier" | "continuation", message, continuation? }`. Continuation notices
+  carry either `{ outcome: "reattached", method }` or `{ outcome: "skipped", reason }`; the detail
+  remains structurally optional for compatibility, while engine emissions always correlate it with
+  `kind: "continuation"`.
 - `WorkflowCheckpointTaken` / `WorkflowCheckpointSource` — a resolved checkpoint's call index,
   kind, journaled decision, and provable source (`live`, `headless-default`, `journal-replay`, or
   `injected`). These result-only arrays are absent when empty and never widen `WorkflowRunStatus`.
 - `RunStatus`, `WorkflowMeta`, `WorkflowMetaPhase`, `WorkflowBackendConfig`, `TokenUsage`,
-  `JournalEntry`, `AgentSessionRef`, `AgentSessionRecord`.
+  `JournalEntry`, `AgentSessionRef`, `AgentSessionRecord`. Session refs include the optional persisted
+  `poolKey` spawn identity used to reject a reattach to a changed custom backend.
 - `ResumePolicy`, `WorkflowResumeStrategy`, `WorkflowResumeMatch`, `WorkflowResumeSafety`,
   `WorkflowResumeFallbackReason`, `WorkflowResumeDisabledReason`,
   `WorkflowResumeCallLiveReason`, `WorkflowResumeCallFailedReason`,

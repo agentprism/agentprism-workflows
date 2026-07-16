@@ -26,12 +26,33 @@ export interface AgentUsage {
   cost: number;
 }
 
+export type ContinuationSkipReason =
+  // engine-side gates — candidate existed at the index but a gate rejected it, no reattach
+  // attempted:
+  | "hash-mismatch" // recorded hash !== the live call's hash at this index (script changed)
+  | "inputs-mismatch" // recorded inputsHash !== the live call's inputsHash, or either is absent
+  | "worktree-isolated" // the call is worktree-isolated
+  | "cwd-mismatch" // recorded cwd !== the call's resolved cwd
+  | "cwd-missing" // the call's resolved cwd does not exist on disk
+  // runner-side gates — reattach attempted and abandoned before the continuation turn:
+  | "backend-mismatch" // recorded backendId or effective poolKey !== the resolved backend
+  | "capability-missing" // the current connection advertises neither session/resume nor session/load
+  | "reattach-failed" // load/resume rejected, session gone, or a spawn/auth error at reopen
+  // engine-synthesized — the runner ignored continueFromSession and reported no continuation
+  // provenance:
+  | "runner-declined";
+
+/** The outcome of a resume-only session continuation attempt. */
+export type ContinuationAttempt =
+  | { reattached: true; method: "resume" | "load" }
+  | { reattached: false; reason: ContinuationSkipReason };
+
 /** Out-of-band result provenance a wrapping/caching AgentRunner MAY report for the
  *  current attempt: whether the result it returns was produced live or replayed
  *  from a recording. Generic — any memoizing or record/replay wrapper can report it;
  *  the engine never fabricates a value; absence means an ordinary live call. */
 export type AgentResultProvenance =
-  | { source: "live"; overrideModel?: string }
+  | { source: "live"; overrideModel?: string; continuation?: ContinuationAttempt }
   | {
       source: "replay";
       recordedRunId?: string;
@@ -62,7 +83,7 @@ export interface PromptImage {
  * NOT the logical call, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
  * backend registry `backends`, the Codex-only `baseInstructions` / `developerInstructions`,
- * and the session hand-off pair `keepSession` / `onSessionOpen`.
+ * and the session hand-off fields `keepSession` / `onSessionOpen` / `continueFromSession`.
  * `maxSchemaRetries` is runner-internal (the engine never passes it). Pi's
  * `tools?: ToolDefinition[]` is DROPPED — a pi-coding-agent type with no ACP analog (ACP
  * injects tools via session/new mcpServers, not this field) and never passed by the engine.
@@ -190,12 +211,23 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  of the resume identity hash (hashAgentCall) — it shapes session disposal, not the logical
    *  call. Omitted/false => today's behavior (close when the agent advertises it). */
   keepSession?: boolean;
-  /** The run's ACP session identity, fired ONCE right after `session/new` (before the first
-   *  prompt) with the re-attach handle — sessionId, backend, cwd, and the agent-advertised
-   *  reopen capabilities. Best-effort observer (a throwing callback is isolated, never fails
-   *  the run) and, like every on* callback, OUT-OF-BAND: run()'s return value stays the bare
-   *  AgentResult. NOT part of the resume identity hash. */
+  /** The run's ACP session identity, fired EXACTLY ONCE for whichever acquisition wins:
+   *  `session/new`, or `session/resume`/`session/load` on a successful reattach — never
+   *  twice. A failed reattach that falls to a fresh `session/new` fires it exactly once for
+   *  the fresh handle. Fires before the first prompt with the re-attach handle — sessionId,
+   *  backend, cwd, and the agent-advertised reopen capabilities. Best-effort observer (a
+   *  throwing callback is isolated, never fails the run) and, like every on* callback,
+   *  OUT-OF-BAND: run()'s return value stays the bare AgentResult. NOT part of the resume
+   *  identity hash. */
   onSessionOpen?: (session: AgentSessionRef) => void;
+  /** RESUME-ONLY reattach directive. When set, the runner attempts to reopen this exact ACP
+   *  session (via session/resume, else session/load) and CONTINUE the interrupted turn instead of
+   *  opening a fresh session/new. Advisory: a runner that ignores it — or any reattach failure —
+   *  runs the call fresh, which IS the fallback. ADDITIVE and NOT part of the resume identity hash
+   *  (hashAgentCall) or the input fingerprint (hashCallInputs): it changes how a live call reaches
+   *  its result, never the logical call. Omitted => today's fresh session/new + original-prompt
+   *  path. */
+  continueFromSession?: AgentSessionRef;
   /** The engine's deterministic journal index for THIS agent() call — the same
    *  value as JournalEntry.index / WorkflowCallRecord.index. Assigned at lexical
    *  call time BEFORE the concurrency limiter; identical on every retry attempt.

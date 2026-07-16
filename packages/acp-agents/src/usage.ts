@@ -18,6 +18,11 @@
 import type { AgentUsage } from "@automatalabs/shared-types";
 import type { Cost, Usage } from "@agentclientprotocol/sdk";
 
+export interface UsageBaseline {
+  costAmount: number;
+  contextUsedTokens: number;
+}
+
 export class UsageAccumulator {
   private promptUsage: Usage | undefined;
   private costAmount = 0;
@@ -45,6 +50,38 @@ export class UsageAccumulator {
   recordContextTokens(used: number | null | undefined, size?: number | null | undefined): void {
     if (typeof used === "number" && Number.isFinite(used) && used >= 0) this.contextUsedTokens = used;
     if (typeof size === "number" && Number.isFinite(size) && size >= 0) this.contextSizeTokens = size;
+  }
+
+  /** Snapshot the cumulative/gauge channels before a continuation turn begins. */
+  baseline(): UsageBaseline {
+    return {
+      costAmount: this.costAmount,
+      contextUsedTokens: this.contextUsedTokens,
+    };
+  }
+
+  /** Report only usage observed after a reopened session's replay/setup boundary. */
+  delta(baseline: UsageBaseline): AgentUsage {
+    const cost = Math.max(0, this.costAmount - baseline.costAmount);
+    const u = this.promptUsage;
+    if (u) {
+      return {
+        input: u.inputTokens ?? 0,
+        output: u.outputTokens ?? 0,
+        cacheRead: u.cachedReadTokens ?? 0,
+        cacheWrite: u.cachedWriteTokens ?? 0,
+        total: u.totalTokens ?? 0,
+        cost,
+      };
+    }
+    return {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: Math.max(0, this.contextUsedTokens - baseline.contextUsedTokens),
+      cost,
+    };
   }
 
   toAgentUsage(): AgentUsage {

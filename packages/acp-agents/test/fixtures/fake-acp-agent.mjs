@@ -32,8 +32,11 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const scenario = JSON.parse(process.env.AGENTPRISM_FAKE_SCENARIO ?? "{}");
 const logPath = process.env.AGENTPRISM_FAKE_LOG;
 const crashSentinel = process.env.AGENTPRISM_FAKE_CRASH_SENTINEL;
+const authOnceSentinel = process.env.AGENTPRISM_FAKE_AUTH_ONCE_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 const hasLifecycleSupport = scenario.lifecycleSupport === true;
+const hasLoadSessionSupport = scenario.loadSessionSupport ?? hasLifecycleSupport;
+const hasResumeSessionSupport = scenario.resumeSessionSupport ?? hasLifecycleSupport;
 const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
 const hasMcpHttpSupport = scenario.mcpHttpSupport === true;
 const hasProviderSupport = scenario.providersSupport === true || Object.prototype.hasOwnProperty.call(scenario, "providers");
@@ -207,8 +210,14 @@ class FakeAgent {
     this.cancelWaiters = new Map();
   }
 
-  initialize(params) {
+  async initialize(params) {
     record({ method: "initialize", params });
+    if (typeof scenario.initializeDelayMs === "number" && scenario.initializeDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, scenario.initializeDelayMs));
+    }
+    if (scenario.initializeThrow) {
+      throw new RequestError(scenario.initializeThrowCode ?? -32603, String(scenario.initializeThrow));
+    }
     // Scenario-driven initialize response (protocolVersion + agentCapabilities + agentInfo), so a
     // capability-negotiation test can drive a mismatched protocol version, advertise mcpCapabilities,
     // or advertise the @automatalabs/codex-acp custom-capability namespace. Defaults to a capable
@@ -219,13 +228,15 @@ class FakeAgent {
       if (Array.isArray(scenario.authMethods)) response.authMethods = clone(scenario.authMethods);
       return response;
     }
-    const sessionCapabilities = hasLifecycleSupport
-      ? { close: {}, fork: {}, resume: {}, list: {}, delete: {}, additionalDirectories: {} }
-      : { close: {} };
+    const sessionCapabilities = {
+      close: {},
+      ...(hasLifecycleSupport ? { fork: {}, list: {}, delete: {}, additionalDirectories: {} } : {}),
+      ...(hasResumeSessionSupport ? { resume: {} } : {}),
+    };
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: {
-        ...(hasLifecycleSupport ? { loadSession: true } : {}),
+        ...(hasLoadSessionSupport ? { loadSession: true } : {}),
         sessionCapabilities,
         ...(hasMcpAcpSupport || hasMcpHttpSupport
           ? {
@@ -244,7 +255,21 @@ class FakeAgent {
 
   newSession(params) {
     record({ method: "newSession", params });
-    if (scenario.authRequiredOnNewSession) {
+    this.newSessionAttempts = (this.newSessionAttempts ?? 0) + 1;
+    const authRequiredCount = typeof scenario.authRequiredOnNewSessionCount === "number"
+      ? scenario.authRequiredOnNewSessionCount
+      : scenario.authRequiredOnNewSession
+        ? Number.POSITIVE_INFINITY
+        : 0;
+    const authRequiredOnceAlreadyFired = scenario.authRequiredOnNewSessionOnce && authOnceSentinel && existsSync(authOnceSentinel);
+    if (this.newSessionAttempts <= authRequiredCount && !authRequiredOnceAlreadyFired) {
+      if (scenario.authRequiredOnNewSessionOnce && authOnceSentinel) {
+        try {
+          writeFileSync(authOnceSentinel, "1");
+        } catch {
+          // best-effort cross-process test latch
+        }
+      }
       throw RequestError.authRequired(
         clone(scenario.authRequiredData),
         typeof scenario.authRequiredMessage === "string" ? scenario.authRequiredMessage : undefined,
@@ -267,6 +292,9 @@ class FakeAgent {
   async loadSession(params) {
     record({ method: "loadSession", params });
     const load = scenario.loadSession ?? {};
+    if (load.delayMs) await new Promise((resolve) => setTimeout(resolve, load.delayMs));
+    if (load.authRequired) throw RequestError.authRequired(clone(load.throwData), load.throw);
+    if (load.throw) throw new RequestError(load.throwCode ?? -32603, load.throw, clone(load.throwData));
     const modes = scenarioModesFor(load);
     if (modes) this.modesBySession.set(params.sessionId, modes);
     const configOptions = scenarioConfigOptionsFor(load, this.configOptions);
@@ -301,15 +329,21 @@ class FakeAgent {
         update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
       });
     }
+    for (const update of Array.isArray(load.updates) ? load.updates : []) {
+      await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
+    }
     return {
       configOptions,
       ...(modes ? { modes } : {}),
     };
   }
 
-  resumeSession(params) {
+  async resumeSession(params) {
     record({ method: "resumeSession", params });
     const resume = scenario.resumeSession ?? {};
+    if (resume.delayMs) await new Promise((resolve) => setTimeout(resolve, resume.delayMs));
+    if (resume.authRequired) throw RequestError.authRequired(clone(resume.throwData), resume.throw);
+    if (resume.throw) throw new RequestError(resume.throwCode ?? -32603, resume.throw, clone(resume.throwData));
     const modes = scenarioModesFor(resume);
     if (modes) this.modesBySession.set(params.sessionId, modes);
     const configOptions = scenarioConfigOptionsFor(resume, this.configOptions);

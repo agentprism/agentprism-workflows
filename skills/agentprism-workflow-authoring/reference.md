@@ -39,7 +39,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `images` | `PromptImage[]` | Base64 image blocks appended to the prompt; backends without image support get a bracketed text note. Not hashed. |
 | `meta` | `object` | ACP `_meta` merged into `session/new` — session-scoped extension passthrough (pairs with custom backends). Not hashed. |
 | `promptMeta` | `object` | ACP `_meta` merged into `session/prompt` — turn-scoped passthrough. Backend-computed keys win on conflict. Not hashed. |
-| `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Not hashed. |
+| `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Usage/auth pause failures are kept open automatically for managed continuation. Not identity-hashed; included in the input fingerprint. |
 
 ## Model specs & routing
 
@@ -54,7 +54,7 @@ A `model` string is resolved solely from its first segment, then delegated to th
 
 Selection is a single `session/set_config_option` with `configId: "model"` and the exact remaining string. There is no catalog matching, case folding, normalization, bracket parsing, nearest-neighbor selection, sibling effort/Fast option driving, retry, or echo verification. Brackets, dots, and provider-style prefixes are ordinary model-id characters. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; prefer backend-only forms for harness-configured models.
 
-Whatever the harness returns is the outcome. A rejection follows the existing agent-error path with no resolution-specific code or fallback event. `onModelFallback` and `WorkflowRunResult.fallbacks` remain public compatibility surfaces, but model resolution does not emit them.
+Whatever the harness returns is the outcome. A rejection follows the existing agent-error path with no resolution-specific code or model fallback event. `onModelFallback` and `WorkflowRunResult.fallbacks` remain public compatibility surfaces; model resolution does not emit entries, while pause recovery emits `kind: "continuation"` reattach/skip notices.
 
 ### Session config options
 
@@ -169,9 +169,10 @@ The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elic
 - A source is admitted only after exact cwd, full Node/V8/runtime-format, and terminal environment checks. Git sources compare HEAD plus the dirty digest; non-git hosts must provide the same `environmentKey`. Unknown formats, missing facts, source drift, and uncertainty select all-live. A safe, stable source can use identity matching; an unsafe but stable new-format source gets only a safety-checked positional prefix, while nested or source-drifted fallback is all-live.
 - The first live call without a valid read-only declaration, any nested workflow, a live host checkpoint callback, or an annotated worktree that degrades/fails closes the remaining identity cache before the effect runs. Declared readers and successfully created declared worktrees may stay open. Unordered `parallel()` siblings must never communicate through files or another persistent/ambient side channel.
 - Identity hits add their preserved logical budget debit to `budget.spent()`/`remaining()` so budget-driven control flow stays stable, while current `tokenUsage` and provider cost remain zero. Replayed session records are rebound to the current call index/label/phase without opening a session.
+- A root call interrupted by `PROVIDER_USAGE_LIMIT` / `AUTH_REQUIRED` may continue its recorded session on either resume API. Continuation is index-local and independent of replay strategy. It requires matching identity and input fingerprints, a non-worktree call, equal existing cwd, a coherent reopenable session row, and matching runner backend/`poolKey`; current capabilities choose resume before load. Every rejection fails to a fresh call and appears in `fallbacks`, while successful continuation journals its reopen method and charges only continuation-turn usage.
 - `checkpoint()` identity replay uses only proven host decisions and requires equal fingerprints of `default`, `headless`, and `timeoutMs`. Source headless decisions always execute fresh. `checkpointReplies` keys refer to source indexes; an unambiguous reply may move to a shifted current checkpoint.
 - `resumePolicy: "positional"` is the migration escape hatch: it requests index/prefix correspondence but cannot bypass new-format input, safety, cwd, runtime, or environment gates. Marker-less journals and permanently marked manual/same-run legacy resumes retain historical hash-only positional behavior.
-- The additive options `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not hashed. A changed value affects only a live call; it does not invalidate or modify a replayed result.
+- The additive options `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not identity-hashed. A changed value does not invalidate an ordinary replayed result, but it changes the input fingerprint and therefore rejects continuation of an interrupted turn.
 
 Two all-live outcomes are expected calibration, not an engine error. A new-format source containing any result row without a captured call path/input fact—possible with a call stack deeper than the raw-frame cap or a non-strict-JSON `meta` value—is source-wide `"manifest-invalid"`; excluding the row could make an ambiguous sibling look unique. Also, exact runtime equality means a Node or V8 upgrade invalidates every new-format cache (`"runtime-mismatch"`), while marker-less legacy journals keep their historical positional behavior. Relaxing that asymmetry would require a new persisted format literal; v1 bytes are never reinterpreted.
 
@@ -212,7 +213,8 @@ current args with `resumeFromRunId`. The MCP `workflow` tool does, as does
 `WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`. MCP resume always requires
 explicit content; a bare `resumeFromRunId` is invalid. `WorkflowManager.resume(runId)` is a
 different same-ID recovery API: it reloads the persisted original script/args and permanently uses
-legacy positional semantics.
+legacy positional replay semantics, while the independent default-on channel may still continue an
+eligible usage/auth-interrupted live call.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 
@@ -361,8 +363,9 @@ interface WorkflowStopToolInput {
 ```
 
 `WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` retains the compatibility shape
-`{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }`; the model
-resolution pipeline no longer produces entries.
+`{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message, continuation? }`.
+`kind` is `model | modifier | continuation`; continuation details report either a reattached
+`resume | load` method or an exact skip reason. The model-resolution pipeline itself produces no entries.
 `WorkflowRunResult.checkpointsTaken?: WorkflowCheckpointTaken[]` records resolved checkpoints as
 `{ callIndex, kind, decision, source }`, where source is `live`, `headless-default`,
 `journal-replay`, or `injected`. A paused checkpoint is not resolved. Both fields are persisted and

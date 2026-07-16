@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
+import type { AgentRunner, AgentSessionRef, RunOptions } from "@automatalabs/shared-types";
 import type { JournalEntry } from "../src/workflow.js";
 import { runWorkflow } from "../src/workflow.js";
 
@@ -75,6 +76,76 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
       b.map((e) => e.hash),
       "the same call identity hashes to the same bytes every run (resume depends on it)",
     );
+  });
+
+  it("keeps call and input hash fixtures unchanged by continuation-adjacent metadata", async () => {
+    const sessionRef: AgentSessionRef = {
+      sessionId: "continuation-session",
+      backendId: "codex",
+      poolKey: "codex",
+      cwd: "/workspace/project",
+      reopen: { load: true, resume: true, list: false, fork: false },
+    };
+    const run = async (withContinuationMetadata: boolean) => {
+      const journal: JournalEntry[] = [];
+      let inputsHash: string | undefined;
+      const runner = {
+        async run(prompt: string, options?: RunOptions) {
+          inputsHash = options?.callInputsHash;
+          if (withContinuationMetadata) {
+            const directive: RunOptions = { ...options, continueFromSession: sessionRef };
+            assert.deepEqual(directive.continueFromSession, sessionRef);
+            options?.onSessionOpen?.(sessionRef);
+            options?.onResultProvenance?.({
+              source: "live",
+              continuation: { reattached: true, method: "resume" },
+            });
+          }
+          return `ran:${prompt}`;
+        },
+      } as AgentRunner;
+      const result = await runWorkflow(singleCall, {
+        agent: runner,
+        persistLogs: false,
+        onAgentJournal: (entry) => journal.push(entry),
+      });
+      return { entry: journal[0], inputsHash, result };
+    };
+
+    const plain = await run(false);
+    const adjacent = await run(true);
+    const expectedInputs = createHash("sha256")
+      .update(
+        JSON.stringify({
+          backends: null,
+          cwd: null,
+          images: null,
+          isolation: null,
+          keepSession: false,
+          label: "a",
+          mcpServers: null,
+          meta: null,
+          promptMeta: null,
+          retries: 0,
+          timeoutMs: null,
+        }),
+      )
+      .digest("hex");
+    const markedEntry: JournalEntry = {
+      ...adjacent.entry,
+      call: { kind: "agent", label: "a", continuation: { method: "resume" } },
+    };
+
+    assert.equal(plain.entry.hash, "2aa09c56e72fb040ff729ab7ada54158759da157dd048aecd467867debc30e99");
+    assert.equal(adjacent.entry.hash, plain.entry.hash);
+    assert.equal(markedEntry.hash, plain.entry.hash);
+    assert.equal(plain.inputsHash, expectedInputs);
+    assert.equal(adjacent.inputsHash, expectedInputs);
+    assert.equal(adjacent.entry.session?.poolKey, "codex");
+    assert.deepEqual(adjacent.result.calls?.[0]?.provenance, {
+      source: "live",
+      continuation: { reattached: true, method: "resume" },
+    });
   });
 
   it("is byte-identical when args change but the call identity does not", async () => {

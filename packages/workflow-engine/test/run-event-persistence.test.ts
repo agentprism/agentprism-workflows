@@ -152,6 +152,84 @@ test(
 );
 
 test(
+  "continuation journal markers and live provenance survive projection and validation",
+  withPersistence(({ persistence }) => {
+    const runId = "continuation-validation";
+    persistence.save(state(runId));
+    persistence.appendEvent(runId, {
+      seq: 1,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "journal",
+        runId,
+        scope: runId,
+        entry: {
+          index: 0,
+          hash: "hash",
+          result: "continued",
+          kind: "agent",
+          call: {
+            kind: "agent",
+            label: "worker",
+            continuation: { method: "resume" },
+          },
+        },
+      },
+    });
+    persistence.appendEvent(runId, {
+      seq: 2,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "agentEnd",
+        runId,
+        scope: runId,
+        label: "worker",
+        result: "continued",
+        callIndex: 0,
+        provenance: {
+          source: "live",
+          continuation: { reattached: false, reason: "runner-declined" },
+        },
+      },
+    });
+    const events = persistence.readEvents(runId).events;
+    const journal = events[0]?.event;
+    assert.equal(journal?.type, "journal");
+    if (journal?.type === "journal") {
+      assert.deepEqual(
+        journal.entry.call?.kind === "agent" ? journal.entry.call.continuation : undefined,
+        { method: "resume" },
+      );
+    }
+    const agentEnd = events[1]?.event;
+    assert.equal(agentEnd?.type, "agentEnd");
+    if (agentEnd?.type === "agentEnd") {
+      assert.deepEqual(
+        agentEnd.provenance?.source === "live" ? agentEnd.provenance.continuation : undefined,
+        { reattached: false, reason: "runner-declined" },
+      );
+    }
+
+    expectCode(() => persistence.appendEvent(runId, {
+      seq: 3,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "agentEnd",
+        runId,
+        scope: runId,
+        label: "worker",
+        result: null,
+        callIndex: 0,
+        provenance: {
+          source: "live",
+          continuation: { reattached: false, reason: "future-reason" },
+        },
+      } as PersistableEngineRunEvent,
+    }), "CORRUPT_LOG");
+  }),
+);
+
+test(
   "read validation uses the exact option and snapshot classification precedence",
   withPersistence(({ persistence, eventPath }) => {
     expectCode(() => persistence.readEvents("missing", { after: -1, limit: 0, streamId: "bad" }), "INVALID_CURSOR");

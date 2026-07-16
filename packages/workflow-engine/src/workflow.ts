@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
@@ -7,6 +8,7 @@ import type { TSchema } from "typebox";
 import type {
   AgentHistoryEntry,
   AgentResultProvenance,
+  ContinuationSkipReason,
   AgentRunner,
   AgentSessionRecord,
   AgentSessionRef,
@@ -33,13 +35,20 @@ import {
   resolveAgentType,
 } from "./agent-registry.js";
 import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
-import { errorMessage, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import {
+  errorMessage,
+  isAuthRequired,
+  isProviderUsageLimit,
+  WorkflowError,
+  WorkflowErrorCode,
+  wrapError,
+} from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { loadModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { projectRecordedError } from "./recorded-error.js";
 import { registerRunTripwire } from "./rejection-tripwire.js";
-import type { PreparedResume } from "./resume.js";
+import type { PreparedContinuation, PreparedResume } from "./resume.js";
 import {
   buildResumeCandidateIndexes,
   buildResumeReport,
@@ -167,6 +176,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Manager-prepared resume state. Mutually exclusive with a caller-authored
    *  resumeJournal except for strategy "positional-v1", where that map is the cache. */
   preparedResume?: PreparedResume;
+  /** Manager-prepared interrupted calls, consulted only at the live boundary. */
+  preparedContinuation?: PreparedContinuation;
   /** Manager-owned synchronous latch; called before unproved persistent effects. */
   onResumeFilesystemTainted?: () => void;
   /** Manager-owned absolute root-execution activity count. The engine reports
@@ -692,6 +703,7 @@ export async function runWorkflow<T = unknown>(
   };
 
   const preparedResume = options.preparedResume;
+  const preparedContinuation = options.preparedContinuation;
   const resumeReportPlan: ResumeReportPlan | undefined = preparedResume
     ? preparedResume.strategy === "identity-v1"
       ? {
@@ -1073,6 +1085,7 @@ export async function runWorkflow<T = unknown>(
       let budgetDebit = 0;
       const sealedUsage: AgentUsage[] = [];
       const modelFallbacks: string[] = [];
+      const continuationCandidate = preparedContinuation?.candidatesByIndex.get(callIndex);
 
       interface AttemptSlots {
         sealed: boolean;
@@ -1108,16 +1121,39 @@ export async function runWorkflow<T = unknown>(
         modelFallbacks.push(...slot.modelFallbacks);
       };
 
-      const sessionRecord = (slot: AttemptSlots): AgentSessionRecord | undefined =>
+      const sessionRecord = (slot: AttemptSlots, keptOpen: boolean): AgentSessionRecord | undefined =>
         slot.sessionRef
           ? deepFreeze({
               ...slot.sessionRef,
               callIndex,
               label,
               phase: assignedPhase,
-              keptOpen: agentOptions.keepSession === true,
+              keptOpen,
             })
           : undefined;
+
+      const emitContinuationNotice = (
+        continuation: NonNullable<WorkflowRunFallback["continuation"]>,
+      ) => {
+        const message = continuation.outcome === "reattached"
+          ? `continuation: reattached via session/${continuation.method}`
+          : `continuation skipped (${continuation.reason}) — running fresh`;
+        const fallback: WorkflowRunFallback = deepFreeze({
+          callIndex,
+          label,
+          ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
+          requestedSpec: modelSpec ?? agentOptions.tier ?? "(default)",
+          ...(continuationCandidate?.sessionRef.backendId === undefined
+            ? {}
+            : { backendId: continuationCandidate.sessionRef.backendId }),
+          kind: "continuation",
+          continuation,
+          message,
+        });
+        if (state.fallbacks.some((entry) => sameFallback(entry, fallback))) return;
+        state.fallbacks.push(fallback);
+        guardTerminal("onFallback", () => options.onFallback?.(fallback));
+      };
 
       const terminalUsage = (): AgentUsage | undefined => sumUsage(sealedUsage);
 
@@ -1132,7 +1168,14 @@ export async function runWorkflow<T = unknown>(
         const errorRecord = projectRecordedError(thrown);
         const workflowError = wrapError(thrown, { agentLabel: label });
         const usage = terminalUsage();
-        const session = slot ? sessionRecord(slot) : undefined;
+        const session = slot
+          ? sessionRecord(
+              slot,
+              agentOptions.keepSession === true ||
+                isProviderUsageLimit(workflowError) ||
+                isAuthRequired(workflowError),
+            )
+          : undefined;
         if (session) state.agentSessions.push(session);
         settle({
           outcome,
@@ -1191,8 +1234,33 @@ export async function runWorkflow<T = unknown>(
         }
         runCwd = worktree?.isolated ? worktree.cwd : resolvePath(baseCwd, agentOptions.cwd ?? ".");
 
+        let continuationSkipReason: ContinuationSkipReason | undefined;
+        if (continuationCandidate) {
+          if (continuationCandidate.hash !== callHash) {
+            continuationSkipReason = "hash-mismatch";
+          } else if (
+            continuationCandidate.inputsHash === undefined ||
+            callInputsHash === undefined ||
+            continuationCandidate.inputsHash !== callInputsHash
+          ) {
+            continuationSkipReason = "inputs-mismatch";
+          } else if (resolvedIsolation === "worktree") {
+            continuationSkipReason = "worktree-isolated";
+          } else if (continuationCandidate.recordedCwd !== runCwd) {
+            continuationSkipReason = "cwd-mismatch";
+          } else if (!existsSync(runCwd)) {
+            continuationSkipReason = "cwd-missing";
+          }
+          if (continuationSkipReason) {
+            emitContinuationNotice({ outcome: "skipped", reason: continuationSkipReason });
+          }
+        }
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const slot: AttemptSlots = { sealed: false, modelFallbacks: [] };
+          const continueFromSession = attempt === 1 && continuationCandidate && !continuationSkipReason
+            ? continuationCandidate.sessionRef
+            : undefined;
           try {
             throwIfAborted();
             const attemptController = new AbortController();
@@ -1228,6 +1296,7 @@ export async function runWorkflow<T = unknown>(
                   backends: options.scriptBackends,
                   runId,
                   keepSession: agentOptions.keepSession,
+                  ...(continueFromSession === undefined ? {} : { continueFromSession }),
                   callIndex,
                   callHash,
                   callPath,
@@ -1310,6 +1379,24 @@ export async function runWorkflow<T = unknown>(
               );
             } finally {
               sealAttempt(slot);
+              if (continueFromSession !== undefined && !signal.aborted) {
+                const continuation = slot.provenance?.source === "live"
+                  ? slot.provenance.continuation
+                  : undefined;
+                if (continuation?.reattached === true) {
+                  emitContinuationNotice({
+                    outcome: "reattached",
+                    method: continuation.method,
+                  });
+                } else {
+                  emitContinuationNotice({
+                    outcome: "skipped",
+                    reason: continuation?.reattached === false
+                      ? continuation.reason
+                      : "runner-declined",
+                  });
+                }
+              }
             }
 
             throwIfAborted();
@@ -1323,7 +1410,7 @@ export async function runWorkflow<T = unknown>(
             recordTokens(result, slot.usage);
             applyBudgetReplay(slot.budgetReplay?.settlementOrdinal);
             const usage = terminalUsage();
-            const session = sessionRecord(slot);
+            const session = sessionRecord(slot, agentOptions.keepSession === true);
             if (session) state.agentSessions.push(session);
             settle({
               outcome: "result",
@@ -1361,6 +1448,10 @@ export async function runWorkflow<T = unknown>(
                   phase: assignedPhase,
                   model: slot.modelResolved ?? displayModel,
                   backendId: session?.backendId,
+                  ...(slot.provenance?.source === "live" &&
+                    slot.provenance.continuation?.reattached === true
+                    ? { continuation: { method: slot.provenance.continuation.method } }
+                    : {}),
                 },
               });
               guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
@@ -1486,6 +1577,9 @@ export async function runWorkflow<T = unknown>(
           phase: assignedPhase,
           model: displayModel,
           backendId: cachedSession?.backendId,
+          ...(input.entry.call?.kind === "agent" && input.entry.call.continuation
+            ? { continuation: input.entry.call.continuation }
+            : {}),
         },
       });
       guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
@@ -1878,6 +1972,7 @@ export async function runWorkflow<T = unknown>(
         resumeJournal: undefined,
         resumeFromRunId: undefined,
         preparedResume: undefined,
+        preparedContinuation: undefined,
         onResumeCallAllocated: undefined,
         onResumeDecision: undefined,
         runId: childRunId,
@@ -2566,6 +2661,19 @@ export async function runWorkflow<T = unknown>(
 }
 
 function sameFallback(left: WorkflowRunFallback, right: WorkflowRunFallback): boolean {
+  if (left.kind === "continuation" || right.kind === "continuation") {
+    return (
+      left.kind === "continuation" &&
+      right.kind === "continuation" &&
+      left.callIndex === right.callIndex &&
+      ((left.continuation?.outcome === "reattached" &&
+        right.continuation?.outcome === "reattached" &&
+        left.continuation.method === right.continuation.method) ||
+        (left.continuation?.outcome === "skipped" &&
+          right.continuation?.outcome === "skipped" &&
+          left.continuation.reason === right.continuation.reason))
+    );
+  }
   return (
     left.callIndex === right.callIndex &&
     left.label === right.label &&

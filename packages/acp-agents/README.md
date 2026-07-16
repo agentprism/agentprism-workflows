@@ -48,7 +48,7 @@ try {
 }
 ```
 
-`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, `onSessionOpen`, `onUsage`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
+`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, the resume-only `continueFromSession` directive, `onSessionOpen`, `onUsage`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
 
 Model routing uses only the first `/`-delimited segment. An ASCII-case-insensitive `claude`, `codex`, `opencode`, or registered custom name selects that harness and is stripped exactly once; custom registrations win on collision. A harness name alone is backend-only and issues no model config call. Otherwise the whole string goes unchanged to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). Any remaining id is sent byte-for-byte as `configId: "model"`: catalogs are not matched, brackets and provider prefixes are ordinary characters, no sibling effort/Fast option is driven, and harness errors propagate through the normal agent-error path. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; use backend-only forms for harness-configured models.
 
@@ -170,11 +170,21 @@ from errors and events, and are zeroized on logout.
 
 ## Session handoff
 
-Use `onSessionOpen` to capture the backend/session/cwd re-attach handle. Set `keepSession: true`
-when the backend supports persistence and the host intends to call `loadSession()` or
-`resumeSession()` later; this skips the release-time best-effort `session/close`. The runner also
-exposes `listSessions()` and `deleteSession()` where advertised. Re-attach support is capability
-gated, so inspect the handle's `reopen` flags rather than assuming every ACP agent persists state.
+Use `onSessionOpen` to capture the backend/session/cwd re-attach handle. It fires exactly once for
+the winning acquisition: a fresh `session/new`, a successful `session/resume`/`session/load`, or the
+fresh fallback after a reopen failure. Set `keepSession: true` when the host intends to reopen a
+successful call; pause-class `PROVIDER_USAGE_LIMIT` and `AUTH_REQUIRED` failures are kept open
+automatically so managed resume can continue the interrupted turn.
+
+When `continueFromSession` is supplied, `run()` first verifies the recorded backend and effective
+`poolKey`, prefers the current connection's `session/resume` capability, and falls back to
+`session/load`. A missing capability or rejected reopen reports a typed continuation skip through
+`onResultProvenance`, cleans up the partial acquisition, and runs the original prompt in a fresh
+session. Once reopen succeeds, the runner reports `reattached` before post-open setup and sends a
+fixed continue-the-interrupted-task instruction instead of repeating the original prompt. Load
+transcript usage is baselined away, so only continuation-turn usage is reported. Caller cancellation
+never opens the fresh fallback. The runner also exposes `listSessions()` and `deleteSession()` where
+advertised; inspect `reopen` rather than assuming every ACP agent persists state.
 
 ## Listening in: live ACP events
 

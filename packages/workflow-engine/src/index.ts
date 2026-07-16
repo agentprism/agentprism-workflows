@@ -49,6 +49,8 @@ export {
   RESUME_CALL_LIVE_REASONS,
   RESUME_CALL_FAILED_REASONS,
   type PreparedResume,
+  type PreparedContinuation,
+  type ContinuationCandidate,
 } from "./resume.js";
 export {
   RUN_EVENT_MAX_RECORD_BYTES,

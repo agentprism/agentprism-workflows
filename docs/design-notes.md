@@ -259,7 +259,11 @@ auth-capable runner APIs for embedding hosts.
 
 Resume is **not lost**, it becomes **explicit**: expose a `resumeFromRunId` tool parameter; the
 host calls `workflow` again to continue from the persisted journal (the engine already supports
-this via `resumeJournal` in `runWorkflow`).
+this via `resumeJournal` in `runWorkflow`). If the source paused inside a root agent turn on
+usage/auth, the manager separately projects its persisted call/session join into a continuation
+candidate. The resumed live occurrence reopens and continues that session when every identity,
+input, cwd, backend, and capability gate holds; otherwise it opens a fresh session. This channel is
+independent of replay strategy and adds no MCP input.
 
 Human-in-the-loop: `checkpoint()` relied on Pi's `ui.confirm`. Over MCP, elicitation-capable
 clients provide the live channel. Without elicitation, the authored headless mode applies:
@@ -279,13 +283,19 @@ Spec: https://agentclientprotocol.com/protocol/v1/transports
 
 ```
 initialize                         → capability handshake (protocolVersion, clientCapabilities, authMethods)
-session/new   { cwd, mcpServers }  → returns sessionId (+ configOptions)
+session/new   { cwd, mcpServers }  → returns sessionId (+ configOptions)             [fresh path]
+  OR session/resume { sessionId } / session/load { sessionId }                      [eligible pause resume]
 session/prompt { sessionId, prompt }  (request)
   ↳ session/update  notifications  → agent_message_chunk, tool_call, tool_call_update,
                                       plan, usage_update, …  (streaming, agent→client)
 session/prompt response            → { stopReason, usage? }
 session/cancel { sessionId }       (notification, client→agent)
 ```
+
+The continuation acquire waits for the current pooled connection's initialize handshake, prefers
+advertised `session/resume`, and falls back to `session/load`. A missing/rejected reopen falls through
+to `session/new` with the original prompt. Once reopen resolves, the runner sends a fixed
+continue-the-interrupted-task prompt and does not restart fresh after later turn/setup failures.
 
 - **Stop reasons** (on the `session/prompt` result): `end_turn`, `max_tokens`,
   `max_turn_requests`, `refusal`, `cancelled`.
@@ -540,8 +550,9 @@ So: set `_meta.claudeCode.emitRawSDKMessages = true`, then read `structured_outp
 `_claude/sdkMessage` notification carrying the `type:"result", subtype:"success"` message.
 
 **Scope:** **session-scoped** — `outputFormat` is read at `session/new`; `prompt()`
-([`src/acp-agent.ts:1034`](https://github.com/agentclientprotocol/claude-agent-acp/blob/b8df8e0e5460fd782214f4dde488f7476c80c454/src/acp-agent.ts#L1034)) reads no per-turn schema. With the engine's one-session-per-`agent()`
-model this is a non-issue (one schema per agent call = one session).
+([`src/acp-agent.ts:1034`](https://github.com/agentclientprotocol/claude-agent-acp/blob/b8df8e0e5460fd782214f4dde488f7476c80c454/src/acp-agent.ts#L1034)) reads no per-turn schema. With the engine's one-session-acquisition-per-occurrence
+model this is a non-issue: ordinary occurrences acquire a new session, while a continued
+occurrence reopens the exact session whose original turn already carried that schema.
 
 ### 6.3 Codex — `@automatalabs/codex-acp` (Codex App Server)
 
@@ -677,13 +688,16 @@ into its dist, §2, §6.3), and `opencode acp` as ACP server subprocesses. It im
 ```
 run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
   1. pick backend (Claude vs Codex vs OpenCode/custom) by agentType/model
-  2. session/new({ cwd: worktree?.cwd })           // §5.3 worktree isolation
+  2. if continueFromSession is eligible:
+       session/resume({ sessionId }) else session/load({ sessionId })
+       on reopen failure → clean up and session/new({ cwd }) with the ORIGINAL prompt
+     otherwise session/new({ cwd: worktree?.cwd }) // §5.3 worktree isolation
   3. select model via session config option         // §5.4
   4. apply schema:
        Claude → already set in session/new _meta.claudeCode.options.outputFormat (+ emitRawSDKMessages)
        Codex  → outputSchema on the turn params
        OpenCode/custom → generic outputSchema + optional StructuredOutput MCP tool
-  5. session/prompt(prompt); drain session/update:
+  5. session/prompt(continued ? CONTINUATION_INSTRUCTION : prompt); drain session/update:
        • agent_message_chunk → assistant text
        • tool_call / request_permission → enforce allow/deny (§5.5)
        • usage_update → token accounting (§5.6)
@@ -694,6 +708,12 @@ run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
        no schema   → final assistant text (empty ⇒ recoverable retry)
   7. signal.aborted → session/cancel (§5.7)
 ```
+
+`onSessionOpen` fires exactly once for the acquisition that wins. Usage/auth pause failures release
+with `keepOpen:true` so the recorded session survives; a successful `session/load` snapshots usage
+after transcript replay and reports only the continuation-turn delta. Continuation attempt
+provenance is reported before post-open setup, and the engine turns it into a guarded audit notice
+plus a replay-neutral journal marker.
 
 Everything above this method — `parallel`/`pipeline`, the journal, budget, phases, resume — is
 the unchanged engine.

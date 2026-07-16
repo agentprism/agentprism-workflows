@@ -41,6 +41,17 @@ const EVENT_TYPES = new Set([
   "resumed",
 ]);
 const WORKFLOW_ERROR_CODES = new Set(Object.values(WorkflowErrorCode));
+const CONTINUATION_SKIP_REASONS = new Set([
+  "hash-mismatch",
+  "inputs-mismatch",
+  "worktree-isolated",
+  "cwd-mismatch",
+  "cwd-missing",
+  "backend-mismatch",
+  "capability-missing",
+  "reattach-failed",
+  "runner-declined",
+]);
 
 export interface ReadRunEventsOptions {
   /** Greatest seq already consumed. Default 0. */
@@ -237,10 +248,25 @@ function isTokenUsage(value: unknown): boolean {
   );
 }
 
+function isContinuationAttempt(value: unknown): boolean {
+  if (!isObject(value)) return false;
+  if (value.reattached === true) return value.method === "resume" || value.method === "load";
+  return value.reattached === false &&
+    typeof value.reason === "string" &&
+    CONTINUATION_SKIP_REASONS.has(value.reason);
+}
+
+function isContinuationMarker(value: unknown): boolean {
+  return isObject(value) && (value.method === "resume" || value.method === "load");
+}
+
 function isProvenance(value: unknown, projected: boolean): boolean {
   if (!isObject(value)) return false;
   const text = projected ? isProjectedText : isString;
-  if (value.source === "live") return hasOptional(value, "overrideModel", text);
+  if (value.source === "live") {
+    return hasOptional(value, "overrideModel", text) &&
+      hasOptional(value, "continuation", isContinuationAttempt);
+  }
   if (value.source !== "replay") return false;
   return (
     hasOptional(value, "recordedRunId", text) &&
@@ -328,7 +354,8 @@ function isJournalCall(value: unknown, projected: boolean): boolean {
       hasRequired(value, "label", text) &&
       hasOptional(value, "phase", text) &&
       hasOptional(value, "model", text) &&
-      hasOptional(value, "backendId", text)
+      hasOptional(value, "backendId", text) &&
+      hasOptional(value, "continuation", isContinuationMarker)
     );
   }
   return value.kind === "checkpoint" && value.label === "checkpoint" && hasOptional(value, "phase", text);

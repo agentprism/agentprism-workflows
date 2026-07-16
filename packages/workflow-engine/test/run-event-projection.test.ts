@@ -89,7 +89,11 @@ test("projectRunEventForPersistence redacts every retained string surface withou
     modelResolved: allSecrets,
     modelFallbacks: Array.from({ length: 22 }, (_, index) => `${allSecrets}-${index}`),
     backendId: allSecrets,
-    provenance: { source: "live", overrideModel: allSecrets },
+    provenance: {
+      source: "live",
+      overrideModel: allSecrets,
+      continuation: { reattached: false, reason: "reattach-failed" },
+    },
     errorRecord: recordedError(),
   };
   const original = structuredClone(event);
@@ -111,6 +115,12 @@ test("projectRunEventForPersistence redacts every retained string surface withou
     assert.equal("session" in projected.event, false);
     assert.equal(projected.event.modelFallbacks?.length, 20);
     assert.equal(projected.event.provenance?.source, "live");
+    assert.deepEqual(
+      projected.event.provenance?.source === "live"
+        ? projected.event.provenance.continuation
+        : undefined,
+      { reattached: false, reason: "reattach-failed" },
+    );
   }
 });
 
@@ -154,7 +164,14 @@ test("config, journal metadata, and call-record provenance follow the nested pro
         label: "never-persist",
         keptOpen: false,
       },
-      call: { kind: "agent", label: allSecrets, phase: allSecrets, model: allSecrets, backendId: allSecrets },
+      call: {
+        kind: "agent",
+        label: allSecrets,
+        phase: allSecrets,
+        model: allSecrets,
+        backendId: allSecrets,
+        continuation: { method: "load" },
+      },
       kind: "agent",
       scope: allSecrets,
     },
@@ -163,6 +180,12 @@ test("config, journal metadata, and call-record provenance follow the nested pro
   if (journal.event.type === "journal") {
     assert.equal(journal.event.entry.hash, "hash-copied-verbatim");
     assert.equal("session" in journal.event.entry, false);
+    assert.deepEqual(
+      journal.event.entry.call?.kind === "agent"
+        ? journal.event.entry.call.continuation
+        : undefined,
+      { method: "load" },
+    );
   }
 
   const callRecord = projectRunEventForPersistence({

@@ -24,6 +24,7 @@ import {
   type AgentResult,
   type AgentRunner,
   type AgentSessionRef,
+  type ContinuationSkipReason,
   type RunOptions,
 } from "@automatalabs/shared-types";
 import type {
@@ -45,7 +46,12 @@ import type {
   StopReason,
 } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
-import { PooledConnection, type AcpSessionOptions, type SessionHandle } from "./acp-client.js";
+import {
+  PooledConnection,
+  ReattachCapabilityUnavailable,
+  type AcpSessionOptions,
+  type SessionHandle,
+} from "./acp-client.js";
 import { AcpAgentPool, type AcpPoolOptions } from "./pool.js";
 import {
   TypedEventEmitter,
@@ -96,11 +102,18 @@ import {
   validatePromptImages,
 } from "./prompt.js";
 import type { ClientHandlers } from "./client-handlers.js";
+import type { UsageBaseline } from "./usage.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
 
 const STRUCTURED_TOOL_REPROMPT_TEXT =
   "You did not call the StructuredOutput tool. Call the StructuredOutput tool now, exactly once, with your final answer as its arguments conforming to its parameter schema. Do not reply with plain text.";
+
+const CONTINUATION_INSTRUCTION =
+  "Your previous turn was interrupted before it finished — the provider paused it for a usage " +
+  "limit or expired credentials, not because the task was complete. The full task and all prior " +
+  "context are already in this session's history; do not restart or repeat work you already did. " +
+  "Continue from where you stopped and produce the COMPLETE final answer to the original task now.";
 
 interface SessionPreparationOptions {
   model?: string;
@@ -750,6 +763,45 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     let structuredTool: StructuredOutputToolRegistration | undefined;
     let structuredToolActive = false;
     let releaseStructuredToolTurn: (() => void) | undefined;
+    let continuationUsageBaseline: UsageBaseline | undefined;
+    let continuationMethod: "resume" | "load" | undefined;
+    let keepOpenOnRelease = opts.keepSession === true;
+
+    const reportContinuation = (
+      continuation:
+        | { reattached: true; method: "resume" | "load" }
+        | { reattached: false; reason: ContinuationSkipReason },
+    ): void => {
+      try {
+        opts.onResultProvenance?.({ source: "live", continuation });
+      } catch {
+        // Provenance is diagnostic; a throwing observer never changes the live call outcome.
+      }
+    };
+
+    const cleanupFailedAcquisition = async (): Promise<void> => {
+      try {
+        releaseStructuredToolTurn?.();
+      } catch {
+        // best-effort cleanup before another acquire.
+      }
+      releaseStructuredToolTurn = undefined;
+      try {
+        structuredTool?.release();
+      } catch {
+        // best-effort cleanup before another acquire.
+      }
+      structuredTool = undefined;
+      structuredToolActive = false;
+      const discarded = session;
+      session = undefined;
+      try {
+        await discarded?.release({ keepOpen: false });
+      } catch {
+        // best-effort cleanup before another acquire.
+      }
+    };
+
     try {
       const prepare = async (connection: PooledConnection): Promise<AcpSessionOptions> => {
         let sessionOptions = prepared.sessionOptions;
@@ -781,37 +833,72 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         }
         return sessionOptions;
       };
+
+      // Continuation is a one-shot acquisition before and outside the fresh inline-auth loop.
+      if (opts.continueFromSession) {
+        const recorded = opts.continueFromSession;
+        const recordedPoolKey = recorded.poolKey ?? recorded.backendId;
+        const resolvedPoolKey = prepared.backend.poolKey ?? prepared.backend.id;
+        let skipReason: ContinuationSkipReason | undefined;
+
+        if (recorded.backendId !== prepared.backend.id || recordedPoolKey !== resolvedPoolKey) {
+          skipReason = "backend-mismatch";
+        } else {
+          try {
+            const reattached = await this.pool.acquirePreparedReattach(
+              prepared.backend,
+              recorded.sessionId,
+              prepare,
+              { signal: opts.signal, label: opts.label },
+            );
+            session = reattached.handle;
+            continuationMethod = reattached.method;
+            // Provenance is committed at the reopen-handle boundary, before any post-open setup.
+            reportContinuation({ reattached: true, method: reattached.method });
+            continuationUsageBaseline = session.usage.baseline();
+          } catch (error) {
+            if (opts.signal?.aborted) throw error;
+            skipReason = error instanceof ReattachCapabilityUnavailable
+              ? "capability-missing"
+              : "reattach-failed";
+          }
+        }
+
+        if (skipReason) {
+          await cleanupFailedAcquisition();
+          // An abort that landed during acquire/cleanup wins before skip provenance is reported.
+          opts.signal?.throwIfAborted();
+          reportContinuation({ reattached: false, reason: skipReason });
+          // Mandated checked boundary immediately before the fresh acquire loop.
+          opts.signal?.throwIfAborted();
+        }
+      }
+
       // Inline resolve-and-retry-once (§2.11): when `onAuth` is set, a -32000 at session/new is
       // resolved via the resolver and the acquire retried EXACTLY once — the run never pauses. A
       // second -32000 propagates as AUTH_REQUIRED. When `onAuth` is unset this loop runs once and
       // the error propagates unchanged (the PR4 pause-and-resume path), byte-identical to today.
-      let authRetried = false;
-      for (;;) {
-        try {
-          session = await this.pool.acquirePrepared(prepared.backend, prepare, {
-            signal: opts.signal,
-            label: opts.label,
-          });
-          break;
-        } catch (error) {
-          if (this.onAuth && !authRetried && !opts.signal?.aborted && isAuthRequiredError(error)) {
-            authRetried = true;
-            // Discard the failed attempt's partial structured-tool registration so the retry's
-            // prepare re-registers cleanly (the failure happened at session/new, after prepare ran).
-            releaseStructuredToolTurn?.();
-            releaseStructuredToolTurn = undefined;
-            try {
-              structuredTool?.release();
-            } catch {
-              // best-effort cleanup between attempts.
+      if (!session) {
+        let authRetried = false;
+        for (;;) {
+          try {
+            session = await this.pool.acquirePrepared(prepared.backend, prepare, {
+              signal: opts.signal,
+              label: opts.label,
+            });
+            break;
+          } catch (error) {
+            if (this.onAuth && !authRetried && !opts.signal?.aborted && isAuthRequiredError(error)) {
+              authRetried = true;
+              // Discard the failed attempt's partial structured-tool registration so the retry's
+              // prepare re-registers cleanly (the failure happened at session/new, after prepare ran).
+              await cleanupFailedAcquisition();
+              const resolved = await this.resolveInlineAuth(prepared.backend, opts, error);
+              if (!resolved) throw error; // cancelled/unresolved -> propagate AUTH_REQUIRED
+              continue;
             }
-            structuredTool = undefined;
-            structuredToolActive = false;
-            const resolved = await this.resolveInlineAuth(prepared.backend, opts, error);
-            if (!resolved) throw error; // cancelled/unresolved -> propagate AUTH_REQUIRED
-            continue;
+            throw error;
           }
-          throw error;
         }
       }
       const activeSession = session;
@@ -821,7 +908,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       // a throwing host callback never fails the run.
       if (opts.onSessionOpen) {
         try {
-          opts.onSessionOpen(sessionRefFor(activeSession, prepared.backend.id, cwd));
+          opts.onSessionOpen(sessionRefFor(activeSession, prepared.backend, cwd));
         } catch {
           // observer only; the run result never depends on it.
         }
@@ -834,9 +921,18 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       opts.signal?.throwIfAborted();
       if (opts.mode) await activeSession.setMode(opts.mode);
 
-      const text = buildRunPrompt(prompt, opts, schema, prepared.backend, structuredToolActive);
-      const initialPrompt =
-        opts.images && opts.images.length > 0 ? promptWithImages(text, opts.images) : text;
+      const text = buildRunPrompt(
+        continuationMethod ? CONTINUATION_INSTRUCTION : prompt,
+        opts,
+        schema,
+        prepared.backend,
+        structuredToolActive,
+      );
+      const initialPrompt = continuationMethod
+        ? text
+        : opts.images && opts.images.length > 0
+          ? promptWithImages(text, opts.images)
+          : text;
       // Generic turn-scoped _meta passthrough merged UNDER the backend-computed keys (e.g. the
       // outputSchema forward when a schema is set) — user meta never clobbers the schema channel.
       const promptMeta = mergeTurnMeta(opts.promptMeta, prepared.backend.promptMeta(schema));
@@ -881,20 +977,30 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     } catch (error) {
       // Abort is the engine's concern (throwIfAborted before/after the call) — re-throw it raw.
       if (opts.signal?.aborted) throw error;
-      throw mapThrownError(error, {
+      const mapped = mapThrownError(error, {
         label: opts.label,
         backendId: prepared.backend.id,
         backend: prepared.backend,
         providerErrorMetadata: session?.providerErrorMetadata,
         authMethods: session?.capabilities?.authMethods,
       });
+      if (isProviderUsageLimitError(mapped) || isAuthRequiredError(mapped)) keepOpenOnRelease = true;
+      throw mapped;
     } finally {
       try {
-        structuredTool?.release();
+        try {
+          structuredTool?.release();
+        } catch {
+          // best-effort tool cleanup; never mask the run result, error, or caller cancellation.
+        }
         if (session) {
           // Read real usage on BOTH success and error so partial usage is never lost.
           try {
-            opts.onUsage?.(session.usage.toAgentUsage());
+            opts.onUsage?.(
+              continuationUsageBaseline
+                ? session.usage.delta(continuationUsageBaseline)
+                : session.usage.toAgentUsage(),
+            );
           } catch {
             // usage is best-effort; never let it mask the real result/error.
           }
@@ -906,7 +1012,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
           // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
           // keepSession skips the close so the agent-persisted session stays re-openable.
           try {
-            await session.release({ keepOpen: opts.keepSession === true });
+            await session.release({ keepOpen: keepOpenOnRelease });
           } catch {
             // release is best-effort (session already untracked); never mask the real result/error.
           }
@@ -914,7 +1020,11 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       } finally {
         // The injected-tool turn spans the WHOLE run incl. session close, so the next queued
         // schema run's session/new (same-name registry replacement) never overlaps this one.
-        releaseStructuredToolTurn?.();
+        try {
+          releaseStructuredToolTurn?.();
+        } catch {
+          // best-effort turn release; never mask the run outcome.
+        }
       }
     }
   }
@@ -1372,11 +1482,12 @@ function resolveModelRoute(spec: string | undefined, registry?: BackendRegistry)
 /** The re-attach handle for an open session: id + backend routing name + cwd + the
  *  agent-advertised reopen surface. Contains no secrets; JSON-round-trippable. `backendId`
  *  doubles as the `model` routing spec for loadSession/resumeSession/listSessions. */
-function sessionRefFor(session: SessionHandle, backendId: string, cwd: string): AgentSessionRef {
+function sessionRefFor(session: SessionHandle, backend: Backend, cwd: string): AgentSessionRef {
   const caps = session.capabilities;
   return {
     sessionId: session.sessionId,
-    backendId,
+    backendId: backend.id,
+    poolKey: backend.poolKey ?? backend.id,
     cwd,
     reopen: {
       load: caps?.supportsLoadSession === true,
@@ -1427,6 +1538,10 @@ function validateRequiredString(
  *  pool via mapThrownError (§1.5), so the inline seam keys on the code, not the raw -32000. */
 function isAuthRequiredError(error: unknown): boolean {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.AUTH_REQUIRED;
+}
+
+function isProviderUsageLimitError(error: unknown): boolean {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
 }
 
 /** The SDK types a missing `type` discriminant as `agent`. */
