@@ -1,5 +1,11 @@
 # @automatalabs/mcp-server
 
+## 0.15.2
+
+### Patch Changes
+
+- @automatalabs/workflows@0.38.2
+
 ## 0.15.1
 
 ### Patch Changes
