@@ -75,6 +75,12 @@ export function buildAuthoringPromptContent() {
   );
   skill = replaceOnce(
     skill,
+    "[`examples/implementation-train.workflow.js`](examples/implementation-train.workflow.js)",
+    `[\`implementation-train.workflow.js\`](${EXAMPLES_URL}/implementation-train.workflow.js)`,
+    "SKILL.md",
+  );
+  skill = replaceOnce(
+    skill,
     "[`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js)",
     "`quick-wins.workflow.js` (included in full at the end of this document)",
     "SKILL.md",

@@ -15,7 +15,17 @@ This guide is **backend-agnostic**: everything here works the same regardless of
 - **Treat agent calls as memoryless orchestration boundaries.** Ordinary calls open fresh sessions, so thread everything a later call needs into its prompt explicitly. The sole automatic exception is recovery of the *same* usage/auth-interrupted occurrence: an unchanged, eligible resume may reopen that recorded session to finish its unfinished turn; it never gives a different call ambient memory.
 - **Agents are real coding agents, not chat completions.** They have file access, shells, and tools, rooted at the run's working directory. "Read the failing test and fix it" is a valid prompt; the agent will actually edit files.
 - **The DSL primitives are realm globals, not imports.** There is nothing to `import` — `agent`, `parallel`, `pipeline`, `gate`, `checkpoint`, `args`, `budget`, … are injected. Top-level `await` and a top-level `return` are valid (the body runs inside an async wrapper). The script's return value becomes the run's `result`.
+- **Assume every agent is brilliant, amnesiac, overconfident, and racing a world that changed since its prompt was written.** Every load-bearing pattern in this guide — self-contained prompts, evidence-demanding schemas, pinned bases re-checked every round, refusal as a first-class outcome — follows from those four facts. The script, not the agents, is responsible for compensating for them.
 - **Scripts are plain JavaScript, not TypeScript.** Type annotations fail to parse. There are also no Node APIs in the realm (no `require`, `import`, `fs`, `fetch`, timers) — all side effects happen through agents.
+
+## Start from the user's outcome — the source contract
+
+The most expensive workflow failures are not crashes; they are flawless executions of the wrong scope. They enter at one seam: the prose YOU write between the user's request and the agents' prompts. Downstream reviewers verify against your framing, so an assumption or a silent narrowing made here is amplified by every later stage, not caught. Before composing anything:
+
+- **Carry the user's words verbatim, not your summary of them.** Put the exact request sentences (including scope-bearing follow-ups from conversation — a later "and it must be first class" belongs beside the original ask) into the workflow's inputs: an `args.sourceRequest` field, a focus file the prompts reference, or both. Hosts may verify this mechanically; even where they don't, the discipline stands. Over-include — selection bias, not verbosity, is the failure mode.
+- **Anchor every derived stage to hop zero.** Specs, briefs, review prompts, and gate lenses should quote or reference the original sentences, never only the previous derivation. A chain that verifies hop N against hop N−1 will defend a hop-1 error forever; a chain that verifies against hop 0 self-corrects.
+- **Diff your prompts against the source before launching.** Enumerate what your prompts add that the user never asked for, what they drop, and what they reframe. Fix the mechanical deltas silently; put the genuine ambiguities to the user as binary questions ("Your request was: ⟨X⟩. The workflow does: ⟨Y⟩. Correct?") while corrections are still free. Never resolve an ambiguity by narrowing scope on your own authority — stated scope is an instruction, not an opening bid.
+- **Serve the implicit outcome too.** A user asking for a review wants findings they can act on (file:line, severity, evidence), not prose. A user asking for an implementation wants it shipped — tests green, docs consistent, zero deferred work — not a diff plus a TODO list. Encode the implicit bar in schemas and verification steps so the workflow cannot return something the user would have to finish themselves.
 
 ## Minimal script
 
@@ -180,7 +190,7 @@ const verified = (await pipeline(
 )).filter(Boolean).filter((f) => f.real);
 ```
 
-**Default to `pipeline`** for multi-stage work; use a `parallel` barrier only when the next stage genuinely needs *all* prior results at once (dedup across the full set, early-exit on a zero count, prompts that compare "the other findings"). Passing a promise instead of a thunk to `parallel` is a `TypeError` — wrap every call: `() => agent(...)`.
+**Default to `pipeline`** for multi-stage work; use a `parallel` barrier only when the next stage genuinely needs *all* prior results at once (dedup across the full set, early-exit on a zero count, prompts that compare "the other findings"). The test is always the **information dependency**, never the org chart: "these stages are conceptually separate" or "this reads cleaner" are not reasons for a barrier, and a barrier's cost is real — the fastest worker idles for the slowest. Likewise, all coordination lives in script code: never ask an agent to "check with the other reviewers" or "spawn helpers" — agents cannot see each other, and the ones that try will hallucinate colleagues. Passing a promise instead of a thunk to `parallel` is a `TypeError` — wrap every call: `() => agent(...)`.
 
 The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` as many items as the task needs and let the limiter schedule them. `workflow(nameOrScript, args)` nests another workflow inline (one level deep, sharing this run's budget and limiter) — inline script strings always work; saved names resolve when the host serves a workflows folder (`openWorkflowDir` / the `workflows` run option — see `reference.md`).
 
@@ -190,6 +200,8 @@ The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` 
 - A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle. In particular, **always rethrow pause-class errors** (`err.code === "PROVIDER_USAGE_LIMIT"` or `"AUTH_REQUIRED"`): they must propagate out of the script so the engine can pause the run resumably — swallowing one converts that pause into a fake, lossy completion.
 - A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
 - Per-call knobs: `timeoutMs` (a step allowed to run long: `timeoutMs: null` disables the clock), `retries`.
+- **Make refusal a first-class outcome (STOP-and-report).** For implementation and spec work, give the producer an explicit refusal shape — e.g. `commitShas: []` plus the discrepancy verbatim in a `deviations` field — with the instruction that a cited surface that does not exist as cited means STOP, never improvise. Then make your checker RECOGNIZE that shape: set a flag, exit the loop, skip adjudication, and surface it for the owner. A correct refusal routed into "round failed, try again" wastes every remaining round; the plausible-looking alternative — the agent quietly building around the discrepancy — is worse, because the mismatch is usually a stale base, not a wrong spec.
+- **Treat provider failure as an expected path, not an anomaly.** Rate limits, capacity collapse on newly launched models, and schema-repair exhaustion on oversized outputs all happen mid-run. Keep the recovery knobs at the host level where they are NOT identity-hashed — concurrency caps, engine retries, labels — so a resume can turn them without invalidating completed work. When one panel model's provider degrades, swapping that role to a stable model (an owner decision, disclosed) beats burning rounds on retries.
 
 ## Built-in quality loops
 
@@ -225,6 +237,21 @@ const outcome = await gate(
 if (!outcome.ok) log(`reviewer never approved after ${outcome.attempts} attempts`);
 else log(`reviewer approved commit ${outcome.verdict?.commitSha ?? "(unspecified)"}`);
 ```
+
+## Designing review gates and lenses
+
+The quality helpers give you the machinery; these rules — each bought with a real failure — govern how to aim it:
+
+- **A lens is a falsifiable question, not a job title.** Charge each reviewer with ONE failure mode and an explicit pass condition: "ok=true only if you *failed* to find a real bug" reads differently to a model than "review for correctness", and the difference shows in output. Overlapping mandates produce duplicate findings and diffuse accountability.
+- **Force evidence generation, not opinion formation.** Require an `evidence` field of literal commands + exit codes; charge reviewers to *run* things — drive the e2e themselves, reproduce the bug on the wire, re-run the suite from the committed state. A lens that only reads produces plausible opinions; a lens that runs produces facts. Always include one lens whose entire job is independently re-verifying greenness while trusting nothing in the producer's report.
+- **Cap the structured fields; overflow to files.** Evidence and feedback fields must stay small (tens of lines) — an oversized structured output can fail schema repair and kill the round. Full transcripts and detailed findings go to per-round files in a design directory; the structured verdict carries conclusions and pointers.
+- **Diversity of question beats count of reviewers — and watch for the question nobody owns.** Distinct failure-mode lenses (compliance, correctness, deferred work, green-verify) beat N generic reviewers. When every lens verifies against the same derived artifact, add one whose only input is the ORIGINAL source (the user's verbatim request) and whose only question is fidelity: enumerate every addition, omission, narrowing, or reframing. Scope drift is invisible to every other lens by construction.
+- **Constrain each lens's jurisdiction explicitly.** A minimalism lens will otherwise "improve" the design by descoping requested features: state that it judges HOW, never the owner's WHAT. Requested scope is not a design variable.
+- **Feedback must be self-contained.** The producer's next round sees ONLY the feedback string — sessions are memoryless. Never template in references to files that may not exist ("read review-X.md" when no reviewer ran); interpolate everything the producer needs. A phantom citation sends an honest producer into a correct-but-wasteful STOP.
+- **Adversarial gates do not self-converge — design the terminal state.** At high effort, each fix commit is fresh attack surface: rejections narrow but never reach zero on their own. Bound the rounds, then run a TERMINAL adjudicator whose verdict is final: it reads all rounds' files, independently spot-checks surprising verdicts in both directions (lens verdicts are inputs, not votes), resolves what the repo actually answers, and emits findings as a CLOSED list plus any genuine owner decisions.
+- **The fix round after adjudication uses no panel.** One producer pass applying the closed list exactly — nothing more — judged directly by the SAME adjudicator re-verifying its own findings. Re-opening a multi-lens gate on a fix round generates novel findings forever. Match review breadth to the openness of the question: open question → panel; closed list → the author of the list.
+- **Reconcile contradictions above the producer.** When lenses (or rounds) issue conflicting directives, the workflow owner adjudicates before the next produce round — an implementer will otherwise obey whichever spoke last, and the conflict lands unresolved on the terminal verdict.
+- **Don't spend lenses where code suffices.** SHA-format checks, placeholder detection, "does the report name the mandated path" — script code, run in the checker BEFORE any reviewer burns tokens. Lenses are expensive instruments; point them only at questions requiring judgment.
 
 ## Human gates: `checkpoint()`
 
@@ -449,6 +476,8 @@ keeps moving. Each of these prevented — or would have prevented — a real ter
   ("seeds persist on every resumed run") that is false at HEAD forces the implementer into
   ungrounded redesigns mid-flight. Cited behaviors deserve the same file:line grounding the spec
   gets.
+- **Design artifacts live OUTSIDE the worktree and survive it.** Briefs, review files, base pins, and adjudication reports go in a design directory beside (never inside) the worktree — a mid-run reset or worktree removal must not destroy the record the adjudicator needs. The persisted run state, not your scratchpad copy, is the replay-identity ground truth for the script itself.
+- **Re-verify external pins with fresh clones, every round.** A dependency pinned at authoring time can be superseded mid-train (fast-moving upstreams release daily). Reviewers fetch a FRESH temp clone and confirm the pin still equals the upstream's current release; the spec carries an implementation-time re-verification clause obligating the implementer to repeat the check and STOP on drift. A pinned checkout that was fresh yesterday is a stale checkout today.
 - **No uninvited resource caps.** A structurally bounded workflow (fixed rounds × fixed fan-out +
   one adjudication) cannot run away; a token budget adds no protection but adds a new failure mode —
   the mid-flight kill that wastes live work. Add caps only when the structure itself is unbounded,
@@ -566,6 +595,7 @@ return { confirmed, missing: gaps.missing ?? [] };
 When the inline examples above aren't enough, study the complete, validated scripts in [`examples/`](examples/) (same directory as this file):
 
 - [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous, unattended cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor adversarial verification panel, `gate()` where writer and reviewer are always different vendors, nesting a saved workflow by name, `completenessCheck()`, budget headroom reservation, string-form `args` hardening, placeholder/path guards on schema outputs, and pause-class error rethrow.
+- [`examples/implementation-train.workflow.js`](examples/implementation-train.workflow.js) — the battle pattern for shipping real work against a frozen contract: a lens-gated implement loop (produce → four falsifiable-question reviewers → self-contained combined feedback) with STOP-and-report recognized in the checker, script-side report validation before any reviewer spends tokens, base-freshness re-anchoring every round, and a terminal adjudicator whose closed finding list feeds a panel-free fix round.
 - [`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js) — a small hunter that runs standalone *or* nested: `loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an in-round budget floor (nested runs share the parent's budget).
 
 [`examples/README.md`](examples/README.md) maps each script to what it teaches.
@@ -609,6 +639,10 @@ If the script nests saved workflows by name (`workflow("review-pr")`), pass the 
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.
 - [ ] `return` a compact, structured result — it is the run's `result`, not a transcript.
 - [ ] Boolean-controlled convergence branches are scripted with mock answers (including reject-then-approve), not left to the all-true default.
+- [ ] The user's verbatim request sentences travel with the run (`args.sourceRequest` / a focus file), your prompts were diffed against them, and every genuine ambiguity became a question to the user — not a silent scope decision.
+- [ ] Producer reports have a refusal shape (STOP-and-report) and the checker recognizes it; report-shape validation runs in script code before any reviewer is spawned.
+- [ ] Every reviewer charge is one falsifiable question with an evidence field capped in size; full detail goes to design-dir files outside the worktree.
+- [ ] Gates are bounded, a terminal adjudicator is designed in, and its findings feed a panel-free fix round — no unaddressed final-round blockers, no unbounded convergence hopes.
 - [ ] `npx @automatalabs/workflows validate <file> --args '<json>'` exits 0 with no surprising warnings.
 
 For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and how hosts run scripts, read [`reference.md`](reference.md).
