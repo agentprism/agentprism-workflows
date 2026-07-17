@@ -9,6 +9,22 @@ A workflow script is a small piece of plain JavaScript (passed around as a **str
 
 This guide is **backend-agnostic**: everything here works the same regardless of which agent serves a given call, and one script can freely mix backends per call. `reference.md` (same directory) holds the exhaustive option tables, routing grammar, and error codes.
 
+## The guide, by task
+
+<!-- guide-index:begin -->
+Read the section your task needs — each is a separate document in this skill directory:
+
+1. **[MCP Server Setup](mcp-server-setup.md)** — how workflows actually run: registering `@automatalabs/mcp-server`, the `workflow` tool's run/await/inspect/stop actions, background runs, `script` vs `scriptPath`, the `args`/`cwd` globals, and the operational rules (runId retention, un-hashed recovery knobs).
+2. **[Start from the user's outcome](source-contract.md)** — the source contract: carrying the user's verbatim request, hop-zero anchoring, diffing prompts against the source, and serving the implicit bar. Read this before composing anything.
+3. **[Choosing agents and structured output](models-and-output.md)** — per-call model routing, `configOptions`, cross-vendor independence, and schema-validated outputs across every backend.
+4. **[Composition and failure design](composition-and-failure.md)** — the `meta` header, `pipeline` vs `parallel` by information dependency, null semantics, STOP-and-report, provider failure as an expected path, budgets and phases.
+5. **[Gates and lenses](gates-and-lenses.md)** — the built-in quality loops, and the discipline for review gates: falsifiable lens questions, evidence generation, terminal adjudication, the panel-free closed-list fix round, and human `checkpoint()` gates.
+6. **[Execution environment and tools](environment-and-tools.md)** — working directories, worktree isolation, confinement modes, attaching MCP servers/images/meta to a call, and custom ACP backends.
+7. **[Determinism and resume](determinism-and-resume.md)** — the replay contract: what is identity-hashed, content-addressed resume, continuation of interrupted calls, and the worked resume example.
+8. **[Long-running implementation trains](long-running-trains.md)** — the hard-won rules for multi-hour workflows racing a moving repository: base pins, fresh-clone re-verification, design artifacts outside the worktree, report/HEAD discipline.
+9. **[Worked examples and validation](examples-and-validation.md)** — two complete inline examples, the full-scale scripts in `examples/`, and the zero-token validator workflow.
+<!-- guide-index:end -->
+
 ## The mental model
 
 - **The script is the orchestrator; agents are workers.** All control flow — loops, fan-out, dedup, aggregation, conditionals — lives in script code. Never ask an agent to "spawn subagents" or "coordinate the other agents"; agents cannot do that. Decompose in the script and give each agent one self-contained task.
@@ -36,22 +52,6 @@ return { summary };
 
 Running scripts happens through the MCP server's `workflow` tool — server setup, the run/inspect/await/stop actions, and the `args`/`cwd` globals a running script receives are covered in **MCP Server Setup** ([mcp-server-setup.md](mcp-server-setup.md)).
 
-## The guide, by task
-
-<!-- guide-index:begin -->
-Read the section your task needs — each is a separate document in this skill directory:
-
-1. **[MCP Server Setup](mcp-server-setup.md)** — how workflows actually run: registering `@automatalabs/mcp-server`, the `workflow` tool's run/await/inspect/stop actions, background runs, `script` vs `scriptPath`, the `args`/`cwd` globals, and the operational rules (runId retention, un-hashed recovery knobs).
-2. **[Start from the user's outcome](source-contract.md)** — the source contract: carrying the user's verbatim request, hop-zero anchoring, diffing prompts against the source, and serving the implicit bar. Read this before composing anything.
-3. **[Choosing agents and structured output](models-and-output.md)** — per-call model routing, `configOptions`, cross-vendor independence, and schema-validated outputs across every backend.
-4. **[Composition and failure design](composition-and-failure.md)** — the `meta` header, `pipeline` vs `parallel` by information dependency, null semantics, STOP-and-report, provider failure as an expected path, budgets and phases.
-5. **[Gates and lenses](gates-and-lenses.md)** — the built-in quality loops, and the discipline for review gates: falsifiable lens questions, evidence generation, terminal adjudication, the panel-free closed-list fix round, and human `checkpoint()` gates.
-6. **[Execution environment and tools](environment-and-tools.md)** — working directories, worktree isolation, confinement modes, attaching MCP servers/images/meta to a call, and custom ACP backends.
-7. **[Determinism and resume](determinism-and-resume.md)** — the replay contract: what is identity-hashed, content-addressed resume, continuation of interrupted calls, and the worked resume example.
-8. **[Long-running implementation trains](long-running-trains.md)** — the hard-won rules for multi-hour workflows racing a moving repository: base pins, fresh-clone re-verification, design artifacts outside the worktree, report/HEAD discipline.
-9. **[Worked examples and validation](examples-and-validation.md)** — two complete inline examples, the full-scale scripts in `examples/`, and the zero-token validator workflow.
-<!-- guide-index:end -->
-
 ## Pre-flight checklist
 
 - [ ] `export const meta = { name, description }` is the first statement, a pure literal.
@@ -74,6 +74,5 @@ Read the section your task needs — each is a separate document in this skill d
 - [ ] Every reviewer charge is one falsifiable question with an evidence field capped in size; full detail goes to design-dir files outside the worktree.
 - [ ] Gates are bounded, a terminal adjudicator is designed in, and its findings feed a panel-free fix round — no unaddressed final-round blockers, no unbounded convergence hopes.
 - [ ] `npx @automatalabs/workflows validate <file> --args '<json>'` exits 0 with no surprising warnings.
-
 
 For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and how hosts run scripts, read [`reference.md`](reference.md).

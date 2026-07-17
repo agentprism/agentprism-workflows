@@ -65,7 +65,12 @@ export function buildAuthoringPromptContent() {
     throw new Error("generate-authoring-prompt: guide-index markers not found in SKILL.md");
   }
   const inlined = GUIDE_PARTS.map((f) => readFileSync(join(skillDir, f), "utf8").trimEnd()).join("\n\n");
-  skill = skill.slice(0, begin) + inlined + skill.slice(end + INDEX_END.length);
+  skill =
+    skill.slice(0, begin) +
+    "Every section of the guide is inlined below, after the core: MCP Server Setup, the source contract, models and structured output, composition and failure design, gates and lenses, the execution environment, determinism and resume, long-running trains, and worked examples with validation." +
+    skill.slice(end + INDEX_END.length) +
+    "\n\n" +
+    inlined;
 
   // Same-directory pointers → in-document sections / absolute URLs (applied to the STITCHED text).
   skill = replaceOnce(
