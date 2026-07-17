@@ -77,6 +77,13 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
 
   const context = typeof labelOrContext === "string" ? { label: labelOrContext } : (labelOrContext ?? {});
   const message = errorText(error);
+  if (isChildCleanupError(error)) {
+    return new WorkflowError("child process cleanup failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+      recoverable: false,
+      agentLabel: context.label,
+      details: error,
+    });
+  }
   if (isAcpAuthRequired(error, message)) {
     // authContext sources ONLY agent-advertised AuthMethod fields (ids/types/names) — never our
     // sent _meta/env values (Principle 9). This is the machine-readable contract every downstream
@@ -118,6 +125,15 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
     agentLabel: context.label,
     details: error,
   });
+}
+
+function isChildCleanupError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; data?: unknown };
+  return candidate.code === -32603 && Boolean(
+    candidate.data && typeof candidate.data === "object" &&
+    (candidate.data as { errorKind?: unknown }).errorKind === "child_cleanup_error",
+  );
 }
 
 function classifyProviderError(

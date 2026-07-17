@@ -8,10 +8,8 @@ import { join } from "node:path";
 
 import {
   AgentSession,
-  DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
@@ -49,24 +47,17 @@ const model = {
 
 const createAgentSession = async (options) => {
   const cwd = options.sessionManager?.getCwd?.() ?? process.cwd();
-  const settingsManager = SettingsManager.create(cwd, sessionDir);
-  const resourceLoader = new DefaultResourceLoader({
-    cwd,
-    agentDir: sessionDir,
-    settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-  });
-  await resourceLoader.reload();
-
-  const streamFn = () => {
+  let callIndex = 0;
+  const streamFn = (_activeModel, context) => {
     const stream = createAssistantMessageEventStream();
+    const structuredTool = context.tools?.find(({ name }) => name.startsWith("mcp__structured_output__StructuredOutput"));
+    const toolTurn = Boolean(structuredTool) && callIndex === 0;
+    callIndex += 1;
     const message = {
       role: "assistant",
-      content: [{ type: "text", text: "hermetic pong" }],
+      content: toolTurn
+        ? [{ type: "toolCall", id: "hermetic-structured-call", name: structuredTool.name, arguments: { answer: "pong" } }]
+        : [{ type: "text", text: structuredTool ? "capture complete" : "hermetic pong" }],
       api: model.api,
       provider: model.provider,
       model: model.id,
@@ -78,29 +69,18 @@ const createAgentSession = async (options) => {
         totalTokens: 4,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
-      stopReason: "stop",
+      stopReason: toolTurn ? "toolUse" : "stop",
       timestamp: Date.now(),
     };
     queueMicrotask(() => {
       stream.push({ type: "start", partial: { ...message, content: [] } });
-      stream.push({
-        type: "text_start",
-        contentIndex: 0,
-        partial: { ...message, content: [{ type: "text", text: "" }] },
-      });
-      stream.push({
-        type: "text_delta",
-        contentIndex: 0,
-        delta: "hermetic pong",
-        partial: message,
-      });
-      stream.push({
-        type: "text_end",
-        contentIndex: 0,
-        content: "hermetic pong",
-        partial: message,
-      });
-      stream.push({ type: "done", reason: "stop", message });
+      if (!toolTurn) {
+        const text = message.content[0].text;
+        stream.push({ type: "text_start", contentIndex: 0, partial: { ...message, content: [{ type: "text", text: "" }] } });
+        stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+        stream.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+      }
+      stream.push({ type: "done", reason: message.stopReason, message });
     });
     return stream;
   };
@@ -113,16 +93,16 @@ const createAgentSession = async (options) => {
   const session = new AgentSession({
     agent,
     sessionManager: options.sessionManager ?? SessionManager.inMemory(cwd),
-    settingsManager,
+    settingsManager: options.settingsManager,
     cwd,
-    resourceLoader,
+    resourceLoader: options.resourceLoader,
     customTools: options.customTools,
     modelRuntime,
     initialActiveToolNames: [],
   });
   return {
     session,
-    extensionsResult: resourceLoader.getExtensions(),
+    extensionsResult: options.resourceLoader?.getExtensions(),
     modelFallbackMessage: undefined,
   };
 };

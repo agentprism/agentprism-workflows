@@ -2,18 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
-import { Type } from "typebox";
-import { META_KEYS } from "@automatalabs/shared-types";
 import { PiBackend } from "../src/index.js";
-import type { StructuredSource } from "../src/index.js";
 
 const require = createRequire(import.meta.url);
-const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
 const ENV_KEYS = ["AGENTPRISM_PI_ACP_CMD", "AGENTPRISM_PI_ACP_ARGS"] as const;
-
-function source(text: string, finalText = text): StructuredSource {
-  return { currentTurnText: () => text, finalMessageText: () => finalText, rawStructuredOutput: () => undefined };
-}
 
 function withEnv(overrides: Record<string, string | undefined>, fn: () => void): void {
   const previous = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -33,16 +25,14 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
   }
 }
 
-test("PiBackend exposes the native pi structured-output posture", () => {
+test("PiBackend exposes the standard injected structured-output posture", () => {
   const backend = new PiBackend();
   assert.equal(backend.id, "pi");
   assert.equal(backend.stripsRoutingPrefix, true);
-  assert.equal(backend.embedSchemaInPrompt, false);
-  assert.equal(backend.injectStructuredOutputTool, false);
-  assert.deepEqual(backend.customCapabilities, {
-    namespace: "@automatalabs/pi-acp",
-    gatedKeys: [META_KEYS.outputSchema],
-  });
+  assert.equal(backend.embedSchemaInPrompt, true);
+  assert.equal(backend.injectStructuredOutputTool, true);
+  assert.equal(backend.customCapabilities, undefined);
+  assert.equal(backend.nativeStructured, undefined);
 });
 
 test("PiBackend.spawnConfig: CMD override wins and argv comes only from _ARGS", () => {
@@ -70,18 +60,12 @@ test("PiBackend.spawnConfig: default resolves the package bin under the current 
   });
 });
 
-test("PiBackend sends plain JSON Schema on the turn and parses only the final message", () => {
+test("PiBackend sends no private prompt metadata and has no native result hook", () => {
   const backend = new PiBackend();
-  assert.equal(backend.sessionMeta(SCHEMA), undefined);
+  assert.equal(backend.sessionMeta(undefined), undefined);
   assert.equal(backend.promptMeta(undefined), undefined);
-  const meta = backend.promptMeta(SCHEMA) as Record<string, Record<string, unknown>>;
-  assert.equal((meta[META_KEYS.outputSchema].properties as Record<string, Record<string, unknown>>).city.minLength, 1);
-  assert.equal("additionalProperties" in meta[META_KEYS.outputSchema], false);
-
-  const progress = '{"city":"progress","hot":false}';
-  const final = '{"city":"Oslo","hot":true}';
-  assert.deepEqual(backend.nativeStructured(source(progress + final, final)), { city: "Oslo", hot: true });
-  assert.equal(backend.nativeStructured(source("not json")), undefined);
+  assert.equal(backend.promptMeta({ type: "object" } as never), undefined);
+  assert.equal(backend.nativeStructured, undefined);
 });
 
 test("PiBackend classifies only categorical rate/billing walls as provider usage limits", () => {

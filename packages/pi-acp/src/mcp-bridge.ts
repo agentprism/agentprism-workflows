@@ -1,26 +1,109 @@
-import type { McpServer, McpServerStdio } from "@agentclientprotocol/sdk";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { basename } from "node:path";
+import { pathToFileURL } from "node:url";
+import type {
+  AgentContext,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  McpServer,
+} from "@agentclientprotocol/sdk";
+import type {
+  AgentSession,
+  ExtensionAPI,
+  InlineExtension,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  CreateMessageRequestSchema,
+  ElicitRequestSchema,
+  ElicitationCompleteNotificationSchema,
+  ErrorCode,
+  ListRootsRequestSchema,
+  LoggingMessageNotificationSchema,
+  McpError,
+  PromptListChangedNotificationSchema,
+  ResourceListChangedNotificationSchema,
+  ResourceUpdatedNotificationSchema,
+  ToolListChangedNotificationSchema,
+  type CallToolResult,
+  type ContentBlock,
+  type CreateMessageRequest,
+  type JSONRPCMessage,
+  type MessageExtraInfo,
+  type ServerCapabilities,
+  type Tool,
+} from "@modelcontextprotocol/sdk/types.js";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
+import type { JsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js";
+import { Type } from "typebox";
 import { adapterError } from "./errors.js";
 import type { PiAcpDeps } from "./deps.js";
+import { createMcpSamplingPayload } from "./mcp-sampling-payload.js";
+import { PKG_VERSION } from "./version.js";
 
-export interface McpToolInfo {
-  name: string;
-  description?: string;
-  inputSchema: Record<string, unknown>;
+const NO_RECONNECT = {
+  initialReconnectionDelay: 0,
+  maxReconnectionDelay: 0,
+  reconnectionDelayGrowFactor: 1,
+  maxRetries: 0,
+} as const;
+
+const NEVER_ABORTED = new AbortController().signal;
+export const MCP_CLOSE_DEADLINE_MS = 60_000;
+
+export interface McpSessionBinding {
+  sessionId: string;
+  cwd: string;
+  client: AgentContext;
+  sessionSignal: AbortSignal;
+  getPi(): AgentSession | undefined;
+  getTurnSignal(): AbortSignal | undefined;
+  isPublished(): boolean;
+  emitDiagnostic(text: string): void;
+  /** Adapter-allocated collision-safe token for this configured server. */
+  serverToken?: string;
+  poison?(server: string): void;
+  ownerToken?: object;
+  modelRuntime?: PiAcpDeps["modelRuntime"];
 }
 
 export interface McpListResult {
-  tools: McpToolInfo[];
+  tools: Tool[];
   nextCursor?: string;
+  raw?: unknown;
 }
 
 export interface McpClientHandle {
   listTools(cursor: string | undefined, signal: AbortSignal, timeoutMs: number): Promise<McpListResult>;
-  callTool(name: string, args: unknown, signal: AbortSignal, timeoutMs: number): Promise<CallToolResult>;
+  callTool(
+    name: string,
+    args: unknown,
+    signal: AbortSignal,
+    timeoutMs: number,
+    onprogress?: (progress: unknown) => void,
+  ): Promise<CallToolResult>;
   close(): Promise<void>;
+  ping?(signal: AbortSignal, timeoutMs: number): Promise<void>;
+  getCapabilities?(): ServerCapabilities | undefined;
+  getInstructions?(): string | undefined;
+  setLoggingLevel?(signal: AbortSignal, timeoutMs: number): Promise<void>;
+  listResources?(cursor: string | undefined, options: RequestOptions): Promise<unknown>;
+  listResourceTemplates?(cursor: string | undefined, options: RequestOptions): Promise<unknown>;
+  readResource?(uri: string, options: RequestOptions): Promise<unknown>;
+  subscribeResource?(uri: string, options: RequestOptions): Promise<unknown>;
+  unsubscribeResource?(uri: string, options: RequestOptions): Promise<unknown>;
+  listPrompts?(cursor: string | undefined, options: RequestOptions): Promise<unknown>;
+  getPrompt?(name: string, args: Record<string, string> | undefined, options: RequestOptions): Promise<unknown>;
+  complete?(params: unknown, options: RequestOptions): Promise<unknown>;
+  setToolsChangedHandler?(handler: () => void): void;
+  setDisabledHandler?(handler: () => void): void;
+  disableOnTimeout?(): void;
 }
 
 export class McpTimeoutError extends Error {
@@ -28,6 +111,13 @@ export class McpTimeoutError extends Error {
     super("MCP operation timed out");
     this.name = "McpTimeoutError";
   }
+}
+
+function exactMcpError(code: ErrorCode, message: string): McpError {
+  const error = new McpError(code, message);
+  // McpError adds a local-display prefix, but Protocol serializes error.message verbatim.
+  error.message = message;
+  return error;
 }
 
 function abortPromise(signal: AbortSignal): Promise<never> {
@@ -38,100 +128,587 @@ function abortPromise(signal: AbortSignal): Promise<never> {
 }
 
 export async function bounded<T>(
-  operation: Promise<T>,
+  operation: Promise<T> | (() => Promise<T>),
   signal: AbortSignal,
   timeoutMs: number,
   sleep: PiAcpDeps["sleep"],
 ): Promise<T> {
-  const timeoutController = new AbortController();
-  const timeout = sleep(timeoutMs, timeoutController.signal).then(() => {
+  const timer = new AbortController();
+  let timedOut = false;
+  const timeout = sleep(timeoutMs, timer.signal).then(() => {
+    timedOut = true;
     throw new McpTimeoutError();
   });
-  operation.then(() => undefined, () => undefined);
+  // The lazy form is used by incoming MCP handlers so their deadline is armed
+  // before progress 0 and before constructing provider/ACP work.
+  const running = typeof operation === "function" ? Promise.resolve().then(operation) : operation;
+  running.then(() => undefined, () => undefined);
   try {
-    return await Promise.race([operation, abortPromise(signal), timeout]);
+    try {
+      const result = await Promise.race([running, abortPromise(signal), timeout]);
+      if (signal.aborted) throw signal.reason;
+      if (timedOut) throw new McpTimeoutError();
+      return result;
+    } catch (error) {
+      if (signal.aborted) throw signal.reason;
+      if (timedOut) throw new McpTimeoutError();
+      throw error;
+    }
   } finally {
-    timeoutController.abort();
+    timer.abort();
     timeout.catch(() => undefined);
   }
 }
 
-export async function connectDefaultMcpClient(
-  server: McpServerStdio,
-  signal: AbortSignal,
-  timeoutMs: number,
-  sleep: PiAcpDeps["sleep"],
-): Promise<McpClientHandle> {
-  const client = new Client({ name: "@automatalabs/pi-acp", version: "0.0.0" });
-  const transport = new StdioClientTransport({
-    command: server.command,
-    args: server.args,
-    env: Object.fromEntries(server.env.map(({ name, value }) => [name, value])),
-  });
-  try {
-    await bounded(client.connect(transport), signal, timeoutMs, sleep);
-  } catch (error) {
-    const pid = transport.pid;
-    const close = transport.close().catch(() => undefined);
-    try {
-      await bounded(close, new AbortController().signal, timeoutMs, sleep);
-    } catch {
-      if (pid !== null) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // The child may have exited between the timeout and the kill.
-        }
-      }
-      try {
-        await bounded(close, new AbortController().signal, timeoutMs, sleep);
-      } catch {
-        close.then(() => undefined, () => undefined);
-      }
-    }
-    throw error;
-  }
-  let closed = false;
-  return {
-    async listTools(cursor, requestSignal, requestTimeout) {
-      const result = await client.listTools(cursor ? { cursor } : undefined, {
-        signal: requestSignal,
-        timeout: requestTimeout,
-      });
-      return {
-        tools: result.tools.map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema as Record<string, unknown>,
-        })),
-        nextCursor: result.nextCursor,
-      };
-    },
-    callTool(name, args, requestSignal, requestTimeout) {
-      return client.callTool(
-        { name, arguments: typeof args === "object" && args !== null ? args as Record<string, unknown> : {} },
-        undefined,
-        { signal: requestSignal, timeout: requestTimeout },
-      ).then((result) => {
-        if (!("content" in result)) throw new Error("MCP task result did not contain tool content");
-        return result as CallToolResult;
-      });
-    },
-    async close() {
-      if (closed) return;
-      closed = true;
-      await client.close();
-    },
-  };
+function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  return present.length === 0 ? NEVER_ABORTED : AbortSignal.any(present);
 }
 
-function slug(value: string): string {
+function headers(values: readonly { name: string; value: string }[]): Headers {
+  const result = new Headers();
+  for (const { name, value } of values) result.append(name, value);
+  return result;
+}
+
+class CloseSignallingTransport implements Transport {
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
+  private signalled = false;
+  private closePromise: Promise<void> | undefined;
+
+  constructor(
+    private readonly raw: Transport,
+    private readonly terminate: (() => Promise<void>) | undefined,
+    private readonly onRawError: (error: Error) => void,
+    private readonly onRawClose: () => void,
+    private readonly timeoutMs: number,
+    private readonly sleep: PiAcpDeps["sleep"],
+    private readonly serverToken: string,
+  ) {
+    raw.onclose = () => {
+      this.signalClose();
+      this.onRawClose();
+    };
+    raw.onerror = (error) => {
+      this.onRawError(error);
+      this.onerror?.(error);
+    };
+    raw.onmessage = (message, extra) => this.onmessage?.(message, extra);
+  }
+
+  get sessionId(): string | undefined { return this.raw.sessionId; }
+  setProtocolVersion(version: string): void { this.raw.setProtocolVersion?.(version); }
+  start(): Promise<void> { return this.raw.start(); }
+  send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
+    return this.raw.send(message, options);
+  }
+
+  signalClose(): void {
+    if (this.signalled) return;
+    this.signalled = true;
+    this.onclose?.();
+  }
+
+  close(): Promise<void> {
+    this.closePromise ??= this.closeOwned();
+    return this.closePromise;
+  }
+
+  private async closeOwned(): Promise<void> {
+    this.signalClose();
+    const timer = new AbortController();
+    const expired = this.sleep(this.timeoutMs, timer.signal).then(() => {
+      throw new McpTimeoutError();
+    });
+    expired.catch(() => undefined);
+    if (this.terminate) {
+      try {
+        const terminating = this.terminate();
+        terminating.catch(() => undefined);
+        await Promise.race([terminating, expired]);
+      } catch {
+        console.error(`[mcp:${this.serverToken}] session termination failed`);
+      }
+    }
+    let physical: Promise<void>;
+    try {
+      physical = this.raw.close();
+    } catch {
+      console.error(`[mcp:${this.serverToken}] close failed`);
+      timer.abort();
+      return;
+    }
+    physical.catch(() => undefined);
+    try {
+      await Promise.race([physical, expired]);
+    } catch {
+      console.error(`[mcp:${this.serverToken}] close failed`);
+    } finally {
+      timer.abort();
+    }
+  }
+}
+
+function safeToken(value: string): string {
   const sanitized = value.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/_+/g, "_");
   return sanitized || "_";
 }
 
+function createTransport(
+  server: McpServer,
+  sleep: PiAcpDeps["sleep"],
+  fatal: (error?: Error) => void,
+  timeoutMs: number,
+): CloseSignallingTransport {
+  const token = safeToken(server.name);
+  let raw: Transport;
+  let terminate: (() => Promise<void>) | undefined;
+  if (!("type" in server)) {
+    const stdio = new StdioClientTransport({
+      command: server.command,
+      args: server.args,
+      env: Object.fromEntries(server.env.map(({ name, value }) => [name, value])),
+    });
+    raw = stdio;
+    terminate = async () => {
+      const pid = stdio.pid;
+      if (pid === null) return;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    };
+  } else if (server.type === "http") {
+    let open = true;
+    const observedFetch = async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      if (!open) throw new Error("MCP transport closed");
+      const response = await fetch(url, init);
+      if (init?.method === "GET" && response.ok && response.headers.get("content-type")?.includes("text/event-stream") && !response.body) {
+        throw new Error("MCP event stream has no body");
+      }
+      return response;
+    };
+    const http = new StreamableHTTPClientTransport(new URL(server.url), {
+      requestInit: { headers: headers(server.headers) },
+      fetch: observedFetch,
+      reconnectionOptions: NO_RECONNECT,
+    });
+    raw = http;
+    terminate = () => http.terminateSession();
+    const wrapper = new CloseSignallingTransport(raw, terminate, (error) => {
+      open = false;
+      wrapper.signalClose();
+      fatal(error);
+      void wrapper.close();
+    }, () => fatal(), timeoutMs, sleep, token);
+    return wrapper;
+  } else if (server.type === "sse") {
+    let open = true;
+    const guardedFetch = (url: string | URL, init?: RequestInit): Promise<Response> => {
+      if (!open) return Promise.reject(new Error("MCP transport closed"));
+      return fetch(url, init);
+    };
+    raw = new SSEClientTransport(new URL(server.url), {
+      requestInit: { headers: headers(server.headers) },
+      eventSourceInit: { fetch: guardedFetch },
+      fetch: guardedFetch,
+    });
+    const wrapper = new CloseSignallingTransport(raw, undefined, (error) => {
+      open = false;
+      wrapper.signalClose();
+      fatal(error);
+      void wrapper.close();
+    }, () => fatal(), timeoutMs, sleep, token);
+    return wrapper;
+  } else {
+    throw adapterError("unsupported_mcp_transport", { server: server.name });
+  }
+  return new CloseSignallingTransport(raw, terminate, (error) => {
+    // stdio parser/pipe errors are diagnostic-only; natural close is observed by onclose.
+    void error;
+  }, () => fatal(), timeoutMs, sleep, token);
+}
+
+let elicitationCounter = 0n;
+let elicitationOwnerCounter = 0n;
+const elicitationOwners = new WeakMap<object, bigint>();
+const urlElicitations = new Map<string, {
+  opaque: string;
+  remote: string;
+  accepted: boolean;
+  declinePending(): void;
+}>();
+const consumedElicitations = new Set<string>();
+
+function elicitationKey(binding: McpSessionBinding, token: string, remote: string): string {
+  const owner = binding.ownerToken ?? binding;
+  let ownerId = elicitationOwners.get(owner);
+  if (ownerId === undefined) {
+    ownerId = ++elicitationOwnerCounter;
+    elicitationOwners.set(owner, ownerId);
+  }
+  return `${ownerId}\u0000${binding.sessionId}\u0000${token}\u0000${remote}`;
+}
+
+function clearElicitations(binding: McpSessionBinding | undefined, token: string): void {
+  if (!binding) return;
+  const prefix = elicitationKey(binding, token, "");
+  for (const [key, entry] of urlElicitations) {
+    if (key.startsWith(prefix)) {
+      entry.declinePending();
+      urlElicitations.delete(key);
+    }
+  }
+  for (const key of consumedElicitations) {
+    if (key.startsWith(prefix)) consumedElicitations.delete(key);
+  }
+}
+
+function progress(extra: { sendNotification(notification: { method: "notifications/progress"; params: { progressToken: string | number; progress: number; total: number } }): Promise<void> }, token: string | number | undefined, value: number, diagnostic: () => void): void {
+  if (token === undefined) return;
+  extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: value, total: 1 } })
+    .catch(diagnostic);
+}
+
+export function createMcpRootsResult(
+  binding: Pick<McpSessionBinding, "cwd" | "sessionSignal">,
+  progressToken: string | number | undefined,
+  extra: {
+    signal: AbortSignal;
+    sendNotification(notification: { method: "notifications/progress"; params: { progressToken: string | number; progress: number; total: number } }): Promise<void>;
+  },
+  onProgressFailure: () => void,
+) {
+  extra.signal.throwIfAborted();
+  binding.sessionSignal.throwIfAborted();
+  progress(extra, progressToken, 0, onProgressFailure);
+  const result = { roots: [{ uri: pathToFileURL(binding.cwd).href, name: basename(binding.cwd) }] };
+  progress(extra, progressToken, 1, onProgressFailure);
+  return result;
+}
+
+export function mapMcpSamplingResult(message: AssistantMessage, stopSequences: readonly string[] = []) {
+  if (message.stopReason === "error") throw exactMcpError(ErrorCode.InternalError, "MCP sampling failed");
+  if (message.stopReason === "aborted") throw exactMcpError(ErrorCode.InternalError, "MCP sampling cancelled");
+  if (message.content.some((block) => block.type === "toolCall")) {
+    throw exactMcpError(ErrorCode.InternalError, "MCP sampling returned unsupported tool output");
+  }
+  let text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+  let stopReason: "endTurn" | "maxTokens" | "stopSequence" = message.stopReason === "length" ? "maxTokens" : "endTurn";
+  let earliest = -1;
+  for (const stop of stopSequences) {
+    const index = text.indexOf(stop);
+    if (index >= 0 && (earliest < 0 || index < earliest)) earliest = index;
+  }
+  if (earliest >= 0) {
+    text = text.slice(0, earliest);
+    stopReason = "stopSequence";
+  }
+  return {
+    role: "assistant" as const,
+    model: `${message.provider}/${message.responseModel ?? message.model}`,
+    content: { type: "text" as const, text },
+    stopReason,
+  };
+}
+
+function installClientHandlers(
+  client: Client,
+  binding: McpSessionBinding | undefined,
+  token: string,
+  validator: AjvJsonSchemaValidator,
+  timeoutMs: number,
+  sleep: PiAcpDeps["sleep"],
+): void {
+  if (!binding) return;
+  const diagnostic = (suffix: string) => binding.emitDiagnostic(`[mcp:${token}] ${suffix}`);
+  client.setRequestHandler(CreateMessageRequestSchema, async (request, extra) => {
+    if (request.params.task || (request.params.includeContext && request.params.includeContext !== "none") || request.params.tools || request.params.toolChoice) {
+      throw exactMcpError(ErrorCode.InvalidParams, request.params.task ? "Unsupported experimental MCP task" : "Unsupported MCP sampling capability");
+    }
+    const pi = binding.getPi();
+    const model = pi?.model;
+    if (!pi || !model) throw exactMcpError(ErrorCode.InternalError, "MCP sampling requires an active pi session model");
+    const progressToken = request.params._meta?.progressToken;
+    const turnSignal = binding.getTurnSignal();
+    const signal = anySignal([extra.signal, binding.sessionSignal, turnSignal]);
+    let message: AssistantMessage;
+    try {
+      message = await bounded(() => {
+        progress(extra, progressToken, 0, () => diagnostic("progress notification failed"));
+        const prepared = createMcpSamplingPayload(request.params, model);
+        return (binding.modelRuntime ?? pi.modelRuntime).completeSimple(model, prepared.context, {
+          signal,
+          maxTokens: request.params.maxTokens,
+          temperature: request.params.temperature,
+          metadata: request.params.metadata as Record<string, unknown> | undefined,
+          onPayload: prepared.onPayload,
+        });
+      }, signal, timeoutMs, sleep);
+    } catch (error) {
+      if (extra.signal.aborted || binding.sessionSignal.aborted) throw error;
+      if (turnSignal?.aborted) throw exactMcpError(ErrorCode.InternalError, "MCP sampling cancelled");
+      if (error instanceof McpTimeoutError) throw exactMcpError(ErrorCode.InternalError, "MCP sampling timed out");
+      if (error instanceof McpError) throw error;
+      throw exactMcpError(ErrorCode.InternalError, "MCP sampling failed");
+    }
+    if (extra.signal.aborted) throw extra.signal.reason;
+    if (binding.sessionSignal.aborted) throw binding.sessionSignal.reason;
+    if (turnSignal?.aborted) throw exactMcpError(ErrorCode.InternalError, "MCP sampling cancelled");
+    const result = mapMcpSamplingResult(message, request.params.stopSequences);
+    progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
+    return result;
+  });
+  client.setRequestHandler(ListRootsRequestSchema, (request, extra) => createMcpRootsResult(
+    binding,
+    request.params?._meta?.progressToken,
+    extra,
+    () => diagnostic("progress notification failed"),
+  ));
+  client.setRequestHandler(ElicitRequestSchema, async (request, extra) => {
+    if (request.params.task) throw exactMcpError(ErrorCode.InvalidParams, "Unsupported experimental MCP task");
+    if (!binding.isPublished()) return { action: "decline" as const };
+    const progressToken = request.params._meta?.progressToken;
+    const turnSignal = binding.getTurnSignal();
+    const signal = anySignal([extra.signal, binding.sessionSignal, turnSignal]);
+    let urlKey: string | undefined;
+    try {
+      const response = await bounded(async () => {
+        progress(extra, progressToken, 0, () => diagnostic("progress notification failed"));
+        if (request.params.mode === "form") {
+          let validate: JsonSchemaValidator<Record<string, unknown>>;
+          try {
+            validate = validator.getValidator(request.params.requestedSchema);
+          } catch {
+            throw exactMcpError(ErrorCode.InternalError, "MCP elicitation schema validation failed");
+          }
+          const value = await binding.client.request<CreateElicitationResponse, CreateElicitationRequest>("elicitation/create", {
+            sessionId: binding.sessionId,
+            mode: "form",
+            message: request.params.message,
+            requestedSchema: request.params.requestedSchema,
+          });
+          if (value.action !== "accept") return value;
+          const checked = validate(value.content);
+          if (!checked.valid) throw exactMcpError(ErrorCode.InvalidParams, "Invalid MCP elicitation response");
+          return { action: "accept" as const, content: checked.data };
+        }
+
+        const urlParams = request.params as { elicitationId: string; url: string; message: string };
+        urlKey = elicitationKey(binding, token, urlParams.elicitationId);
+        if (urlElicitations.has(urlKey)) {
+          diagnostic("duplicate elicitation id");
+          return { action: "decline" as const };
+        }
+        if (consumedElicitations.has(urlKey)) {
+          diagnostic("reused elicitation id");
+          return { action: "decline" as const };
+        }
+        const opaque = `pi-acp-elicitation-${++elicitationCounter}`;
+        let declinePending!: () => void;
+        const earlyCompletion = new Promise<CreateElicitationResponse>((resolve) => {
+          declinePending = () => resolve({ action: "decline" });
+        });
+        urlElicitations.set(urlKey, { opaque, remote: urlParams.elicitationId, accepted: false, declinePending });
+        const acpRequest = binding.client.request<CreateElicitationResponse, CreateElicitationRequest>("elicitation/create", {
+          sessionId: binding.sessionId,
+          mode: "url",
+          message: urlParams.message,
+          elicitationId: opaque,
+          url: urlParams.url,
+        });
+        acpRequest.then(() => undefined, () => undefined);
+        return Promise.race([acpRequest, earlyCompletion]);
+      }, signal, timeoutMs, sleep);
+      if (extra.signal.aborted) throw extra.signal.reason;
+      if (binding.sessionSignal.aborted) throw binding.sessionSignal.reason;
+      if (turnSignal?.aborted) {
+        if (urlKey) {
+          urlElicitations.delete(urlKey);
+          consumedElicitations.add(urlKey);
+        }
+        return { action: "cancel" as const };
+      }
+      if (request.params.mode === "url" && response.action === "accept") {
+        const entry = urlKey ? urlElicitations.get(urlKey) : undefined;
+        if (entry) entry.accepted = true;
+      } else if (urlKey) {
+        urlElicitations.delete(urlKey);
+        consumedElicitations.add(urlKey);
+      }
+      progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
+      if (response.action === "accept") {
+        return request.params.mode === "form"
+          ? { action: "accept" as const, content: response.content as Record<string, unknown> }
+          : { action: "accept" as const };
+      }
+      return { action: response.action };
+    } catch (error) {
+      if (urlKey) {
+        urlElicitations.delete(urlKey);
+        consumedElicitations.add(urlKey);
+      }
+      if (extra.signal.aborted || binding.sessionSignal.aborted) throw error;
+      if (turnSignal?.aborted || error instanceof McpTimeoutError) return { action: "cancel" as const };
+      if (error instanceof McpError) throw error;
+      progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
+      return { action: "decline" as const };
+    }
+  });
+  client.setNotificationHandler(ElicitationCompleteNotificationSchema, async (notification) => {
+    const key = elicitationKey(binding, token, notification.params.elicitationId);
+    const entry = urlElicitations.get(key);
+    if (!entry) {
+      diagnostic(consumedElicitations.has(key) ? "late elicitation completion" : "unknown elicitation completion");
+      return;
+    }
+    urlElicitations.delete(key);
+    consumedElicitations.add(key);
+    if (!entry.accepted) {
+      entry.declinePending();
+      diagnostic("late elicitation completion");
+      return;
+    }
+    try {
+      await binding.client.notify("elicitation/complete", { elicitationId: entry.opaque });
+    } catch {
+      diagnostic("ACP elicitation completion failed");
+    }
+  });
+}
+
+export async function connectDefaultMcpClient(
+  server: McpServer,
+  signal: AbortSignal,
+  timeoutMs: number,
+  sleep: PiAcpDeps["sleep"],
+  binding?: McpSessionBinding,
+): Promise<McpClientHandle> {
+  const token = binding?.serverToken ?? safeToken(server.name);
+  const validator = new AjvJsonSchemaValidator();
+  const client = new Client({ name: "@automatalabs/pi-acp", version: PKG_VERSION }, {
+    enforceStrictCapabilities: true,
+    capabilities: { sampling: {}, roots: { listChanged: false }, elicitation: { form: {}, url: {} } },
+    jsonSchemaValidator: validator,
+  });
+  let state: "opening" | "open" | "disabled" | "closing" | "closed" = "opening";
+  const fatalController = new AbortController();
+  let disabledHandler: () => void = () => {};
+  let toolsChangedHandler: (() => void) | undefined;
+  let pendingToolsChanged = false;
+  const fatal = () => {
+    if (state === "opening") {
+      clearElicitations(binding, token);
+      fatalController.abort(new Error("MCP transport closed while opening"));
+      return;
+    }
+    if (state !== "open") return;
+    state = "disabled";
+    clearElicitations(binding, token);
+    binding?.emitDiagnostic(`[mcp:${token}] connection closed; server disabled`);
+    disabledHandler();
+  };
+  const transport = createTransport(server, sleep, fatal, timeoutMs);
+  installClientHandlers(client, binding, token, validator, timeoutMs, sleep);
+  const capabilityDiagnostic = (method: string) => binding?.emitDiagnostic(`[mcp:${token}] ${method}`);
+  client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    const caps = client.getServerCapabilities();
+    if (!caps?.tools?.listChanged) return capabilityDiagnostic("unexpected notifications/tools/list_changed");
+    if (toolsChangedHandler) toolsChangedHandler();
+    else pendingToolsChanged = true;
+  });
+  client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+    const caps = client.getServerCapabilities();
+    capabilityDiagnostic(caps?.resources?.listChanged ? "notifications/resources/list_changed" : "unexpected notifications/resources/list_changed");
+  });
+  client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+    const caps = client.getServerCapabilities();
+    capabilityDiagnostic(caps?.resources?.subscribe
+      ? `notifications/resources/updated uri=${notification.params.uri}`
+      : "unexpected notifications/resources/updated");
+  });
+  client.setNotificationHandler(PromptListChangedNotificationSchema, () => {
+    const caps = client.getServerCapabilities();
+    capabilityDiagnostic(caps?.prompts?.listChanged ? "notifications/prompts/list_changed" : "unexpected notifications/prompts/list_changed");
+  });
+  client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+    if (!client.getServerCapabilities()?.logging) {
+      capabilityDiagnostic("unexpected notifications/message");
+      return;
+    }
+    const data = typeof notification.params.data === "string"
+      ? notification.params.data
+      : JSON.stringify(notification.params.data) ?? String(notification.params.data);
+    binding?.emitDiagnostic(`[mcp:${token}] ${notification.params.level}: ${data}`);
+  });
+  client.onerror = () => {
+    if (state === "opening" || state === "open") binding?.emitDiagnostic(`[mcp:${token}] transport error`);
+  };
+  try {
+    const connectSignal = anySignal([signal, fatalController.signal]);
+    await bounded(client.connect(transport, { timeout: timeoutMs, signal: connectSignal }), connectSignal, timeoutMs, sleep);
+    state = "open";
+  } catch (error) {
+    state = "closing";
+    await transport.close();
+    state = "closed";
+    throw error;
+  }
+  const options = (requestSignal: AbortSignal, requestTimeout: number, onprogress?: (progress: unknown) => void): RequestOptions => ({
+    signal: requestSignal,
+    timeout: requestTimeout,
+    ...(onprogress ? { onprogress } : {}),
+  });
+  return {
+    async listTools(cursor, requestSignal, requestTimeout) {
+      const raw = await client.listTools(cursor ? { cursor } : undefined, options(requestSignal, requestTimeout));
+      return { tools: raw.tools, nextCursor: raw.nextCursor, raw };
+    },
+    async callTool(name, args, requestSignal, requestTimeout, onprogress) {
+      const result = await client.callTool(
+        { name, arguments: typeof args === "object" && args !== null ? args as Record<string, unknown> : {} },
+        undefined,
+        options(requestSignal, requestTimeout, onprogress),
+      );
+      if (!("content" in result)) throw new Error("MCP task result did not contain tool content");
+      return result as CallToolResult;
+    },
+    async ping(requestSignal, requestTimeout) { await client.ping(options(requestSignal, requestTimeout)); },
+    getCapabilities: () => client.getServerCapabilities(),
+    getInstructions: () => client.getInstructions(),
+    async setLoggingLevel(requestSignal, requestTimeout) { await client.setLoggingLevel("info", options(requestSignal, requestTimeout)); },
+    listResources: (cursor, requestOptions) => client.listResources(cursor ? { cursor } : undefined, requestOptions),
+    listResourceTemplates: (cursor, requestOptions) => client.listResourceTemplates(cursor ? { cursor } : undefined, requestOptions),
+    readResource: (uri, requestOptions) => client.readResource({ uri }, requestOptions),
+    subscribeResource: (uri, requestOptions) => client.subscribeResource({ uri }, requestOptions),
+    unsubscribeResource: (uri, requestOptions) => client.unsubscribeResource({ uri }, requestOptions),
+    listPrompts: (cursor, requestOptions) => client.listPrompts(cursor ? { cursor } : undefined, requestOptions),
+    getPrompt: (name, args, requestOptions) => client.getPrompt({ name, arguments: args }, requestOptions),
+    complete: (params, requestOptions) => client.complete(params as Parameters<Client["complete"]>[0], requestOptions),
+    setToolsChangedHandler(handler) {
+      toolsChangedHandler = handler;
+      if (pendingToolsChanged) {
+        pendingToolsChanged = false;
+        handler();
+      }
+    },
+    setDisabledHandler(handler) { disabledHandler = handler; },
+    ...("type" in server && server.type === "http" ? { disableOnTimeout: () => fatal() } : {}),
+    async close() {
+      if (state === "closed" || state === "closing") return;
+      state = "closing";
+      clearElicitations(binding, token);
+      await client.close();
+      state = "closed";
+    },
+  };
+}
+
 export function allocateAlias(server: string, tool: string, used: Set<string>): string {
-  const base = `mcp__${slug(server)}__${slug(tool)}`;
+  const base = `mcp__${safeToken(server)}__${safeToken(tool)}`;
   let candidate = base.slice(0, 128);
   if (!used.has(candidate)) {
     used.add(candidate);
@@ -147,42 +724,39 @@ export function allocateAlias(server: string, tool: string, used: Set<string>): 
   }
 }
 
-type McpContent = CallToolResult["content"][number];
-
-export function convertMcpContent(content: McpContent):
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string } {
+export function convertMcpContent(content: ContentBlock): { type: "text"; text: string } | { type: "image"; data: string; mimeType: string } {
   switch (content.type) {
-    case "text":
-      return { type: "text", text: content.text };
-    case "image":
-      return { type: "image", data: content.data, mimeType: content.mimeType };
-    case "audio":
-      return { type: "text", text: "[unsupported audio tool-result omitted]" };
-    case "resource_link":
-      return { type: "text", text: `[${content.title ?? content.name ?? content.uri}](${content.uri})` };
-    case "resource":
-      return {
-        type: "text",
-        text: "text" in content.resource
-          ? content.resource.text
-          : `[embedded resource: ${content.resource.uri}]`,
-      };
-    default: {
-      const exhaustive: never = content;
-      return exhaustive;
-    }
+    case "text": return { type: "text", text: content.text };
+    case "image": return { type: "image", data: content.data, mimeType: content.mimeType };
+    case "audio": return { type: "text", text: `[audio mime=${content.mimeType} bytes=${Buffer.from(content.data, "base64").byteLength}]` };
+    case "resource_link": return { type: "text", text: `[${content.title ?? content.name ?? content.uri}](${content.uri})` };
+    case "resource": return "text" in content.resource
+      ? { type: "text", text: content.resource.text }
+      : { type: "text", text: `[embedded resource uri=${content.resource.uri} mime=${content.resource.mimeType ?? "application/octet-stream"} bytes=${Buffer.from(content.resource.blob, "base64").byteLength}]` };
+    default: throw new Error("Unsupported MCP content block");
   }
 }
 
 export function convertMcpResult(result: CallToolResult) {
-  return {
-    content: result.content.map(convertMcpContent),
-    ...(result.structuredContent === undefined ? {} : { details: result.structuredContent }),
-  };
+  return { content: result.content.map(convertMcpContent), details: result };
 }
 
 export type McpResultProjection = ReturnType<typeof convertMcpResult>;
+
+interface ServerState {
+  server: McpServer;
+  token: string;
+  handle: McpClientHandle;
+  tools: Tool[];
+  pages: unknown[];
+  aliases: Map<string, string>;
+  validators: Map<string, JsonSchemaValidator<Record<string, unknown>>>;
+  syntheticAliases: string[];
+  validAliases: Set<string>;
+  disabled: boolean;
+  dirty: boolean;
+  initializing: boolean;
+}
 
 export interface McpBridge {
   clients: McpClientHandle[];
@@ -190,115 +764,587 @@ export interface McpBridge {
   aliases: string[];
   aliasServers: Map<string, string>;
   failedResults: Map<string, McpResultProjection>;
+  inlineExtension: InlineExtension;
+  instructionsExtension: InlineExtension;
+  bindSession(session: AgentSession): void;
+  acquireTurnBoundary(): Promise<() => void>;
+  drainRefreshes(): Promise<void>;
+  close(): Promise<void>;
 }
 
-async function closeClients(clients: readonly McpClientHandle[], deps: PiAcpDeps): Promise<void> {
-  await Promise.allSettled(
-    clients.map((client) =>
-      bounded(client.close(), new AbortController().signal, deps.mcpTimeoutMs, deps.sleep).catch((error) => {
-        console.error("pi-acp MCP close error:", error);
-      }),
-    ),
-  );
+const EMPTY_SCHEMA = Type.Object({});
+const URI_SCHEMA = Type.Object({ uri: Type.String() });
+const PROMPT_SCHEMA = Type.Object({ name: Type.String(), arguments: Type.Optional(Type.Record(Type.String(), Type.String())) });
+const COMPLETE_SCHEMA = Type.Object({
+  ref: Type.Union([
+    Type.Object({ type: Type.Literal("ref/prompt"), name: Type.String() }),
+    Type.Object({ type: Type.Literal("ref/resource"), uri: Type.String() }),
+  ]),
+  argument: Type.Object({ name: Type.String(), value: Type.String() }),
+  context: Type.Optional(Type.Object({ arguments: Type.Optional(Type.Record(Type.String(), Type.String())) })),
+});
+
+async function pageAll(
+  request: (cursor: string | undefined, options: RequestOptions) => Promise<unknown>,
+  signal: AbortSignal,
+  deps: PiAcpDeps,
+  field: "resources" | "resourceTemplates" | "prompts",
+  onUpdate?: Parameters<ToolDefinition["execute"]>[3],
+  serverToken = "_",
+): Promise<{ items: unknown[]; pages: unknown[] }> {
+  const items: unknown[] = [];
+  const pages: unknown[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    if (cursor !== undefined) {
+      if (seen.has(cursor)) throw new Error("cycling pagination cursor");
+      seen.add(cursor);
+    }
+    const page = await bounded(request(cursor, {
+      signal,
+      timeout: deps.mcpTimeoutMs,
+      ...(onUpdate ? { onprogress: (value) => {
+        const item = value as { progress?: unknown; total?: unknown; message?: unknown };
+        onUpdate({
+          content: [{
+            type: "text",
+            text: `[mcp:${serverToken}] ${String(item.progress)}${item.total === undefined ? "" : `/${String(item.total)}`}${item.message === undefined ? "" : ` ${String(item.message)}`}`,
+          }],
+          details: value,
+        });
+      } } : {}),
+    }), signal, deps.mcpTimeoutMs, deps.sleep) as Record<string, unknown>;
+    pages.push(page);
+    const values = page[field];
+    if (!Array.isArray(values)) throw new Error(`invalid ${field} result`);
+    items.push(...values);
+    cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+  } while (cursor !== undefined);
+  return { items, pages };
+}
+
+function syntheticTool(
+  alias: string,
+  description: string,
+  parameters: ToolDefinition["parameters"],
+  execute: ToolDefinition["execute"],
+): ToolDefinition {
+  return { name: alias, label: alias, description, parameters, execute };
 }
 
 export async function bridgeMcpServers(
   servers: readonly McpServer[],
   openSignal: AbortSignal,
   deps: PiAcpDeps,
+  binding?: McpSessionBinding,
 ): Promise<McpBridge> {
   const seenNames = new Set<string>();
   for (const server of servers) {
     if (seenNames.has(server.name)) throw adapterError("mcp_init_error", { server: server.name });
     seenNames.add(server.name);
-    if ("type" in server) {
-      throw adapterError("unsupported_mcp_transport", { server: server.name });
-    }
+    if ("type" in server && server.type === "acp") throw adapterError("unsupported_mcp_transport", { server: server.name });
   }
-  const clients: McpClientHandle[] = [];
+  const states: ServerState[] = [];
+  const failedResults = new Map<string, McpResultProjection>();
+  const aliasServers = new Map<string, string>();
   const tools: ToolDefinition[] = [];
   const aliases: string[] = [];
-  const aliasServers = new Map<string, string>();
-  const failedResults = new Map<string, McpResultProjection>();
   const usedAliases = new Set<string>();
+  const usedServerTokens = new Set<string>();
+  const validatorProvider = new AjvJsonSchemaValidator();
+  let extensionApi: ExtensionAPI | undefined;
+  let piSession: AgentSession | undefined;
+  let refreshQueue = Promise.resolve();
+  let refreshScheduled = false;
+  let closing = false;
+  let poisoned = false;
+  const refreshController = new AbortController();
+  let boundaryTail = Promise.resolve();
+
+  const acquireTurnBoundary = async (): Promise<() => void> => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const prior = boundaryTail;
+    boundaryTail = prior.then(() => held);
+    await prior;
+    return release;
+  };
+
+  const allocateServerToken = (name: string): string => {
+    const base = safeToken(name);
+    let candidate = base;
+    for (let index = 2; usedServerTokens.has(candidate); index += 1) candidate = `${base}_${index}`;
+    usedServerTokens.add(candidate);
+    return candidate;
+  };
+
+  const requestOptions = (signal: AbortSignal, onprogress?: (progress: unknown) => void): RequestOptions => ({
+    signal,
+    timeout: deps.mcpTimeoutMs,
+    ...(onprogress ? { onprogress } : {}),
+  });
+
+  const makeSynthetic = (state: ServerState, operation: string): ToolDefinition => {
+    const alias = allocateAlias(state.server.name, operation, usedAliases);
+    state.syntheticAliases.push(alias);
+    state.validAliases.add(alias);
+    aliases.push(alias);
+    aliasServers.set(alias, state.server.name);
+    const executeRequest = async (
+      toolCallId: string,
+      signal: AbortSignal | undefined,
+      onUpdate: Parameters<ToolDefinition["execute"]>[3],
+      operation: (
+        turnSignal: AbortSignal,
+        guardedUpdate: Parameters<ToolDefinition["execute"]>[3],
+      ) => Promise<unknown>,
+    ) => {
+      if (state.disabled || !state.validAliases.has(alias)) {
+        throw new Error(`MCP tool ${alias} is no longer available`);
+      }
+      const turnSignal = anySignal([signal, binding?.sessionSignal]);
+      let acceptingUpdates = true;
+      const guardedUpdate: Parameters<ToolDefinition["execute"]>[3] = (update) => {
+        if (acceptingUpdates) onUpdate?.(update);
+      };
+      let result: unknown;
+      try {
+        result = await bounded(operation(turnSignal, guardedUpdate), turnSignal, deps.mcpTimeoutMs, deps.sleep);
+      } catch (error) {
+        if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
+        throw new Error(error instanceof McpTimeoutError ? `MCP tool ${alias} timed out` : `MCP tool ${alias} failed`);
+      } finally {
+        acceptingUpdates = false;
+      }
+      void toolCallId;
+      return result;
+    };
+    const updateProgress = (onUpdate: Parameters<ToolDefinition["execute"]>[3]) => (value: unknown) => {
+      const item = value as { progress?: unknown; total?: unknown; message?: unknown };
+      onUpdate?.({
+        content: [{
+          type: "text",
+          text: `[mcp:${state.token}] ${String(item.progress)}${item.total === undefined ? "" : `/${String(item.total)}`}${item.message === undefined ? "" : ` ${String(item.message)}`}`,
+        }],
+        details: value,
+      });
+    };
+    switch (operation) {
+      case "list_resources": return syntheticTool(alias, "List MCP resources", EMPTY_SCHEMA, async (_id, _params, signal, onUpdate) => {
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => pageAll(state.handle.listResources!.bind(state.handle), turnSignal, deps, "resources", guardedUpdate, state.token));
+        const paged = result as { items: unknown[]; pages: unknown[] };
+        return { content: [{ type: "text", text: JSON.stringify({ resources: paged.items }) }], details: { pages: paged.pages } };
+      });
+      case "list_resource_templates": return syntheticTool(alias, "List MCP resource templates", EMPTY_SCHEMA, async (_id, _params, signal, onUpdate) => {
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const paged = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => pageAll(state.handle.listResourceTemplates!.bind(state.handle), turnSignal, deps, "resourceTemplates", guardedUpdate, state.token)) as { items: unknown[]; pages: unknown[] };
+        return { content: [{ type: "text", text: JSON.stringify({ resourceTemplates: paged.items }) }], details: { pages: paged.pages } };
+      });
+      case "read_resource": return syntheticTool(alias, "Read an MCP resource", URI_SCHEMA, async (_id, params, signal, onUpdate) => {
+        const input = params as { uri: string };
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.readResource!(input.uri, requestOptions(turnSignal, updateProgress(guardedUpdate)))) as { contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> };
+        return { content: result.contents.map((content) => content.text !== undefined
+          ? { type: "text" as const, text: content.text }
+          : { type: "text" as const, text: `[embedded resource uri=${content.uri} mime=${content.mimeType ?? "application/octet-stream"} bytes=${Buffer.from(content.blob ?? "", "base64").byteLength}]` }), details: result };
+      });
+      case "subscribe_resource": return syntheticTool(alias, "Subscribe to an MCP resource", URI_SCHEMA, async (_id, params, signal, onUpdate) => {
+        const input = params as { uri: string };
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.subscribeResource!(input.uri, requestOptions(turnSignal, updateProgress(guardedUpdate))));
+        return { content: [{ type: "text", text: `Subscribed to ${input.uri}` }], details: result };
+      });
+      case "unsubscribe_resource": return syntheticTool(alias, "Unsubscribe from an MCP resource", URI_SCHEMA, async (_id, params, signal, onUpdate) => {
+        const input = params as { uri: string };
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.unsubscribeResource!(input.uri, requestOptions(turnSignal, updateProgress(guardedUpdate))));
+        return { content: [{ type: "text", text: `Unsubscribed from ${input.uri}` }], details: result };
+      });
+      case "list_prompts": return syntheticTool(alias, "List MCP prompts", EMPTY_SCHEMA, async (_id, _params, signal, onUpdate) => {
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const paged = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => pageAll(state.handle.listPrompts!.bind(state.handle), turnSignal, deps, "prompts", guardedUpdate, state.token)) as { items: unknown[]; pages: unknown[] };
+        return { content: [{ type: "text", text: JSON.stringify({ prompts: paged.items }) }], details: { pages: paged.pages } };
+      });
+      case "get_prompt": return syntheticTool(alias, "Get an MCP prompt", PROMPT_SCHEMA, async (_id, params, signal, onUpdate) => {
+        const input = params as { name: string; arguments?: Record<string, string> };
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.getPrompt!(input.name, input.arguments, requestOptions(turnSignal, updateProgress(guardedUpdate)))) as { description?: string; messages: Array<{ role: string; content: ContentBlock }> };
+        const content = [
+          ...(result.description ? [{ type: "text" as const, text: `[mcp prompt description]\n${result.description}` }] : []),
+          ...result.messages.flatMap((message) => [{ type: "text" as const, text: `[mcp prompt role=${message.role}]` }, convertMcpContent(message.content)]),
+        ];
+        return { content, details: result };
+      });
+      case "complete": return syntheticTool(alias, "Complete an MCP prompt or resource argument", COMPLETE_SCHEMA, async (_id, params, signal, onUpdate) => {
+        const turnSignal = anySignal([signal, binding?.sessionSignal]);
+        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.complete!(params, requestOptions(turnSignal, updateProgress(guardedUpdate)))) as { completion: unknown };
+        return { content: [{ type: "text", text: JSON.stringify(result.completion) }], details: result };
+      });
+      default: throw new Error("unknown synthetic MCP operation");
+    }
+  };
+
+  const remoteDefinition = (state: ServerState, remote: Tool, alias: string): ToolDefinition => ({
+    name: alias,
+    label: remote.title ?? remote.annotations?.title ?? remote.name,
+    description: remote.description ?? `MCP tool ${remote.name}`,
+    parameters: remote.inputSchema,
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      if (state.disabled || !state.validAliases.has(alias) || state.aliases.get(remote.name) !== alias) {
+        throw new Error(`MCP tool ${alias} is no longer available`);
+      }
+      const turnSignal = anySignal([signal, binding?.sessionSignal]);
+      let acceptingUpdates = true;
+      let result: CallToolResult;
+      try {
+        result = await bounded(state.handle.callTool(remote.name, params, turnSignal, deps.mcpTimeoutMs, (value) => {
+          if (!acceptingUpdates) return;
+          const progressValue = value as { progress?: unknown; total?: unknown; message?: unknown };
+          const text = `[mcp:${state.token}] ${String(progressValue.progress)}${progressValue.total === undefined ? "" : `/${String(progressValue.total)}`}${progressValue.message === undefined ? "" : ` ${String(progressValue.message)}`}`;
+          onUpdate?.({ content: [{ type: "text", text }], details: value });
+        }), turnSignal, deps.mcpTimeoutMs, deps.sleep);
+        const validate = state.validators.get(alias);
+        if (validate && !result.isError) {
+          if (result.structuredContent === undefined || !validate(result.structuredContent).valid) throw new Error("invalid MCP tool output");
+        }
+      } catch (error) {
+        if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
+        throw new Error(error instanceof McpTimeoutError ? `MCP tool ${alias} timed out` : `MCP tool ${alias} failed`);
+      } finally {
+        acceptingUpdates = false;
+      }
+      const projection = convertMcpResult(result);
+      if (result.isError) {
+        failedResults.set(toolCallId, projection);
+        throw new Error(`MCP tool ${alias} failed`);
+      }
+      return projection;
+    },
+  });
+
+  const enumerate = async (state: ServerState, signal: AbortSignal): Promise<{ tools: Tool[]; pages: unknown[] }> => {
+    const listed: Tool[] = [];
+    const pages: unknown[] = [];
+    const seenCursors = new Set<string>();
+    const seenNames = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      if (cursor !== undefined) {
+        if (seenCursors.has(cursor)) throw new Error("cycling tools/list cursor");
+        seenCursors.add(cursor);
+      }
+      let page: Awaited<ReturnType<McpClientHandle["listTools"]>>;
+      try {
+        page = await bounded(state.handle.listTools(cursor, signal, deps.mcpTimeoutMs), signal, deps.mcpTimeoutMs, deps.sleep);
+      } catch (error) {
+        if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
+        throw error;
+      }
+      pages.push(page.raw ?? page);
+      for (const tool of page.tools) {
+        if (seenNames.has(tool.name) || tool.execution?.taskSupport === "required") throw new Error("invalid MCP tool catalog");
+        seenNames.add(tool.name);
+        listed.push(tool);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    return { tools: listed, pages };
+  };
+
+  const poison = (state: ServerState) => {
+    if (poisoned) return;
+    poisoned = true;
+    closing = true;
+    refreshController.abort(new Error("MCP refresh commit failed"));
+    binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh commit failed; session terminated`);
+    binding?.poison?.(state.server.name);
+  };
+
+  const refreshOne = async (state: ServerState): Promise<void> => {
+    if (closing || state.disabled || !extensionApi || !piSession) return;
+    let candidate: { tools: Tool[]; pages: unknown[] };
+    let candidateUsed: Set<string>;
+    let nextAliases: Map<string, string>;
+    let definitions: ToolDefinition[];
+    let validators: Map<string, JsonSchemaValidator<Record<string, unknown>>>;
+    let removed: string[];
+    const addedReservations: Array<{ alias: string; server: string }> = [];
+    try {
+      candidate = await enumerate(state, anySignal([binding?.sessionSignal, refreshController.signal]));
+      candidateUsed = new Set(usedAliases);
+      nextAliases = new Map(state.aliases);
+      const previousNames = new Set(state.tools.map((tool) => tool.name));
+      definitions = [];
+      validators = new Map();
+      for (const remote of candidate.tools) {
+        let alias = nextAliases.get(remote.name);
+        if (!alias) {
+          alias = allocateAlias(state.server.name, remote.name, candidateUsed);
+          nextAliases.set(remote.name, alias);
+          addedReservations.push({ alias, server: state.server.name });
+        }
+        if (remote.outputSchema) validators.set(alias, validatorProvider.getValidator(remote.outputSchema));
+        definitions.push(remoteDefinition(state, remote, alias));
+        previousNames.delete(remote.name);
+      }
+      removed = [...previousNames]
+        .map((name) => state.aliases.get(name))
+        .filter((value): value is string => value !== undefined);
+    } catch (error) {
+      if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
+      if (!closing && !state.disabled) binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
+      return;
+    }
+
+    const release = await acquireTurnBoundary();
+    if (closing || state.disabled || !extensionApi || !piSession) {
+      release();
+      return;
+    }
+    let mutationStarted = false;
+    try {
+      for (const definition of definitions) {
+        mutationStarted = true;
+        extensionApi.registerTool(definition);
+      }
+      const active = new Set(piSession.getActiveToolNames());
+      for (const alias of removed) active.delete(alias);
+      for (const definition of definitions) active.add(definition.name);
+      mutationStarted = true;
+      piSession.setActiveToolsByName([...active]);
+
+      usedAliases.clear();
+      for (const alias of candidateUsed) usedAliases.add(alias);
+      for (const reservation of addedReservations) {
+        aliases.push(reservation.alias);
+        aliasServers.set(reservation.alias, reservation.server);
+      }
+      state.aliases = nextAliases;
+      state.tools = candidate.tools;
+      state.pages = candidate.pages;
+      state.validators = validators;
+      state.validAliases = new Set([...state.syntheticAliases, ...definitions.map(({ name }) => name)]);
+    } catch {
+      if (mutationStarted) poison(state);
+      else binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
+    } finally {
+      release();
+    }
+  };
+
+  const runRefreshBatches = async (): Promise<void> => {
+    while (!closing) {
+      const batch = states.filter((state) => state.dirty && !state.initializing && !state.disabled);
+      if (batch.length === 0) return;
+      for (const state of batch) state.dirty = false;
+      for (const state of batch) await refreshOne(state);
+    }
+  };
+
+  const scheduleRefreshes = () => {
+    if (refreshScheduled || closing || !extensionApi || !piSession) return;
+    refreshScheduled = true;
+    refreshQueue = refreshQueue
+      .then(runRefreshBatches)
+      .finally(() => {
+        refreshScheduled = false;
+        if (states.some((state) => state.dirty && !state.initializing && !state.disabled)) scheduleRefreshes();
+      });
+    refreshQueue.catch(() => undefined);
+  };
+
+  const refresh = (state: ServerState) => {
+    if (closing || state.disabled) return;
+    state.dirty = true;
+    if (!state.initializing) scheduleRefreshes();
+  };
+
   try {
-    for (const server of servers as readonly McpServerStdio[]) {
+    for (const server of servers) {
+      const token = allocateServerToken(server.name);
       let handle: McpClientHandle;
       try {
-        handle = await bounded(
-          deps.connectMcpClient(server, openSignal),
-          openSignal,
-          deps.mcpTimeoutMs,
-          deps.sleep,
-        );
-      } catch (error) {
-        if (openSignal.aborted) throw error;
-        throw adapterError("mcp_init_error", { server: server.name });
-      }
-      clients.push(handle);
-      const serverTools: McpToolInfo[] = [];
-      const cursors = new Set<string>();
-      let cursor: string | undefined;
-      try {
-        do {
-          if (cursor !== undefined) {
-            if (cursors.has(cursor)) throw new Error("cycling tools/list cursor");
-            cursors.add(cursor);
-          }
-          const page = await bounded(
-            handle.listTools(cursor, openSignal, deps.mcpTimeoutMs),
+        const serverBinding = binding ? { ...binding, serverToken: token } : undefined;
+        const connecting = deps.connectMcpClient(server, openSignal, serverBinding);
+        connecting.then(() => undefined, () => undefined);
+        try {
+          handle = await bounded(connecting, openSignal, deps.mcpTimeoutMs, deps.sleep);
+        } catch (error) {
+          // The outer transport-start bound can win before the factory returns its owner. Observe and
+          // close a detached late handle so a real stdio child cannot escape rollback.
+          void connecting.then((late) => late.close()).catch(() => undefined);
+          throw error;
+        }
+        if (handle.ping) {
+          await bounded(
+            Promise.resolve().then(() => handle.ping!(openSignal, deps.mcpTimeoutMs)),
             openSignal,
             deps.mcpTimeoutMs,
             deps.sleep,
           );
-          serverTools.push(...page.tools);
-          cursor = page.nextCursor;
-        } while (cursor !== undefined);
+        }
       } catch (error) {
         if (openSignal.aborted) throw error;
         throw adapterError("mcp_init_error", { server: server.name });
       }
-      for (const remoteTool of serverTools) {
-        const alias = allocateAlias(server.name, remoteTool.name, usedAliases);
-        aliases.push(alias);
-        aliasServers.set(alias, server.name);
-        const tool = {
-          name: alias,
-          label: remoteTool.name,
-          description: remoteTool.description ?? `MCP tool ${remoteTool.name}`,
-          parameters: remoteTool.inputSchema,
-          execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) => {
-            const turnSignal = signal ?? new AbortController().signal;
-            let result: CallToolResult;
-            try {
-              result = await bounded(
-                handle.callTool(remoteTool.name, params, turnSignal, deps.mcpTimeoutMs),
-                turnSignal,
-                deps.mcpTimeoutMs,
-                deps.sleep,
-              );
-            } catch (error) {
-              if (error instanceof McpTimeoutError) {
-                throw new Error(`MCP tool ${alias} timed out`);
-              }
-              throw new Error(`MCP tool ${alias} failed`);
-            }
-            const converted = convertMcpResult(result);
-            if (result.isError) {
-              failedResults.set(_toolCallId, converted);
-              throw new Error(`MCP tool ${alias} returned an error result`);
-            }
-            return converted;
-          },
-        };
-        tools.push(tool as ToolDefinition);
+      const state: ServerState = {
+        server,
+        token,
+        handle,
+        tools: [],
+        pages: [],
+        aliases: new Map(),
+        validators: new Map(),
+        syntheticAliases: [],
+        validAliases: new Set(),
+        disabled: false,
+        dirty: false,
+        initializing: true,
+      };
+      states.push(state);
+      handle.setToolsChangedHandler?.(() => refresh(state));
+      handle.setDisabledHandler?.(() => {
+        if (state.disabled || closing) return;
+        state.disabled = true;
+        state.dirty = false;
+        refreshQueue = refreshQueue.then(async () => {
+          if (!piSession || closing) return;
+          const release = await acquireTurnBoundary();
+          try {
+            if (!piSession || closing) return;
+            const active = new Set(piSession.getActiveToolNames());
+            for (const alias of [...state.syntheticAliases, ...state.aliases.values()]) active.delete(alias);
+            piSession.setActiveToolsByName([...active]);
+            state.validAliases.clear();
+          } catch {
+            poison(state);
+          } finally {
+            release();
+          }
+        });
+        refreshQueue.catch(() => undefined);
+      });
+      const caps = handle.getCapabilities?.();
+      try {
+        if (caps?.logging && handle.setLoggingLevel) {
+          await bounded(
+            Promise.resolve().then(() => handle.setLoggingLevel!(openSignal, deps.mcpTimeoutMs)),
+            openSignal,
+            deps.mcpTimeoutMs,
+            deps.sleep,
+          );
+        }
+        const operations: string[] = [];
+        if (caps?.resources) operations.push("list_resources", "list_resource_templates", "read_resource");
+        if (caps?.resources?.subscribe) operations.push("subscribe_resource", "unsubscribe_resource");
+        if (caps?.prompts) operations.push("list_prompts", "get_prompt");
+        if (caps?.completions) operations.push("complete");
+        for (const operation of operations) tools.push(makeSynthetic(state, operation));
+        let initial = await enumerate(state, openSignal);
+        if (state.dirty) {
+          state.dirty = false;
+          try {
+            initial = await enumerate(state, openSignal);
+          } catch {
+            binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
+          }
+        }
+        state.initializing = false;
+        state.tools = initial.tools;
+        state.pages = initial.pages;
+      } catch (error) {
+        if (openSignal.aborted) throw error;
+        throw adapterError("mcp_init_error", { server: server.name });
+      }
+      // A notification accepted while the one coalesced extra pass was running becomes ordinary
+      // post-publication work and intentionally does not extend the open-time quiescence barrier.
+    }
+    // Every capability-conditioned synthetic reservation precedes every remote tool reservation.
+    for (const state of states) {
+      try {
+        for (const remote of state.tools) {
+          const alias = allocateAlias(state.server.name, remote.name, usedAliases);
+          state.aliases.set(remote.name, alias);
+          aliases.push(alias);
+          aliasServers.set(alias, state.server.name);
+          state.validAliases.add(alias);
+          if (remote.outputSchema) state.validators.set(alias, validatorProvider.getValidator(remote.outputSchema));
+          tools.push(remoteDefinition(state, remote, alias));
+        }
+      } catch {
+        throw adapterError("mcp_init_error", { server: state.server.name });
       }
     }
-    return { clients, tools, aliases, aliasServers, failedResults };
   } catch (error) {
-    await closeClients(clients, deps);
+    await closeClients(states.map(({ handle }) => handle), deps);
     throw error;
   }
+
+  const inlineExtension: InlineExtension = {
+    name: "agentprism-pi-acp-mcp",
+    factory(api) {
+      extensionApi = api;
+      for (const tool of tools) api.registerTool(tool);
+    },
+  };
+  const instructionsExtension: InlineExtension = {
+    name: "agentprism-pi-acp-control",
+    factory(api) {
+      api.on("before_agent_start", (event) => {
+        const suffix = states
+          .filter((state) => !state.disabled)
+          .map((state) => ({ token: state.token, instructions: state.handle.getInstructions?.() }))
+          .filter((item): item is { token: string; instructions: string } => Boolean(item.instructions))
+          .map((item) => `\n\n# MCP server instructions (${item.token})\n${item.instructions}`)
+          .join("");
+        return suffix ? { systemPrompt: `${event.systemPrompt}${suffix}` } : undefined;
+      });
+    },
+  };
+
+  let closePromise: Promise<void> | undefined;
+  return {
+    clients: states.map(({ handle }) => handle),
+    tools,
+    aliases,
+    aliasServers,
+    failedResults,
+    inlineExtension,
+    instructionsExtension,
+    bindSession(session) {
+      piSession = session;
+      scheduleRefreshes();
+    },
+    acquireTurnBoundary,
+    drainRefreshes: () => refreshQueue,
+    close() {
+      if (!closing) {
+        closing = true;
+        refreshController.abort(new Error("MCP bridge closed"));
+      }
+      closePromise ??= (async () => {
+        const physicalCloses = closeClients(states.map(({ handle }) => handle), deps);
+        await refreshQueue.catch(() => undefined);
+        const release = await acquireTurnBoundary();
+        release();
+        await physicalCloses;
+      })();
+      return closePromise;
+    },
+  };
+}
+
+async function closeClients(clients: readonly McpClientHandle[], deps: PiAcpDeps): Promise<void> {
+  const closes = [...clients].reverse().map((client) =>
+    bounded(
+      Promise.resolve().then(() => client.close()),
+      NEVER_ABORTED,
+      MCP_CLOSE_DEADLINE_MS,
+      deps.sleep,
+    ).catch(() => undefined));
+  await Promise.allSettled(closes);
 }
 
 export async function disposeMcpBridge(clients: readonly McpClientHandle[], deps: PiAcpDeps): Promise<void> {

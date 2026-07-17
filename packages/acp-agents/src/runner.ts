@@ -49,6 +49,7 @@ import type { TSchema } from "typebox";
 import {
   PooledConnection,
   ReattachCapabilityUnavailable,
+  isChildCleanupError,
   type AcpSessionOptions,
   type SessionHandle,
 } from "./acp-client.js";
@@ -464,8 +465,10 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     } finally {
       try {
         await session?.release();
-      } catch {
-        // Probe cleanup is best-effort and must not mask spawn/auth/session errors.
+      } catch (error) {
+        if (isChildCleanupError(error)) {
+          throw mapThrownError(error, { backendId: prepared.backend.id, backend: prepared.backend });
+        }
       }
     }
   }
@@ -798,8 +801,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       session = undefined;
       try {
         await discarded?.release({ keepOpen: false });
-      } catch {
-        // best-effort cleanup before another acquire.
+      } catch (error) {
+        if (isChildCleanupError(error)) throw error;
       }
     };
 
@@ -956,7 +959,9 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
           // would resurrect the first-JSON-wins bug for schema-shaped progress messages.
           lastText: () => activeSession.finalMessageText(),
           tryCaptured: structuredTool ? () => structuredTool?.tryCaptured() : undefined,
-          tryNative: () => prepared.backend.nativeStructured(activeSession),
+          tryNative: prepared.backend.nativeStructured
+            ? () => prepared.backend.nativeStructured?.(activeSession)
+            : undefined,
         };
         const result = await resolveStructuredOutput(structuredSession, schema, {
           maxSchemaRetries: opts.maxSchemaRetries,
@@ -1014,8 +1019,14 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
           // keepSession skips the close so the agent-persisted session stays re-openable.
           try {
             await session.release({ keepOpen: keepOpenOnRelease });
-          } catch {
-            // release is best-effort (session already untracked); never mask the real result/error.
+          } catch (error) {
+            if (isChildCleanupError(error)) {
+              throw mapThrownError(error, {
+                label: opts.label,
+                backendId: prepared.backend.id,
+                backend: prepared.backend,
+              });
+            }
           }
         }
       } finally {
@@ -1049,13 +1060,23 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     this.disposed = true;
     this.removeExitHook();
     const sessions = [...this.interactiveSessions.keys()];
-    await Promise.all(sessions.map((session) => session.release()));
+    const releases = await Promise.allSettled(sessions.map((session) => session.release()));
+    const childFailure = releases.find((result): result is PromiseRejectedResult =>
+      result.status === "rejected" && isChildCleanupError(result.reason));
+    let teardownFailure: unknown;
     try {
       await this.pool.dispose();
-    } finally {
+    } catch (error) {
+      teardownFailure = error;
+    }
+    try {
       await this.structuredOutputTools.dispose();
+    } catch (error) {
+      teardownFailure ??= error;
     }
     this.events.removeAllListeners();
+    if (childFailure) throw childFailure.reason;
+    if (teardownFailure) throw teardownFailure;
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -1115,12 +1136,20 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       this.interactiveSessions.set(interactive, connection);
       return interactive;
     } catch (error) {
+      let cleanupError: unknown;
       try {
         await session?.release();
-      } catch {
-        // best-effort: lifecycle setup failed, so teardown must never mask the real error.
+      } catch (releaseError) {
+        if (isChildCleanupError(releaseError)) cleanupError = releaseError;
       }
       await disposeBestEffort(connection);
+      if (cleanupError) {
+        throw mapThrownError(cleanupError, {
+          label: opts.label,
+          backendId: prepared.backend.id,
+          backend: prepared.backend,
+        });
+      }
       if (opts.signal?.aborted) throw error;
       throw mapThrownError(error, {
         label: opts.label,

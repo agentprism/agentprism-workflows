@@ -82,11 +82,11 @@ test("the executable Pi contract stays grounded in the frozen pi-acp spec", () =
   const spec = readRepoFile("docs/specs/pi-acp-spec.md");
   assert.ok(spec.includes("## 5. Capability advertisement (`initialize`)"));
   assert.ok(spec.includes("## 8. Error taxonomy and pinned wire codes (`src/errors.ts`)"));
-  assert.ok(spec.includes("### 9.4 Structured output (`src/structured-output.ts`)"));
+  assert.ok(spec.includes("### 9.4 Structured output through client-hosted MCP injection"));
   assert.ok(spec.includes("### 9.5 Auth (`src/auth.ts`)"));
-  assert.ok(spec.includes(`_meta["${PI_ACP_PROTOCOL_CONTRACT.customCapabilityNamespace}"]`));
-  assert.ok(spec.includes(`{ ${PI_ACP_PROTOCOL_CONTRACT.outputSchemaKey}: true }`));
-  assert.ok(spec.includes("mcpCapabilities: {}"));
+  assert.ok(spec.includes("mcpCapabilities: { http: true, sse: true }"));
+  assert.ok(!spec.includes('agentCapabilities._meta["@automatalabs/pi-acp"]'));
+  assert.ok(!spec.includes("{ outputSchema: true }"));
   for (const methodId of PI_ACP_PROTOCOL_CONTRACT.authMethodIds) {
     assert.ok(spec.includes(methodId), `frozen pi-acp spec must contain auth method ${methodId}`);
   }

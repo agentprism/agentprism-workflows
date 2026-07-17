@@ -8,10 +8,8 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   AgentSession,
-  DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
@@ -50,11 +48,18 @@ test("T14/T21 scripted ACP client observes ordered updates before the full-turn 
   assert.equal(setup.createOptions[0]?.modelRuntime, setup.deps.modelRuntime);
   connection.close();
   server.connection.close();
+  await Promise.all([connection.closed, server.connection.closed]);
   await server.agent.dispose();
 });
 
-test("T21 real AgentSession with an injected Agent streamFn completes a credential-free ACP turn", async () => {
+test("T21 real AgentSession with an injected Agent streamFn completes a credential-free ACP turn", async (t) => {
   const setup = fakeDeps();
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = setup.sessionDir;
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
   const credentials = new InMemoryCredentialStore();
   await credentials.modify("openai", async () => ({ type: "api_key", key: "hermetic-key" }));
   const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
@@ -71,18 +76,6 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
     contextWindow: 8_192,
     maxTokens: 1_024,
   };
-  const settingsManager = SettingsManager.create(setup.cwd, setup.sessionDir);
-  const resourceLoader = new DefaultResourceLoader({
-    cwd: setup.cwd,
-    agentDir: setup.sessionDir,
-    settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-  });
-  await resourceLoader.reload();
   let constructedWithRuntime: ModelRuntime | undefined;
   setup.deps.createAgentSession = async (options) => {
     constructedWithRuntime = options.modelRuntime;
@@ -123,16 +116,16 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
     const session = new AgentSession({
       agent,
       sessionManager: options.sessionManager ?? SessionManager.inMemory(setup.cwd),
-      settingsManager,
+      settingsManager: options.settingsManager,
       cwd: setup.cwd,
-      resourceLoader,
+      resourceLoader: options.resourceLoader,
       customTools: options.customTools,
       modelRuntime,
       initialActiveToolNames: [],
     });
     return {
       session,
-      extensionsResult: resourceLoader.getExtensions(),
+      extensionsResult: options.resourceLoader?.getExtensions(),
       modelFallbackMessage: undefined,
     };
   };
@@ -162,6 +155,7 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
     update.sessionUpdate === "agent_message_chunk" && update.content.text === "hermetic pong"));
   connection.close();
   server.connection.close();
+  await Promise.all([connection.closed, server.connection.closed]);
   await server.agent.dispose();
 });
 
@@ -273,7 +267,7 @@ test("T17 list pagination uses canonical base64url offsets and tolerates shrink 
   await assert.rejects(agent.listSessions(context({ cwd: "" })), (error) => kind(error) === "invalid_cwd");
 });
 
-test("T18/T22 scheduler-driven wedged cancel resolves once, tombstones, disposes, and close stays successful", async () => {
+test("T18/T22 cleanup deadline wins before barrier commit, rejects once, tombstones, and close retries", async () => {
   const setup = fakeDeps("wedged");
   let fire: (() => void) | undefined;
   setup.deps.sleep = (_ms, signal) => new Promise<void>((resolve, reject) => {
@@ -285,11 +279,11 @@ test("T18/T22 scheduler-driven wedged cancel resolves once, tombstones, disposes
   const pending = agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "hang" }] }));
   agent.cancel({ params: { sessionId: opened.sessionId }, signal: new AbortController().signal, client: {} as never });
   fire?.();
-  assert.equal((await pending).stopReason, "cancelled");
+  await assert.rejects(pending, (error) => kind(error) === "child_cleanup_error");
   await new Promise((resolve) => setImmediate(resolve));
   assert.throws(() => agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "again" }] })), (error) => kind(error) === "session_terminated");
   assert.ok((setup.controls[0]?.disposeCalls ?? 0) >= 1);
-  await agent.closeSession(context({ sessionId: opened.sessionId }));
+  assert.deepEqual(await agent.closeSession(context({ sessionId: opened.sessionId })), {});
   setup.controls[0]?.resolvePrompt?.();
 });
 
@@ -329,7 +323,7 @@ test("T20 MCP bridge enumerates every page, rejects cursor cycles, and closes pa
     (error) => kind(error) === "mcp_init_error",
   );
   await assert.rejects(
-    bridgeMcpServers([{ type: "http", name: "h", url: "https://example.test", headers: [] }], new AbortController().signal, setup.deps),
+    bridgeMcpServers([{ type: "acp", name: "a", command: "agent", args: [], env: [] }], new AbortController().signal, setup.deps),
     (error) => kind(error) === "unsupported_mcp_transport",
   );
 });

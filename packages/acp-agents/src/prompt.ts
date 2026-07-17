@@ -26,15 +26,18 @@ export function buildRunPrompt(
   parts.push(prompt);
   if (schema) {
     if (structuredToolActive) {
-      parts.push(
-        [
-          "Final output contract:",
-          "- You have been provided an MCP tool named StructuredOutput (it may appear namespaced by its MCP server name, e.g. structured_output_xxxx_StructuredOutput).",
-          "- You MUST call it exactly once with your final answer as its arguments; its parameter schema defines the required output shape.",
-          "- Complete all necessary research and tool calls BEFORE calling it.",
-          "- Do NOT emit your final answer as plain text.",
-        ].join("\n"),
-      );
+      const contract = [
+        "Final output contract:",
+        "- You have been provided an MCP tool named StructuredOutput (it may appear namespaced by its MCP server name, e.g. structured_output_xxxx_StructuredOutput).",
+        "- You MUST call it exactly once with your final answer as its arguments; its parameter schema defines the required output shape.",
+        "- Complete all necessary research and tool calls BEFORE calling it.",
+        "- If no valid StructuredOutput capture is available, your FINAL message MUST be a single JSON object that conforms to the required output schema.",
+        "- In that fallback, output ONLY the JSON object — no prose, explanation, or markdown code fences.",
+      ];
+      if (backend.embedSchemaInPrompt) {
+        contract.push(`- The required output schema (JSON Schema):\n${JSON.stringify(toJsonSchema(schema))}`);
+      }
+      parts.push(contract.join("\n"));
     } else {
       const contract = [
         "Final output contract:",

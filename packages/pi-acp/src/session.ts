@@ -6,13 +6,13 @@ import {
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import type { AgentSession, SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { adapterError, classifyPreflight, isRequestError, unexpectedError } from "./errors.js";
 import type { PiAcpDeps } from "./deps.js";
-import { applyConfig, thinkingLevelOption } from "./config.js";
+import { applyConfig, modelOption, thinkingLevelOption } from "./config.js";
 import { convertPromptContent } from "./prompt-content.js";
 import { replayEntry } from "./replay.js";
 import { stopReasonFor } from "./stop-reason.js";
-import { StructuredOutputState } from "./structured-output.js";
 import { translateEvent } from "./translate.js";
 import {
   agentMessages,
@@ -21,25 +21,32 @@ import {
   usageUpdate,
 } from "./usage.js";
 import { installPermissionWrapper } from "./permissions.js";
-import {
-  disposeMcpBridge,
-  type McpClientHandle,
-  type McpResultProjection,
-} from "./mcp-bridge.js";
+import type { McpBridge, McpResultProjection } from "./mcp-bridge.js";
+import { ChildCleanupFailure, type ChildProcessRegistrySlot } from "./child-process-registry.js";
 
 interface ActiveTurn {
   controller: AbortController;
-  settledController: AbortController;
   settlement: Promise<void>;
   resolveSettlement: () => void;
   completed: boolean;
+  diagnosticOpen: boolean;
+  errorSettlementStarted: boolean;
   notificationFailed: boolean;
-  backstopStarted: boolean;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
   startMessageIndex: number;
-  structured: boolean;
+  cleanup?: Promise<void>;
   removeRequestAbort?: () => void;
+  releaseBoundary?: () => void;
+}
+
+interface CleanupGeneration {
+  mode: "cancel-only" | "disposal";
+  status: "pending" | "succeeded" | "failed";
+  promise: Promise<void>;
+  error?: unknown;
+  deadlineController: AbortController;
+  timerController: AbortController;
 }
 
 export interface PiSessionOptions {
@@ -48,10 +55,12 @@ export interface PiSessionOptions {
   manager: SessionManager;
   client: AgentContext;
   deps: PiAcpDeps;
-  mcpClients: McpClientHandle[];
+  mcpBridge: McpBridge;
   failedMcpResults: Map<string, McpResultProjection>;
-  structured: StructuredOutputState;
-  onWedged(sessionId: string, session: PiSession): Promise<void>;
+  availableModels: readonly Model<Api>[];
+  childRegistry: ChildProcessRegistrySlot;
+  lifecycleController: AbortController;
+  onWedged(sessionId: string, session: PiSession, cleanupRetryRequired: boolean): Promise<void>;
 }
 
 export class PiSession {
@@ -60,9 +69,11 @@ export class PiSession {
   readonly manager: SessionManager;
   private readonly client: AgentContext;
   private readonly deps: PiAcpDeps;
-  private readonly mcpClients: McpClientHandle[];
+  private readonly mcpBridge: McpBridge;
   private readonly failedMcpResults: Map<string, McpResultProjection>;
-  private readonly structured: StructuredOutputState;
+  private availableModels: readonly Model<Api>[];
+  private readonly childRegistry: ChildProcessRegistrySlot;
+  private readonly lifecycleController: AbortController;
   private readonly onWedged: PiSessionOptions["onWedged"];
   private readonly pending: SessionUpdate[] = [];
   private pump: Promise<void> | undefined;
@@ -72,6 +83,10 @@ export class PiSession {
   private disposed = false;
   private unsubscribe: (() => void) | undefined;
   private activeTurn: ActiveTurn | undefined;
+  private cleanupDirty = false;
+  private cleanupGeneration: CleanupGeneration | undefined;
+  private resourceDisposePromise: Promise<void> | undefined;
+  private bridgeClosePromise: Promise<void> | undefined;
 
   constructor(options: PiSessionOptions) {
     this.sessionId = options.sessionId;
@@ -79,9 +94,11 @@ export class PiSession {
     this.manager = options.manager;
     this.client = options.client;
     this.deps = options.deps;
-    this.mcpClients = options.mcpClients;
+    this.mcpBridge = options.mcpBridge;
     this.failedMcpResults = options.failedMcpResults;
-    this.structured = options.structured;
+    this.availableModels = options.availableModels;
+    this.childRegistry = options.childRegistry;
+    this.lifecycleController = options.lifecycleController;
     this.onWedged = options.onWedged;
     installPermissionWrapper(this.pi, {
       sessionId: this.sessionId,
@@ -115,7 +132,18 @@ export class PiSession {
   }
 
   configOptions() {
-    return [thinkingLevelOption(this.pi)];
+    return [thinkingLevelOption(this.pi), modelOption(this.pi, this.availableModels)];
+  }
+
+  activeTurnSignal(): AbortSignal | undefined { return this.activeTurn?.controller.signal; }
+
+  emitMcpDiagnostic(text: string): void {
+    if (this.disposed) return;
+    if (this.activeTurn && !this.activeTurn.completed && this.activeTurn.diagnosticOpen) {
+      this.enqueue({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text } });
+    } else {
+      console.error(text);
+    }
   }
 
   enqueue(update: SessionUpdate): void {
@@ -167,25 +195,19 @@ export class PiSession {
 
   async setConfig(configId: string, value: string | boolean) {
     if (this.busy) throw adapterError("session_busy");
-    return applyConfig(this.pi, this.deps.modelRuntime, configId, value);
+    const result = await applyConfig(this.pi, this.deps.modelRuntime, this.availableModels, configId, value);
+    this.availableModels = result.availableModels;
+    return result.configOptions;
   }
 
-  private disarm(turn: ActiveTurn): void {
-    if (!turn.structured) return;
-    try {
-      this.structured.disarm(this.pi);
-    } catch (error) {
-      console.error("pi-acp structured-output disarm error:", error);
-    }
-  }
-
-  private finish(turn: ActiveTurn, outcome: { response: PromptResponse } | { error: unknown }, keepBackstop = false): void {
+  private finish(turn: ActiveTurn, outcome: { response: PromptResponse } | { error: unknown }): void {
     if (turn.completed) return;
+    turn.diagnosticOpen = false;
     turn.completed = true;
     turn.removeRequestAbort?.();
     turn.removeRequestAbort = undefined;
-    this.disarm(turn);
-    if (!keepBackstop) turn.settledController.abort();
+    turn.releaseBoundary?.();
+    turn.releaseBoundary = undefined;
     if (this.activeTurn === turn) this.activeTurn = undefined;
     if ("response" in outcome) turn.resolve(outcome.response);
     else turn.reject(outcome.error);
@@ -197,23 +219,136 @@ export class PiSession {
     if (!turn || turn.completed) return;
     turn.notificationFailed = true;
     this.abortTurn(turn);
-    this.finish(turn, { error: adapterError("notification_error") }, true);
+    void turn.cleanup?.then(
+      () => this.finish(turn, { error: adapterError("notification_error") }),
+      () => undefined,
+    );
   }
 
   private abortTurn(turn: ActiveTurn): void {
     if (turn.completed) return;
     if (!turn.controller.signal.aborted) turn.controller.abort();
+    turn.cleanup ??= this.cleanupTurn("cancel-only");
+    turn.cleanup.catch((error) => {
+      if (!turn.completed) this.turnError(turn, error);
+      void this.cleanupWedged();
+    });
+  }
+
+  private startDisposal(): void {
+    this.closing = true;
+    if (!this.lifecycleController.signal.aborted) {
+      this.lifecycleController.abort(new Error("session disposed"));
+    }
+    this.bridgeClosePromise ??= Promise.resolve().then(() => this.mcpBridge.close());
+    this.bridgeClosePromise.catch(() => undefined);
+  }
+
+  private cleanupTurn(mode: CleanupGeneration["mode"]): Promise<void> {
+    const current = this.cleanupGeneration;
+    if (current?.status === "pending") {
+      if (mode === "disposal" && current.mode === "cancel-only") {
+        current.mode = "disposal";
+        this.startDisposal();
+      }
+      return current.promise;
+    }
+    if (current?.status === "succeeded" && current.mode === "disposal") {
+      return current.promise;
+    }
+
+    if (mode === "disposal") this.startDisposal();
+    const deadlineController = new AbortController();
+    const timerController = new AbortController();
+    const generation: CleanupGeneration = {
+      mode,
+      status: "pending",
+      promise: Promise.resolve(),
+      deadlineController,
+      timerController,
+    };
+    this.cleanupGeneration = generation;
+
+    const expiry = this.deps.sleep(this.deps.graceMs, timerController.signal).then(() => {
+      const failure = new ChildCleanupFailure(this.childRegistry.remainingChildren);
+      deadlineController.abort(failure);
+      throw failure;
+    });
+    expiry.catch(() => undefined);
+
+    let abortPi: Promise<void>;
+    try {
+      abortPi = this.pi.abort();
+    } catch (error) {
+      abortPi = Promise.reject(error);
+    }
+    abortPi.catch(() => undefined);
+    const terminate = this.childRegistry.terminateAll(
+      () => generation.mode === "cancel-only",
+      deadlineController.signal,
+    );
+    terminate.catch(() => undefined);
+    const operations = Promise.allSettled([abortPi, terminate]);
+
+    generation.promise = new Promise<void>((resolve, reject) => {
+      let claimed = false;
+      const fail = (error: unknown) => {
+        if (claimed) return;
+        claimed = true;
+        generation.status = "failed";
+        this.cleanupDirty = true;
+        generation.mode = "disposal";
+        this.startDisposal();
+        const remaining = error instanceof ChildCleanupFailure
+          ? error.remainingChildren
+          : this.childRegistry.remainingChildren;
+        generation.error = adapterError("child_cleanup_error", { details: { remainingChildren: remaining } });
+        timerController.abort();
+        reject(generation.error);
+      };
+      expiry.then(
+        () => undefined,
+        (error) => {
+          if (timerController.signal.aborted && !deadlineController.signal.aborted) return;
+          fail(error);
+        },
+      );
+      operations.then((results) => {
+        if (claimed) return;
+        const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failure) {
+          fail(failure.reason);
+          return;
+        }
+        claimed = true;
+        generation.status = "succeeded";
+        this.cleanupDirty = false;
+        timerController.abort();
+        if (generation.mode === "cancel-only" && this.cleanupGeneration === generation) {
+          this.cleanupGeneration = undefined;
+        }
+        resolve();
+      });
+    });
+    generation.promise.catch(() => undefined);
+    return generation.promise;
   }
 
   private turnError(turn: ActiveTurn, error: unknown): void {
-    if (turn.completed) return;
+    if (turn.completed || turn.errorSettlementStarted) return;
+    turn.errorSettlementStarted = true;
+    turn.diagnosticOpen = false;
     let terminal;
     try {
       terminal = terminalAssistant(agentMessages(this.pi).slice(turn.startMessageIndex));
     } catch {
       terminal = undefined;
     }
-    this.finish(turn, { error: isRequestError(error) ? error : unexpectedError(error, terminal) });
+    const mapped = isRequestError(error) ? error : unexpectedError(error, terminal);
+    void this.drain().then(
+      () => this.finish(turn, { error: mapped }),
+      () => this.notificationFailure(),
+    );
   }
 
   private runTurnTask(turn: ActiveTurn, task: Promise<void>): void {
@@ -225,59 +360,19 @@ export class PiSession {
 
   private async cleanupWedged(): Promise<void> {
     try {
-      await this.onWedged(this.sessionId, this);
+      await this.onWedged(this.sessionId, this, true);
     } catch (error) {
       console.error("pi-acp wedged-session cleanup error:", error);
     }
   }
 
-  private startBackstop(turn: ActiveTurn): void {
-    if (turn.backstopStarted) return;
-    turn.backstopStarted = true;
-    const backstop = this.deps.sleep(this.deps.graceMs, turn.settledController.signal).then(
-      async () => {
-        try {
-          if (!turn.completed) {
-            const messages = agentMessages(this.pi).slice(turn.startMessageIndex);
-            if (!this.pumpFailure) {
-              this.enqueue(usageUpdate(this.pi));
-              await this.drain();
-            }
-            if (!turn.completed) {
-              this.finish(turn, {
-                response: { stopReason: "cancelled", usage: promptUsage(messages) },
-              });
-            }
-          }
-        } catch (error) {
-          if (this.pumpFailure !== undefined) {
-            turn.notificationFailed = true;
-            this.finish(turn, { error: adapterError("notification_error") }, true);
-          } else {
-            this.turnError(turn, error);
-          }
-        }
-        if (turn.completed) await this.cleanupWedged();
-      },
-      async (error) => {
-        if (turn.settledController.signal.aborted || turn.completed) return;
-        this.turnError(turn, error);
-        await this.cleanupWedged();
-      },
-    );
-    this.runTurnTask(turn, backstop);
-  }
-
   private async handlePiResolved(turn: ActiveTurn): Promise<void> {
     if (turn.completed) return;
     try {
+      if (this.childRegistry.childCleanupFailed) turn.cleanup ??= this.cleanupTurn("disposal");
       const messages = agentMessages(this.pi).slice(turn.startMessageIndex);
-      if (turn.structured) {
-        const json = this.structured.takeJson();
-        if (json !== undefined) {
-          this.enqueue({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: json } });
-        }
-      }
+      if (turn.cleanup) await turn.cleanup;
+      turn.diagnosticOpen = false;
       this.enqueue(usageUpdate(this.pi));
       await this.drain();
       if (turn.completed) return;
@@ -293,11 +388,19 @@ export class PiSession {
   private async handlePiRejected(turn: ActiveTurn, error: unknown): Promise<void> {
     if (turn.completed) return;
     if (!turn.controller.signal.aborted) {
-      this.finish(turn, { error: classifyPreflight(error) });
+      turn.diagnosticOpen = false;
+      try {
+        await this.drain();
+        this.finish(turn, { error: classifyPreflight(error) });
+      } catch {
+        this.notificationFailure();
+      }
       return;
     }
     try {
+      if (turn.cleanup) await turn.cleanup;
       const messages = agentMessages(this.pi).slice(turn.startMessageIndex);
+      turn.diagnosticOpen = false;
       this.enqueue(usageUpdate(this.pi));
       await this.drain();
       this.finish(turn, { response: { stopReason: "cancelled", usage: promptUsage(messages) } });
@@ -310,32 +413,12 @@ export class PiSession {
   async prompt(params: PromptRequest, requestSignal: AbortSignal): Promise<PromptResponse> {
     if (this.busy) throw adapterError("session_busy");
     const converted = convertPromptContent(params.prompt);
-    const schema = params._meta?.outputSchema;
-    let text = converted.text;
-    let structured = false;
-    if (schema !== undefined) {
-      let instruction: string;
-      try {
-        instruction = this.structured.arm(this.pi, schema);
-      } catch (error) {
-        if (isRequestError(error)) throw error;
-        throw unexpectedError(error);
-      }
-      text = text ? `${instruction}\n\n${text}` : instruction;
-      structured = true;
-    }
+    const text = converted.text;
 
     let startMessageIndex: number;
     try {
       startMessageIndex = agentMessages(this.pi).length;
     } catch (error) {
-      if (structured) {
-        try {
-          this.structured.disarm(this.pi);
-        } catch (disarmError) {
-          console.error("pi-acp structured-output disarm error:", disarmError);
-        }
-      }
       throw unexpectedError(error);
     }
 
@@ -351,27 +434,17 @@ export class PiSession {
     });
     const turn: ActiveTurn = {
       controller: new AbortController(),
-      settledController: new AbortController(),
       settlement,
       resolveSettlement,
       completed: false,
+      diagnosticOpen: true,
+      errorSettlementStarted: false,
       notificationFailed: false,
-      backstopStarted: false,
       resolve,
       reject,
       startMessageIndex,
-      structured,
     };
     this.activeTurn = turn;
-    turn.controller.signal.addEventListener("abort", () => {
-      try {
-        this.pi.agent.abort();
-      } catch (error) {
-        console.error("pi-acp abort error:", error);
-      } finally {
-        this.startBackstop(turn);
-      }
-    }, { once: true });
     const abortFromRequest = () => this.abortTurn(turn);
     if (requestSignal.aborted) abortFromRequest();
     else {
@@ -379,17 +452,37 @@ export class PiSession {
       turn.removeRequestAbort = () => requestSignal.removeEventListener("abort", abortFromRequest);
     }
 
-    let piPromise: Promise<void>;
-    try {
-      piPromise = this.pi.prompt(text, { images: converted.images });
-    } catch (error) {
-      this.runTurnTask(turn, this.handlePiRejected(turn, error));
-      return result;
-    }
-    void piPromise.then(
-      () => this.runTurnTask(turn, this.handlePiResolved(turn)),
-      (error) => this.runTurnTask(turn, this.handlePiRejected(turn, error)),
-    );
+    this.runTurnTask(turn, (async () => {
+      turn.releaseBoundary = await this.mcpBridge.acquireTurnBoundary();
+      if (turn.controller.signal.aborted) {
+        try {
+          if (turn.cleanup) await turn.cleanup;
+          turn.diagnosticOpen = false;
+          this.enqueue(usageUpdate(this.pi));
+          await this.drain();
+          this.finish(turn, {
+            response: {
+              stopReason: "cancelled",
+              usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 },
+            },
+          });
+        } catch (error) {
+          this.turnError(turn, error);
+        }
+        return;
+      }
+      let piPromise: Promise<void>;
+      try {
+        piPromise = this.pi.prompt(text, { images: converted.images });
+      } catch (error) {
+        await this.handlePiRejected(turn, error);
+        return;
+      }
+      await piPromise.then(
+        () => this.handlePiResolved(turn),
+        (error) => this.handlePiRejected(turn, error),
+      );
+    })());
     return result;
   }
 
@@ -398,38 +491,67 @@ export class PiSession {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
-    this.closing = true;
+    if (this.disposed && !this.cleanupDirty && this.childRegistry.remainingChildren === 0 && !this.childRegistry.childCleanupFailed) return;
+    const cleanup = this.cleanupTurn("disposal");
     const turn = this.activeTurn;
+    let cleanupError: unknown;
     if (turn) {
       this.abortTurn(turn);
       await turn.settlement;
+      try { await cleanup; } catch (error) { cleanupError = error; }
+    } else {
+      try { await cleanup; } catch (error) { cleanupError = error; }
     }
+    await this.disposeResources();
+    if (cleanupError) throw cleanupError;
+  }
+
+  async disposeAfterCleanupFailure(): Promise<void> {
+    this.startDisposal();
     await this.disposeResources();
   }
 
+  get remainingChildren(): number { return this.childRegistry.remainingChildren; }
+
+  get cleanupRetryRequired(): boolean {
+    return this.cleanupDirty || this.childRegistry.remainingChildren > 0 || this.childRegistry.childCleanupFailed;
+  }
+
   async disposeResources(): Promise<void> {
-    if (this.disposed) return;
+    this.resourceDisposePromise ??= (async () => {
+      if (this.disposed) return;
+      this.closing = true;
+      this.lifecycleController.abort(new Error("session disposed"));
+      this.disposed = true;
+      this.stopped = true;
+      this.pending.length = 0;
+      this.failedMcpResults.clear();
+      try {
+        this.unsubscribe?.();
+      } catch (error) {
+        console.error("pi-acp unsubscribe error:", error);
+      }
+      this.unsubscribe = undefined;
+      this.startDisposal();
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => this.pi.dispose()),
+        this.bridgeClosePromise ?? Promise.resolve(),
+      ]);
+      if (results[0]?.status === "rejected") {
+        console.error("pi-acp session dispose error:", results[0].reason);
+      }
+      if (results[1]?.status === "rejected") {
+        console.error("pi-acp MCP disposal error:", results[1].reason);
+      }
+    })();
+    return this.resourceDisposePromise;
+  }
+
+  poison(): void {
+    if (this.closing || this.disposed) return;
     this.closing = true;
-    this.disposed = true;
-    this.stopped = true;
-    this.pending.length = 0;
-    this.failedMcpResults.clear();
-    try {
-      this.unsubscribe?.();
-    } catch (error) {
-      console.error("pi-acp unsubscribe error:", error);
-    }
-    this.unsubscribe = undefined;
-    try {
-      await this.pi.dispose();
-    } catch (error) {
-      console.error("pi-acp session dispose error:", error);
-    }
-    try {
-      await disposeMcpBridge(this.mcpClients, this.deps);
-    } catch (error) {
-      console.error("pi-acp MCP disposal error:", error);
-    }
+    void this.onWedged(this.sessionId, this, false).catch((error) => {
+      console.error("pi-acp poisoned-session cleanup error:", error);
+    });
   }
 }

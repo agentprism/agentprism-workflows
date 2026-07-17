@@ -75,7 +75,7 @@ declaration is not replay-safe.
 
 ### Structured output as validated objects
 
-`agent({ schema })` returns a schema-validated object, not text to parse. Claude, Codex, and pi use native ACP schema channels; OpenCode and eligible custom ACP agents get a client-hosted `StructuredOutput` MCP tool injected automatically when they advertise HTTP MCP support. The runner still validates and re-prompts on mismatch, so the same API works for native, tool-capture, and final-text JSON fallback paths.
+`agent({ schema })` returns a schema-validated object, not text to parse. Claude and Codex use their agent-specific schema channels. Pi, OpenCode, and eligible custom ACP agents get a client-hosted `StructuredOutput` MCP tool injected automatically when they advertise HTTP MCP support. The runner still validates and re-prompts on mismatch, so the same API works for schema channels, tool capture, and validated final-text fallback.
 
 ### The full ACP spec, enforced by the build
 
@@ -399,7 +399,7 @@ machines; it is the same table every validate report includes.
 
 ## Structured output
 
-Pass a JSON Schema as `agent({ schema })` and the result is a **validated object**, not text. Claude, Codex, and pi constrain generation through native channels (pi uses turn-level `_meta.outputSchema` and returns the captured value in the final message), while OpenCode uses the injected client-hosted `StructuredOutput` MCP tool when it advertises HTTP MCP support. Generic ACP agents get that same tool when opted in. The runner validates and re-prompts on mismatch; the public `agent({ schema })` API is unchanged. See [`docs/design-notes.md` §6](docs/design-notes.md) for the per-backend mechanics.
+Pass a JSON Schema as `agent({ schema })` and the result is a **validated object**, not text. Claude and Codex use their agent-specific schema channels. Pi and OpenCode receive the injected client-hosted HTTP `StructuredOutput` MCP tool; the runner also retains the common prompt-embedded schema and validated last-text fallback. Generic ACP agents get the same tool when opted in. The public `agent({ schema })` API is unchanged. See [`docs/design-notes.md` §6](docs/design-notes.md) for the per-backend mechanics.
 
 ---
 

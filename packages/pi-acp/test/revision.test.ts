@@ -32,7 +32,7 @@ import {
   streamPair,
 } from "./helpers/fakes.js";
 
-const STRUCTURED_TOOL = "__acp_structured_output";
+const RETIRED_STRUCTURED_TOOL = "__acp_structured_output";
 
 function errorKind(error: unknown): unknown {
   return ((error as RequestError).data as { errorKind?: string } | undefined)?.errorKind;
@@ -181,6 +181,7 @@ test("T9 journal-restored model/thinking values are initial and later sets win a
   ]);
   setup.deps.modelRuntime = {
     getModel(provider: string, id: string) { return provider === "test" ? models.get(id) : undefined; },
+    async getAvailable() { return [...models.values()]; },
     hasConfiguredAuth() { return true; },
   } as never;
   setup.deps.createAgentSession = async (options: CreateAgentSessionOptions) => {
@@ -249,7 +250,7 @@ test("T9 journal-restored model/thinking values are initial and later sets win a
   await agent.dispose();
 });
 
-test("T12 outputSchema arms only the requested turn and always disarms afterward", async () => {
+test("S3 private outputSchema metadata is ignored and never arms a server-side tool", async () => {
   const setup = fakeDeps();
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
@@ -262,14 +263,14 @@ test("T12 outputSchema arms only the requested turn and always disarms afterward
     prompt: [{ type: "text", text: "structured" }],
     _meta: { outputSchema: { type: "object" } },
   }));
-  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(STRUCTURED_TOOL), false);
-  assert.equal(setup.controls[0]?.activeToolsAtPrompt[1]?.includes(STRUCTURED_TOOL), true);
-  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(STRUCTURED_TOOL), false);
+  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(RETIRED_STRUCTURED_TOOL) ?? false, false);
+  assert.equal(setup.controls[0]?.activeToolsAtPrompt[1]?.includes(RETIRED_STRUCTURED_TOOL), false);
+  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(RETIRED_STRUCTURED_TOOL), false);
   await agent.dispose();
 });
 
-test("T12 captured structured value is the final agent_message_chunk before usage on session/prompt", async () => {
-  const setup = fakeDeps("structured");
+test("S3 private metadata cannot fabricate a final agent message", async () => {
+  const setup = fakeDeps();
   const pair = streamPair();
   const updates: SessionUpdate[] = [];
   const clientApp = client({ name: "pi-acp-structured-capture" })
@@ -293,9 +294,8 @@ test("T12 captured structured value is the final agent_message_chunk before usag
     const chunks = updates.filter((update) => update.sessionUpdate === "agent_message_chunk");
     assert.deepEqual(chunks.map((update) => update.sessionUpdate === "agent_message_chunk"
       ? update.content.text
-      : undefined), ["hello", '{"answer":1}']);
+      : undefined), ["hello"]);
     assert.deepEqual(updates.map(({ sessionUpdate }) => sessionUpdate), [
-      "agent_message_chunk",
       "agent_message_chunk",
       "usage_update",
     ]);
@@ -306,7 +306,7 @@ test("T12 captured structured value is the final agent_message_chunk before usag
   }
 });
 
-test("T12 auth preflight throw finally disarms structured output", async () => {
+test("S3 auth preflight never creates private structured state", async () => {
   const setup = fakeDeps("auth-preflight");
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
@@ -318,12 +318,12 @@ test("T12 auth preflight throw finally disarms structured output", async () => {
     assert.equal((error as RequestError).code, -32000);
     return errorKind(error) === "auth_error";
   });
-  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(STRUCTURED_TOOL), true);
-  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(STRUCTURED_TOOL), false);
+  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(RETIRED_STRUCTURED_TOOL) ?? false, false);
+  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(RETIRED_STRUCTURED_TOOL), false);
   await agent.dispose();
 });
 
-test("T12 cancellation finally disarms structured output", async () => {
+test("S3 cancellation never creates private structured state", async () => {
   const setup = fakeDeps("wedged");
   setup.deps.sleep = (_ms, signal) => new Promise<void>((_resolve, reject) => {
     signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -337,16 +337,16 @@ test("T12 cancellation finally disarms structured output", async () => {
     _meta: { outputSchema: { type: "object" } },
   }, undefined, cancellation.signal));
   await Promise.resolve();
-  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(STRUCTURED_TOOL), true);
+  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(RETIRED_STRUCTURED_TOOL) ?? false, false);
   cancellation.abort();
   setup.controls[0]?.resolvePrompt?.();
   assert.equal((await pending).stopReason, "cancelled");
-  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(STRUCTURED_TOOL), false);
+  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(RETIRED_STRUCTURED_TOOL), false);
   await agent.dispose();
 });
 
-test("T12 notification failure finally disarms structured output", async () => {
-  const setup = fakeDeps("structured");
+test("S3 notification failure never creates private structured state", async () => {
+  const setup = fakeDeps();
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context(
     { cwd: setup.cwd, mcpServers: [] },
@@ -357,13 +357,13 @@ test("T12 notification failure finally disarms structured output", async () => {
     prompt: [{ type: "text", text: "notify structured" }],
     _meta: { outputSchema: { type: "object" } },
   })), (error) => errorKind(error) === "notification_error");
-  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(STRUCTURED_TOOL), true);
-  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(STRUCTURED_TOOL), false);
+  assert.equal(setup.controls[0]?.activeToolsAtPrompt[0]?.includes(RETIRED_STRUCTURED_TOOL), false);
+  assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(RETIRED_STRUCTURED_TOOL), false);
   await agent.dispose();
 });
 
-test("T12 mixed unstructured/structured/unstructured session sequence does not leak state", async () => {
-  const setup = fakeDeps("structured");
+test("S3 private metadata remains inert across a mixed session sequence", async () => {
+  const setup = fakeDeps();
   const pair = streamPair();
   const updates: SessionUpdate[] = [];
   const clientApp = client({ name: "pi-acp-structured-sequence" })
@@ -392,20 +392,20 @@ test("T12 mixed unstructured/structured/unstructured session sequence does not l
       sessionId: opened.sessionId,
       prompt: [{ type: "text", text: "plain three" }],
     });
-    assert.deepEqual(setup.controls[0]?.activeToolsAtPrompt.map((names) => names.includes(STRUCTURED_TOOL)), [
+    assert.deepEqual(setup.controls[0]?.activeToolsAtPrompt.map((names) => names.includes(RETIRED_STRUCTURED_TOOL)), [
       false,
-      true,
+      false,
       false,
     ]);
     assert.doesNotMatch(setup.controls[0]?.promptCalls[0]?.text ?? "", /__acp_structured_output/);
-    assert.match(setup.controls[0]?.promptCalls[1]?.text ?? "", /__acp_structured_output/);
+    assert.doesNotMatch(setup.controls[0]?.promptCalls[1]?.text ?? "", /__acp_structured_output/);
     assert.doesNotMatch(setup.controls[0]?.promptCalls[2]?.text ?? "", /__acp_structured_output/);
     const structuredChunks = updates.filter((update) =>
       update.sessionUpdate === "agent_message_chunk" && update.content.text.startsWith("{"));
     assert.deepEqual(structuredChunks.map((update) => update.sessionUpdate === "agent_message_chunk"
       ? update.content.text
-      : undefined), ['{"answer":2}']);
-    assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(STRUCTURED_TOOL), false);
+      : undefined), []);
+    assert.equal(setup.controls[0]?.session.getActiveToolNames().includes(RETIRED_STRUCTURED_TOOL), false);
   } finally {
     connection.close();
     server.connection.close();
@@ -457,7 +457,8 @@ async function runShutdownFixture(
 ): Promise<ShutdownResult> {
   const fixtureDir = mkdtempSync(join(tmpdir(), "pi-acp-shutdown-"));
   const markerPath = join(fixtureDir, "marker.log");
-  const builtIndex = readFileSync(new URL("../dist/index.js", import.meta.url), "utf8");
+  const sourceIndex = readFileSync(new URL("../dist/index.js", import.meta.url), "utf8");
+  const builtIndex = mode === "hung-dispose" ? sourceIndex.replace("66_000", "50") : sourceIndex;
   writeFileSync(join(fixtureDir, "package.json"), '{"type":"module"}\n');
   writeFileSync(join(fixtureDir, "index.js"), builtIndex);
   writeFileSync(join(fixtureDir, "server.js"), `
@@ -549,9 +550,9 @@ test("T3 runAcp startup throw exits 1 without entering disposal", async () => {
   assert.match(result.stderr, /startup error:.*fixture startup failure/s);
 });
 
-test("T3 teardown timeout is bounded and still exits with the trigger code", async () => {
+test("T3 teardown timeout is bounded and forces cleanup-failure exit", async () => {
   const result = await runShutdownFixture("hung-dispose", ["SIGTERM"]);
-  assert.deepEqual({ code: result.code, signal: result.signal }, { code: 0, signal: null });
+  assert.deepEqual({ code: result.code, signal: result.signal }, { code: 1, signal: null });
   assert.equal(result.marker.match(/^dispose$/gm)?.length, 1);
-  assert.match(result.stderr, /shutdown error:.*shutdown timed out/s);
+  assert.equal(result.stderr.trim(), "shutdown cleanup failed");
 });

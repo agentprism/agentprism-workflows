@@ -130,9 +130,7 @@ test("the pinned auth-required code is the SDK's exclusively-reserved -32000", (
 
 test("the first-class Pi backend pins the frozen pi-acp capability/auth/error surface", () => {
   assert.deepEqual(PI_ACP_PROTOCOL_CONTRACT, {
-    customCapabilityNamespace: "@automatalabs/pi-acp",
-    outputSchemaKey: "outputSchema",
-    mcpCapabilities: {},
+    mcpCapabilities: { http: true, sse: true },
     authMethodIds: [
       "anthropic-api-key",
       "openai-api-key",
@@ -143,9 +141,9 @@ test("the first-class Pi backend pins the frozen pi-acp capability/auth/error su
     ],
     providerErrorKinds: ["auth_error", "rate_limit", "billing_error", "provider_error"],
   });
-  assert.ok(PI_AGENT_DIST.includes(PI_ACP_PROTOCOL_CONTRACT.customCapabilityNamespace));
-  assert.ok(PI_AGENT_DIST.includes(PI_ACP_PROTOCOL_CONTRACT.outputSchemaKey));
-  assert.ok(PI_AGENT_DIST.includes("mcpCapabilities: {}"));
+  assert.ok(PI_AGENT_DIST.includes("http: true"));
+  assert.ok(PI_AGENT_DIST.includes("sse: true"));
+  assert.ok(!PI_AGENT_DIST.includes("outputSchema: true"));
   for (const methodId of PI_ACP_PROTOCOL_CONTRACT.authMethodIds) {
     assert.ok(PI_AUTH_DIST.includes(methodId), `installed pi-acp auth dist must contain ${methodId}`);
   }

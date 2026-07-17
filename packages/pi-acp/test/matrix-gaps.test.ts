@@ -89,8 +89,8 @@ test("T8 adapter errors have the exact reserved prefix and fixed-label wire shap
     session_not_forkable: { code: -32602, prefix: "Invalid params", label: "session has no persisted history to fork" },
     mcp_init_error: { code: -32603, prefix: "Internal error", label: "mcp server initialization failed" },
     unsupported_mcp_transport: { code: -32602, prefix: "Invalid params", label: "unsupported mcp transport" },
-    structured_tool_collision: { code: -32603, prefix: "Internal error", label: "structured-output tool unavailable" },
-    invalid_output_schema: { code: -32602, prefix: "Invalid params", label: "invalid output schema" },
+    extension_setup_error: { code: -32603, prefix: "Internal error", label: "pi extension setup failed" },
+    child_cleanup_error: { code: -32603, prefix: "Internal error", label: "child process cleanup failed" },
     invalid_cursor: { code: -32602, prefix: "Invalid params", label: "invalid list cursor" },
     unknown_auth_method: { code: -32602, prefix: "Invalid params", label: "unknown auth method" },
     notification_error: { code: -32603, prefix: "Internal error", label: "notification delivery failed" },
@@ -100,7 +100,9 @@ test("T8 adapter errors have the exact reserved prefix and fixed-label wire shap
   for (const [kind, shape] of Object.entries(expected) as Array<[ErrorKind, typeof expected[ErrorKind]]>) {
     const extras = kind === "mcp_init_error" || kind === "unsupported_mcp_transport"
       ? { server: "server-a" }
-      : undefined;
+      : kind === "child_cleanup_error"
+        ? { details: { remainingChildren: 2 } }
+        : undefined;
     assert.deepEqual(errorWire(adapterError(kind, extras)), {
       code: shape.code,
       message: shape.prefix,
@@ -761,7 +763,7 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
     };
 
     const lateConnect = deferred<never>();
-    setup.deps.connectMcpClient = async () => lateConnect.promise;
+    setup.deps.connectMcpClient = () => lateConnect.promise;
     await assert.rejects(
       bridgeMcpServers([server], new AbortController().signal, setup.deps),
       (error) => errorKind(error) === "mcp_init_error",
@@ -770,8 +772,17 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
 
     const lateList = deferred<never>();
     let listCloseCalls = 0;
+    let listBoundedCall = 0;
+    setup.deps.sleep = (_ms, signal) => {
+      listBoundedCall += 1;
+      if (listBoundedCall === 2) return Promise.resolve();
+      return new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
     setup.deps.connectMcpClient = async () => fakeMcpHandle({
-      async listTools() { return lateList.promise; },
+      listTools() { return lateList.promise; },
       async close() { listCloseCalls += 1; },
     });
     await assert.rejects(
@@ -781,12 +792,21 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
     assert.equal(listCloseCalls, 1);
     lateList.reject(new Error("late list rejection"));
 
+    let boundedCall = 0;
+    setup.deps.sleep = (_ms, signal) => {
+      boundedCall += 1;
+      if (boundedCall === 3) return Promise.resolve();
+      return new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
     const lateCall = deferred<never>();
     setup.deps.connectMcpClient = async () => fakeMcpHandle({
       async listTools() {
         return { tools: [{ name: "slow", inputSchema: { type: "object" } }] };
       },
-      async callTool() { return lateCall.promise; },
+      callTool() { return lateCall.promise; },
     });
     const bridge = await bridgeMcpServers([server], new AbortController().signal, setup.deps);
     await assert.rejects(
@@ -875,15 +895,21 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
     setup.deps.sessions.create = () => SessionManager.create(setup.cwd, setup.sessionDir, { id });
     const late = deferred<never>();
     if (mode === "timeout") {
-      setup.deps.sleep = async (_ms, signal) => {
-        if (signal.aborted) throw signal.reason;
+      let boundedCall = 0;
+      setup.deps.sleep = (_ms, signal) => {
+        boundedCall += 1;
+        if (boundedCall === 3) return Promise.resolve();
+        return new Promise<void>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
       };
     }
     setup.deps.connectMcpClient = async () => fakeMcpHandle({
       async listTools() { return { tools: [{ name: "remote", inputSchema: { type: "object" } }] }; },
-      async callTool() {
+      callTool() {
         if (mode === "timeout") return late.promise;
-        return { content: [{ type: "text", text: "remote tool error detail" }], isError: true };
+        return Promise.resolve({ content: [{ type: "text", text: "remote tool error detail" }], isError: true });
       },
     });
     const updates: SessionUpdate[] = [];
@@ -913,6 +939,7 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
       if (mode === "timeout") late.reject(new Error("late tools/call rejection"));
       await setImmediatePromise();
       assert.deepEqual(unhandled, []);
+      if (mode === "timeout") setup.deps.sleep = realSleep;
       await agent.dispose();
     } finally {
       process.off("unhandledRejection", onUnhandled);
@@ -972,12 +999,13 @@ test("T20 tools/call round-trips through new, load, resume, and fork with shared
   assert.equal(setup.createOptions.length, 4);
   for (const options of setup.createOptions) {
     assert.equal(options.modelRuntime, setup.deps.modelRuntime);
-    assert.ok(options.customTools?.some(({ name }) => name === "mcp__server__roundtrip"));
+    assert.ok(options.resourceLoader?.getExtensions().extensions
+      .some((extension) => extension.tools.has("mcp__server__roundtrip")));
   }
   await agent.dispose();
 });
 
-test("T22 each cooperative abort source force-settles a wedged turn once, emits usage, and detaches pi", async () => {
+test("T22 each cooperative abort source drains before settling once and preserves the mode boundary", async () => {
   const unhandled: unknown[] = [];
   const onUnhandled = (error: unknown) => { unhandled.push(error); };
   process.on("unhandledRejection", onUnhandled);
@@ -1009,15 +1037,14 @@ test("T22 each cooperative abort source force-settles a wedged turn once, emits 
       else if (source === "session-cancel") agent.cancel(context({ sessionId: opened.sessionId }) as never);
       else closing = agent.closeSession(context({ sessionId: opened.sessionId }));
       assert.equal(typeof fire, "function");
-      fire?.();
       assert.equal((await pending).stopReason, "cancelled", source);
       if (closing) assert.deepEqual(await closing, {});
       await setImmediatePromise();
       assert.equal(updates.filter(({ sessionUpdate }) => sessionUpdate === "usage_update").length, 1, source);
-      assert.ok((setup.controls[0]?.disposeCalls ?? 0) >= 1, source);
-      assert.throws(
-        () => agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "again" }] })),
-        (error) => errorKind(error) === "session_terminated",
+      assert.equal(
+        (setup.controls[0]?.disposeCalls ?? 0) >= 1,
+        source === "session-close",
+        source,
       );
       setup.controls[0]?.rejectPrompt?.(new Error(`late pi rejection: ${source}`));
       await setImmediatePromise();
@@ -1030,7 +1057,7 @@ test("T22 each cooperative abort source force-settles a wedged turn once, emits 
   }
 });
 
-test("T22 notify failure wins settlement; its later backstop only cleans up with no usage or unhandled rejection", async () => {
+test("T22 notify failure wins settlement after successful abort cleanup with no usage or unhandled rejection", async () => {
   const setup = fakeDeps("wedged");
   let fire: (() => void) | undefined;
   setup.deps.sleep = (_ms, signal) => new Promise<void>((resolve, reject) => {
@@ -1067,17 +1094,13 @@ test("T22 notify failure wins settlement; its later backstop only cleans up with
     await assert.rejects(pending, (error) => errorKind(error) === "notification_error");
     assert.equal(delivered.filter(({ sessionUpdate }) => sessionUpdate === "usage_update").length, 0);
     assert.equal(typeof fire, "function");
-    fire?.();
     await setImmediatePromise();
-    assert.ok((setup.controls[0]?.disposeCalls ?? 0) >= 1);
-    assert.throws(
-      () => agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "again" }] })),
-      (error) => errorKind(error) === "session_terminated",
-    );
+    assert.equal(setup.controls[0]?.disposeCalls, 0);
     setup.controls[0]?.rejectPrompt?.(new Error("late notify-failure pi rejection"));
     await setImmediatePromise();
     assert.deepEqual(unhandled, []);
     assert.equal(delivered.filter(({ sessionUpdate }) => sessionUpdate === "usage_update").length, 0);
+    setup.deps.sleep = realSleep;
     await agent.dispose();
   } finally {
     process.off("unhandledRejection", onUnhandled);

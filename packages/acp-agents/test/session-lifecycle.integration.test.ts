@@ -13,6 +13,8 @@ import {
   AGENT_METHODS,
   AcpAgentRunner,
   ClaudeBackend,
+  PI_CHILD_CLEANUP_DEADLINE_MS,
+  PI_CLOSE_SESSION_TIMEOUT_MS,
   PooledConnection,
   type AcpSessionOptions,
 } from "../src/index.js";
@@ -68,6 +70,41 @@ function permissionOutcomes(log: LogEntry[]): Array<RequestPermissionResponse["o
 
 afterEach(async () => {
   await harness.cleanup();
+});
+
+test("Pi close delivery bound admits 4,999 ms success and observes 5,000 ms child cleanup failure", async () => {
+  assert.equal(PI_CHILD_CLEANUP_DEADLINE_MS, 5_000);
+  assert.equal(PI_CLOSE_SESSION_TIMEOUT_MS, 6_000);
+  assert.ok(PI_CLOSE_SESSION_TIMEOUT_MS > PI_CHILD_CLEANUP_DEADLINE_MS);
+
+  const success = harness.configure<LogEntry>({
+    turns: [{ text: "closed cleanly", close: { delayMs: 4_999 } }],
+  }, { backends: ["pi"] });
+  const successRunner = makeRunner();
+  assert.equal(await successRunner.run("hi", { model: "pi", cwd: success.cwd }), "closed cleanly");
+  await successRunner.dispose();
+
+  const failure = harness.configure<LogEntry>({
+    turns: [{
+      text: "primary success",
+      close: {
+        delayMs: 5_000,
+        throw: "child process cleanup failed",
+        throwData: { errorKind: "child_cleanup_error", details: { remainingChildren: 1 } },
+      },
+    }],
+  }, { backends: ["pi"] });
+  await assert.rejects(
+    () => makeRunner().run("hi", { model: "pi", cwd: failure.cwd, label: "pi-cleanup" }),
+    (error: unknown) => {
+      assert.ok(isWorkflowError(error));
+      assert.equal(error.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+      assert.equal(error.recoverable, false);
+      assert.equal(error.message, "child process cleanup failed");
+      assert.equal(error.agentLabel, "pi-cleanup");
+      return true;
+    },
+  );
 });
 
 test("loadSession routes replay updates and permissions before resolving", async () => {

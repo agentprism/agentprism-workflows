@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { isWorkflowError, WorkflowErrorCode, type AgentUsage, type McpServerConfig } from "@automatalabs/shared-types";
 import { AcpAgentRunner } from "../src/index.js";
-import { createFakeAgentHarness } from "./helpers/fake-agent.js";
+import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
 
@@ -43,6 +43,60 @@ const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 afterEach(async () => {
   // Dispose every runner this test built (closes its pooled processes) before clearing env.
   await harness.cleanup();
+});
+
+test("Pi release-time child cleanup failure overrides success, primary error, and caller abort", async () => {
+  const close = {
+    throw: "child process cleanup failed",
+    throwData: { errorKind: "child_cleanup_error", details: { remainingChildren: 1 } },
+  };
+  const expectCleanup = (error: unknown): boolean => {
+    assert.ok(isWorkflowError(error));
+    assert.equal(error.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(error.recoverable, false);
+    assert.equal(error.message, "child process cleanup failed");
+    return true;
+  };
+
+  const success = harness.configure<LogEntry>({ turns: [{ text: "primary success", close }] }, { backends: ["pi"] });
+  await assert.rejects(
+    () => makeRunner().run("hi", { model: "pi", cwd: success.cwd }),
+    expectCleanup,
+  );
+
+  const failed = harness.configure<LogEntry>({ turns: [{ throw: "primary failure", close }] }, { backends: ["pi"] });
+  await assert.rejects(
+    () => makeRunner().run("hi", { model: "pi", cwd: failed.cwd }),
+    expectCleanup,
+  );
+
+  const aborted = harness.configure<LogEntry>({ turns: [{ waitForCancel: true, close }] }, { backends: ["pi"] });
+  const controller = new AbortController();
+  const running = makeRunner().run("hi", { model: "pi", cwd: aborted.cwd, signal: controller.signal });
+  await waitFor(() => aborted.readLog().some((entry) => entry.method === "prompt"));
+  controller.abort();
+  await assert.rejects(() => running, expectCleanup);
+});
+
+test("runner disposal releases every interactive Pi session before reporting the first child cleanup failure", async () => {
+  const configured = harness.configure<LogEntry>({
+    close: {
+      throw: "child process cleanup failed",
+      throwData: { errorKind: "child_cleanup_error", details: { remainingChildren: 1 } },
+    },
+  }, { backends: ["pi"] });
+  const runner = makeRunner();
+  await runner.openSession({ model: "pi", cwd: configured.cwd });
+  await runner.openSession({ model: "pi", cwd: configured.cwd });
+
+  await assert.rejects(
+    runner.dispose(),
+    (error: { code?: unknown; data?: { errorKind?: unknown } }) =>
+      error.code === -32603 && error.data?.errorKind === "child_cleanup_error",
+  );
+  const log = configured.readLog();
+  assert.equal(log.filter((entry) => entry.method === "closeSession").length, 2);
+  assert.equal(log.filter((entry) => entry.method === "__exit").length, 2);
 });
 
 // ---- (7) benign clientInfo at initialize --------------------------------------------

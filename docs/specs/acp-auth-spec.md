@@ -166,7 +166,7 @@ onAuth?: AuthResolver;   // §1.3
 
 Default derivation (in the runner constructor, `:241-252`, alongside `advertiseElicitation`):
 
-- `onAuth` set, `authCapabilities` unset → `{ terminal: false, gateway: true }`. Gateway is cheap and non-destructive; terminal needs a real TTY that a generic programmatic host lacks. **Sequencing note (§4.7):** the `onAuth` field does not exist until PR3, so this `onAuth`-conditioned branch of the default derivation lands **with PR3**; PR2 implements only the explicit-`authCapabilities` path and the omit-when-unset behavior below. The two PRs compose without behavior change because in PR2 `authCapabilities` unset ⇒ omit `auth`, which is exactly what the `onAuth`-unset case also does.
+- `onAuth` set, `authCapabilities` unset → `{ terminal: false, gateway: true }`. Gateway is cheap and non-destructive; terminal needs a real TTY that a generic programmatic host lacks. **Sequencing record (§4.7):** PR3 introduced `onAuth` and its conditioned default after PR2 established the explicit-`authCapabilities` and omit-when-unset paths. The delivered composition preserves the PR2 default when `onAuth` is unset.
 - `onAuth` unset (and `authCapabilities` unset) → advertise nothing. The `auth` key is omitted — spec-correct "unsupported" (any capability omitted in `initialize` MUST be treated as unsupported, `agentclientprotocol.com/protocol/v1/initialization`). This is today's exact behavior, so PR2 (§4.7) is a zero-behavior-change opt-in.
 - Native-TTY hosts (the local runner, or any CLI host — §4) pass `{ terminal: true, gateway: true }` explicitly.
 
@@ -1051,9 +1051,9 @@ For any spec-conformant agent (`@agentclientprotocol/sdk` 1.2.1 schema, agentcli
 
 Every `_meta` capability the four servers expose — auth and non-auth — is supported and cited or
 represented by an executable drift tripwire in `packages/acp-agents/src/protocol-coverage.ts`. Pi's
-six auth methods carry no auth `_meta`; its non-auth structured-output namespace is pinned by
-`PI_ACP_PROTOCOL_CONTRACT`. Direction: `A→C` = agent emits to client; `C→A` = client sends to / gates
-agent.
+six auth methods carry no auth `_meta`, and Pi exposes no non-auth private structured-output namespace;
+its structured channel is the standard injected HTTP MCP tool. Direction: `A→C` = agent emits to
+client; `C→A` = client sends to / gates agent.
 
 #### Auth `_meta`
 
@@ -1420,7 +1420,7 @@ The implementation was delivered as seven PR-sized stages, error-taxonomy-first,
 | PR | Scope (spec §) | Key files | Why green in isolation |
 |----|----------------|-----------|------------------------|
 | **PR1** | Error taxonomy + structured `authContext` (§1.5) | `packages/acp-agents/src/errors-map.ts`, `packages/shared-types/src/errors.ts` (+`isAuthRequired`), `packages/workflow-engine/src/errors.ts` (+`isAuthRequired` in the shared-types re-export block `:17-23`), `packages/workflow-engine/src/index.ts` (+`isAuthRequired` in the named re-export block `:37-49`), `packages/shared-types/test/errors.test.ts`, `errors-map.test.ts` | Pure classification; the three first-class agents already emit `-32000`+English, so the code-only matcher is behavior-preserving and immediately unblocks conformant custom agents. Threading `isAuthRequired` through the workflow-engine re-export here (not later) means PR6's `export { isAuthRequired } from "@automatalabs/workflow-engine"` resolves and builds. |
-| **PR2** | Client auth advertisement (§1.2) | `packages/acp-agents/src/client-handlers.ts`, `capabilities.ts`, `acp-client.ts` (initialize thread), `pool.ts`, `runner.ts` (`authCapabilities`), `protocol-coverage.ts`, `client-handlers.test.ts`, `protocol-coverage.test.ts` | Default-OFF; the `auth` key is omitted until a host sets `authCapabilities`, so zero behavior change. Drift shape assertion lands here. |
+| **PR2** | Client auth advertisement (§1.2) | `packages/acp-agents/src/client-handlers.ts`, `capabilities.ts`, `acp-client.ts` (initialize thread), `pool.ts`, `runner.ts` (`authCapabilities`), `protocol-coverage.ts`, `client-handlers.test.ts`, `protocol-coverage.test.ts` | Default-OFF; the `auth` key is omitted unless a host sets `authCapabilities`, so zero behavior change. This delivery added the drift shape assertion. |
 | **PR3** | Auth contracts + `AuthStore`/`BackendAuthMachine` + generation-stamped lifecycle + resolver + runner API (§1.3, §2, §4.1) | new `packages/acp-agents/src/auth/{auth-types,auth-store}.ts`, `acp-client.ts` (replay-after-initialize + spawn overlay + stamp/reapply), `pool.ts` (generation-gated `selectConnection` + `recycle` + drain), `runner.ts` (`describeAuthMethods`/`completeAuth`/`auth`/`onAuth`/inline retry-once; rebuild `authenticate`/`logout`), `fixtures/fake-auth-agent.mjs`, `auth-descriptors.test.ts`, `auth-store.test.ts`, `auth.integration.test.ts`, `auth-secrets.test.ts`, `auth-providers.integration.test.ts` | The core correctness PR (fixes gap 3). Behavioral but opt-in: unset `onAuth`/`authCapabilities` ⇒ identical to today; the fixture proves conformance-by-absence. |
 | **PR4** | Engine pause-for-auth + cold-resume re-arm (§2.12, §2.13) | `packages/workflow-engine/src/workflow-manager.ts`, `run-persistence.ts`, `packages/shared-types/src/{errors,workflow-result}.ts` (`reason` widen + `authContext`), `auth-pause.test.ts`, `run-persistence.test.ts` | Generalizes the existing `PROVIDER_USAGE_LIMIT` pause branch (`workflow-manager.ts:620-649,675-699`); `PersistedRunState.pauseReason` is already free-form (`run-persistence.ts:43`) so no migration. |
 | **PR5** | MCP server auth tools (§4.3) | `packages/mcp-server/src/server.ts`, new `auth-tool-io.ts`, new `auth-resolver.ts`, `packages/workflows/src/index.ts` (the §4.2 type re-exports — see the §4.2 sequencing note), `packages/mcp-server/test/auth-tools.test.ts` | Two additive tools + summary branch; `createWorkflowServer` signature unchanged; inline elicitation is env-gated OFF. |

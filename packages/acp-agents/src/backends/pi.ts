@@ -1,23 +1,16 @@
 // PiBackend — drives @automatalabs/pi-acp, the ACP server for the pi coding agent.
-// pi-acp advertises a native outputSchema channel under its package namespace and emits the
-// captured structured value as the final assistant message, so the runner sends plain JSON Schema
-// on session/prompt and parses only that final message. No prompt embedding or client-hosted MCP
-// tool is needed.
+// pi-acp consumes the same client-hosted StructuredOutput MCP server as other HTTP-capable agents.
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
-import { META_KEYS } from "@automatalabs/shared-types";
 import type {
   Backend,
   ProviderErrorClassification,
   ProviderErrorMetadata,
   SpawnConfig,
-  StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
 import { piAuthProfile } from "../auth/auth-profiles.js";
-import { toJsonSchema } from "../schema-strict.js";
-import { parseFinalJson } from "../structured-output.js";
 
 const require = createRequire(import.meta.url);
 
@@ -26,12 +19,8 @@ export class PiBackend implements Backend {
   /** Pure-data pi auth profile: five provider env keys plus ambient pi stored credentials. */
   readonly authProfile = piAuthProfile;
   readonly stripsRoutingPrefix = true;
-  readonly embedSchemaInPrompt = false;
-  readonly injectStructuredOutputTool = false;
-  readonly customCapabilities = {
-    namespace: "@automatalabs/pi-acp",
-    gatedKeys: [META_KEYS.outputSchema],
-  } as const;
+  readonly embedSchemaInPrompt = true;
+  readonly injectStructuredOutputTool = true;
 
   classifyProviderError(
     error: unknown,
@@ -76,13 +65,8 @@ export class PiBackend implements Backend {
     return undefined;
   }
 
-  promptMeta(schema: TSchema | undefined): Record<string, unknown> | undefined {
-    if (!schema) return undefined;
-    return { [META_KEYS.outputSchema]: toJsonSchema(schema) };
-  }
-
-  nativeStructured(source: StructuredSource): unknown {
-    return parseFinalJson(source.finalMessageText());
+  promptMeta(_schema: TSchema | undefined): Record<string, unknown> | undefined {
+    return undefined;
   }
 }
 

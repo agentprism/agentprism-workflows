@@ -7,9 +7,13 @@ import {
   type NewSessionOptions,
   type SessionInfo,
 } from "@earendil-works/pi-coding-agent";
-import type { McpServerStdio } from "@agentclientprotocol/sdk";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import { DEFAULT_REQUEST_TIMEOUT_MSEC } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import { connectDefaultMcpClient, type McpClientHandle } from "./mcp-bridge.js";
+import {
+  connectDefaultMcpClient,
+  type McpClientHandle,
+  type McpSessionBinding,
+} from "./mcp-bridge.js";
 
 export interface PiAcpDeps {
   createAgentSession(opts: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>;
@@ -22,7 +26,11 @@ export interface PiAcpDeps {
   };
   modelRuntime: ModelRuntime;
   sessionDir?: string;
-  connectMcpClient(server: McpServerStdio, signal: AbortSignal): Promise<McpClientHandle>;
+  connectMcpClient(
+    server: McpServer,
+    signal: AbortSignal,
+    binding?: McpSessionBinding,
+  ): Promise<McpClientHandle>;
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   graceMs: number;
   mcpTimeoutMs: number;
@@ -67,6 +75,6 @@ export async function resolveDeps(partial: Partial<PiAcpDeps> = {}): Promise<PiA
     mcpTimeoutMs,
     connectMcpClient:
       partial.connectMcpClient ??
-      ((server, signal) => connectDefaultMcpClient(server, signal, mcpTimeoutMs, sleep)),
+      ((server, signal, binding) => connectDefaultMcpClient(server, signal, mcpTimeoutMs, sleep, binding)),
   };
 }

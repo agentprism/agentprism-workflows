@@ -19,8 +19,8 @@ export type ErrorKind =
   | "session_not_forkable"
   | "mcp_init_error"
   | "unsupported_mcp_transport"
-  | "structured_tool_collision"
-  | "invalid_output_schema"
+  | "extension_setup_error"
+  | "child_cleanup_error"
   | "invalid_cursor"
   | "unknown_auth_method"
   | "notification_error"
@@ -45,8 +45,8 @@ const LABELS: Record<ErrorKind, string> = {
   session_not_forkable: "session has no persisted history to fork",
   mcp_init_error: "mcp server initialization failed",
   unsupported_mcp_transport: "unsupported mcp transport",
-  structured_tool_collision: "structured-output tool unavailable",
-  invalid_output_schema: "invalid output schema",
+  extension_setup_error: "pi extension setup failed",
+  child_cleanup_error: "child process cleanup failed",
   invalid_cursor: "invalid list cursor",
   unknown_auth_method: "unknown auth method",
   notification_error: "notification delivery failed",
@@ -66,7 +66,6 @@ const INVALID_KINDS = new Set<ErrorKind>([
   "session_terminated",
   "session_not_forkable",
   "unsupported_mcp_transport",
-  "invalid_output_schema",
   "invalid_cursor",
   "unknown_auth_method",
 ]);
@@ -90,13 +89,23 @@ export function redactedDiagnostics(diagnostics: readonly DiagnosticLike[] | und
     : undefined;
 }
 
+type DiagnosticDetails = { details?: Array<{ type: string; timestamp: number }> };
+type ServerDetails = { server: string };
+type ChildDetails = { details: { remainingChildren: number } };
+
+export function adapterError(kind: "mcp_init_error" | "unsupported_mcp_transport", extras: ServerDetails): RequestError;
+export function adapterError(kind: "provider_error" | "internal_error", extras?: DiagnosticDetails): RequestError;
+export function adapterError(kind: "child_cleanup_error", extras: ChildDetails): RequestError;
+export function adapterError(kind: Exclude<ErrorKind,
+  "mcp_init_error" | "unsupported_mcp_transport" | "provider_error" | "internal_error" | "child_cleanup_error"
+>): RequestError;
 export function adapterError(
   kind: ErrorKind,
-  extras: { server?: string; details?: Array<{ type: string; timestamp: number }> } = {},
+  extras: ServerDetails | DiagnosticDetails | ChildDetails = {},
 ): RequestError {
   const data: Record<string, unknown> = { errorKind: kind, message: LABELS[kind] };
-  if (extras.server !== undefined) data.server = extras.server;
-  if (extras.details !== undefined) data.details = extras.details;
+  if ("server" in extras) data.server = extras.server;
+  if ("details" in extras && extras.details !== undefined) data.details = extras.details;
   if (kind === "auth_error") return RequestError.authRequired(data);
   if (INVALID_KINDS.has(kind)) return RequestError.invalidParams(data);
   return RequestError.internalError(data);
@@ -148,4 +157,10 @@ export function unexpectedError(error: unknown, terminal?: TerminalAssistantLike
 
 export function isRequestError(error: unknown): error is RequestError {
   return error instanceof RequestError;
+}
+
+export function isChildCleanupError(error: unknown): error is RequestError {
+  if (!(error instanceof RequestError) || error.code !== -32603) return false;
+  const data = error.data;
+  return Boolean(data && typeof data === "object" && (data as { errorKind?: unknown }).errorKind === "child_cleanup_error");
 }

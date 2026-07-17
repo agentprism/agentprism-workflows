@@ -20,6 +20,12 @@ const SCRIPT = [
   "return answer;",
 ].join("\n");
 
+const STRUCTURED_SCRIPT = [
+  'export const meta = { name: "pi-hermetic-structured-e2e", description: "exercise Pi StructuredOutput injection" };',
+  'const answer = await agent("Return the requested structured answer.", { schema: { type: "object", additionalProperties: false, required: ["answer"], properties: { answer: { type: "string" } } } });',
+  "return answer;",
+].join("\n");
+
 test("first-class pi runs end to end through pi-acp's credential-free AgentSession seam", {
   timeout: 60_000,
 }, async () => {
@@ -54,10 +60,52 @@ test("first-class pi runs end to end through pi-acp's credential-free AgentSessi
     assert.equal(response.isError, false, stderr);
     assert.equal(result?.status, "completed", stderr);
     assert.equal(result?.result, "hermetic pong", stderr);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n${stderr}`);
   } finally {
     try {
       await client.close();
     } finally {
+      await transport.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test("first-class pi captures schema output through the injected HTTP MCP tool", {
+  timeout: 60_000,
+}, async () => {
+  const home = mkdtempSync(join(tmpdir(), "agentprism-pi-structured-e2e-home-"));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER_ENTRY],
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      HOME: home,
+      AGENTPRISM_DEFAULT_BACKEND: "pi",
+      AGENTPRISM_PI_ACP_CMD: process.execPath,
+      AGENTPRISM_PI_ACP_ARGS: PI_FIXTURE,
+    } as Record<string, string>,
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "pi-hermetic-structured-e2e", version: "0.0.0" }, { capabilities: {} });
+  let stderr = "";
+  transport.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8_000); });
+  try {
+    await client.connect(transport);
+    const response = await client.callTool({ name: "workflow", arguments: { script: STRUCTURED_SCRIPT } }, undefined, {
+      timeout: 45_000,
+      maxTotalTimeout: 45_000,
+    });
+    const result = response.structuredContent as Record<string, unknown> | undefined;
+    assert.equal(response.isError, false, stderr);
+    assert.equal(result?.status, "completed", stderr);
+    assert.deepEqual(result?.result, { answer: "pong" }, stderr);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n${stderr}`);
+  } finally {
+    try { await client.close(); } finally {
       await transport.close();
       rmSync(home, { recursive: true, force: true });
     }
