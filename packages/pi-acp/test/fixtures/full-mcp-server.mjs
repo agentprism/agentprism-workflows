@@ -18,6 +18,46 @@ import {
 
 export const LARGE_FIXTURE_ITEM_COUNT = 1_025;
 const LARGE_FIXTURE_PAGE_SIZE = 257;
+const wireProgressStates = new WeakMap();
+
+function wireProgressState(server) {
+  const state = wireProgressStates.get(server);
+  if (!state) throw new Error("conformance server has no wire-progress state");
+  return state;
+}
+
+/**
+ * The SDK defers notification handlers but handles a following response
+ * synchronously. Stdio may deliver progress and that response in one read
+ * batch, causing the SDK to remove its progress callback before dispatch;
+ * HTTP may deliver a fire-and-forget progress POST after the result POST.
+ * Observe the fixture's progress at transport ingress for the connection
+ * lifetime so its barriers test wire frames rather than callback scheduling.
+ */
+export function conformanceProgressOptions(server, onprogress) {
+  wireProgressState(server).pending.push(onprogress);
+  return { onprogress() {} };
+}
+
+export function connectConformanceServer(server, transport) {
+  const state = wireProgressState(server);
+  const send = transport.send.bind(transport);
+  transport.send = (message, options) => {
+    if (message && typeof message === "object" && "id" in message && "method" in message && state.pending.length > 0) {
+      state.active.set(message.id, state.pending.shift());
+    }
+    return send(message, options);
+  };
+  const onmessage = transport.onmessage;
+  transport.onmessage = (message, extra) => {
+    if (message && typeof message === "object" && "method" in message && message.method === "notifications/progress") {
+      const { progressToken, ...params } = message.params;
+      state.active.get(progressToken)?.(params);
+    }
+    onmessage?.(message, extra);
+  };
+  return server.connect(transport);
+}
 
 function largePage(field, prefix, cursor, createItem) {
   const page = cursor === undefined ? 0 : Number(cursor.slice(prefix.length));
@@ -51,6 +91,7 @@ export function createConformanceServer(options = {}) {
       instructions: "fixture instructions",
     },
   );
+  wireProgressStates.set(server, { pending: [], active: new Map() });
 
   server.setRequestHandler(ListToolsRequestSchema, ({ params }) => {
     if (options.largeCatalog) {
@@ -181,7 +222,7 @@ export function createConformanceServer(options = {}) {
       let markStarted;
       const started = new Promise((resolve) => { markStarted = resolve; });
       const options = {
-        onprogress: () => markStarted(),
+        ...conformanceProgressOptions(server, () => markStarted()),
         ...(cause === "peer" ? { signal: peer.signal } : {}),
       };
       let incoming;
@@ -288,14 +329,14 @@ export function createConformanceServer(options = {}) {
     progressReady = new Promise((resolve) => { markProgressReady = resolve; });
     const recordProgress = (feature) => (value) => {
       incomingProgress[feature].push(value);
-      if (["sampling", "form", "url"].every((name) => incomingProgress[name].length === 2)) markProgressReady();
+      if (Object.values(incomingProgress).every((values) => values.length === 2)) markProgressReady();
     };
     const sampling = await server.createMessage({
       messages: [{ role: "user", content: { type: "text", text: "sample me" } }],
       maxTokens: 32,
       systemPrompt: "fixture system",
-    }, { onprogress: recordProgress("sampling") });
-    const roots = await server.listRoots(undefined, { onprogress: recordProgress("roots") });
+    }, conformanceProgressOptions(server, recordProgress("sampling")));
+    const roots = await server.listRoots(undefined, conformanceProgressOptions(server, recordProgress("roots")));
     const form = await server.elicitInput({
       mode: "form",
       message: "form",
@@ -304,16 +345,15 @@ export function createConformanceServer(options = {}) {
         required: ["answer"],
         properties: { answer: { type: "string" } },
       },
-    }, { onprogress: recordProgress("form") });
+    }, conformanceProgressOptions(server, recordProgress("form")));
     const url = await server.elicitInput({
       mode: "url",
       message: "url",
       elicitationId: "fixture-url",
       url: "https://example.invalid/complete",
-    }, { onprogress: recordProgress("url") });
+    }, conformanceProgressOptions(server, recordProgress("url")));
     // Progress is optional telemetry and therefore is not a barrier for the exercised result. The
-    // separate progress_snapshot operation is the test-only observation barrier: this also lets
-    // stdio drain notifications queued behind the active tools/call handler.
+    // separate progress_snapshot operation is the test-only wire-observation barrier.
     if (url.action === "accept") {
       const complete = server.createElicitationCompletionNotifier("fixture-url");
       await complete();
@@ -376,5 +416,5 @@ export function createConformanceServer(options = {}) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const server = createConformanceServer({ exitOnTransportRace: true });
-  await server.connect(new StdioServerTransport());
+  await connectConformanceServer(server, new StdioServerTransport());
 }

@@ -10,11 +10,17 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema, ElicitationCompleteNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { bridgeMcpServers, connectDefaultMcpClient, createMcpRootsResult, type McpSessionBinding } from "../src/mcp-bridge.js";
 import { realSleep, resolveDeps } from "../src/deps.js";
-import { createConformanceServer, LARGE_FIXTURE_ITEM_COUNT } from "./fixtures/full-mcp-server.mjs";
+import {
+  conformanceProgressOptions,
+  connectConformanceServer,
+  createConformanceServer,
+  LARGE_FIXTURE_ITEM_COUNT,
+} from "./fixtures/full-mcp-server.mjs";
 
 interface Host {
   url: string;
@@ -196,7 +202,7 @@ async function fatalSseHost(): Promise<Host & {
         const transport = new SSEServerTransport("/messages", res);
         const protocol = createConformanceServer();
         sessions.set(transport.sessionId, { transport, server: protocol });
-        await protocol.connect(transport);
+        await connectConformanceServer(protocol, transport);
         return;
       }
       if (req.method === "POST" && url.pathname === "/messages") {
@@ -273,7 +279,7 @@ async function httpHost(options: { largeCatalog?: boolean } = {}): Promise<Host>
           onsessionclosed(id) { sessions.delete(id); },
         });
         entry = { transport, server: protocol };
-        await protocol.connect(transport);
+        await connectConformanceServer(protocol, transport);
       }
       if (!entry) {
         res.writeHead(404).end();
@@ -308,7 +314,7 @@ async function sseHost(): Promise<Host> {
         const transport = new SSEServerTransport("/messages", res);
         const protocol = createConformanceServer();
         sessions.set(transport.sessionId, { transport, server: protocol });
-        await protocol.connect(transport);
+        await connectConformanceServer(protocol, transport);
         return;
       }
       if (req.method === "POST" && url.pathname === "/messages") {
@@ -446,7 +452,6 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
   assert.equal(progressBlock?.type, "text");
   const incomingProgress = JSON.parse(progressBlock.text) as Record<"sampling" | "roots" | "form" | "url", Array<{ progress: number; total: number }>>;
   for (const [feature, values] of Object.entries(incomingProgress)) {
-    if (feature === "roots") continue;
     const expected = [
       { progress: 0, total: 1 },
       { progress: 1, total: 1 },
@@ -706,6 +711,47 @@ test("M7 roots sends the exact synchronous progress pair around its result", () 
     { method: "notifications/progress", params: { progressToken: "roots-progress", progress: 1, total: 1 } },
   ]);
   assert.deepEqual(result, { roots: [{ uri: pathToFileURL(process.cwd()).href, name: process.cwd().split("/").at(-1) }] });
+});
+
+test("M7 fixture observes progress before an SDK-deferred same-batch response", async () => {
+  const protocol = createConformanceServer();
+  const transport: Transport = {
+    async start() {},
+    async send(message) {
+      if (!("method" in message) || message.method !== "roots/list" || !("id" in message)) return;
+      const progressToken = (message.params as { _meta: { progressToken: number } })._meta.progressToken;
+      const progress = {
+        jsonrpc: "2.0",
+        method: "notifications/progress" as const,
+        params: { progressToken, progress: 1, total: 1 },
+      };
+      const response = { jsonrpc: "2.0" as const, id: message.id, result: { roots: [] } };
+      if (progressToken === 0) {
+        transport.onmessage?.(progress);
+        transport.onmessage?.(response);
+      } else {
+        transport.onmessage?.(response);
+        transport.onmessage?.(progress);
+      }
+    },
+    async close() { transport.onclose?.(); },
+  };
+  await connectConformanceServer(protocol, transport);
+  try {
+    const sdkProgress: unknown[] = [];
+    await protocol.listRoots(undefined, { onprogress: (value) => sdkProgress.push(value) });
+    await Promise.resolve();
+    assert.deepEqual(sdkProgress, [], "SDK response cleanup wins before its deferred notification handler");
+
+    const wireProgress: unknown[] = [];
+    assert.deepEqual(
+      await protocol.listRoots(undefined, conformanceProgressOptions(protocol, (value) => wireProgress.push(value))),
+      { roots: [] },
+    );
+    assert.deepEqual(wireProgress, [{ progress: 1, total: 1 }], "wire observer remains live after an earlier HTTP-style response");
+  } finally {
+    await protocol.close();
+  }
 });
 
 test("M1-M7 full MCP transcript is transport-independent across real stdio/http/sse", { timeout: 90_000 }, async () => {
