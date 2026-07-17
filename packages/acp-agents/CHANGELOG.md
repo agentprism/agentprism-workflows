@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.30.2
+
+### Patch Changes
+
+- 660983b: Daily ACP dependency maintenance: codex-acp fork pin 1.6.7 (upstream sync, CI-only change) and root override advancing the wrapped `@anthropic-ai/claude-agent-sdk` runtime to 0.3.212.
+
 ## 0.30.1
 
 ### Patch Changes
