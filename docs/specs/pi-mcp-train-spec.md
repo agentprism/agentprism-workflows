@@ -284,7 +284,7 @@ defined below; it never triggers a feature request.
 | **completion** | `complete` | Synthetic `complete` tool accepting the exact MCP `ref` union (prompt reference or resource-template reference), `argument`, and optional `context`; its result returns every `values` entry plus `total` and `hasMore` without adapter truncation. |
 | **logging** | `logging/setLevel`, `notifications/message` (`setLoggingLevel`) | If and only if the server advertises logging, set level `info`. During an active turn, each message becomes an ACP `agent_thought_chunk` prefixed `[mcp:<server>] <level>: `. Outside a turn it is written to stderr with that prefix because an unbound `session/update` is invalid. Data is JSON-stringified when it is not a string. |
 | **pagination** | `nextCursor` on list operations | Consume all pages for tools, resources, resource templates, and prompts in server order. Any repeated defined cursor is a protocol failure; there is no adapter page or item cap. |
-| **progress** | `RequestOptions.onprogress` | Every remote and synthetic tool passes its pi `onUpdate` callback to each underlying MCP request (including each list page). Each progress notification emits a pi tool update with `details = full progress params` and text formed as `[mcp:<server>] <progress>`, plus `/<total>` iff total exists, plus ` <message>` iff message exists. Amend the pi→ACP translator's `tool_execution_update` row to copy non-undefined partial `details` into `tool_call_update.rawOutput`, just as its end row already does (`translate.ts:95-110`); no progress field is lost. |
+| **progress** | `RequestOptions.onprogress`; incoming `RequestHandlerExtra._meta`/`sendNotification` | Every remote and synthetic tool passes its pi `onUpdate` callback to each underlying MCP request (including each list page). Each progress notification emits a pi tool update with `details = full progress params` and text formed as `[mcp:<server>] <progress>`, plus `/<total>` iff total exists, plus ` <message>` iff message exists. Amend the pi→ACP translator's `tool_execution_update` row to copy non-undefined partial `details` into `tool_call_update.rawOutput`, just as its end row already does (`translate.ts:95-110`); no progress field is lost. Incoming client-feature progress follows §3.4. |
 | **cancellation/timeouts** | `RequestOptions.signal`, `timeout`, cancellation notification | The session signal, plus the turn signal when one exists, and timeout are passed to every outgoing MCP request; incoming handlers additionally combine the SDK request signal. The SDK emits `notifications/cancelled` for an aborted outgoing request and honors incoming cancellation (`src/shared/protocol.ts:1126-1218`). Cancellation is never converted into an ordinary tool error after the ACP turn has settled. |
 | **URL elicitation completion** | `notifications/elicitation/complete` | The originating MCP server notifies pi-acp that its out-of-band URL interaction completed; pi-acp translates that server→client notification into ACP agent→client `unstable_completeElicitation` with the corresponding opaque ACP id (§3.4). |
 
@@ -296,9 +296,13 @@ notification is ignored. Logging uses its richer fixed prefix from the table; if
 serializes to `undefined`, use `String(data)`, otherwise use unindented `JSON.stringify(data)`.
 
 Synthetic aliases are `mcp__<sanitized-server>__<operation>` and use the same deterministic collision
-allocator as remote tools. Their TypeBox argument schemas mirror the exact fields and bounds of the MCP
-request schemas and do not invent narrower limits: the resource/template/prompt list tools take `{}` and
-return all pages; read/subscribe/unsubscribe take `{ uri: string }`; `get_prompt` takes
+allocator as remote tools. Their TypeBox argument schemas expose the exact model-supplied semantic fields
+and bounds without inventing narrower limits. The adapter, not the model, owns pagination cursors (every
+list tool consumes and returns all pages) and request `_meta` (the SDK supplies the progress token from
+`RequestOptions.onprogress`, `src/shared/protocol.ts:1135-1143`; related-task metadata is absent because
+tasks are unadvertised, `src/types.ts:60-94`), so neither
+protocol-control field appears in a synthetic tool schema. The resource/template/prompt list tools take
+`{}`; read/subscribe/unsubscribe take `{ uri: string }`; `get_prompt` takes
 `{ name: string, arguments?: Record<string,string> }`; `complete` takes
 `{ ref: {type:"ref/prompt",name:string}|{type:"ref/resource",uri:string},
 argument:{name:string,value:string}, context?:{arguments?:Record<string,string>} }`.
@@ -490,6 +494,17 @@ corresponding handlers. It deliberately does
 not advertise optional `sampling.context` or `sampling.tools` sub-capabilities because pi's
 provider-neutral completion seam cannot honor their semantics.
 
+All three incoming request handlers (sampling, roots, elicitation) implement the base progress seam.
+When `extra._meta?.progressToken` exists, the handler sends related
+`notifications/progress { progressToken, progress:0, total:1 }` immediately before its work and
+`{ progressToken, progress:1, total:1 }` immediately before a successful response, using the SDK's
+request-related `extra.sendNotification` (`src/shared/protocol.ts:237-280,734-746`; progress schema
+`src/types.ts:641-673`). It sends no terminal `1` after an error or cancellation. Pi's provider-neutral
+completion is non-streaming, so inventing token-level intermediate units would be false; deterministic
+request-lifecycle units are the exact progress contract. A progress-send rejection emits the fixed
+diagnostic `[mcp:<server>] progress notification failed` through §3.2's active-turn ACP/stderr route and
+does not replace the feature result or error. Without a token, no progress notification is sent.
+
 1. **Sampling** — `sampling/createMessage` (`CreateMessageRequestSchema`→`CreateMessageResultSchema`).
    The handler first normalizes each MCP message's single-or-array `content` to an array, then maps MCP
    user text/image and assistant text blocks in source order plus `systemPrompt` to pi `Context`: user
@@ -553,9 +568,12 @@ provider-neutral completion seam cannot honor their semantics.
    failure, MCP resolves `{ action: "decline" }`; turn abort resolves `{ action: "cancel" }`. Permission
    requests remain the separate tool-approval channel.
 
-Sampling is served without a new per-request approval: attaching the MCP server to the agent call is
-the workflow author's authorization, and headless runs cannot complete an interactive approval that MCP
-does not define. This is default-on, as the owner's FULL-scope decision requires.
+Sampling is served without a new per-request approval. The pinned MCP schema recommends that the client
+inform the user and allow inspection before sampling, but defines no sampling-specific approval wire
+exchange (`src/types.ts:1784-1789`). In this workflow product, explicitly attaching the MCP server to the
+agent call is the author's authorization; overloading ACP tool permission for every sampling request
+would conflate two protocols and deadlock headless runs. This is default-on, as the owner's FULL-scope
+decision requires.
 
 ### 3.5 Ownership, binding, and failure atomicity
 
@@ -762,7 +780,7 @@ upstream provider message strings** each classifier row depends on, each with a 
 `// pi <pin> — <file:line or provider>`:
 
 - The exact outputs of `formatNoModelSelectedMessage` and `formatNoApiKeyFoundMessage("anthropic")`
-  (`auth-guidance.ts:18-25`) after replacing only the installation-specific `getDocsPath()` prefix with
+  (`auth-guidance.ts:6-25`) after replacing only the installation-specific `getDocsPath()` prefix with
   the literal `<DOCS>`; the fixture retains every other byte and newline. It also captures both OAuth
   source sites (`agent-session.ts:414-416,1177-1179`) instantiated with provider `anthropic`, whose exact
   common value is `Authentication failed for "anthropic". Credentials may have expired or network is
@@ -843,7 +861,8 @@ SDK transports — not a transport-shaped DI fake:
 For every row the transcript initializes, pings, observes instructions, walks multi-page tools/resources/
 templates/prompts, calls a tool with progress, lists/reads/subscribes/unsubscribes resources, lists/gets
 prompts, completes both reference kinds, consumes logging and list/update notifications, invokes
-sampling/roots/form elicitation/URL elicitation, forwards elicitation completion, exercises
+sampling/roots/form elicitation/URL elicitation with incoming progress tokens and observes each exact
+`0/1` lifecycle pair, forwards elicitation completion, exercises
 `tools/list_changed`, aborts an in-flight call, and closes. It asserts identical semantic output and
 protocol behavior across all transports; the HTTP and SSE rows additionally assert identical header
 behavior, including ordered combined values for repeated names. stdio has no HTTP headers. Separate DI
@@ -928,6 +947,10 @@ does both operations immediately: signal `registry.terminateAll()` and invoke `v
 (`AgentSession.abort()` cancels retry, calls `Agent.abort()`, and waits for idle at
 `agent-session.ts:1530-1533`). Dispose continues to call `pi.dispose()` as defense in depth. The adapter
 then waits for registry drain before reporting `cancelled` or completing close.
+The existing CLI connection-close/SIGTERM/SIGINT path already awaits `agent.dispose()` inside its
+5-second process-shutdown envelope (`packages/pi-acp/src/index.ts:17-51`); this implementation keeps that
+path, and `PiAcpAgent.dispose()` does not settle until every per-session registry and MCP close has been
+attempted. The outer process envelope does not replace or lengthen the per-session cleanup deadline below.
 
 The existing cancellation grace is the cleanup deadline, not permission to report a false success. If
 the registry drains, cancellation settles exactly as before. If a PID remains or termination rejects at
@@ -982,6 +1005,7 @@ in exactly these ways:
 | elicitation unsupported by ACP client | — | — | MCP `{ action:"decline" }` result, not an error (§3.4). |
 | duplicate outstanding server URL-elicitation id | — | — | MCP `{ action:"decline" }` plus fixed diagnostic `[…] duplicate elicitation id`; existing mapping remains (§3.4). |
 | unknown/duplicate MCP URL-completion notification or ACP completion-send failure | — | — | fixed stderr diagnostics `[…] unknown elicitation completion` / `[…] ACP elicitation completion failed`; no replay or request error because both legs are notifications (§3.4). |
+| incoming sampling/roots/elicitation progress notification cannot be sent | — | — | retain the feature result/error and emit fixed diagnostic `[…] progress notification failed`; progress is optional telemetry and cannot replace the request outcome (§3.4). |
 | outgoing MCP operation cancelled | MCP SDK cancellation | — | SDK emits/consumes `notifications/cancelled`; no post-settlement ACP tool failure is emitted. |
 | MCP transport close fails/times out | — | — | all closes still run; fixed stderr diagnostic `[…] close failed`; ordinary `session/close` succeeds and failed-open retains its original error (§3.5). |
 | repeated pagination cursor / malformed stable-base response | `-32603` internalError | `mcp_init_error` at open; failed tool result during a turn | open uses fixed `data.message = "mcp server initialization failed"`; turn-time text is `MCP tool ${alias} failed`; diagnostics name only the safe server token and operation, never headers/env/content. |
@@ -1099,11 +1123,11 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 |---|---|---|
 | M1 | §3.1/§7.1 | one table-driven transcript passes over actual SDK stdio, Streamable HTTP, and legacy SSE transports; the HTTP/SSE rows prove repeated header values survive in their combined field order while stdio has no header assertion; `initialize` advertises `{ http:true, sse:true }`; `acp` remains `unsupported_mcp_transport` `-32602` |
 | M2 | §3.1 | `Client.connect` receives timeout/session signal for initialize and the outer bound independently catches a hung transport start; connect/list/call/synthetic requests are bounded by injected `mcpTimeoutMs` on stdio, HTTP, and SSE (hung connect → rollback + reject `mcp_init_error` + transport closed; hung turn request → fixed failed tool); a fake-client option audit covers every outbound SDK method and session/turn signal combination; a late resolve/reject of a timed-out op produces NO unhandled rejection (detached) |
-| M3 | §3.2/§3.3 | exact package client identity, strict-capability option enabled (an unadvertised direct request is rejected before send), initialize metadata/instructions, outgoing/incoming ping, canonical text/image/audio/resource-link/embedded-resource/unknown/structured/error projection and lossless details envelopes (exact result, exact current Tool, exact list pages, including explicit false and metadata), all resource list/template/read/subscribe/unsubscribe surfaces, prompts, both completion refs, conditional logging, every notification (including one sent immediately after initialized), and all-page enumeration work; a pre-initialize/unadvertised notification emits only the fixed unexpected diagnostic and no request; output-schema success/missing/invalid cases are enforced for tools on the first and final list pages; a second list/read observes changed server state without a notification; repeated cursor fails; a large multi-page fixture proves no adapter item/page/response cap |
+| M3 | §3.2/§3.3 | exact package client identity, strict-capability option enabled (an unadvertised direct request is rejected before send), initialize metadata/instructions (non-empty instructions appear on every turn in server order but never enter message history), outgoing/incoming ping, canonical text/image/audio/resource-link/embedded-resource/unknown/structured/error projection and lossless details envelopes (exact result, exact current Tool, exact list pages, including explicit false and metadata), all resource list/template/read/subscribe/unsubscribe surfaces, prompts, both completion refs, conditional logging, every notification (including one sent immediately after initialized), synthetic schemas expose every semantic request field but no adapter-owned cursor/`_meta`, and all-page enumeration works; a pre-initialize/unadvertised notification emits only the fixed unexpected diagnostic and no request; output-schema success/missing/invalid cases are enforced for tools on the first and final list pages; a second list/read observes changed server state without a notification; repeated cursor fails; a large multi-page fixture proves no adapter item/page/response cap |
 | M4 | §3.2 | MCP call progress reaches pi `onUpdate`, then ACP `tool_call_update` with full params in `rawOutput`; cancellation reaches the MCP peer and no late update/error is emitted after ACP settlement; logging and other notifications inside/outside a turn use the specified ACP/stderr routes |
 | M5 | §3.3 | synthetic aliases reserve first; initial tools register with top-level-title → annotation-title → name label precedence; list-changed ADD/CHANGE/UNCHANGED/REMOVE/RE-ADD atomically swaps exact Tool/page/validator state and has next-turn activation, inactive tombstone, stale-call fixed failure, stable alias, serialized/coalesced refresh, and fresh extension per load/resume/fork; a prompt racing a multi-tool commit starts only after the entire snapshot is active; initial duplicate/task-required/schema-compile failure rolls back, while the same failures during refresh retain the prior complete snapshot and emit the exact fixed diagnostic; optional/forbidden task metadata uses ordinary call |
 | M6 | §3.3/§8.1 | the named adapter extension is first while every other extension retains order and loader runtime/errors retain identity; its tracked `bash` overrides the built-in and its reserved aliases override colliding user-extension names; source-qualified post-construction verification catches a wrong winner as `mcp_init_error` |
-| M7 | §3.4 | sampling uses only active model; maps user text/image, assistant text with exact zero-usage metadata, tokens/temperature/metadata/signal/result/stops/model id; rejects assistant-image/audio/tool blocks and unsupported context/tools with `-32602`, rejects experimental sampling/elicitation tasks with their exact `-32602`, and rejects no model/provider/uncaught-abort/tool output with the exact `-32603` messages; hung sampling and ACP elicitation inside and outside a turn prove the combined request/session/optional-turn/timeout behavior; invokes no permission request and adds no token cap; roots returns cwd; form + URL elicitation map to ACP (including null-content normalization); an MCP server URL-completion notification maps to ACP agent→client completion with the process-unique opaque id, including equal remote ids on two servers; same-server outstanding duplicates decline with the exact diagnostic; unknown/duplicate completions and ACP send failure emit their exact stderr diagnostics; unsupported/abort map decline/cancel |
+| M7 | §3.4 | sampling uses only active model; maps user text/image, assistant text with exact zero-usage metadata, tokens/temperature/metadata/signal/result/model id and the earliest-stop-sequence/tie/stop-reason rules; rejects assistant-image/audio/tool blocks and unsupported context/tools with `-32602`, rejects experimental sampling/elicitation tasks with their exact `-32602`, and rejects no model/provider/uncaught-abort/tool output with the exact `-32603` messages; hung sampling and ACP elicitation inside and outside a turn prove the combined request/session/optional-turn/timeout behavior; sampling/roots/elicitation with a progress token emit exact related `0/1` lifecycle progress, without a token emit none, on error omit `1`, and a send failure emits the fixed diagnostic without replacing the outcome; invokes no ACP permission request and adds no token cap; roots returns cwd; form + URL elicitation map to ACP (including null-content normalization); an MCP server URL-completion notification maps to ACP agent→client completion with the process-unique opaque id, including equal remote ids on two servers; same-server outstanding duplicates decline with the exact diagnostic; unknown/duplicate completions and ACP send failure emit their exact stderr diagnostics; unsupported/abort map decline/cancel |
 | M8 | §3.5 | equal raw names fail; colliding slugs receive stable ordered suffixes used on every outward label; roots/elicitation work during open while sampling gets fixed pre-bind `-32603`; capability-conditioned logging setup failure and other partial-open failures roll back clients in reverse order; close is exactly once/failure-collecting, and an injected MCP close failure/timeout emits the exact diagnostic without failing ordinary close; post-dispose notification is ignored; no state crosses sessions |
 
 ### 11.2 Structured output via injection (§4)
@@ -1128,7 +1152,7 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 
 | # | covers | assertion |
 |---|---|---|
-| E1 | §6.1 | every fixture string in `provider-error-strings.ts` classifies to its intended `errorKind` (auth/billing/rate/generic) and thence the intended `PiBackend` classification (pausable vs recoverable) |
+| E1 | §6.1 | every fixture string in `provider-error-strings.ts` classifies to its intended `errorKind` (auth/billing/rate/generic) and thence the intended `PiBackend` classification (pausable vs recoverable); both OAuth provenance sites are represented, and reconstructing the normalized no-model/no-key guidance from the pinned upstream formatters must byte-equal the complete fixtures |
 | E2 | §6.2 | the guard test asserts `FIXTURE_PI_PIN` equals the installed `@earendil-works/pi-coding-agent` version — a mismatch (runtime bumped without re-capture) FAILS; the classifier precedence stays ordered (auth>billing>rate>generic) |
 
 ### 11.5 Correctness batch (§8)
@@ -1138,6 +1162,7 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 | A1 | §8.1/§8.3 | real tracked bash starts the platform-specific long-lived child; cancel and close each wait for `ESRCH` before settlement; timeout and abort retain pi result/progress behavior and configured shell path/prefix are honored through the one SettingsManager shared by loader and session |
 | A2 | §8.1/§8.3 | two concurrent sessions: cancelling A kills only A; B remains alive until B closes; no global kill or cross-session registry state |
 | A3 | §8.2/§9 | injected kill failure/non-closing child attempts all cleanup, returns `child_cleanup_error` `-32603` with the fixed label and integer `remainingChildren` only, tombstones the session, and never reports `cancelled` |
+| A4 | §3.5/§8.2 | failure after registry/client creation but before session publication drains owned children and closes every MCP client in reverse order; replacing a session closes the prior session's children/clients; a production pi-acp subprocess with a tracked long-lived child exits on process shutdown only after the child process group is gone and its MCP stdio fixture observes close |
 
 ### 11.6 Live e2e (gated on provider keys)
 
@@ -1151,6 +1176,7 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 |---|---|---|
 | R1 | §0/§1/§13 | Source quotes byte-match focus §0; base file equals `78944e3462458de30c4989ff04894fecbf43632d`; implementation records fresh GitHub/npm latest values, tag commits, and release→main cited-surface diffs before code |
 | R2 | §10/§13 | docs/protocol/backend/authoring drift suites pass; every referenced local and fresh-clone path exists and every cited line range contains the named symbol or literal |
+| R3 | §10.5 | static documentation assertions show `docs/api.md`, `docs/design-notes.md`, and `packages/pi-acp/README.md` describe stdio/HTTP/SSE, standard structured-tool injection, the configured model catalog, and client-hosted `acp`, while containing no Pi native `_meta.outputSchema`/`__acp_structured_output` claim |
 
 ### 11.8 Compatibility and release (§15)
 
@@ -1218,9 +1244,10 @@ record and implementation-time stop gate.
 `78944e3462458de30c4989ff04894fecbf43632d` (branch `spec/pi-mcp-train`, based on `origin/main`; matches
 `.agentprism/design-224/base-sha.txt`).
 
-**Base-freshness note (verified at authoring):** `origin/main` equals that SHA. The worktree's earlier
-draft commit is not a citation base; every local reference below was re-read from the pinned base with
-`git show 78944e3:<path>` or verified unchanged in the working tree. Package versions at the base are
+**Base-freshness note (verified in a fresh round check at `2026-07-17T03:26:13Z`):** `origin/main`
+equals that SHA. The worktree's earlier draft commit is not a citation base; every local reference below
+was re-read from the pinned base with `git show 78944e3:<path>` or verified unchanged in the working tree.
+Package versions at the base are
 `@automatalabs/pi-acp@0.1.3`, `@automatalabs/acp-agents@0.30.1`, and
 `@automatalabs/workflows@0.38.1`.
 
@@ -1263,6 +1290,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   namespace :83) :70-87, current manifest-backed `PKG_VERSION` :30-32,
   `createAgentSession({ customTools:[…bridge.tools, structured.tool] })` :146-151,
   post-construction alias/structured-tool presence check :166-173, `dispose()` :427-436.
+- `packages/pi-acp/src/index.ts` — 5-second process-shutdown envelope and connection-close/SIGTERM/
+  SIGINT delegation to `agent.dispose()` :17-51.
 - `packages/pi-acp/src/session.ts` — `configOptions()` (thinkingLevel-only) :117-119, `_meta.outputSchema`
   consume + `structured.arm` + prompt splice :313-326, fabricated final `agent_message_chunk` :275-279,
   turn-abort listener calls `this.pi.agent.abort()` :366-374, `cancel()` :396-398, `dispose()` :400-409,
@@ -1270,7 +1299,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
 - `packages/pi-acp/src/config.ts` — `thinkingLevelOption` :8-17, `applyConfig` (accepts `"model"`, echoes
   `[thinkingLevelOption]`) :19-52.
 - `packages/pi-acp/src/errors.ts` — `ErrorKind` union (incl. `structured_tool_collision`,
-  `invalid_output_schema`) :3-27, labels :29-54, `INVALID_KINDS` :56-72, `classifyPreflight` (prose
+  `invalid_output_schema`) :3-27, labels :29-54, `INVALID_KINDS` :56-72, `adapterError`'s
+  auth/invalid/internal constructor selection :93-103, `classifyPreflight` (prose
   regex) :105-116, `classifyTerminal` (auth/billing/rate regex, ordered) :118-140.
 - `packages/pi-acp/src/structured-output.ts` — `STRUCTURED_TOOL_NAME` + `StructuredOutputState`
   (arm/capture/disarm) :5-74 (deleted by §4.3).
@@ -1357,7 +1387,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   `_refreshToolRegistry` :2571-2574, `async abort()` (`abortRetry`+`agent.abort`+`waitForIdle`) :1530-1533,
   `abortBash()` :2771-2772, `_bashAbortController` :318, `dispose()` (`abortRetry/Compaction/BranchSummary/
   Bash`+`agent.abort`) :825-830, tool execution update forwarding :754-770, `setModel` :1566-1580,
-  `setThinkingLevel` :1630-1640.
+  `setThinkingLevel` :1630-1640, and the two exact OAuth re-authentication message sites :411-419,
+  1170-1182.
 - `packages/coding-agent/src/core/extensions/loader.ts` — `refreshTools` no-op pre-bind (comment "valid
   during extension load; refresh needed post-bind") :189-190, `createExtensionAPI.registerTool`
   (`extension.tools.set` + `runtime.refreshTools()`) :237-244, `loadExtensionFromFactory` :472-483.
@@ -1367,7 +1398,7 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   :1474-1483, `ExtensionAPI.registerTool` (no `unregisterTool`) :1219-1221, tool-registration API surface
   :1210-1245, `RegisteredTool` :1488-1491, `ToolDefinition.execute` signal + `onUpdate` :438-473,
   `before_agent_start` system prompt input/result :685-695,1081-1084.
-- `packages/coding-agent/src/core/resource-loader.ts` — `ResourceLoader` interface :38-46,
+- `packages/coding-agent/src/core/resource-loader.ts` — `ResourceLoader` interface, including `reload` :38-48,
   `DefaultResourceLoaderOptions.settingsManager`/`extensionFactories` + public `extensionsOverride`
   :122-140, `DefaultResourceLoader` retains the supplied settings instance :214-223, construction
   :214-236, override application :404-414, inline-factory load and
@@ -1380,8 +1411,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   :130-165.
 - `packages/coding-agent/src/core/settings-manager.ts` — public `SettingsManager.create` :308-315,
   `getShellPath` :878-880, `getShellCommandPrefix` :910-912.
-- `packages/coding-agent/src/core/auth-guidance.ts` — `formatNoModelSelectedMessage` :18-20,
-  `formatNoApiKeyFoundMessage` :22-25 (ground the §6 pre-flight fixtures).
+- `packages/coding-agent/src/core/auth-guidance.ts` — shared docs-path login guidance plus
+  `formatNoModelSelectedMessage` and `formatNoApiKeyFoundMessage` :6-25 (ground the §6 pre-flight fixtures).
 - `packages/coding-agent/src/core/tools/bash.ts` — timeout validation :24-37,
   `createLocalBashOperations` streaming/signal/timeout/cleanup algorithm :82-147, spawn context gets pi's
   environment :150-160, `createBashToolDefinition` with pluggable operations and settings :291-312,
@@ -1423,21 +1454,24 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
 - `package.json` — public AJV validator export :42-46; `src/validation/ajv-provider.ts` —
   `AjvJsonSchemaValidator` implementation and `getValidator` :36-97.
 - `src/client/streamableHttp.ts` — options/constructor :120-155 and request application :466-475;
-  `src/client/sse.ts` — legacy transport/options :45-70, headers/GET :116-147, POST :243-259;
-  `src/client/stdio.ts` — transport :92-221, including child close :204-220.
+  `src/client/sse.ts` — legacy transport/options :45-89, headers/GET :116-147, POST :243-259;
+  `src/client/stdio.ts` — transport :87-259, including child close :204-243.
 - `src/shared/transport.ts` — header normalization/request-init merge :5-45;
-  `src/shared/protocol.ts` — opt-in strict-capability option :60-71, 60-second default +
+  `src/shared/protocol.ts` — incoming handler signal/metadata/related notification seam :237-280,734-746;
+  opt-in strict-capability option :60-71, 60-second default +
   `RequestOptions` :106-135, automatic ping response :366-379, strict request guard :1112-1119,
   cancellation/timeout propagation :1126-1218.
-- `src/types.ts` — BaseMetadata Tool display-title precedence :341-355; client/server capabilities
+- `src/types.ts` — base request `_meta`/experimental task fields :60-94; MCP `ErrorCode` numeric pins
+  :191-206; BaseMetadata Tool display-title precedence :341-355; client/server capabilities
   :475-590; progress/pagination :641-694; resource contents
   (text/blob) :814-861; resource list/update/subscription notifications :1022-1064; canonical
   content-block union (text/image/audio/resource link/embedded resource) :1144-1278; prompt messages and
   get result :1283-1297; prompt/tool/logging notifications :1302,1511,1614-1642; Tool metadata/list
-  result :1307-1439; tool result content/structured/error fields :1444-1474; sampling :1644-1830;
+  result :1307-1439; tool result content/structured/error fields :1444-1474; sampling, including the
+  human-review recommendation and request/result schemas :1644-1830;
   elicitation request/completion
   :1978-2084; completion request/result :2086-2181.
-- `src/server/stdio.ts:12-119`, `src/server/streamableHttp.ts:70-384`, and `src/server/sse.ts:48-210` —
+- `src/server/stdio.ts:12-92`, `src/server/streamableHttp.ts:70-207`, and `src/server/sse.ts:48-229` —
   real server transports used by the hermetic conformance matrix.
 
 ### `@agentclientprotocol/sdk@1.2.1` source (tag/commit above)
@@ -1451,6 +1485,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
 - `src/acp.ts` — typed elicitation request spec :1349-1355, client dispatch for create/complete
   :2567-2575, connection methods :2770-2794, and optional client handlers :3831-3846. ACP marks these
   methods experimental at 1.2.1; this contract pins them and §1 makes any change stop-and-report.
+- `src/jsonrpc.ts` — `RequestError.invalidParams` `-32602`, `internalError` `-32603`, and
+  `authRequired` `-32000` constructors :1290-1341.
 
 ---
 
@@ -1527,9 +1563,11 @@ unverifiable correctness claim.
     notifications are optional and can race. Synthetic tools fetch live on every call; notifications
     remain observable diagnostics. This gives correct state without a stale-cache policy.
 
-14. **Require interactive approval for every sampling request.** Rejected: the workflow author already
-    attached the server, MCP defines no such approval, and headless workflows would deadlock. Sampling is
-    default-on but cannot change the active model (§3.4).
+14. **Require an ACP permission round-trip for every sampling request.** Rejected: MCP recommends
+    client-side human review but defines no sampling-specific approval wire exchange
+    (`src/types.ts:1784-1789`). The workflow author already authorized sampling by attaching the server;
+    overloading ACP's tool-permission method would conflate protocols and deadlock headless workflows.
+    Sampling is default-on but cannot change the active model (§3.4).
 
 15. **Prove transport parity only with injected fake clients.** Rejected: DI tests prove adapter logic,
     not framing, headers, subprocess cleanup, or legacy SSE behavior. The same conformance transcript
@@ -1609,6 +1647,11 @@ unverifiable correctness claim.
     a regenerated authoring prompt published separately could describe unsupported behavior. The
     coordinated Changesets release in §15 keeps implementation, runtime resolution, and guidance in one
     compatible train.
+
+31. **Fabricate token-level progress for incoming sampling.** Rejected: pi's provider-neutral
+    `completeSimple` seam returns one final `AssistantMessage`, not a token stream. The related `0/1`
+    request-lifecycle notifications in §3.4 are truthful and transport-independent; invented
+    intermediates would misrepresent provider work.
 
 ---
 
