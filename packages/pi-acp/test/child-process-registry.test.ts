@@ -5,11 +5,13 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { PiAcpAgent } from "../src/agent.js";
 import {
   ChildProcessRegistrySlot,
   createTrackedBashOperations,
+  isTaskkillAlreadyGone,
 } from "../src/child-process-registry.js";
 import { realSleep } from "../src/deps.js";
 import { context, fakeDeps } from "./helpers/fakes.js";
@@ -56,22 +58,23 @@ function fakeChild(pid: number): ChildProcess & EventEmitter {
   return child;
 }
 
+const processTreeFixture = fileURLToPath(new URL("./fixtures/process-tree.mjs", import.meta.url));
+const quote = (value: string): string => `"${value.replaceAll('"', '\\"')}"`;
+const treeCommand = (leaderPath: string, descendantPath: string): string =>
+  `${quote(process.execPath)} ${quote(processTreeFixture)} ${quote(leaderPath)} ${quote(descendantPath)}`;
+
 test("A1 tracked bash abort waits for the leader and descendant process tree", async () => {
-  if (process.platform === "win32") {
-    assert.equal(process.platform, "win32");
-    return;
-  }
   const cwd = await mkdtemp(join(tmpdir(), "pi-acp-bash-tree-"));
   const leaderPath = join(cwd, "leader.pid");
   const descendantPath = join(cwd, "descendant.pid");
   const slot = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
   let cleanupFailed = false;
-  const operations = createTrackedBashOperations(slot, "/bin/bash", { graceMs: 5_000, sleep: realSleep }, () => {
+  const operations = createTrackedBashOperations(slot, undefined, { graceMs: 5_000, sleep: realSleep }, () => {
     cleanupFailed = true;
   });
   const controller = new AbortController();
   const running = operations.exec(
-    `echo $$ > ${leaderPath}; sleep 180 & echo $! > ${descendantPath}; wait`,
+    treeCommand(leaderPath, descendantPath),
     cwd,
     { onData() {}, signal: controller.signal, timeout: 60, env: { ...process.env } },
   );
@@ -86,32 +89,27 @@ test("A1 tracked bash abort waits for the leader and descendant process tree", a
 });
 
 test("A1 tracked bash timeout retains the ordinary Pi timeout only after disappearance proof", async () => {
-  if (process.platform === "win32") {
-    assert.equal(process.platform, "win32");
-    return;
-  }
   const cwd = await mkdtemp(join(tmpdir(), "pi-acp-bash-timeout-"));
   const pidPath = join(cwd, "leader.pid");
+  const descendantPath = join(cwd, "descendant.pid");
   const slot = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
-  const operations = createTrackedBashOperations(slot, "/bin/bash", { graceMs: 5_000, sleep: realSleep }, () => {
+  const operations = createTrackedBashOperations(slot, undefined, { graceMs: 5_000, sleep: realSleep }, () => {
     assert.fail("successful timeout cleanup must not latch a session failure");
   });
   const running = operations.exec(
-    `echo $$ > ${pidPath}; sleep 180`,
+    treeCommand(pidPath, descendantPath),
     cwd,
     { onData() {}, signal: new AbortController().signal, timeout: 0.05, env: { ...process.env } },
   );
   const pid = await readPid(pidPath);
+  const descendant = await readPid(descendantPath);
   await assert.rejects(running, /timeout:0\.05/);
   assert.equal(slot.remainingChildren, 0);
   await assertGone(pid);
+  await assertGone(descendant);
 });
 
 test("A2 concurrent session registries never kill across ownership boundaries", async () => {
-  if (process.platform === "win32") {
-    assert.equal(process.platform, "win32");
-    return;
-  }
   const cwd = await mkdtemp(join(tmpdir(), "pi-acp-bash-isolation-"));
   const paths = {
     aLeader: join(cwd, "a-leader.pid"),
@@ -121,17 +119,17 @@ test("A2 concurrent session registries never kill across ownership boundaries", 
   };
   const slotA = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
   const slotB = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
-  const operationsA = createTrackedBashOperations(slotA, "/bin/bash", { graceMs: 5_000, sleep: realSleep }, () => assert.fail("A cleanup failed"));
-  const operationsB = createTrackedBashOperations(slotB, "/bin/bash", { graceMs: 5_000, sleep: realSleep }, () => assert.fail("B cleanup failed"));
+  const operationsA = createTrackedBashOperations(slotA, undefined, { graceMs: 5_000, sleep: realSleep }, () => assert.fail("A cleanup failed"));
+  const operationsB = createTrackedBashOperations(slotB, undefined, { graceMs: 5_000, sleep: realSleep }, () => assert.fail("B cleanup failed"));
   const abortA = new AbortController();
   const abortB = new AbortController();
   const runningA = operationsA.exec(
-    `echo $$ > ${paths.aLeader}; sleep 180 & echo $! > ${paths.aDescendant}; wait`,
+    treeCommand(paths.aLeader, paths.aDescendant),
     cwd,
     { onData() {}, signal: abortA.signal, timeout: 60, env: { ...process.env } },
   );
   const runningB = operationsB.exec(
-    `echo $$ > ${paths.bLeader}; sleep 180 & echo $! > ${paths.bDescendant}; wait`,
+    treeCommand(paths.bLeader, paths.bDescendant),
     cwd,
     { onData() {}, signal: abortB.signal, timeout: 60, env: { ...process.env } },
   );
@@ -153,6 +151,70 @@ test("A2 concurrent session registries never kill across ownership boundaries", 
   assert.equal(slotB.remainingChildren, 0);
 });
 
+test("A1 real leader and descendant drain through cancel, close, failed-open rollback, and shutdown", { timeout: 30_000 }, async () => {
+  for (const lifecycle of ["cancel", "close", "failed-open", "shutdown"] as const) {
+    const setup = fakeDeps();
+    setup.deps.graceMs = 5_000;
+    const leaderPath = join(setup.cwd, `${lifecycle}-leader.pid`);
+    const descendantPath = join(setup.cwd, `${lifecycle}-descendant.pid`);
+    const realCreate = setup.deps.createAgentSession;
+    let running: Promise<unknown> | undefined;
+    let toolController: AbortController | undefined;
+    setup.deps.createAgentSession = async (options) => {
+      const result = await realCreate(options);
+      const control = setup.controls.at(-1)!;
+      const bash = control.tools.find(({ name }) => name === "bash");
+      assert.ok(bash, "tracked control bash must be installed");
+      const startTree = () => {
+        toolController = new AbortController();
+        running = bash.execute("tree-call", {
+          command: treeCommand(leaderPath, descendantPath),
+          timeout: 60,
+        }, toolController.signal);
+        running.catch(() => undefined);
+        return running;
+      };
+      control.session.abort = async () => {
+        toolController?.abort(new Error(`${lifecycle} cleanup`));
+        await running?.catch(() => undefined);
+      };
+      control.session.prompt = async () => { await startTree(); };
+      if (lifecycle === "failed-open") {
+        void startTree();
+        control.session.bindExtensions = async () => {
+          await Promise.all([readPid(leaderPath), readPid(descendantPath)]);
+          throw new Error("failed after tracked child admission");
+        };
+      }
+      return result;
+    };
+    const agent = new PiAcpAgent(setup.deps);
+    if (lifecycle === "failed-open") {
+      await assert.rejects(agent.newSession(context({ cwd: setup.cwd, mcpServers: [] })));
+    } else {
+      const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
+      const prompt = agent.prompt(context({
+        sessionId: opened.sessionId,
+        prompt: [{ type: "text", text: "launch tree" }],
+      }));
+      await Promise.all([readPid(leaderPath), readPid(descendantPath)]);
+      if (lifecycle === "cancel") {
+        agent.cancel(context({ sessionId: opened.sessionId }) as never);
+        await Promise.allSettled([prompt]);
+        await agent.closeSession(context({ sessionId: opened.sessionId }));
+      } else if (lifecycle === "close") {
+        await Promise.allSettled([prompt, agent.closeSession(context({ sessionId: opened.sessionId }))]);
+      } else {
+        await Promise.allSettled([prompt, agent.dispose()]);
+      }
+    }
+    const leader = await readPid(leaderPath);
+    const descendant = await readPid(descendantPath);
+    await Promise.all([assertGone(leader), assertGone(descendant)]);
+    await agent.dispose();
+  }
+});
+
 test("A1 spawn admission covers closing-before-spawn and registration-after-close races", async () => {
   const slot = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
   const held = slot.beginSpawn();
@@ -164,10 +226,9 @@ test("A1 spawn admission covers closing-before-spawn and registration-after-clos
   const fresh = slot.beginSpawn();
   fresh.failed();
 
-  if (process.platform === "win32") return;
   const raced = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
   const lease = raced.beginSpawn();
-  const child = spawn("/bin/bash", ["-c", "sleep 180"], {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 180_000)"], {
     detached: true,
     stdio: "ignore",
   });
@@ -224,6 +285,13 @@ test("A1 Windows ownership requires successful taskkill /T /F and leader close",
   heldChild.emit("close", 0);
   await heldDrain;
   assert.equal(held.remainingChildren, 0);
+});
+
+test("A1 Windows already-exited taskkill output is success without accepting other failures", () => {
+  assert.equal(isTaskkillAlreadyGone('ERROR: The process "41001" not found.\r\n'), true);
+  assert.equal(isTaskkillAlreadyGone("ERROR: The process with PID 41001 could not be terminated.\r\nReason: There is no running instance of the task.\r\n"), true);
+  assert.equal(isTaskkillAlreadyGone("ERROR: Access is denied.\r\n"), false);
+  assert.equal(isTaskkillAlreadyGone("ERROR: Invalid argument/option.\r\n"), false);
 });
 
 test("A1 Unix ownership retains a naturally closed leader until process-group ESRCH proof", async () => {

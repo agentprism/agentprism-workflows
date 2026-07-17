@@ -104,6 +104,8 @@ export interface McpClientHandle {
   setDisabledHandler?(handler: () => void): void;
   disableOnTimeout?(): void;
   getPeerSignal?(): AbortSignal;
+  /** The handle's own close implementation enforces the shared physical deadline. */
+  closeIsBounded?: boolean;
 }
 
 export class McpTimeoutError extends Error {
@@ -307,7 +309,7 @@ export class CloseSignallingTransport implements Transport {
   constructor(
     private readonly raw: Transport,
     private readonly terminate: (() => Promise<void>) | undefined,
-    private readonly onRawError: (error: Error) => void,
+    private readonly onRawError: (error: Error) => boolean,
     private readonly onRawClose: () => void,
     private readonly timeoutMs: number,
     private readonly sleep: PiAcpDeps["sleep"],
@@ -318,8 +320,7 @@ export class CloseSignallingTransport implements Transport {
       this.onRawClose();
     };
     raw.onerror = (error) => {
-      this.onRawError(error);
-      this.onerror?.(error);
+      if (this.onRawError(error)) this.onerror?.(error);
     };
     raw.onmessage = (message, extra) => this.onmessage?.(message, extra);
   }
@@ -384,11 +385,11 @@ function safeToken(value: string): string {
 
 function createTransport(
   server: McpServer,
+  serverToken: string,
   sleep: PiAcpDeps["sleep"],
   fatal: (error?: Error) => void,
   timeoutMs: number,
 ): CloseSignallingTransport {
-  const token = safeToken(server.name);
   let raw: Transport;
   let terminate: (() => Promise<void>) | undefined;
   if (!("type" in server)) {
@@ -400,7 +401,11 @@ function createTransport(
   } else if (server.type === "http") {
     let open = true;
     const observedFetch = async (url: string | URL, init?: RequestInit): Promise<Response> => {
-      if (!open) throw new Error("MCP transport closed");
+      // Fatal disable closes the ordinary fetch lane before the owner invokes
+      // close(). The retained raw transport must still be able to send its
+      // one explicit session DELETE; permitting DELETE here cannot reconnect
+      // either GET or POST traffic.
+      if (!open && init?.method !== "DELETE") throw new Error("MCP transport closed");
       const response = await fetch(url, init);
       if (init?.method === "GET" && response.ok && response.headers.get("content-type")?.includes("text/event-stream") && !response.body) {
         throw new Error("MCP event stream has no body");
@@ -419,7 +424,8 @@ function createTransport(
       wrapper.signalClose();
       fatal(error);
       void wrapper.close();
-    }, () => fatal(), timeoutMs, sleep, token);
+      return false;
+    }, () => fatal(), timeoutMs, sleep, serverToken);
     return wrapper;
   } else if (server.type === "sse") {
     let open = true;
@@ -437,7 +443,8 @@ function createTransport(
       wrapper.signalClose();
       fatal(error);
       void wrapper.close();
-    }, () => fatal(), timeoutMs, sleep, token);
+      return false;
+    }, () => fatal(), timeoutMs, sleep, serverToken);
     return wrapper;
   } else {
     throw adapterError("unsupported_mcp_transport", { server: server.name });
@@ -445,7 +452,8 @@ function createTransport(
   return new CloseSignallingTransport(raw, terminate, (error) => {
     // stdio parser/pipe errors are diagnostic-only; natural close is observed by onclose.
     void error;
-  }, () => fatal(), timeoutMs, sleep, token);
+    return true;
+  }, () => fatal(), timeoutMs, sleep, serverToken);
 }
 
 let elicitationCounter = 0n;
@@ -728,7 +736,7 @@ export async function connectDefaultMcpClient(
     binding?.emitDiagnostic(`[mcp:${token}] connection closed; server disabled`);
     disabledHandler();
   };
-  const transport = createTransport(server, sleep, fatal, timeoutMs);
+  const transport = createTransport(server, token, sleep, fatal, timeoutMs);
   installClientHandlers(client, binding, token, validator, timeoutMs, sleep);
   const capabilityDiagnostic = (method: string) => binding?.emitDiagnostic(`[mcp:${token}] ${method}`);
   client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
@@ -822,13 +830,23 @@ export async function connectDefaultMcpClient(
       disabledHandler = handler;
       if (state === "disabled") handler();
     },
-    ...("type" in server && server.type === "http" ? { disableOnTimeout: () => fatal() } : {}),
+    ...("type" in server && server.type === "http" ? {
+      disableOnTimeout: () => {
+        fatal();
+        void transport.close();
+      },
+    } : {}),
     getPeerSignal: () => fatalController.signal,
+    closeIsBounded: true,
     async close() {
       if (state === "closed" || state === "closing") return;
       state = "closing";
       clearElicitations(binding, token);
-      await client.close();
+      // Protocol._onclose() deliberately drops its transport reference as
+      // soon as our logical close signal fires. Retain and close the wrapper
+      // owner directly so EOF/fatal paths still join HTTP DELETE + physical
+      // close instead of turning Client.close() into a no-op.
+      await transport.close();
       state = "closed";
     },
   };
@@ -897,6 +915,12 @@ export interface McpBridge {
   bindSession(session: AgentSession): void;
   assertReady(): void;
   acquireTurnBoundary(): Promise<() => void>;
+  /** Synchronously start every owned client close without aborting refresh work. */
+  startDisposal(): void;
+  /** Abort refresh admission/work after transport and session-lifetime close starts. */
+  abortRefreshes(): void;
+  /** Reopen refresh admission only after a successful cancel-only generation. */
+  resumeRefreshes(): void;
   drainRefreshes(): Promise<void>;
   close(): Promise<void>;
 }
@@ -989,7 +1013,8 @@ export async function bridgeMcpServers(
   let refreshScheduled = false;
   let closing = false;
   let poisoned = false;
-  const refreshController = new AbortController();
+  let refreshController = new AbortController();
+  let refreshPaused = false;
   let boundaryTail = Promise.resolve();
 
   const assertReady = (): void => {
@@ -1021,7 +1046,7 @@ export async function bridgeMcpServers(
   });
 
   const makeSynthetic = (state: ServerState, operation: string): ToolDefinition => {
-    const alias = allocateAlias(state.server.name, operation, usedAliases);
+    const alias = allocateAlias(state.token, operation, usedAliases);
     state.syntheticAliases.push(alias);
     state.validAliases.add(alias);
     aliases.push(alias);
@@ -1212,7 +1237,7 @@ export async function bridgeMcpServers(
   };
 
   const refreshOne = async (state: ServerState): Promise<void> => {
-    if (closing || state.peerDead || state.disabled || !extensionApi || !piSession) return;
+    if (closing || refreshPaused || state.peerDead || state.disabled || !extensionApi || !piSession) return;
     let candidate: { tools: Tool[]; pages: unknown[] };
     let candidateUsed: Set<string>;
     let nextAliases: Map<string, string>;
@@ -1230,7 +1255,7 @@ export async function bridgeMcpServers(
       for (const remote of candidate.tools) {
         let alias = nextAliases.get(remote.name);
         if (!alias) {
-          alias = allocateAlias(state.server.name, remote.name, candidateUsed);
+          alias = allocateAlias(state.token, remote.name, candidateUsed);
           nextAliases.set(remote.name, alias);
           addedReservations.push({ alias, server: state.server.name });
         }
@@ -1243,12 +1268,12 @@ export async function bridgeMcpServers(
         .filter((value): value is string => value !== undefined);
     } catch (error) {
       if (isMcpTimeout(error)) state.handle.disableOnTimeout?.();
-      if (!closing && !state.peerDead && !state.disabled) binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
+      if (!closing && !refreshPaused && !state.peerDead && !state.disabled) binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
       return;
     }
 
     const release = await acquireTurnBoundary();
-    if (closing || state.peerDead || state.disabled || !extensionApi || !piSession) {
+    if (closing || refreshPaused || state.peerDead || state.disabled || !extensionApi || !piSession) {
       release();
       return;
     }
@@ -1284,7 +1309,7 @@ export async function bridgeMcpServers(
   };
 
   const runRefreshBatches = async (): Promise<void> => {
-    while (!closing) {
+    while (!closing && !refreshPaused) {
       const batch = states.filter((state) => state.dirty && !state.initializing && !state.peerDead && !state.disabled);
       if (batch.length === 0) return;
       for (const state of batch) state.dirty = false;
@@ -1293,13 +1318,13 @@ export async function bridgeMcpServers(
   };
 
   const scheduleRefreshes = () => {
-    if (refreshScheduled || closing || !extensionApi || !piSession) return;
+    if (refreshScheduled || closing || refreshPaused || !extensionApi || !piSession) return;
     refreshScheduled = true;
     refreshQueue = refreshQueue
       .then(runRefreshBatches)
       .finally(() => {
         refreshScheduled = false;
-        if (states.some((state) => state.dirty && !state.initializing && !state.peerDead && !state.disabled)) scheduleRefreshes();
+        if (!refreshPaused && states.some((state) => state.dirty && !state.initializing && !state.peerDead && !state.disabled)) scheduleRefreshes();
       });
     refreshQueue.catch(() => undefined);
   };
@@ -1307,7 +1332,7 @@ export async function bridgeMcpServers(
   const refresh = (state: ServerState) => {
     if (closing || state.peerDead || state.disabled) return;
     state.dirty = true;
-    if (!state.initializing) scheduleRefreshes();
+    if (!state.initializing && !refreshPaused) scheduleRefreshes();
   };
 
   try {
@@ -1453,7 +1478,7 @@ export async function bridgeMcpServers(
     for (const state of states) {
       try {
         for (const remote of state.tools) {
-          const alias = allocateAlias(state.server.name, remote.name, usedAliases);
+          const alias = allocateAlias(state.token, remote.name, usedAliases);
           state.aliases.set(remote.name, alias);
           aliases.push(alias);
           aliasServers.set(alias, state.server.name);
@@ -1492,7 +1517,17 @@ export async function bridgeMcpServers(
     },
   };
 
+  let physicalCloses: Promise<void> | undefined;
   let closePromise: Promise<void> | undefined;
+  const startDisposal = () => {
+    if (!closing) closing = true;
+    physicalCloses ??= closeClients(states.map(({ handle }) => handle), deps);
+    physicalCloses.catch(() => undefined);
+  };
+  const abortRefreshes = () => {
+    refreshPaused = true;
+    if (!refreshController.signal.aborted) refreshController.abort(new Error("MCP refresh aborted"));
+  };
   return {
     clients: states.map(({ handle }) => handle),
     tools,
@@ -1508,14 +1543,19 @@ export async function bridgeMcpServers(
     },
     assertReady,
     acquireTurnBoundary,
+    startDisposal,
+    abortRefreshes,
+    resumeRefreshes() {
+      if (closing || !refreshPaused) return;
+      refreshController = new AbortController();
+      refreshPaused = false;
+      scheduleRefreshes();
+    },
     drainRefreshes: () => refreshQueue,
     close() {
-      if (!closing) {
-        closing = true;
-        refreshController.abort(new Error("MCP bridge closed"));
-      }
+      startDisposal();
+      abortRefreshes();
       closePromise ??= (async () => {
-        const physicalCloses = closeClients(states.map(({ handle }) => handle), deps);
         await refreshQueue.catch(() => undefined);
         const release = await acquireTurnBoundary();
         release();
@@ -1536,7 +1576,9 @@ async function closeClients(clients: readonly McpClientHandle[], deps: PiAcpDeps
       return Promise.resolve();
     }
     close.catch(() => undefined);
-    return bounded(close, NEVER_ABORTED, deps.mcpTimeoutMs, deps.sleep).catch(() => undefined);
+    return client.closeIsBounded
+      ? close.catch(() => undefined)
+      : bounded(close, NEVER_ABORTED, deps.mcpTimeoutMs, deps.sleep).catch(() => undefined);
   });
   await Promise.allSettled(closes);
 }

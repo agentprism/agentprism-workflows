@@ -244,7 +244,6 @@ export class PiSession {
   private abortTurn(turn: ActiveTurn): void {
     if (turn.completed) return;
     turn.cleanup ??= this.cleanupTurn("cancel-only");
-    if (!turn.controller.signal.aborted) turn.controller.abort();
     turn.cleanup.catch((error) => {
       if (!turn.completed) this.turnError(turn, error);
       void this.cleanupWedged();
@@ -253,14 +252,16 @@ export class PiSession {
 
   private startDisposal(): void {
     this.closing = true;
-    // Client.close() reaches the close-signalling transport synchronously.
-    // Start every logical close before lifetime abort so incoming MCP handlers
-    // take the protocol-owned no-response path.
-    this.bridgeClosePromise ??= this.mcpBridge.close();
-    this.bridgeClosePromise.catch(() => undefined);
+    // The contract's disposal prefix is intentionally split: transport close
+    // admission starts first, then incoming handlers observe session disposal,
+    // and only then are refresh/turn signals aborted.
+    this.mcpBridge.startDisposal();
     if (!this.lifecycleController.signal.aborted) {
       this.lifecycleController.abort(new Error("session disposed"));
     }
+    this.mcpBridge.abortRefreshes();
+    this.bridgeClosePromise ??= this.mcpBridge.close();
+    this.bridgeClosePromise.catch(() => undefined);
   }
 
   private cleanupTurn(mode: CleanupGeneration["mode"]): Promise<void> {
@@ -276,7 +277,6 @@ export class PiSession {
       return current.promise;
     }
 
-    if (mode === "disposal") this.startDisposal();
     const deadlineController = new AbortController();
     const timerController = new AbortController();
     const generation: CleanupGeneration = {
@@ -300,6 +300,12 @@ export class PiSession {
     // between its filesystem check and lease acquisition.
     const captured = this.childRegistry.closeEpoch(deadlineController.signal);
     captured.drain.catch(() => undefined);
+    if (mode === "disposal") this.startDisposal();
+    else this.mcpBridge.abortRefreshes();
+    const turn = this.activeTurn;
+    if (turn && !turn.controller.signal.aborted) turn.controller.abort();
+    turn?.releaseBoundary?.();
+    if (turn) turn.releaseBoundary = undefined;
     let abortPi: Promise<void>;
     try {
       abortPi = this.pi.abort();
@@ -307,7 +313,9 @@ export class PiSession {
       abortPi = Promise.reject(error);
     }
     abortPi.catch(() => undefined);
-    const operations = Promise.allSettled([abortPi, captured.drain]);
+    const refreshDrain = this.mcpBridge.drainRefreshes();
+    refreshDrain.catch(() => undefined);
+    const operations = Promise.allSettled([abortPi, captured.drain, refreshDrain]);
 
     generation.promise = new Promise<void>((resolve, reject) => {
       let claimed = false;
@@ -345,6 +353,7 @@ export class PiSession {
         timerController.abort();
         if (generation.mode === "cancel-only" && this.cleanupGeneration === generation) {
           this.childRegistry.commitRotation(captured.epoch);
+          this.mcpBridge.resumeRefreshes();
           this.cleanupGeneration = undefined;
         }
         resolve();
@@ -550,7 +559,6 @@ export class PiSession {
     this.resourceDisposePromise ??= (async () => {
       if (this.disposed) return;
       this.closing = true;
-      this.lifecycleController.abort(new Error("session disposed"));
       this.disposed = true;
       this.stopped = true;
       this.pending.length = 0;
@@ -562,6 +570,9 @@ export class PiSession {
       }
       this.unsubscribe = undefined;
       this.startDisposal();
+      await this.mcpBridge.drainRefreshes().catch((error) => {
+        console.error("pi-acp MCP refresh drain error:", error);
+      });
       const results = await Promise.allSettled([
         Promise.resolve().then(() => this.pi.dispose()),
         this.bridgeClosePromise ?? Promise.resolve(),

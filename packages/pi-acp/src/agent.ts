@@ -1,4 +1,5 @@
 import { existsSync, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type {
   AgentNotificationContext,
@@ -50,6 +51,18 @@ interface CleanupOwner {
   readonly remainingChildren: number;
 }
 
+interface McpBindingState {
+  pi?: AgentSession;
+  wrapper?: PiSession;
+  published: boolean;
+}
+
+interface PreparedMcp {
+  bridge: McpBridge;
+  lifecycle: AbortController;
+  state: McpBindingState;
+}
+
 /** Retry owner for the narrow interval after Pi exists but before PiSession is
  * publishable.  It gives failed-open rollback the same abort/tree barrier and
  * hidden-record ownership as a fully constructed session. */
@@ -68,6 +81,9 @@ class FailedOpenCleanup implements CleanupOwner {
 
   private startResources(bridgeClose: Promise<void>): Promise<void> {
     this.resourceDispose ??= (async () => {
+      await this.bridge.drainRefreshes().catch((error) => {
+        console.error("pi-acp failed-open refresh drain error:", error);
+      });
       const results = await Promise.allSettled([
         Promise.resolve().then(() => this.pi.dispose()),
         bridgeClose,
@@ -95,9 +111,11 @@ class FailedOpenCleanup implements CleanupOwner {
     // before aborting the binding lifetime, then start Pi abort before its
     // one-shot resource disposal can run.
     const captured = this.children.closeEpoch(deadline.signal);
+    this.bridge.startDisposal();
+    if (!this.lifecycle.signal.aborted) this.lifecycle.abort(new Error("failed open disposed"));
+    this.bridge.abortRefreshes();
     const bridgeClose = this.bridge.close();
     bridgeClose.catch(() => undefined);
-    if (!this.lifecycle.signal.aborted) this.lifecycle.abort(new Error("failed open disposed"));
     let abort: Promise<void>;
     try { abort = this.pi.abort(); } catch (error) { abort = Promise.reject(error); }
     abort.catch(() => undefined);
@@ -222,6 +240,37 @@ export class PiAcpAgent {
     }
   }
 
+  private async connectMcp(
+    opening: Opening,
+    sessionId: string,
+    cwd: string,
+    client: AgentRequestContext<unknown>["client"],
+    mcpServers: readonly McpServer[],
+  ): Promise<PreparedMcp> {
+    const lifecycle = new AbortController();
+    const state: McpBindingState = { published: false };
+    const binding = {
+      sessionId,
+      cwd,
+      client,
+      sessionSignal: lifecycle.signal,
+      getPi: () => state.pi,
+      getTurnSignal: () => state.wrapper?.activeTurnSignal(),
+      isPublished: () => state.published,
+      emitDiagnostic: (text: string) => state.wrapper?.emitMcpDiagnostic(text) ?? console.error(text),
+      poison: () => state.wrapper?.poison(),
+      ownerToken: this.mcpOwnerToken,
+      modelRuntime: this.deps.modelRuntime,
+    };
+    try {
+      const bridge = await bridgeMcpServers(mcpServers, opening.controller.signal, this.deps, binding);
+      return { bridge, lifecycle, state };
+    } catch (error) {
+      lifecycle.abort(new Error("MCP opening failed"));
+      throw error;
+    }
+  }
+
   private async construct(
     opening: Opening,
     manager: SessionManager,
@@ -229,35 +278,26 @@ export class PiAcpAgent {
     client: AgentRequestContext<unknown>["client"],
     mcpServers: readonly McpServer[],
     replay: boolean,
-    preconnected?: McpBridge,
+    preconnected?: PreparedMcp,
   ): Promise<PiSession> {
     const id = manager.getSessionId();
     if (opening.id === undefined) {
       this.reserve(id, opening);
       opening.id = id;
     }
-    let bridge = preconnected;
+    let prepared = preconnected;
+    let bridge = prepared?.bridge;
     let pi: AgentSession | undefined;
     let wrapper: PiSession | undefined;
-    let published = false;
-    const lifecycle = new AbortController();
+    let lifecycle = prepared?.lifecycle;
+    let bindingState = prepared?.state;
     const childRegistry = new ChildProcessRegistrySlot(this.deps);
-    const binding = {
-      sessionId: id,
-      cwd,
-      client,
-      sessionSignal: lifecycle.signal,
-      getPi: () => pi,
-      getTurnSignal: () => wrapper?.activeTurnSignal(),
-      isPublished: () => published,
-      emitDiagnostic: (text: string) => wrapper?.emitMcpDiagnostic(text) ?? console.error(text),
-      poison: () => wrapper?.poison(),
-      ownerToken: this.mcpOwnerToken,
-      modelRuntime: this.deps.modelRuntime,
-    };
     try {
       this.gate(opening);
-      bridge ??= await bridgeMcpServers(mcpServers, opening.controller.signal, this.deps, binding);
+      prepared ??= await this.connectMcp(opening, id, cwd, client, mcpServers);
+      bridge = prepared.bridge;
+      lifecycle = prepared.lifecycle;
+      bindingState = prepared.state;
       this.gate(opening);
       const settingsManager = SettingsManager.create(cwd, getAgentDir());
       const instructionFactory = bridge.instructionsExtension;
@@ -323,6 +363,7 @@ export class PiAcpAgent {
         settingsManager,
       });
       pi = created.session;
+      bindingState.pi = pi;
       wrapper = new PiSession({
         sessionId: id,
         session: pi,
@@ -337,6 +378,7 @@ export class PiAcpAgent {
         onWedged: (sessionId, session, cleanupRetryRequired) =>
           this.terminateWedged(sessionId, session, cleanupRetryRequired),
       });
+      bindingState.wrapper = wrapper;
       await pi.bindExtensions({});
       const availableModels = [...await this.deps.modelRuntime.getAvailable()];
       wrapper.publishAvailableModels(availableModels);
@@ -362,7 +404,7 @@ export class PiAcpAgent {
       bridge.assertReady();
       this.gate(opening);
       this.live.set(id, wrapper);
-      published = true;
+      bindingState.published = true;
       this.opening.delete(id);
       return wrapper;
     } catch (error) {
@@ -379,7 +421,7 @@ export class PiAcpAgent {
       }
       else {
         if (pi) {
-          const rollback = new FailedOpenCleanup(pi, bridge!, childRegistry, lifecycle, this.deps);
+          const rollback = new FailedOpenCleanup(pi, bridge!, childRegistry, lifecycle!, this.deps);
           try {
             await rollback.dispose();
           } catch (candidate) {
@@ -388,7 +430,12 @@ export class PiAcpAgent {
               cleanupError = candidate;
             }
           }
-        } else if (bridge) await bridge.close();
+        } else if (bridge) {
+          bridge.startDisposal();
+          if (lifecycle && !lifecycle.signal.aborted) lifecycle.abort(new Error("failed open disposed"));
+          bridge.abortRefreshes();
+          await bridge.close();
+        }
       }
       if (cleanupError) {
         opening.cleanupError = cleanupError;
@@ -501,6 +548,8 @@ export class PiAcpAgent {
     validateCwd(context.params.cwd);
     const opening = this.beginOpening(context.signal);
     const task = (async () => {
+      let prepared: PreparedMcp | undefined;
+      let preparedTransferred = false;
       try {
         let sourcePath: string | undefined;
         if (liveSource) {
@@ -514,14 +563,32 @@ export class PiAcpAgent {
         this.gate(opening);
         if (this.tombstones.has(context.params.sessionId)) throw adapterError("session_terminated");
         if (liveSource?.busy) throw adapterError("session_busy");
+        // Pin the target id before the irreversible journal write so the MCP
+        // binding can be fully connected and owned first. SessionManager
+        // validates and uses this exact id when forkFrom eventually writes.
+        const targetId = randomUUID();
+        this.reserve(targetId, opening);
+        opening.id = targetId;
+        prepared = await this.connectMcp(
+          opening,
+          targetId,
+          context.params.cwd,
+          context.client,
+          context.params.mcpServers ?? [],
+        );
+        this.gate(opening);
         let manager: SessionManager;
         try {
-          manager = this.deps.sessions.forkFrom(sourcePath, context.params.cwd, this.deps.sessionDir);
+          manager = this.deps.sessions.forkFrom(
+            sourcePath,
+            context.params.cwd,
+            this.deps.sessionDir,
+            { id: targetId },
+          );
         } catch {
           throw adapterError("session_corrupt");
         }
-        this.reserve(manager.getSessionId(), opening);
-        opening.id = manager.getSessionId();
+        preparedTransferred = true;
         const session = await this.construct(
           opening,
           manager,
@@ -529,9 +596,18 @@ export class PiAcpAgent {
           context.client,
           context.params.mcpServers ?? [],
           false,
+          prepared,
         );
         return { sessionId: session.sessionId, configOptions: session.configOptions(), modes: null };
       } catch (error) {
+        if (prepared && !preparedTransferred) {
+          prepared.bridge.startDisposal();
+          prepared.lifecycle.abort(new Error("fork failed before construction"));
+          prepared.bridge.abortRefreshes();
+          await prepared.bridge.close().catch((closeError) => {
+            console.error("pi-acp fork MCP rollback error:", closeError);
+          });
+        }
         if (opening.id !== undefined && this.opening.get(opening.id) === opening) {
           this.opening.delete(opening.id);
         }

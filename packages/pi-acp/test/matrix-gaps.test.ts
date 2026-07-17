@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import test from "node:test";
@@ -642,6 +642,185 @@ test("A4 failed-open abort deadline overrides the opening error and hidden owner
   await agent.closeSession(context({ sessionId: id }));
   assert.equal(abortAttempts, 2, "hidden failed-open owner retries the abort/liveness generation");
   assert.equal(control?.disposeCalls, 1);
+  await agent.dispose();
+});
+
+test("A4 new/load/resume/fork preserve every representative open error unless cleanup fails", { timeout: 30_000 }, async () => {
+  const methodsUnderTest = ["new", "load", "resume", "fork"] as const;
+  const outcomes = [
+    { name: "cancel", code: -32800, kind: undefined, error: () => RequestError.requestCancelled() },
+    { name: "mcp", code: -32603, kind: "mcp_init_error", error: () => adapterError("mcp_init_error", { server: "second" }) },
+    { name: "extension", code: -32603, kind: "extension_setup_error", error: () => adapterError("extension_setup_error") },
+    { name: "replay-other", code: -32603, kind: "session_corrupt", error: () => adapterError("session_corrupt") },
+  ] as const;
+
+  for (const openingMethod of methodsUnderTest) {
+    for (const outcome of outcomes) {
+      for (const cleanupFails of [false, true]) {
+        const setup = fakeDeps();
+        const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: `a4-${openingMethod}-${outcome.name}-source` });
+        source.appendMessage({ role: "user", content: "source", timestamp: 1 } as never);
+        source.appendMessage({
+          role: "assistant",
+          content: [{ type: "text", text: "answer" }],
+          usage: {
+            input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 2,
+        } as never);
+        const events: string[] = [];
+        setup.deps.connectMcpClient = async (server) => fakeMcpHandle({
+          close() { events.push(`mcp-close:${server.name}`); return Promise.resolve(); },
+        });
+        const realCreate = setup.deps.createAgentSession;
+        let abortAttempts = 0;
+        setup.deps.createAgentSession = async (options) => {
+          const result = await realCreate(options);
+          const control = setup.controls.at(-1)!;
+          control.session.abort = async () => {
+            abortAttempts += 1;
+            events.push(`pi-abort:${abortAttempts}`);
+            if (cleanupFails && abortAttempts === 1) throw new Error("injected cleanup failure");
+          };
+          return result;
+        };
+        setup.deps.modelRuntime.getAvailable = async () => { throw outcome.error(); };
+        const agent = new PiAcpAgent(setup.deps);
+        const request = {
+          cwd: setup.cwd,
+          mcpServers: [
+            { name: "first", command: "fixture", args: [], env: [] },
+            { name: "second", command: "fixture", args: [], env: [] },
+          ],
+        };
+        const opening = openingMethod === "new"
+          ? agent.newSession(context(request))
+          : openingMethod === "load"
+            ? agent.loadSession(context({ ...request, sessionId: source.getSessionId() }))
+            : openingMethod === "resume"
+              ? agent.resumeSession(context({ ...request, sessionId: source.getSessionId() }))
+              : agent.forkSession(context({ ...request, sessionId: source.getSessionId() }));
+        await assert.rejects(opening, (error: RequestError) => {
+          if (cleanupFails) {
+            assert.equal(error.code, -32603, `${openingMethod}/${outcome.name}`);
+            assert.deepEqual(error.data, {
+              errorKind: "child_cleanup_error",
+              message: "child process cleanup failed",
+              details: { remainingChildren: 0 },
+            });
+          } else {
+            assert.equal(error.code, outcome.code, `${openingMethod}/${outcome.name}`);
+            assert.equal(errorKind(error), outcome.kind, `${openingMethod}/${outcome.name}`);
+          }
+          return true;
+        });
+        assert.deepEqual(events.slice(0, 3), ["mcp-close:second", "mcp-close:first", "pi-abort:1"],
+          `${openingMethod}/${outcome.name} starts reverse MCP closes before Pi abort`);
+        assert.equal(setup.controls[0]!.disposeCalls, 1);
+
+        if (cleanupFails && (openingMethod === "load" || openingMethod === "resume")) {
+          await agent.closeSession(context({ sessionId: source.getSessionId() }));
+        } else {
+          await agent.dispose();
+        }
+        if (cleanupFails) {
+          assert.equal(abortAttempts, 2, `${openingMethod}/${outcome.name} retained cleanup owner retries`);
+          await agent.dispose();
+        } else {
+          assert.equal(abortAttempts, 1);
+        }
+        assert.equal(setup.controls[0]!.disposeCalls, 1, "non-child resources remain memoized");
+      }
+    }
+  }
+});
+
+test("M8 fork MCP failure occurs before forkFrom and leaves no target journal", async () => {
+  const setup = fakeDeps();
+  const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: "fork-preconnect-source" });
+  source.appendMessage({ role: "user", content: "source", timestamp: Date.now() } as never);
+  source.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "answer" }],
+    usage: {
+      input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as never);
+  const sourcePath = source.getSessionFile();
+  assert.ok(sourcePath);
+  setup.deps.sessions.listAll = async () => [{
+    path: sourcePath,
+    id: source.getSessionId(),
+    cwd: setup.cwd,
+    created: new Date(),
+    modified: new Date(),
+    messageCount: 2,
+    firstMessage: "source",
+    allMessagesText: "source answer",
+  }];
+  let forkCalls = 0;
+  setup.deps.sessions.forkFrom = () => {
+    forkCalls += 1;
+    throw new Error("forkFrom must not run");
+  };
+  setup.deps.connectMcpClient = async () => { throw new Error("MCP connect failed"); };
+  const before = readdirSync(setup.sessionDir).sort();
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(agent.forkSession(context({
+    cwd: setup.cwd,
+    sessionId: source.getSessionId(),
+    mcpServers: [{ name: "fails-before-write", command: "fixture", args: [], env: [] }],
+  })), (error) => errorKind(error) === "mcp_init_error");
+  assert.equal(forkCalls, 0);
+  assert.deepEqual(readdirSync(setup.sessionDir).sort(), before);
+  await agent.dispose();
+});
+
+test("M8 fork cancellation after MCP preparation closes the owner before any journal write", async () => {
+  const setup = fakeDeps();
+  const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: "fork-cancel-source" });
+  source.appendMessage({ role: "user", content: "source", timestamp: 1 } as never);
+  const sourcePath = source.getSessionFile();
+  assert.ok(sourcePath);
+  setup.deps.sessions.listAll = async () => [{
+    path: sourcePath,
+    id: source.getSessionId(),
+    cwd: setup.cwd,
+    created: new Date(),
+    modified: new Date(),
+    messageCount: 1,
+    firstMessage: "source",
+    allMessagesText: "source",
+  }];
+  const request = new AbortController();
+  let forkCalls = 0;
+  let closes = 0;
+  setup.deps.sessions.forkFrom = () => {
+    forkCalls += 1;
+    throw new Error("forkFrom must not run after cancellation");
+  };
+  setup.deps.connectMcpClient = async () => fakeMcpHandle({
+    async listTools() {
+      request.abort(new Error("cancel after MCP preparation"));
+      return { tools: [] };
+    },
+    close() { closes += 1; return Promise.resolve(); },
+  });
+  const before = readdirSync(setup.sessionDir).sort();
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(agent.forkSession(context({
+    cwd: setup.cwd,
+    sessionId: source.getSessionId(),
+    mcpServers: [{ name: "prepared", command: "fixture", args: [], env: [] }],
+  }, undefined, request.signal)));
+  assert.equal(forkCalls, 0);
+  assert.equal(closes, 1);
+  assert.deepEqual(readdirSync(setup.sessionDir).sort(), before);
   await agent.dispose();
 });
 

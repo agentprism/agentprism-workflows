@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentSession, ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type AgentSession, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   CloseSignallingTransport,
   McpOperationTerminalError,
@@ -44,7 +44,7 @@ test("M2 close wrapper delegates, signals once, and invokes stdio/SSE raw close 
   const wrapper = new CloseSignallingTransport(
     raw as never,
     undefined,
-    () => events.push("raw-error"),
+    () => { events.push("raw-error"); return true; },
     () => events.push("raw-natural-close"),
     73,
     async () => new Promise<void>(() => undefined),
@@ -88,7 +88,7 @@ test("M2 HTTP DELETE and raw close share one injected absolute deadline", async 
   const wrapper = new CloseSignallingTransport(
     raw as never,
     () => { events.push("delete"); return terminate.promise; },
-    () => undefined,
+    () => false,
     () => undefined,
     91,
     (ms) => { sleeps.push(ms); return deadline.promise; },
@@ -123,6 +123,44 @@ test("M2 all client closes start synchronously in reverse acquisition order", as
   }));
   await disposeMcpBridge(clients, setup.deps);
   assert.deepEqual(order, [3, 2, 1]);
+});
+
+test("A4 disposal starts MCP close before refresh/Pi abort and drains refresh before Pi dispose", async () => {
+  const setup = fakeDeps();
+  const events: string[] = [];
+  const refreshStarted = deferred<void>();
+  let changed: (() => void) | undefined;
+  let lists = 0;
+  setup.deps.connectMcpClient = async () => fakeMcpHandle({
+    async listTools(_cursor, signal) {
+      lists += 1;
+      if (lists === 1) return { tools: [{ name: "one", inputSchema: { type: "object" } }] };
+      refreshStarted.resolve();
+      return new Promise((_, reject) => {
+        signal.addEventListener("abort", () => {
+          events.push("refresh-abort");
+          reject(signal.reason);
+        }, { once: true });
+      });
+    },
+    setToolsChangedHandler(handler) { changed = handler; },
+    close() { events.push("mcp-close"); return Promise.resolve(); },
+  });
+  const { PiAcpAgent } = await import("../src/agent.js");
+  const agent = new PiAcpAgent(setup.deps);
+  const opened = await agent.newSession(context({
+    cwd: setup.cwd,
+    mcpServers: [{ name: "ordered-disposal", command: "fixture", args: [], env: [] }],
+  }));
+  const control = setup.controls[0];
+  assert.ok(control);
+  control.session.abort = async () => { events.push("pi-abort"); };
+  control.session.dispose = () => { events.push("pi-dispose"); };
+  changed?.();
+  await refreshStarted.promise;
+  await agent.closeSession(context({ sessionId: opened.sessionId }));
+  assert.deepEqual(events, ["mcp-close", "refresh-abort", "pi-abort", "pi-dispose"]);
+  await agent.dispose();
 });
 
 test("M2 outgoing settleOnce uses lifecycle > session > peer > timeout > completion", async () => {
@@ -436,6 +474,263 @@ test("M5 refresh keeps stable aliases across change, invalid-catalog rollback, r
   await bridge.close();
 });
 
+test("M5/M8 colliding server slugs use the allocated token for aliases and diagnostics", async () => {
+  const setup = fakeDeps();
+  const handlers = new Map<string, () => void>();
+  const calls = new Map<string, number>();
+  setup.deps.connectMcpClient = async (server) => fakeMcpHandle({
+    async listTools() {
+      const count = (calls.get(server.name) ?? 0) + 1;
+      calls.set(server.name, count);
+      if (count > 1) throw new Error("refresh failure");
+      return { tools: [{ name: "same", inputSchema: { type: "object" } }] };
+    },
+    setToolsChangedHandler(handler) { handlers.set(server.name, handler); },
+  });
+  const diagnostics: string[] = [];
+  const bridge = await bridgeMcpServers([
+    { name: "a b", command: "fixture", args: [], env: [] },
+    { name: "a_b", command: "fixture", args: [], env: [] },
+  ], new AbortController().signal, setup.deps, {
+    sessionId: "colliding-server-slugs",
+    cwd: setup.cwd,
+    client: { notify: async () => undefined } as never,
+    sessionSignal: new AbortController().signal,
+    getPi: () => undefined,
+    getTurnSignal: () => undefined,
+    isPublished: () => true,
+    emitDiagnostic: (value) => diagnostics.push(value),
+  });
+  assert.deepEqual(bridge.aliases, [
+    "mcp__a_b__same",
+    "mcp__a_b_2__same",
+  ]);
+  const registered = new Map<string, ToolDefinition>();
+  const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
+  await factory({ registerTool(tool: ToolDefinition) { registered.set(tool.name, tool); } } as unknown as ExtensionAPI);
+  let active = [...registered.keys()];
+  bridge.bindSession({
+    getActiveToolNames: () => [...active],
+    setActiveToolsByName(names: string[]) { active = [...names]; },
+  } as unknown as AgentSession);
+  handlers.get("a_b")?.();
+  await bridge.drainRefreshes();
+  assert.deepEqual(diagnostics, ["[mcp:a_b_2] tools/list refresh failed"]);
+  await bridge.close();
+});
+
+test("M5 simultaneous two-server refreshes rebase in configuration order without losing deltas", async () => {
+  const setup = fakeDeps();
+  const common = "s".repeat(130);
+  const names = [`${common} a`, `${common} b`];
+  const catalogs = new Map<string, Array<Record<string, unknown>>>([
+    [names[0]!, [
+      { name: "keep-a", title: "keep a v1", inputSchema: { type: "object" } },
+      { name: "remove-a", inputSchema: { type: "object" } },
+    ]],
+    [names[1]!, [
+      { name: "keep-b", title: "keep b v1", inputSchema: { type: "object" } },
+      { name: "remove-b", inputSchema: { type: "object" } },
+    ]],
+  ]);
+  const handlers = new Map<string, () => void>();
+  const listOrder: string[] = [];
+  setup.deps.connectMcpClient = async (server) => fakeMcpHandle({
+    async listTools() {
+      listOrder.push(server.name);
+      return { tools: catalogs.get(server.name) as never };
+    },
+    setToolsChangedHandler(handler) { handlers.set(server.name, handler); },
+  });
+  const bridge = await bridgeMcpServers(names.map((name) => ({
+    name, command: "fixture", args: [], env: [],
+  })), new AbortController().signal, setup.deps);
+  const registered = new Map<string, ToolDefinition>();
+  const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
+  await factory({ registerTool(tool: ToolDefinition) { registered.set(tool.name, tool); } } as unknown as ExtensionAPI);
+  let active = [...registered.keys()];
+  bridge.bindSession({
+    getActiveToolNames: () => [...active],
+    setActiveToolsByName(values: string[]) { active = [...values]; },
+  } as unknown as AgentSession);
+  const initialByServer = names.map((name) => bridge.aliases.filter((alias) => bridge.aliasServers.get(alias) === name));
+  catalogs.set(names[0]!, [
+    { name: "keep-a", title: "keep a v2", inputSchema: { type: "object" } },
+    { name: "add-a", inputSchema: { type: "object" } },
+  ]);
+  catalogs.set(names[1]!, [
+    { name: "keep-b", title: "keep b v2", inputSchema: { type: "object" } },
+    { name: "add-b", inputSchema: { type: "object" } },
+  ]);
+  // Reverse arrival is intentionally batched; preparation remains configured-order.
+  handlers.get(names[1]!)?.();
+  handlers.get(names[0]!)?.();
+  await bridge.drainRefreshes();
+  assert.deepEqual(listOrder.slice(-2), names);
+  const finalByServer = names.map((name) => bridge.aliases.filter((alias) => bridge.aliasServers.get(alias) === name));
+  assert.equal(new Set(bridge.aliases).size, bridge.aliases.length);
+  assert.ok(bridge.aliases.every((alias) => alias.length <= 128));
+  assert.ok(bridge.aliases.some((alias) => /_2$/.test(alias)), "truncation collision must use an ordered suffix");
+  for (let index = 0; index < names.length; index += 1) {
+    const [kept, removed] = initialByServer[index]!;
+    const added = finalByServer[index]!.find((alias) => !initialByServer[index]!.includes(alias));
+    assert.ok(kept && removed && added);
+    assert.ok(active.includes(kept));
+    assert.ok(active.includes(added));
+    assert.equal(active.includes(removed), false);
+  }
+  assert.equal(registered.get(initialByServer[0]![0]!)?.label, "keep a v2");
+  assert.equal(registered.get(initialByServer[1]![0]!)?.label, "keep b v2");
+  await bridge.close();
+});
+
+test("M5 opening waits for one coalesced dirty pass and defers a notification during that pass", async () => {
+  const setup = fakeDeps();
+  const pages = [deferred<{ tools: Array<{ name: string; inputSchema: { type: string } }> }>(), deferred<{ tools: Array<{ name: string; inputSchema: { type: string } }> }>()];
+  const starts = [deferred<void>(), deferred<void>(), deferred<void>()];
+  let changed: (() => void) | undefined;
+  let calls = 0;
+  setup.deps.connectMcpClient = async () => fakeMcpHandle({
+    async listTools() {
+      const index = calls++;
+      starts[index]?.resolve();
+      if (index < 2) return pages[index]!.promise;
+      return { tools: [{ name: "third", inputSchema: { type: "object" } }] };
+    },
+    setToolsChangedHandler(handler) { changed = handler; },
+  });
+  let opened = false;
+  const opening = bridgeMcpServers([
+    { name: "initial-dirty", command: "fixture", args: [], env: [] },
+  ], new AbortController().signal, setup.deps).then((bridge) => {
+    opened = true;
+    return bridge;
+  });
+  await starts[0]!.promise;
+  changed?.();
+  pages[0]!.resolve({ tools: [{ name: "first", inputSchema: { type: "object" } }] });
+  await starts[1]!.promise;
+  assert.equal(opened, false, "session publication waits for the coalesced extra enumeration");
+  changed?.();
+  pages[1]!.resolve({ tools: [{ name: "second", inputSchema: { type: "object" } }] });
+  const bridge = await opening;
+  assert.equal(calls, 2, "a notification during the extra pass does not extend the opening barrier");
+  assert.ok(bridge.aliases.includes("mcp__initial-dirty__second"));
+  assert.equal(bridge.aliases.some((alias) => alias.endsWith("__first")), false);
+  const registered = new Map<string, ToolDefinition>();
+  const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
+  await factory({ registerTool(tool: ToolDefinition) { registered.set(tool.name, tool); } } as unknown as ExtensionAPI);
+  let active = [...registered.keys()];
+  bridge.bindSession({
+    getActiveToolNames: () => [...active],
+    setActiveToolsByName(names: string[]) { active = [...names]; },
+  } as unknown as AgentSession);
+  await starts[2]!.promise;
+  await bridge.drainRefreshes();
+  assert.equal(calls, 3, "the deferred dirty bit becomes ordinary post-publication work");
+  assert.ok(active.includes("mcp__initial-dirty__third"));
+  await bridge.close();
+});
+
+test("M5 refresh discards pre-commit aliases and poisons the session after mutation begins", async () => {
+  {
+    const setup = fakeDeps();
+    let catalog: Array<{ name: string; inputSchema: { type: string } }> = [
+      { name: "base", inputSchema: { type: "object" } },
+    ];
+    let changed: (() => void) | undefined;
+    setup.deps.connectMcpClient = async () => fakeMcpHandle({
+      async listTools() { return { tools: catalog }; },
+      setToolsChangedHandler(handler) { changed = handler; },
+    });
+    const bridge = await bridgeMcpServers([
+      { name: "precommit", command: "fixture", args: [], env: [] },
+    ], new AbortController().signal, setup.deps);
+    const registered = new Map<string, ToolDefinition>();
+    const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
+    await factory({ registerTool(tool: ToolDefinition) { registered.set(tool.name, tool); } } as unknown as ExtensionAPI);
+    let active = [...registered.keys()];
+    bridge.bindSession({
+      getActiveToolNames: () => [...active],
+      setActiveToolsByName(names: string[]) { active = [...names]; },
+    } as unknown as AgentSession);
+    catalog = [
+      { name: "base", inputSchema: { type: "object" } },
+      { name: "candidate", inputSchema: { type: "object" } },
+      { name: "candidate", inputSchema: { type: "object" } },
+    ];
+    changed?.();
+    await bridge.drainRefreshes();
+    assert.equal(bridge.aliases.some((alias) => alias.includes("candidate")), false);
+    catalog = [
+      { name: "base", inputSchema: { type: "object" } },
+      { name: "candidate", inputSchema: { type: "object" } },
+    ];
+    changed?.();
+    await bridge.drainRefreshes();
+    assert.ok(bridge.aliases.includes("mcp__precommit__candidate"));
+    assert.equal(bridge.aliases.some((alias) => alias.endsWith("candidate_2")), false,
+      "discarded candidates consume no suffix reservation");
+    await bridge.close();
+  }
+
+  {
+    const setup = fakeDeps();
+    let catalog: Array<{ name: string; inputSchema: { type: string } }> = [
+      { name: "base", inputSchema: { type: "object" } },
+    ];
+    let changed: (() => void) | undefined;
+    setup.deps.connectMcpClient = async () => fakeMcpHandle({
+      async listTools() { return { tools: catalog }; },
+      setToolsChangedHandler(handler) { changed = handler; },
+    });
+    const diagnostics: string[] = [];
+    let poisonCalls = 0;
+    const bridge = await bridgeMcpServers([
+      { name: "commit-fault", command: "fixture", args: [], env: [] },
+    ], new AbortController().signal, setup.deps, {
+      sessionId: "commit-fault",
+      cwd: setup.cwd,
+      client: { notify: async () => undefined } as never,
+      sessionSignal: new AbortController().signal,
+      getPi: () => undefined,
+      getTurnSignal: () => undefined,
+      isPublished: () => true,
+      emitDiagnostic: (value) => diagnostics.push(value),
+      poison: () => { poisonCalls += 1; },
+    });
+    let rejectRegistration = false;
+    const registered = new Map<string, ToolDefinition>();
+    const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
+    await factory({
+      registerTool(tool: ToolDefinition) {
+        if (rejectRegistration && tool.name.endsWith("__added")) throw new Error("injected registry mutation failure");
+        registered.set(tool.name, tool);
+      },
+    } as unknown as ExtensionAPI);
+    let active = [...registered.keys()];
+    bridge.bindSession({
+      getActiveToolNames: () => [...active],
+      setActiveToolsByName(names: string[]) { active = [...names]; },
+    } as unknown as AgentSession);
+    rejectRegistration = true;
+    catalog = [
+      { name: "base", inputSchema: { type: "object" } },
+      { name: "added", inputSchema: { type: "object" } },
+    ];
+    changed?.();
+    await bridge.drainRefreshes();
+    assert.equal(poisonCalls, 1);
+    assert.deepEqual(diagnostics, ["[mcp:commit-fault] tools/list refresh commit failed; session terminated"]);
+    assert.equal(bridge.aliases.some((alias) => alias.endsWith("__added")), false,
+      "adapter snapshot and reservation remain unpublished after mutation poison");
+    changed?.();
+    await bridge.drainRefreshes();
+    assert.equal(poisonCalls, 1, "poison suppresses all later registration work");
+    await bridge.close();
+  }
+});
+
 test("M4 turn cancellation suppresses every late remote progress and settlement", async () => {
   const setup = fakeDeps();
   const remote = deferred<Awaited<ReturnType<ReturnType<typeof fakeMcpHandle>["callTool"]>>>();
@@ -533,9 +828,9 @@ test("M8 partial-open rollback closes every acquired handle in reverse order", a
   assert.deepEqual(closed, ["third", "second", "first"]);
 });
 
-test("M9 fresh bridges never inherit or replay resource subscriptions", async () => {
+test("M9 actual new/load/resume/fork connections never restore subscriptions or mutate history", async () => {
   const setup = fakeDeps();
-  const subscriptions = [0, 0, 0, 0];
+  const subscriptions = [0, 0, 0, 0, 0];
   let connection = 0;
   setup.deps.connectMcpClient = async () => {
     const index = connection++;
@@ -548,22 +843,80 @@ test("M9 fresh bridges never inherit or replay resource subscriptions", async ()
       async unsubscribeResource() { return {}; },
     });
   };
-  for (let index = 0; index < 4; index += 1) {
-    const bridge = await bridgeMcpServers(
-      [{ name: "same", command: "fixture", args: [], env: [] }],
-      new AbortController().signal,
-      setup.deps,
-    );
-    assert.equal(subscriptions[index], 0, "new/load/resume/fork connection starts unsubscribed");
-    if (index === 0) {
-      const subscribe = bridge.tools.find(({ name }) => name.endsWith("__subscribe_resource"));
-      assert.ok(subscribe);
-      await subscribe.execute("explicit", { uri: "file:///one" }, new AbortController().signal);
-      assert.equal(subscriptions[index], 1);
-    }
-    await bridge.close();
-  }
-  assert.deepEqual(subscriptions, [1, 0, 0, 0]);
+  const { PiAcpAgent } = await import("../src/agent.js");
+  const agent = new PiAcpAgent(setup.deps);
+  const server = { name: "same", command: "fixture", args: [], env: [] } as const;
+
+  const created = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [server] }));
+  const createdManager = setup.createOptions[0]!.sessionManager!;
+  const createdBranch = structuredClone(createdManager.getBranch());
+  const firstSubscribe = setup.controls[0]!.tools.find(({ name }) => name.endsWith("__subscribe_resource"));
+  assert.ok(firstSubscribe);
+  assert.equal(subscriptions[0], 0);
+  await firstSubscribe.execute("new-explicit", { uri: "file:///one" }, new AbortController().signal);
+  assert.equal(subscriptions[0], 1);
+  assert.deepEqual(createdManager.getBranch(), createdBranch, "explicit subscription is ephemeral, not journaled");
+  assert.deepEqual(setup.controls[0]!.session.agent.state.messages, [], "subscription never enters model context");
+  await agent.closeSession(context({ sessionId: created.sessionId }));
+
+  const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: "m9-source" });
+  source.appendMessage({ role: "user", content: "source prompt", timestamp: 1 } as never);
+  source.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "source answer" }],
+    usage: {
+      input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 2,
+  } as never);
+  const sourcePath = source.getSessionFile();
+  assert.ok(sourcePath);
+  const sourceBranch = structuredClone(source.getBranch());
+  const sourceBytes = readFileSync(sourcePath, "utf8");
+  const replay: unknown[] = [];
+
+  await agent.loadSession(context({
+    cwd: setup.cwd, sessionId: source.getSessionId(), mcpServers: [server],
+  }, { notify: async (_method, params) => { replay.push(params); } }));
+  assert.equal(subscriptions[1], 0, "load starts with no inherited subscription");
+  assert.deepEqual(setup.createOptions[1]!.sessionManager!.getBranch(), sourceBranch);
+  assert.deepEqual(setup.controls[1]!.session.agent.state.messages, [], "replay does not inject MCP state into model context");
+  assert.ok(replay.length > 0, "load still emits its ordinary replay transcript");
+  assert.equal(JSON.stringify(replay).includes("subscribe_resource"), false);
+  await agent.closeSession(context({ sessionId: source.getSessionId() }));
+
+  await agent.resumeSession(context({ cwd: setup.cwd, sessionId: source.getSessionId(), mcpServers: [server] }));
+  assert.equal(subscriptions[2], 0, "resume starts with no inherited subscription");
+  assert.deepEqual(setup.createOptions[2]!.sessionManager!.getBranch(), sourceBranch);
+  assert.deepEqual(setup.controls[2]!.session.agent.state.messages, []);
+  await agent.closeSession(context({ sessionId: source.getSessionId() }));
+
+  const forked = await agent.forkSession(context({ cwd: setup.cwd, sessionId: source.getSessionId(), mcpServers: [server] }));
+  assert.equal(subscriptions[3], 0, "fork starts with no inherited subscription despite copied history");
+  const forkManager = setup.createOptions[3]!.sessionManager!;
+  assert.deepEqual(forkManager.getBranch(), sourceBranch);
+  assert.deepEqual(setup.controls[3]!.session.agent.state.messages, []);
+  const forkSubscribe = setup.controls[3]!.tools.find(({ name }) => name.endsWith("__subscribe_resource"));
+  assert.ok(forkSubscribe);
+  await forkSubscribe.execute("fork-explicit", { uri: "file:///one" }, new AbortController().signal);
+  assert.equal(subscriptions[3], 1, "only a later explicit call re-subscribes");
+  assert.deepEqual(forkManager.getBranch(), sourceBranch);
+  await agent.closeSession(context({ sessionId: forked.sessionId }));
+
+  const originalAvailable = setup.deps.modelRuntime.getAvailable.bind(setup.deps.modelRuntime);
+  setup.deps.modelRuntime.getAvailable = async () => { throw new Error("M9 open failure"); };
+  await assert.rejects(agent.loadSession(context({
+    cwd: setup.cwd, sessionId: source.getSessionId(), mcpServers: [server],
+  })));
+  setup.deps.modelRuntime.getAvailable = originalAvailable;
+  assert.equal(subscriptions[4], 0, "failed open does not restore a subscription");
+  assert.deepEqual(source.getBranch(), sourceBranch);
+  assert.equal(readFileSync(sourcePath, "utf8"), sourceBytes, "load/resume/fork/open-failure add no source journal marker");
+  assert.deepEqual(subscriptions, [1, 0, 0, 1, 0]);
+  assert.equal(connection, 5);
+  await agent.dispose();
 });
 
 test("C4 config refresh reserves prompt, config, and fork admission synchronously", async () => {

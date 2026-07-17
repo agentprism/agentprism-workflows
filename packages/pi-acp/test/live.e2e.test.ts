@@ -21,11 +21,12 @@ const HAS_KEY = Boolean(
   process.env.XAI_API_KEY ||
   process.env.OPENROUTER_API_KEY,
 );
-const skip = !LIVE
-  ? "gated pi live e2e — set AGENTPRISM_LIVE_E2E=1, AGENTPRISM_PI_E2E_MODEL, and a provider key"
-  : !MODEL || !HAS_KEY
-    ? "pi live e2e requires AGENTPRISM_PI_E2E_MODEL and its provider key"
-    : false;
+function liveReady(): boolean {
+  if (!LIVE) return false;
+  assert.ok(MODEL, "AGENTPRISM_LIVE_E2E=1 requires AGENTPRISM_PI_E2E_MODEL");
+  assert.ok(HAS_KEY, "AGENTPRISM_LIVE_E2E=1 requires the selected provider key");
+  return true;
+}
 
 function installPiCommand(): () => void {
   const priorCommand = process.env.AGENTPRISM_PI_ACP_CMD;
@@ -115,7 +116,11 @@ function processIsGone(pid: number): boolean {
   }
 }
 
-test("T23 built-in PiBackend validates through injected StructuredOutput plus common fallback", { skip }, async () => {
+test("T23 built-in PiBackend validates through injected StructuredOutput plus common fallback", async () => {
+  if (!liveReady()) {
+    assert.equal(LIVE, false, "credential-free CI must leave the explicit live gate closed");
+    return;
+  }
   const restore = installPiCommand();
   const runner = new AcpAgentRunner();
   try {
@@ -131,7 +136,11 @@ test("T23 built-in PiBackend validates through injected StructuredOutput plus co
   }
 });
 
-test("L1 real HTTP MCP round-trip and stopped sleep child is reaped", { skip, timeout: 240_000 }, async () => {
+test("L1 real HTTP MCP round-trip and stopped sleep child is reaped", { timeout: 240_000 }, async () => {
+  if (!liveReady()) {
+    assert.equal(LIVE, false, "credential-free CI must leave the explicit live gate closed");
+    return;
+  }
   const restore = installPiCommand();
   const runner = new AcpAgentRunner();
   const host = await liveToolHost();

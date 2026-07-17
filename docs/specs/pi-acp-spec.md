@@ -9,7 +9,7 @@ revision: the MCP `tools/call` timeout now defaults to the MCP SDK's own
 (§6.2.1) from which §6.5/§9.1.6/§9.6/T22 are derived; a redaction contract that reads pi's real
 `AssistantMessageDiagnostic` fields and never forwards `error.message`/`.stack`; every error mapping named
 to its producing mechanism (the `setModel` auth precheck) with a canonical `{ errorKind, message }` wire
-shape; observable structured-tool collision (absence-detection); pinned opening-transaction races
+shape; source-qualified MCP/control extension collision detection; pinned opening-transaction races
 (cancel/close/dispose); a categorical empty-live-fork error; mutation-safe cursor pagination; a total MCP
 bridge over the pinned SDK (paginated `tools/list`, the five-member `CallToolResult` union, and a
 timeout/detach/orphan-child protocol); `allow_always` that still runs the extension chain plus a
@@ -273,7 +273,8 @@ Normative packaging rules (resolves adversarial finding 1 — **exact pins, no c
 - `@earendil-works/pi-coding-agent` transitively pulls `@earendil-works/pi-agent-core` and
   `@earendil-works/pi-ai` in lockstep (`packages/coding-agent/package.json` deps), so pi-acp declares
   only the one direct pi dep. The freshness gate (§10.1) keeps it current.
-- `typebox` matches the monorepo (`1.3.2`); it builds the structured-output tool schema wrapper. pi
+- `typebox` matches the monorepo (`1.3.2`); it builds the full MCP bridge's synthetic resource, prompt,
+  completion, and subscription tool schemas. Pi
   consumes tool `parameters` as raw JSON Schema and strips symbol keys per provider
   (`openai-completions.ts:1110`, `bedrock-converse-stream.ts:918`, `mistral-conversations.ts:491`), so
   the typebox major mismatch with pi's bundled `1.1.38` is inert.
@@ -455,8 +456,12 @@ export interface PiAcpDeps {
   modelRuntime: ModelRuntime;
   /** Root for session JSONL. Default: undefined => pi's ~/.pi/agent/sessions/<encoded-cwd>. */
   sessionDir?: string;
-  /** MCP stdio client factory. Default: a real @modelcontextprotocol/sdk stdio client (§9.3). */
-  connectMcpClient(server: McpServerStdio, signal: AbortSignal): Promise<McpClientHandle>;
+  /** Full MCP client factory. Default: the matching real SDK stdio/HTTP/SSE client (§9.3). */
+  connectMcpClient(
+    server: McpServer,
+    signal: AbortSignal,
+    binding?: McpSessionBinding,
+  ): Promise<McpClientHandle>;
   /**
    * Cancellable timer for the wedged-agent grace window and MCP bounded liveness (§9.6, §9.3).
    * `sleep(ms, signal)` resolves after `ms` unless `signal` aborts first, in which case it rejects
@@ -667,8 +672,8 @@ through:** pi's `AgentSession.prompt(text, options)` builds the user message unc
 `userContent = [{ type:"text", text: expandedText }, ...options.images]`
 (`agent-session.ts:1167-1169`), so `prompt("", { images })` lands a well-formed multimodal user message
 (an empty text block plus the images) — pi does **not** reject an empty text string; the images carry the
-content (T4 covers it). Structured-output instruction text (§9.4), when armed, is prepended to the text
-buffer after this fold (which also makes the text buffer non-empty on a structured image-only turn).
+content (T4 covers it). The runner may embed its common schema instruction in the ordinary prompt text
+before ACP delivery (§9.4); pi-acp itself performs no private schema splice or turn-level arming.
 
 ### 6.2 Ordered delivery and the turn-settlement state machine (`src/session.ts`) — resolves adversarial finding 4 (ordering) and the settlement contradiction
 
@@ -767,8 +772,8 @@ is total and identical for live and replay:
   `createToolResultMessage` `content: result.content ?? []`); an empty array → an empty `content` array
   (a valid, terminal `tool_call_update` with no content blocks).
 - `rawOutput` = `r.details` when `details` is a non-`undefined` value, else the field is **omitted**
-  (never `null`, never the whole message). `details` is pi's structured tool payload — exactly what ACP
-  `rawOutput` ("raw structured output") is for.
+  (never `null`, never the whole message). `details` is the executing Pi tool's exact structured payload
+  (including an MCP operation's exact result/pages) — exactly what ACP `rawOutput` is for.
 - **No `type:"diff"` projection.** pi's `AgentToolResult` exposes no standardized old-text/new-text pair
   (only `content` + arbitrary `details`), so a diff content block would be fabricated. `read`/`edit`/
   `write` results are projected uniformly through `toContent` (pi renders a human-readable summary into
@@ -841,8 +846,8 @@ input, whose broken transport can deliver nothing (§6.2.1 invariant 1). A compa
 
 ### 6.6 Turn lifecycle and concurrency
 
-One ACP `session/prompt` drives one pi turn: convert content (§6.1), arm structured output if requested
-(§9.4), then `await session.prompt(text, { images })` (`agent-session.ts:1076`), which awaits
+One ACP `session/prompt` drives one pi turn: convert content (§6.1), then
+`await session.prompt(text, { images })` (`agent-session.ts:1076`), which awaits
 `agent.prompt()` plus pi's auto-retry/compaction loop and settles by emitting `agent_settled` in a
 `finally` (`agent-session.ts:1023-1034`). After it resolves: compute stopReason (§7) and usage (§6.5),
 emit `usage_update`, `await drain()` (§6.2), then resolve `{ stopReason, usage }` — this is the **normal**
@@ -1086,8 +1091,10 @@ The adapter holds three per-connection structures plus one terminal flag: a `Map
 transaction, its value the transaction's own `openController` whose `openSignal` gates acquisition and
 commit, §9.1.0), a `Set<sessionId>` (**tombstones**, §9.1.6), and a process-`disposed` boolean set by
 `PiAcpAgent.dispose()` (§9.1.0 / §3.2). Each `PiSession` owns one `AgentSession`, its translator
-subscription, its send queue (§6.2), its permission wrapper (§9.2), its bridged MCP clients (§9.3), and
-(when armed) its structured-output tool (§9.4). `sessionId` is pi's `SessionManager.getSessionId()`.
+subscription, its send queue (§6.2), its permission wrapper (§9.2), its full MCP bridge (§9.3), its
+completed model-catalog cache (§5), and its tracked-child registry (§9.6). Structured output is entirely
+client-hosted MCP injection (§9.4); no Pi session owns a private structured-output tool or capture state.
+`sessionId` is pi's `SessionManager.getSessionId()`.
 
 #### 9.1.0 Transactional acquisition, atomic reservation, and open-time races (resolves adversarial findings 7, 8; the opening-race gaps)
 
@@ -1098,8 +1105,9 @@ every awaited stage. Because Node runs the handler body to its first `await` wit
 
 1. **Reserve synchronously, before any `await`.** If `disposed` (§3.2) → reject `internalError`
    (`errorKind:"internal_error"`) — the connection is shutting down. For load/resume the id is
-   `request.sessionId`; for new/fork the id is not known until pi mints it, so those reserve on the minted
-   id at the first sync point after minting. Check `live.has(id) || opening.has(id)` → if set, reject
+   `request.sessionId`; new reserves the id minted by its in-memory `SessionManager`; fork allocates and
+   reserves its target id before MCP connect, then passes that exact id to `forkFrom({ id })` after MCP is
+   ready. Check `live.has(id) || opening.has(id)` → if set, reject
    `session_already_open` (row 13); check `tombstones.has(id)` → reject `session_terminated` (row 14).
    Otherwise construct `openController = new AbortController()`, set `opening.set(id, openController)`, and
    subscribe it to the request signal: `context.signal.addEventListener("abort", () =>
@@ -1107,10 +1115,13 @@ every awaited stage. Because Node runs the handler body to its first `await` wit
    every awaited step below. This closes the round-2 check-then-await-then-register race in which two
    concurrent `load`s for the same id could both pass a live-map check and both register (leaking one).
 2. **Acquire in order, tracking each resource, honoring `openSignal`:** validate cwd (row 11) → obtain the
-   `SessionManager` (create/open/forkFrom) → connect MCP (§9.3, all-or-nothing, each connect/list bounded
-   by `deps.mcpTimeoutMs` **and** cancellable by `openSignal`) →
-   `deps.createAgentSession({ …, modelRuntime: deps.modelRuntime })` → install the permission wrapper
-   + translator + (inactive) structured-output tool → (load only) replay + `drain()`. If `openSignal`
+   in-memory/opened `SessionManager` for new/load/resume (fork instead resolves its source and reserves a
+   target id) → connect the full MCP bridge (§9.3, all-or-nothing, each connect/list bounded by
+   `deps.mcpTimeoutMs` **and** cancellable by `openSignal`) → for fork only, perform the now-safe
+   `forkFrom(..., { id: targetId })` write → load and precedence-order the reserved/control inline
+   extensions → `deps.createAgentSession({ resourceLoader, settingsManager, sessionManager,
+   modelRuntime: deps.modelRuntime })` → bind extensions, cross the completed model-catalog barrier,
+   install the permission wrapper + translator → (load only) replay + `drain()`. If `openSignal`
    aborts at or between any step, the in-flight step is cancelled and the transaction proceeds to
    rollback (step 4). `forkFrom`'s eager write is the one step that cannot be un-done (§9.1.4); an
    `openSignal` abort strictly after it still rolls back the *live* state, leaving only a complete valid
@@ -1121,16 +1132,19 @@ every awaited stage. Because Node runs the handler body to its first `await` wit
    `opening.delete(id)`, and return the response. Because the gate check and `live.set` are synchronous,
    no close/dispose/cancel can interleave between them — a session can never be resurrected after a
    close/dispose that landed during opening.
-4. **Rollback on ANY failure OR gate-abort at any stage** (reverse order, best-effort, each step guarded
-   and bounded): call pi's **`AgentSession.dispose()`** (`agent-session.ts:799` — aborts pi's
-   retry/compaction/bash hooks + `agent.abort()`, invalidates extensions, cleans pi resources;
-   abort/unsubscribe alone would leak them), unsubscribe the translator, cancel + drop the send queue,
-   disconnect every MCP client already connected (each bounded by `deps.mcpTimeoutMs` so a hung `close()`
-   cannot wedge rollback), and `opening.delete(id)`. **No live registry entry, MCP child, listener, pi
-   resource, or structured tool remains.** A replay-`notify` failure (§6.2.1) is a stage-2 failure: it
+4. **Rollback on ANY failure OR gate-abort at any stage** (best-effort, each step guarded and bounded):
+   close tracked-child spawn admission first; synchronously start every acquired MCP wrapper's logical
+   close in reverse acquisition order (including HTTP termination); abort the binding lifetime, refresh,
+   and turn; start and await pi's **`AgentSession.abort()`** plus the child/refresh drains; only then
+   unsubscribe/drop the translator queue and call **`AgentSession.dispose()`** concurrently with the
+   already-started physical MCP closes. `AgentSession.dispose()` (`agent-session.ts:799`) remains required
+   to invalidate extensions and clean Pi resources; abort/unsubscribe alone would leak them. Finally
+   `opening.delete(id)`. **No live registry entry, MCP child, listener, Pi resource, inline-extension
+   capture, or tracked child remains.** A replay-`notify` failure (§6.2.1) is a stage-2 failure: it
    rolls back fully, so the id is NOT left live and a retry is a clean `session/load`, never a spurious
-   `session_already_open`. Disposal/disconnect errors during rollback are logged to stderr and never mask
-   the original rejection.
+   `session_already_open`. Non-child disposal/disconnect errors are logged to stderr and do not mask the
+   original rejection. A failed tracked-child/Pi-abort cleanup is the sole exception: it returns the exact
+   `child_cleanup_error`, retains hidden retry ownership, and overrides the original open error (§9.6).
 
 **Open-time race outcomes (pinned).**
 
@@ -1162,11 +1176,12 @@ hand-delete it (no pi delete API, §11). This satisfies "no half-initialized **l
 
 `validateCwd(request.cwd)` (row 11) → `deps.sessions.create(cwd, deps.sessionDir)`
 (`session-manager.ts:1441`; constructs in memory, writes no JSONL until the first append) → reserve the
-minted `getSessionId()` (§9.1.0 step 1) → connect the request's stdio MCP servers (§9.3; row 16/17 on
-failure, with rollback) → `deps.createAgentSession({ cwd, model?, thinkingLevel?, customTools,
-sessionManager, modelRuntime: deps.modelRuntime })` (§5.2) → install the permission wrapper (§9.2), the
-translator (§6.3), and the structured-output tool inactive (§9.4) → commit. Return
-`{ sessionId, configOptions: [thinkingLevelOption], modes: null }` (`NewSessionResponse`,
+minted `getSessionId()` (§9.1.0 step 1) → connect the request's stdio/Streamable-HTTP/legacy-SSE MCP
+servers (§9.3; row 16/17 on failure, with rollback) → load the reserved MCP/control inline extensions and
+`deps.createAgentSession({ resourceLoader, settingsManager, sessionManager,
+modelRuntime: deps.modelRuntime })` (§5.2) → bind extensions, await the completed filtered model catalog,
+and install the permission wrapper (§9.2) + translator (§6.3) → commit. Return
+`{ sessionId, configOptions: [thinkingLevelOption, modelOption], modes: null }` (`NewSessionResponse`,
 `types.gen.d.ts:2556`).
 
 #### 9.1.2 `session/load` (reopen + replay)
@@ -1247,12 +1262,13 @@ our client (§5).
    desc, `:1556`) — deterministic. If **none** → row 12 (`unknown_session`).
 
 Then: if the source is a live **busy** session (in-flight turn) → reject `session_busy` (do not fork
-mid-turn). `validateCwd(request.cwd)` (target, row 11). Connect the request's MCP servers **first**
-(all-or-nothing, §9.3) so an MCP failure rolls back before anything is written. Then
-`deps.sessions.forkFrom(sourcePath, request.cwd, deps.sessionDir)` (`session-manager.ts:1490` — the
-irreversible JSONL write; §9.1.0 covers a post-write `createAgentSession` failure). Reserve the minted
-new `getSessionId()`, `deps.createAgentSession({ sessionManager: forked, modelRuntime:
-deps.modelRuntime })`, install wrapper/translator/structured tool, commit a **new** `PiSession` under
+mid-turn). `validateCwd(request.cwd)` (target, row 11). Allocate and reserve the target id, then connect
+the request's MCP servers **first** (all-or-nothing, §9.3) so an MCP failure rolls back before anything
+is written. Then `deps.sessions.forkFrom(sourcePath, request.cwd, deps.sessionDir, { id: targetId })`
+(`session-manager.ts:1490` — the irreversible JSONL write; §9.1.0 covers a post-write
+`createAgentSession` failure). Load the inline extensions, `deps.createAgentSession({ resourceLoader,
+settingsManager, sessionManager: forked, modelRuntime: deps.modelRuntime })`, bind the completed model
+catalog, install the wrapper/translator, and commit a **new** `PiSession` under
 the new `sessionId`, and return it with fresh `configOptions`.
 
 #### 9.1.5 `session/list`
@@ -1295,10 +1311,10 @@ freshly-read, `modified`-desc-sorted list with a fixed page size of **100**.
 
 `session/close` **disposes** the `PiSession`. Close is normally idempotent success, but the retained
 child-cleanup tombstone in §9.6 is the one observable failure exception. The synchronous prefix of the
-shared cleanup generation first closes prompt/refresh and child-spawn admission, captures and starts
-termination for the current child epoch, starts every memoized MCP logical close, aborts the session
-lifetime, aborts the turn/refresh signals, and starts awaited `AgentSession.abort()` without serial
-gaps. If a turn is active, close joins its settlement and cleanup barrier before dropping the send queue,
+shared cleanup generation first closes child-spawn admission and starts termination for the captured
+epoch; then starts every memoized MCP logical close; then aborts the session lifetime; then aborts the
+turn/refresh signals; and finally starts awaited `AgentSession.abort()`, without serial gaps. If a turn
+is active, close joins its settlement and cleanup barrier before dropping the send queue,
 so any admitted `usage_update` and notification drain complete first. The live entry is removed in a
 `finally`, even when cleanup fails, and the cleanup owner remains addressable behind the tombstone.
 Ordinary `AgentSession.dispose()`/MCP-close/logging failures stay bounded best-effort diagnostics and do
@@ -1683,8 +1699,9 @@ PID acquisition, and remains owned until the leader and complete Unix process gr
 are proven gone. Drain closes admission first and includes late registrations and pending spawn leases.
 
 Request cancellation, `session/cancel`, close/dispose, notification failure, and in-turn bash timeout
-share one cleanup generation. It synchronously starts child termination, resource closure for disposal,
-turn/refresh abort, and awaited `AgentSession.abort()` without serial gaps. One absolute default
+share one cleanup generation. It closes child admission first; disposal then starts reverse-acquisition
+MCP logical/physical close before aborting the binding lifetime; turn/refresh abort follows; and awaited
+`AgentSession.abort()` starts last, without serial gaps. One absolute default
 5,000-ms deadline covers every child, lease, kill, leader close, and liveness proof. Unix uses detached
 process-group `SIGKILL`, leader close, and repeated `kill(-pgid,0)` until `ESRCH`; Windows awaits
 `taskkill /T /F` and leader close. A successful cancel-only drain compare-and-swaps a fresh open epoch
@@ -1850,9 +1867,9 @@ workflow→acp-agents→pi-acp dependency edges and the installed smoke checks a
     model-facing compacted context (summaries replace history), not the human transcript. `getBranch()`
     replays the full active branch (§9.1.2), which is what a client rehydrating a conversation wants.
 13. **Aliasing MCP tools only on collision** (the round-2 rule) instead of unconditional `mcp__…`
-    prefixing. Rejected (§9.3.2): "only on collision" requires knowing the built-in + extension name set
-    to detect a collision, but customTools are fixed at `createAgentSession` construction and pi has no
-    post-hoc registration API — a chicken-and-egg the unconditional prefix avoids. Unconditional
+    prefixing. Rejected (§9.3.2): the reserved inline extension needs a stable namespace that can be
+    reserved before remote catalogs and maintained across dynamic add/remove/re-add transactions.
+    Unconditional
     `mcp__<server>__<tool>` (the well-known MCP convention) puts every bridged tool in a reserved
     namespace pi built-ins/extensions never use, making MCP-vs-builtin/extension collisions structurally
     impossible and the naming fully deterministic (`_meta.toolName` still carries the alias for the
@@ -1953,7 +1970,7 @@ cites the normative statement it covers.
 
 | # | covers | assertion |
 |---|---|---|
-| T23 | §9.4 | the built-in PiBackend live leg uses the injected HTTP StructuredOutput tool plus common prompt fallback; no private Pi capability switch exists. Gated on an env key and skipped in credential-free CI. |
+| T23 | §9.4 | the built-in PiBackend live leg uses the injected HTTP StructuredOutput tool plus common prompt fallback; no private Pi capability switch exists. The provider call runs only behind its explicit env/key gate; credential-free CI reports a passing assertion that the gate remains closed. |
 | L1 | §9.3.7/§9.6 | the same gated cheap-model leg attaches a real HTTP MCP server and round-trips its tool, then starts `sleep 180`, stops the turn, and proves the tracked child is reaped |
 
 ### 13.5 Packaging / integration guards
@@ -2217,7 +2234,7 @@ implementation time per §0.
 - `packages/ai/src/providers/all.ts` — `getBuiltinModel` :53, `getBuiltinModels` :65.
 - `packages/ai/src/api/openai-completions.ts:1110`, `bedrock-converse-stream.ts:918`,
   `google-shared.ts:283-284`, `mistral-conversations.ts:491` — providers consume `tool.parameters` as
-  raw JSON Schema (symbol keys stripped), grounding the outputSchema-as-parameters injection (§9.4).
+  raw JSON Schema (symbol keys stripped), grounding MCP input-schema registration (§9.3).
 
 ### `@modelcontextprotocol/sdk@1.29.0` (MCP client, installed dist; version confirmed 1.29.0)
 

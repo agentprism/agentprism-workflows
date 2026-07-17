@@ -33,6 +33,11 @@ export class ChildCleanupFailure extends Error {
   }
 }
 
+export function isTaskkillAlreadyGone(output: string): boolean {
+  return /ERROR:\s+The process "[^"]+" not found\./i.test(output)
+    || /Reason:\s+There is no running instance of the task\./i.test(output);
+}
+
 /** One monotonic ownership epoch. A failed drain remains closing and is retryable. */
 export class ChildProcessRegistry {
   private state: "open" | "closing" | "closed" = "open";
@@ -206,12 +211,21 @@ export class ChildProcessRegistry {
         ? this.deps.taskkillTree(record.pid, deadlineSignal)
         : new Promise<void>((resolve, reject) => {
           const killer = spawn("taskkill", ["/PID", String(record.pid), "/T", "/F"], { windowsHide: true });
+          let output = "";
+          killer.stdout?.setEncoding("utf8");
+          killer.stderr?.setEncoding("utf8");
+          killer.stdout?.on("data", (chunk: string) => { output += chunk; });
+          killer.stderr?.on("data", (chunk: string) => { output += chunk; });
           killer.once("error", reject);
-          killer.once("close", (code) => code === 0
+          killer.once("close", (code) => code === 0 || isTaskkillAlreadyGone(output)
             ? resolve()
             : reject(new Error(`taskkill exited ${code}`)));
         });
-      await raceAbort(taskkill, deadlineSignal);
+      try {
+        await raceAbort(taskkill, deadlineSignal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
     } else {
       if (this.deps.killProcessGroup) {
         this.deps.killProcessGroup(record.pgid ?? record.pid);

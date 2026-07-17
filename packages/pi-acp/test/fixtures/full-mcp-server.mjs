@@ -16,8 +16,10 @@ import {
   UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-export function createConformanceServer() {
+export function createConformanceServer(options = {}) {
   let revision = 0;
+  let raceId = 0;
+  let transportClose;
   const server = new Server(
     { name: "pi-acp-full-mcp-fixture", version: "1.0.0" },
     {
@@ -49,6 +51,20 @@ export function createConformanceServer() {
         { name: "projection", description: "project every stable result block", inputSchema: { type: "object", additionalProperties: false } },
         { name: "remote_error", description: "return an MCP error result", inputSchema: { type: "object", additionalProperties: false } },
         { name: "hang", description: "wait for cancellation", inputSchema: { type: "object", additionalProperties: false } },
+        {
+          name: "race_feature",
+          description: "exercise incoming client-feature terminal races",
+          inputSchema: {
+            type: "object",
+            required: ["feature", "cause"],
+            properties: {
+              feature: { type: "string", enum: ["sampling", "roots", "form", "url"] },
+              cause: { type: "string", enum: ["ordinary", "peer", "turn", "timeout", "session", "transport"] },
+            },
+            additionalProperties: false,
+          },
+        },
+        { name: "isolate_url", description: "hold one equal remote elicitation id", inputSchema: { type: "object", additionalProperties: false } },
         { name: "trigger_dynamic", description: "trigger list change", inputSchema: { type: "object", additionalProperties: false } },
       ],
       nextCursor: "tool-page-2",
@@ -66,6 +82,93 @@ export function createConformanceServer() {
         if (extra.signal.aborted) return reject(extra.signal.reason);
         extra.signal.addEventListener("abort", () => reject(extra.signal.reason), { once: true });
       });
+    }
+    if (params.name === "race_feature") {
+      const { feature, cause } = params.arguments;
+      let outerStartSent = false;
+      if (cause === "session" && extra._meta?.progressToken !== undefined) {
+        await extra.sendNotification({
+          method: "notifications/progress",
+          params: { progressToken: extra._meta.progressToken, progress: 1, total: 1, message: `race-started:${feature}:${cause}` },
+        });
+        outerStartSent = true;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      const peer = new AbortController();
+      let markStarted;
+      const started = new Promise((resolve) => { markStarted = resolve; });
+      const options = {
+        onprogress: () => markStarted(),
+        ...(cause === "peer" ? { signal: peer.signal } : {}),
+      };
+      let incoming;
+      if (feature === "sampling") {
+        incoming = server.createMessage({
+          messages: [{ role: "user", content: { type: "text", text: `race:${cause}` } }],
+          maxTokens: 8,
+          metadata: { raceFeature: feature, raceCause: cause },
+        }, options);
+      } else if (feature === "roots") {
+        incoming = server.listRoots(undefined, options);
+      } else if (feature === "form") {
+        incoming = server.elicitInput({
+          mode: "form",
+          message: `race:${cause}`,
+          requestedSchema: {
+            type: "object",
+            required: ["answer"],
+            properties: { answer: { type: "string" } },
+          },
+        }, options);
+      } else {
+        incoming = server.elicitInput({
+          mode: "url",
+          message: `race:${cause}`,
+          elicitationId: `race-${cause}-${++raceId}`,
+          url: "https://example.invalid/race",
+        }, options);
+      }
+      // A peer/session/turn/timeout can settle the protocol request while this
+      // fixture is still awaiting its deterministic outer progress barrier.
+      // Observe that rejection immediately, then assert it below.
+      incoming.catch(() => undefined);
+      // A deliberately immediate timeout may commit before its fire-and-forget
+      // 0/1 progress frame is received. The host-operation barrier in the test
+      // triggers that timeout, so it is the deterministic admission proof.
+      if (cause === "timeout" || cause === "session") markStarted();
+      await started;
+      if (!outerStartSent && extra._meta?.progressToken !== undefined) {
+        await extra.sendNotification({
+          method: "notifications/progress",
+          params: { progressToken: extra._meta.progressToken, progress: 1, total: 1, message: `race-started:${feature}:${cause}` },
+        });
+      }
+      if (cause === "peer") peer.abort(new Error("fixture peer cancellation"));
+      if (cause === "transport") {
+        if (options.exitOnTransportRace) {
+          setImmediate(() => process.exit(0));
+          await new Promise(() => undefined);
+        } else {
+          transportClose ??= server.close();
+          await transportClose;
+        }
+      }
+      try {
+        const value = await incoming;
+        return { content: [{ type: "text", text: JSON.stringify({ status: "resolved", value }) }] };
+      } catch {
+        return { content: [{ type: "text", text: JSON.stringify({ status: "rejected" }) }] };
+      }
+    }
+    if (params.name === "isolate_url") {
+      const result = await server.elicitInput({
+        mode: "url",
+        message: "isolate-url",
+        elicitationId: "equal-remote",
+        url: "https://example.invalid/isolate",
+      });
+      if (result.action === "accept") await server.createElicitationCompletionNotifier("equal-remote")();
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     }
     if (params.name === "projection") {
       const data = Buffer.from([0, 1, 2, 3]).toString("base64");
@@ -178,6 +281,6 @@ export function createConformanceServer() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const server = createConformanceServer();
+  const server = createConformanceServer({ exitOnTransportRace: true });
   await server.connect(new StdioServerTransport());
 }

@@ -87,6 +87,22 @@ test("the executable Pi contract stays grounded in the frozen pi-acp spec", () =
   assert.ok(spec.includes("mcpCapabilities: { http: true, sse: true }"));
   assert.ok(!spec.includes('agentCapabilities._meta["@automatalabs/pi-acp"]'));
   assert.ok(!spec.includes("{ outputSchema: true }"));
+  for (const retired of [
+    /when armed[^\n]*structured-output tool/i,
+    /install[^\n]*(?:inactive )?structured-output tool/i,
+    /connect the request's stdio MCP servers/i,
+    /configOptions:\s*\[thinkingLevelOption\]/,
+    /wrapper\/translator\/structured tool/i,
+    /createAgentSession\([^\n]*customTools/i,
+    /arm structured output if requested/i,
+    /MCP stdio client factory/i,
+    /Disposal\/disconnect errors[^\n]*never mask/i,
+    /observable structured-tool collision/i,
+  ]) {
+    assert.doesNotMatch(spec, retired, `frozen pi-acp spec retains a retired Pi mechanism: ${retired.source}`);
+  }
+  assert.match(spec, /MCP is connected \*\*before\*\*\s*`forkFrom`/);
+  assert.match(spec, /fork allocates and\s+reserves its target id before MCP connect/);
   for (const methodId of PI_ACP_PROTOCOL_CONTRACT.authMethodIds) {
     assert.ok(spec.includes(methodId), `frozen pi-acp spec must contain auth method ${methodId}`);
   }
