@@ -2047,7 +2047,7 @@ ahead/behind counts, and cited-surface diffs below remained unchanged in that fi
 with `@earendil-works/pi-agent-core@0.80.10`, `@earendil-works/pi-ai@0.80.10`). Freshness re-checked at
 authoring: `gh api repos/earendil-works/pi/releases/latest` = `v0.80.10`, `npm view … version` = `0.80.10`
 — pin is current. **Forward-compat risk note:** upstream `main` is at
-`5124c61b2527e90b10674a286ac69ad5c49d0560`, exactly **17** unreleased commits ahead of the tag. Its
+`f1a466b19d59cde009bd2d6da57b063518e299b8`, exactly **17** unreleased commits ahead of the tag. Its
 release→main diff now touches cited `packages/ai/test/retry.test.ts` and the provider/extension seams
 `agent-session-services.ts`, `agent-session.ts`, `extensions/{loader,runner,types}.ts`, and
 `model-runtime.ts` (96 insertions/7 deletions across those seven files), including unreleased native-
@@ -2712,9 +2712,9 @@ removal. There is no compatibility flag and no dual bespoke/standard mode.
 | package at the pinned base | required bump/target | compatibility statement |
 |---|---|---|
 | `@automatalabs/pi-acp@0.1.3` | **minor → `0.2.0`** | Adds HTTP/SSE and full stable MCP/client capabilities, model advertisement, and cleanup errors; removes the bespoke `_meta.outputSchema` namespace/tool contract. Direct clients that sent that private metadata must instead attach a client-hosted HTTP `StructuredOutput` MCP server. The package is pre-1.0, so this intentional contract removal ships in the minor bump. |
-| `@automatalabs/acp-agents@0.30.1` | **minor → `0.31.0`** | Pi changes from a native/private structured channel to the standard injected MCP channel; the caller also gives Pi cleanup its required close/process margins, quarantines a cleanup-dirty process, and maps `child_cleanup_error` non-recoverably. Making the shared native hook optional is source-compatible for existing implementers and non-Pi timeout/grace behavior is preserved. |
-| `@automatalabs/workflows@0.38.1` | **patch → `0.38.2`** | Republishes the CLI/runtime dependency edge so `config pi` and workflow Pi runs resolve the new acp-agents/pi-acp behavior rather than the old workspace-published dependency set. No workflow schema or resume identity changes. |
-| `@automatalabs/mcp-server@0.15.1` | **patch → `0.15.2`** | Publishes the regenerated authoring prompt that describes Pi's HTTP/SSE and standard structured-output behavior. |
+| `@automatalabs/acp-agents@0.30.2` | **minor → `0.31.0`** | Pi changes from a native/private structured channel to the standard injected MCP channel; the caller also gives Pi cleanup its required close/process margins, quarantines a cleanup-dirty process, and maps `child_cleanup_error` non-recoverably. Making the shared native hook optional is source-compatible for existing implementers and non-Pi timeout/grace behavior is preserved. |
+| `@automatalabs/workflows@0.38.2` | **patch → `0.38.3`** | Republishes the CLI/runtime dependency edge so `config pi` and workflow Pi runs resolve the new acp-agents/pi-acp behavior rather than the old workspace-published dependency set. No workflow schema or resume identity changes. |
+| `@automatalabs/mcp-server@0.15.2` | **patch → `0.15.3`** | Publishes the regenerated authoring prompt that describes Pi's HTTP/SSE and standard structured-output behavior. |
 
 `@automatalabs/workflow-engine` and `@automatalabs/shared-types` receive no bump because their existing
 public MCP union/agent option already carries the required values and this train changes no source in
@@ -2724,7 +2724,7 @@ must verify the published `@automatalabs/workflows` manifest resolves the new ac
 that the published acp-agents manifest resolves the new pi-acp release. No package is announced as the
 issue #224 release until all four are present and the post-publish smoke checks pass:
 
-1. `npx @automatalabs/workflows@0.38.2 config pi` exposes both `thinkingLevel` and `model` under §5.
+1. `npx @automatalabs/workflows@0.38.3 config pi` exposes both `thinkingLevel` and `model` under §5.
 2. A Pi workflow using an HTTP MCP fixture completes a tool call and a schema'd call captures through
    the injected `StructuredOutput` host under §7.2.
 3. Installed tarball/manifest inspection contains no Pi `_meta.outputSchema` namespace or
