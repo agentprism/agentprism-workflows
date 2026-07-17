@@ -56,7 +56,9 @@ pin silently (the pi-acp spec §0 obligation, extended here to the new surfaces 
 1. Fresh temp clone of `https://github.com/earendil-works/pi`, then
    `git fetch origin main --tags` (a tag-only fetch is insufficient for the release→main risk check).
 2. `gh api repos/earendil-works/pi/releases/latest --jq .tag_name` **and**
-   `npm view @earendil-works/pi-coding-agent version`; the two MUST agree.
+   `npm view @earendil-works/pi-coding-agent version`,
+   `npm view @earendil-works/pi-agent-core version`, and `npm view @earendil-works/pi-ai version`;
+   all three npm values MUST agree with the release.
 3. Compare against the pin in §13 (`v0.80.10` / commit `8dc78834cde4e329284cf505f9e3f99763df5529` / npm
    `0.80.10`). **If the pin is no longer the latest release, that is a STOP:** re-verify every pi
    citation this contract adds — the inline-extension tool-registration seam
@@ -64,7 +66,8 @@ pin silently (the pi-acp spec §0 obligation, extended here to the new surfaces 
    settings seam (`settings-manager.ts`),
    tool-registry internals (`agent-session.ts` `_customTools`/`_refreshToolRegistry`/`setActiveToolsByName`/
    `getAllTools`/`abort`), the LLM completion seam (`model-runtime.ts` `completeSimple`/
-   `getAvailableSnapshot`), and the bash-child kill path (`tools/bash.ts`, `exec.ts`, `utils/shell.ts`) —
+   `getAvailableSnapshot`, `ai/src/models.ts` credential/`filterModels` availability, and provider
+   filters), and the bash-child kill path (`tools/bash.ts`, `exec.ts`, `utils/shell.ts`) —
    against the new latest, update the pins (§13) and every changed claim, and re-open this contract for
    review before building.
 4. Fresh temp clone `https://github.com/modelcontextprotocol/typescript-sdk`, run
@@ -75,7 +78,9 @@ pin silently (the pi-acp spec §0 obligation, extended here to the new surfaces 
    `gh api repos/agentclientprotocol/typescript-sdk/releases/latest --jq .tag_name` with
    `npm view @agentclientprotocol/sdk version`. If either pair is
    no longer `v1.29.0` / `1.29.0` or `v1.2.1` / `1.2.1`, STOP: re-verify the MCP transport, lifecycle,
-   completion, subscription, progress/cancellation, output-validator, client-handler, and notification surfaces and the
+   completion, subscription, progress/cancellation, output-validator, client-handler, raw transport
+   error/close behavior, reconnect configuration, Streamable HTTP DELETE termination, sampling
+   `systemPrompt`/message metadata, exact-schema elicitation, and notification surfaces and the
    ACP form/URL elicitation request + completion-notification surfaces against the new release source;
    update the release tag, commit, npm pin, citations, and forward-risk note before building.
 5. **Base-freshness (blocking):** fetch `origin/main`; if it has advanced since the base commit
@@ -209,7 +214,8 @@ pi ships no native MCP; the adapter is the MCP client for every server ACP's `mc
 deliver (except `acp`, which stays client-hosted — §12.6 non-goal). The MCP TS SDK
 (`@modelcontextprotocol/sdk@1.29.0`) already implements the whole client surface; the work is wiring it
 into pi's seams. `packages/pi-acp/src/mcp-bridge.ts` grows from a stdio-only slice into a full MCP client
-module; `src/deps.ts` gains the client-feature dependency seams. Every feature is default-on when the
+module; sampling uses the already-injected `deps.modelRuntime` and adds no parallel completion
+dependency. Every feature is default-on when the
 server advertises its corresponding capability. The adapter imposes no server-count, tool-count,
 page-count, response-size, or token cap; protocol schemas and provider context limits still apply.
 
@@ -221,25 +227,81 @@ typed servers (`mcp-bridge.ts:214-216` removed):
 | ACP transport (`McpServerConfig`) | MCP SDK transport | construction |
 |---|---|---|
 | stdio (`{ command, args, env }`) | `StdioClientTransport` (`src/client/stdio.ts:88-130`) | as today (`mcp-bridge.ts:66-70`) |
-| `{ type:"http", url, headers }` | `StreamableHTTPClientTransport` (`src/client/streamableHttp.ts:120-155`) | `new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: fold(headers) } })` |
-| `{ type:"sse", url, headers }` | `SSEClientTransport` (`src/client/sse.ts:57-88`) | `new SSEClientTransport(new URL(url), { requestInit: { headers: fold(headers) } })` |
+| `{ type:"http", url, headers }` | `StreamableHTTPClientTransport` (`src/client/streamableHttp.ts:120-155`) | `new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: fold(headers) }, fetch: observedFetch, reconnectionOptions: NO_RECONNECT })` |
+| `{ type:"sse", url, headers }` | `SSEClientTransport` (`src/client/sse.ts:57-88`) | `new SSEClientTransport(new URL(url), { requestInit: { headers: fold(headers) }, fetch: guardedSseFetch })` |
 | `{ type:"acp", … }` | not served by pi-acp | rejected `unsupported_mcp_transport` (client-hosted; §12.6) |
 
 Every constructed SDK transport is immediately wrapped in one adapter-owned
 `CloseSignallingTransport`. The wrapper delegates `start`, `send`, `sessionId`, and
-`setProtocolVersion` without transformation and forwards the raw transport's `onmessage`/`onerror`; its one
-semantic addition is a `signalClose()` once-gate. `close()` calls `signalClose()` synchronously **before**
-awaiting the raw transport's `close()`, then delegates that physical close; a raw/natural `onclose`
-also calls the same gate. Pass the wrapper to `Client.connect` but retain the raw transport for
-transport-specific construction/PID cleanup. This is required by the SDK's own `Transport` contract,
-which says `onclose` is invoked when `close()` is called (`src/shared/transport.ts:74-127`), and by the
-protocol layer, which aborts all incoming request-handler signals only from its installed `onclose`
-callback and whose `close()` delegates to the installed transport (`src/shared/protocol.ts:607-618,644-660,942-944`). At the pin, HTTP/SSE call `onclose` directly
-(`src/client/streamableHttp.ts:442-449`; `src/client/sse.ts:237-241`), but
-stdio `close()` can return after sending `SIGKILL` without awaiting the process `close` event
-(`src/client/stdio.ts:204-243`). The once-wrapper makes disposal ordering transport-independent: SDK
-handler suppression happens synchronously, a late raw close event is harmless, and a hung physical
-close remains subject to the existing outer bound without leaving an incoming handler alive.
+`setProtocolVersion` without transformation and forwards `onmessage`. It owns the raw `onclose` and
+`onerror` callbacks and exposes one `signalClose()` once-gate. A raw `onclose` calls that gate. The
+wrapper's `close()` calls it synchronously, then, for Streamable HTTP, runs the bounded DELETE policy
+below, and finally calls the raw transport's `close()` even when DELETE failed or timed out. With no
+pre-close step (stdio/SSE), raw `close()` is invoked in that same synchronous call stack. Pass the
+wrapper to `Client.connect` and retain the raw transport only behind this owner; no other code calls raw
+`close()` or `terminateSession()`.
+
+The logical-close step is required by the SDK's own `Transport` contract, which says `onclose` is
+invoked when `close()` is called (`src/shared/transport.ts:74-127`), and by the protocol layer: only its
+installed `onclose` callback aborts incoming request handlers, clears the transport, and rejects pending
+requests, while `Client.close()` merely delegates to the installed transport
+(`src/shared/protocol.ts:607-674,942-944`). At the pin, HTTP/SSE invoke `onclose` only from explicit
+`close()` (`src/client/streamableHttp.ts:442-449`; `src/client/sse.ts:237-241`); stdio additionally
+invokes it for a natural child close (`src/client/stdio.ts:141-144`) and can return from explicit close
+after `SIGKILL` without awaiting that event (`src/client/stdio.ts:204-243`). The wrapper therefore makes
+adapter-initiated disposal transport-independent without falsely claiming that `Client.onclose`
+reports a natural HTTP/SSE failure.
+
+**Transport-specific fatal observation and reconnect suppression (pinned).** Raw errors are classified
+inside the wrapper before any optional forwarding to the SDK protocol layer; protocol-layer
+`Client.onerror` events remain a separate nonfatal diagnostic class (§3.5).
+
+- **stdio:** raw process `close` is fatal in `opening|open`. Raw pipe/parser `onerror` remains nonfatal
+  unless followed by process close; it is forwarded to `Client.onerror`.
+- **Streamable HTTP:** `NO_RECONNECT` is exactly
+  `{ initialReconnectionDelay:0, maxReconnectionDelay:0, reconnectionDelayGrowFactor:1,
+  maxRetries:0 }`. The pinned transport otherwise defaults to two reconnects and calls only `onerror`
+  after retry exhaustion (`streamableHttp.ts:6-12,49-75,271-299`). With zero retries, GET SSE normal
+  EOF and stream error both reach raw `onerror` without scheduling a fetch
+  (`streamableHttp.ts:301-409`); every raw HTTP `onerror` in `opening|open` is fatal. `observedFetch`
+  additionally rejects a successful `text/event-stream` GET with a missing body as fatal before it is
+  returned. The initialized notification starts that optional GET stream
+  (`streamableHttp.ts:558-566`). A 405 response means the server deliberately provides no ambient GET
+  stream (`streamableHttp.ts:226-240`): this is **request-driven idle mode**, not a failure. Passage of
+  time alone never declares such an idle connection dead because the transport exposes no liveness
+  channel; its next outgoing request is the probe, and a raw transport error or the operation timeout
+  disables the server. A POST SSE response that closes before returning its JSON-RPC result is covered
+  by the same operation-timeout rule. Thus a GET-capable idle peer is detected at stream EOF/error,
+  while a 405 idle peer is detected at its first failed/timed-out operation; no polling or invented
+  keepalive is claimed.
+- **legacy SSE:** every raw `SSEClientTransport.onerror` in `opening|open` is fatal. That callback is
+  the pinned transport's only natural EventSource termination/failure signal
+  (`sse.ts:136-169`); parse and endpoint errors use it too (`sse.ts:175-205`). The fatal handler calls
+  `wrapper.close()` synchronously before returning. `SSEClientTransport.close()` synchronously closes
+  its EventSource before its first promise yield (`sse.ts:237-241`). In addition,
+  `guardedSseFetch` checks the wrapper state before delegating and rejects without an underlying network
+  call after the fatal transition; the pinned transport routes that fetch into both EventSource GET and
+  recurring POST (`sse.ts:136-147,243-259`). Thus even a transitive EventSource retry cannot reconnect.
+  Treating a malformed legacy event as fatal is
+  intentionally conservative: the client cannot distinguish a recoverable stream exception from the
+  same `onerror` event used for connection loss.
+
+All fatal paths first claim the per-server once-only state transition in §3.5 and synchronously call
+`signalClose()`; a simultaneous outgoing completion can therefore never publish after peer close.
+Errors caused after state becomes `closing|closed|disabled` are disposal noise and are suppressed.
+There is no adapter reconnect and neither SDK transport may issue one.
+
+**Streamable HTTP session termination.** Intentional session disposal, failed-open rollback after a
+session id was learned, and a fatal Streamable HTTP disable make a best-effort explicit session
+termination attempt because `Client.close()` itself sends no DELETE. After state changes to
+`closing`/`disabled` and `signalClose()` has rejected protocol work, the wrapper calls the retained raw
+`terminateSession()` under one `deps.mcpTimeoutMs` bound, then calls raw `close()` in `finally` under
+the ordinary close bound. `terminateSession()` is a no-op without a session id, sends DELETE with the
+session header when present, treats HTTP 405 as a supported refusal, clears the id after success/405,
+and reports other statuses/errors (`streamableHttp.ts:612-652`). Success and 405 are silent. Error or
+timeout emits only `[mcp:<server>] session termination failed` to stderr, never masks the original
+open/close/disable outcome, and never skips physical close. All servers' wrapper closes are started
+without awaiting between starts; DELETE-before-close is ordered only within one server.
 
 `fold(headers)` creates a WHATWG `Headers` object and calls `append(name, value)` in input order. WHATWG
 combines repeated names into one field value while retaining each value in order; that is the exact wire
@@ -249,13 +311,15 @@ configured `requestInit.headers` reach both GET and POST on both HTTP transports
 `requestInit`; GET does not: Streamable HTTP builds a new GET init, while legacy SSE GET spreads
 `eventSourceInit`. The adapter supplies only `requestInit.headers`, so it relies on exactly the common
 behavior the pin implements. Call
-`client.connect(transport, { timeout: deps.mcpTimeoutMs, signal: sessionSignal })` so
+`client.connect(transport, { timeout: deps.mcpTimeoutMs,
+signal: anySignal([sessionSignal, openSignal]) })` so
 the SDK bounds its initialize request (`src/client/index.ts:483-502`). Retain the existing outer
 `bounded()` race around the entire connect: the pinned SDK starts the transport in
 `super.connect(transport)` before it uses those request options, so the options do not bound a hung
 transport start, and the outer race also observes a late detached rejection. Every other outgoing
 request receives `deps.mcpTimeoutMs` (default 60,000 ms) as SDK `RequestOptions.timeout` and is also
-bounded for detached-promise safety. Every outgoing request receives `sessionSignal`; `tools/call` and
+bounded for detached-promise safety. Every outgoing request receives `sessionSignal`; opening operations
+also combine the lifecycle transaction's `openSignal`, while `tools/call` and
 every synthetic-tool request additionally combine the current turn signal. Incoming
 sampling/elicitation handlers combine the SDK request signal, the
 session-lifetime signal, the active turn signal when one exists, and the same timeout around their
@@ -264,6 +328,28 @@ failed/timed-out connect closes the transport it opened, extending
 the existing stdio orphan-child guarantee to `transport.close()` for every transport. The
 `connectMcpClient` DI factory remains available for unit fault injection, but §7 separately exercises
 the real SDK transports.
+
+**Outgoing-operation terminal arbiter (exact).** Connect/initialize, initial and refresh lists, remote
+calls, and every synthetic request use one `settleOnce` wrapper around the SDK request plus outer bound;
+both promises receive rejection observers before the race. Immediately before committing an outcome,
+already-observable conditions have this precedence: (1) lifecycle request/turn abort, (2) session
+disposal, (3) per-server fatal/peer close, (4) `deps.mcpTimeoutMs` expiry, (5) operation completion or
+rejection. Otherwise the first callback to claim `settleOnce` wins. This ordering preserves the frozen
+open-request cancellation contract: `$/cancel_request` during new/load/resume/fork rolls back and
+propagates the SDK abort so ACP emits `-32800`, even at the timeout boundary. Close/dispose of an
+opening transaction produces `internal_error -32603` for that opening request (the racing
+`session/close` itself still succeeds); it is a global gate abort, never a fabricated
+`mcp_init_error`. If child cleanup then fails, §3.5's stronger error overrides either outcome.
+An ordinary open-time timeout or transport/protocol failure that wins becomes the server-attributable
+`mcp_init_error`; a peer fatal observed first is the same open error. During a turn, request/turn abort
+produces no tool failure after the turn settles; session disposal/peer close produces the ordinary fixed
+`MCP tool <alias> failed` only if the turn is still live; timeout produces `MCP tool <alias> timed out`.
+For Streamable HTTP request-driven idle mode, that timeout also claims the server fatal-disable task.
+A refresh cancelled by close/disposal exits silently. A refresh rejected because the peer-disable task
+won is suppressed by that task and emits **no** second `tools/list refresh failed` diagnostic; a timeout
+or other refresh failure while the server remains open retains the fixed refresh-failed diagnostic.
+Late resolve/reject/progress callbacks are consumed and cannot emit a second result, diagnostic, update,
+or unhandled rejection.
 
 **Truthful advertisement (derived from owner quote 3).** `initialize` advertises
 `mcpCapabilities: { http: true, sse: true }` instead of `{}` (`agent.ts:81`). stdio stays the implicit
@@ -474,7 +560,9 @@ argument to an **inline extension**. Concretely:
    `{ ...base, extensions: [reservedMcpExtension,
    ...base.extensions.filter(e => e !== reservedMcpExtension)] }`: the reserved MCP extension is first;
    **every other extension, including the control extension, retains its original relative order**;
-   `runtime` and `errors` retain identity. Missing/duplicate matches fail open as `mcp_init_error`.
+   `runtime` and `errors` retain identity. Missing/duplicate inline-extension matches or changed
+   runtime/errors identity are session-global loader failures and fail open as
+   `extension_setup_error -32603` (§9), with no fabricated server field.
    Pi's `getAllRegisteredTools()` is first-registration-per-name
    (`extensions/runner.ts:421-432`), so only the reserved `mcp__…` namespace gains adapter precedence.
    Configured extensions continue to run their ordered `before_agent_start` handlers before the
@@ -490,12 +578,13 @@ argument to an **inline extension**. Concretely:
    `deps.createAgentSession({ resourceLoader, settingsManager, … })` (`sdk.ts:71,76`). The inline
    control factory reads its shell path/command prefix after loader reload for §8. After construction it
    MUST verify `session.getAllTools()` reports
-   `sourceInfo.path === "<inline:agentprism-pi-acp-mcp>"` for every live MCP alias. For `bash`, either
+   `sourceInfo.path === "<inline:agentprism-pi-acp-mcp>"` for every live MCP alias; an alias mismatch is
+   server-attributable `mcp_init_error` naming the configured server that owns it. For `bash`, either
    (a) no configured extension registered it and the winner MUST have
    `sourceInfo.path === "<inline:agentprism-pi-acp-control>"`, or (b) a configured extension registered
    it and that configured source MUST remain the winner; case (b) is intentionally outside adapter
-   child tracking under Non-goal 12.11. Mere name presence or a different winner fails open as
-   `mcp_init_error` and triggers §3.5 rollback.
+   child tracking under Non-goal 12.11. A missing/wrong `bash` or control-extension winner is the global
+   `extension_setup_error` and triggers §3.5 rollback.
 5. The session owns **one session-wide serialized refresh transaction queue**, one
    refresh-lifetime controller, and an `open | closing | closed | poisoned` refresh state. Per-server
    dirty bits coalesce repeated notifications into one additional pass, but no two servers ever prepare
@@ -704,6 +793,17 @@ deliberately distinguishable only by the absent terminal `1`; no private metadat
    preservation and zero markers on the outbound body. The bridge is request-local, cannot mutate
    persisted Pi history, and rejects a provider payload that happens to echo or duplicate a marker.
 
+   `params.systemPrompt` maps directly to the request-local Pi `Context.systemPrompt`
+   (`MCP types.ts:1742-1751`; Pi `packages/ai/src/types.ts:450-454`): absent stays `undefined` and is
+   omitted, empty stays the empty string, and a non-empty value is copied byte-for-byte. It is never
+   trimmed, prefixed, appended to, or combined with the ACP session's system prompt or any MCP server
+   `instructions`; those belong to ordinary agent turns, while sampling is this isolated
+   `completeSimple` call. `SamplingMessage._meta` plus content-block `annotations`/`_meta` are
+   intentionally ignored rather than forwarded (`types.ts:1144-1213,1729-1737`): Pi messages have no
+   corresponding opaque field, and treating one as provider metadata or prompt text would invent
+   control/data semantics.
+   This is distinct from top-level `params.metadata`, which is forwarded as specified below.
+
    The handler always uses the ACP session's active model. `modelPreferences` is advisory and does not
    authorize an attached MCP server to change the workflow author's provider, cost, or data-routing
    choice. `maxTokens`, `temperature`, metadata, and the combined SDK-request, session-lifetime,
@@ -717,11 +817,15 @@ deliberately distinguishable only by the absent terminal `1`; no private metadat
    earliest requested stop sequence and reports `stopReason: "stopSequence"`: concatenate returned text
    blocks, find the smallest UTF-16 index of any requested sequence (ties use request-array order), and
    slice before that index. With no match, Pi `stop` maps to MCP `endTurn`; `length` maps to
-   `maxTokens`. The result role is `assistant`, model is
+   `maxTokens`. The pure `mapMcpSamplingResult(message: AssistantMessage, stopSequences)` mapper owns
+   response conversion. At this pin Pi `AssistantMessage.content` is exactly
+   `TextContent | ThinkingContent | ToolCall` (`packages/ai/src/types.ts:388-401`): concatenate text
+   blocks in order, omit thinking blocks, and reject if any tool call exists because sampling tools were
+   not advertised. The result role is `assistant`, model is
    `message.provider + "/" + (message.responseModel ?? message.model)`, content is the single stable
-   `{ type:"text", text:<concatenated/truncated text> }` block, and thinking is not exposed. The response
-   schema also permits image/audio, so the injected `completeMcpSample` test seam must preserve either
-   exact stable block if a Pi provider extension returns one; it must not stringify it. Pi `error`
+   `{ type:"text", text:<concatenated/truncated text> }` block, and thinking is not exposed. The mapper
+   has no image/audio output arm because production `modelRuntime.completeSimple` cannot return one at
+   the pinned Pi type; no broader or test-only completion dependency is introduced. Pi `error`
    fails with MCP `InternalError` `-32603` and exact message `MCP sampling failed`; `aborted` follows the
    arbiter row that caused it or otherwise fails `-32603` with `MCP sampling cancelled`; and unexpected
    tool output fails `-32603` with `MCP sampling returned unsupported tool output` because sampling
@@ -735,14 +839,13 @@ deliberately distinguishable only by the absent terminal `1`; no private metadat
    `unstable_createElicitation`, carrying bound `sessionId`, mode, message, and the mode-specific
    requested schema or URL. ACP `decline`/`cancel` map directly back. For form `accept`, the adapter
    requires a non-null content object and validates it **without coercion or default application** against
-   the exact request's `requestedSchema` augmented with `additionalProperties:false`. It uses the same
+   the request's exact `requestedSchema`, byte-for-byte and without adding/removing any keyword. It uses the same
    per-server `AjvJsonSchemaValidator` already supplied to the MCP client
-   (`ajv-provider.ts:9-20,59-96`); compilation happens before the ACP call. This enforces required keys,
-   primitive and integer types, string/array length, enum/oneOf/anyOf membership, numeric bounds, formats,
-   and — if a future/ACP-carried schema contains it — pattern, while rejecting every extra key. The
-   pinned MCP 1.29.0 request schema itself permits only its flat primitive subset and does not carry a
-   `pattern` keyword (`types.ts:1848-2001`); the validator helper nevertheless pins pattern behavior so
-   ACP 1.2.1's wider schema (`types.gen.ts:1072-1119`) cannot create a future bypass. A valid content
+   (`ajv-provider.ts:9-20,59-96`); compilation happens before the ACP call. This enforces exactly the
+   keywords the server sent. In particular, an undeclared extra property is accepted when the schema
+   does not forbid it; the adapter never synthesizes `additionalProperties:false`, defaults, coercion,
+   or an ACP-only keyword. The pinned MCP server helper likewise compiles `requestedSchema` verbatim
+   (`server/index.ts:550-603`). A valid content
    object is returned byte-for-byte. Missing content or validation failure throws MCP `InvalidParams`
    `-32602` with exact fixed message `Invalid MCP elicitation response`; validator details and submitted
    values are never echoed. A schema-compilation/validator throw becomes MCP `InternalError` `-32603`
@@ -809,7 +912,8 @@ elicitation for an unknown session (`acp-client.ts:522-540,1561-1594`), while av
 wait. Once the session is published, both modes use §3.4 normally. The binding's pi-session/model getter
 is populated after `createAgentSession`; sampling before that point follows the fixed no-active-model
 `-32603` contract. Raw server names must be exact-JavaScript-string distinct as today (`Set<string>`
-identity; no normalization before the duplicate check). Each receives a stable safe token
+identity; no normalization before the duplicate check); the second equal configured name fails open as
+server-attributable `mcp_init_error` with that exact configured name. Each receives a stable safe token
 from the existing slug function; slug collisions gain `_2`, `_3`, and so on in configuration order.
 That token drives aliases, prompt headers, diagnostics, and the server component of elicitation lookup
 keys; no other name rule is added. The frozen alias allocator remains unchanged: the full alias is at
@@ -837,19 +941,42 @@ no-response row and cannot outlive the session. An MCP transport close
 failure/timeout writes fixed stderr diagnostic `[mcp:<server>] close failed` after all closes are
 attempted; ordinary
 `session/close` still succeeds under the inherited best-effort non-child-disposal rule.
-Failed-open rollback retains the original `mcp_init_error`. A dynamic apply failure instead follows
-§3.3's session poison rule. Child cleanup is the sole observable close exception and follows §8.
 
-**Post-publication transport state (exact).** Install `Client.onclose` and `Client.onerror` before
-connect. Each server has `opening | open | disabled | closing | closed` state and a once-only disable
-task. Adapter-initiated close sets `closing` before `Client.close()`; its resulting `onclose` only
-advances `closing→closed`. A natural raw stdio exit, HTTP stream/session termination, or SSE end while
-`opening` fails the atomic open as `mcp_init_error`. The same event while `open` atomically changes only
-that server to `disabled` and performs these steps:
+**Failed-open error/cleanup precedence (exact).** Rollback always attempts Pi abort/dispose, child
+drain, every wrapper close (including HTTP termination), and other acquired resources before settling.
+Non-child cleanup failures are redacted diagnostics and do not replace the open outcome. The
+child/Pi-abort barrier is different because concealing a possibly live process would falsely report a
+clean rollback:
 
-1. rely on the SDK `onclose` path to abort incoming handlers and reject pending outgoing requests,
-   cancel/remove that server's refresh dirty bit/pass, remove its active URL-elicitation mappings under §3.4, and rejection-
-   observe all late ACP outcomes so none can resurrect state;
+| original opening outcome | child/Pi-abort cleanup succeeds | child/Pi-abort cleanup fails |
+|---|---|---|
+| lifecycle `$/cancel_request` | preserve SDK `requestCancelled -32800` | replace with `child_cleanup_error -32603` |
+| server-attributable MCP open failure | preserve `mcp_init_error -32603` with exact configured `data.server` | replace with `child_cleanup_error -32603` |
+| global loader/control verification failure | preserve `extension_setup_error -32603`, no `server` | replace with `child_cleanup_error -32603` |
+| replay notification, session corruption, or another construction error | preserve that exact inherited code/data | replace with `child_cleanup_error -32603` |
+| `session/close`/agent disposal gate-aborts the opening transaction while its request signal is not aborted | `internal_error -32603` for the opening request; close itself succeeds | replace opening outcome with `child_cleanup_error -32603` |
+
+“Replace” means the wire contains only the fixed child-cleanup shape in §9; the original error is sent
+only to the redacted logger. For load/resume, the retained cleanup record is addressable by the requested
+session id, so a later `session/close` retries it. For new/fork, the generated target id was never
+published: retain the record under that internal id without putting it on the wire, and
+`PiAcpAgent.dispose()` is the mandatory retry owner. All retained records also participate in top-level
+dispose. A cleanup-successful failed open leaves no cleanup record; a failed one leaves a tombstone and
+can never be reopened. A dynamic apply failure instead follows §3.3's poison path and the same cleanup
+failure override. §8.2 defines retry generations and repeated top-level dispose.
+
+**Post-publication transport state (exact).** Install the wrapper handlers plus `Client.onclose` and
+`Client.onerror` before connect. Each server has `opening | open | disabled | closing | closed` state
+and a once-only disable task. Adapter-initiated close sets `closing` before `Client.close()`; the
+wrapper's synchronous logical close advances only `closing→closed`. A transport-specific fatal event
+from §3.1 while `opening` fails the atomic open as server-attributable `mcp_init_error`. The same event
+while `open` atomically changes only that server to `disabled` and performs these steps:
+
+1. synchronously call `signalClose()`, which drives the SDK protocol `onclose` path to abort incoming
+   handlers and reject pending outgoing requests; suppress any peer-caused refresh rejection under the
+   outgoing arbiter; cancel/remove that server's refresh dirty bit/pass; remove its active URL-
+   elicitation mappings under §3.4; and rejection-observe all late ACP outcomes so none can resurrect
+   state;
 2. emit exactly `[mcp:<server>] connection closed; server disabled` through
    `emitMcpDiagnostic`; the dispatch-time active-gate/stderr/suppression rule in §3.2 applies;
 3. enqueue one pass on the **same session-wide refresh transaction/turn mutex** that marks every remote
@@ -857,7 +984,11 @@ that server to `disabled` and performs these steps:
    that server's instructions from future `before_agent_start` output. Existing alias reservations and
    inactive Pi definitions remain tombstones. A mutation failure takes the §3.3 poison path.
 
-There is **no automatic reconnect**. Reconnect could repeat initialize-time side effects, silently
+4. start the wrapper close; Streamable HTTP first attempts bounded DELETE and all transports then
+   physically close under §3.1. Close/termination diagnostics cannot create a second disable.
+
+There is **no automatic reconnect**: HTTP is constructed with zero retries and legacy SSE is
+synchronously closed from its raw error callback (§3.1). Reconnect could repeat initialize-time side effects, silently
 change authorization/identity, or pretend connection-scoped subscriptions survived; reopening the ACP
 session is the explicit recovery. A disable waits for an active turn boundary. The running turn retains
 its old instructions/tool snapshot: an already-selected call on the dead peer receives the ordinary
@@ -867,12 +998,13 @@ prompt and every other MCP server continue. After commit, a stale direct call re
 server is deactivated and no active prompt is aborted merely because one peer died (an ACP diagnostic
 send failure can still invoke the existing `notification_error` rule).
 
-`Client.onerror` is nonfatal at the pin: the protocol only invokes the public handler and does not close
-or reject pending requests (`src/shared/protocol.ts:644-674`). While state is `opening` or `open`, each
-callback emits exactly `[mcp:<server>] transport error` through `emitMcpDiagnostic`, never copies the raw
-error, does not change aliases/instructions/subscriptions, and does not reconnect. A later `onclose`
-performs the once-only transition above. Errors in `disabled|closing|closed` are suppressed. Repeated or
-late raw `onclose` events are idempotent.
+`Client.onerror` remains nonfatal only for **protocol-layer** errors and forwarded stdio pipe/parser
+errors: the protocol callback itself only reports and does not close/reject pending work
+(`src/shared/protocol.ts:644-674`). While state is `opening|open`, each such callback emits exactly
+`[mcp:<server>] transport error` through `emitMcpDiagnostic`, never copies the raw error, and does not
+change aliases/instructions/subscriptions. Raw HTTP/SSE `onerror` never enters this branch; the wrapper
+classifies it as fatal first. Errors in `disabled|closing|closed` are suppressed. Repeated/late raw
+close/error events and simultaneous operation timeout are idempotent under the same disable once-gate.
 
 **Advertisement follows capability.** Because the client now genuinely serves sampling/roots/elicitation
 and http/sse transports, `mcpCapabilities` and the client-capability object are truthful — the
@@ -981,7 +1113,8 @@ pi-acp spec §5.1 ("design-minimalism finding 2") justified omitting a `model` o
 necessarily-partial 'representative' model list would mislead the validate probe (which would surface it
 as the model menu)." **That objection is to a FAKE/hardcoded partial list. The fix advertises pi's REAL
 configured catalog — the models whose provider is actually authenticated — so the validate probe surfaces
-exactly what the user can select.** A truthful enumeration is not misleading; it is the correct config
+exactly what passes a new set request's catalog-membership check.** A truthful enumeration is not
+misleading; it is the correct config
 surface, and it fixes the origin incident directly. The freeze amendment (§10.2) engages this rationale
 by name.
 
@@ -993,9 +1126,14 @@ current catalog). `modelOption` is a `SessionConfigSelect` (`config-options.md` 
 `SessionConfigSelect`):
 
 - **`id`**: `"model"`. **`name`**: `"Model"`. **`type`**: `"select"`. **`category`**: `"model"`.
-- **`options` (choices)**: `deps.modelRuntime.getAvailableSnapshot()` (`model-runtime.ts:318`) — the
-  models whose provider is configured/authenticated (`snapshot.available`, filtered by
-  `configuredProviders`, `model-runtime.ts:243-251`) — each mapped to
+- **`options` (choices)**: `deps.modelRuntime.getAvailableSnapshot()` (`model-runtime.ts:318-320`) — the
+  last availability snapshot produced by Pi's `Models.getAvailable()`. That method checks each provider's
+  credentials/authentication and returns no models for an unauthenticated provider; for an authenticated
+  provider it applies the provider's optional credential-aware `filterModels` before returning models
+  (`packages/ai/src/models.ts:394-408`). GitHub Copilot makes this distinction concrete by filtering its
+  OAuth catalog through `credential.availableModelIds` (`providers/github-copilot.ts:19-27`). The
+  separately stored `configuredProviders` set is an auth summary, not the model filter
+  (`model-runtime.ts:228-254`). Each available model is mapped to
   `{ value: `${model.provider}/${model.id}`, name: model.name }` in snapshot order. This is pi's REAL
   configured catalog, not a representative list. The adapter does not sort, deduplicate, truncate, or
   append fabricated choices.
@@ -1018,14 +1156,25 @@ author's `configOptions.model` against those choices — but note the runner FOR
 instead). So the advertised select is for **discovery** (the `config` probe) and for hosts driving pi-acp
 directly; it does not change how the runner selects models (§2.3 constraint honored).
 
-### 5.4 Set-path semantics (unchanged behavior, echo updated)
+### 5.4 Set-path semantics (catalog and set are symmetric)
 
-`applyConfig("model", "<provider>/<id>")` (`config.ts:36-51`) is unchanged in resolution/auth behavior
-(resolve via `modelRuntime.getModel`, precheck `hasConfiguredAuth`, `setModel`, auth→`auth_error`), but
-now returns `[thinkingLevelOption, modelOption]` so the echoed catalog includes the (freshly recomputed)
-`model` option with `currentValue` reflecting the just-set model. `thinkingLevel` set/echo is unchanged
-(pi-acp spec §5.2). The §5.2 state-machine rows (pi-acp spec) are unchanged except that every successful
-echo now carries both options.
+`applyConfig("model", "<provider>/<id>")` first parses the value, then finds an exact provider+id match
+in the **current `getAvailableSnapshot()`** used by §5.2. Absence returns the inherited
+`invalid_model -32602`; it MUST NOT fall back to unfiltered `modelRuntime.getModel()`. The matched
+snapshot `Model` object is passed to `session.setModel`; its auth failure still maps to `auth_error
+-32000`, and busy behavior remains `session_busy -32602`. This closes the pinned upstream asymmetry:
+Pi's old path could resolve an unfiltered registry model and check only provider-level auth, allowing a
+GitHub Copilot OAuth model omitted by `filterModels` to be set (`config.ts:36-44` base;
+`model-runtime.ts:293-295,354-356`; `agent-session.ts:1566-1580`). After this train, every advertised
+choice passes membership and no unadvertised model does; the subsequent auth recheck may still return
+`auth_error` if credentials drifted after the snapshot, and a concurrent turn may still return
+`session_busy`. An already-active model may remain the
+truthful `currentValue` after it disappears from availability, but attempting to set/re-set that absent
+value returns `invalid_model`; reporting historical current state does not grant selection authority.
+
+Every successful model or thinking-level set returns `[thinkingLevelOption, modelOption]`; the model
+option is recomputed after the mutation and reflects the just-set current model. Failed sets return no
+catalog. Other thinking-level semantics remain as frozen in pi-acp spec §5.2.
 
 ---
 
@@ -1214,28 +1363,47 @@ the synchronous `spawn()` call, the operation calls `slot.beginSpawn()`, which r
 current epoch in the same synchronous step. In `open`, that returns a unique
 lease and increments `pendingSpawns`; in `closing/closed`, it throws `aborted` and no process is spawned.
 A spawn throw calls `lease.failed()` in the same catch path. A successful spawn calls
-`lease.register({pid, child})` before feeding stdin or awaiting anything:
+`lease.register({pid, pgid: process.platform === "win32" ? undefined : pid, child,
+leaderClosed:false, treeGone:false})` before feeding stdin or awaiting anything:
 
-- in `open`, registration moves the lease from `pendingSpawns` into the child map;
+- in `open`, registration moves the lease from `pendingSpawns` into the retained process-tree map;
 - if shutdown changed state to `closing` between spawn and registration, registration still moves the
   child into the map and immediately starts its process-tree termination. It joins the current drain
   while that generation is pending; if the deadline already failed that generation, its handle and
   termination promise remain in the retained cleanup record and join the next close retry;
-- a lease is removed only by `failed()` or after its registered child has closed. The drain condition is
-  `pendingSpawns === 0 && children.size === 0`, not an initial registry snapshot.
+- a lease is removed only by `failed()` or registration. A registered record is removed only after the
+  production tree-disappearance proof below, never merely because the leader emitted `close`. The drain
+  condition is `pendingSpawns === 0 && processTrees.size === 0`, not an initial registry snapshot.
 
-`terminateAll()` synchronously changes `open → closing` before observing children, returns the current
-drain-generation promise, and starts termination for every registered child concurrently. Repeated calls
+`terminateAll()` synchronously changes `open → closing` before observing records, returns the current
+drain-generation promise, and starts termination for every registered tree concurrently. Repeated calls
 during that generation return the same promise. Late registrations join it as above, so cancellation
 cannot falsely drain between spawn and PID registration. After a successful empty drain, state becomes
 `closed`; after a failed/deadline drain, live child handles/PIDs remain in `closing` for the retry rule in
-§8.2. In every operation's `finally`, a child is removed only after its close promise settles.
+§8.2. A normal operation may settle after its leader closes, but the registry retains its record while
+any descendant group remains; later cleanup still owns and kills that group.
 
 On abort/timeout/registry shutdown, kill the whole process tree —
 process-group `SIGKILL` to `-pid` on Unix and an awaited
-`taskkill /PID <pid> /T /F` on Windows — then wait for child close. `ESRCH`/already-exited is success;
-other kill, taskkill-launch, taskkill-exit, or child-close failures fail that drain generation after all
-children were attempted. A shell spawn failure before a PID exists remains pi's ordinary failed bash
+`taskkill /PID <pid> /T /F` on Windows — then prove termination as follows:
+
+- **Unix:** wait for leader `close`, but retain the PGID record. Probe `process.kill(-pgid, 0)` after
+  signal delivery and then every 10 ms through the injected `deps.sleep`/clock. Only `ESRCH` proves the
+  process group is gone. A successful probe or `EPERM` means it still exists and remains counted; any
+  other probe error fails the generation. Remove the record only after both leader close and `ESRCH`,
+  within the same absolute §8.2 deadline. This production barrier, not merely the test's descendant PID
+  poll, prevents a dead leader from masquerading as a drained tree.
+- **Windows:** await `taskkill /T /F` exit **and** leader `close`; successful exit is the OS tree-
+  termination completion guarantee for the leader and every child selected by `/T`. A launch error or
+  nonzero exit retains the record and fails the generation. The hermetic fixture separately probes its
+  known descendant PID after that barrier, so a platform/runtime that violates the guarantee fails the
+  suite rather than weakening settlement.
+
+`ESRCH`/already-exited is success; other kill, taskkill-launch, taskkill-exit, leader-close, or liveness-
+probe failures fail that drain generation after all process trees were attempted. `remainingChildren`
+is always the number of retained live process-tree records, including a record whose leader closed but
+whose Unix group has not reached `ESRCH`; it is never just the count of open leader handles. A shell
+spawn failure before a PID exists remains pi's ordinary failed bash
 result, not `child_cleanup_error`; its lease still releases, so shutdown cannot hang. No global PID
 registry or broad kill is allowed: concurrent ACP sessions must be isolated.
 
@@ -1266,7 +1434,8 @@ when Pi exists (a failed-open generation before construction treats this leg as 
 `AgentSession.abort()` cancels retry, calls `Agent.abort()`, and waits for
 idle at `agent-session.ts:1530-1533`. `void pi.abort()` is forbidden. The barrier succeeds only after
 the underlying Pi run is idle, every already-enqueued turn notification has drained, every spawn lease
-has resolved, every registered child has closed, and every cleanup operation has succeeded. The
+has resolved, every registered process tree has passed the platform disappearance proof in §8.1, and
+every cleanup operation has succeeded. The
 ACP prompt settles from this barrier outcome, so the barrier never waits on the promise it controls.
 The implementation uses the injected `deps.sleep`/clock
 seam already used by cancellation so the boundary is deterministic: if the 5,000-ms deadline callback
@@ -1287,7 +1456,8 @@ unresolved lease/PID, `pi.abort()` failure, or deadline expiry, the prompt and e
 with ACP `child_cleanup_error` (`-32603`); before rejection the generation escalates to disposal mode,
 the session is tombstoned/disposed, and **no** `cancelled`
 notification is emitted. All children and MCP transports are attempted before that failure settles.
-The error names only the remaining PID count (never PID values, commands, cwd, headers, or environment).
+The error names only the remaining process-tree-record count (never PID values, commands, cwd,
+headers, or environment).
 For a prompt without a joined close, the cleanup-generation failure rejects the prompt after every MCP
 close has at least been invoked; bounded resource disposal may continue behind the retained tombstone.
 A joined/explicit close waits for all bounded resource-disposal promises before returning the same
@@ -1300,17 +1470,32 @@ reopens the session, and returns `{}` only if the retry drains. If it fails, it 
 error and keeps the record for another idempotent retry. When a retry succeeds, the cleanup record is
 removed while the ordinary tombstone remains, so still-later close is the inherited no-op success.
 The record memoizes every non-child disposal promise: retry joins a still-pending Pi/MCP dispose and
-never calls `Client.close()` or `pi.dispose()` twice, while it does re-run `pi.abort()` and termination
-for each remaining child because those are the retryable guarantees.
+never calls `Client.close()` or `pi.dispose()` twice, while it does re-run `pi.abort()` and termination/
+liveness proof for each remaining process-tree record because those are the retryable guarantees.
 Prompt/load/resume/config operations against either tombstone retain the existing closed-session
 contract. An ordinary tombstone with no cleanup record still closes successfully.
 
 This explicitly amends pi-acp spec §9.1.6 and T15: ordinary `pi.dispose()`/MCP-close/logging failures
 remain best-effort diagnostics and close succeeds, but unresolved adapter-owned child cleanup or
-`pi.abort()` failure returns `child_cleanup_error`. `PiAcpAgent.dispose()` starts/joins cleanup for every
-session without awaiting between session starts, waits for all attempts with failure collection, closes
-every MCP transport concurrently, and rejects once
-with `child_cleanup_error` if any session remains unresolved.
+`pi.abort()` failure returns `child_cleanup_error`. `PiAcpAgent.dispose()` has this exact idempotent
+retry state machine, replacing the current one-way `disposed` once gate (`agent.ts:427-436`):
+
+- the first call permanently closes agent admission, aborts/awaits all opening transactions, then starts
+  cleanup for every live, published-tombstone, and unpublished failed-open record without awaiting
+  between starts;
+- concurrent calls while that generation is in flight return the same promise and outcome;
+- success memoizes a fulfilled terminal state; every later call is an immediate no-op success and starts
+  no Pi/MCP/child work;
+- `child_cleanup_error` leaves terminal admission closed but retains the dirty records. The next call
+  starts one fresh retry generation over all of them; concurrent callers join it. A fail→success removes
+  the records and memoizes success; fail→fail retains them for another call.
+
+Across retry generations, `Client.close()`/HTTP DELETE and `pi.dispose()` are memoized once (a still-
+pending promise is joined); `pi.abort()`, process-tree signal/taskkill, leader-close wait, and Unix group
+liveness probes are retried for unresolved records. Each top-level generation failure is one
+`child_cleanup_error` whose `remainingChildren` is the sum of retained live process-tree records across
+all sessions, including unpublished opens. Non-child close/dispose failures remain diagnostics. This is
+the recovery path for new/fork cleanup records whose generated id was never returned.
 
 The current CLI's outer 5-second process envelope (`packages/pi-acp/src/index.ts:17-51`) is therefore
 replaced with **66,000 ms**: the 5,000-ms child generation + the existing 60,000-ms MCP request/close
@@ -1323,11 +1508,15 @@ process exits code **1**, overriding a requested zero exit. The process must not
 shutdown while the registry still knows an owned child is alive.
 
 `ErrorKind` gains `child_cleanup_error`; `LABELS.child_cleanup_error` is exactly
-`"child process cleanup failed"` and it is not added to `INVALID_KINDS`. Generalize
-`adapterError`'s existing `extras.details` type from its current diagnostic-array shape to `unknown`
-(existing callers are unchanged), then construct
-`adapterError("child_cleanup_error", { details:{ remainingChildren: registry.size } })`. No PID,
-command, cwd, or environment reaches the wire.
+`"child process cleanup failed"` and it is not added to `INVALID_KINDS`. Keep the compile-time
+redaction boundary narrow with four exported overload families: `mcp_init_error` and
+`unsupported_mcp_transport` require `{ server:string }`; `provider_error`/`internal_error` take either
+no second argument or `{ details?: Array<{type:string; timestamp:number}> }`;
+`child_cleanup_error` requires `{ details:{ remainingChildren:number } }`; every remaining kind,
+including `extension_setup_error`, has no second argument. The shared implementation accepts only the
+union of those three object shapes, never `unknown`, and the overloads expose no cross-kind call.
+Construct child failure from the retained process-tree count. No PID,
+command, cwd, headers, provider detail, submitted value, or environment can type-check into the wire.
 
 ### 8.3 Regression test (hermetic, credential-free)
 
@@ -1347,7 +1536,9 @@ before `spawn()` and immediately after `spawn()` but before `lease.register()`; 
 failed-open rollback, and process shutdown at each pause must either prevent the spawn or kill/join the
 late registration before settlement. Deterministic-clock cases pin success at 4,999 ms, deadline failure
 at 5,000 ms, cancel+close joining one generation/outcome, a failed first close followed by a successful
-retry, a second failed retry, and later no-op close after a successful retry. A failing process-shutdown
+retry, a second failed retry, and later no-op close after a successful retry. Agent-level dispose cases
+pin concurrent join, fail→success, fail→fail, and post-success no-op, including an unpublished failed-open
+record. A failing process-shutdown
 case pins the 66,000-ms envelope, exact stderr line, exit 1, and attempts of every session/transport.
 Implementation must also rerun the original live probe against the pinned pi release; a remaining leak
 is stop-and-report, not a waived test.
@@ -1367,7 +1558,8 @@ in exactly these ways:
 |---|---|---|---|
 | `http`/`sse` MCP server now **accepted** | — | — | no error: `bridgeMcpServers` connects it (§3.1). The prior `unsupported_mcp_transport` for http/sse is REMOVED. |
 | `acp` transport MCP server sent to pi-acp | `-32602` invalidParams | `unsupported_mcp_transport` | fixed `data.message = "unsupported mcp transport"`; names the server; RETAINED for `acp` only (§12.6). |
-| MCP connect/initialize/ping/logging-setup/initial-list/schema/source-verification failure or timeout during open (any transport) | `-32603` internalError | `mcp_init_error` | fixed `data.message = "mcp server initialization failed"`; extended to http/sse. A call-time failure is instead the fixed failed tool result from §3.2. |
+| duplicate raw MCP server name, or MCP connect/initialize/ping/logging-setup/initial-list/schema/alias-source verification failure or timeout during open (any transport) | `-32603` internalError | `mcp_init_error` | exact `data = { errorKind:"mcp_init_error", message:"mcp server initialization failed", server:<exact configured name> }`; the duplicate row names the second configured occurrence. Only a failure attributable to that server uses this kind. A call-time failure is instead the fixed failed tool result from §3.2. |
+| missing/duplicate/reordered inline control/reserved extension, changed loader runtime/errors identity, or wrong/missing `bash`/control winner | `-32603` internalError | `extension_setup_error` | exact `data = { errorKind:"extension_setup_error", message:"pi extension setup failed" }`; no `server` or `details`, because the failure is session-global and may occur with zero MCP servers (§3.3). |
 | removed MCP tool called after `tools/list_changed` | — | — | not a request error: a **failed tool result** with fixed message `` `MCP tool ${alias} is no longer available` `` (§3.3). |
 | dynamic `tools/list` refresh fails validation/request | — | — | retain the prior snapshot and emit fixed diagnostic `[…] tools/list refresh failed`; no request error (§3.3). |
 | dynamic refresh fails after the first Pi registration/activation mutation | `-32602` invalidParams for any admitted/subsequent operation | `session_terminated` | the prior snapshot cannot be restored through Pi's public API; emit `[…] tools/list refresh commit failed; session terminated`, poison/tombstone, drain, and never publish the partial candidate (§3.3). |
@@ -1387,19 +1579,25 @@ in exactly these ways:
 | unknown/duplicate MCP URL-completion notification or ACP completion-send failure | — | — | fixed diagnostics `[…] unknown elicitation completion` / `[…] ACP elicitation completion failed` through `emitMcpDiagnostic`; active-gate delivery may fail that prompt, after-gate/outside-turn uses stderr, post-dispose suppresses (§3.4). |
 | incoming sampling/roots/elicitation progress notification cannot be sent | — | — | retain the feature result/error and emit fixed diagnostic `[…] progress notification failed`; progress is optional telemetry and cannot replace the request outcome (§3.4). |
 | ordered active-turn MCP diagnostic cannot be delivered over ACP | `-32603` internalError for the active prompt | `notification_error` | abort the turn, close the diagnostic gate, drain/suppress later diagnostics, and reject only after the shared ACP FIFO pump settles (§3.2). |
-| outgoing MCP operation cancelled | MCP SDK cancellation | — | SDK emits/consumes `notifications/cancelled`; no post-settlement ACP tool failure is emitted. |
-| MCP transport close fails/times out | — | — | all closes still run; fixed stderr diagnostic `[…] close failed`; ordinary `session/close` succeeds and failed-open retains its original error (§3.5). |
-| published MCP peer closes unexpectedly | — | — | only that server is disabled at the next turn boundary; exact `[…] connection closed; server disabled` diagnostic, aliases/instructions deactivate, mappings clear, other servers/session survive, and no reconnect occurs (§3.5). |
-| MCP client reports nonfatal `onerror` | — | — | exact redacted `[…] transport error` diagnostic; no state/capability/reconnect change unless a later `onclose` arrives (§3.5). |
+| outgoing MCP operation abort/disposal/peer-close/timeout/completion race | per §3.1 | — | settle-once precedence is request/turn abort > disposal > peer fatal > timeout > operation; open cancellation remains `-32800`, live tool timeout/failure text is fixed, peer-caused refresh rejection is suppressed, and no late outcome is emitted. |
+| Streamable HTTP DELETE session termination fails/times out | — | — | physical close still runs; fixed stderr `[…] session termination failed`; 405 is silent success and clears the id (§3.1). |
+| MCP transport close fails/times out | — | — | all closes still run; fixed stderr diagnostic `[…] close failed`; ordinary `session/close` succeeds unless child cleanup fails (§3.5). |
+| published MCP peer has a transport-specific fatal event | — | — | stdio raw close, every raw HTTP/SSE error, or request-driven HTTP timeout disables only that server at the next boundary; exact `[…] connection closed; server disabled`, aliases/instructions deactivate, mappings clear, other server/session survives, and zero reconnect occurs (§3.1/§3.5). |
+| MCP client reports nonfatal protocol/stdio pipe-parser `onerror` | — | — | exact redacted `[…] transport error` diagnostic; raw HTTP/SSE errors are not in this class (§3.5). |
 | repeated pagination cursor / malformed stable-base response | `-32603` internalError | `mcp_init_error` at open; failed tool result during a turn | open uses fixed `data.message = "mcp server initialization failed"`; turn-time text is `MCP tool ${alias} failed`; diagnostics name only the safe server token and operation, never headers/env/content. |
 | child registry/Pi abort cannot drain on cancel/close | `-32603` internalError | `child_cleanup_error` | fixed `data.message = "child process cleanup failed"`; `data.details = { remainingChildren: <integer> }`; prompt and joined close fail after all attempts, session tombstoned, never `cancelled`; repeated close retries the retained cleanup record (§8.2). |
+| failed-open original error plus child/Pi-abort cleanup failure | `-32603` internalError | `child_cleanup_error` | cleanup failure overrides `-32800`, `mcp_init_error`, `extension_setup_error`, or another original open error; retain addressable load/resume or agent-owned unpublished new/fork cleanup record (§3.5). |
 | process shutdown cannot prove cleanup | process exit `1` | — | exact stderr `shutdown cleanup failed`; overrides requested zero exit after all session/transport attempts or the pinned 66,000-ms envelope (§8.2). |
 | structured-output errorKinds `structured_tool_collision` / `invalid_output_schema` | — | REMOVED | the bespoke channel is gone (§4.3); these `ErrorKind` literals are deleted from `errors.ts:3-27` and their label/`INVALID_KINDS` rows (`errors.ts:29-72`), and the T12 assertions (pi-acp spec §13) are removed. |
-| set `model` unresolvable / unauthenticated / busy | `-32602` / `-32000` / `-32602` | `invalid_model` / `auth_error` / `session_busy` | UNCHANGED (pi-acp spec §5.2); the `model` select advertisement (§5) does not alter set-path errors. |
+| set `model` absent from current advertised availability snapshot / matched but auth fails / busy | `-32602` / `-32000` / `-32602` | `invalid_model` / `auth_error` / `session_busy` | availability membership is now authoritative; unfiltered registry fallback is removed (§5.4). |
 
 The provider-error classification codes (`auth_error` `-32000`; `billing_error`/`rate_limit`/
 `provider_error` via terminal reject) are UNCHANGED; §6 pins their inputs. `PI_ACP_PROTOCOL_CONTRACT.providerErrorKinds`
 (`auth_error`, `rate_limit`, `billing_error`, `provider_error`) is UNCHANGED.
+`ErrorKind` adds `extension_setup_error` and `child_cleanup_error`; their labels are exactly
+`"pi extension setup failed"` and `"child process cleanup failed"`, and neither is in
+`INVALID_KINDS`. This explicitly amends pi-acp spec error row 16: `mcp_init_error` always has
+`data.server`; global verification never uses it.
 
 ---
 
@@ -1430,8 +1628,9 @@ state, not narrated as removals.)
   the provider-payload seam and the exact active-model representation error.
 - **§5.1 (config surface)**: replace "No `model` config option is advertised (design-minimalism finding
   2)" with the truthful-`model`-select amendment — QUOTE the "necessarily-partial representative list
-  would mislead the validate probe" rationale and ANSWER it (the advertised catalog is pi's real
-  configured catalog, §5.1–5.3). Update §5.2 to note every successful set echoes both options.
+  would mislead the validate probe" rationale and ANSWER it (the advertised catalog is Pi's
+  credential- and `Provider.filterModels`-aware availability snapshot, §5.1–5.3). Update §5.2 so a
+  model set must belong to that snapshot and every successful set echoes both options.
 - **§9.3 (MCP bridge)**: rewrite §9.3.4 "Transports" — v1 now serves stdio + http + sse (not stdio only);
   `unsupported_mcp_transport` is retained for `acp` only. Add §9.3.5 dynamic registration (§3.3),
   §9.3.6 lifecycle/resources/prompts/completion/logging/progress (§3.2), §9.3.7 client features (§3.4),
@@ -1440,7 +1639,9 @@ state, not narrated as removals.)
   `translate.ts` partial-details → ACP `rawOutput` change. Record `enforceStrictCapabilities: true` and the refresh/prompt
   turn-boundary mutex, while stating that adapter-level capability conditioning is authoritative for
   both subscription operations. Record the session-wide prepare+commit transaction queue, split
-  reserved-MCP/control extensions, preserved configured hook/`bash` ordering, post-open per-server
+  reserved-MCP/control extensions, preserved configured hook/`bash` ordering, transport-specific
+  fatal observation, HTTP zero-reconnect/request-driven-idle behavior, SSE synchronous reconnect
+  suppression, bounded HTTP DELETE-before-close, the outgoing-operation arbiter, post-open per-server
   disable/no-reconnect state, and pre-connect notification registration with post-initialize capability
   dispatch checks; these are part of the request-validity, no-gap, and atomic-snapshot contracts. Move
   `PKG_VERSION` to the shared internal `version.ts` module and use it for both ACP and MCP initialize
@@ -1449,22 +1650,28 @@ state, not narrated as removals.)
   channel is retired; pi rides the injected `StructuredOutput` HTTP tool like OpenCode (§4). Replace with
   a short section pointing at the runner injection path (`runner.ts:1397-1407`, `structured-tool.ts`).
 - **§8 (error taxonomy)**: remove `structured_tool_collision`/`invalid_output_schema`; add
-  `child_cleanup_error` as internal `-32603`, the §6 fixture tripwire, and all §9 MCP rows.
+  `extension_setup_error` and `child_cleanup_error` as internal `-32603`, retain mandatory `server` only
+  on server-attributable `mcp_init_error`, preserve the narrow kind-specific overload boundary, add the §6
+  fixture tripwire, and apply all §9 rows.
 - **§9.6 (cancellation)**: add the per-session tracked-bash registry, drain-before-settlement rule, and
   `child_cleanup_error` `-32603` failure (§8); `AgentSession.abort()` is awaited. Explicitly amend
   §9.1.6/T15's close-success rule with the retained-cleanup-tombstone retry contract and the one
   child-cleanup exception; add the open→closing→closed spawn-admission state machine, one absolute
   5,000-ms generation deadline, per-session slot/fresh-epoch swap after successful cancel-only drain,
-  and the 66,000-ms process envelope.
+  retained Unix PGID liveness/Windows tree-completion barrier, repeated `PiAcpAgent.dispose()` retry
+  state machine, failed-open precedence/hidden-record ownership, and the 66,000-ms process envelope.
 - **§9.1/§9.2 (session lifecycle/history)**: record that every fresh MCP client starts unsubscribed,
   subscriptions are never inferred/restored from replay, and no MCP reset marker or other history
   mutation is added (§3.2). Add prompt `idle→reserved` admission, the incoming-request
   cancellation/timeout arbiter, pre-publication elicitation decline, ordered diagnostic-pump settlement,
-  per-server post-publication disable/no-reconnect behavior, and the dynamic-commit poison/tombstone path.
+  outgoing-operation arbiter, exact `systemPrompt`/per-message `_meta` sampling mapping, exact-schema
+  form validation, per-server post-publication disable/no-reconnect behavior, and the dynamic-commit
+  poison/tombstone path.
 - **§13 (test plan)**: remove T12 (bespoke structured output) and the T9 "no `model` option" clause;
   amend T10 (`mcpCapabilities: { http:true, sse:true }`, no `_meta` namespace), T9 (advertises a `model`
   select with defined `currentValue` states), T20 (http/sse transports, dynamic registration, client
-  features), and add the §11 rows below.
+  features), and T8 (deep wire shapes for server-attributable `mcp_init_error`, global
+  `extension_setup_error`, and narrow `child_cleanup_error` details); add the §11 rows below.
 - **§0 (implementation-time re-verification)**: add a §0.4 repin note if the pin moved at build time.
 
 ### 10.3 Drift + conformance tests
@@ -1507,15 +1714,22 @@ state, not narrated as removals.)
 
 Audit and update the **entire contents**, not only the known passages, of root `README.md`,
 `docs/api.md`, `docs/design-notes.md`, `packages/workflows/README.md`, and
-`packages/pi-acp/README.md` to the full-client + injected-tool reality. Known stale anchors include
+`packages/pi-acp/README.md`, plus `packages/acp-agents/README.md` and the implemented design record
+`docs/specs/acp-auth-spec.md`, to the full-client + injected-tool reality. Known stale anchors include
 `README.md:402`, `docs/api.md:892,1078`,
 `docs/design-notes.md:193,229,418,434,460-471,660-713`, and
-`packages/workflows/README.md:700`, and `packages/pi-acp/README.md:22,41,45`; they are starting points,
-not the scan boundary.
+`packages/workflows/README.md:700`, `packages/pi-acp/README.md:22,41,45`,
+`packages/acp-agents/README.md:233`, and `docs/specs/acp-auth-spec.md:1050-1055`; they are starting
+points, not the scan boundary.
 The package README lists stdio/HTTP/SSE, explains `acp` remains client-hosted, removes the
 `__acp_structured_output` reservation, and names the configured `model` catalog. Whole-file negative
 assertions reject any remaining Pi stdio-only, native `_meta.outputSchema`, bespoke prompt-splice,
-`__acp_structured_output`, or no-injected-tool claim in all five documents. Historical `CHANGELOG.md`
+`__acp_structured_output`, or no-injected-tool claim in all seven documents. The acp-agents README says
+plain JSON Schema is for Claude's native channel while Pi uses injected HTTP MCP plus the common
+prompt/last-text fallback. The auth spec §3.6 says Pi's auth methods still carry no auth `_meta`, but Pi
+has **no non-auth private structured-output namespace** after this train; remove the claim that
+`PI_ACP_PROTOCOL_CONTRACT` pins one while retaining every actual auth-matrix row and its executable
+drift relationship (`packages/acp-agents/test/docs-drift.test.ts:38-55`). Historical `CHANGELOG.md`
 entries are excluded under Non-goal 12.13; current guidance must not use a changelog as its mechanism
 description.
 
@@ -1536,13 +1750,13 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 | # | covers | assertion |
 |---|---|---|
 | M1 | §3.1/§7.1 | one table-driven transcript passes over actual SDK stdio, Streamable HTTP, and legacy SSE transports; the HTTP/SSE rows prove repeated header values survive in their combined field order while stdio has no header assertion; `initialize` advertises `{ http:true, sse:true }`; `acp` remains `unsupported_mcp_transport` `-32602` |
-| M2 | §3.1 | `Client.connect` receives timeout/session signal for initialize and the outer bound independently catches a hung transport start; connect/list/call/synthetic requests are bounded by injected `mcpTimeoutMs` on stdio, HTTP, and SSE (hung connect → rollback + reject `mcp_init_error` + transport closed; hung turn request → fixed failed tool); the close-signalling wrapper delegates every transport member, synchronously emits exactly one `onclose` before raw close (including raw-close throw/hang), coalesces a later/natural raw `onclose`, and causes the SDK to abort every incoming handler before physical close; a fake-client option audit covers every outbound SDK method and session/turn signal combination; a late resolve/reject of a timed-out op produces NO unhandled rejection (detached) |
+| M2 | §3.1 | `Client.connect` receives timeout/session signal for initialize and the outer bound independently catches a hung transport start; connect/list/call/synthetic requests are bounded on all transports. The wrapper delegates every member, logically closes once before physical close, and coalesces late raw events. HTTP is constructed with the exact zero-retry object; GET EOF/error disables before any reconnect, 405 request-driven idle stays live until the next operation, and a timed-out next request disables. Legacy SSE `onerror` synchronously closes EventSource and produces zero reconnect fetches; stdio natural close uses raw `onclose`. Raw HTTP/SSE errors are fatal while protocol/stdio pipe errors are nonfatal. Deterministic barriers assert the outgoing precedence for request/turn abort vs disposal vs peer fatal vs timeout vs completion on connect, every tool/synthetic request, and refresh, including cancel-at-timeout and peer-close-at-timeout; peer-caused refresh rejection emits no duplicate refresh diagnostic; late settlement is consumed. Streamable HTTP close with absent/present session id proves DELETE-before-close, 2xx and 405 success, error/timeout diagnostic, and unconditional physical close. |
 | M3 | §3.2/§3.3 | exact package client identity, strict-capability defense enabled, and adapter conditioning prevents both subscribe and unsubscribe when `resources.subscribe` is absent (including the SDK unsubscribe guard hole); initialize metadata/instructions (non-empty instructions appear on every turn in server order but never enter ordinary model history), outgoing/incoming ping, canonical text/image/audio/resource-link/embedded-resource/unknown/structured/error projection, remote `rawOutput` equals the exact `CallToolResult` with no Tool/page wrapper, non-paginated synthetic output equals its exact result, and paginated output contains only exact page arrays; exact Tool/list pages remain internally available for registration/validation/refresh. Cover all resource list/template/read/subscribe/unsubscribe surfaces, prompts, both completion refs, conditional logging, every notification (including one sent immediately after initialized), exact synthetic schemas, and all-page enumeration; pre-initialize/unadvertised notification emits only the fixed unexpected diagnostic and no request; output schemas work on first/final list pages; second list/read observes live change; repeated cursor fails; large fixture proves no cap. |
 | M4 | §3.2 | MCP call progress reaches pi `onUpdate`, then ACP `tool_call_update` with full params in `rawOutput`; cancellation reaches the MCP peer and no late update/error is emitted after ACP settlement. Interleaved logging/list/update/unexpected/progress-failure/refresh-failure diagnostics and normal turn updates traverse the one ACP FIFO in enqueue order; prompt settlement waits for its accepted diagnostics. Injecting ACP send failure aborts/rejects the active prompt as `notification_error -32603`; later diagnostics are suppressed/stderr-routed exactly by the gate and never leak into a later turn. Outside-turn/post-dispose routes are stderr/suppression as specified. |
 | M5 | §3.2/§3.3 | synthetic aliases reserve before remote aliases in exact server/operation order; initial tools use title precedence; list-changed ADD/CHANGE/UNCHANGED/REMOVE/RE-ADD swaps exact internal Tool/page/validator state with next-turn activation, inactive tombstones, and stable aliases. One session-global prepare+commit queue prevents concurrent stale candidates. A two-server barrier delivers simultaneous dirty notifications (reverse arrival), colliding sanitized/truncated aliases, and disjoint additions/removals; configuration order gets the unsuffixed alias, later server gets `_2`, no reservation/active-name delta is lost, and later batches rebase on committed state. An actual Pi turn pauses after model tool selection, sends removal, then executes: the fixture still honors the old tool so the current call succeeds; after settlement the next turn omits it and a direct stale call gets `no longer available`. Fault injection before/through commit proves pre-commit discard/no suffix consumption and post-mutation poison/tombstone. Prompt/config/fork busy admission, prompt-vs-commit atomicity, close races, all-zero reserved-prompt cancellation, no registration after dispose, and optional/forbidden task metadata are covered. |
-| M6 | §3.3/§8.1 | configured extensions retain their full relative order. Only `<inline:agentprism-pi-acp-mcp>` moves first and wins reserved `mcp__` collisions; `<inline:agentprism-pi-acp-control>` remains normally appended. Two configured `before_agent_start` handlers observe/thread system prompts in their original order before MCP instructions. A configured `bash` remains winner and is not tracked; without one, the control tracked fallback replaces the built-in. Loader runtime/errors retain identity and source-qualified checks reject every wrong winner as `mcp_init_error`. |
-| M7 | §3.4 | sampling uses only active model and accepts user/assistant text/image/audio. For every role/media pair across Pi's ten known API dialects, payload fixtures assert either exact marker replacement with role/order/MIME/base64 preservation or the codec's exact active-model `-32603` when that dialect has no lossless native block; no fixture permits persisted markers or lossy fallback. Google multimodal fixtures prove valid assistant image/audio reach the provider body. Missing/duplicate/moved marker and unsupported custom API return exact `-32603 Active pi model cannot represent MCP sampling media`, never `-32602` or lossy text. Text/image/audio result blocks from the completion seam remain exact; tokens/temperature/metadata/signal/model/stop rules, optional context/tools `-32602`, experimental task `-32602`, and no-model/provider/tool-output `-32603` are pinned. Race sampling and both elicitation modes against peer cancel/transport close, turn abort, disposal, and timeout on each transport; assert winner, progress, and late-promise suppression. URL cases assert active-map removal and non-resurrection after timeout/abort/peer-cancel/transport-close followed by late ACP `accept`; on a still-open connection same-id retry declines with reused-id diagnostic and later completion gets late-completion diagnostic, while close/disposal suppresses forced late callbacks and a fresh client may reuse the id. Pending completion cannot leak; unknown/ACP-send-failure diagnostics take active FIFO, after-gate stderr, outside-turn stderr, and post-dispose suppression routes. Form validation, roots, and no permission request remain covered. |
-| M8 | §3.5 | equal raw names fail; colliding slugs receive stable ordered suffixes. Roots works during open; form and URL elicitation during open are locally declined without ACP resolver call/map/counter, verified through the real `acp-agents` `session/new` path, while sampling gets fixed pre-bind `-32603`. Partial-open failures roll back in reverse order; close is once/failure-collecting; post-dispose notifications are ignored; no state crosses sessions. Real transports cover idle and in-flight unexpected stdio process exit, Streamable HTTP session/stream termination, and legacy SSE end after publication: only that server disables at the next boundary, exact diagnostic routes, selected dead-peer call gets ordinary fixed failure, aliases/synthetics/instructions disappear later, mappings clear, other server/prompt/session survive, and no reconnect occurs. Nonfatal `Client.onerror` on all three transports emits only redacted transport-error diagnostic and leaves state live until an optional later close. |
+| M6 | §3.3/§8.1/§9 | configured extensions retain their full relative order. Only `<inline:agentprism-pi-acp-mcp>` moves first and wins reserved collisions; control remains appended. Ordered hooks and configured/core `bash` precedence are exact. Alias-source failure returns `mcp_init_error -32603` with the required exact configured server field; missing/duplicate/global loader/control/wrong-bash failures (including zero servers) return `extension_setup_error -32603` with exact no-server/no-details data. Deep wire assertions amend base T8: only the configured server name appears where required; no path, source, cause, or raw diagnostic leaks. |
+| M7 | §3.4 | sampling uses only active model and accepts user/assistant text/image/audio. Every role/media/API payload fixture proves exact replacement or the fixed active-model error, with no marker/lossy fallback. `systemPrompt` fixtures prove undefined omitted, empty preserved, and non-empty byte-copied into only `Context.systemPrompt`, never combined with ACP/MCP instructions; top-level metadata is forwarded while per-message/content annotations and `_meta` are ignored. The pure response mapper is tested over the real Pi `AssistantMessage` union (ordered text concat/stop, thinking omission, tool-call error, provider error/abort); no invented image/audio result seam exists. Optional context/tools/task and no-model errors are pinned. Race sampling and both elicitation modes against peer cancel/transport fatal close, turn abort, disposal, timeout, and ordinary completion on every transport; deterministic simultaneous-event barriers assert the incoming precedence, exactly one/no response as applicable, progress behavior, and late-settlement suppression. URL tests prove pending/accepted removal, consumed-id non-resurrection, same-id rejection on one client, safe reuse on a fresh client, late/unknown completion diagnostics, and no mapping or ACP request before session publication. Form tests compile the exact schema: an undeclared extra key is accepted when not forbidden, while missing/mistyped/bounded values fail; no keyword/default/coercion is added. Roots and no permission request remain covered. |
+| M8 | §3.5 | equal raw names fail as `mcp_init_error` naming the second exact configured occurrence; colliding slugs receive stable ordered suffixes. Pre-publication feature behavior is exact. Partial-open failures roll back in reverse order and use the §3.5 original-error × cleanup-result table. Real transports cover stdio raw close, HTTP GET EOF/error and request-driven-idle timeout, and legacy SSE `onerror`: only that server disables, the exact diagnostic/result/boundary behavior holds, and reconnect count is zero. Protocol-layer and stdio pipe/parser `Client.onerror` remain redacted/nonfatal; raw HTTP/SSE errors never take that branch. Post-dispose events are ignored and no state crosses sessions. |
 | M9 | §3.2/§3.5 | subscribe, then new/load/resume/fork each creates a fresh connection with zero subscriptions and never auto-resubscribes, even for equal server name/URI or copied fork history. Exact before/after session branches, replay transcript, and model context prove the subscription lifecycle adds no history entry or other journal mutation; open/replay failure likewise adds no MCP journal side effect. Re-subscription occurs only through a later explicit tool call. |
 
 ### 11.2 Structured output via injection (§4)
@@ -1558,10 +1772,10 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 
 | # | covers | assertion |
 |---|---|---|
-| C1 | §5.2 | every config/read successful-set echo is `[thinkingLevel, model]`; choices equal snapshot order exactly, map `provider/id` + `model.name`, and are neither sorted, truncated, deduplicated, nor fabricated |
+| C1 | §5.2/§5.4 | deep-equal the complete direct ACP `SessionConfigSelect` on initial read and every successful model/thinking set echo: `{ id:"model", name:"Model", type:"select", category:"model", currentValue, options }`, after `thinkingLevel`; choices equal the credential/`filterModels` snapshot order exactly and are neither sorted, truncated, deduplicated, nor fabricated. Include empty and active-but-unlisted catalogs; absent filtered model set is `invalid_model` and cannot use unfiltered lookup. |
 | C2 | §5.2 | no active model + empty catalog gives `""`/`[]`; active model gives its id; active-but-unlisted stays current while options remain the authenticated catalog, including empty |
 | C3 | §5.3 | the validate probe (`config-options.md` §2.3 surface) enumerates the `model` option with its choices — the `config pi` origin incident is fixed; the runner's `assertNoModelConfigOption` guard is unaffected |
-| C4 | §5.4 | set model hit/miss/unauthenticated/busy behavior unchanged (rows of pi-acp spec §5.2), with the two-option echo |
+| C4 | §5.4 | advertised hit sets the exact snapshot model; absent/filtered-out value is `invalid_model`, matched auth failure is `auth_error`, busy is `session_busy`, and every success returns the complete two-option echo |
 
 ### 11.4 Error-taxonomy tripwire (§6)
 
@@ -1574,10 +1788,10 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 
 | # | covers | assertion |
 |---|---|---|
-| A1 | §8.1/§8.3 | real tracked bash starts the long-lived leader+distinct-descendant fixture on Unix and Windows; cancel, close, failed-open rollback, and process shutdown each wait until probes prove **both** PIDs/process group gone. After successful cancel a fresh epoch can start/reap another tree. Timeout/abort preserve Pi results and configured shell settings. Before-spawn and after-spawn/before-register barriers cover every cleanup cause and prove no false empty drain. |
+| A1 | §8.1/§8.3 | real tracked bash starts the leader+distinct-descendant fixture on Unix and Windows; cancel, close, failed-open rollback, and shutdown each wait until both are gone. Unix unit barriers hold leader close while group probe still succeeds/EPERM and prove settlement/record removal waits for ESRCH; Windows waits for successful taskkill plus leader close and the fixture probes descendant. `remainingChildren` counts retained group records after leader close. Fresh epoch, settings, and both spawn-race barriers are covered. |
 | A2 | §8.1/§8.3 | two concurrent sessions each own a leader+descendant tree: cancelling A kills both A PIDs while both B PIDs remain alive until B closes; no global kill or cross-session registry state |
-| A3 | §8.2/§9 | injected kill/taskkill/close failure, non-closing child, and `pi.abort()` failure each attempt all cleanup, return `child_cleanup_error -32603` with the fixed label and integer `remainingChildren` only, tombstone, install no fresh registry epoch, and never report `cancelled`. Deterministic clock pins barrier success at 4,999 ms and deadline failure at exactly 5,000 ms; cancel+close join one generation/outcome. Repeated close covers fail→successful retry→ordinary no-op success and fail→failed retry, with retained handles, no reopening, no duplicate Pi/MCP dispose/close, and renewed abort/termination attempts only. |
-| A4 | §3.5/§8.2 | failure after registry/client creation but before publication drains the fixture leader **and descendant**, starts every MCP close in reverse acquisition order without serial awaiting, then failure-collects; replacement closes the prior session's whole tree/clients. A production subprocess exits successfully only after leader+descendant/process group are gone and MCP stdio observes close. Disposal failure/66,000-ms expiry prints exact stderr, attempts every tree/session/transport, exits 1; connection-close/SIGTERM/SIGINT share one shutdown. |
+| A3 | §8.2/§9 | cleanup failures return the narrow exact `child_cleanup_error` wire shape and retain records. Repeated close covers retries. Top-level `PiAcpAgent.dispose()` covers concurrent join, fail→success, fail→fail, and post-success no-op; non-child Pi/MCP promises run once while abort/tree termination/liveness retries. Aggregate remaining group count is exact and no forbidden detail type compiles. |
+| A4 | §3.5/§8.2 | for each new/load/resume/fork, cross every representative original open outcome (`-32800`, `mcp_init_error`, `extension_setup_error`, replay/other error) with child/Pi-abort cleanup success/failure. Success preserves original; failure returns only child cleanup. Load/resume retry by known id close; unpublished new/fork records retry only through top-level dispose. Every case drains leader+descendant, starts reverse-acquisition wrapper closes concurrently, attempts HTTP termination, and proves fail→retry ownership. Replacement and subprocess/66,000-ms shutdown assertions remain. |
 
 ### 11.6 Live e2e (gated on provider keys)
 
@@ -1591,14 +1805,14 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 |---|---|---|
 | R1 | §0/§1/§13 | Source quotes byte-match focus §0; base file equals `78944e3462458de30c4989ff04894fecbf43632d`; implementation records fresh GitHub/npm latest values, tag commits, and release→main cited-surface diffs before code |
 | R2 | §10/§13 | docs/protocol/backend/authoring drift suites pass; every referenced local and fresh-clone path exists and every cited line range contains the named symbol or literal |
-| R3 | §10.4/§10.5 | whole-file static assertions show root `README.md`, `docs/api.md`, `docs/design-notes.md`, `packages/workflows/README.md`, `packages/pi-acp/README.md`, both authoring-skill inputs, and the generated prompt collectively document stdio/HTTP/SSE, standard structured-tool injection, the configured model catalog, and client-hosted `acp`; each complete non-changelog file contains no Pi stdio-only/native `_meta.outputSchema`/bespoke prompt-splice/`__acp_structured_output`/no-injection claim |
+| R3 | §10.4/§10.5 | whole-file static assertions cover root `README.md`, `docs/api.md`, `docs/design-notes.md`, `packages/workflows/README.md`, `packages/pi-acp/README.md`, `packages/acp-agents/README.md`, `docs/specs/acp-auth-spec.md`, both skill inputs, and generated prompt. All current guidance agrees on stdio/HTTP/SSE, injected structured tool/common fallback, filtered model catalog, client-hosted `acp`, and no Pi private `_meta` namespace; stale-language scans cover every complete non-changelog file. The acp-auth executable matrix test remains green. |
 
 ### 11.8 Compatibility and release (§15)
 
 | # | covers | assertion |
 |---|---|---|
 | REL1 | §15 | the Changesets entry declares minor `pi-acp`, minor `acp-agents`, patch `workflows`, and patch `mcp-server`; no workflow-engine/shared-types bump is introduced; packed/published manifests resolve the coordinated new internal versions after `pnpm version` + `pnpm pack` |
-| REL2 | §15 | installed-package smoke runs `npx @automatalabs/workflows@0.38.2 config pi`, the HTTP MCP + injected-structured fixture, tarball/private-channel absence checks, and generated-authoring-prompt assertion exactly as pinned |
+| REL2 | §15 | installed-package smoke runs `npx @automatalabs/workflows@0.38.2 config pi`, the HTTP MCP + injected-structured fixture, tarball/private-channel absence checks (including packed `acp-agents/README.md`), repository release-doc scan of `docs/specs/acp-auth-spec.md`, and generated-authoring-prompt assertion exactly as pinned |
 
 ---
 
@@ -1670,19 +1884,20 @@ record and implementation-time stop gate.
 `78944e3462458de30c4989ff04894fecbf43632d` (branch `spec/pi-mcp-train`, based on `origin/main`; matches
 `.agentprism/design-224/base-sha.txt`).
 
-**Base-freshness note (verified in a fresh round check at `2026-07-17T05:40:07Z`):** `origin/main`
+**Base-freshness note (verified in the round-3 fresh check at `2026-07-17T06:29:19Z`):** `origin/main`
 equals that SHA. The worktree's earlier draft commit is not a citation base; every local reference below
 was re-read from the pinned base with `git show 78944e3:<path>` or verified unchanged in the working tree.
 Package versions at the base are
 `@automatalabs/pi-acp@0.1.3`, `@automatalabs/acp-agents@0.30.1`, and
 `@automatalabs/workflows@0.38.1`.
 
-**External-freshness note:** at `2026-07-17T05:12:41Z` this authoring round created three new temporary
-clones, fetched their tags and `origin/main`, resolved GitHub latest plus npm latest independently, then
-checked out the exact release tags below for every citation. No prior checkout was reused. At
-`2026-07-17T05:34:53Z` all three clones were fetched again and the release→main deltas below remained
-unchanged; at `2026-07-17T05:39:45Z`, immediately before freeze, every GitHub latest value and npm
-package pin below was re-queried and remained unchanged.
+**External-freshness note:** round 3 created three new temporary clones under a fresh `mktemp`
+directory, completed their initial fetch/latest checks before substantive editing, and at
+`2026-07-17T06:28:55Z` re-fetched tags and `origin/main` and re-queried every GitHub/npm latest value
+immediately before freeze. GitHub
+latest, npm latest, exact tag commit, and release-to-main diffs were resolved independently. Every
+citation below was checked at the exact release tag. No prior checkout was reused. The pins, main refs,
+ahead/behind counts, and cited-surface diffs below remained unchanged in that final check.
 
 **pi source, all `packages/{ai,agent,coding-agent}/…` citations verified against:** repo
 `github.com/earendil-works/pi`, tag **`v0.80.10`**, commit
@@ -1738,7 +1953,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   `[thinkingLevelOption]`) :19-52.
 - `packages/pi-acp/src/errors.ts` — `ErrorKind` union (incl. `structured_tool_collision`,
   `invalid_output_schema`) :3-27, labels :29-54, `INVALID_KINDS` :56-72, `adapterError`'s
-  auth/invalid/internal constructor selection :93-103, `classifyPreflight` (prose
+  current narrow redacted-diagnostic extras and auth/invalid/internal constructor selection :93-103,
+  `classifyPreflight` (prose
   regex) :105-116, `classifyTerminal` (auth/billing/rate regex, ordered) :118-140.
 - `packages/pi-acp/src/structured-output.ts` — `STRUCTURED_TOOL_NAME` + `StructuredOutputState`
   (arm/capture/disarm) :5-74 (deleted by §4.3).
@@ -1793,6 +2009,9 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   `includes("mcpCapabilities: {}")` :148.
 - `packages/acp-agents/test/pi-backend.test.ts` — `embedSchemaInPrompt`/`injectStructuredOutputTool`/
   `customCapabilities` pins :40-44, `promptMeta` :78-79, `nativeStructured` :83.
+- `packages/acp-agents/README.md` — stale public export description calling Pi a native plain-JSON-
+  Schema channel :233; `packages/acp-agents/test/docs-drift.test.ts` reads the implemented auth spec's
+  full `_meta` matrix and checks it against executable data :38-55.
 - `scripts/check-acp-deps.mjs` — `ACP_DEP_MATCHERS` (matches `@earendil-works/pi-coding-agent`) :40-43,
   `WRAPPED_RUNTIMES` :68.
 - `CONTRIBUTING.md` — dependency gate and bump runbook :60-81.
@@ -1817,6 +2036,8 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   set-config state machine :597-661, §9.1.6 close-always-success/tombstone rules :1315-1348, §9.3 MCP
   bridge :1457-1585, §9.4 structured output :1587-1658, §8 error taxonomy :914-1100, §9.6 cancellation
   :1717-1772, T15 close behavior :1966-1968, §13 test plan :1937-2000, §14 references :2002-2307.
+- `docs/specs/acp-auth-spec.md` — current/implemented full `_meta` matrix and stale Pi private-
+  structured-namespace claim :1050-1055 (amended to no Pi private namespace by §10.5).
 - `docs/specs/config-options.md` — probe API §2.2, validate-time surfacing + select-choice check §2.3
   :54-107.
 
@@ -1854,11 +2075,15 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   synthetic inline source info :744-751, `getExtensions` :262.
 - `packages/coding-agent/examples/extensions/built-in-tool-renderer.ts` — documented supported
   re-registration/override of built-in tools, including `bash` :1-16.
-- `packages/coding-agent/src/core/model-runtime.ts` — `getModels` :289-291, `getModel(provider,id)`
-  :293-295, `getAvailable` (async) :301, `getAvailableSnapshot()` (authed-provider models) :318-320,
-  `hasConfiguredAuth` :354-356, `configuredProviders` snapshot :53,243-251,
+- `packages/coding-agent/src/core/model-runtime.ts` — availability refresh independently stores
+  `Models.getAvailable()` and provider-auth summary :228-254; `getModels` :289-291,
+  unfiltered `getModel(provider,id)` :293-295, `getAvailable` :301-316,
+  `getAvailableSnapshot()` :318-320, `hasConfiguredAuth` :354-356,
   `completeSimple(model, context, options): Promise<AssistantMessage>` :479-481, `ModelRuntime.create`
   :130-165.
+- `packages/ai/src/models.ts` — credential/auth checks and authenticated availability with optional
+  credential-aware `Provider.filterModels` :394-408; `packages/ai/src/providers/github-copilot.ts` —
+  OAuth `availableModelIds` filter :19-27 (proves catalog membership is narrower than provider auth).
 - `packages/coding-agent/src/core/settings-manager.ts` — public `SettingsManager.create` :308-315,
   `getShellPath` :878-880, `getShellCommandPrefix` :910-912.
 - `packages/coding-agent/src/core/auth-guidance.ts` — shared docs-path login guidance plus
@@ -1918,10 +2143,14 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   :845-902; roots-changed :905-906.
 - `package.json` — public AJV validator export :42-46; `src/validation/ajv-provider.ts` —
   `AjvJsonSchemaValidator` implementation and `getValidator` :36-97.
-- `src/client/streamableHttp.ts` — options/constructor :120-155, common headers + GET :182-224, and POST
-  request-init spread :466-475; `src/client/sse.ts` — legacy transport/options :45-89, common headers +
-  `eventSourceInit` GET :116-147, and `requestInit` POST :243-259;
-  `src/client/stdio.ts` — transport :87-259, including child close :204-243.
+- `src/client/streamableHttp.ts` — default/configurable reconnect policy :6-12,49-75,145-155;
+  optional GET/405 behavior :206-247; zero-retry-relevant scheduling and SSE EOF/error paths
+  :271-409; explicit close-only `onclose` :442-449; common headers/POST :182-224,466-475;
+  initialized starts GET :558-566; public DELETE termination (no id no-op, 405 accepted, id cleared,
+  other errors surfaced) :612-652. `src/client/sse.ts` — legacy transport/options :45-89,
+  EventSource/guarded fetch and raw error callback :136-169, endpoint/parser errors :175-205,
+  explicit close-only `onclose` :237-241, recurring POST :243-290. `src/client/stdio.ts` — natural
+  process close invokes `onclose` :141-144; explicit close :204-243.
 - `src/shared/transport.ts` — header normalization/request-init merge :5-45 and the `Transport`
   lifecycle contract (`onclose` must be invoked when `close()` is called) :74-127;
   `src/shared/protocol.ts` — incoming handler signal/metadata/related notification seam :237-280,734-746;
@@ -1938,10 +2167,13 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
   :191-206; BaseMetadata Tool display-title precedence :341-355; client/server capabilities
   :475-590; progress/pagination :641-694; resource contents
   (text/blob) :814-861; resource list/update/subscription notifications :1022-1064; canonical
-  content-block union (text/image/audio/resource link/embedded resource) :1144-1278; prompt messages and
+  content-block annotations/`_meta` plus text/image/audio/resource-link/embedded-resource union
+  :1144-1278; prompt messages and
   get result :1283-1297; prompt/tool/logging notifications :1302,1511,1614-1642; Tool metadata/list
-  result :1307-1439; tool result content/structured/error fields :1444-1474; sampling, including the
-  human-review recommendation and request/result schemas :1644-1830;
+  result :1307-1439; tool result content/structured/error fields :1444-1474; sampling message `_meta`,
+  request `systemPrompt`, top-level metadata, and result schemas :1694-1830 (especially
+  `SamplingMessage` :1729-1737 and `systemPrompt` :1742-1751), including the human-review
+  recommendation :1784-1789;
   elicitation primitive schemas (including string formats/length but no `pattern`, numeric bounds,
   single/multi-select enums) :1848-1976, request/completion/result :1978-2084; completion request/result
   :2086-2181.
@@ -2168,8 +2400,10 @@ unverifiable correctness claim.
 38. **Trust ACP `accept` content because the ACP type says it matches the elicitation schema.**
     Rejected: the ACP response type is only a primitive-valued record and the MCP client wrapper at the
     pin validates only the general result, not the request's dynamic schema (`src/client/index.ts:326-420`).
-    Validating without coercion/defaults prevents missing, mistyped, out-of-range, or extra user input
-    from being reported as a conforming MCP response (§3.4).
+    Validate the server's exact dynamic schema without coercion/defaults. Augmenting it with
+    `additionalProperties:false` is also rejected: the pinned validator and server helper accept extra
+    keys unless the schema forbids them, so an adapter-added keyword would reject a protocol-valid
+    response (§3.4).
 
 39. **Send MCP diagnostics, including elicitation-completion failures, on a separate best-effort/stderr
     channel or ignore ACP delivery failure.**
@@ -2228,6 +2462,70 @@ unverifiable correctness claim.
     path proves both leader and descendant/process group are gone, including cross-session isolation
     (§8.3/§11).
 
+49. **Treat every `Client.onerror` as nonfatal and wait for `Client.onclose` on HTTP/SSE.** Rejected:
+    the pinned HTTP/SSE transports report natural failure through raw `onerror` and reserve `onclose`
+    for explicit close. The wrapper classifies raw events per transport, configures HTTP zero retries,
+    and synchronously closes legacy SSE; protocol-layer errors remain the narrow nonfatal class
+    (§3.1/§3.5).
+
+50. **Add an adapter heartbeat so a Streamable HTTP server that returns GET 405 is declared dead while
+    idle.** Rejected: the pinned request-driven mode exposes no ambient liveness stream, and an invented
+    heartbeat adds traffic/side effects outside the base lifecycle. Passage of idle time is not failure;
+    the next real operation is bounded and disables the peer on transport error/timeout (§3.1).
+
+51. **Rely on `Client.close()` without `terminateSession()`, or close the socket before DELETE.**
+    Rejected: the pinned public DELETE lifecycle method is not called by `Client.close()`. The wrapper
+    logically closes first, attempts bounded DELETE (405 accepted), and physically closes in `finally`,
+    preventing both live handlers and leaked server-side sessions (§3.1).
+
+52. **Let Promise scheduling choose among abort, disposal, peer close, timeout, and completion.**
+    Rejected: different schedules would change `-32800` versus init error, tool text, and refresh
+    diagnostics. One settle-once precedence preserves lifecycle cancellation, suppresses peer-caused
+    refresh noise, and consumes late callbacks (§3.1).
+
+53. **Keep model set on unfiltered `getModel()` plus provider-level auth.** Rejected: credential-aware
+    `Provider.filterModels` (concretely GitHub Copilot OAuth) can omit a model that the old path still
+    accepts. Current availability-snapshot membership is authoritative for both choices and new sets;
+    an unlisted active value remains reportable but cannot be reselected (§5).
+
+54. **Ignore or merge MCP `systemPrompt` into the ACP session/MCP instruction prompt.** Rejected: Pi has
+    an exact request-local `Context.systemPrompt` seam. Byte-for-byte forwarding (including empty) serves
+    the stable field without contaminating ordinary agent instructions; absent stays absent (§3.4).
+
+55. **Forward per-message/content `_meta` or annotations as provider metadata/prompt text.** Rejected:
+    Pi messages have no equivalent and top-level sampling `metadata` is the distinct provider field.
+    Promoting opaque message data would invent semantics, so those fields are explicitly ignored
+    (§3.4).
+
+56. **Inject a `completeMcpSample` test dependency capable of returning image/audio.** Rejected:
+    production already uses injected `modelRuntime.completeSimple`, whose pinned `AssistantMessage`
+    union cannot return those blocks. A pure mapper over the real result union tests production behavior
+    without a test-only capability Pi cannot produce (§3.4/§11 M7).
+
+57. **Preserve the original failed-open error when child cleanup also fails.** Rejected: returning
+    cancellation/init/replay failure while a process may remain alive conceals the stronger broken
+    guarantee. `child_cleanup_error` wins, retains a record, and known-id close or top-level dispose owns
+    retry (§3.5/§8.2).
+
+58. **Memoize a failed `PiAcpAgent.dispose()` forever under the current once gate.** Rejected: that
+    strands retained children and unpublished failed-open records. Concurrent calls join, success is a
+    permanent no-op, and failure permits a fresh retry of only abort/tree work (§8.2).
+
+59. **Use `mcp_init_error` without a real configured server for global extension verification.**
+    Rejected: the frozen wire shape requires `data.server`, and fabricating one breaks redaction and
+    attribution. Global loader/control failures use exact no-server `extension_setup_error`; only a
+    server-attributable failure uses `mcp_init_error` (§3.3/§9).
+
+60. **Remove a child registry record after only the leader's `close`.** Rejected: descendants/process
+    groups can survive their leader. Unix retains/probes PGID until `ESRCH`; Windows awaits the OS tree-
+    kill completion guarantee plus leader close, and retained records drive `remainingChildren`
+    (§8.1).
+
+61. **Widen all adapter error `details` to `unknown`.** Rejected: it removes the compile-time redaction
+    boundary for an owner-unrequested convenience. Kind-specific overloads grant only
+    `child_cleanup_error` its integer count and retains diagnostic arrays only for their existing kinds
+    (§8.2/§9).
+
 ---
 
 ## 15. Compatibility, versioning, and release contract
@@ -2258,7 +2556,9 @@ issue #224 release until all four are present and the post-publish smoke checks 
 2. A Pi workflow using an HTTP MCP fixture completes a tool call and a schema'd call captures through
    the injected `StructuredOutput` host under §7.2.
 3. Installed tarball/manifest inspection contains no Pi `_meta.outputSchema` namespace or
-   `__acp_structured_output` tool and the generated authoring prompt describes the standard route.
+   `__acp_structured_output` tool; packed `@automatalabs/acp-agents` README describes Pi's injected
+   route; repository `docs/specs/acp-auth-spec.md` contains no Pi private-namespace claim; and the
+   generated authoring prompt describes the standard route.
 
 The new `mcpCapabilities.http/sse`, client capabilities, model config option, and MCP feature tools are
 additive and default-on. The new `child_cleanup_error` `-32603` appears only when cancellation/close
