@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +13,13 @@ import {
 } from "../src/child-process-registry.js";
 import { realSleep } from "../src/deps.js";
 import { context, fakeDeps } from "./helpers/fakes.js";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 
 async function eventually<T>(operation: () => Promise<T>, timeoutMs = 5_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -39,6 +48,12 @@ async function assertGone(pid: number): Promise<void> {
       (error: NodeJS.ErrnoException) => error.code === "ESRCH",
     );
   });
+}
+
+function fakeChild(pid: number): ChildProcess & EventEmitter {
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  Object.defineProperty(child, "pid", { value: pid });
+  return child;
 }
 
 test("A1 tracked bash abort waits for the leader and descendant process tree", async () => {
@@ -165,6 +180,171 @@ test("A1 spawn admission covers closing-before-spawn and registration-after-clos
   await draining;
   assert.equal(raced.remainingChildren, 0);
   await assertGone(pid);
+});
+
+test("A1 Windows ownership requires successful taskkill /T /F and leader close", async () => {
+  const taskkills: number[] = [];
+  const taskkillResolvers: Array<() => void> = [];
+  const slot = new ChildProcessRegistrySlot({
+    platform: "win32",
+    graceMs: 5_000,
+    sleep: realSleep,
+    taskkillTree(pid) {
+      taskkills.push(pid);
+      return new Promise<void>((resolve) => taskkillResolvers.push(resolve));
+    },
+  });
+  const child = fakeChild(41_001);
+  const record = slot.beginSpawn().register(child);
+  child.emit("close", 0);
+  slot.registry.complete(record);
+  assert.equal(slot.remainingChildren, 1, "natural leader close cannot discard Windows tree ownership");
+  const deadline = new AbortController();
+  const draining = slot.terminateAll(() => false, deadline.signal);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(taskkills, [41_001]);
+  assert.equal(slot.remainingChildren, 1);
+  taskkillResolvers[0]?.();
+  await draining;
+  assert.equal(slot.remainingChildren, 0);
+
+  const held = new ChildProcessRegistrySlot({
+    platform: "win32",
+    graceMs: 5_000,
+    sleep: realSleep,
+    async taskkillTree() {},
+  });
+  const heldChild = fakeChild(41_002);
+  held.beginSpawn().register(heldChild);
+  let settled = false;
+  const heldDrain = held.terminateAll(() => false, new AbortController().signal)
+    .then(() => { settled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "taskkill success alone cannot remove a live leader record");
+  heldChild.emit("close", 0);
+  await heldDrain;
+  assert.equal(held.remainingChildren, 0);
+});
+
+test("A1 Unix ownership retains a naturally closed leader until process-group ESRCH proof", async () => {
+  let probe: "alive" | "gone" = "alive";
+  const killed: number[] = [];
+  const slot = new ChildProcessRegistrySlot({
+    platform: "linux",
+    graceMs: 5_000,
+    sleep: async () => { probe = "gone"; },
+    processGroupState: () => probe,
+    killProcessGroup: (pgid) => { killed.push(pgid); },
+  });
+  const child = fakeChild(42_001);
+  const record = slot.beginSpawn().register(child);
+  child.emit("close", 0);
+  slot.registry.complete(record);
+  assert.equal(slot.remainingChildren, 1);
+  await slot.terminateAll(() => false, new AbortController().signal);
+  assert.deepEqual(killed, [42_001]);
+  assert.equal(slot.remainingChildren, 0);
+});
+
+test("A1 timeout-owned kill failure latches the record and a later generation reaps it", async () => {
+  if (process.platform === "win32") return;
+  const cwd = await mkdtemp(join(tmpdir(), "pi-acp-bash-kill-failure-"));
+  const pidPath = join(cwd, "leader.pid");
+  let failKill = true;
+  let cleanupFailures = 0;
+  const groupState = (pgid: number): "alive" | "gone" | "error" => {
+    try {
+      process.kill(-pgid, 0);
+      return "alive";
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "error";
+    }
+  };
+  const slot = new ChildProcessRegistrySlot({
+    graceMs: 5_000,
+    sleep: realSleep,
+    platform: "linux",
+    processGroupState: groupState,
+    killProcessGroup(pgid) {
+      if (failKill) throw new Error("injected process-group kill failure");
+      process.kill(-pgid, "SIGKILL");
+    },
+  });
+  const operations = createTrackedBashOperations(slot, "/bin/bash", { graceMs: 5_000, sleep: realSleep }, () => {
+    cleanupFailures += 1;
+  });
+  const running = operations.exec(
+    `echo $$ > ${pidPath}; sleep 180`,
+    cwd,
+    { onData() {}, signal: new AbortController().signal, timeout: 0.03, env: { ...process.env } },
+  );
+  const pid = await readPid(pidPath);
+  await assert.rejects(running);
+  assert.equal(cleanupFailures, 1);
+  assert.equal(slot.childCleanupFailed, true);
+  assert.equal(slot.remainingChildren, 1);
+  assert.doesNotThrow(() => process.kill(pid, 0));
+  failKill = false;
+  await slot.terminateAll(() => false, new AbortController().signal);
+  await assertGone(pid);
+  assert.equal(slot.remainingChildren, 0);
+});
+
+test("A1 exact proof deadline retains ownership until a successful retry", async () => {
+  const expiry = deferred<void>();
+  let deadlineCount = 0;
+  let state: "alive" | "gone" = "alive";
+  const slot = new ChildProcessRegistrySlot({
+    platform: "linux",
+    graceMs: 5_000,
+    sleep(ms) {
+      if (ms === 5_000 && ++deadlineCount === 1) return expiry.promise;
+      return new Promise<void>(() => undefined);
+    },
+    processGroupState: () => state,
+    killProcessGroup() {},
+  });
+  const child = fakeChild(43_001);
+  const record = slot.beginSpawn().register(child);
+  const terminating = slot.registry.terminateOne(record);
+  expiry.resolve();
+  await assert.rejects(terminating, (error) => error instanceof Error && error.name === "ChildCleanupFailure");
+  assert.equal(slot.remainingChildren, 1);
+  state = "gone";
+  child.emit("close", 0);
+  await slot.terminateAll(() => false, new AbortController().signal);
+  assert.equal(slot.remainingChildren, 0);
+});
+
+test("A1 Windows taskkill failure retains the closed leader record for retry", async () => {
+  let attempts = 0;
+  const slot = new ChildProcessRegistrySlot({
+    platform: "win32",
+    graceMs: 5_000,
+    sleep: realSleep,
+    async taskkillTree() {
+      attempts += 1;
+      if (attempts === 1) throw new Error("taskkill failed");
+    },
+  });
+  const child = fakeChild(43_002);
+  slot.beginSpawn().register(child);
+  child.emit("close", 0);
+  await assert.rejects(slot.terminateAll(() => false, new AbortController().signal));
+  assert.equal(slot.remainingChildren, 1);
+  await slot.terminateAll(() => false, new AbortController().signal);
+  assert.equal(attempts, 2);
+  assert.equal(slot.remainingChildren, 0);
+});
+
+test("A1 cancel-only epoch rotation is a separate whole-generation commit", async () => {
+  const slot = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
+  const closed = slot.closeEpoch(new AbortController().signal);
+  await closed.drain;
+  assert.throws(() => slot.beginSpawn(), /aborted/, "registry drain alone must not publish fresh admission");
+  slot.commitRotation(closed.epoch);
+  const fresh = slot.beginSpawn();
+  fresh.failed();
 });
 
 test("A3 expired generations retain admission state and a fresh close generation retries", async () => {

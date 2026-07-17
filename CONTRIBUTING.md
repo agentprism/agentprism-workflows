@@ -44,10 +44,13 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 ## Testing
 
-`pnpm test` runs the full deterministic suite without credentials. Two files contain live tests, and both are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
+`pnpm test` runs the full deterministic suite without credentials. Five files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
 
 - `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, and OpenCode structured-output/pooling paths.
 - `packages/acp-agents/test/auth.live.e2e.test.ts` drives the three first-class auth profiles; individual cases have additional credential/gateway gates.
+- `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_CONTINUATION_LIVE_E2E=1` plus its backend credentials.
+- `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation and additionally requires `AGENTPRISM_ISOLATION_LIVE_E2E=1` plus backend credentials.
+- `packages/pi-acp/test/live.e2e.test.ts` drives Pi structured output, a real HTTP MCP tool round-trip, and tracked-bash stop/reap; it additionally requires `AGENTPRISM_PI_E2E_MODEL` and that model's provider key.
 
 Run the MCP live suite explicitly with real auth:
 

@@ -45,6 +45,83 @@ interface Opening {
   cleanupError?: unknown;
 }
 
+interface CleanupOwner {
+  dispose(): Promise<void>;
+  readonly remainingChildren: number;
+}
+
+/** Retry owner for the narrow interval after Pi exists but before PiSession is
+ * publishable.  It gives failed-open rollback the same abort/tree barrier and
+ * hidden-record ownership as a fully constructed session. */
+class FailedOpenCleanup implements CleanupOwner {
+  private resourceDispose: Promise<void> | undefined;
+
+  constructor(
+    private readonly pi: AgentSession,
+    private readonly bridge: McpBridge,
+    private readonly children: ChildProcessRegistrySlot,
+    private readonly lifecycle: AbortController,
+    private readonly deps: PiAcpDeps,
+  ) {}
+
+  get remainingChildren(): number { return this.children.remainingChildren; }
+
+  private startResources(bridgeClose: Promise<void>): Promise<void> {
+    this.resourceDispose ??= (async () => {
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => this.pi.dispose()),
+        bridgeClose,
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected") console.error("pi-acp failed-open resource disposal error:", result.reason);
+      }
+    })();
+    return this.resourceDispose;
+  }
+
+  async dispose(): Promise<void> {
+    const deadline = new AbortController();
+    const timer = new AbortController();
+    const expiry = this.deps.sleep(this.deps.graceMs, timer.signal).then(() => {
+      const failure = adapterError("child_cleanup_error", {
+        details: { remainingChildren: this.children.remainingChildren },
+      });
+      deadline.abort(failure);
+      throw failure;
+    });
+    expiry.catch(() => undefined);
+    // Failed-open cleanup has the same synchronous prefix as a published
+    // session: close spawn admission first, logically close every MCP client
+    // before aborting the binding lifetime, then start Pi abort before its
+    // one-shot resource disposal can run.
+    const captured = this.children.closeEpoch(deadline.signal);
+    const bridgeClose = this.bridge.close();
+    bridgeClose.catch(() => undefined);
+    if (!this.lifecycle.signal.aborted) this.lifecycle.abort(new Error("failed open disposed"));
+    let abort: Promise<void>;
+    try { abort = this.pi.abort(); } catch (error) { abort = Promise.reject(error); }
+    abort.catch(() => undefined);
+    const settled = Promise.allSettled([abort, captured.drain]);
+    let cleanupError: unknown;
+    await Promise.race([settled, expiry]).then((results) => {
+      if (!Array.isArray(results)) return;
+      const failure = results.find((result) => result.status === "rejected") as PromiseRejectedResult | undefined;
+      if (failure) {
+        cleanupError = adapterError("child_cleanup_error", {
+          details: { remainingChildren: this.children.remainingChildren },
+        });
+      }
+    }, (error) => { cleanupError = error; });
+    timer.abort();
+    // Pi disposal is defense in depth only after the abort/tree barrier has
+    // committed success or failure. MCP physical close was already started
+    // by the synchronous disposal prefix above.
+    const resources = this.startResources(bridgeClose);
+    await resources;
+    if (cleanupError) throw cleanupError;
+  }
+}
+
 function validateCwd(cwd: string): void {
   if (!isAbsolute(cwd)) throw adapterError("invalid_cwd");
   try {
@@ -70,7 +147,7 @@ export class PiAcpAgent {
   private readonly openingControllers = new Set<AbortController>();
   private readonly openingTasks = new Set<Promise<unknown>>();
   private readonly tombstones = new Set<string>();
-  private readonly cleanupRecords = new Map<string, PiSession>();
+  private readonly cleanupRecords = new Map<string, CleanupOwner>();
   private readonly mcpOwnerToken = {};
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
@@ -195,7 +272,7 @@ export class PiAcpAgent {
               childRegistry,
               settingsManager.getShellPath(),
               this.deps,
-              () => { try { pi?.agent.abort(); } catch { /* cleanup settlement owns the error */ } },
+              () => wrapper?.childCleanupFailure(),
             ),
           }));
         },
@@ -210,6 +287,27 @@ export class PiAcpAgent {
           const controls = base.extensions.filter(({ path }) => path === "<inline:agentprism-pi-acp-control>");
           if (matches.length !== 1 || controls.length !== 1) throw adapterError("extension_setup_error");
           const reserved = matches[0]!;
+          const control = controls[0]!;
+          const configured = base.extensions.filter(({ path }) => !path.startsWith("<inline:"));
+          const configuredBash = configured.some(({ tools }) => tools.has("bash"));
+          if (configuredBash) control.tools.delete("bash");
+
+          // Pi records conflict diagnostics before this override can impose
+          // the adapter's deliberate precedence. Remove only the conflicts
+          // that this transaction has actually resolved: the reserved MCP
+          // extension is moved first, and core bash is omitted when a
+          // configured extension already owns it. User/user conflicts and
+          // every loader/factory error remain fatal and retain their order.
+          const reservedNames = new Set(reserved.tools.keys());
+          for (let index = base.errors.length - 1; index >= 0; index -= 1) {
+            const issue = base.errors[index]!;
+            const resolvedReserved = issue.path === reserved.path
+              && [...reservedNames].some((name) => issue.error.startsWith(`Tool "${name}" conflicts with `));
+            const resolvedBash = configuredBash
+              && issue.path === control.path
+              && issue.error.startsWith('Tool "bash" conflicts with ');
+            if (resolvedReserved || resolvedBash) base.errors.splice(index, 1);
+          }
           const result = { ...base, extensions: [reserved, ...base.extensions.filter((item) => item !== reserved)] };
           if (result.runtime !== base.runtime || result.errors !== base.errors) throw adapterError("extension_setup_error");
           return result;
@@ -225,9 +323,6 @@ export class PiAcpAgent {
         settingsManager,
       });
       pi = created.session;
-      await pi.bindExtensions({});
-      const availableModels = [...await this.deps.modelRuntime.getAvailable()];
-      this.gate(opening);
       wrapper = new PiSession({
         sessionId: id,
         session: pi,
@@ -236,12 +331,16 @@ export class PiAcpAgent {
         deps: this.deps,
         mcpBridge: bridge,
         failedMcpResults: bridge.failedResults,
-        availableModels,
+        availableModels: [],
         childRegistry,
         lifecycleController: lifecycle,
         onWedged: (sessionId, session, cleanupRetryRequired) =>
           this.terminateWedged(sessionId, session, cleanupRetryRequired),
       });
+      await pi.bindExtensions({});
+      const availableModels = [...await this.deps.modelRuntime.getAvailable()];
+      wrapper.publishAvailableModels(availableModels);
+      this.gate(opening);
       bridge.bindSession(pi);
       const toolInfos = pi.getAllTools();
       const names = new Set(toolInfos.map(({ name }) => name));
@@ -260,6 +359,7 @@ export class PiAcpAgent {
       const bash = toolInfos.find(({ name }) => name === "bash");
       if (!bash || bash.sourceInfo.path === "<builtin:bash>") throw adapterError("extension_setup_error");
       if (replay) await wrapper.replay(manager.getBranch());
+      bridge.assertReady();
       this.gate(opening);
       this.live.set(id, wrapper);
       published = true;
@@ -279,13 +379,16 @@ export class PiAcpAgent {
       }
       else {
         if (pi) {
+          const rollback = new FailedOpenCleanup(pi, bridge!, childRegistry, lifecycle, this.deps);
           try {
-            await pi.dispose();
-          } catch (disposeError) {
-            console.error("pi-acp rollback dispose error:", disposeError);
+            await rollback.dispose();
+          } catch (candidate) {
+            if (isChildCleanupError(candidate)) {
+              this.cleanupRecords.set(id, rollback);
+              cleanupError = candidate;
+            }
           }
-        }
-        if (bridge) await bridge.close();
+        } else if (bridge) await bridge.close();
       }
       if (cleanupError) {
         opening.cleanupError = cleanupError;

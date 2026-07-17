@@ -14,6 +14,13 @@ interface ChildRecord {
   terminationSettled?: boolean;
 }
 
+export interface ChildProcessRegistryDeps extends Pick<PiAcpDeps, "graceMs" | "sleep"> {
+  platform?: NodeJS.Platform;
+  processGroupState?(pgid: number): "alive" | "gone" | "error";
+  killProcessGroup?(pgid: number): void;
+  taskkillTree?(pid: number, signal: AbortSignal): Promise<void>;
+}
+
 export interface SpawnLease {
   register(child: ChildProcess): ChildRecord;
   failed(): void;
@@ -35,7 +42,9 @@ export class ChildProcessRegistry {
   private generationSignal: AbortSignal | undefined;
   private changeWaiters = new Set<() => void>();
 
-  constructor(private readonly deps: Pick<PiAcpDeps, "graceMs" | "sleep">) {}
+  constructor(private readonly deps: ChildProcessRegistryDeps) {}
+
+  private get platform(): NodeJS.Platform { return this.deps.platform ?? process.platform; }
 
   get remainingChildren(): number { return this.children.size; }
   get leaderPids(): readonly number[] { return [...this.children.keys()]; }
@@ -80,7 +89,7 @@ export class ChildProcessRegistry {
     leaderClosed.catch(() => undefined);
     const record: ChildRecord = {
       pid: child.pid,
-      pgid: process.platform === "win32" ? undefined : child.pid,
+      pgid: this.platform === "win32" ? undefined : child.pid,
       child,
       leaderClosed,
     };
@@ -91,7 +100,11 @@ export class ChildProcessRegistry {
   /** Natural operation completion never proves away a surviving Unix process group. */
   complete(record: ChildRecord): void {
     if (this.children.get(record.pid) !== record) return;
-    if (process.platform === "win32" || this.groupState(record.pgid ?? record.pid) === "gone") {
+    // A Windows leader close is not descendant-disappearance proof.  Keep the
+    // ownership record until terminateRecord observes successful taskkill /T
+    // /F as well as leader close.  Unix may discharge ownership with ESRCH for
+    // the process group plus the already-observed leader completion.
+    if (this.platform !== "win32" && this.groupState(record.pgid ?? record.pid) === "gone") {
       this.children.delete(record.pid);
       this.changed();
     }
@@ -166,6 +179,7 @@ export class ChildProcessRegistry {
   }
 
   private groupState(pgid: number): "alive" | "gone" | "error" {
+    if (this.deps.processGroupState) return this.deps.processGroupState(pgid);
     try {
       process.kill(-pgid, 0);
       return "alive";
@@ -187,23 +201,30 @@ export class ChildProcessRegistry {
   }
 
   private async terminateRecord(record: ChildRecord, deadlineSignal: AbortSignal): Promise<void> {
-    if (process.platform === "win32") {
-      await raceAbort(new Promise<void>((resolve, reject) => {
-        const killer = spawn("taskkill", ["/PID", String(record.pid), "/T", "/F"], { windowsHide: true });
-        killer.once("error", reject);
-        killer.once("close", (code) => code === 0
-          ? resolve()
-          : reject(new Error(`taskkill exited ${code}`)));
-      }), deadlineSignal);
+    if (this.platform === "win32") {
+      const taskkill = this.deps.taskkillTree
+        ? this.deps.taskkillTree(record.pid, deadlineSignal)
+        : new Promise<void>((resolve, reject) => {
+          const killer = spawn("taskkill", ["/PID", String(record.pid), "/T", "/F"], { windowsHide: true });
+          killer.once("error", reject);
+          killer.once("close", (code) => code === 0
+            ? resolve()
+            : reject(new Error(`taskkill exited ${code}`)));
+        });
+      await raceAbort(taskkill, deadlineSignal);
     } else {
-      try {
-        process.kill(-(record.pgid ?? record.pid), "SIGKILL");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      if (this.deps.killProcessGroup) {
+        this.deps.killProcessGroup(record.pgid ?? record.pid);
+      } else {
+        try {
+          process.kill(-(record.pgid ?? record.pid), "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
       }
     }
     await raceAbort(record.leaderClosed, deadlineSignal);
-    if (process.platform !== "win32") {
+    if (this.platform !== "win32") {
       while (true) {
         const state = this.groupState(record.pgid ?? record.pid);
         if (state === "gone") break;
@@ -244,7 +265,7 @@ export class ChildProcessRegistrySlot {
   private epoch: ChildProcessRegistry;
   private cleanupFailed = false;
 
-  constructor(private readonly deps: Pick<PiAcpDeps, "graceMs" | "sleep">) {
+  constructor(private readonly deps: ChildProcessRegistryDeps) {
     this.epoch = new ChildProcessRegistry(deps);
   }
 
@@ -255,13 +276,33 @@ export class ChildProcessRegistrySlot {
   latchFailure(): void { this.cleanupFailed = true; }
   clearFailure(): void { this.cleanupFailed = false; }
 
-  async terminateAll(shouldRotate: () => boolean, deadlineSignal: AbortSignal): Promise<void> {
+  /**
+   * Close admission on the current epoch synchronously and return that exact
+   * epoch with its drain.  Rotation is deliberately a separate commit: a
+   * cancel generation must not publish a fresh spawn epoch until both Pi and
+   * this captured registry are idle.
+   */
+  closeEpoch(deadlineSignal: AbortSignal): {
+    epoch: ChildProcessRegistry;
+    drain: Promise<void>;
+  } {
     const captured = this.epoch;
-    await captured.terminateAll(deadlineSignal);
-    if (shouldRotate() && this.epoch === captured) {
+    return { epoch: captured, drain: captured.terminateAll(deadlineSignal) };
+  }
+
+  commitRotation(captured: ChildProcessRegistry): void {
+    if (this.epoch === captured) {
       this.epoch = new ChildProcessRegistry(this.deps);
       this.cleanupFailed = false;
     }
+  }
+
+  /** Compatibility seam for focused registry tests; production uses the
+   * explicit closeEpoch/commitRotation transaction above. */
+  async terminateAll(shouldRotate: () => boolean, deadlineSignal: AbortSignal): Promise<void> {
+    const { epoch, drain } = this.closeEpoch(deadlineSignal);
+    await drain;
+    if (shouldRotate()) this.commitRotation(epoch);
   }
 }
 
@@ -288,6 +329,9 @@ export function createTrackedBashOperations(
       } catch {
         throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`);
       }
+      // access() is asynchronous.  A cancel may have closed the captured
+      // generation while it was pending, so re-check before taking a lease.
+      if (signal?.aborted) throw new Error("aborted");
       const shell = getShellConfig(shellPath);
       const stdin = shell.commandTransport === "stdin";
       const lease = slot.beginSpawn();

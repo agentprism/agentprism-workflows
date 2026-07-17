@@ -288,6 +288,7 @@ export function fakeMcpHandle(overrides: Partial<McpClientHandle> = {}): McpClie
     async listTools() { return { tools: [] }; },
     async callTool() { return { content: [] }; },
     async close() {},
+    getCapabilities() { return { tools: {} }; },
     ...overrides,
   };
 }

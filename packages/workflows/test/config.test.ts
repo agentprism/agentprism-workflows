@@ -15,6 +15,7 @@ import type { SessionConfigOption } from "@automatalabs/acp-agents";
 const ROOT = resolve(import.meta.dirname, "../../..");
 const CLI = resolve(import.meta.dirname, "../src/cli.ts");
 const FAKE_AGENT = resolve(import.meta.dirname, "../../acp-agents/test/fixtures/fake-acp-agent.mjs");
+const HERMETIC_PI_AGENT = resolve(import.meta.dirname, "../../pi-acp/test/fixtures/hermetic-pi-acp.mjs");
 const HOME = mkdtempSync(join(tmpdir(), "automatalabs-workflows-config-"));
 
 process.on("exit", () => {
@@ -251,6 +252,31 @@ test("CLI: no-arg config probes every built-in harness and exits 0", () => {
     model.options.some((choice: { value: string }) => choice.value === "gpt-5.6-luna[high]"),
     "the fake agent's advertised model catalog is reported verbatim",
   );
+});
+
+test("C3 CLI: config pi executes the hermetic real-pi origin probe and exposes model choices", () => {
+  const result = spawnSync(process.execPath, ["--import", "tsx", CLI, "config", "pi", "--json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      HOME,
+      AGENTPRISM_BACKENDS: undefined,
+      AGENTPRISM_PI_ACP_CMD: process.execPath,
+      AGENTPRISM_PI_ACP_ARGS: HERMETIC_PI_AGENT,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout) as {
+    harnessOptions: Array<{ backendId: string; options: SessionConfigOption[] }>;
+  };
+  assert.equal(report.harnessOptions.length, 1);
+  assert.equal(report.harnessOptions[0]?.backendId, "pi");
+  assert.deepEqual(report.harnessOptions[0]?.options.map(({ id }) => id), ["thinkingLevel", "model"]);
+  const model = report.harnessOptions[0]?.options[1];
+  assert.equal(model?.type, "select");
+  assert.ok(model?.type === "select" && model.options.length > 0);
 });
 
 test("CLI: a named harness scopes the probe and renders the human table", () => {

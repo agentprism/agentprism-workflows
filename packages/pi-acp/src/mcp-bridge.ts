@@ -55,7 +55,6 @@ const NO_RECONNECT = {
 } as const;
 
 const NEVER_ABORTED = new AbortController().signal;
-export const MCP_CLOSE_DEADLINE_MS = 60_000;
 
 export interface McpSessionBinding {
   sessionId: string;
@@ -104,12 +103,37 @@ export interface McpClientHandle {
   setToolsChangedHandler?(handler: () => void): void;
   setDisabledHandler?(handler: () => void): void;
   disableOnTimeout?(): void;
+  getPeerSignal?(): AbortSignal;
 }
 
 export class McpTimeoutError extends Error {
   constructor() {
     super("MCP operation timed out");
     this.name = "McpTimeoutError";
+  }
+}
+
+export type McpTerminalCause = "lifecycle" | "session" | "peer" | "timeout";
+
+export class McpOperationTerminalError extends Error {
+  constructor(
+    readonly terminalCause: McpTerminalCause,
+    readonly terminalReason?: unknown,
+  ) {
+    super(`MCP operation terminated by ${terminalCause}`);
+    this.name = "McpOperationTerminalError";
+  }
+}
+
+export type McpIncomingTerminalCause = "peer" | "session" | "turn" | "timeout";
+
+export class McpIncomingTerminalError extends Error {
+  constructor(
+    readonly terminalCause: McpIncomingTerminalCause,
+    readonly terminalReason?: unknown,
+  ) {
+    super(`Incoming MCP operation terminated by ${terminalCause}`);
+    this.name = "McpIncomingTerminalError";
   }
 }
 
@@ -120,10 +144,86 @@ function exactMcpError(code: ErrorCode, message: string): McpError {
   return error;
 }
 
-function abortPromise(signal: AbortSignal): Promise<never> {
-  return new Promise((_, reject) => {
-    if (signal.aborted) reject(signal.reason);
-    else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+/**
+ * One terminal arbiter for every MCP request.  Claims are committed in a
+ * microtask so conditions that become observable at the same boundary are
+ * resolved by the frozen precedence instead of Promise.race scheduling.
+ */
+export function settleMcpOperation<T>(
+  operation: (requestSignal: AbortSignal) => Promise<T>,
+  lifecycleSignal: AbortSignal | undefined,
+  sessionSignal: AbortSignal | undefined,
+  peerSignal: AbortSignal | undefined,
+  timeoutMs: number,
+  sleep: PiAcpDeps["sleep"],
+): Promise<T> {
+  const requestSignal = anySignal([lifecycleSignal, sessionSignal, peerSignal]);
+  return new Promise<T>((resolve, reject) => {
+    const timer = new AbortController();
+    let settled = false;
+    let commitQueued = false;
+    let timedOut = false;
+    let operationOutcome:
+      | { status: "fulfilled"; value: T }
+      | { status: "rejected"; reason: unknown }
+      | undefined;
+    const removers: Array<() => void> = [];
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      timer.abort();
+      for (const remove of removers) remove();
+      callback();
+    };
+    const commit = () => {
+      commitQueued = false;
+      if (settled) return;
+      if (lifecycleSignal?.aborted) {
+        finish(() => reject(new McpOperationTerminalError("lifecycle", lifecycleSignal.reason)));
+      } else if (sessionSignal?.aborted) {
+        finish(() => reject(new McpOperationTerminalError("session", sessionSignal.reason)));
+      } else if (peerSignal?.aborted) {
+        finish(() => reject(new McpOperationTerminalError("peer", peerSignal.reason)));
+      } else if (timedOut) {
+        finish(() => reject(new McpOperationTerminalError("timeout", new McpTimeoutError())));
+      } else {
+        const outcome = operationOutcome;
+        if (outcome?.status === "fulfilled") {
+          finish(() => resolve(outcome.value));
+        } else if (outcome?.status === "rejected") {
+          finish(() => reject(outcome.reason));
+        }
+      }
+    };
+    const claim = () => {
+      if (settled || commitQueued) return;
+      commitQueued = true;
+      queueMicrotask(commit);
+    };
+    const observe = (signal: AbortSignal | undefined) => {
+      if (!signal) return;
+      if (signal.aborted) claim();
+      else {
+        signal.addEventListener("abort", claim, { once: true });
+        removers.push(() => signal.removeEventListener("abort", claim));
+      }
+    };
+    observe(lifecycleSignal);
+    observe(sessionSignal);
+    observe(peerSignal);
+    const expiry = sleep(timeoutMs, timer.signal).then(
+      () => { timedOut = true; claim(); },
+      () => undefined,
+    );
+    expiry.catch(() => undefined);
+    const running = Promise.resolve().then(() => {
+      if (settled) throw new Error("MCP operation was cancelled before admission");
+      return operation(requestSignal);
+    });
+    running.then(
+      (value) => { operationOutcome = { status: "fulfilled", value }; claim(); },
+      (reason) => { operationOutcome = { status: "rejected", reason }; claim(); },
+    );
   });
 }
 
@@ -133,31 +233,57 @@ export async function bounded<T>(
   timeoutMs: number,
   sleep: PiAcpDeps["sleep"],
 ): Promise<T> {
-  const timer = new AbortController();
-  let timedOut = false;
-  const timeout = sleep(timeoutMs, timer.signal).then(() => {
-    timedOut = true;
-    throw new McpTimeoutError();
-  });
-  // The lazy form is used by incoming MCP handlers so their deadline is armed
-  // before progress 0 and before constructing provider/ACP work.
-  const running = typeof operation === "function" ? Promise.resolve().then(operation) : operation;
-  running.then(() => undefined, () => undefined);
   try {
-    try {
-      const result = await Promise.race([running, abortPromise(signal), timeout]);
-      if (signal.aborted) throw signal.reason;
-      if (timedOut) throw new McpTimeoutError();
-      return result;
-    } catch (error) {
-      if (signal.aborted) throw signal.reason;
-      if (timedOut) throw new McpTimeoutError();
-      throw error;
+    return await settleMcpOperation(
+      () => typeof operation === "function" ? operation() : operation,
+      signal,
+      undefined,
+      undefined,
+      timeoutMs,
+      sleep,
+    );
+  } catch (error) {
+    if (error instanceof McpOperationTerminalError) {
+      if (error.terminalCause === "timeout") throw new McpTimeoutError();
+      throw error.terminalReason;
     }
-  } finally {
-    timer.abort();
-    timeout.catch(() => undefined);
+    throw error;
   }
+}
+
+export async function settleIncomingMcpOperation<T>(
+  operation: (requestSignal: AbortSignal) => Promise<T>,
+  peerSignal: AbortSignal,
+  sessionSignal: AbortSignal,
+  turnSignal: AbortSignal | undefined,
+  timeoutMs: number,
+  sleep: PiAcpDeps["sleep"],
+): Promise<T> {
+  try {
+    // Positional mapping gives the incoming arbiter its distinct frozen order:
+    // peer/transport > session disposal > active turn > timeout > completion.
+    return await settleMcpOperation(
+      operation,
+      peerSignal,
+      sessionSignal,
+      turnSignal,
+      timeoutMs,
+      sleep,
+    );
+  } catch (error) {
+    if (!(error instanceof McpOperationTerminalError)) throw error;
+    const cause: McpIncomingTerminalCause = error.terminalCause === "lifecycle"
+      ? "peer"
+      : error.terminalCause === "peer"
+        ? "turn"
+        : error.terminalCause;
+    throw new McpIncomingTerminalError(cause, error.terminalReason);
+  }
+}
+
+function isMcpTimeout(error: unknown): boolean {
+  return error instanceof McpTimeoutError
+    || (error instanceof McpOperationTerminalError && error.terminalCause === "timeout");
 }
 
 function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal {
@@ -171,7 +297,7 @@ function headers(values: readonly { name: string; value: string }[]): Headers {
   return result;
 }
 
-class CloseSignallingTransport implements Transport {
+export class CloseSignallingTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
   onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
@@ -266,21 +392,11 @@ function createTransport(
   let raw: Transport;
   let terminate: (() => Promise<void>) | undefined;
   if (!("type" in server)) {
-    const stdio = new StdioClientTransport({
+    raw = new StdioClientTransport({
       command: server.command,
       args: server.args,
       env: Object.fromEntries(server.env.map(({ name, value }) => [name, value])),
     });
-    raw = stdio;
-    terminate = async () => {
-      const pid = stdio.pid;
-      if (pid === null) return;
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-      }
-    };
   } else if (server.type === "http") {
     let open = true;
     const observedFetch = async (url: string | URL, init?: RequestInit): Promise<Response> => {
@@ -429,16 +545,16 @@ function installClientHandlers(
     if (request.params.task || (request.params.includeContext && request.params.includeContext !== "none") || request.params.tools || request.params.toolChoice) {
       throw exactMcpError(ErrorCode.InvalidParams, request.params.task ? "Unsupported experimental MCP task" : "Unsupported MCP sampling capability");
     }
-    const pi = binding.getPi();
-    const model = pi?.model;
-    if (!pi || !model) throw exactMcpError(ErrorCode.InternalError, "MCP sampling requires an active pi session model");
     const progressToken = request.params._meta?.progressToken;
     const turnSignal = binding.getTurnSignal();
-    const signal = anySignal([extra.signal, binding.sessionSignal, turnSignal]);
-    let message: AssistantMessage;
     try {
-      message = await bounded(() => {
+      const result = await settleIncomingMcpOperation((signal) => {
         progress(extra, progressToken, 0, () => diagnostic("progress notification failed"));
+        const pi = binding.getPi();
+        const model = pi?.model;
+        if (!pi || !model) {
+          throw exactMcpError(ErrorCode.InternalError, "MCP sampling requires an active pi session model");
+        }
         const prepared = createMcpSamplingPayload(request.params, model);
         return (binding.modelRuntime ?? pi.modelRuntime).completeSimple(model, prepared.context, {
           signal,
@@ -446,21 +562,23 @@ function installClientHandlers(
           temperature: request.params.temperature,
           metadata: request.params.metadata as Record<string, unknown> | undefined,
           onPayload: prepared.onPayload,
-        });
-      }, signal, timeoutMs, sleep);
+        }).then((message) => mapMcpSamplingResult(message, request.params.stopSequences));
+      }, extra.signal, binding.sessionSignal, turnSignal, timeoutMs, sleep);
+      progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
+      return result;
     } catch (error) {
-      if (extra.signal.aborted || binding.sessionSignal.aborted) throw error;
-      if (turnSignal?.aborted) throw exactMcpError(ErrorCode.InternalError, "MCP sampling cancelled");
-      if (error instanceof McpTimeoutError) throw exactMcpError(ErrorCode.InternalError, "MCP sampling timed out");
+      if (error instanceof McpIncomingTerminalError) {
+        if (error.terminalCause === "peer" || error.terminalCause === "session") {
+          throw error.terminalReason;
+        }
+        if (error.terminalCause === "turn") {
+          throw exactMcpError(ErrorCode.InternalError, "MCP sampling cancelled");
+        }
+        throw exactMcpError(ErrorCode.InternalError, "MCP sampling timed out");
+      }
       if (error instanceof McpError) throw error;
       throw exactMcpError(ErrorCode.InternalError, "MCP sampling failed");
     }
-    if (extra.signal.aborted) throw extra.signal.reason;
-    if (binding.sessionSignal.aborted) throw binding.sessionSignal.reason;
-    if (turnSignal?.aborted) throw exactMcpError(ErrorCode.InternalError, "MCP sampling cancelled");
-    const result = mapMcpSamplingResult(message, request.params.stopSequences);
-    progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
-    return result;
   });
   client.setRequestHandler(ListRootsRequestSchema, (request, extra) => createMcpRootsResult(
     binding,
@@ -470,14 +588,17 @@ function installClientHandlers(
   ));
   client.setRequestHandler(ElicitRequestSchema, async (request, extra) => {
     if (request.params.task) throw exactMcpError(ErrorCode.InvalidParams, "Unsupported experimental MCP task");
-    if (!binding.isPublished()) return { action: "decline" as const };
+    // Snapshot publication at handler admission. An elicitation received
+    // during open remains local even if session/new publishes while it is
+    // settling, while still receiving the ordinary 0/1 progress pair.
+    const publishedAtAdmission = binding.isPublished();
     const progressToken = request.params._meta?.progressToken;
     const turnSignal = binding.getTurnSignal();
-    const signal = anySignal([extra.signal, binding.sessionSignal, turnSignal]);
     let urlKey: string | undefined;
     try {
-      const response = await bounded(async () => {
+      const response = await settleIncomingMcpOperation(async () => {
         progress(extra, progressToken, 0, () => diagnostic("progress notification failed"));
+        if (!publishedAtAdmission) return { action: "decline" as const };
         if (request.params.mode === "form") {
           let validate: JsonSchemaValidator<Record<string, unknown>>;
           try {
@@ -522,16 +643,7 @@ function installClientHandlers(
         });
         acpRequest.then(() => undefined, () => undefined);
         return Promise.race([acpRequest, earlyCompletion]);
-      }, signal, timeoutMs, sleep);
-      if (extra.signal.aborted) throw extra.signal.reason;
-      if (binding.sessionSignal.aborted) throw binding.sessionSignal.reason;
-      if (turnSignal?.aborted) {
-        if (urlKey) {
-          urlElicitations.delete(urlKey);
-          consumedElicitations.add(urlKey);
-        }
-        return { action: "cancel" as const };
-      }
+      }, extra.signal, binding.sessionSignal, turnSignal, timeoutMs, sleep);
       if (request.params.mode === "url" && response.action === "accept") {
         const entry = urlKey ? urlElicitations.get(urlKey) : undefined;
         if (entry) entry.accepted = true;
@@ -551,8 +663,12 @@ function installClientHandlers(
         urlElicitations.delete(urlKey);
         consumedElicitations.add(urlKey);
       }
-      if (extra.signal.aborted || binding.sessionSignal.aborted) throw error;
-      if (turnSignal?.aborted || error instanceof McpTimeoutError) return { action: "cancel" as const };
+      if (error instanceof McpIncomingTerminalError) {
+        if (error.terminalCause === "peer" || error.terminalCause === "session") {
+          throw error.terminalReason;
+        }
+        return { action: "cancel" as const };
+      }
       if (error instanceof McpError) throw error;
       progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
       return { action: "decline" as const };
@@ -607,6 +723,7 @@ export async function connectDefaultMcpClient(
     }
     if (state !== "open") return;
     state = "disabled";
+    fatalController.abort(new Error("MCP peer closed"));
     clearElicitations(binding, token);
     binding?.emitDiagnostic(`[mcp:${token}] connection closed; server disabled`);
     disabledHandler();
@@ -648,8 +765,14 @@ export async function connectDefaultMcpClient(
     if (state === "opening" || state === "open") binding?.emitDiagnostic(`[mcp:${token}] transport error`);
   };
   try {
-    const connectSignal = anySignal([signal, fatalController.signal]);
-    await bounded(client.connect(transport, { timeout: timeoutMs, signal: connectSignal }), connectSignal, timeoutMs, sleep);
+    await settleMcpOperation(
+      (connectSignal) => client.connect(transport, { timeout: timeoutMs, signal: connectSignal }),
+      signal,
+      binding?.sessionSignal,
+      fatalController.signal,
+      timeoutMs,
+      sleep,
+    );
     state = "open";
   } catch (error) {
     state = "closing";
@@ -695,8 +818,12 @@ export async function connectDefaultMcpClient(
         handler();
       }
     },
-    setDisabledHandler(handler) { disabledHandler = handler; },
+    setDisabledHandler(handler) {
+      disabledHandler = handler;
+      if (state === "disabled") handler();
+    },
     ...("type" in server && server.type === "http" ? { disableOnTimeout: () => fatal() } : {}),
+    getPeerSignal: () => fatalController.signal,
     async close() {
       if (state === "closed" || state === "closing") return;
       state = "closing";
@@ -753,6 +880,7 @@ interface ServerState {
   validators: Map<string, JsonSchemaValidator<Record<string, unknown>>>;
   syntheticAliases: string[];
   validAliases: Set<string>;
+  peerDead: boolean;
   disabled: boolean;
   dirty: boolean;
   initializing: boolean;
@@ -767,6 +895,7 @@ export interface McpBridge {
   inlineExtension: InlineExtension;
   instructionsExtension: InlineExtension;
   bindSession(session: AgentSession): void;
+  assertReady(): void;
   acquireTurnBoundary(): Promise<() => void>;
   drainRefreshes(): Promise<void>;
   close(): Promise<void>;
@@ -846,6 +975,7 @@ export async function bridgeMcpServers(
     if ("type" in server && server.type === "acp") throw adapterError("unsupported_mcp_transport", { server: server.name });
   }
   const states: ServerState[] = [];
+  const acquiredHandles: McpClientHandle[] = [];
   const failedResults = new Map<string, McpResultProjection>();
   const aliasServers = new Map<string, string>();
   const tools: ToolDefinition[] = [];
@@ -861,6 +991,11 @@ export async function bridgeMcpServers(
   let poisoned = false;
   const refreshController = new AbortController();
   let boundaryTail = Promise.resolve();
+
+  const assertReady = (): void => {
+    const dead = states.find((state) => state.peerDead || state.handle.getPeerSignal?.().aborted);
+    if (dead) throw adapterError("mcp_init_error", { server: dead.server.name });
+  };
 
   const acquireTurnBoundary = async (): Promise<() => void> => {
     let release!: () => void;
@@ -896,24 +1031,30 @@ export async function bridgeMcpServers(
       signal: AbortSignal | undefined,
       onUpdate: Parameters<ToolDefinition["execute"]>[3],
       operation: (
-        turnSignal: AbortSignal,
+        requestSignal: AbortSignal,
         guardedUpdate: Parameters<ToolDefinition["execute"]>[3],
       ) => Promise<unknown>,
     ) => {
       if (state.disabled || !state.validAliases.has(alias)) {
         throw new Error(`MCP tool ${alias} is no longer available`);
       }
-      const turnSignal = anySignal([signal, binding?.sessionSignal]);
       let acceptingUpdates = true;
       const guardedUpdate: Parameters<ToolDefinition["execute"]>[3] = (update) => {
         if (acceptingUpdates) onUpdate?.(update);
       };
       let result: unknown;
       try {
-        result = await bounded(operation(turnSignal, guardedUpdate), turnSignal, deps.mcpTimeoutMs, deps.sleep);
+        result = await settleMcpOperation(
+          (requestSignal) => operation(requestSignal, guardedUpdate),
+          signal,
+          binding?.sessionSignal,
+          state.peerDead ? undefined : state.handle.getPeerSignal?.(),
+          deps.mcpTimeoutMs,
+          deps.sleep,
+        );
       } catch (error) {
-        if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
-        throw new Error(error instanceof McpTimeoutError ? `MCP tool ${alias} timed out` : `MCP tool ${alias} failed`);
+        if (isMcpTimeout(error)) state.handle.disableOnTimeout?.();
+        throw new Error(isMcpTimeout(error) ? `MCP tool ${alias} timed out` : `MCP tool ${alias} failed`);
       } finally {
         acceptingUpdates = false;
       }
@@ -932,45 +1073,38 @@ export async function bridgeMcpServers(
     };
     switch (operation) {
       case "list_resources": return syntheticTool(alias, "List MCP resources", EMPTY_SCHEMA, async (_id, _params, signal, onUpdate) => {
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => pageAll(state.handle.listResources!.bind(state.handle), turnSignal, deps, "resources", guardedUpdate, state.token));
+        const result = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => pageAll(state.handle.listResources!.bind(state.handle), requestSignal, deps, "resources", guardedUpdate, state.token));
         const paged = result as { items: unknown[]; pages: unknown[] };
         return { content: [{ type: "text", text: JSON.stringify({ resources: paged.items }) }], details: { pages: paged.pages } };
       });
       case "list_resource_templates": return syntheticTool(alias, "List MCP resource templates", EMPTY_SCHEMA, async (_id, _params, signal, onUpdate) => {
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const paged = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => pageAll(state.handle.listResourceTemplates!.bind(state.handle), turnSignal, deps, "resourceTemplates", guardedUpdate, state.token)) as { items: unknown[]; pages: unknown[] };
+        const paged = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => pageAll(state.handle.listResourceTemplates!.bind(state.handle), requestSignal, deps, "resourceTemplates", guardedUpdate, state.token)) as { items: unknown[]; pages: unknown[] };
         return { content: [{ type: "text", text: JSON.stringify({ resourceTemplates: paged.items }) }], details: { pages: paged.pages } };
       });
       case "read_resource": return syntheticTool(alias, "Read an MCP resource", URI_SCHEMA, async (_id, params, signal, onUpdate) => {
         const input = params as { uri: string };
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.readResource!(input.uri, requestOptions(turnSignal, updateProgress(guardedUpdate)))) as { contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> };
+        const result = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => state.handle.readResource!(input.uri, requestOptions(requestSignal, updateProgress(guardedUpdate)))) as { contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> };
         return { content: result.contents.map((content) => content.text !== undefined
           ? { type: "text" as const, text: content.text }
           : { type: "text" as const, text: `[embedded resource uri=${content.uri} mime=${content.mimeType ?? "application/octet-stream"} bytes=${Buffer.from(content.blob ?? "", "base64").byteLength}]` }), details: result };
       });
       case "subscribe_resource": return syntheticTool(alias, "Subscribe to an MCP resource", URI_SCHEMA, async (_id, params, signal, onUpdate) => {
         const input = params as { uri: string };
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.subscribeResource!(input.uri, requestOptions(turnSignal, updateProgress(guardedUpdate))));
+        const result = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => state.handle.subscribeResource!(input.uri, requestOptions(requestSignal, updateProgress(guardedUpdate))));
         return { content: [{ type: "text", text: `Subscribed to ${input.uri}` }], details: result };
       });
       case "unsubscribe_resource": return syntheticTool(alias, "Unsubscribe from an MCP resource", URI_SCHEMA, async (_id, params, signal, onUpdate) => {
         const input = params as { uri: string };
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.unsubscribeResource!(input.uri, requestOptions(turnSignal, updateProgress(guardedUpdate))));
+        const result = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => state.handle.unsubscribeResource!(input.uri, requestOptions(requestSignal, updateProgress(guardedUpdate))));
         return { content: [{ type: "text", text: `Unsubscribed from ${input.uri}` }], details: result };
       });
       case "list_prompts": return syntheticTool(alias, "List MCP prompts", EMPTY_SCHEMA, async (_id, _params, signal, onUpdate) => {
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const paged = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => pageAll(state.handle.listPrompts!.bind(state.handle), turnSignal, deps, "prompts", guardedUpdate, state.token)) as { items: unknown[]; pages: unknown[] };
+        const paged = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => pageAll(state.handle.listPrompts!.bind(state.handle), requestSignal, deps, "prompts", guardedUpdate, state.token)) as { items: unknown[]; pages: unknown[] };
         return { content: [{ type: "text", text: JSON.stringify({ prompts: paged.items }) }], details: { pages: paged.pages } };
       });
       case "get_prompt": return syntheticTool(alias, "Get an MCP prompt", PROMPT_SCHEMA, async (_id, params, signal, onUpdate) => {
         const input = params as { name: string; arguments?: Record<string, string> };
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.getPrompt!(input.name, input.arguments, requestOptions(turnSignal, updateProgress(guardedUpdate)))) as { description?: string; messages: Array<{ role: string; content: ContentBlock }> };
+        const result = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => state.handle.getPrompt!(input.name, input.arguments, requestOptions(requestSignal, updateProgress(guardedUpdate)))) as { description?: string; messages: Array<{ role: string; content: ContentBlock }> };
         const content = [
           ...(result.description ? [{ type: "text" as const, text: `[mcp prompt description]\n${result.description}` }] : []),
           ...result.messages.flatMap((message) => [{ type: "text" as const, text: `[mcp prompt role=${message.role}]` }, convertMcpContent(message.content)]),
@@ -978,8 +1112,7 @@ export async function bridgeMcpServers(
         return { content, details: result };
       });
       case "complete": return syntheticTool(alias, "Complete an MCP prompt or resource argument", COMPLETE_SCHEMA, async (_id, params, signal, onUpdate) => {
-        const turnSignal = anySignal([signal, binding?.sessionSignal]);
-        const result = await executeRequest(_id, signal, onUpdate, (_requestSignal, guardedUpdate) => state.handle.complete!(params, requestOptions(turnSignal, updateProgress(guardedUpdate)))) as { completion: unknown };
+        const result = await executeRequest(_id, signal, onUpdate, (requestSignal, guardedUpdate) => state.handle.complete!(params, requestOptions(requestSignal, updateProgress(guardedUpdate)))) as { completion: unknown };
         return { content: [{ type: "text", text: JSON.stringify(result.completion) }], details: result };
       });
       default: throw new Error("unknown synthetic MCP operation");
@@ -995,23 +1128,29 @@ export async function bridgeMcpServers(
       if (state.disabled || !state.validAliases.has(alias) || state.aliases.get(remote.name) !== alias) {
         throw new Error(`MCP tool ${alias} is no longer available`);
       }
-      const turnSignal = anySignal([signal, binding?.sessionSignal]);
       let acceptingUpdates = true;
       let result: CallToolResult;
       try {
-        result = await bounded(state.handle.callTool(remote.name, params, turnSignal, deps.mcpTimeoutMs, (value) => {
-          if (!acceptingUpdates) return;
-          const progressValue = value as { progress?: unknown; total?: unknown; message?: unknown };
-          const text = `[mcp:${state.token}] ${String(progressValue.progress)}${progressValue.total === undefined ? "" : `/${String(progressValue.total)}`}${progressValue.message === undefined ? "" : ` ${String(progressValue.message)}`}`;
-          onUpdate?.({ content: [{ type: "text", text }], details: value });
-        }), turnSignal, deps.mcpTimeoutMs, deps.sleep);
+        result = await settleMcpOperation(
+          (requestSignal) => state.handle.callTool(remote.name, params, requestSignal, deps.mcpTimeoutMs, (value) => {
+            if (!acceptingUpdates) return;
+            const progressValue = value as { progress?: unknown; total?: unknown; message?: unknown };
+            const text = `[mcp:${state.token}] ${String(progressValue.progress)}${progressValue.total === undefined ? "" : `/${String(progressValue.total)}`}${progressValue.message === undefined ? "" : ` ${String(progressValue.message)}`}`;
+            onUpdate?.({ content: [{ type: "text", text }], details: value });
+          }),
+          signal,
+          binding?.sessionSignal,
+          state.peerDead ? undefined : state.handle.getPeerSignal?.(),
+          deps.mcpTimeoutMs,
+          deps.sleep,
+        );
         const validate = state.validators.get(alias);
         if (validate && !result.isError) {
           if (result.structuredContent === undefined || !validate(result.structuredContent).valid) throw new Error("invalid MCP tool output");
         }
       } catch (error) {
-        if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
-        throw new Error(error instanceof McpTimeoutError ? `MCP tool ${alias} timed out` : `MCP tool ${alias} failed`);
+        if (isMcpTimeout(error)) state.handle.disableOnTimeout?.();
+        throw new Error(isMcpTimeout(error) ? `MCP tool ${alias} timed out` : `MCP tool ${alias} failed`);
       } finally {
         acceptingUpdates = false;
       }
@@ -1024,7 +1163,10 @@ export async function bridgeMcpServers(
     },
   });
 
-  const enumerate = async (state: ServerState, signal: AbortSignal): Promise<{ tools: Tool[]; pages: unknown[] }> => {
+  const enumerate = async (
+    state: ServerState,
+    lifecycleSignal: AbortSignal,
+  ): Promise<{ tools: Tool[]; pages: unknown[] }> => {
     const listed: Tool[] = [];
     const pages: unknown[] = [];
     const seenCursors = new Set<string>();
@@ -1037,9 +1179,16 @@ export async function bridgeMcpServers(
       }
       let page: Awaited<ReturnType<McpClientHandle["listTools"]>>;
       try {
-        page = await bounded(state.handle.listTools(cursor, signal, deps.mcpTimeoutMs), signal, deps.mcpTimeoutMs, deps.sleep);
+        page = await settleMcpOperation(
+          (requestSignal) => state.handle.listTools(cursor, requestSignal, deps.mcpTimeoutMs),
+          lifecycleSignal,
+          binding?.sessionSignal,
+          state.handle.getPeerSignal?.(),
+          deps.mcpTimeoutMs,
+          deps.sleep,
+        );
       } catch (error) {
-        if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
+        if (isMcpTimeout(error)) state.handle.disableOnTimeout?.();
         throw error;
       }
       pages.push(page.raw ?? page);
@@ -1063,7 +1212,7 @@ export async function bridgeMcpServers(
   };
 
   const refreshOne = async (state: ServerState): Promise<void> => {
-    if (closing || state.disabled || !extensionApi || !piSession) return;
+    if (closing || state.peerDead || state.disabled || !extensionApi || !piSession) return;
     let candidate: { tools: Tool[]; pages: unknown[] };
     let candidateUsed: Set<string>;
     let nextAliases: Map<string, string>;
@@ -1072,7 +1221,7 @@ export async function bridgeMcpServers(
     let removed: string[];
     const addedReservations: Array<{ alias: string; server: string }> = [];
     try {
-      candidate = await enumerate(state, anySignal([binding?.sessionSignal, refreshController.signal]));
+      candidate = await enumerate(state, refreshController.signal);
       candidateUsed = new Set(usedAliases);
       nextAliases = new Map(state.aliases);
       const previousNames = new Set(state.tools.map((tool) => tool.name));
@@ -1093,13 +1242,13 @@ export async function bridgeMcpServers(
         .map((name) => state.aliases.get(name))
         .filter((value): value is string => value !== undefined);
     } catch (error) {
-      if (error instanceof McpTimeoutError) state.handle.disableOnTimeout?.();
-      if (!closing && !state.disabled) binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
+      if (isMcpTimeout(error)) state.handle.disableOnTimeout?.();
+      if (!closing && !state.peerDead && !state.disabled) binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
       return;
     }
 
     const release = await acquireTurnBoundary();
-    if (closing || state.disabled || !extensionApi || !piSession) {
+    if (closing || state.peerDead || state.disabled || !extensionApi || !piSession) {
       release();
       return;
     }
@@ -1136,7 +1285,7 @@ export async function bridgeMcpServers(
 
   const runRefreshBatches = async (): Promise<void> => {
     while (!closing) {
-      const batch = states.filter((state) => state.dirty && !state.initializing && !state.disabled);
+      const batch = states.filter((state) => state.dirty && !state.initializing && !state.peerDead && !state.disabled);
       if (batch.length === 0) return;
       for (const state of batch) state.dirty = false;
       for (const state of batch) await refreshOne(state);
@@ -1150,13 +1299,13 @@ export async function bridgeMcpServers(
       .then(runRefreshBatches)
       .finally(() => {
         refreshScheduled = false;
-        if (states.some((state) => state.dirty && !state.initializing && !state.disabled)) scheduleRefreshes();
+        if (states.some((state) => state.dirty && !state.initializing && !state.peerDead && !state.disabled)) scheduleRefreshes();
       });
     refreshQueue.catch(() => undefined);
   };
 
   const refresh = (state: ServerState) => {
-    if (closing || state.disabled) return;
+    if (closing || state.peerDead || state.disabled) return;
     state.dirty = true;
     if (!state.initializing) scheduleRefreshes();
   };
@@ -1165,73 +1314,101 @@ export async function bridgeMcpServers(
     for (const server of servers) {
       const token = allocateServerToken(server.name);
       let handle: McpClientHandle;
+      let state: ServerState;
       try {
         const serverBinding = binding ? { ...binding, serverToken: token } : undefined;
         const connecting = deps.connectMcpClient(server, openSignal, serverBinding);
         connecting.then(() => undefined, () => undefined);
         try {
-          handle = await bounded(connecting, openSignal, deps.mcpTimeoutMs, deps.sleep);
+          handle = await settleMcpOperation(
+            () => connecting,
+            openSignal,
+            binding?.sessionSignal,
+            undefined,
+            deps.mcpTimeoutMs,
+            deps.sleep,
+          );
         } catch (error) {
           // The outer transport-start bound can win before the factory returns its owner. Observe and
           // close a detached late handle so a real stdio child cannot escape rollback.
           void connecting.then((late) => late.close()).catch(() => undefined);
           throw error;
         }
+        // Ownership transfers immediately when connect returns.  Ping, logging,
+        // and enumeration are all post-connect work and rollback must close
+        // this handle if any of them fails.
+        acquiredHandles.push(handle);
+        state = {
+          server,
+          token,
+          handle,
+          tools: [],
+          pages: [],
+          aliases: new Map(),
+          validators: new Map(),
+          syntheticAliases: [],
+          validAliases: new Set(),
+          peerDead: false,
+          disabled: false,
+          dirty: false,
+          initializing: true,
+        };
+        states.push(state);
+        handle.setToolsChangedHandler?.(() => refresh(state));
+        handle.setDisabledHandler?.(() => {
+          if (state.peerDead || state.disabled || closing) return;
+          // Transport death is observable immediately, but alias validity is
+          // committed only while holding the turn boundary.  The running turn
+          // therefore retains its selected definition and receives the remote
+          // connection failure, not a premature tombstone.
+          state.peerDead = true;
+          state.dirty = false;
+          refreshQueue = refreshQueue.then(async () => {
+            if (!piSession || closing) return;
+            const release = await acquireTurnBoundary();
+            try {
+              if (!piSession || closing) return;
+              const active = new Set(piSession.getActiveToolNames());
+              for (const alias of [...state.syntheticAliases, ...state.aliases.values()]) active.delete(alias);
+              piSession.setActiveToolsByName([...active]);
+              state.validAliases.clear();
+              state.disabled = true;
+            } catch {
+              poison(state);
+            } finally {
+              release();
+            }
+          });
+          refreshQueue.catch(() => undefined);
+        });
         if (handle.ping) {
-          await bounded(
-            Promise.resolve().then(() => handle.ping!(openSignal, deps.mcpTimeoutMs)),
+          await settleMcpOperation(
+            (requestSignal) => handle.ping!(requestSignal, deps.mcpTimeoutMs),
             openSignal,
+            binding?.sessionSignal,
+            handle.getPeerSignal?.(),
             deps.mcpTimeoutMs,
             deps.sleep,
           );
+        } else if (handle.getPeerSignal?.().aborted) {
+          throw new McpOperationTerminalError("peer", handle.getPeerSignal?.().reason);
         }
       } catch (error) {
-        if (openSignal.aborted) throw error;
+        if (error instanceof McpOperationTerminalError
+          && (error.terminalCause === "lifecycle" || error.terminalCause === "session")) {
+          throw error.terminalReason;
+        }
+        if (openSignal.aborted) throw openSignal.reason;
         throw adapterError("mcp_init_error", { server: server.name });
       }
-      const state: ServerState = {
-        server,
-        token,
-        handle,
-        tools: [],
-        pages: [],
-        aliases: new Map(),
-        validators: new Map(),
-        syntheticAliases: [],
-        validAliases: new Set(),
-        disabled: false,
-        dirty: false,
-        initializing: true,
-      };
-      states.push(state);
-      handle.setToolsChangedHandler?.(() => refresh(state));
-      handle.setDisabledHandler?.(() => {
-        if (state.disabled || closing) return;
-        state.disabled = true;
-        state.dirty = false;
-        refreshQueue = refreshQueue.then(async () => {
-          if (!piSession || closing) return;
-          const release = await acquireTurnBoundary();
-          try {
-            if (!piSession || closing) return;
-            const active = new Set(piSession.getActiveToolNames());
-            for (const alias of [...state.syntheticAliases, ...state.aliases.values()]) active.delete(alias);
-            piSession.setActiveToolsByName([...active]);
-            state.validAliases.clear();
-          } catch {
-            poison(state);
-          } finally {
-            release();
-          }
-        });
-        refreshQueue.catch(() => undefined);
-      });
       const caps = handle.getCapabilities?.();
       try {
         if (caps?.logging && handle.setLoggingLevel) {
-          await bounded(
-            Promise.resolve().then(() => handle.setLoggingLevel!(openSignal, deps.mcpTimeoutMs)),
+          await settleMcpOperation(
+            (requestSignal) => handle.setLoggingLevel!(requestSignal, deps.mcpTimeoutMs),
             openSignal,
+            binding?.sessionSignal,
+            handle.getPeerSignal?.(),
             deps.mcpTimeoutMs,
             deps.sleep,
           );
@@ -1242,20 +1419,31 @@ export async function bridgeMcpServers(
         if (caps?.prompts) operations.push("list_prompts", "get_prompt");
         if (caps?.completions) operations.push("complete");
         for (const operation of operations) tools.push(makeSynthetic(state, operation));
-        let initial = await enumerate(state, openSignal);
+        let initial = caps?.tools
+          ? await enumerate(state, openSignal)
+          : { tools: [], pages: [] };
         if (state.dirty) {
           state.dirty = false;
           try {
-            initial = await enumerate(state, openSignal);
+            initial = caps?.tools
+              ? await enumerate(state, openSignal)
+              : { tools: [], pages: [] };
           } catch {
             binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
           }
+        }
+        if (state.peerDead || handle.getPeerSignal?.().aborted) {
+          throw new McpOperationTerminalError("peer", handle.getPeerSignal?.().reason);
         }
         state.initializing = false;
         state.tools = initial.tools;
         state.pages = initial.pages;
       } catch (error) {
-        if (openSignal.aborted) throw error;
+        if (error instanceof McpOperationTerminalError
+          && (error.terminalCause === "lifecycle" || error.terminalCause === "session")) {
+          throw error.terminalReason;
+        }
+        if (openSignal.aborted) throw openSignal.reason;
         throw adapterError("mcp_init_error", { server: server.name });
       }
       // A notification accepted while the one coalesced extra pass was running becomes ordinary
@@ -1278,7 +1466,7 @@ export async function bridgeMcpServers(
       }
     }
   } catch (error) {
-    await closeClients(states.map(({ handle }) => handle), deps);
+    await closeClients(acquiredHandles, deps);
     throw error;
   }
 
@@ -1314,9 +1502,11 @@ export async function bridgeMcpServers(
     inlineExtension,
     instructionsExtension,
     bindSession(session) {
+      assertReady();
       piSession = session;
       scheduleRefreshes();
     },
+    assertReady,
     acquireTurnBoundary,
     drainRefreshes: () => refreshQueue,
     close() {
@@ -1337,13 +1527,17 @@ export async function bridgeMcpServers(
 }
 
 async function closeClients(clients: readonly McpClientHandle[], deps: PiAcpDeps): Promise<void> {
-  const closes = [...clients].reverse().map((client) =>
-    bounded(
-      Promise.resolve().then(() => client.close()),
-      NEVER_ABORTED,
-      MCP_CLOSE_DEADLINE_MS,
-      deps.sleep,
-    ).catch(() => undefined));
+  const closes = [...clients].reverse().map((client) => {
+    let close: Promise<void>;
+    try {
+      // Invocation itself is part of the synchronous logical-close prefix.
+      close = client.close();
+    } catch {
+      return Promise.resolve();
+    }
+    close.catch(() => undefined);
+    return bounded(close, NEVER_ABORTED, deps.mcpTimeoutMs, deps.sleep).catch(() => undefined);
+  });
   await Promise.allSettled(closes);
 }
 

@@ -1293,22 +1293,23 @@ freshly-read, `modified`-desc-sorted list with a fixed page size of **100**.
 
 #### 9.1.6 `session/close`, idempotency, and the concurrency matrix
 
-`session/close` **disposes** the `PiSession` and returns success. **Close is total and never
-observable-failing (resolves the known-close cleanup-failure gap):** the live entry is dropped from `live`
-in a `finally`, so the drop happens even if disposal throws; each disposal sub-step is guarded and bounded
-and its errors are logged to stderr only (best-effort, never surfaced) — so a `session/close` never
-reaches the row-23 catch-all, and a retry is a clean idempotent success. Disposal (the same routine §3.2
-calls; **settlement-ordered** per §6.2.1 invariant 3): if a turn is in flight, abort the per-turn
-controller (§9.6) and **await the turn's settlement** (guaranteed within `deps.graceMs` by the wedged
-backstop) so its `usage_update`/`drain`/resolve complete first; then call pi's
-**`AgentSession.dispose()`** (`agent-session.ts:799`), cancel + drop the send queue, unsubscribe the
-translator, disconnect every MCP client (each bounded by `deps.mcpTimeoutMs`), and (in the `finally`) drop
-from `live`. Pinned behaviors:
+`session/close` **disposes** the `PiSession`. Close is normally idempotent success, but the retained
+child-cleanup tombstone in §9.6 is the one observable failure exception. The synchronous prefix of the
+shared cleanup generation first closes prompt/refresh and child-spawn admission, captures and starts
+termination for the current child epoch, starts every memoized MCP logical close, aborts the session
+lifetime, aborts the turn/refresh signals, and starts awaited `AgentSession.abort()` without serial
+gaps. If a turn is active, close joins its settlement and cleanup barrier before dropping the send queue,
+so any admitted `usage_update` and notification drain complete first. The live entry is removed in a
+`finally`, even when cleanup fails, and the cleanup owner remains addressable behind the tombstone.
+Ordinary `AgentSession.dispose()`/MCP-close/logging failures stay bounded best-effort diagnostics and do
+not fail close; unresolved child ownership, awaited Pi-abort failure, or the absolute `deps.graceMs`
+deadline rejects row 19 and retains retry ownership. Pinned behaviors:
 
 | situation | behavior |
 |---|---|
-| close an unknown / already-closed / tombstoned id | **success** (idempotent; close is never observable-failing — never rows 12/14) |
-| close whose `AgentSession.dispose()` / MCP `close()` throws | **success** — the live entry is dropped in the `finally`, disposal errors logged to stderr only; a retry is a clean idempotent success (never row 23) |
+| close an unknown / already-closed / ordinary-or-cleanup-complete tombstoned id | **success** (idempotent; never rows 12/14) |
+| close whose `AgentSession.dispose()` / MCP `close()` throws, with child/Pi-abort cleanup proven | **success** — the live entry is dropped in the `finally`, non-child disposal errors are fixed diagnostics, and a retry is a clean idempotent success (never row 23) |
+| close whose child registry or awaited `AgentSession.abort()` cannot drain by the generation deadline | **reject `child_cleanup_error` (row 19)** after every child and MCP owner has been attempted; retain a cleanup tombstone, and let repeated close start/join a fresh retry generation until proof succeeds |
 | duplicate `load`/`resume` for an id already **live or reserved-opening** | reject the second `session_already_open` (row 13) — never overwrite a live/opening wrapper (its subscription/MCP clients would leak) |
 | `close` racing an **in-flight opening** transaction (id in `opening`) | close aborts that transaction's `openController` and returns **success**; the transaction fails its §9.1.0 step-3 gate and rolls back — **no post-close resurrection** |
 | `close` racing an in-flight `prompt` | close aborts the per-turn controller (§9.6); the racing `prompt` settles `cancelled` (§6.2.1), emitting its `usage_update`/`drain` **before** close tears the queue down; then close disposes |
@@ -1322,9 +1323,9 @@ a wedged turn, the underlying pi run may still be alive and could later append t
 The adapter therefore records the `sessionId` in the per-connection **tombstone** set and rejects any
 subsequent `load`/`resume`/`fork`/`prompt`/`set_config_option`/reopen for that id with
 `session_terminated` (row 14) for the remainder of the process — preventing a second writer from
-corrupting the journal a wedged writer may still touch. (`session/close` on a tombstoned id still
-succeeds idempotently, §9.1.6 table.) Tombstones are per connection and cleared only on connection
-teardown.
+corrupting the journal a wedged writer may still touch. `session/close` on an ordinary or
+cleanup-complete tombstone succeeds idempotently; a retained child-cleanup tombstone follows the retry
+exception in the §9.1.6 table. Tombstones are per connection and cleared only on connection teardown.
 
 #### 9.1.7 `additionalDirectories` (accept-and-ignore, documented)
 
@@ -1473,8 +1474,8 @@ resolve/reject produces **no unhandled rejection** (extending to MCP the detache
 previously covered only pi prompt + permission requests, §9.6). For a **failed or timed-out `connect`**,
 the wrapper closes the acquired transport, including any stdio child, and observes/closes a handle that
 resolves after the outer bound. The returned `McpClientHandle` exposes the complete stable-base
-operations plus idempotent `close`; HTTP DELETE and raw close share one absolute 60,000-ms close
-deadline, so neither phase restarts the clock.
+operations plus idempotent `close`; HTTP DELETE and raw close share one absolute
+`deps.mcpTimeoutMs` close deadline (60,000 ms by default), so neither phase restarts the clock.
 
 #### 9.3.2 Naming, collisions, partial-init rollback, cleanup (total — resolves adversarial finding 9)
 
@@ -1517,7 +1518,9 @@ Naming is therefore made total so no injected name can ever occupy a built-in/ex
   (pi surfaces it as a failed tool, §9.3.3, not a crashed session).
 - **Cleanup.** MCP clients are disconnected on `session/close`, on the §9.6 backstop, and on connection
   teardown (§3.2 disposal). All closes are started without awaiting between invocations; each server's
-  HTTP DELETE/raw-close pair shares the absolute 60,000-ms bound, so a hung close cannot wedge shutdown.
+  HTTP DELETE/raw-close pair shares the injected absolute `deps.mcpTimeoutMs` bound. Streamable HTTP
+  alone performs DELETE before raw close; stdio and SSE invoke their transport-owned raw `close()` in the
+  same synchronous logical-close stack, with no adapter pre-kill or other pre-close step.
 
 #### 9.3.3 Result conversion (total over the pinned `CallToolResult` — resolves the content-union gap)
 
@@ -1529,23 +1532,25 @@ details? }`) is **total over every member**, in `content` order:
 
 - **text** → `{ type:"text", text }`.
 - **image** (`{ data, mimeType }`) → `{ type:"image", data, mimeType }`.
-- **audio** → a text item `[unsupported audio tool-result omitted]` (pi's tool-result content is
-  text-or-image only, `ai/types.ts:403-418`; audio has no pi representation — degrade, don't drop
-  silently).
+- **audio** → a text item `` `[audio mime=${mimeType} bytes=${decodedByteLength}]` `` (pi's tool-result
+  content is text-or-image only, `ai/types.ts:403-418`; the canonical text retains media type and byte
+  count without leaking or inventing audio playback).
 - **resource_link** (`{ uri, name?, title? }`) → a text item `[<title ?? name ?? uri>](<uri>)`.
 - **embedded resource** — text contents → the embedded `text`; blob contents → a text item
-  `[embedded resource: <uri>]`.
-- **`structuredContent`** (when present) → set pi `AgentToolResult.details = structuredContent`, so it
-  surfaces to the client as `tool_call_update.rawOutput` (§6.3.1) rather than being lost.
-- **`isError: true`** → the pi tool `execute` **throws** (pi encodes a thrown tool error as a failed tool
-  result — `extensions/types.ts` requires throwing rather than encoding errors in `content`), surfaced to
-  the client as `tool_call_update { status:"failed" }` (§6.3). The thrown `Error.message` is a **fixed**
-  string `` `MCP tool ${alias} failed` `` — **never** the raw provider `content` text
-  (redaction parity with §8.2); the result `content` (already converted above) is still projected as the
-  failed update's `content`, so the model sees the tool's own error text there without a raw exception on
-  any error channel.
-- A **timed-out / aborted** `tools/call` (§9.3.1) throws the same way (fixed message
-  `` `MCP tool ${alias} timed out` ``) → a failed tool result the model sees, never a crashed session.
+  `` `[embedded resource uri=${uri} mime=${mimeType ?? "application/octet-stream"} bytes=${decodedByteLength}]` ``.
+- **raw result** → set pi `AgentToolResult.details` to the exact complete `CallToolResult` object, so
+  `tool_call_update.rawOutput` contains the peer's exact result (including `content`, optional
+  `structuredContent`, and optional `isError`) rather than a narrowed or wrapped projection.
+- **`isError: true`** → retain the complete projected `{ content, details }` in the session's failed-result
+  side map, then throw the fixed `` `MCP tool ${alias} failed` `` so pi takes its normal failed-tool path.
+  The paired `afterToolCall` override consumes that entry for the same call and restores the peer's
+  projected content plus exact raw result as the single `tool_execution_end { isError:true }`; ACP
+  therefore receives `tool_call_update { status:"failed", content, rawOutput }` without an adapter
+  crash. The thrown message never contains the peer's raw content, and the side-map entry is consumed
+  exactly once.
+- A timeout that wins the outgoing arbiter throws fixed
+  `` `MCP tool ${alias} timed out` ``. A turn abort emits no late tool failure after ACP settlement;
+  disposal or peer close uses the ordinary fixed `failed` label only while the turn is still live.
 
 #### 9.3.4 Transports
 
@@ -1760,8 +1765,7 @@ workflow→acp-agents→pi-acp dependency edges and the installed smoke checks a
 
 ## 11. Non-goals (v1) — with rationale
 - **`session/delete`** — pi's `SessionManager` exposes no delete/unlink API; hand-unlinking `.jsonl`
-  files risks corrupting the fork tree and would violate invariant 2. Revisit if pi adds a first-class
-  delete.
+  files risks corrupting the fork tree and would violate invariant 2. It is outside this adapter contract.
 - **Branch-topology + compaction-summary replay on `session/load`** — v1 replays the linear active
   branch (`getBranch()`) only; ACP `session/update` has no representation for fork topology, and the
   compaction summary is model-facing, not a human transcript (§9.1.2). `getTree()` metadata is not
@@ -1811,11 +1815,12 @@ workflow→acp-agents→pi-acp dependency edges and the installed smoke checks a
    Rejected: the ACP `StopReason` enum has no error member (`types.gen.d.ts:3027`), and an error that
    looks like a normal turn defeats the client's pause/retry logic. Errors reject with `data.errorKind`;
    `-32000` is auth-exclusive (§8).
-6. **Advertising a `model` select config option.** Rejected (design-minimalism finding 2): the client
-   sets the model unconditionally through the reserved channel and `applyConfigOption` does not check
-   advertisement (`acp-client.ts:1986-1993`), so advertising is unneeded surface; worse, a partial
-   "representative" list would mislead the `config-options.md` §2.3 validate probe. We only *handle*
-   `set_config_option("model", …)` (§5.2).
+6. **Advertising a necessarily-partial representative `model` list.** Rejected (the original
+   design-minimalism finding 2): such a fabricated list would mislead the `config-options.md` §2.3
+   validate probe. The current contract overturns the old no-select conclusion because the adapter now
+   advertises the real ordered cache returned by a completed, credential- and `Provider.filterModels`-
+   aware `ModelRuntime.getAvailable()` call after extension bind (§5.1–§5.2). The display and set paths
+   refresh and use that same cache, so no representative or provisional list is published.
 7. **Gating auth-method advertisement on client auth capabilities** (the round-1 rule; also the literal
    phrasing of the focus.md auth directive, "gated on advertised client auth capabilities"). Rejected —
    and this resolves, decisively and from the repo, the tension the round-2 adversarial board routed as
@@ -1898,7 +1903,7 @@ cites the normative statement it covers.
 | T5 | §6.3/§6.3.1 | live translation row-by-row incl. `agent_thought_chunk` for thinking; the SOLE `tool_call` pending comes from `tool_execution_start` and the SOLE terminal `tool_call_update` from `tool_execution_end` (translator-owned); `toContent(result)` text+image mapping, `rawOutput = result.details` (omitted when `undefined`), empty-content → empty array, **no** `type:"diff"`; an **exhaustive switch** over `AgentSessionEvent` has no unhandled arm — **`agent_end`, and `assistantMessageEvent` `done`/`error`, produce no update** (terminal outcome read from the terminal message per §7/§8) — plus the rest of the "no fabricated" set |
 | T6 | §6.5 | per-turn `PromptResponse.usage` field map + multi-message accumulation; `usage_update.used` = `getContextUsage().tokens`, `cost.amount` = cumulative `getSessionStats().cost`; **cost.amount monotonic across two turns, and a compaction-drop turn where `used` DECREASES while `cost.amount` rises**; per-outcome usage (provider-error emits before reject; pre-flight emits none; **notify-failure emits none**; forced-cancel best-effort) |
 | T7 | §7 | stopReason table `stop\|length\|toolUse\|aborted\|error` → `end_turn\|max_tokens\|end_turn\|cancelled\|REJECT`; error rejects, never a stopReason |
-| T8 | §8.1/§8.2 | **every canonical row (1–26)**: pinned code + `errorKind`; the **exact adapter-owned wire shape** `{ code, message:<SDK prefix>, data:{ errorKind, message:<fixed label> } }` (+ `server` for 16/17, `details` for 4/23); a structurally-malformed prompt block → SDK `zPromptRequest` `invalidParams`, **no** `errorKind` (row 8); `$/cancel_request` during an opening transaction → **`-32800`** with the transaction rolled back (row 25); `close` on unknown/tombstoned id **succeeds** (not row 12/14); row-23 catch-all → `internal_error`; classification precedence (auth>billing>rate>generic); **redaction sentinel: a terminal error whose diagnostic `error.message` AND `error.stack` carry a sentinel secret → the secret is in NONE of `error.message`/`data.message`/`data.details`, and `data.details` is only the `{ type, timestamp }` projection** |
+| T8 | §8.1/§8.2 | **every canonical row (1–26)**: pinned code + `errorKind`; the **exact adapter-owned wire shape** `{ code, message:<SDK prefix>, data:{ errorKind, message:<fixed label> } }` (+ `server` for 16/17, redacted diagnostic `details` for 4/23, and integer-only `{ remainingChildren }` for 19); a structurally-malformed prompt block → SDK `zPromptRequest` `invalidParams`, **no** `errorKind` (row 8); `$/cancel_request` during an opening transaction → **`-32800`** with the transaction rolled back (row 25); `close` on unknown/ordinary-or-cleanup-complete tombstoned id **succeeds** (not row 12/14), while a retained child-cleanup tombstone is row 19; row-23 catch-all → `internal_error`; classification precedence (auth>billing>rate>generic); **redaction sentinel: a terminal error whose diagnostic `error.message` AND `error.stack` carry a sentinel secret → the secret is in NONE of `error.message`/`data.message`/`data.details`, diagnostic `data.details` is only the `{ type, timestamp }` projection, and child cleanup details contain only `remainingChildren`** |
 | T9 | §5.1/§5.2 | initialize and every successful set return `[thinkingLevel, model]`; the model choices equal the completed credential/filter-aware catalog in order, current-value states are exact, every set refreshes before mutation, duplicate model ids select the first cached object, and an unavailable model rejects `invalid_model` |
 | T10 | §5 | initialize returns the exact agent capabilities: load/resume/fork/list/close, image prompts, and `mcpCapabilities:{ http:true, sse:true }`, with no Pi private capability namespace, delete, or additionalDirectories |
 | T11 | §9.2 | permission wire order + exactly-once: for each `toolCallId`, the pending `tool_call` (from `tool_execution_start`) is on the wire **before** `session/request_permission` (drain enforced), and the wrapper emits **no** `session/update`; exactly one pending + one terminal `tool_call_update` on **every** path — allow_once, allow_always, reject_once, **unknown/missing `optionId` → fail-safe deny**, cancelled-outcome, turn-abort-wins-race, transport-failure(fail-safe deny, turn continues), inner-hook block, inner-hook throw; **wrapper delegates to `inner` after BOTH a fresh allow AND an `allow_always` cache hit** (a cache hit combined with an inner block/throw still blocks); `allow_always` name-scoped single-session cache skips only the round-trip |
@@ -1910,26 +1915,46 @@ cites the normative statement it covers.
 | # | covers | assertion |
 |---|---|---|
 | T14 | §6.2/§6.2.1, §6.6 | full turn: ordered `session/update` stream drained before `PromptResponse`; a notify-failure fixture aborts + **rejects `notification_error` (settlement input 3) with NO `usage_update`/`drain`**; a close racing an in-flight prompt still emits `usage_update`+`drain`+resolves `cancelled` **before** the queue is torn down (teardown-waits-for-settlement) |
-| T15 | §9.1.0-.6 | lifecycle + concurrency matrix: new→prompt→close; **two concurrent `load`s for one id** → exactly one wins, the other `session_already_open`, no leak (atomic reservation); unknown id (load/resume/prompt) → `unknown_session`; `close` on unknown/already-closed/**tombstoned** id → **success**, and **close whose `dispose()` throws → still success (entry dropped, retry clean)**; close-races-prompt → cancelled; busy fork/set_config → `session_busy`; cwd validation on **new/fork-target**/load/resume/list; **the same injected `deps.modelRuntime` object is passed on ALL FOUR `createAgentSession` call sites**; **open-time races: `$/cancel_request` during open → `-32800` + rollback (no leak); `close` during an opening txn → success + rollback (no resurrection); `dispose()` during an opening txn → rollback (no post-dispose commit)** |
+| T15 | §9.1.0-.6 | lifecycle + concurrency matrix: new→prompt→close; **two concurrent `load`s for one id** → exactly one wins, the other `session_already_open`, no leak (atomic reservation); unknown id (load/resume/prompt) → `unknown_session`; `close` on unknown/already-closed/ordinary-or-cleanup-complete tombstoned id → **success**, and **close whose non-child `dispose()` leg throws → still success (entry dropped, retry clean)**; retained child cleanup is the sole row-19 exception and retries; close-races-prompt → cancelled; busy fork/set_config → `session_busy`; cwd validation on **new/fork-target**/load/resume/list; **the same injected `deps.modelRuntime` object is passed on ALL FOUR `createAgentSession` call sites**; **open-time races: `$/cancel_request` during open → `-32800` + rollback (no leak); `close` during an opening txn → success + rollback (no resurrection); `dispose()` during an opening txn → rollback (no post-dispose commit)** |
 | T15b | §9.1.0 | transactional rollback: inject a failure after **each** acquisition stage (MCP connect, `createAgentSession`, wrapper install, load replay-`notify`) and assert no live registry entry, no MCP child, no listener, no pi resource (pi `dispose()` called), and no `opening` reservation remains; a post-rollback retry is a clean open, not `session_already_open`; **the irreversible-fork case: after `forkFrom` writes successfully, inject a `createAgentSession` failure → the new JSONL remains a complete, valid, listable/loadable session while no live/opening/MCP resource leaks** |
 | T16 | §9.1.2/.3/.4 | resume emits **no** replay; load replays the linear branch via the **total** SessionEntry/AgentMessage projection — user, assistant (text/thinking/toolCall), toolResult, `bashExecution`, `custom` display-true/false, `branchSummary`/`compactionSummary` (no update), `custom_message` display-true/false, and string-vs-array content; fork round-trips over a temp `sessionDir`, including **cross-cwd** source lookup via `listAll`; **fork of a live never-prompted (unpersisted) source → `session_not_forkable` (row 26), not `session_corrupt`** |
 | T17 | §9.1.5 | list with cwd vs `listAll` (no cwd); exact cursor codec (`base64url` of decimal offset, page 100) + `nextCursor` set/omitted; missing/empty cursor → offset 0; `offset===length` → empty page; undecodable / non-canonical → `invalid_cursor`; **a shrink-below-cursor mutation (150 → page-1 cursor 100 → remove 60 → length 90) returns an EMPTY page, NOT `invalid_cursor` or a crash** |
-| T18 | §9.1.6 | poisoned/tombstoned reopen after backstop → `session_terminated`; `close` on it still succeeds |
+| T18 | §9.1.6/§9.6 | poisoned/tombstoned reopen after backstop → `session_terminated`; close succeeds for an ordinary/cleanup-complete tombstone, while a retained child-cleanup tombstone returns row 19 and retries until disappearance proof succeeds |
 | T19 | §9.1.7 | non-empty `additionalDirectories` accepted and ignored on **new AND load AND resume AND fork** (session still created; extra roots ignored) |
-| T20 | §9.3 | one credential-free transcript runs unchanged over real stdio, Streamable HTTP, and SSE: strict initialize/ping/instructions, fully paged tools/resources/templates/prompts, calls and output validation, read/subscribe/unsubscribe, prompt get/completion, logging/notifications/progress/cancellation, sampling/roots/form+URL elicitation and completion, dynamic `tools/list_changed`, and close all preserve identical semantics. DI fault rows pin hung/late connect and request arbitration, cursor cycles, collision/128-char aliases, reverse rollback, transport-specific fatal disable/no reconnect, shared HTTP DELETE/raw-close deadline, dynamic prepare/commit publication and poison, exact fixed failures, details→`rawOutput`, and `acp` as the sole unsupported transport. Lifecycle methods new/load/resume/fork all inject the same reserved extension path. |
+| T20 | §9.3.1-.3 | base bridge coverage: full tools pagination/cursor-cycle rejection, duplicate names, deterministic 128-char aliases, fixed tool failure/timeout labels, exact full-result `rawOutput`, partial-open close, and new/load/resume/fork injection |
+| M1 | §5/§9.3.4 | one table-driven transcript uses actual SDK stdio, Streamable HTTP, and legacy SSE transports, preserves repeated HTTP/SSE header order, advertises `{ http:true, sse:true }`, and rejects only client-hosted `acp` |
+| M2 | §9.3.1/§9.3.4 | connect and every outgoing operation use deterministic lifecycle/turn > disposal > peer > timeout > completion arbitration with late-settlement suppression; wrapper logical close is once-only, HTTP alone performs bounded DELETE, stdio/SSE raw close stays transport-owned, every close starts synchronously in reverse acquisition order, and DELETE/raw close share injected `deps.mcpTimeoutMs` |
+| M3 | §9.3.3/§9.3.6 | strict capabilities are authoritative (including resources-only/no-tools and subscription conditioning); package identity, ping/instructions, canonical content/result projection, exact raw pages/results, schemas, every stable operation, logging, and advertised/unadvertised notifications are covered |
+| M4 | §6.2.1/§9.3.6 | progress reaches Pi and ACP with full `rawOutput`; cancellation reaches the peer and suppresses late updates; interleaved diagnostics and turn updates use one FIFO, prompt settlement drains it, notification failure aborts as `notification_error`, and outside-turn/post-dispose routing is fixed |
+| M5 | §6.6/§9.3.5 | exact synthetic-before-remote alias order; ADD/CHANGE/UNCHANGED/REMOVE/RE-ADD state and validators; two-server serialized prepare/commit rebasing; duplicate/task-required open-vs-refresh outcomes; initial coalescing barrier; current-turn snapshot retention; fault rollback/poison; prompt/config/fork admission and close/dispose races |
+| M6 | §8/§9.3.2 | configured extension order, reserved-MCP precedence, control/bash verification, exact server-attributable `mcp_init_error`, global `extension_setup_error`, and deep redaction are covered |
+| M7 | §9.3.7 | every sampling role/media/payload mapping, system prompt/metadata rule, response mapper, unsupported base-sampling additions, peer/disposal/turn/timeout/completion races, roots, both elicitation modes and registries, progress, exact form validation, and no permission request are covered |
+| M8 | §9.3.2/§9.3.8 | post-connect ping failure ownership, partial-open rollback order, pre-publication behavior, raw fatal vs protocol error, held-boundary peer death, per-server disable/no reconnect, exact diagnostics, post-dispose suppression, and original-error × cleanup-result precedence are covered |
+| M9 | §9.3.6/§9.3.8 | subscribe then new/load/resume/fork proves every connection starts unsubscribed; replay/fork/open failure adds no MCP history mutation and only an explicit later tool call re-subscribes |
+| C1 | §5.1/§5.2 | initial and every successful echo deep-equal the complete two-option surface; a real Pi configured-provider writer fixture exposes provisional unfiltered state while publication waits for completed credential/filter-aware availability; filtered-out models are neither shown nor accepted |
+| C2 | §5.1 | no-active/empty, active, active-unlisted, and active-unlisted/empty current-value and option states are exact |
+| C3 | §5.1 | an executed hermetic workflows `config pi` origin probe enumerates the model choices while the authored-config model guard remains active |
+| C4 | §5.2/§6.6 | every set refreshes before mutation; first duplicate identity wins; filtered/absent/auth/refresh/busy paths are exact; refresh failure is non-mutating; synchronous reservation excludes prompt/config/fork; every success echoes both options |
+| E1 | §8.2 | every pinned provider string maps through auth > billing > rate > generic precedence to the intended backend classification, including both OAuth provenance sites and byte-equal normalized guidance |
+| E2 | §8.2 | the fixture Pi version equals the installed direct Pi version, making a runtime bump without recapture fail |
 
 ### 13.3 Hermetic e2e
 
 | # | covers | assertion |
 |---|---|---|
 | T21 | §4.1 | inject a `createAgentSession` that wraps `new Agent({ streamFn: mockStream })` in an `AgentSession`; drive a full ACP conversation end-to-end with **zero external credentials** — the same seam consumed by the first-class engine e2e; the spy asserts the injected `deps.modelRuntime` identity is threaded on every `createAgentSession` call |
-| A1–A4 | §9.6/§6.2.1 | real tracked core bash launches a leader plus descendant; cancel/close/rollback/shutdown do not settle before both are gone; concurrent sessions remain isolated; spawn-admission pauses cover pre/post-spawn races; deterministic generations pin 4,999-ms success, 5,000-ms failure, cancel+close join, retry tombstones, top-level-dispose retry, and the 66,000-ms process envelope |
+| A1 | §9.6/§6.2.1 | real Unix/Windows tracked bash launches a leader plus descendant; cancel, close, rollback, shutdown, and tool timeout wait for disappearance proof; Unix ESRCH and Windows successful `taskkill /T /F` plus leader close gate record removal; failure/deadline latches the retained record and only `child_cleanup_error` surfaces |
+| A2 | §9.6 | concurrent session trees are isolated: cancelling A removes only A's leader/descendant while B remains alive until B closes |
+| A3 | §9.6 | exact cleanup wire shape, retained-record counts, repeated close, concurrent top-level-dispose join, fail→success, fail→fail, post-success no-op, and once-only non-child disposal are covered |
+| A4 | §9.1.0/§9.6 | new/load/resume/fork cross cancellation/MCP/extension/replay failures with cleanup success/failure; failure overrides exactly, published and hidden retry ownership is retained, reverse closes and HTTP termination all run, and replacement/shutdown honor the 66,000-ms envelope |
+| A5 | §10.4 | acp-agents Pi close/process margins, exact error propagation/quarantine, all-settled runner/interactive disposal, memoized process disposal, and non-recoverable mapping are covered |
 
 ### 13.4 Live e2e (gated on provider keys)
 
 | # | covers | assertion |
 |---|---|---|
 | T23 | §9.4 | the built-in PiBackend live leg uses the injected HTTP StructuredOutput tool plus common prompt fallback; no private Pi capability switch exists. Gated on an env key and skipped in credential-free CI. |
+| L1 | §9.3.7/§9.6 | the same gated cheap-model leg attaches a real HTTP MCP server and round-trips its tool, then starts `sleep 180`, stops the turn, and proves the tracked child is reaped |
 
 ### 13.5 Packaging / integration guards
 

@@ -46,6 +46,8 @@ export function createConformanceServer() {
     return {
       tools: [
         { name: "exercise", description: "exercise client features", inputSchema: { type: "object", additionalProperties: false } },
+        { name: "projection", description: "project every stable result block", inputSchema: { type: "object", additionalProperties: false } },
+        { name: "remote_error", description: "return an MCP error result", inputSchema: { type: "object", additionalProperties: false } },
         { name: "hang", description: "wait for cancellation", inputSchema: { type: "object", additionalProperties: false } },
         { name: "trigger_dynamic", description: "trigger list change", inputSchema: { type: "object", additionalProperties: false } },
       ],
@@ -65,6 +67,29 @@ export function createConformanceServer() {
         extra.signal.addEventListener("abort", () => reject(extra.signal.reason), { once: true });
       });
     }
+    if (params.name === "projection") {
+      const data = Buffer.from([0, 1, 2, 3]).toString("base64");
+      return {
+        content: [
+          { type: "text", text: "plain" },
+          { type: "image", data, mimeType: "image/png" },
+          { type: "audio", data, mimeType: "audio/wav" },
+          { type: "resource_link", uri: "file:///linked", name: "linked", title: "Linked title" },
+          { type: "resource", resource: { uri: "file:///embedded-text", mimeType: "text/plain", text: "embedded" } },
+          { type: "resource", resource: { uri: "file:///embedded-blob", blob: data } },
+        ],
+        structuredContent: { exact: true },
+        isError: false,
+        _meta: { retained: true },
+      };
+    }
+    if (params.name === "remote_error") {
+      return {
+        content: [{ type: "text", text: "peer-declared failure" }],
+        isError: true,
+        _meta: { retained: "error" },
+      };
+    }
     if (params.name !== "exercise") return { content: [{ type: "text", text: params.name }] };
     const progressToken = extra._meta?.progressToken;
     if (progressToken !== undefined) {
@@ -74,12 +99,21 @@ export function createConformanceServer() {
       });
     }
     const incomingProgress = { sampling: [], roots: [], form: [], url: [] };
+    const progressBarriers = Object.fromEntries(Object.keys(incomingProgress).map((feature) => {
+      let resolve;
+      const promise = new Promise((done) => { resolve = done; });
+      return [feature, { promise, resolve }];
+    }));
+    const recordProgress = (feature) => (value) => {
+      incomingProgress[feature].push(value);
+      if (incomingProgress[feature].length === 2) progressBarriers[feature].resolve();
+    };
     const sampling = await server.createMessage({
       messages: [{ role: "user", content: { type: "text", text: "sample me" } }],
       maxTokens: 32,
       systemPrompt: "fixture system",
-    }, { onprogress: (value) => incomingProgress.sampling.push(value) });
-    const roots = await server.listRoots(undefined, { onprogress: (value) => incomingProgress.roots.push(value) });
+    }, { onprogress: recordProgress("sampling") });
+    const roots = await server.listRoots(undefined, { onprogress: recordProgress("roots") });
     const form = await server.elicitInput({
       mode: "form",
       message: "form",
@@ -88,22 +122,33 @@ export function createConformanceServer() {
         required: ["answer"],
         properties: { answer: { type: "string" } },
       },
-    }, { onprogress: (value) => incomingProgress.form.push(value) });
+    }, { onprogress: recordProgress("form") });
     const url = await server.elicitInput({
       mode: "url",
       message: "url",
       elicitationId: "fixture-url",
       url: "https://example.invalid/complete",
-    }, { onprogress: (value) => incomingProgress.url.push(value) });
-    // Related progress is intentionally non-blocking. Drain the slowest real transport before
-    // serializing the observed transcript so callback scheduling cannot make the fixture flaky.
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-    if (url.action === "accept") await server.createElicitationCompletionNotifier("fixture-url")();
+    }, { onprogress: recordProgress("url") });
+    // Each client handler invokes its terminal progress send before returning its response. Await
+    // the corresponding protocol callbacks instead of guessing how long a transport needs to drain.
+    await Promise.all(["sampling", "form", "url"].map((feature) => progressBarriers[feature].promise));
+    if (url.action === "accept") {
+      const complete = server.createElicitationCompletionNotifier("fixture-url");
+      await complete();
+      await complete();
+      await server.createElicitationCompletionNotifier("never-issued")();
+    }
+    const urlReuse = await server.elicitInput({
+      mode: "url",
+      message: "url-reuse",
+      elicitationId: "fixture-url",
+      url: "https://example.invalid/reused",
+    });
     await server.sendLoggingMessage({ level: "info", data: { fixture: true } });
     await server.sendResourceListChanged();
     await server.sendResourceUpdated({ uri: "file:///one" });
     await server.sendPromptListChanged();
-    const structuredContent = { sampling, roots, form, url, incomingProgress };
+    const structuredContent = { sampling, roots, form, url, urlReuse, incomingProgress };
     return { content: [{ type: "text", text: "exercised" }], structuredContent };
   });
 

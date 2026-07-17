@@ -133,8 +133,10 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
       return assistant("sampled");
     },
   } as never;
+  let urlRequests = 0;
   const acpClient = {
     async request(_method: string, params: { mode: string }) {
+      if (params.mode === "url") urlRequests += 1;
       return params.mode === "form"
         ? { action: "accept", content: { answer: "accepted" } }
         : { action: "accept" };
@@ -160,7 +162,7 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
     ownerToken: {},
     modelRuntime,
   };
-  const deps = await resolveDeps({ modelRuntime, mcpTimeoutMs: 5_000, sleep: realSleep });
+  const deps = await resolveDeps({ modelRuntime, mcpTimeoutMs: 60_000, sleep: realSleep });
   const bridge = await bridgeMcpServers([server], new AbortController().signal, deps, binding);
   try {
   const registered = new Map<string, ToolDefinition>();
@@ -196,6 +198,7 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
     roots: { roots: Array<{ uri: string }> };
     form: { action: string; content: { answer: string } };
     url: { action: string };
+    urlReuse: { action: string };
     incomingProgress: Record<"sampling" | "roots" | "form" | "url", Array<{ progress: number; total: number }>>;
   };
   assert.ok(clientFeatures.sampling);
@@ -204,6 +207,8 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
   assert.equal(clientFeatures.roots.roots[0]?.uri, pathToFileURL(process.cwd()).href);
   assert.deepEqual(clientFeatures.form, { action: "accept", content: { answer: "accepted" } });
   assert.deepEqual(clientFeatures.url, { action: "accept" });
+  assert.deepEqual(clientFeatures.urlReuse, { action: "decline" });
+  assert.equal(urlRequests, 1, "a consumed URL id must decline without a second ACP request");
   for (const [feature, values] of Object.entries(clientFeatures.incomingProgress)) {
     if (feature === "roots") continue;
     const expected = [
@@ -214,21 +219,101 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
   }
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(completions.length, 1);
-  assert.equal((await execute("list_resources")).details !== undefined, true);
-  assert.equal((await execute("list_resource_templates")).details !== undefined, true);
-  assert.equal((await execute("read_resource", { uri: "file:///one" })).details !== undefined, true);
-  await execute("subscribe_resource", { uri: "file:///one" });
-  await execute("unsubscribe_resource", { uri: "file:///one" });
-  assert.equal((await execute("list_prompts")).details !== undefined, true);
-  assert.equal((await execute("get_prompt", { name: "one" })).details !== undefined, true);
+  assert.deepEqual(await execute("list_resources"), {
+    content: [{ type: "text", text: JSON.stringify({ resources: [
+      { name: "one", uri: "file:///one" },
+      { name: "two", uri: "file:///two" },
+    ] }) }],
+    details: { pages: [
+      { resources: [{ uri: "file:///one", name: "one" }], nextCursor: "resource-page-2" },
+      { resources: [{ uri: "file:///two", name: "two" }] },
+    ] },
+  });
+  assert.deepEqual(await execute("list_resource_templates"), {
+    content: [{ type: "text", text: JSON.stringify({ resourceTemplates: [
+      { name: "one", uriTemplate: "file:///one/{name}" },
+      { name: "two", uriTemplate: "file:///two/{name}" },
+    ] }) }],
+    details: { pages: [
+      { resourceTemplates: [{ uriTemplate: "file:///one/{name}", name: "one" }], nextCursor: "template-page-2" },
+      { resourceTemplates: [{ uriTemplate: "file:///two/{name}", name: "two" }] },
+    ] },
+  });
+  assert.deepEqual(await execute("read_resource", { uri: "file:///one" }), {
+    content: [{ type: "text", text: "read:file:///one" }],
+    details: { contents: [{ uri: "file:///one", mimeType: "text/plain", text: "read:file:///one" }] },
+  });
+  assert.deepEqual(await execute("subscribe_resource", { uri: "file:///one" }), {
+    content: [{ type: "text", text: "Subscribed to file:///one" }], details: {},
+  });
+  assert.deepEqual(await execute("unsubscribe_resource", { uri: "file:///one" }), {
+    content: [{ type: "text", text: "Unsubscribed from file:///one" }], details: {},
+  });
+  assert.deepEqual(await execute("list_prompts"), {
+    content: [{ type: "text", text: JSON.stringify({ prompts: [
+      { name: "one", description: "one" },
+      { name: "two", description: "two" },
+    ] }) }],
+    details: { pages: [
+      { prompts: [{ name: "one", description: "one" }], nextCursor: "prompt-page-2" },
+      { prompts: [{ name: "two", description: "two" }] },
+    ] },
+  });
+  assert.deepEqual(await execute("get_prompt", { name: "one" }), {
+    content: [
+      { type: "text", text: "[mcp prompt description]\nprompt:one" },
+      { type: "text", text: "[mcp prompt role=user]" },
+      { type: "text", text: "prompt body" },
+    ],
+    details: {
+      description: "prompt:one",
+      messages: [{ role: "user", content: { type: "text", text: "prompt body" } }],
+    },
+  });
   const completion = await execute("complete", {
     ref: { type: "ref/prompt", name: "one" }, argument: { name: "arg", value: "a" },
   });
-  assert.match((completion.content[0] as { text: string }).text, /alpha/);
+  assert.deepEqual(completion, {
+    content: [{ type: "text", text: JSON.stringify({ values: ["alpha", "beta"], total: 2, hasMore: false }) }],
+    details: { completion: { values: ["alpha", "beta"], total: 2, hasMore: false } },
+  });
   const resourceCompletion = await execute("complete", {
     ref: { type: "ref/resource", uri: "file:///one" }, argument: { name: "arg", value: "a" },
   });
-  assert.match((resourceCompletion.content[0] as { text: string }).text, /beta/);
+  assert.deepEqual(resourceCompletion, completion);
+  const data = Buffer.from([0, 1, 2, 3]).toString("base64");
+  const exactProjectionResult = {
+    content: [
+      { type: "text", text: "plain" },
+      { type: "image", data, mimeType: "image/png" },
+      { type: "audio", data, mimeType: "audio/wav" },
+      { type: "resource_link", uri: "file:///linked", name: "linked", title: "Linked title" },
+      { type: "resource", resource: { uri: "file:///embedded-text", mimeType: "text/plain", text: "embedded" } },
+      { type: "resource", resource: { uri: "file:///embedded-blob", blob: data } },
+    ],
+    structuredContent: { exact: true },
+    isError: false,
+    _meta: { retained: true },
+  };
+  const projection = await execute("projection");
+  assert.deepEqual(projection.details, exactProjectionResult);
+  assert.deepEqual(projection.content, [
+    { type: "text", text: "plain" },
+    { type: "image", data, mimeType: "image/png" },
+    { type: "text", text: "[audio mime=audio/wav bytes=4]" },
+    { type: "text", text: "[Linked title](file:///linked)" },
+    { type: "text", text: "embedded" },
+    { type: "text", text: "[embedded resource uri=file:///embedded-blob mime=application/octet-stream bytes=4]" },
+  ]);
+  await assert.rejects(execute("remote_error"), /MCP tool .* failed/);
+  assert.deepEqual(bridge.failedResults.get("call-remote_error"), {
+    content: [{ type: "text", text: "peer-declared failure" }],
+    details: {
+      content: [{ type: "text", text: "peer-declared failure" }],
+      isError: true,
+      _meta: { retained: "error" },
+    },
+  });
   const cancellation = new AbortController();
   const hanging = execute("hang", {}, cancellation);
   setImmediate(() => cancellation.abort(new Error("fixture abort")));
@@ -265,7 +350,7 @@ test("M7 roots sends the exact synchronous progress pair around its result", () 
   assert.deepEqual(result, { roots: [{ uri: pathToFileURL(process.cwd()).href, name: process.cwd().split("/").at(-1) }] });
 });
 
-test("M1-M7 full MCP transcript is transport-independent across real stdio/http/sse", { timeout: 30_000 }, async () => {
+test("M1-M7 full MCP transcript is transport-independent across real stdio/http/sse", { timeout: 90_000 }, async () => {
   const fixture = new URL("./fixtures/full-mcp-server.mjs", import.meta.url).pathname;
   const http = await httpHost();
   const sse = await sseHost();
@@ -283,6 +368,9 @@ test("M1-M7 full MCP transcript is transport-independent across real stdio/http/
       assert.ok(result.diagnostics.some((value) => value.includes("notifications/resources/list_changed")));
       assert.ok(result.diagnostics.some((value) => value.includes("notifications/resources/updated")));
       assert.ok(result.diagnostics.some((value) => value.includes("notifications/prompts/list_changed")));
+      assert.ok(result.diagnostics.some((value) => value.includes("late elicitation completion")));
+      assert.ok(result.diagnostics.some((value) => value.includes("unknown elicitation completion")));
+      assert.ok(result.diagnostics.some((value) => value.includes("reused elicitation id")));
       assert.equal(result.completions.length, 1);
     }
     assert.ok(http.seenHeaders.some((value) => value === "one, two"));

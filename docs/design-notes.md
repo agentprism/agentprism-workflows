@@ -727,16 +727,16 @@ run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
   4. apply schema:
        Claude → already set in session/new _meta.claudeCode.options.outputFormat (+ emitRawSDKMessages)
        Codex  → outputSchema on the turn params
-       Pi     → outputSchema on the turn _meta; no MCP injection or prompt embedding
-       OpenCode/custom → generic outputSchema + optional StructuredOutput MCP tool
+       Pi/OpenCode → append a client-hosted HTTP StructuredOutput MCP tool and embed the schema
+       custom → generic outputSchema plus optional StructuredOutput MCP tool
   5. session/prompt(continued ? CONTINUATION_INSTRUCTION : prompt); drain session/update:
        • agent_message_chunk → assistant text
        • tool_call / request_permission → enforce allow/deny (§5.5)
        • usage_update → token accounting (§5.6)
   6. on stopReason:
        schema set → extract structured result
-                     (Claude: structured_output off _claude/sdkMessage; Codex/Pi: final text;
-                      OpenCode/custom: final text/tool capture),
+                     (Claude: structured_output off _claude/sdkMessage; Codex: final text;
+                      Pi/OpenCode/custom: HTTP tool capture, then the common final-text fallback),
                      then VALIDATE; re-prompt on failure (guard)
        no schema   → final assistant text (empty ⇒ recoverable retry)
   7. signal.aborted → session/cancel (§5.7)

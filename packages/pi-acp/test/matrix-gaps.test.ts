@@ -564,6 +564,7 @@ test("T15b rollback releases every resource after MCP, factory, wrapper, and rep
       cwd: setup.cwd,
       mcpServers: [{ name: "connected", command: "connected", args: [], env: [] }],
     })), (error) => errorKind(error) === "internal_error");
+    assert.equal(failedControl?.abortCalls, 1);
     assert.equal(failedControl?.disposeCalls, 1);
     assert.equal(failedControl?.listenerCount, 0);
     assert.equal(closes, 1);
@@ -602,6 +603,46 @@ test("T15b rollback releases every resource after MCP, factory, wrapper, and rep
     assert.ok(retried.configOptions.length > 0);
     await agent.dispose();
   }
+});
+
+test("A4 failed-open abort deadline overrides the opening error and hidden ownership retries", async () => {
+  const setup = fakeDeps();
+  const id = "failed-open-hidden-cleanup";
+  setup.deps.sessions.create = () => SessionManager.create(setup.cwd, setup.sessionDir, { id });
+  let sleeps = 0;
+  setup.deps.sleep = async () => {
+    sleeps += 1;
+    if (sleeps === 1) return;
+    return new Promise<void>(() => undefined);
+  };
+  let control: ReturnType<typeof fakeSession> | undefined;
+  let abortAttempts = 0;
+  setup.deps.createAgentSession = async (options) => {
+    const created = fakeCreateResult(options);
+    control = created.control;
+    (created.control.session as unknown as { abort(): Promise<void> }).abort = async () => {
+      abortAttempts += 1;
+      if (abortAttempts === 1) await new Promise<void>(() => undefined);
+    };
+    Object.defineProperty(created.control.session.agent, "beforeToolCall", {
+      configurable: true,
+      get: () => undefined,
+      set: () => { throw new Error("wrapper install failed before publication"); },
+    });
+    return created.result;
+  };
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(
+    agent.newSession(context({ cwd: setup.cwd, mcpServers: [] })),
+    (error: { data?: { errorKind?: unknown; details?: { remainingChildren?: unknown } } }) =>
+      error.data?.errorKind === "child_cleanup_error" && error.data.details?.remainingChildren === 0,
+  );
+  assert.equal(control?.disposeCalls, 1, "non-child failed-open resources dispose only once");
+  assert.equal(abortAttempts, 1);
+  await agent.closeSession(context({ sessionId: id }));
+  assert.equal(abortAttempts, 2, "hidden failed-open owner retries the abort/liveness generation");
+  assert.equal(control?.disposeCalls, 1);
+  await agent.dispose();
 });
 
 test("T15b irreversible fork failure leaves a complete listable and loadable journal without live leaks", async () => {
@@ -850,6 +891,17 @@ test("T20 a timed-out real stdio connect kills its spawned child and lifecycle r
   })), (error) => errorKind(error) === "mcp_init_error");
   assert.equal(existsSync(pidPath), true);
   const pid = Number(readFileSync(pidPath, "utf8"));
+  // The pinned stdio transport owns escalation: it first gives the child its
+  // transport grace and then issues SIGKILL.  The adapter must not pre-kill it.
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+      await realSleep(10, new AbortController().signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+      throw error;
+    }
+  }
   assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
   assert.equal((await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }))).sessionId, id);
   await agent.dispose();

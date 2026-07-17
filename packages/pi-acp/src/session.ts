@@ -83,6 +83,7 @@ export class PiSession {
   private disposed = false;
   private unsubscribe: (() => void) | undefined;
   private activeTurn: ActiveTurn | undefined;
+  private configReserved = false;
   private cleanupDirty = false;
   private cleanupGeneration: CleanupGeneration | undefined;
   private resourceDisposePromise: Promise<void> | undefined;
@@ -128,11 +129,15 @@ export class PiSession {
   }
 
   get busy(): boolean {
-    return this.activeTurn !== undefined || this.closing;
+    return this.activeTurn !== undefined || this.configReserved || this.closing;
   }
 
   configOptions() {
     return [thinkingLevelOption(this.pi), modelOption(this.pi, this.availableModels)];
+  }
+
+  publishAvailableModels(models: readonly Model<Api>[]): void {
+    this.availableModels = [...models];
   }
 
   activeTurnSignal(): AbortSignal | undefined { return this.activeTurn?.controller.signal; }
@@ -195,9 +200,20 @@ export class PiSession {
 
   async setConfig(configId: string, value: string | boolean) {
     if (this.busy) throw adapterError("session_busy");
-    const result = await applyConfig(this.pi, this.deps.modelRuntime, this.availableModels, configId, value);
-    this.availableModels = result.availableModels;
-    return result.configOptions;
+    // Reserve synchronously before the corrective catalog refresh.  Prompt,
+    // config, fork, and refresh commit all share the same admission boundary.
+    this.configReserved = true;
+    let release: (() => void) | undefined;
+    try {
+      release = await this.mcpBridge.acquireTurnBoundary();
+      if (this.closing) throw adapterError("session_busy");
+      const result = await applyConfig(this.pi, this.deps.modelRuntime, this.availableModels, configId, value);
+      this.availableModels = result.availableModels;
+      return result.configOptions;
+    } finally {
+      release?.();
+      this.configReserved = false;
+    }
   }
 
   private finish(turn: ActiveTurn, outcome: { response: PromptResponse } | { error: unknown }): void {
@@ -227,8 +243,8 @@ export class PiSession {
 
   private abortTurn(turn: ActiveTurn): void {
     if (turn.completed) return;
-    if (!turn.controller.signal.aborted) turn.controller.abort();
     turn.cleanup ??= this.cleanupTurn("cancel-only");
+    if (!turn.controller.signal.aborted) turn.controller.abort();
     turn.cleanup.catch((error) => {
       if (!turn.completed) this.turnError(turn, error);
       void this.cleanupWedged();
@@ -237,11 +253,14 @@ export class PiSession {
 
   private startDisposal(): void {
     this.closing = true;
+    // Client.close() reaches the close-signalling transport synchronously.
+    // Start every logical close before lifetime abort so incoming MCP handlers
+    // take the protocol-owned no-response path.
+    this.bridgeClosePromise ??= this.mcpBridge.close();
+    this.bridgeClosePromise.catch(() => undefined);
     if (!this.lifecycleController.signal.aborted) {
       this.lifecycleController.abort(new Error("session disposed"));
     }
-    this.bridgeClosePromise ??= Promise.resolve().then(() => this.mcpBridge.close());
-    this.bridgeClosePromise.catch(() => undefined);
   }
 
   private cleanupTurn(mode: CleanupGeneration["mode"]): Promise<void> {
@@ -276,6 +295,11 @@ export class PiSession {
     });
     expiry.catch(() => undefined);
 
+    // Closing the captured epoch is the synchronous admission barrier.  It
+    // must precede Pi abort, because abort can yield while a bash spawn is
+    // between its filesystem check and lease acquisition.
+    const captured = this.childRegistry.closeEpoch(deadlineController.signal);
+    captured.drain.catch(() => undefined);
     let abortPi: Promise<void>;
     try {
       abortPi = this.pi.abort();
@@ -283,12 +307,7 @@ export class PiSession {
       abortPi = Promise.reject(error);
     }
     abortPi.catch(() => undefined);
-    const terminate = this.childRegistry.terminateAll(
-      () => generation.mode === "cancel-only",
-      deadlineController.signal,
-    );
-    terminate.catch(() => undefined);
-    const operations = Promise.allSettled([abortPi, terminate]);
+    const operations = Promise.allSettled([abortPi, captured.drain]);
 
     generation.promise = new Promise<void>((resolve, reject) => {
       let claimed = false;
@@ -325,6 +344,7 @@ export class PiSession {
         this.cleanupDirty = false;
         timerController.abort();
         if (generation.mode === "cancel-only" && this.cleanupGeneration === generation) {
+          this.childRegistry.commitRotation(captured.epoch);
           this.cleanupGeneration = undefined;
         }
         resolve();
@@ -488,6 +508,15 @@ export class PiSession {
 
   cancel(): void {
     if (this.activeTurn) this.abortTurn(this.activeTurn);
+  }
+
+  childCleanupFailure(): void {
+    const turn = this.activeTurn;
+    if (turn && !turn.completed) {
+      this.abortTurn(turn);
+      return;
+    }
+    void this.cleanupWedged();
   }
 
   async dispose(): Promise<void> {
