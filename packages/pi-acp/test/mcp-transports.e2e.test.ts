@@ -5,13 +5,16 @@ import test from "node:test";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
 import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ElicitRequestSchema, ElicitationCompleteNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { bridgeMcpServers, connectDefaultMcpClient, createMcpRootsResult, type McpSessionBinding } from "../src/mcp-bridge.js";
 import { realSleep, resolveDeps } from "../src/deps.js";
-import { createConformanceServer } from "./fixtures/full-mcp-server.mjs";
+import { createConformanceServer, LARGE_FIXTURE_ITEM_COUNT } from "./fixtures/full-mcp-server.mjs";
 
 interface Host {
   url: string;
@@ -254,7 +257,7 @@ async function listen(server: HttpServer): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
-async function httpHost(): Promise<Host> {
+async function httpHost(options: { largeCatalog?: boolean } = {}): Promise<Host> {
   const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: ReturnType<typeof createConformanceServer> }>();
   const seenHeaders: string[] = [];
   const http = createServer((req, res) => {
@@ -263,7 +266,7 @@ async function httpHost(): Promise<Host> {
       const sessionId = req.headers["mcp-session-id"];
       let entry = typeof sessionId === "string" ? sessions.get(sessionId) : undefined;
       if (!entry && req.method === "POST") {
-        const protocol = createConformanceServer();
+        const protocol = createConformanceServer(options);
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: randomUUID,
           onsessioninitialized(id) { sessions.set(id, { transport, server: protocol }); },
@@ -735,6 +738,235 @@ test("M1-M7 full MCP transcript is transport-independent across real stdio/http/
   }
 });
 
+test("M3 large multi-page fixture proves tools/resources/templates/prompts have no adapter cap", { timeout: 90_000 }, async () => {
+  const host = await httpHost({ largeCatalog: true });
+  const deps = await resolveDeps({ mcpTimeoutMs: 60_000, sleep: realSleep });
+  const bridge = await bridgeMcpServers([{
+    name: "large", type: "http", url: host.url, headers: [],
+  }], new AbortController().signal, deps);
+  try {
+    const registered = new Map<string, ToolDefinition>();
+    const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
+    await factory({ registerTool(tool: ToolDefinition) { registered.set(tool.name, tool); } } as unknown as ExtensionAPI);
+    let active = [...registered.keys()];
+    bridge.bindSession({
+      getActiveToolNames: () => [...active],
+      setActiveToolsByName(names: string[]) { active = [...names]; },
+    } as never);
+
+    const remote = bridge.aliases.filter((alias) => /^mcp__large__large_tool_\d+$/.test(alias));
+    assert.equal(remote.length, LARGE_FIXTURE_ITEM_COUNT);
+    assert.equal(remote[0], "mcp__large__large_tool_0");
+    assert.equal(remote.at(-1), `mcp__large__large_tool_${LARGE_FIXTURE_ITEM_COUNT - 1}`);
+
+    const executeList = async (suffix: string, field: "resources" | "resourceTemplates" | "prompts") => {
+      const tool = registered.get(`mcp__large__${suffix}`);
+      assert.ok(tool);
+      const result = await tool.execute(`large-${suffix}`, {}, new AbortController().signal);
+      const block = result.content[0];
+      assert.equal(block?.type, "text");
+      const items = JSON.parse(block.text)[field] as unknown[];
+      const pages = (result.details as { pages: unknown[] }).pages;
+      return { items, pages };
+    };
+    const resources = await executeList("list_resources", "resources");
+    assert.equal(resources.items.length, LARGE_FIXTURE_ITEM_COUNT);
+    assert.equal(resources.pages.length, 4);
+    assert.deepEqual(resources.items[0], { uri: "file:///large/0", name: "large-resource-0" });
+    assert.deepEqual(resources.items.at(-1), {
+      uri: `file:///large/${LARGE_FIXTURE_ITEM_COUNT - 1}`,
+      name: `large-resource-${LARGE_FIXTURE_ITEM_COUNT - 1}`,
+    });
+    const templates = await executeList("list_resource_templates", "resourceTemplates");
+    assert.equal(templates.items.length, LARGE_FIXTURE_ITEM_COUNT);
+    assert.equal(templates.pages.length, 4);
+    assert.deepEqual(templates.items.at(-1), {
+      uriTemplate: `file:///large/${LARGE_FIXTURE_ITEM_COUNT - 1}/{name}`,
+      name: `large-template-${LARGE_FIXTURE_ITEM_COUNT - 1}`,
+    });
+    const prompts = await executeList("list_prompts", "prompts");
+    assert.equal(prompts.items.length, LARGE_FIXTURE_ITEM_COUNT);
+    assert.equal(prompts.pages.length, 4);
+    assert.deepEqual(prompts.items.at(-1), {
+      name: `large-prompt-${LARGE_FIXTURE_ITEM_COUNT - 1}`,
+      description: `large prompt ${LARGE_FIXTURE_ITEM_COUNT - 1}`,
+    });
+  } finally {
+    await bridge.close().catch(() => undefined);
+    await host.close();
+  }
+});
+
+test("M7 form elicitation validates the exact schema with pinned wire failures", { timeout: 30_000 }, async () => {
+  const host = await httpHost();
+  const acpRequests: string[] = [];
+  const lifecycle = new AbortController();
+  const responses: Record<string, { action: "accept"; content: Record<string, unknown> }> = {
+    extra: { action: "accept", content: { answer: "okay", extra: true } },
+    missing: { action: "accept", content: {} },
+    mistyped: { action: "accept", content: { answer: 17 } },
+    bounded: { action: "accept", content: { answer: "x" } },
+    default: { action: "accept", content: {} },
+  };
+  const deps = await resolveDeps({ mcpTimeoutMs: 10_000, sleep: realSleep });
+  const bridge = await bridgeMcpServers([{
+    name: "form-matrix", type: "http", url: host.url, headers: [],
+  }], new AbortController().signal, deps, {
+    sessionId: "form-matrix",
+    cwd: process.cwd(),
+    client: {
+      async request(_method: string, params: { message: string }) {
+        const formCase = params.message.slice("form-case:".length);
+        acpRequests.push(formCase);
+        const response = responses[formCase];
+        if (!response) throw new Error(`ACP request must not be sent for ${formCase}`);
+        return response;
+      },
+      async notify() {},
+    } as never,
+    sessionSignal: lifecycle.signal,
+    getPi: () => undefined,
+    getTurnSignal: () => undefined,
+    isPublished: () => true,
+    emitDiagnostic: () => undefined,
+  });
+  try {
+    const tool = bridge.tools.find(({ name }) => name === "mcp__form-matrix__form_case");
+    assert.ok(tool);
+    const runCase = async (formCase: string) => {
+      const result = await tool.execute(`form-${formCase}`, { case: formCase }, new AbortController().signal);
+      const block = result.content[0];
+      assert.equal(block?.type, "text");
+      return JSON.parse(block.text) as {
+        result?: { action: string; content?: Record<string, unknown> };
+        error?: { code: number; wireMessage: string };
+      };
+    };
+
+    const extra = await runCase("extra");
+    assert.deepEqual(extra.result, { action: "accept", content: { answer: "okay", extra: true } });
+
+    const missing = await runCase("missing");
+    assert.equal(missing.error?.code, -32602);
+    assert.equal(missing.error?.wireMessage, "Invalid MCP elicitation response");
+
+    const mistyped = await runCase("mistyped");
+    assert.equal(mistyped.error?.code, -32602);
+    assert.equal(mistyped.error?.wireMessage, "Invalid MCP elicitation response");
+
+    const bounded = await runCase("bounded");
+    assert.equal(bounded.error?.code, -32602);
+    assert.equal(bounded.error?.wireMessage, "Invalid MCP elicitation response");
+
+    const defaults = await runCase("default");
+    assert.deepEqual(defaults.result, { action: "accept", content: {} });
+
+    const requestsBeforeCompilation = acpRequests.length;
+    const compilation = await runCase("compilation");
+    assert.equal(compilation.error?.code, -32603);
+    assert.equal(compilation.error?.wireMessage, "MCP elicitation schema validation failed");
+    assert.equal(acpRequests.length, requestsBeforeCompilation, "schema compilation fails before ACP invocation");
+    assert.deepEqual(acpRequests, ["extra", "missing", "mistyped", "bounded", "default"]);
+  } finally {
+    lifecycle.abort();
+    await bridge.close().catch(() => undefined);
+    await host.close();
+  }
+});
+
+test("M7 URL completion observed at the accept commit is forwarded, not discarded", { timeout: 30_000 }, async () => {
+  type ElicitHandler = (
+    request: {
+      method: "elicitation/create";
+      params: { mode: "url"; elicitationId: string; url: string; message: string };
+    },
+    extra: { signal: AbortSignal; sendNotification(notification: unknown): Promise<void> },
+  ) => Promise<{ action: string }>;
+  type CompleteHandler = (notification: {
+    method: "notifications/elicitation/complete";
+    params: { elicitationId: string };
+  }) => Promise<void>;
+  const clientPrototype = Client.prototype as unknown as {
+    setRequestHandler(schema: unknown, handler: unknown): void;
+    setNotificationHandler(schema: unknown, handler: unknown): void;
+  };
+  const originalSetRequestHandler = clientPrototype.setRequestHandler;
+  const originalSetNotificationHandler = clientPrototype.setNotificationHandler;
+  let elicitHandler: ElicitHandler | undefined;
+  let completeHandler: CompleteHandler | undefined;
+  clientPrototype.setRequestHandler = function captureRequest(this: unknown, schema, handler) {
+    if (schema === ElicitRequestSchema) elicitHandler = handler as ElicitHandler;
+    Reflect.apply(originalSetRequestHandler, this, [schema, handler]);
+  };
+  clientPrototype.setNotificationHandler = function captureNotification(this: unknown, schema, handler) {
+    if (schema === ElicitationCompleteNotificationSchema) completeHandler = handler as CompleteHandler;
+    Reflect.apply(originalSetNotificationHandler, this, [schema, handler]);
+  };
+
+  const host = await httpHost();
+  const accepted = deferred<{ action: "accept" }>();
+  const acpAdmitted = deferred<void>();
+  const forwarded: Array<{ method: string; params: { elicitationId: string } }> = [];
+  const diagnostics: string[] = [];
+  const lifecycle = new AbortController();
+  const deps = await resolveDeps({ mcpTimeoutMs: 10_000, sleep: realSleep });
+  let handle: Awaited<ReturnType<typeof connectDefaultMcpClient>> | undefined;
+  try {
+    handle = await connectDefaultMcpClient({
+      name: "url-commit", type: "http", url: host.url, headers: [],
+    }, new AbortController().signal, deps.mcpTimeoutMs, deps.sleep, {
+      sessionId: "url-commit",
+      cwd: process.cwd(),
+      client: {
+        request() {
+          acpAdmitted.resolve();
+          return accepted.promise;
+        },
+        async notify(method: string, params: { elicitationId: string }) {
+          forwarded.push({ method, params });
+        },
+      } as never,
+      sessionSignal: lifecycle.signal,
+      getPi: () => undefined,
+      getTurnSignal: () => undefined,
+      isPublished: () => true,
+      emitDiagnostic: (value) => diagnostics.push(value),
+    });
+    assert.ok(elicitHandler);
+    assert.ok(completeHandler);
+    const response = elicitHandler({
+      method: "elicitation/create",
+      params: {
+        mode: "url",
+        elicitationId: "same-commit",
+        url: "https://example.test/complete",
+        message: "complete at accept commit",
+      },
+    }, {
+      signal: new AbortController().signal,
+      async sendNotification() {},
+    });
+    await acpAdmitted.promise;
+    const completion = accepted.promise.then(() => completeHandler!({
+      method: "notifications/elicitation/complete",
+      params: { elicitationId: "same-commit" },
+    }));
+    accepted.resolve({ action: "accept" });
+    assert.deepEqual(await response, { action: "accept" });
+    await completion;
+    assert.equal(forwarded.length, 1);
+    assert.equal(forwarded[0]?.method, "elicitation/complete");
+    assert.match(forwarded[0]?.params.elicitationId ?? "", /^pi-acp-elicitation-\d+$/);
+    assert.equal(diagnostics.some((value) => value.includes("late elicitation completion")), false);
+  } finally {
+    clientPrototype.setRequestHandler = originalSetRequestHandler;
+    clientPrototype.setNotificationHandler = originalSetNotificationHandler;
+    lifecycle.abort();
+    await handle?.close().catch(() => undefined);
+    await host.close();
+  }
+});
+
 test("M7 sampling, roots, form, and URL races execute over every real transport", { timeout: 90_000 }, async () => {
   const fixture = new URL("./fixtures/full-mcp-server.mjs", import.meta.url).pathname;
   const http = await httpHost();
@@ -1079,6 +1311,12 @@ test("M2/M8 real stdio natural close disables through raw onclose without protoc
   const diagnostics: string[] = [];
   const lifecycle = new AbortController();
   const deps = await resolveDeps({ mcpTimeoutMs: 2_000, sleep: realSleep });
+  const originalClose = StdioClientTransport.prototype.close;
+  let rawCloseCalls = 0;
+  StdioClientTransport.prototype.close = function closeWithCount() {
+    rawCloseCalls += 1;
+    return originalClose.call(this);
+  };
   const bridge = await bridgeMcpServers([{
     name: "fatal-stdio", command: process.execPath, args: [fixture], env: [],
   }], new AbortController().signal, deps, {
@@ -1097,10 +1335,12 @@ test("M2/M8 real stdio natural close disables through raw onclose without protoc
     bridge.bindSession({ getActiveToolNames: () => [...bridge.aliases], setActiveToolsByName() {} } as never);
     await tool.execute("exit-peer", {}, new AbortController().signal);
     await eventually(() => assert.deepEqual(diagnostics, ["[mcp:fatal-stdio] connection closed; server disabled"]));
+    await eventually(() => assert.equal(rawCloseCalls, 1));
     assert.equal(diagnostics.some((value) => value.includes("transport error")), false);
   } finally {
     await bridge.close();
     lifecycle.abort();
+    StdioClientTransport.prototype.close = originalClose;
   }
 });
 

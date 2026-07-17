@@ -130,13 +130,14 @@ dependency-injection seam, capability advertisement, session lifecycle (with a f
 matrix), prompt-content conversion, event translation with ordered delivery, prompt/stopReason/usage,
 an exhaustive error taxonomy, permissions, the MCP bridge across all lifecycle methods, structured
 output, auth, cancellation, the config surface, and the monorepo integration for that package
-(workspace/changesets/CI/tsconfig). The one client-repo change is adding the pi runtime to the ACP
-freshness gate (§10.1).
+(workspace/changesets/CI/tsconfig). Outside the package, this train updates the ACP freshness gate
+(§10.1) and the coordinated `acp-agents` caller/release surfaces (§10.4).
 
 **Out of scope (see §11 Non-goals):** fs/terminal client-delegation; subprocess/RPC mode;
 `additionalDirectories`; audio prompt content; mid-turn steering over ACP; branch-topology replay.
 Issue #213 consumes this frozen server contract from the first-class `PiBackend`; direct hosts can also
-drive the server through the generic custom-backend registry.
+drive the server through the generic custom-backend registry. The freshness-gate edit in §10.1 and the
+coordinated `acp-agents` caller/release amendments in §10.4 are the specified out-of-package changes.
 
 ### 1.1 Verified baseline and invariants
 
@@ -309,9 +310,13 @@ const { connection, agent } = await runAcp();                  // real stdio str
 let shuttingDown: Promise<void> | undefined;
 function shutdown(code: number): Promise<void> {
   shuttingDown ??= (async () => {                              // idempotent: one disposal, awaited
-    try { await withTimeout(agent.dispose(), 5000); }         // bounded teardown (§3.2)
-    catch (err) { console.error("shutdown error:", err); }
-    finally { process.exit(code); }
+    try {
+      await withTimeout(agent.dispose(), 66_000);              // child + MCP + scheduling envelope (§9.6)
+      process.exit(code);
+    } catch {
+      console.error("shutdown cleanup failed");
+      process.exit(1);
+    }
   })();
   return shuttingDown;
 }
@@ -349,11 +354,12 @@ claim that a runtime import "yields `PiAcpDeps`" was impossible and is corrected
   commits after shutdown, §9.1.0), then disposes **every** live `PiSession` (abort in-flight turns
   settlement-ordered, unsubscribe the translator, drain-and-drop the send queue, disconnect MCP clients —
   §9.6, §9.1.6) and resolves once all are disposed.
-- **Bounded teardown.** Disposal is raced against a 5000 ms `withTimeout`; on timeout the process still
-  exits (a hung MCP-client `close()` cannot wedge shutdown).
-- **Exit codes:** `0` for a clean transport close / SIGINT / SIGTERM; `1` when `connection.closed`
-  rejects (transport error) or `runAcp()` throws during startup. Disposal errors are logged to stderr but
-  do not change the code (best-effort cleanup).
+- **Bounded teardown.** Disposal is raced against the 66,000-ms process envelope: the 5,000-ms child
+  generation, one shared 60,000-ms MCP close deadline, and a 1,000-ms scheduling margin (§9.6).
+- **Exit codes:** `0` for a clean transport close / SIGINT / SIGTERM after proven cleanup; `1` when
+  `connection.closed` rejects, startup throws, disposal fails, or the shutdown envelope expires. A
+  cleanup failure prints exactly `shutdown cleanup failed`, overrides a requested zero exit, and does
+  not prevent attempts against the remaining owners.
 
 `runAcp` and `PiAcpAgent` are exported from `lib.ts` for library reuse (the
 `ClaudeAcpAgent`/`runAcp` export convention, claude-agent-acp `dist/lib.js:2`).
@@ -463,14 +469,14 @@ export interface PiAcpDeps {
     binding?: McpSessionBinding,
   ): Promise<McpClientHandle>;
   /**
-   * Cancellable timer for the wedged-agent grace window and MCP bounded liveness (§9.6, §9.3).
+   * Cancellable timer for the cleanup-generation deadline and MCP bounded liveness (§9.6, §9.3).
    * `sleep(ms, signal)` resolves after `ms` unless `signal` aborts first, in which case it rejects
-   * with the signal reason. Injecting the scheduler is what makes the backstop and MCP timeouts
+   * with the signal reason. Injecting the scheduler is what makes cleanup and MCP timeouts
    * DETERMINISTIC in tests (a monotonic clock alone cannot control when a timer fires — the round-2
    * `now()` seam is removed). Default: a real `setTimeout`-based sleep with `clearTimeout` on abort.
    */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
-  /** Grace window after abort before the §9.6 backstop force-resolves. Default: 5000. */
+  /** Absolute deadline for one §9.6 child/Pi-abort cleanup generation. Default: 5000. */
   graceMs: number;
   /**
    * Bounded liveness for each MCP `connect`, `tools/list` page, and `tools/call` (§9.3). A hung MCP
@@ -495,8 +501,8 @@ The hermetic e2e substrate (§13.3): a test `createAgentSession` returns
 extensionsResult: { extensions: [], errors: [], runtime }, modelFallbackMessage: undefined }` — a real
 `CreateAgentSessionResult` — the pi-agent-core injectable `streamFn` (`agent.ts:214`) wrapped in an
 `AgentSession` (its constructor takes `agent`, `agent-session.ts:343`), driven with zero credentials.
-`sleep`/`graceMs` make the §9.6 backstop deterministic (a test injects a `sleep` that resolves when it
-chooses, forcing the wedged path); `mcpTimeoutMs` does the same for MCP hangs; `sessionDir` points at a
+`sleep`/`graceMs` make the §9.6 cleanup deadline deterministic (a test injects a `sleep` that resolves
+at the chosen boundary); `mcpTimeoutMs` does the same for MCP hangs; `sessionDir` points at a
 temp dir; `stream` (runAcp arg) is an in-memory paired ndjson stream.
 
 ---
@@ -694,35 +700,29 @@ queued update.
 
 Every settlement claim elsewhere in this contract is **derived from this one machine** — the sections
 below do not each define their own outcome. A `session/prompt` turn owns a **one-shot** settlement: a
-`settled` boolean and a `settle(result)` that resolves or rejects the ACP request **exactly once** (the
-first caller wins; every later caller is a settlement no-op and may only run cleanup). `settle` is
-therefore idempotent regardless of interleaving. Four **settlement inputs** feed it; the **first to fire
-is the winner**:
+`settled` boolean and a `settle(result)` that resolves or rejects the ACP request **exactly once**. The
+cleanup generation is part of that settlement barrier, so cleanup failure is the strongest outcome and
+is recorded before any weaker result commits:
 
 | input | trigger | settlement action | usage_update + drain | post-settlement |
 |---|---|---|---|---|
 | **normal** | `session.prompt()` resolves and no abort source fired | compute stopReason (§7): terminal `stop`/`length`/`toolUse` → **resolve** `{ stopReason, usage }`; terminal `error` → **reject** classified (§8) | **yes**, before `settle` | turn kept live |
-| **cancelled** | an abort source (§9.6 sources 1–3) fired `turnController.abort()`, then `session.prompt()` resolved with terminal `aborted` | **resolve** `{ stopReason:"cancelled", usage }` (§7) | **yes**, before `settle` | close/dispose cleanup runs *after* settle (§9.1.6) |
-| **notify-failure** | the pump's `this.notify(update)` **rejects** mid-turn (transport closed/broken) | abort `turnController`, then **reject** `internalError` (`-32603`, `errorKind:"notification_error"`, row 22) | **no** — the transport is broken, so no update (incl. `usage_update`) can be delivered or ordered; the pump is stopped and `pending` is abandoned | the §9.6 backstop, if it later elapses, does **cleanup only** — it never re-settles |
-| **wedged-backstop** | `deps.sleep(deps.graceMs)` elapses before `session.prompt()` settles (§9.6) | if still unsettled → **resolve** `{ stopReason:"cancelled", usage }` (best-effort snapshot, §6.5 forced-cancel row) | **best-effort**: emit `usage_update` + `drain` before `settle` *unless* the pump has already failed (then skip, as notify-failure) | detach the pi promise, dispose, tombstone (§9.6) |
+| **cancelled** | an abort source (§9.6) fired `turnController.abort()`, `session.prompt()` resolved terminal `aborted`, and the cleanup generation succeeded | **resolve** `{ stopReason:"cancelled", usage }` (§7) | **yes**, before `settle` | cancel-only cleanup installs a fresh child epoch only while admission remains reserved; close/dispose does not reopen it |
+| **notify-failure** | the pump's `this.notify(update)` **rejects** mid-turn and the cleanup generation succeeds | abort `turnController`, then **reject** `internalError` (`-32603`, `errorKind:"notification_error"`, row 22) | **no** — the transport is broken, so no update (incl. `usage_update`) can be delivered or ordered; the pump is stopped and `pending` is abandoned | cleanup completes before this weaker outcome commits |
+| **cleanup-failure** | a child/Pi-abort operation fails or the absolute `deps.graceMs` cleanup deadline wins (§9.6) | **reject** `internalError` (`-32603`, `errorKind:"child_cleanup_error"`, row 19), overriding cancelled, notification failure, or another prompt outcome | **no** — never emit a false `cancelled` or ordinary timeout result | escalate to disposal, retain the cleanup tombstone, and retry on later close/dispose |
 
 **Invariants derived from the single winner:**
 
-1. **`usage_update` + `drain` precede `settle` on every transport-healthy input** (normal, cancelled,
-   wedged-backstop). Only **notify-failure skips them** — the wire is already broken, so there is nothing
-   to deliver and nothing to order. This removes the old contradiction (a failed pump was asked to deliver
-   a usage update).
-2. **Exactly one settlement per turn.** A notify-failure that rejects row 22 is the winner; a later
-   backstop cleans up but does **not** resolve `cancelled` (T22). A wedged-backstop that resolves
-   `cancelled` is the winner; a late pi resolve/reject is swallowed by the detached promise (§9.6). The
-   `settled` guard makes this deterministic for any ordering.
-3. **Teardown waits for settlement.** Disposal (close/dispose, §9.1.6; or the backstop's own cleanup)
-   **never drops the send queue until the turn has settled.** Because the §9.6 backstop force-settles
-   within `deps.graceMs` of any abort, settlement is *guaranteed* to occur, so a `session/close` racing an
-   in-flight turn (a) aborts `turnController`, (b) **awaits settlement** (bounded by the backstop), then
-   (c) disposes and drops the queue. This is exactly why a close-racing prompt can still emit its
-   `usage_update`, `drain`, and resolve `cancelled` *before* its queue is destroyed — the ordering the
-   round-3 board found unspecified.
+1. **`usage_update` + `drain` precede `settle` on transport-healthy normal and successfully-cancelled
+   inputs.** Notify failure and cleanup failure emit none: the former has no usable transport, and the
+   latter must not publish a weaker cancelled/timeout outcome.
+2. **Exactly one settlement per turn, with cleanup failure strongest.** Notification failure rejects
+   row 22 only after successful cleanup; if that cleanup rejects or expires, row 19 commits instead.
+   Late Pi resolution/rejection is swallowed after settlement.
+3. **Teardown waits for settlement.** Disposal never drops the send queue until the turn's cleanup,
+   notification drain, and one-shot settlement have completed. A successful close-racing prompt emits
+   `usage_update`, drains, and resolves `cancelled` before queue teardown; failed cleanup rejects row 19
+   by the absolute `deps.graceMs` deadline and retains retry ownership.
 4. **Replay uses the same one-shot settle.** During `session/load` replay a notify rejection **rejects**
    `session/load` `notification_error` (row 22) through `settle` and rolls the opening transaction back
    (§9.1.0 stage-2 failure). A rejected notify **after** a turn already settled is logged to stderr only
@@ -837,11 +837,11 @@ authoritative for the per-turn token breakdown.
 | provider error (terminal `stopReason "error"`, §8 reject) | emit once from the post-settle snapshot **before** rejecting (so cumulative cost includes the billed failed attempts), then `drain()` | n/a — the request rejects (no `usage`) |
 | pre-flight throw (synchronous, nothing streamed) | **none** — no assistant message and no new billed tokens exist | n/a — the request rejects |
 | **notify-failure** (row 22, §6.2.1 input 3) | **none** — the transport is broken, so no update (incl. `usage_update`) can be delivered or ordered; the pump is stopped | n/a — the request rejects `notification_error` |
-| forced cancel (wedged backstop, §9.6 — turn never settled) | emit once from the **current** `getContextUsage()`/`getSessionStats()` snapshot (best-effort; may equal the pre-turn values), then `drain()` — **unless** the pump already failed (then skip, as notify-failure) | per-turn breakdown over any assistant messages captured so far (commonly all-zero) |
+| child/Pi-abort cleanup failure or cleanup deadline (§9.6) | **none** — reject `child_cleanup_error`; never emit a false cancelled/ordinary timeout outcome | n/a — the request rejects |
 
-`usage_update` is always emitted **before** `drain()` and before the request resolves/rejects on every
-transport-healthy input, so the client observes usage in order; the sole exception is the notify-failure
-input, whose broken transport can deliver nothing (§6.2.1 invariant 1). A compaction-drop case is tested (T6): two turns where the second's
+`usage_update` is always emitted **before** `drain()` and before the request resolves/rejects on normal
+and successfully-cancelled transport-healthy inputs, so the client observes usage in order. Notify
+failure and cleanup failure emit none (§6.2.1 invariant 1). A compaction-drop case is tested (T6): two turns where the second's
 `used` is **lower** than the first's while `cost.amount` still rises.
 
 ### 6.6 Turn lifecycle and concurrency
@@ -852,7 +852,7 @@ One ACP `session/prompt` drives one pi turn: convert content (§6.1), then
 `finally` (`agent-session.ts:1023-1034`). After it resolves: compute stopReason (§7) and usage (§6.5),
 emit `usage_update`, `await drain()` (§6.2), then resolve `{ stopReason, usage }` — this is the **normal**
 settlement input of the §6.2.1 one-shot `settle` (the other inputs — cancelled, notify-failure,
-wedged-backstop — are §9.6/§6.2.1).
+cleanup-failure — are §9.6/§6.2.1).
 
 Concurrency (resolves issue Open item 2, invariant 4): pi permits **one in-flight turn per session** —
 `AgentSession.prompt()` throws when already streaming unless a `streamingBehavior` is supplied
@@ -1334,12 +1334,12 @@ deadline rejects row 19 and retains retry ownership. Pinned behaviors:
 | `load`/`resume` racing each other for the same id | the atomic §9.1.0 reservation makes the first win; the second sees `opening.has(id)` synchronously → `session_already_open` — neither leaks |
 | use of a poisoned/tombstoned id (below) | reject `session_terminated` (row 14) |
 
-**Poisoned-journal guard (resolves the concurrent-writer hole).** When the §9.6 backstop force-resolves
-a wedged turn, the underlying pi run may still be alive and could later append to the session's JSONL.
+**Poisoned-journal guard (resolves the concurrent-writer hole).** When a §9.6 cleanup generation fails,
+the underlying pi run may still be alive and could later append to the session's JSONL.
 The adapter therefore records the `sessionId` in the per-connection **tombstone** set and rejects any
 subsequent `load`/`resume`/`fork`/`prompt`/`set_config_option`/reopen for that id with
 `session_terminated` (row 14) for the remainder of the process — preventing a second writer from
-corrupting the journal a wedged writer may still touch. `session/close` on an ordinary or
+corrupting the journal a retained writer may still touch. `session/close` on an ordinary or
 cleanup-complete tombstone succeeds idempotently; a retained child-cleanup tombstone follows the retry
 exception in the §9.1.6 table. Tombstones are per connection and cleared only on connection teardown.
 
@@ -1532,7 +1532,7 @@ Naming is therefore made total so no injected name can ever occupy a built-in/ex
 - **Cancellation + timeout.** Each `tools/call` is passed the turn signal (§9.6); on abort the call is
   cancelled. `deps.mcpTimeoutMs` also bounds each `tools/call`; a timeout/abort becomes an error result
   (pi surfaces it as a failed tool, §9.3.3, not a crashed session).
-- **Cleanup.** MCP clients are disconnected on `session/close`, on the §9.6 backstop, and on connection
+- **Cleanup.** MCP clients are disconnected on `session/close`, on §9.6 cleanup-failure escalation, and on connection
   teardown (§3.2 disposal). All closes are started without awaiting between invocations; each server's
   HTTP DELETE/raw-close pair shares the injected absolute `deps.mcpTimeoutMs` bound. Streamable HTTP
   alone performs DELETE before raw close; stdio and SSE invoke their transport-owned raw `close()` in the
@@ -1723,7 +1723,7 @@ cannot preempt either server boundary.
 
 ## 10. Monorepo integration
 
-### 10.1 Freshness gate (the one client-repo change)
+### 10.1 Freshness gate
 
 Add `@earendil-works/pi-coding-agent` to `ACP_DEP_MATCHERS` in `scripts/check-acp-deps.mjs:34-37`:
 
@@ -1740,17 +1740,16 @@ pre-push freshness check must fail when pi-acp's pinned pi runtime falls behind 
 `@earendil-works/pi-coding-agent` is a **direct** dependency of a workspace package (pi-acp embeds it),
 so it belongs in `ACP_DEP_MATCHERS` (check 1, direct freshness), **not** `WRAPPED_RUNTIMES` (third-party
 adapters whose runtime is only transitive, `check-acp-deps.mjs:53-55`). `@agentclientprotocol/sdk` is
-already matched by the `@agentclientprotocol/` prefix. This is the only normative change outside
-`packages/pi-acp`.
+already matched by the `@agentclientprotocol/` prefix. The coordinated changes outside
+`packages/pi-acp` also include the §10.4 `acp-agents` caller and release amendments.
 
 ### 10.2 Changesets, CI
 
 - `packages/pi-acp` is auto-included by `pnpm-workspace.yaml` (`packages/*`).
 - CI (`.github/workflows/ci.yml`) runs `pnpm -r exec tsc -b`, `tsc --noEmit`, and `pnpm -r test` on
   Node 24 — pi-acp participates through its `build`/`typecheck`/`test` scripts with no CI-file change.
-- A changeset accompanies the introducing PR so the package publishes on the next release wave
-  (`.changeset/config.json`, access `public`, baseBranch `main`); its first publish is a new-package
-  release at `0.0.0` → the changeset's bump.
+- The coordinated changeset publishes `@automatalabs/pi-acp` at `0.2.0` together with the §10.4
+  four-package release transaction (`.changeset/config.json`, access `public`, baseBranch `main`).
 
 ### 10.3 tsconfig project reference
 
@@ -1884,7 +1883,7 @@ workflow→acp-agents→pi-acp dependency edges and the installed smoke checks a
     thousands of entries — so an unbounded single response is a real memory/latency hazard for our own
     client. Offset pagination (page 100, exact base64url cursor, §9.1.5) bounds each response while
     returning every session across pages (it chunks, never truncates) — the bounded-liveness choice,
-    consistent with the injectable MCP/backstop timeouts.
+    consistent with the injectable MCP/cleanup timeouts.
 16. **Emitting `type:"diff"` tool-call content for `read`/`edit`/`write`.** Rejected (§6.3.1): pi's
     `AgentToolResult` exposes no standardized old-text/new-text pair (only `content` + arbitrary
     `details`), so a diff block would be fabricated. All tool results project uniformly through
@@ -1931,12 +1930,12 @@ cites the normative statement it covers.
 
 | # | covers | assertion |
 |---|---|---|
-| T14 | §6.2/§6.2.1, §6.6 | full turn: ordered `session/update` stream drained before `PromptResponse`; a notify-failure fixture aborts + **rejects `notification_error` (settlement input 3) with NO `usage_update`/`drain`**; a close racing an in-flight prompt still emits `usage_update`+`drain`+resolves `cancelled` **before** the queue is torn down (teardown-waits-for-settlement) |
+| T14 | §6.2/§6.2.1, §6.6 | full turn: ordered `session/update` stream drained before `PromptResponse`; a notify-failure fixture with successful cleanup rejects `notification_error` with NO `usage_update`/`drain`; notification failure plus cleanup failure rejects only `child_cleanup_error`; a close racing an in-flight prompt with successful cleanup still emits `usage_update`+`drain`+resolves `cancelled` before queue teardown |
 | T15 | §9.1.0-.6 | lifecycle + concurrency matrix: new→prompt→close; **two concurrent `load`s for one id** → exactly one wins, the other `session_already_open`, no leak (atomic reservation); unknown id (load/resume/prompt) → `unknown_session`; `close` on unknown/already-closed/ordinary-or-cleanup-complete tombstoned id → **success**, and **close whose non-child `dispose()` leg throws → still success (entry dropped, retry clean)**; retained child cleanup is the sole row-19 exception and retries; close-races-prompt → cancelled; busy fork/set_config → `session_busy`; cwd validation on **new/fork-target**/load/resume/list; **the same injected `deps.modelRuntime` object is passed on ALL FOUR `createAgentSession` call sites**; **open-time races: `$/cancel_request` during open → `-32800` + rollback (no leak); `close` during an opening txn → success + rollback (no resurrection); `dispose()` during an opening txn → rollback (no post-dispose commit)** |
 | T15b | §9.1.0 | transactional rollback: inject a failure after **each** acquisition stage (MCP connect, `createAgentSession`, wrapper install, load replay-`notify`) and assert no live registry entry, no MCP child, no listener, no pi resource (pi `dispose()` called), and no `opening` reservation remains; a post-rollback retry is a clean open, not `session_already_open`; **the irreversible-fork case: after `forkFrom` writes successfully, inject a `createAgentSession` failure → the new JSONL remains a complete, valid, listable/loadable session while no live/opening/MCP resource leaks** |
 | T16 | §9.1.2/.3/.4 | resume emits **no** replay; load replays the linear branch via the **total** SessionEntry/AgentMessage projection — user, assistant (text/thinking/toolCall), toolResult, `bashExecution`, `custom` display-true/false, `branchSummary`/`compactionSummary` (no update), `custom_message` display-true/false, and string-vs-array content; fork round-trips over a temp `sessionDir`, including **cross-cwd** source lookup via `listAll`; **fork of a live never-prompted (unpersisted) source → `session_not_forkable` (row 26), not `session_corrupt`** |
 | T17 | §9.1.5 | list with cwd vs `listAll` (no cwd); exact cursor codec (`base64url` of decimal offset, page 100) + `nextCursor` set/omitted; missing/empty cursor → offset 0; `offset===length` → empty page; undecodable / non-canonical → `invalid_cursor`; **a shrink-below-cursor mutation (150 → page-1 cursor 100 → remove 60 → length 90) returns an EMPTY page, NOT `invalid_cursor` or a crash** |
-| T18 | §9.1.6/§9.6 | poisoned/tombstoned reopen after backstop → `session_terminated`; close succeeds for an ordinary/cleanup-complete tombstone, while a retained child-cleanup tombstone returns row 19 and retries until disappearance proof succeeds |
+| T18 | §9.1.6/§9.6 | cleanup failure tombstones the session without a false `cancelled` settlement; reopen → `session_terminated`; close succeeds for an ordinary/cleanup-complete tombstone, while a retained child-cleanup tombstone returns row 19 and retries until disappearance proof succeeds |
 | T19 | §9.1.7 | non-empty `additionalDirectories` accepted and ignored on **new AND load AND resume AND fork** (session still created; extra roots ignored) |
 | T20 | §9.3.1-.3 | base bridge coverage: full tools pagination/cursor-cycle rejection, duplicate names, deterministic 128-char aliases, fixed tool failure/timeout labels, exact full-result `rawOutput`, partial-open close, and new/load/resume/fork injection |
 | M1 | §5/§9.3.4 | one table-driven transcript uses actual SDK stdio, Streamable HTTP, and legacy SSE transports, preserves repeated HTTP/SSE header order, advertises `{ http:true, sse:true }`, and rejects only client-hosted `acp` |

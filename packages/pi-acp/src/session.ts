@@ -47,6 +47,7 @@ interface CleanupGeneration {
   error?: unknown;
   deadlineController: AbortController;
   timerController: AbortController;
+  resumeRefreshesOnSettlement?: true;
 }
 
 export interface PiSessionOptions {
@@ -222,12 +223,17 @@ export class PiSession {
     turn.completed = true;
     turn.removeRequestAbort?.();
     turn.removeRequestAbort = undefined;
-    turn.releaseBoundary?.();
-    turn.releaseBoundary = undefined;
-    if (this.activeTurn === turn) this.activeTurn = undefined;
     if ("response" in outcome) turn.resolve(outcome.response);
     else turn.reject(outcome.error);
     turn.resolveSettlement();
+    turn.releaseBoundary?.();
+    turn.releaseBoundary = undefined;
+    if (this.activeTurn === turn) this.activeTurn = undefined;
+    const generation = this.cleanupGeneration;
+    if (generation?.resumeRefreshesOnSettlement && generation.mode === "cancel-only") {
+      this.cleanupGeneration = undefined;
+      this.mcpBridge.resumeRefreshes();
+    }
   }
 
   private notificationFailure(): void {
@@ -237,7 +243,7 @@ export class PiSession {
     this.abortTurn(turn);
     void turn.cleanup?.then(
       () => this.finish(turn, { error: adapterError("notification_error") }),
-      () => undefined,
+      (error) => this.finish(turn, { error }),
     );
   }
 
@@ -304,8 +310,6 @@ export class PiSession {
     else this.mcpBridge.abortRefreshes();
     const turn = this.activeTurn;
     if (turn && !turn.controller.signal.aborted) turn.controller.abort();
-    turn?.releaseBoundary?.();
-    if (turn) turn.releaseBoundary = undefined;
     let abortPi: Promise<void>;
     try {
       abortPi = this.pi.abort();
@@ -313,9 +317,7 @@ export class PiSession {
       abortPi = Promise.reject(error);
     }
     abortPi.catch(() => undefined);
-    const refreshDrain = this.mcpBridge.drainRefreshes();
-    refreshDrain.catch(() => undefined);
-    const operations = Promise.allSettled([abortPi, captured.drain, refreshDrain]);
+    const operations = Promise.allSettled([abortPi, captured.drain]);
 
     generation.promise = new Promise<void>((resolve, reject) => {
       let claimed = false;
@@ -353,8 +355,7 @@ export class PiSession {
         timerController.abort();
         if (generation.mode === "cancel-only" && this.cleanupGeneration === generation) {
           this.childRegistry.commitRotation(captured.epoch);
-          this.mcpBridge.resumeRefreshes();
-          this.cleanupGeneration = undefined;
+          generation.resumeRefreshesOnSettlement = true;
         }
         resolve();
       });

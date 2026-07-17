@@ -16,6 +16,21 @@ import {
   UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
+export const LARGE_FIXTURE_ITEM_COUNT = 1_025;
+const LARGE_FIXTURE_PAGE_SIZE = 257;
+
+function largePage(field, prefix, cursor, createItem) {
+  const page = cursor === undefined ? 0 : Number(cursor.slice(prefix.length));
+  if (!Number.isInteger(page) || page < 0) throw new Error(`invalid ${prefix} cursor`);
+  const start = page * LARGE_FIXTURE_PAGE_SIZE;
+  const end = Math.min(start + LARGE_FIXTURE_PAGE_SIZE, LARGE_FIXTURE_ITEM_COUNT);
+  const items = Array.from({ length: end - start }, (_, offset) => createItem(start + offset));
+  return {
+    [field]: items,
+    ...(end < LARGE_FIXTURE_ITEM_COUNT ? { nextCursor: `${prefix}${page + 1}` } : {}),
+  };
+}
+
 export function createConformanceServer(options = {}) {
   let revision = 0;
   let raceId = 0;
@@ -38,6 +53,13 @@ export function createConformanceServer(options = {}) {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, ({ params }) => {
+    if (options.largeCatalog) {
+      return largePage("tools", "large-tool-page-", params?.cursor, (index) => ({
+        name: `large_tool_${index}`,
+        description: `large tool ${index}`,
+        inputSchema: { type: "object", additionalProperties: false },
+      }));
+    }
     if (params?.cursor === "tool-page-2") {
       return {
         tools: [
@@ -69,6 +91,18 @@ export function createConformanceServer(options = {}) {
           },
         },
         { name: "isolate_url", description: "hold one equal remote elicitation id", inputSchema: { type: "object", additionalProperties: false } },
+        {
+          name: "form_case",
+          description: "exercise exact form-schema validation",
+          inputSchema: {
+            type: "object",
+            required: ["case"],
+            properties: {
+              case: { type: "string", enum: ["extra", "missing", "mistyped", "bounded", "default", "compilation"] },
+            },
+            additionalProperties: false,
+          },
+        },
         { name: "trigger_dynamic", description: "trigger list change", inputSchema: { type: "object", additionalProperties: false } },
       ],
       nextCursor: "tool-page-2",
@@ -84,6 +118,47 @@ export function createConformanceServer(options = {}) {
     if (params.name === "progress_snapshot") {
       await progressReady;
       return { content: [{ type: "text", text: JSON.stringify(incomingProgress) }] };
+    }
+    if (params.name === "form_case") {
+      const formCase = params.arguments?.case;
+      const requestedSchema = formCase === "bounded"
+        ? {
+            type: "object",
+            required: ["answer"],
+            properties: { answer: { type: "string", minLength: 3, maxLength: 5 } },
+          }
+        : formCase === "default"
+          ? {
+              type: "object",
+              properties: { answer: { type: "string", default: "adapter-must-not-apply" } },
+            }
+          : formCase === "compilation"
+            ? {
+                type: "object",
+                properties: { answer: { type: "string", enum: [] } },
+              }
+          : {
+              type: "object",
+              required: ["answer"],
+              properties: { answer: { type: "string" } },
+            };
+      try {
+        const result = await server.elicitInput({
+          mode: "form",
+          message: `form-case:${formCase}`,
+          requestedSchema,
+        });
+        return { content: [{ type: "text", text: JSON.stringify({ result }) }] };
+      } catch (error) {
+        const value = error instanceof Error ? error : new Error(String(error));
+        const wireMessage = value.message.replace(/^MCP error -?\d+: /, "");
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ error: { code: error?.code, wireMessage } }),
+          }],
+        };
+      }
     }
     if (params.name === "hang") {
       await new Promise((resolve, reject) => {
@@ -259,20 +334,35 @@ export function createConformanceServer(options = {}) {
     return { content: [{ type: "text", text: "exercised" }], structuredContent };
   });
 
-  server.setRequestHandler(ListResourcesRequestSchema, ({ params }) => params?.cursor === "resource-page-2"
-    ? { resources: [{ uri: "file:///two", name: "two" }] }
-    : { resources: [{ uri: "file:///one", name: "one" }], nextCursor: "resource-page-2" });
-  server.setRequestHandler(ListResourceTemplatesRequestSchema, ({ params }) => params?.cursor === "template-page-2"
-    ? { resourceTemplates: [{ uriTemplate: "file:///two/{name}", name: "two" }] }
-    : { resourceTemplates: [{ uriTemplate: "file:///one/{name}", name: "one" }], nextCursor: "template-page-2" });
+  server.setRequestHandler(ListResourcesRequestSchema, ({ params }) => options.largeCatalog
+    ? largePage("resources", "large-resource-page-", params?.cursor, (index) => ({
+        uri: `file:///large/${index}`,
+        name: `large-resource-${index}`,
+      }))
+    : params?.cursor === "resource-page-2"
+      ? { resources: [{ uri: "file:///two", name: "two" }] }
+      : { resources: [{ uri: "file:///one", name: "one" }], nextCursor: "resource-page-2" });
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, ({ params }) => options.largeCatalog
+    ? largePage("resourceTemplates", "large-template-page-", params?.cursor, (index) => ({
+        uriTemplate: `file:///large/${index}/{name}`,
+        name: `large-template-${index}`,
+      }))
+    : params?.cursor === "template-page-2"
+      ? { resourceTemplates: [{ uriTemplate: "file:///two/{name}", name: "two" }] }
+      : { resourceTemplates: [{ uriTemplate: "file:///one/{name}", name: "one" }], nextCursor: "template-page-2" });
   server.setRequestHandler(ReadResourceRequestSchema, ({ params }) => ({
     contents: [{ uri: params.uri, mimeType: "text/plain", text: `read:${params.uri}` }],
   }));
   server.setRequestHandler(SubscribeRequestSchema, () => ({}));
   server.setRequestHandler(UnsubscribeRequestSchema, () => ({}));
-  server.setRequestHandler(ListPromptsRequestSchema, ({ params }) => params?.cursor === "prompt-page-2"
-    ? { prompts: [{ name: "two", description: "two" }] }
-    : { prompts: [{ name: "one", description: "one" }], nextCursor: "prompt-page-2" });
+  server.setRequestHandler(ListPromptsRequestSchema, ({ params }) => options.largeCatalog
+    ? largePage("prompts", "large-prompt-page-", params?.cursor, (index) => ({
+        name: `large-prompt-${index}`,
+        description: `large prompt ${index}`,
+      }))
+    : params?.cursor === "prompt-page-2"
+      ? { prompts: [{ name: "two", description: "two" }] }
+      : { prompts: [{ name: "one", description: "one" }], nextCursor: "prompt-page-2" });
   server.setRequestHandler(GetPromptRequestSchema, ({ params }) => ({
     description: `prompt:${params.name}`,
     messages: [{ role: "user", content: { type: "text", text: "prompt body" } }],

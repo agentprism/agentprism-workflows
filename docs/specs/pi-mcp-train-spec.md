@@ -1948,7 +1948,7 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 | # | covers | assertion |
 |---|---|---|
 | REL1 | §15 | the Changesets entry declares minor `pi-acp`, minor `acp-agents`, patch `workflows`, and patch `mcp-server`; no workflow-engine/shared-types bump is introduced; packed/published manifests resolve the coordinated new internal versions after `pnpm version` + `pnpm pack` |
-| REL2 | §15 | installed-package smoke runs `npx @automatalabs/workflows@0.38.2 config pi`, the HTTP MCP + injected-structured fixture, tarball/private-channel absence checks (including packed `acp-agents/README.md`), repository release-doc scan of `docs/specs/acp-auth-spec.md`, and generated-authoring-prompt assertion exactly as pinned |
+| REL2 | §15 | installed-package smoke runs `npx @automatalabs/workflows@0.38.3 config pi`, the HTTP MCP + injected-structured fixture, tarball/private-channel absence checks (including packed `acp-agents/README.md`), repository release-doc scan of `docs/specs/acp-auth-spec.md`, and generated-authoring-prompt assertion exactly as pinned |
 
 ---
 

@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Type } from "typebox";
 import { AcpAgentRunner } from "../../acp-agents/dist/index.js";
+import { StructuredOutputToolHost } from "../../acp-agents/dist/structured-tool.js";
 
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
 const MODEL = process.env.AGENTPRISM_PI_E2E_MODEL;
@@ -122,16 +123,44 @@ test("T23 built-in PiBackend validates through injected StructuredOutput plus co
     return;
   }
   const restore = installPiCommand();
+  const originalRegister = StructuredOutputToolHost.prototype.register;
+  const captures: Array<{ reads: number; values: unknown[] }> = [];
+  StructuredOutputToolHost.prototype.register = async function observedRegister(schema) {
+    const registration = await originalRegister.call(this, schema);
+    const observation = { reads: 0, values: [] as unknown[] };
+    captures.push(observation);
+    const tryCaptured = registration.tryCaptured;
+    return {
+      ...registration,
+      tryCaptured() {
+        observation.reads += 1;
+        const value = tryCaptured();
+        if (value !== undefined) observation.values.push(value);
+        return value;
+      },
+    };
+  };
   const runner = new AcpAgentRunner();
   try {
     const schema = Type.Object({ answer: Type.String() }, { additionalProperties: false });
-    const result = await runner.run('Return {"answer":"pong"} and no other value.', {
+    const result = await runner.run('Call the StructuredOutput tool exactly once with {"answer":"pong"}. After the tool call, reply only with the plain words capture complete, not JSON.', {
       model: `pi/${MODEL}`,
       schema,
     });
     assert.deepEqual(result, { answer: "pong" });
+    assert.equal(captures[0]?.reads > 0, true);
+    assert.deepEqual(captures[0]?.values, [{ answer: "pong" }], "the injected HTTP tool capture is the primary result");
+
+    const fallback = await runner.run('Do not call any tool. Return exactly {"answer":"fallback"} and no other text.', {
+      model: `pi/${MODEL}`,
+      schema,
+    });
+    assert.deepEqual(fallback, { answer: "fallback" });
+    assert.equal(captures[1]?.reads > 0, true);
+    assert.deepEqual(captures[1]?.values, [], "an absent capture uses the common validated last-text fallback");
   } finally {
     await runner.dispose();
+    StructuredOutputToolHost.prototype.register = originalRegister;
     restore();
   }
 });

@@ -257,7 +257,10 @@ export class PiAcpAgent {
       getPi: () => state.pi,
       getTurnSignal: () => state.wrapper?.activeTurnSignal(),
       isPublished: () => state.published,
-      emitDiagnostic: (text: string) => state.wrapper?.emitMcpDiagnostic(text) ?? console.error(text),
+      emitDiagnostic: (text: string) => {
+        if (state.wrapper) state.wrapper.emitMcpDiagnostic(text);
+        else console.error(text);
+      },
       poison: () => state.wrapper?.poison(),
       ownerToken: this.mcpOwnerToken,
       modelRuntime: this.deps.modelRuntime,

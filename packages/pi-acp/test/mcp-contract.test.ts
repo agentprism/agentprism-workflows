@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager, type AgentSession, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import {
   CloseSignallingTransport,
   McpOperationTerminalError,
@@ -236,6 +237,51 @@ test("M7 incoming settleOnce uses peer > session > turn > timeout > completion",
   timeout.resolve();
   await assert.rejects(running, (error) =>
     error instanceof McpIncomingTerminalError && error.terminalCause === "timeout");
+});
+
+test("M7 URL accept-vs-completion barrier commits registry state inside settleOnce", async () => {
+  const operation = deferred<{ action: "accept" }>();
+  const timeout = deferred<void>();
+  const committed = deferred<void>();
+  let registryState: "pending" | "accepted" | "consumed" = "pending";
+  const completionObservations: string[] = [];
+  const running = settleIncomingMcpOperation(
+    () => operation.promise,
+    new AbortController().signal,
+    new AbortController().signal,
+    new AbortController().signal,
+    60_000,
+    () => timeout.promise,
+    (outcome) => {
+      registryState = outcome.status === "fulfilled" && outcome.value.action === "accept"
+        ? "accepted"
+        : "consumed";
+      completionObservations.push(registryState);
+      committed.resolve();
+    },
+  );
+  operation.resolve({ action: "accept" });
+  await committed.promise;
+  assert.equal(registryState, "accepted");
+  assert.deepEqual(completionObservations, ["accepted"]);
+  assert.deepEqual(await running, { action: "accept" });
+
+  const terminalTimeout = deferred<void>();
+  const never = deferred<{ action: "accept" }>();
+  registryState = "pending";
+  const cancelled = settleIncomingMcpOperation(
+    () => never.promise,
+    new AbortController().signal,
+    new AbortController().signal,
+    new AbortController().signal,
+    60_000,
+    () => terminalTimeout.promise,
+    () => { registryState = "consumed"; },
+  );
+  terminalTimeout.resolve();
+  await assert.rejects(cancelled, (error) =>
+    error instanceof McpIncomingTerminalError && error.terminalCause === "timeout");
+  assert.equal(registryState, "consumed", "losing branches tombstone before publishing their outcome");
 });
 
 test("M8 ping failure closes the post-connect owner exactly once", async () => {
@@ -629,6 +675,100 @@ test("M5 opening waits for one coalesced dirty pass and defers a notification du
   await bridge.drainRefreshes();
   assert.equal(calls, 3, "the deferred dirty bit becomes ordinary post-publication work");
   assert.ok(active.includes("mcp__initial-dirty__third"));
+  await bridge.close();
+});
+
+test("M5 multi-server publication waits for an earlier server dirtied while a later server connects", async () => {
+  const setup = fakeDeps();
+  const secondConnecting = deferred<void>();
+  const releaseSecond = deferred<void>();
+  const refreshStarted = deferred<void>();
+  const refreshPage = deferred<{ tools: Array<{ name: string; inputSchema: { type: string } }> }>();
+  let firstChanged: (() => void) | undefined;
+  let firstLists = 0;
+  setup.deps.connectMcpClient = async (server) => {
+    if (server.name === "second") {
+      secondConnecting.resolve();
+      await releaseSecond.promise;
+      return fakeMcpHandle({ async listTools() { return { tools: [] }; } });
+    }
+    return fakeMcpHandle({
+      async listTools() {
+        firstLists += 1;
+        if (firstLists === 1) return { tools: [{ name: "stale", inputSchema: { type: "object" } }] };
+        refreshStarted.resolve();
+        return refreshPage.promise;
+      },
+      setToolsChangedHandler(handler) { firstChanged = handler; },
+    });
+  };
+  let opened = false;
+  const opening = bridgeMcpServers([
+    { name: "first", command: "fixture", args: [], env: [] },
+    { name: "second", command: "fixture", args: [], env: [] },
+  ], new AbortController().signal, setup.deps).then((bridge) => {
+    opened = true;
+    return bridge;
+  });
+  await secondConnecting.promise;
+  firstChanged?.();
+  releaseSecond.resolve();
+  await refreshStarted.promise;
+  assert.equal(opened, false, "the bridge-wide publication barrier includes the earlier dirty server");
+  refreshPage.resolve({ tools: [{ name: "fresh", inputSchema: { type: "object" } }] });
+  const bridge = await opening;
+  assert.equal(firstLists, 2);
+  assert.equal(bridge.aliases.includes("mcp__first__stale"), false);
+  assert.equal(bridge.aliases.includes("mcp__first__fresh"), true);
+  await bridge.close();
+});
+
+test("M3 output validators retain each handle's per-server provider and isolate equal schema ids", async () => {
+  const setup = fakeDeps();
+  const providers = new Map<string, AjvJsonSchemaValidator>();
+  setup.deps.connectMcpClient = async (server) => {
+    const provider = new AjvJsonSchemaValidator();
+    providers.set(server.name, provider);
+    const property = server.name === "a"
+      ? { a: { type: "string" } }
+      : { b: { type: "number" } };
+    return fakeMcpHandle({
+      jsonSchemaValidator: provider,
+      async listTools() {
+        return { tools: [{
+          name: "validate",
+          inputSchema: { type: "object" },
+          outputSchema: {
+            $id: "https://example.test/shared-output-schema",
+            type: "object",
+            required: [server.name],
+            properties: property,
+            additionalProperties: false,
+          },
+        }] as never };
+      },
+      async callTool() {
+        return {
+          content: [{ type: "text", text: "accepted" }],
+          structuredContent: server.name === "a" ? { a: "ok" } : { b: 7 },
+        };
+      },
+    });
+  };
+  const bridge = await bridgeMcpServers([
+    { name: "a", command: "fixture", args: [], env: [] },
+    { name: "b", command: "fixture", args: [], env: [] },
+  ], new AbortController().signal, setup.deps);
+  assert.notEqual(providers.get("a"), providers.get("b"));
+  const second = bridge.tools.find(({ name }) => name === "mcp__b__validate");
+  assert.ok(second);
+  const result = await second.execute("validate-b", {}, new AbortController().signal);
+  assert.equal(result.content[0]?.type, "text");
+  assert.equal(result.content[0]?.text, "accepted");
+  assert.deepEqual(result.details, {
+    content: [{ type: "text", text: "accepted" }],
+    structuredContent: { b: 7 },
+  });
   await bridge.close();
 });
 

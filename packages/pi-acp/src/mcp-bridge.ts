@@ -104,6 +104,8 @@ export interface McpClientHandle {
   setDisabledHandler?(handler: () => void): void;
   disableOnTimeout?(): void;
   getPeerSignal?(): AbortSignal;
+  /** The per-server provider also supplied to this handle's SDK Client. */
+  jsonSchemaValidator?: AjvJsonSchemaValidator;
   /** The handle's own close implementation enforces the shared physical deadline. */
   closeIsBounded?: boolean;
 }
@@ -139,6 +141,11 @@ export class McpIncomingTerminalError extends Error {
   }
 }
 
+type McpOperationCommit<T> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown }
+  | { status: "terminal"; cause: McpTerminalCause; reason: unknown };
+
 function exactMcpError(code: ErrorCode, message: string): McpError {
   const error = new McpError(code, message);
   // McpError adds a local-display prefix, but Protocol serializes error.message verbatim.
@@ -158,6 +165,7 @@ export function settleMcpOperation<T>(
   peerSignal: AbortSignal | undefined,
   timeoutMs: number,
   sleep: PiAcpDeps["sleep"],
+  onCommit?: (outcome: McpOperationCommit<T>) => void,
 ): Promise<T> {
   const requestSignal = anySignal([lifecycleSignal, sessionSignal, peerSignal]);
   return new Promise<T>((resolve, reject) => {
@@ -181,19 +189,38 @@ export function settleMcpOperation<T>(
       commitQueued = false;
       if (settled) return;
       if (lifecycleSignal?.aborted) {
-        finish(() => reject(new McpOperationTerminalError("lifecycle", lifecycleSignal.reason)));
+        finish(() => {
+          onCommit?.({ status: "terminal", cause: "lifecycle", reason: lifecycleSignal.reason });
+          reject(new McpOperationTerminalError("lifecycle", lifecycleSignal.reason));
+        });
       } else if (sessionSignal?.aborted) {
-        finish(() => reject(new McpOperationTerminalError("session", sessionSignal.reason)));
+        finish(() => {
+          onCommit?.({ status: "terminal", cause: "session", reason: sessionSignal.reason });
+          reject(new McpOperationTerminalError("session", sessionSignal.reason));
+        });
       } else if (peerSignal?.aborted) {
-        finish(() => reject(new McpOperationTerminalError("peer", peerSignal.reason)));
+        finish(() => {
+          onCommit?.({ status: "terminal", cause: "peer", reason: peerSignal.reason });
+          reject(new McpOperationTerminalError("peer", peerSignal.reason));
+        });
       } else if (timedOut) {
-        finish(() => reject(new McpOperationTerminalError("timeout", new McpTimeoutError())));
+        finish(() => {
+          const reason = new McpTimeoutError();
+          onCommit?.({ status: "terminal", cause: "timeout", reason });
+          reject(new McpOperationTerminalError("timeout", reason));
+        });
       } else {
         const outcome = operationOutcome;
         if (outcome?.status === "fulfilled") {
-          finish(() => resolve(outcome.value));
+          finish(() => {
+            onCommit?.(outcome);
+            resolve(outcome.value);
+          });
         } else if (outcome?.status === "rejected") {
-          finish(() => reject(outcome.reason));
+          finish(() => {
+            onCommit?.(outcome);
+            reject(outcome.reason);
+          });
         }
       }
     };
@@ -260,6 +287,7 @@ export async function settleIncomingMcpOperation<T>(
   turnSignal: AbortSignal | undefined,
   timeoutMs: number,
   sleep: PiAcpDeps["sleep"],
+  onCommit?: (outcome: McpOperationCommit<T>) => void,
 ): Promise<T> {
   try {
     // Positional mapping gives the incoming arbiter its distinct frozen order:
@@ -271,6 +299,7 @@ export async function settleIncomingMcpOperation<T>(
       turnSignal,
       timeoutMs,
       sleep,
+      onCommit,
     );
   } catch (error) {
     if (!(error instanceof McpOperationTerminalError)) throw error;
@@ -449,11 +478,15 @@ function createTransport(
   } else {
     throw adapterError("unsupported_mcp_transport", { server: server.name });
   }
-  return new CloseSignallingTransport(raw, terminate, (error) => {
+  const wrapper = new CloseSignallingTransport(raw, terminate, (error) => {
     // stdio parser/pipe errors are diagnostic-only; natural close is observed by onclose.
     void error;
     return true;
-  }, () => fatal(), timeoutMs, sleep, serverToken);
+  }, () => {
+    fatal();
+    void wrapper.close();
+  }, timeoutMs, sleep, serverToken);
+  return wrapper;
 }
 
 let elicitationCounter = 0n;
@@ -462,8 +495,10 @@ const elicitationOwners = new WeakMap<object, bigint>();
 const urlElicitations = new Map<string, {
   opaque: string;
   remote: string;
-  accepted: boolean;
+  state: "pending" | "accepted";
   declinePending(): void;
+  committed: Promise<void>;
+  markCommitted(): void;
 }>();
 const consumedElicitations = new Set<string>();
 
@@ -483,6 +518,7 @@ function clearElicitations(binding: McpSessionBinding | undefined, token: string
   for (const [key, entry] of urlElicitations) {
     if (key.startsWith(prefix)) {
       entry.declinePending();
+      entry.markCommitted();
       urlElicitations.delete(key);
     }
   }
@@ -638,10 +674,19 @@ function installClientHandlers(
         }
         const opaque = `pi-acp-elicitation-${++elicitationCounter}`;
         let declinePending!: () => void;
+        let markCommitted!: () => void;
         const earlyCompletion = new Promise<CreateElicitationResponse>((resolve) => {
           declinePending = () => resolve({ action: "decline" });
         });
-        urlElicitations.set(urlKey, { opaque, remote: urlParams.elicitationId, accepted: false, declinePending });
+        const committed = new Promise<void>((resolve) => { markCommitted = resolve; });
+        urlElicitations.set(urlKey, {
+          opaque,
+          remote: urlParams.elicitationId,
+          state: "pending",
+          declinePending,
+          committed,
+          markCommitted,
+        });
         const acpRequest = binding.client.request<CreateElicitationResponse, CreateElicitationRequest>("elicitation/create", {
           sessionId: binding.sessionId,
           mode: "url",
@@ -651,14 +696,18 @@ function installClientHandlers(
         });
         acpRequest.then(() => undefined, () => undefined);
         return Promise.race([acpRequest, earlyCompletion]);
-      }, extra.signal, binding.sessionSignal, turnSignal, timeoutMs, sleep);
-      if (request.params.mode === "url" && response.action === "accept") {
-        const entry = urlKey ? urlElicitations.get(urlKey) : undefined;
-        if (entry) entry.accepted = true;
-      } else if (urlKey) {
+      }, extra.signal, binding.sessionSignal, turnSignal, timeoutMs, sleep, (outcome) => {
+        if (!urlKey) return;
+        const entry = urlElicitations.get(urlKey);
+        if (outcome.status === "fulfilled" && outcome.value.action === "accept" && entry) {
+          entry.state = "accepted";
+          entry.markCommitted();
+          return;
+        }
         urlElicitations.delete(urlKey);
         consumedElicitations.add(urlKey);
-      }
+        entry?.markCommitted();
+      });
       progress(extra, progressToken, 1, () => diagnostic("progress notification failed"));
       if (response.action === "accept") {
         return request.params.mode === "form"
@@ -667,10 +716,6 @@ function installClientHandlers(
       }
       return { action: response.action };
     } catch (error) {
-      if (urlKey) {
-        urlElicitations.delete(urlKey);
-        consumedElicitations.add(urlKey);
-      }
       if (error instanceof McpIncomingTerminalError) {
         if (error.terminalCause === "peer" || error.terminalCause === "session") {
           throw error.terminalReason;
@@ -684,18 +729,22 @@ function installClientHandlers(
   });
   client.setNotificationHandler(ElicitationCompleteNotificationSchema, async (notification) => {
     const key = elicitationKey(binding, token, notification.params.elicitationId);
-    const entry = urlElicitations.get(key);
+    let entry = urlElicitations.get(key);
     if (!entry) {
       diagnostic(consumedElicitations.has(key) ? "late elicitation completion" : "unknown elicitation completion");
       return;
     }
+    if (entry.state === "pending") {
+      entry.declinePending();
+      await entry.committed;
+      entry = urlElicitations.get(key);
+      if (!entry) {
+        diagnostic("late elicitation completion");
+        return;
+      }
+    }
     urlElicitations.delete(key);
     consumedElicitations.add(key);
-    if (!entry.accepted) {
-      entry.declinePending();
-      diagnostic("late elicitation completion");
-      return;
-    }
     try {
       await binding.client.notify("elicitation/complete", { elicitationId: entry.opaque });
     } catch {
@@ -837,6 +886,7 @@ export async function connectDefaultMcpClient(
       },
     } : {}),
     getPeerSignal: () => fatalController.signal,
+    jsonSchemaValidator: validator,
     closeIsBounded: true,
     async close() {
       if (state === "closed" || state === "closing") return;
@@ -896,6 +946,7 @@ interface ServerState {
   pages: unknown[];
   aliases: Map<string, string>;
   validators: Map<string, JsonSchemaValidator<Record<string, unknown>>>;
+  validatorProvider: AjvJsonSchemaValidator;
   syntheticAliases: string[];
   validAliases: Set<string>;
   peerDead: boolean;
@@ -1006,7 +1057,6 @@ export async function bridgeMcpServers(
   const aliases: string[] = [];
   const usedAliases = new Set<string>();
   const usedServerTokens = new Set<string>();
-  const validatorProvider = new AjvJsonSchemaValidator();
   let extensionApi: ExtensionAPI | undefined;
   let piSession: AgentSession | undefined;
   let refreshQueue = Promise.resolve();
@@ -1259,7 +1309,7 @@ export async function bridgeMcpServers(
           nextAliases.set(remote.name, alias);
           addedReservations.push({ alias, server: state.server.name });
         }
-        if (remote.outputSchema) validators.set(alias, validatorProvider.getValidator(remote.outputSchema));
+        if (remote.outputSchema) validators.set(alias, state.validatorProvider.getValidator(remote.outputSchema));
         definitions.push(remoteDefinition(state, remote, alias));
         previousNames.delete(remote.name);
       }
@@ -1268,12 +1318,14 @@ export async function bridgeMcpServers(
         .filter((value): value is string => value !== undefined);
     } catch (error) {
       if (isMcpTimeout(error)) state.handle.disableOnTimeout?.();
+      if (refreshPaused && !closing && !state.peerDead && !state.disabled) state.dirty = true;
       if (!closing && !refreshPaused && !state.peerDead && !state.disabled) binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
       return;
     }
 
     const release = await acquireTurnBoundary();
     if (closing || refreshPaused || state.peerDead || state.disabled || !extensionApi || !piSession) {
+      if (refreshPaused && !closing && !state.peerDead && !state.disabled) state.dirty = true;
       release();
       return;
     }
@@ -1371,6 +1423,7 @@ export async function bridgeMcpServers(
           pages: [],
           aliases: new Map(),
           validators: new Map(),
+          validatorProvider: handle.jsonSchemaValidator ?? new AjvJsonSchemaValidator(),
           syntheticAliases: [],
           validAliases: new Set(),
           peerDead: false,
@@ -1444,23 +1497,12 @@ export async function bridgeMcpServers(
         if (caps?.prompts) operations.push("list_prompts", "get_prompt");
         if (caps?.completions) operations.push("complete");
         for (const operation of operations) tools.push(makeSynthetic(state, operation));
-        let initial = caps?.tools
+        const initial = caps?.tools
           ? await enumerate(state, openSignal)
           : { tools: [], pages: [] };
-        if (state.dirty) {
-          state.dirty = false;
-          try {
-            initial = caps?.tools
-              ? await enumerate(state, openSignal)
-              : { tools: [], pages: [] };
-          } catch {
-            binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
-          }
-        }
         if (state.peerDead || handle.getPeerSignal?.().aborted) {
           throw new McpOperationTerminalError("peer", handle.getPeerSignal?.().reason);
         }
-        state.initializing = false;
         state.tools = initial.tools;
         state.pages = initial.pages;
       } catch (error) {
@@ -1471,8 +1513,32 @@ export async function bridgeMcpServers(
         if (openSignal.aborted) throw openSignal.reason;
         throw adapterError("mcp_init_error", { server: server.name });
       }
-      // A notification accepted while the one coalesced extra pass was running becomes ordinary
-      // post-publication work and intentionally does not extend the open-time quiescence barrier.
+    }
+    // Keep the initialization window bridge-wide. Once every configured server has completed its
+    // first catalog, snapshot the dirty set and close that window for all servers. Notifications
+    // accepted while these coalesced passes run become ordinary post-open dirty work and therefore do
+    // not create an unbounded open-time quiescence loop.
+    const initialDirty = states.filter((state) => state.dirty);
+    for (const state of states) state.initializing = false;
+    for (const state of initialDirty) {
+      state.dirty = false;
+      try {
+        const refreshed = state.handle.getCapabilities?.()?.tools
+          ? await enumerate(state, openSignal)
+          : { tools: [], pages: [] };
+        state.tools = refreshed.tools;
+        state.pages = refreshed.pages;
+      } catch (error) {
+        if (error instanceof McpOperationTerminalError
+          && (error.terminalCause === "lifecycle" || error.terminalCause === "session")) {
+          throw error.terminalReason;
+        }
+        if (openSignal.aborted) throw openSignal.reason;
+        binding?.emitDiagnostic(`[mcp:${state.token}] tools/list refresh failed`);
+      }
+      if (state.peerDead || state.handle.getPeerSignal?.().aborted) {
+        throw adapterError("mcp_init_error", { server: state.server.name });
+      }
     }
     // Every capability-conditioned synthetic reservation precedes every remote tool reservation.
     for (const state of states) {
@@ -1483,7 +1549,7 @@ export async function bridgeMcpServers(
           aliases.push(alias);
           aliasServers.set(alias, state.server.name);
           state.validAliases.add(alias);
-          if (remote.outputSchema) state.validators.set(alias, validatorProvider.getValidator(remote.outputSchema));
+          if (remote.outputSchema) state.validators.set(alias, state.validatorProvider.getValidator(remote.outputSchema));
           tools.push(remoteDefinition(state, remote, alias));
         }
       } catch {
