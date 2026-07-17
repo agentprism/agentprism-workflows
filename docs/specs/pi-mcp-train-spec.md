@@ -53,7 +53,8 @@ to npm-latest continuously. Before writing any code, the implementer MUST re-run
 protocol and treat any drift as a **stop-and-report** discrepancy — never re-implement around a moved
 pin silently (the pi-acp spec §0 obligation, extended here to the new surfaces this train wires into):
 
-1. Fresh temp clone of `https://github.com/earendil-works/pi`, then `git fetch --tags`.
+1. Fresh temp clone of `https://github.com/earendil-works/pi`, then
+   `git fetch origin main --tags` (a tag-only fetch is insufficient for the release→main risk check).
 2. `gh api repos/earendil-works/pi/releases/latest --jq .tag_name` **and**
    `npm view @earendil-works/pi-coding-agent version`; the two MUST agree.
 3. Compare against the pin in §13 (`v0.80.10` / commit `8dc78834cde4e329284cf505f9e3f99763df5529` / npm
@@ -66,15 +67,18 @@ pin silently (the pi-acp spec §0 obligation, extended here to the new surfaces 
    `getAvailableSnapshot`), and the bash-child kill path (`tools/bash.ts`, `exec.ts`, `utils/shell.ts`) —
    against the new latest, update the pins (§13) and every changed claim, and re-open this contract for
    review before building.
-4. Fresh temp clone `https://github.com/modelcontextprotocol/typescript-sdk`, fetch tags, and compare
+4. Fresh temp clone `https://github.com/modelcontextprotocol/typescript-sdk`, run
+   `git fetch origin main --tags`, and compare
    `gh api repos/modelcontextprotocol/typescript-sdk/releases/latest --jq .tag_name` with
-   `npm view @modelcontextprotocol/sdk version`. Repeat for
-   `https://github.com/agentclientprotocol/typescript-sdk` and `@agentclientprotocol/sdk`. If either is
+   `npm view @modelcontextprotocol/sdk version`. Repeat the fresh clone plus main/tags fetch for
+   `https://github.com/agentclientprotocol/typescript-sdk` and compare
+   `gh api repos/agentclientprotocol/typescript-sdk/releases/latest --jq .tag_name` with
+   `npm view @agentclientprotocol/sdk version`. If either pair is
    no longer `v1.29.0` / `1.29.0` or `v1.2.1` / `1.2.1`, STOP: re-verify the MCP transport, lifecycle,
    completion, subscription, progress/cancellation, output-validator, client-handler, and notification surfaces and the
    ACP form/URL elicitation request + completion-notification surfaces against the new release source;
    update the release tag, commit, npm pin, citations, and forward-risk note before building.
-5. **Base-freshness (blocking):** if `origin/main` has advanced since the base commit
+5. **Base-freshness (blocking):** fetch `origin/main`; if it has advanced since the base commit
    `78944e3462458de30c4989ff04894fecbf43632d` (§13) with any change that touches a `.ts`/`.mjs`/`.md`
    SOURCE surface this contract cites under `packages/pi-acp`, `packages/acp-agents`,
    `packages/workflows`, `packages/workflow-engine`, `packages/shared-types`, `packages/mcp-server`,
@@ -221,6 +225,22 @@ typed servers (`mcp-bridge.ts:214-216` removed):
 | `{ type:"sse", url, headers }` | `SSEClientTransport` (`src/client/sse.ts:57-88`) | `new SSEClientTransport(new URL(url), { requestInit: { headers: fold(headers) } })` |
 | `{ type:"acp", … }` | not served by pi-acp | rejected `unsupported_mcp_transport` (client-hosted; §12.6) |
 
+Every constructed SDK transport is immediately wrapped in one adapter-owned
+`CloseSignallingTransport`. The wrapper delegates `start`, `send`, `sessionId`, and
+`setProtocolVersion` without transformation and forwards the raw transport's `onmessage`/`onerror`; its one
+semantic addition is a `signalClose()` once-gate. `close()` calls `signalClose()` synchronously **before**
+awaiting the raw transport's `close()`, then delegates that physical close; a raw/natural `onclose`
+also calls the same gate. Pass the wrapper to `Client.connect` but retain the raw transport for
+transport-specific construction/PID cleanup. This is required by the SDK's own `Transport` contract,
+which says `onclose` is invoked when `close()` is called (`src/shared/transport.ts:74-127`), and by the
+protocol layer, which aborts all incoming request-handler signals only from its installed `onclose`
+callback and whose `close()` delegates to the installed transport (`src/shared/protocol.ts:607-618,644-660,942-944`). At the pin, HTTP/SSE call `onclose` directly
+(`src/client/streamableHttp.ts:442-449`; `src/client/sse.ts:237-241`), but
+stdio `close()` can return after sending `SIGKILL` without awaiting the process `close` event
+(`src/client/stdio.ts:204-243`). The once-wrapper makes disposal ordering transport-independent: SDK
+handler suppression happens synchronously, a late raw close event is harmless, and a hung physical
+close remains subject to the existing outer bound without leaving an incoming handler alive.
+
 `fold(headers)` creates a WHATWG `Headers` object and calls `append(name, value)` in input order. WHATWG
 combines repeated names into one field value while retaining each value in order; that is the exact wire
 semantic promised (the SDK itself normalizes headers to a record in `src/shared/transport.ts:9-20`). Both
@@ -312,7 +332,11 @@ began during a turn but failed after settlement: dispatch-time gate state, not s
 route.
 
 Synthetic aliases are `mcp__<sanitized-server>__<operation>` and use the same deterministic collision
-allocator as remote tools. Their TypeBox argument schemas expose the exact model-supplied semantic fields
+allocator as remote tools. Reserve them before any remote alias, in server configuration order and,
+within each server, this fixed capability-conditioned operation order:
+`list_resources`, `list_resource_templates`, `read_resource`, `subscribe_resource`,
+`unsubscribe_resource`, `list_prompts`, `get_prompt`, `complete`. An operation the server did not
+advertise consumes no reservation. Their TypeBox argument schemas expose the exact model-supplied semantic fields
 and bounds without inventing narrower limits. The adapter, not the model, owns pagination cursors (every
 list tool consumes and returns all pages) and request `_meta` (the SDK supplies the progress token from
 `RequestOptions.onprogress`, `src/shared/protocol.ts:1135-1143`; related-task metadata is absent because
@@ -601,7 +625,7 @@ progress-send failure does not reset it. Outcomes are pinned:
 |---|---|---|---|
 | ordinary operation completion | mapped `CreateMessageResult`, or existing fixed semantic error | exact validated ACP action/content, or the existing unsupported-client `decline` | `1/1` immediately before any ordinary result, including a user-selected `decline`/`cancel`; none before an error |
 | MCP peer sends `notifications/cancelled`, or transport close aborts `extra.signal` | **no MCP response** | **no MCP response** | none; the pinned SDK suppresses handler success/error once its request controller is aborted (`src/shared/protocol.ts:550-557,728-853`) |
-| session disposal, inside or outside a turn | **no MCP response** | **no MCP response** | none; disposal marks the binding, starts `Client.close()`, waits for `extra.signal` abort, and only then releases the detached handler; close aborts all SDK request handlers (`src/shared/protocol.ts:644-660`) |
+| session disposal, inside or outside a turn | **no MCP response** | **no MCP response** | none; disposal marks the binding and starts `Client.close()`; the §3.1 close-signalling wrapper synchronously fires the protocol layer's `onclose`, which aborts `extra.signal` and suppresses handler success/error before physical transport close is awaited (`src/shared/protocol.ts:607-618,644-660`) |
 | active ACP turn abort (`$/cancel_request`, `session/cancel`, or notification failure) while the MCP connection remains open | MCP error `-32603`, exact message `MCP sampling cancelled` | MCP result `{ action:"cancel" }` | none |
 | `deps.mcpTimeoutMs` expires | MCP error `-32603`, exact message `MCP sampling timed out` | MCP result `{ action:"cancel" }` | none |
 
@@ -703,7 +727,8 @@ ACP client, one session-lifetime `AbortController` (`sessionSignal` in §3.1), a
 elicitation-id allocator/map; roots and elicitation therefore work
 during open. The binding's pi-session/model getter
 is populated after `createAgentSession`; sampling before that point follows the fixed no-active-model
-`-32603` contract. Raw server names must be byte-distinct as today. Each receives a stable safe token
+`-32603` contract. Raw server names must be exact-JavaScript-string distinct as today (`Set<string>`
+identity; no normalization before the duplicate check). Each receives a stable safe token
 from the existing slug function; slug collisions gain `_2`, `_3`, and so on in configuration order.
 That token drives aliases, prompt headers, diagnostics, and the server component of elicitation lookup
 keys; no other name rule is added. The frozen alias allocator remains unchanged: the full alias is at
@@ -743,7 +768,7 @@ overarching invariant "advertise only what is implemented" (pi-acp spec invarian
 
 ## 4. Deliverable 2 — Structured output rides the standard injection path (bespoke channel retired)
 
-Owner quote 4: "Just like the OpenCode ACP Server integration, we should just pass the structured
+**Source trace:** owner quote 4: "Just like the OpenCode ACP Server integration, we should just pass the structured
 output mcp server to pi if a schema is defined on an agent call. As long as we build the MCP client of
 pi-acp correctly, it would work just like any ACP agent that doesn't have native structured outputs?"
 The answer is yes, and this deliverable makes it so **by removal**, not by patching.
@@ -832,7 +857,7 @@ the retired channel and change in lockstep (§10).
 
 ## 5. Deliverable 3 — Model config option (truthful catalog)
 
-Owner quote 5: `npx @automatalabs/workflows config pi` surfaced only `thinkingLevel`. This deliverable
+**Source trace:** owner quote 5: `npx @automatalabs/workflows config pi` surfaced only `thinkingLevel`. This deliverable
 advertises a truthful `model` select so `config pi` enumerates the models the user can actually select,
 and **engages and overturns** the frozen §5.1 rationale for omitting it.
 
@@ -1380,12 +1405,12 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 | # | covers | assertion |
 |---|---|---|
 | M1 | §3.1/§7.1 | one table-driven transcript passes over actual SDK stdio, Streamable HTTP, and legacy SSE transports; the HTTP/SSE rows prove repeated header values survive in their combined field order while stdio has no header assertion; `initialize` advertises `{ http:true, sse:true }`; `acp` remains `unsupported_mcp_transport` `-32602` |
-| M2 | §3.1 | `Client.connect` receives timeout/session signal for initialize and the outer bound independently catches a hung transport start; connect/list/call/synthetic requests are bounded by injected `mcpTimeoutMs` on stdio, HTTP, and SSE (hung connect → rollback + reject `mcp_init_error` + transport closed; hung turn request → fixed failed tool); a fake-client option audit covers every outbound SDK method and session/turn signal combination; a late resolve/reject of a timed-out op produces NO unhandled rejection (detached) |
+| M2 | §3.1 | `Client.connect` receives timeout/session signal for initialize and the outer bound independently catches a hung transport start; connect/list/call/synthetic requests are bounded by injected `mcpTimeoutMs` on stdio, HTTP, and SSE (hung connect → rollback + reject `mcp_init_error` + transport closed; hung turn request → fixed failed tool); the close-signalling wrapper delegates every transport member, synchronously emits exactly one `onclose` before raw close (including raw-close throw/hang), coalesces a later/natural raw `onclose`, and causes the SDK to abort every incoming handler before physical close; a fake-client option audit covers every outbound SDK method and session/turn signal combination; a late resolve/reject of a timed-out op produces NO unhandled rejection (detached) |
 | M3 | §3.2/§3.3 | exact package client identity, strict-capability option enabled (an unadvertised direct request is rejected before send), initialize metadata/instructions (non-empty instructions appear on every turn in server order but never enter ordinary model history), outgoing/incoming ping, canonical text/image/audio/resource-link/embedded-resource/unknown/structured/error projection and lossless details envelopes (exact result, exact current Tool, exact list pages, including explicit false and metadata), all resource list/template/read/subscribe/unsubscribe surfaces, prompts, both completion refs, conditional logging, every notification (including one sent immediately after initialized), synthetic schemas expose every semantic request field but no adapter-owned cursor/`_meta`, and all-page enumeration works; a pre-initialize/unadvertised notification emits only the fixed unexpected diagnostic and no request; output-schema success/missing/invalid cases are enforced for tools on the first and final list pages; a second list/read observes changed server state without a notification; repeated cursor fails; a large multi-page fixture proves no adapter item/page/response cap |
 | M4 | §3.2 | MCP call progress reaches pi `onUpdate`, then ACP `tool_call_update` with full params in `rawOutput`; cancellation reaches the MCP peer and no late update/error is emitted after ACP settlement. Interleaved logging/list/update/unexpected/progress-failure/refresh-failure diagnostics and normal turn updates traverse the one ACP FIFO in enqueue order; prompt settlement waits for its accepted diagnostics. Injecting ACP send failure aborts/rejects the active prompt as `notification_error -32603`; later diagnostics are suppressed/stderr-routed exactly by the gate and never leak into a later turn. Outside-turn/post-dispose routes are stderr/suppression as specified. |
-| M5 | §3.3 | synthetic aliases reserve first; initial tools register with top-level-title → annotation-title → name label precedence; list-changed ADD/CHANGE/UNCHANGED/REMOVE/RE-ADD swaps exact Tool/page/validator state and has next-turn activation, inactive tombstone, stale-call fixed failure, stable alias, serialized/coalesced refresh, and fresh extension per load/resume/fork. Fault injection before every registration, at every `registerTool`, after each registration, during final activation, and during source verification proves: pre-commit failure consumes no alias and retains the prior snapshot; any post-mutation failure emits the exact commit-failed diagnostic, exposes no candidate snapshot, poisons/tombstones, drains, and rejects admitted/subsequent operations as `session_terminated -32602`. Retry after a pre-commit alias reservation reuses the same alias. A second prompt/config/fork sees busy while the first prompt is synchronously reserved; a prompt racing a multi-tool commit starts only after the entire snapshot is active. Close racing fetch, queued refresh, reserved prompt, and commit closes refresh admission, aborts fetch, drains the queue/mutex, and either cleanly closes or follows the poison path; the reserved-never-started case emits current-session usage, drains, returns cancelled with all-zero per-turn usage, and invokes no Pi prompt. No registration occurs after Pi disposal. Optional/forbidden task metadata uses ordinary call. |
+| M5 | §3.2/§3.3 | synthetic aliases reserve before remote aliases in the exact server/operation order, with unadvertised operations consuming no reservation; initial tools register with top-level-title → annotation-title → name label precedence; list-changed ADD/CHANGE/UNCHANGED/REMOVE/RE-ADD swaps exact Tool/page/validator state and has next-turn activation, inactive tombstone, stale-call fixed failure, stable alias, serialized/coalesced refresh, and fresh extension per load/resume/fork. Fault injection before every registration, at every `registerTool`, after each registration, during final activation, and during source verification proves: pre-commit failure consumes no alias and retains the prior snapshot; any post-mutation failure emits the exact commit-failed diagnostic, exposes no candidate snapshot, poisons/tombstones, drains, and rejects admitted/subsequent operations as `session_terminated -32602`. Retry after a pre-commit alias reservation reuses the same alias. A second prompt/config/fork sees busy while the first prompt is synchronously reserved; a prompt racing a multi-tool commit starts only after the entire snapshot is active. Close racing fetch, queued refresh, reserved prompt, and commit closes refresh admission, aborts fetch, drains the queue/mutex, and either cleanly closes or follows the poison path; the reserved-never-started case emits current-session usage, drains, returns cancelled with all-zero per-turn usage, and invokes no Pi prompt. No registration occurs after Pi disposal. Optional/forbidden task metadata uses ordinary call. |
 | M6 | §3.3/§8.1 | the named adapter extension is first while every other extension retains order and loader runtime/errors retain identity; its tracked `bash` overrides the built-in and its reserved aliases override colliding user-extension names; source-qualified post-construction verification catches a wrong winner as `mcp_init_error` |
-| M7 | §3.4 | sampling uses only active model; maps user text/image, assistant text with exact zero-usage metadata, tokens/temperature/metadata/signal/result/model id and the earliest-stop-sequence/tie/stop-reason rules; rejects assistant-image/audio/tool blocks and unsupported context/tools with `-32602`, rejects experimental sampling/elicitation tasks with their exact `-32602`, and rejects no model/provider/tool output with the exact `-32603` messages. For sampling and both elicitation modes, independently race ordinary completion against peer cancellation/transport close, turn abort, session disposal, and timeout on both sides of the settlement boundary; assert the pinned winner, exact response-or-no-response behavior, terminal progress `1` rule, and suppression of abort-ignoring late resolve/reject. Sampling/roots/elicitation with a progress token invoke exact related `0/1` lifecycle progress before work/return, without a token invoke none, on error/cancel/timeout omit `1`; rejected and indefinitely pending progress promises neither replace/block the feature outcome nor become unhandled, and rejection emits the fixed diagnostic through the dispatch-time route. Form acceptance validates without coercion/defaults: valid content is byte-identical; missing required, wrong scalar/integer type, enum/oneOf/anyOf, min/max numeric, min/max length, format, future-compatible pattern, and extra-key cases each return exact `-32602 Invalid MCP elicitation response`; schema compilation failure returns exact `-32603` without calling ACP; decline/cancel null content normalizes. The adapter invokes no ACP permission request and adds no token cap; roots returns cwd. URL mapping/completion covers process-unique ids, equal remote ids on two servers, duplicates, unknown completions, and ACP completion-send failure. |
+| M7 | §3.4 | sampling uses only active model; maps user text/image, assistant text with exact zero-usage metadata, tokens/temperature/metadata/signal/result/model id and the earliest-stop-sequence/tie/stop-reason rules; rejects assistant-image/audio/tool blocks and unsupported context/tools with `-32602`, rejects experimental sampling/elicitation tasks with their exact `-32602`, and rejects no model/provider/tool output with the exact `-32603` messages. For sampling and both elicitation modes, independently race ordinary completion against peer cancellation/transport close, turn abort, session disposal, and timeout on both sides of the settlement boundary on **each** real transport; assert the pinned winner, exact response-or-no-response behavior, synchronous wrapper-driven disposal abort, terminal progress `1` rule, and suppression of abort-ignoring late resolve/reject. Sampling/roots/elicitation with a progress token invoke exact related `0/1` lifecycle progress before work/return, without a token invoke none, on error/cancel/timeout omit `1`; rejected and indefinitely pending progress promises neither replace/block the feature outcome nor become unhandled, and rejection emits the fixed diagnostic through the dispatch-time route. Form acceptance validates without coercion/defaults: valid content is byte-identical; missing required, wrong scalar/integer type, enum/oneOf/anyOf, min/max numeric, min/max length, format, future-compatible pattern, and extra-key cases each return exact `-32602 Invalid MCP elicitation response`; schema compilation failure returns exact `-32603` without calling ACP; decline/cancel null content normalizes. The adapter invokes no ACP permission request and adds no token cap; roots returns cwd. URL mapping/completion covers process-unique ids, equal remote ids on two servers, duplicates, unknown completions, and ACP completion-send failure. |
 | M8 | §3.5 | equal raw names fail; colliding slugs receive stable ordered suffixes used on every outward label; roots/elicitation work during open while sampling gets fixed pre-bind `-32603`; capability-conditioned logging setup failure and other partial-open failures roll back clients in reverse order; close is exactly once/failure-collecting, and an injected MCP close failure/timeout emits the exact diagnostic without failing ordinary close; post-dispose notification is ignored; no state crosses sessions |
 | M9 | §3.2/§3.5 | subscribe, then `session/load`, resume, and fork each create a fresh unsubscribed MCP connection and append exactly one `@automatalabs/pi-acp/mcp-subscriptions-reset` custom history entry with the exact text before publication/replay; no automatic resubscribe occurs even for equal server name/URI, removed servers, or copied fork JSONL. New sessions get no marker. Marker-append failure rejects `mcp_init_error`, publishes no candidate, and closes fresh clients; injected pre-persist/post-persist throws and post-marker replay/final-gate failure prove the journal may retain zero/one complete marker without a live session, and the next successful lifecycle appends its own. Fork's created JSONL is likewise retained. Re-subscription failure is only the later explicit tool result. |
 
@@ -1441,8 +1466,8 @@ row cites the normative statement it covers. Rows extend the pi-acp spec §13 ma
 
 | # | covers | assertion |
 |---|---|---|
-| V1 | §15 | the Changesets entry declares minor `pi-acp`, minor `acp-agents`, patch `workflows`, and patch `mcp-server`; no workflow-engine/shared-types bump is introduced; packed/published manifests resolve the coordinated new internal versions after `pnpm version` + `pnpm pack` |
-| V2 | §15 | installed-package smoke runs `npx @automatalabs/workflows@0.38.2 config pi`, the HTTP MCP + injected-structured fixture, tarball/private-channel absence checks, and generated-authoring-prompt assertion exactly as pinned |
+| REL1 | §15 | the Changesets entry declares minor `pi-acp`, minor `acp-agents`, patch `workflows`, and patch `mcp-server`; no workflow-engine/shared-types bump is introduced; packed/published manifests resolve the coordinated new internal versions after `pnpm version` + `pnpm pack` |
+| REL2 | §15 | installed-package smoke runs `npx @automatalabs/workflows@0.38.2 config pi`, the HTTP MCP + injected-structured fixture, tarball/private-channel absence checks, and generated-authoring-prompt assertion exactly as pinned |
 
 ---
 
@@ -1512,17 +1537,17 @@ record and implementation-time stop gate.
 `78944e3462458de30c4989ff04894fecbf43632d` (branch `spec/pi-mcp-train`, based on `origin/main`; matches
 `.agentprism/design-224/base-sha.txt`).
 
-**Base-freshness note (verified in a fresh round check at `2026-07-17T04:06:04Z`):** `origin/main`
+**Base-freshness note (verified in a fresh round check at `2026-07-17T04:42:53Z`):** `origin/main`
 equals that SHA. The worktree's earlier draft commit is not a citation base; every local reference below
 was re-read from the pinned base with `git show 78944e3:<path>` or verified unchanged in the working tree.
 Package versions at the base are
 `@automatalabs/pi-acp@0.1.3`, `@automatalabs/acp-agents@0.30.1`, and
 `@automatalabs/workflows@0.38.1`.
 
-**External-freshness note:** at `2026-07-17T04:06:04Z` this authoring round created three new temporary
+**External-freshness note:** at `2026-07-17T04:42:53Z` this authoring round created three new temporary
 clones, fetched their tags and `origin/main`, resolved GitHub latest plus npm latest independently, then
 checked out the exact release tags below for every citation. No prior checkout was reused. At
-`2026-07-17T04:25:04Z`, immediately before freeze, all three clones were fetched again and all six
+`2026-07-17T04:54:56Z`, immediately before freeze, all three clones were fetched again and all six
 GitHub/npm latest values plus all release→main deltas below remained unchanged.
 
 **pi source, all `packages/{ai,agent,coding-agent}/…` citations verified against:** repo
@@ -1743,10 +1768,12 @@ exact-pinned; re-verify all three upstreams under §1 before implementation.
 - `src/client/streamableHttp.ts` — options/constructor :120-155 and request application :466-475;
   `src/client/sse.ts` — legacy transport/options :45-89, headers/GET :116-147, POST :243-259;
   `src/client/stdio.ts` — transport :87-259, including child close :204-243.
-- `src/shared/transport.ts` — header normalization/request-init merge :5-45;
+- `src/shared/transport.ts` — header normalization/request-init merge :5-45 and the `Transport`
+  lifecycle contract (`onclose` must be invoked when `close()` is called) :74-127;
   `src/shared/protocol.ts` — incoming handler signal/metadata/related notification seam :237-280,734-746;
   peer cancellation aborts that signal :550-557, aborted handlers suppress both success/error response
   and clean up their controller :728-853, protocol close aborts active request handlers :644-660;
+  protocol `close()` delegates to the installed transport :942-944;
   notification invocation synchronously reaches awaited transport send :1303-1410;
   opt-in strict-capability option :60-71, 60-second default +
   `RequestOptions` :106-135, automatic ping response :366-379, strict request guard :1112-1119,
@@ -2001,6 +2028,14 @@ unverifiable correctness claim.
     leaving it closed would make the still-live session unable to run bash again. The session slot
     compare-and-swaps a fully drained closed epoch for a distinct open epoch before cancellation
     settlement; disposal/failure never performs that swap (§8.1–§8.2).
+
+42. **Rely on each raw SDK transport to signal `onclose` early enough for incoming-handler disposal.**
+    Rejected: the protocol layer aborts incoming request-handler signals only from `onclose`, while the
+    pinned stdio `close()` may return after `SIGKILL` before the process `close` event runs
+    (`src/shared/protocol.ts:644-660`; `src/client/stdio.ts:204-243`). Transport-specific event timing
+    cannot prove the common no-response/no-handler-outlives-session contract. The adapter's once-signalled
+    wrapper fires logical close synchronously, then lets every physical transport finish under the
+    existing bound (§3.1).
 
 ---
 
