@@ -27,6 +27,19 @@ function replaceOnce(text, marker, replacement, file) {
   return parts[0] + replacement + parts[1];
 }
 
+// The guide's sub-documents, inlined into the self-contained prompt in index reading order.
+const GUIDE_PARTS = [
+  "mcp-server-setup.md",
+  "source-contract.md",
+  "models-and-output.md",
+  "composition-and-failure.md",
+  "gates-and-lenses.md",
+  "environment-and-tools.md",
+  "determinism-and-resume.md",
+  "long-running-trains.md",
+  "examples-and-validation.md",
+];
+
 export function buildAuthoringPromptContent() {
   let skill = readFileSync(join(skillDir, "SKILL.md"), "utf8");
   let reference = readFileSync(join(skillDir, "reference.md"), "utf8");
@@ -42,7 +55,25 @@ export function buildAuthoringPromptContent() {
   }
   skill = skill.slice(bodyStart + "\n---\n".length).trimStart();
 
-  // SKILL.md same-directory pointers → in-document sections / absolute URLs.
+  // Inline every guide sub-document at the index span, in reading order — the prompt
+  // recipient has no filesystem, so the on-disk link index becomes the content itself.
+  const INDEX_BEGIN = "<!-- guide-index:begin -->";
+  const INDEX_END = "<!-- guide-index:end -->";
+  const begin = skill.indexOf(INDEX_BEGIN);
+  const end = skill.indexOf(INDEX_END);
+  if (begin === -1 || end === -1 || end < begin) {
+    throw new Error("generate-authoring-prompt: guide-index markers not found in SKILL.md");
+  }
+  const inlined = GUIDE_PARTS.map((f) => readFileSync(join(skillDir, f), "utf8").trimEnd()).join("\n\n");
+  skill = skill.slice(0, begin) + inlined + skill.slice(end + INDEX_END.length);
+
+  // Same-directory pointers → in-document sections / absolute URLs (applied to the STITCHED text).
+  skill = replaceOnce(
+    skill,
+    "covered in **MCP Server Setup** ([mcp-server-setup.md](mcp-server-setup.md)).",
+    "covered in the **MCP Server Setup** section below.",
+    "SKILL.md",
+  );
   skill = replaceOnce(
     skill,
     "`reference.md` (same directory) holds the exhaustive option tables, routing grammar, and error codes.",
