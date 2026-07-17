@@ -429,7 +429,6 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
     form: { action: string; content: { answer: string } };
     url: { action: string };
     urlReuse: { action: string };
-    incomingProgress: Record<"sampling" | "roots" | "form" | "url", Array<{ progress: number; total: number }>>;
   };
   assert.ok(clientFeatures.sampling);
   assert.ok(clientFeatures.sampling.content);
@@ -439,7 +438,11 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
   assert.deepEqual(clientFeatures.url, { action: "accept" });
   assert.deepEqual(clientFeatures.urlReuse, { action: "decline" });
   assert.equal(urlRequests, 1, "a consumed URL id must decline without a second ACP request");
-  for (const [feature, values] of Object.entries(clientFeatures.incomingProgress)) {
+  const progressSnapshot = await execute("progress_snapshot");
+  const progressBlock = progressSnapshot.content[0];
+  assert.equal(progressBlock?.type, "text");
+  const incomingProgress = JSON.parse(progressBlock.text) as Record<"sampling" | "roots" | "form" | "url", Array<{ progress: number; total: number }>>;
+  for (const [feature, values] of Object.entries(incomingProgress)) {
     if (feature === "roots") continue;
     const expected = [
       { progress: 0, total: 1 },

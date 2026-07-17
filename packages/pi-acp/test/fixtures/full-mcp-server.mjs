@@ -20,6 +20,9 @@ export function createConformanceServer(options = {}) {
   let revision = 0;
   let raceId = 0;
   let transportClose;
+  let incomingProgress = { sampling: [], roots: [], form: [], url: [] };
+  let progressReady = Promise.resolve();
+  let markProgressReady = () => {};
   const server = new Server(
     { name: "pi-acp-full-mcp-fixture", version: "1.0.0" },
     {
@@ -48,6 +51,7 @@ export function createConformanceServer(options = {}) {
     return {
       tools: [
         { name: "exercise", description: "exercise client features", inputSchema: { type: "object", additionalProperties: false } },
+        { name: "progress_snapshot", description: "observe completed client progress", inputSchema: { type: "object", additionalProperties: false } },
         { name: "projection", description: "project every stable result block", inputSchema: { type: "object", additionalProperties: false } },
         { name: "remote_error", description: "return an MCP error result", inputSchema: { type: "object", additionalProperties: false } },
         { name: "hang", description: "wait for cancellation", inputSchema: { type: "object", additionalProperties: false } },
@@ -76,6 +80,10 @@ export function createConformanceServer(options = {}) {
       revision = 1;
       await server.sendToolListChanged();
       return { content: [{ type: "text", text: "changed" }] };
+    }
+    if (params.name === "progress_snapshot") {
+      await progressReady;
+      return { content: [{ type: "text", text: JSON.stringify(incomingProgress) }] };
     }
     if (params.name === "hang") {
       await new Promise((resolve, reject) => {
@@ -201,15 +209,11 @@ export function createConformanceServer(options = {}) {
         params: { progressToken, progress: 1, total: 2, message: "half" },
       });
     }
-    const incomingProgress = { sampling: [], roots: [], form: [], url: [] };
-    const progressBarriers = Object.fromEntries(Object.keys(incomingProgress).map((feature) => {
-      let resolve;
-      const promise = new Promise((done) => { resolve = done; });
-      return [feature, { promise, resolve }];
-    }));
+    incomingProgress = { sampling: [], roots: [], form: [], url: [] };
+    progressReady = new Promise((resolve) => { markProgressReady = resolve; });
     const recordProgress = (feature) => (value) => {
       incomingProgress[feature].push(value);
-      if (incomingProgress[feature].length === 2) progressBarriers[feature].resolve();
+      if (["sampling", "form", "url"].every((name) => incomingProgress[name].length === 2)) markProgressReady();
     };
     const sampling = await server.createMessage({
       messages: [{ role: "user", content: { type: "text", text: "sample me" } }],
@@ -232,9 +236,9 @@ export function createConformanceServer(options = {}) {
       elicitationId: "fixture-url",
       url: "https://example.invalid/complete",
     }, { onprogress: recordProgress("url") });
-    // Each client handler invokes its terminal progress send before returning its response. Await
-    // the corresponding protocol callbacks instead of guessing how long a transport needs to drain.
-    await Promise.all(["sampling", "form", "url"].map((feature) => progressBarriers[feature].promise));
+    // Progress is optional telemetry and therefore is not a barrier for the exercised result. The
+    // separate progress_snapshot operation is the test-only observation barrier: this also lets
+    // stdio drain notifications queued behind the active tools/call handler.
     if (url.action === "accept") {
       const complete = server.createElicitationCompletionNotifier("fixture-url");
       await complete();
@@ -251,7 +255,7 @@ export function createConformanceServer(options = {}) {
     await server.sendResourceListChanged();
     await server.sendResourceUpdated({ uri: "file:///one" });
     await server.sendPromptListChanged();
-    const structuredContent = { sampling, roots, form, url, urlReuse, incomingProgress };
+    const structuredContent = { sampling, roots, form, url, urlReuse };
     return { content: [{ type: "text", text: "exercised" }], structuredContent };
   });
 
