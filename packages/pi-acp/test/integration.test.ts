@@ -518,6 +518,59 @@ test("M5 cancel keeps the turn boundary through usage drain and prompt settlemen
   await agent.dispose();
 });
 
+test("M5 cancel resumes refreshes when cleanup settles after prompt settlement", async () => {
+  const setup = fakeDeps("wedged");
+  let changed: (() => void) | undefined;
+  let catalog: Array<{ name: string; inputSchema: { type: string } }> = [
+    { name: "held", inputSchema: { type: "object" } },
+  ];
+  let lists = 0;
+  setup.deps.connectMcpClient = async () => fakeMcpHandle({
+    async listTools() {
+      lists += 1;
+      return { tools: catalog };
+    },
+    setToolsChangedHandler(handler) { changed = handler; },
+  });
+  const usageSeen = deferred<void>();
+  const releaseUsage = deferred<void>();
+  const releaseAbort = deferred<void>();
+  const agent = new PiAcpAgent(setup.deps);
+  const opened = await agent.newSession(context({
+    cwd: setup.cwd,
+    mcpServers: [{ name: "cancel-resume", command: "fixture", args: [], env: [] }],
+  }, {
+    notify: async (_method, params: { update: SessionUpdate }) => {
+      if (params.update.sessionUpdate === "usage_update") {
+        usageSeen.resolve();
+        await releaseUsage.promise;
+      }
+    },
+  }));
+  const control = setup.controls[0]!;
+  control.session.abort = () => releaseAbort.promise;
+  const request = new AbortController();
+  const prompt = agent.prompt(context({
+    sessionId: opened.sessionId,
+    prompt: [{ type: "text", text: "cancel after Pi resolves" }],
+  }, undefined, request.signal));
+  await eventually(() => assert.ok(control.resolvePrompt));
+  control.resolvePrompt!();
+  await usageSeen.promise;
+  request.abort(new Error("cancel during usage drain"));
+  releaseUsage.resolve();
+  assert.equal((await prompt).stopReason, "cancelled");
+
+  releaseAbort.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  const listsBeforeRefresh = lists;
+  catalog = [];
+  changed?.();
+  await eventually(() => assert.equal(lists, listsBeforeRefresh + 1));
+  assert.equal(control.session.getActiveToolNames().includes("mcp__cancel-resume__held"), false);
+  await agent.dispose();
+});
+
 test("T15 lifecycle reservations serialize duplicate load and close is idempotent", async () => {
   const setup = fakeDeps();
   const id = "load-id";

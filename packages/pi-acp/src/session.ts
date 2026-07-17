@@ -355,7 +355,12 @@ export class PiSession {
         timerController.abort();
         if (generation.mode === "cancel-only" && this.cleanupGeneration === generation) {
           this.childRegistry.commitRotation(captured.epoch);
-          generation.resumeRefreshesOnSettlement = true;
+          if (turn?.completed) {
+            this.cleanupGeneration = undefined;
+            this.mcpBridge.resumeRefreshes();
+          } else {
+            generation.resumeRefreshesOnSettlement = true;
+          }
         }
         resolve();
       });
