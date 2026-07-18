@@ -1,5 +1,14 @@
 # @automatalabs/workflows
 
+## 0.38.3
+
+### Patch Changes
+
+- 3f8eb0e: Ship Pi's complete MCP client, standard StructuredOutput injection, configured model catalog,
+  provider-error pin guard, tracked child cleanup, and end-to-end caller quarantine/timeout propagation.
+- Updated dependencies [3f8eb0e]
+  - @automatalabs/acp-agents@0.31.0
+
 ## 0.38.2
 
 ### Patch Changes
