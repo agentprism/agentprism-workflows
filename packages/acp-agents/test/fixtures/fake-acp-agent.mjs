@@ -90,11 +90,19 @@ function recordExit(reason) {
 process.on("exit", () => recordExit("exit"));
 // A normal SIGTERM terminates without running 'exit' handlers, so record + exit explicitly.
 process.on("SIGTERM", () => {
+  if (scenario.ignoreShutdown === true) {
+    record({ method: "__sigterm", pid: process.pid });
+    return;
+  }
   recordExit("sigterm");
   process.exit(0);
 });
 const stdinKeepAlive = setInterval(() => {}, 1 << 30);
 process.stdin.on("end", () => {
+  if (scenario.ignoreShutdown === true) {
+    record({ method: "__stdin_end", pid: process.pid });
+    return;
+  }
   clearInterval(stdinKeepAlive);
   recordExit("stdin-end");
   process.exit(0);
@@ -446,6 +454,10 @@ class FakeAgent {
   async closeSession(params) {
     record({ method: "closeSession", params });
     const turn = this.turnBySession.get(params.sessionId);
+    const close = turn?.close ?? scenario.close ?? {};
+    if (typeof close.delayMs === "number" && close.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, close.delayMs));
+    }
     const postTurnClientCalls = Array.isArray(turn?.postTurnClientCalls) ? turn.postTurnClientCalls : [];
     for (const call of postTurnClientCalls) {
       await this.callClient(call, params.sessionId);
@@ -453,6 +465,9 @@ class FakeAgent {
     const postCloseUpdates = Array.isArray(turn?.postCloseUpdates) ? turn.postCloseUpdates : [];
     for (const update of postCloseUpdates) {
       await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
+    }
+    if (close.throw) {
+      throw new RequestError(close.throwCode ?? -32603, close.throw, clone(close.throwData));
     }
     this.turnBySession.delete(params.sessionId);
     this.modesBySession.delete(params.sessionId);

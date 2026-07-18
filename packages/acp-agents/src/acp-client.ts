@@ -151,8 +151,14 @@ const CLIENT_INFO = {
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
 /** Bound the best-effort session/close round-trip so a slow agent can't hang run()'s finally. */
 const CLOSE_SESSION_TIMEOUT_MS = 5_000;
+export const PI_CHILD_CLEANUP_DEADLINE_MS = 5_000;
+export const PI_CLOSE_DELIVERY_MARGIN_MS = 1_000;
+export const PI_CLOSE_SESSION_TIMEOUT_MS = PI_CHILD_CLEANUP_DEADLINE_MS + PI_CLOSE_DELIVERY_MARGIN_MS;
 /** Bound the graceful SIGTERM shutdown before escalating to SIGKILL. */
 const DISPOSE_SIGKILL_GRACE_MS = 2_000;
+export const PI_PROCESS_SHUTDOWN_ENVELOPE_MS = 66_000;
+export const PI_PROCESS_EXIT_MARGIN_MS = 1_000;
+export const PI_DISPOSE_SIGKILL_GRACE_MS = PI_PROCESS_SHUTDOWN_ENVELOPE_MS + PI_PROCESS_EXIT_MARGIN_MS;
 const TOMBSTONE_SESSION_CAP = 64;
 const GUARDED_STATEFUL_REQUESTS = new Map<string, string>([
   [AGENT_METHODS.session_new, "use openSession()"],
@@ -993,6 +999,11 @@ export interface PooledConnectionDeps {
   providerStore?: ProviderStore;
   /** Client-side ACP fs/terminal handlers advertised once and routed by sessionId. */
   clientHandlers?: ClientHandlers;
+  /** Deterministic disposal-clock seam. Production uses the platform timers. */
+  disposeTimer?: {
+    set(callback: () => void, ms: number): { unref?(): void };
+    clear(timer: { unref?(): void }): void;
+  };
 }
 
 interface RawAgentRequestContext {
@@ -1027,6 +1038,7 @@ export class PooledConnection {
   private readonly authCapabilities: { terminal?: boolean; gateway?: boolean } | undefined;
   private readonly authStore: AuthStore | undefined;
   private readonly providerStore: ProviderStore | undefined;
+  private readonly disposeTimer: NonNullable<PooledConnectionDeps["disposeTimer"]>;
   /** Which intent-generation THIS process reflects (§2.4). Starts at -1/false so a connection with
    *  no applied intent is stale against a machine that has ever advanced past generation 0. */
   authStamp: ConnectionAuthStamp = { appliedGeneration: -1, applied: false, trippedAuthRequired: false };
@@ -1039,6 +1051,7 @@ export class PooledConnection {
   recyclePending = false;
   /** Set true at the start of dispose() so the graceful-shutdown death is NOT reported as a crash. */
   private disposing = false;
+  private disposePromise: Promise<void> | undefined;
   /** Resolves once `initialize` completed (or rejects if the process died first). */
   private readonly ready: Promise<void>;
   /** Resolves when the process dies; `race()` turns it into a thrown, descriptive error. */
@@ -1062,6 +1075,10 @@ export class PooledConnection {
     this.authCapabilities = deps.authCapabilities;
     this.authStore = deps.authStore;
     this.providerStore = deps.providerStore;
+    this.disposeTimer = deps.disposeTimer ?? {
+      set: (callback, ms) => setTimeout(callback, ms),
+      clear: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    };
     this.client = new MultiplexClient(
       this.backendId,
       this.onEvent,
@@ -1891,29 +1908,31 @@ export class PooledConnection {
    * killed — it returns to the pool for the next agent() call.
    */
   async releaseSession(sessionId: string, keepOpen = false): Promise<void> {
+    let childCleanupError: unknown;
+    // Enter teardown-only routing before asking the agent to close so notifications produced by
+    // session/close retain their correlation. Active accounting stays held until the close attempt
+    // finishes, which prevents recycle-triggered disposal from preempting the wire request.
     this.client.unregister(sessionId);
-    if (this._activeSessions > 0) this._activeSessions -= 1;
-    // Generation-gated recycle (§2.6): a stale connection marked for recycle while busy is
-    // disposed-and-dropped the moment it drains, instead of returning to the pool, so the next
-    // acquire lands on a fresh process that primes the current intent at initialize. dispose()
-    // drops it via the onDead path.
-    if (this.recyclePending && this._activeSessions === 0 && this._alive) {
-      void this.dispose();
-      return;
-    }
     // keepOpen: the caller intends to re-open this session later (session/load|resume), so the
     // agent-persisted session must be left untouched — skip the best-effort close entirely.
-    if (keepOpen || !this.negotiated?.supportsClose || !this._alive) return;
-    try {
-      await this.race(
-        withTimeout(
+    if (!keepOpen && this.negotiated?.supportsClose && this._alive) {
+      try {
+        await this.race(withTimeout(
           this.connection.agent.request(AGENT_METHODS.session_close, { sessionId }),
-          CLOSE_SESSION_TIMEOUT_MS,
-        ),
-      );
-    } catch {
-      // best-effort: the session is already untracked; the process stays pooled.
+          this.backendId === "pi" ? PI_CLOSE_SESSION_TIMEOUT_MS : CLOSE_SESSION_TIMEOUT_MS,
+        ));
+      } catch (error) {
+        if (isChildCleanupError(error)) {
+          this.recyclePending = true;
+          childCleanupError = error;
+        }
+      }
     }
+    if (this._activeSessions > 0) this._activeSessions -= 1;
+    if (this.recyclePending && this._activeSessions === 0 && this._alive) {
+      void this.dispose();
+    }
+    if (childCleanupError) throw childCleanupError;
   }
 
   /** Synchronous best-effort kill for a process-exit hook (no time to await a graceful close). */
@@ -1927,7 +1946,12 @@ export class PooledConnection {
   }
 
   /** Close the process (pool teardown): end stdin, SIGTERM, escalate to SIGKILL, await exit. */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    this.disposePromise ??= this.disposeOwned();
+    return this.disposePromise;
+  }
+
+  private async disposeOwned(): Promise<void> {
     if (!this._alive) return;
     // Mark graceful shutdown so the imminent process-exit `die()` does not emit `backend_error`.
     this.disposing = true;
@@ -1944,20 +1968,27 @@ export class PooledConnection {
     } catch {
       // ignore
     }
-    const sigkill = setTimeout(() => {
+    const sigkill = this.disposeTimer.set(() => {
       try {
         this.child.kill("SIGKILL");
       } catch {
         // ignore
       }
-    }, DISPOSE_SIGKILL_GRACE_MS);
+    }, this.backendId === "pi" ? PI_DISPOSE_SIGKILL_GRACE_MS : DISPOSE_SIGKILL_GRACE_MS);
     sigkill.unref?.();
     try {
       await exited;
     } finally {
-      clearTimeout(sigkill);
+      this.disposeTimer.clear(sigkill);
     }
   }
+}
+
+export function isChildCleanupError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; data?: unknown };
+  if (candidate.code !== -32603 || !candidate.data || typeof candidate.data !== "object") return false;
+  return (candidate.data as { errorKind?: unknown }).errorKind === "child_cleanup_error";
 }
 
 type ModelSelectOption = Extract<SessionConfigOption, { type: "select" }>;

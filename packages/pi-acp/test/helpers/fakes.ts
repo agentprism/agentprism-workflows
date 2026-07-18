@@ -41,8 +41,7 @@ export type FakeBehavior =
   | "preflight"
   | "auth-preflight"
   | "tool"
-  | "provider-error"
-  | "structured";
+  | "provider-error";
 
 export function fakeSession(
   options: CreateAgentSessionOptions,
@@ -52,7 +51,14 @@ export function fakeSession(
   const messages: unknown[] = [];
   const promptCalls: Array<{ text: string; options: unknown }> = [];
   const activeToolsAtPrompt: string[][] = [];
-  const tools = [...(options.customTools ?? [])];
+  const registeredTools = options.resourceLoader
+    ?.getExtensions()
+    .extensions.flatMap((extension) => [...extension.tools.values()]) ?? [];
+  const tools = [
+    ...(options.customTools ?? []),
+    ...registeredTools.map(({ definition }) => definition),
+  ];
+  const toolSources = new Map(registeredTools.map(({ definition, sourceInfo }) => [definition.name, sourceInfo]));
   let active = tools.map(({ name }) => name);
   let thinkingLevel = options.thinkingLevel ?? "medium";
   let model = options.model;
@@ -74,6 +80,11 @@ export function fakeSession(
     subscribe(listener: (event: AgentSessionEvent) => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    async bindExtensions() {},
+    async abort() {
+      agent.abort();
+      if (behavior === "wedged") rejectPrompt?.(new Error("aborted"));
     },
     async prompt(text: string, promptOptions: unknown) {
       promptCalls.push({ text, options: promptOptions });
@@ -143,16 +154,6 @@ export function fakeSession(
         } as AgentSessionEvent;
         for (const listener of listeners) listener(end);
       }
-      if (behavior === "structured") {
-        const tool = tools.find(({ name }) => name === "__acp_structured_output");
-        if (tool && active.includes(tool.name)) {
-          await tool.execute(
-            "structured-call",
-            { answer: promptCalls.length },
-            new AbortController().signal,
-          );
-        }
-      }
       const assistant = {
         role: "assistant",
         content: [{ type: "text", text: "hello" }],
@@ -183,7 +184,14 @@ export function fakeSession(
     },
     getContextUsage() { return { tokens: 6, contextWindow: 100, percent: 6 }; },
     getSessionStats() { return { cost: 0.001 }; },
-    getAllTools() { return tools.map(({ name }) => ({ name, description: name, parameters: {}, sourceInfo: { source: "sdk" } })); },
+    getAllTools() {
+      return tools.map(({ name }) => ({
+        name,
+        description: name,
+        parameters: {},
+        sourceInfo: toolSources.get(name) ?? { source: "sdk" },
+      }));
+    },
     getToolDefinition(name: string) { return tools.find((tool) => tool.name === name); },
     getActiveToolNames() { return [...active]; },
     setActiveToolsByName(names: string[]) { active = [...names]; },
@@ -219,9 +227,10 @@ export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
   const sessionDir = mkdtempSync(`${tmpdir()}/pi-acp-sessions-`);
   const controls: FakeSessionControl[] = [];
   const createOptions: CreateAgentSessionOptions[] = [];
-  const model = { provider: "test", id: "model", contextWindow: 100 };
+  const model = { provider: "test", id: "model", name: "Test model", contextWindow: 100 };
   const modelRuntime = {
     getModel(provider: string, id: string) { return provider === "test" && id === "model" ? model : undefined; },
+    async getAvailable() { return [model]; },
     hasConfiguredAuth() { return true; },
   } as unknown as ModelRuntime;
   const deps: PiAcpDeps = {
@@ -279,6 +288,7 @@ export function fakeMcpHandle(overrides: Partial<McpClientHandle> = {}): McpClie
     async listTools() { return { tools: [] }; },
     async callTool() { return { content: [] }; },
     async close() {},
+    getCapabilities() { return { tools: {} }; },
     ...overrides,
   };
 }

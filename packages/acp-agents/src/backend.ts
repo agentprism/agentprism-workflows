@@ -107,7 +107,7 @@ export interface Backend {
   /** `_meta` for session/prompt (undefined when this backend carries the schema at session/new). */
   promptMeta(schema: TSchema | undefined): Record<string, unknown> | undefined;
   /** Read this backend's native structured result for the latest turn (unvalidated), or undefined. */
-  nativeStructured(source: StructuredSource): unknown;
+  nativeStructured?(source: StructuredSource): unknown;
 }
 
 /** Split a whitespace-separated env override (e.g. AGENTPRISM_CLAUDE_ACP_ARGS) into argv. */

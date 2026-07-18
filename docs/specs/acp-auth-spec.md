@@ -75,7 +75,7 @@ resume/pool safety, engine pause-for-auth, and strict secret hygiene.
    - 4.2 `@automatalabs/workflows` SDK exports
    - 4.3 MCP server auth tools
    - 4.4 Native-TTY CLI hosts (non-normative)
-   - 4.5 Forward notes — web app + local runner
+   - 4.5 Web app + local runner bindings
    - 4.6 Implemented test matrix (historical plan)
    - 4.7 Completed PR sequencing (historical)
 
@@ -166,7 +166,7 @@ onAuth?: AuthResolver;   // §1.3
 
 Default derivation (in the runner constructor, `:241-252`, alongside `advertiseElicitation`):
 
-- `onAuth` set, `authCapabilities` unset → `{ terminal: false, gateway: true }`. Gateway is cheap and non-destructive; terminal needs a real TTY that a generic programmatic host lacks. **Sequencing note (§4.7):** the `onAuth` field does not exist until PR3, so this `onAuth`-conditioned branch of the default derivation lands **with PR3**; PR2 implements only the explicit-`authCapabilities` path and the omit-when-unset behavior below. The two PRs compose without behavior change because in PR2 `authCapabilities` unset ⇒ omit `auth`, which is exactly what the `onAuth`-unset case also does.
+- `onAuth` set, `authCapabilities` unset → `{ terminal: false, gateway: true }`. Gateway is cheap and non-destructive; terminal needs a real TTY that a generic programmatic host lacks. **Sequencing record (§4.7):** PR3 introduced `onAuth` and its conditioned default after PR2 established the explicit-`authCapabilities` and omit-when-unset paths. The delivered composition preserves the PR2 default when `onAuth` is unset.
 - `onAuth` unset (and `authCapabilities` unset) → advertise nothing. The `auth` key is omitted — spec-correct "unsupported" (any capability omitted in `initialize` MUST be treated as unsupported, `agentclientprotocol.com/protocol/v1/initialization`). This is today's exact behavior, so PR2 (§4.7) is a zero-behavior-change opt-in.
 - Native-TTY hosts (the local runner, or any CLI host — §4) pass `{ terminal: true, gateway: true }` explicitly.
 
@@ -1051,9 +1051,9 @@ For any spec-conformant agent (`@agentclientprotocol/sdk` 1.2.1 schema, agentcli
 
 Every `_meta` capability the four servers expose — auth and non-auth — is supported and cited or
 represented by an executable drift tripwire in `packages/acp-agents/src/protocol-coverage.ts`. Pi's
-six auth methods carry no auth `_meta`; its non-auth structured-output namespace is pinned by
-`PI_ACP_PROTOCOL_CONTRACT`. Direction: `A→C` = agent emits to client; `C→A` = client sends to / gates
-agent.
+six auth methods carry no auth `_meta`, and Pi exposes no non-auth private structured-output namespace;
+its structured channel is the standard injected HTTP MCP tool. Direction: `A→C` = agent emits to
+client; `C→A` = client sends to / gates agent.
 
 #### Auth `_meta`
 
@@ -1080,7 +1080,7 @@ agent.
 | Codex | `session _meta.{baseInstructions,developerInstructions}` (`:25685-25706`) | **Supported today** — `backend.ts:34-39` `SessionMetaInputs`; gated `capabilities.ts:47-48` |
 | Codex | `session _meta["additionalRoots"]` legacy (`:25678-25683`) | **Supported today** — first-class `additionalDirectories` sent; `additionalRoots` reachable via generic `sessionRequestMeta` passthrough (`acp-client.ts:1267`) |
 | Codex | `clientCapabilities._meta["terminal_output"]` (read `:22387`) + `session/update _meta.{terminal_output,terminal_output_delta,terminal_exit}` (emit `:22385-22408,23500-23508`) | **Supported today** — terminal handlers route the lifecycle; the `terminal_output` client gate is **deliberately not advertised** (code-block fallback, Principle 3 — stated with rationale, not silent) |
-| Codex | tool-approval `_meta.persist` (`:23952-23975`) | **Work item, not deferred** — add `persist?` to the permission outcome (signature below) (PR7) |
+| Codex | tool-approval `_meta.persist` (`:23952-23975`) | **Supported today** — `persist?` is part of the permission outcome (signature below) |
 | Codex | `clientCapabilities.session.configOptions.boolean` (read `:27235`) | **Supported today** — `client-handlers.ts:124` |
 | Claude | `session/new _meta.claudeCode.options.{outputFormat,tools,env,mcpServers,hooks,…}`, `systemPrompt`, `disableBuiltInTools`, `additionalRoots` (`dist/acp-agent.js:2752-2928`) | **Supported today** — `backends/claude.ts:43-51` (outputFormat) + generic `opts.meta` passthrough `sessionRequestMeta` (`acp-client.ts:1267`) |
 | Claude | `agentCapabilities._meta.claudeCode.promptQueueing` (`:413-417`) | **Supported today** — captured in `NegotiatedCapabilities` (`capabilities.ts`); observational documented no-op (we do not queue) |
@@ -1090,7 +1090,7 @@ agent.
 | OpenCode | `PromptResponse._meta` (`service.ts:825,832`) | **Supported today** — always emitted `{}`; ignored (no payload) |
 | OpenCode | `session/update` notifications carry no opencode `_meta` (`event.ts`) | **Supported today** — nothing to consume; verified absent |
 
-**Permission `_meta.persist` — concrete signature (PR7).** The tool-approval persist echo (Codex `dist/index.js:23952-23975`) is delivered by widening the permission-resolver outcome in `packages/acp-agents/src/runner.ts` (the `onPermissionRequest` runner-options pattern at `runner.ts:204-207`) and threaded through to the request-permission response `_meta`:
+**Permission `_meta.persist` — concrete signature.** The tool-approval persist echo (Codex `dist/index.js:23952-23975`) is implemented by the widened permission-resolver outcome in `packages/acp-agents/src/runner.ts` (the `onPermissionRequest` runner-options pattern at `runner.ts:204-207`) and threaded through to the request-permission response `_meta`:
 
 ```ts
 // packages/acp-agents/src/runner.ts — permission outcome widened (echoed to _meta.persist)
@@ -1104,7 +1104,7 @@ export interface PermissionResolution {
 
 This is verified by a dedicated test (§4.6) and completes the `_meta` inventory with **no silent unsupported surface** (Principle 3).
 
-**Key files touched by this section:** `packages/acp-agents/src/auth/auth-profiles.ts` (new — `AuthProfile`, `TerminalLaunch`, `claudeAuthProfile`, `codexAuthProfile`, `opencodeAuthProfile`), `packages/acp-agents/src/backend.ts` (`Backend.authProfile`), `packages/acp-agents/src/backends/{claude,codex,opencode}.ts` (one-line wiring; `custom.ts` unchanged), `packages/acp-agents/src/runner.ts` (`PermissionResolution.persist`), `packages/acp-agents/src/protocol-coverage.ts` (matrix drift-tripwire assertions), `packages/acp-agents/test/fixtures/fake-auth-agent.mjs` (new conformance fixture). All land in **PR7** except the fixture and matcher/lifecycle dependencies it exercises (PR3–PR4), per §4.7.
+**Implemented files in this section:** `packages/acp-agents/src/auth/auth-profiles.ts` (`AuthProfile`, `TerminalLaunch`, `claudeAuthProfile`, `codexAuthProfile`, `opencodeAuthProfile`), `packages/acp-agents/src/backend.ts` (`Backend.authProfile`), `packages/acp-agents/src/backends/{claude,codex,opencode}.ts` (wiring; `custom.ts` unchanged), `packages/acp-agents/src/runner.ts` (`PermissionResolution.persist`), `packages/acp-agents/src/protocol-coverage.ts` (matrix drift-tripwire assertions), and `packages/acp-agents/test/fixtures/fake-auth-agent.mjs` (conformance fixture).
 
 ---
 
@@ -1221,9 +1221,9 @@ export type {
 export type { AuthErrorContext } from "@automatalabs/shared-types"; // via workflow-engine re-export (§1.5)
 ```
 
-**Sequencing.** `packages/mcp-server` imports its runner-facing auth types through this facade (its only `@automatalabs` dependencies are `workflows` and `shared-types`), so the **type re-exports above land with PR5** — the MCP auth tools cannot compile without them. The `isAuthRequired` **value export below lands with PR6** (its workflow-engine re-export chain is threaded in PR1; §4.7).
+`packages/mcp-server` imports its runner-facing auth types through this facade (its only `@automatalabs` dependencies are `workflows` and `shared-types`), so the type re-exports and MCP auth tools form one compile-time dependency. The `isAuthRequired` value export below resolves through the workflow-engine re-export chain (§4.7).
 
-**Value export** — add `isAuthRequired` next to `isProviderUsageLimit`. It is defined once in **`packages/shared-types/src/errors.ts`** beside `isProviderUsageLimit` (`errors.ts:71`), then re-exported by `@automatalabs/workflow-engine` in **two** places that must both be edited or PR6's re-export fails to resolve and PR6 does not build: (a) the shared-types re-export block in `packages/workflow-engine/src/errors.ts:17-23` (which currently names `isProviderUsageLimit` at `:21` and has **no** `export *`), and (b) the named re-export block in `packages/workflow-engine/src/index.ts:37-49`. Both edits land in **PR1** (which already touches this helper). It is then surfaced here in the existing block at `index.ts:64-70`:
+**Value export** — `isAuthRequired` sits next to `isProviderUsageLimit`. It is defined once in **`packages/shared-types/src/errors.ts`** beside `isProviderUsageLimit` (`errors.ts:71`), then re-exported by `@automatalabs/workflow-engine` in **two** places: (a) the shared-types re-export block in `packages/workflow-engine/src/errors.ts:17-23` (which names `isProviderUsageLimit` at `:21` and has **no** `export *`), and (b) the named re-export block in `packages/workflow-engine/src/index.ts:37-49`. Both re-export sites are required for the facade to resolve. It is surfaced here in the existing block at `index.ts:64-70`:
 
 ```ts
 // packages/shared-types/src/errors.ts
@@ -1351,7 +1351,7 @@ No CLI host is in scope for this spec — this note exists so §1.3/§2.11 oblig
 - **Short-lived processes:** a fresh-process-per-invocation CLI loses in-process (gateway) and spawn-env credentials between invocations; if it wants them to survive, it must supply its own persistent `AuthStore` implementation (§2.2 interface), file-backed at mode `0600`, secrets redacted from any logging (§2.14). Disk-persisted methods need no cache — the agent's native store holds them.
 - **Logout:** clear the host store entry, call `runner.auth.logout` (which recycles the pool), and surface agent-side logout availability per the backend's advertisement.
 
-### 4.5 Forward notes — web app + local runner
+### 4.5 Web app + local runner bindings
 
 No library change beyond the PR3 lifecycle work (§2). The **local runner** is long-lived (in-memory `AuthStore`, optionally file-backed per the §4.4 note) and constructs `authCapabilities: { terminal: true, gateway: true }` plus an `onAuth` that serializes the `AuthContext` (secrets stripped from any log) to the browser over the control channel and awaits an `AuthResolution`. Division of labor: **the browser owns env/gateway forms; the TTY step (terminal login, codex `chat-gpt` browser OAuth) is delegated to the local runner** — the browser cannot own a TTY, but the runner can, and a real browser exists here for OAuth (unlike MCP). Pause-for-auth (the no-`onAuth` path, e.g. a cloud/scheduled run) surfaces as a resume-gated card analogous to the checkpoint card, reading the persisted non-secret `authContext`. This is a new binding of the §2 seam in the web/runner repos, not a change to `packages/acp-agents`.
 
@@ -1420,11 +1420,11 @@ The implementation was delivered as seven PR-sized stages, error-taxonomy-first,
 | PR | Scope (spec §) | Key files | Why green in isolation |
 |----|----------------|-----------|------------------------|
 | **PR1** | Error taxonomy + structured `authContext` (§1.5) | `packages/acp-agents/src/errors-map.ts`, `packages/shared-types/src/errors.ts` (+`isAuthRequired`), `packages/workflow-engine/src/errors.ts` (+`isAuthRequired` in the shared-types re-export block `:17-23`), `packages/workflow-engine/src/index.ts` (+`isAuthRequired` in the named re-export block `:37-49`), `packages/shared-types/test/errors.test.ts`, `errors-map.test.ts` | Pure classification; the three first-class agents already emit `-32000`+English, so the code-only matcher is behavior-preserving and immediately unblocks conformant custom agents. Threading `isAuthRequired` through the workflow-engine re-export here (not later) means PR6's `export { isAuthRequired } from "@automatalabs/workflow-engine"` resolves and builds. |
-| **PR2** | Client auth advertisement (§1.2) | `packages/acp-agents/src/client-handlers.ts`, `capabilities.ts`, `acp-client.ts` (initialize thread), `pool.ts`, `runner.ts` (`authCapabilities`), `protocol-coverage.ts`, `client-handlers.test.ts`, `protocol-coverage.test.ts` | Default-OFF; the `auth` key is omitted until a host sets `authCapabilities`, so zero behavior change. Drift shape assertion lands here. |
+| **PR2** | Client auth advertisement (§1.2) | `packages/acp-agents/src/client-handlers.ts`, `capabilities.ts`, `acp-client.ts` (initialize thread), `pool.ts`, `runner.ts` (`authCapabilities`), `protocol-coverage.ts`, `client-handlers.test.ts`, `protocol-coverage.test.ts` | Default-OFF; the `auth` key is omitted unless a host sets `authCapabilities`, so zero behavior change. This delivery added the drift shape assertion. |
 | **PR3** | Auth contracts + `AuthStore`/`BackendAuthMachine` + generation-stamped lifecycle + resolver + runner API (§1.3, §2, §4.1) | new `packages/acp-agents/src/auth/{auth-types,auth-store}.ts`, `acp-client.ts` (replay-after-initialize + spawn overlay + stamp/reapply), `pool.ts` (generation-gated `selectConnection` + `recycle` + drain), `runner.ts` (`describeAuthMethods`/`completeAuth`/`auth`/`onAuth`/inline retry-once; rebuild `authenticate`/`logout`), `fixtures/fake-auth-agent.mjs`, `auth-descriptors.test.ts`, `auth-store.test.ts`, `auth.integration.test.ts`, `auth-secrets.test.ts`, `auth-providers.integration.test.ts` | The core correctness PR (fixes gap 3). Behavioral but opt-in: unset `onAuth`/`authCapabilities` ⇒ identical to today; the fixture proves conformance-by-absence. |
 | **PR4** | Engine pause-for-auth + cold-resume re-arm (§2.12, §2.13) | `packages/workflow-engine/src/workflow-manager.ts`, `run-persistence.ts`, `packages/shared-types/src/{errors,workflow-result}.ts` (`reason` widen + `authContext`), `auth-pause.test.ts`, `run-persistence.test.ts` | Generalizes the existing `PROVIDER_USAGE_LIMIT` pause branch (`workflow-manager.ts:620-649,675-699`); `PersistedRunState.pauseReason` is already free-form (`run-persistence.ts:43`) so no migration. |
 | **PR5** | MCP server auth tools (§4.3) | `packages/mcp-server/src/server.ts`, new `auth-tool-io.ts`, new `auth-resolver.ts`, `packages/workflows/src/index.ts` (the §4.2 type re-exports — see the §4.2 sequencing note), `packages/mcp-server/test/auth-tools.test.ts` | Two additive tools + summary branch; `createWorkflowServer` signature unchanged; inline elicitation is env-gated OFF. |
-| **PR6** | SDK exports (§4.2) | `packages/workflows/src/index.ts` | Re-exports the `isAuthRequired` value through the facade (the type re-exports land with PR5 — §4.2 sequencing note); no new behavior. |
+| **PR6** | SDK exports (§4.2) | `packages/workflows/src/index.ts` | Re-exported the `isAuthRequired` value through the facade after the type re-exports described in §4.2; no new behavior. |
 | **PR7** | Per-agent profiles + codex spawn channel + `_meta` matrix tripwire + `permission _meta.persist` (§3, §2.8, §3.6) | new `packages/acp-agents/src/auth/auth-profiles.ts`, `backend.ts` (`authProfile?`), the three built-in backends, `codexAuthProfile.spawnAuthEnv` (`DEFAULT_AUTH_REQUEST`), `protocol-coverage.ts`/`docs-drift.test.ts` (`_meta`-matrix assertions), `permissions.ts` (`PermissionResolver.persist?`), `auth.live.e2e.test.ts` | Profiles are pure data layered on the PR3 base; codex `DEFAULT_AUTH_REQUEST` is an existing spawn-time agent surface consumed client-side (Principle 6 lever note, §3.3) on top of the universal replay (never required for correctness); per-agent live-e2e lands here. |
 
-The **web app + local runner** (§4.5) are forward notes — new bindings of the PR3 seam in their own repos, requiring no further change to `packages/acp-agents`.
+The **web app + local runner** bindings (§4.5) consume the PR3 seam in their own repositories and require no change to `packages/acp-agents`.

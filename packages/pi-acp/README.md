@@ -19,7 +19,11 @@ await runner.run("Review this change", { model: "pi" });
 await runner.run("Review this change", { model: "pi/openrouter/vendor/model-id" });
 ```
 
-The runner strips exactly the first `pi/` segment and sends the remaining `provider/model-id` verbatim through ACP's reserved `model` config channel. An unknown model rejects with JSON-RPC `-32602` and `data.errorKind = "invalid_model"`. Hosts driving pi-acp directly can negotiate its native schema channel from `agentCapabilities._meta["@automatalabs/pi-acp"].outputSchema` and send the bare `_meta.outputSchema` key.
+The runner strips exactly the first `pi/` segment and sends the remaining `provider/model-id` verbatim through ACP's reserved `model` config channel. Pi-acp advertises a configured `model` select populated from the completed credential- and provider-filter-aware Pi catalog; set requests refresh and require membership in that same catalog. An unknown model rejects with JSON-RPC `-32602` and `data.errorKind = "invalid_model"`.
+
+## MCP and structured output
+
+Pi-acp serves stdio, Streamable HTTP, and legacy SSE MCP servers and consumes stable tools, resources, prompts, completion, logging, pagination, progress, and dynamic tool registration. It also provides MCP client sampling, the workspace root, and form/URL elicitation. Client-hosted `acp` transport remains runner-owned. For `agent({ schema })`, Pi receives the runner's client-hosted HTTP `StructuredOutput` tool through this standard MCP path and retains the common prompt-embedded schema plus validated last-text fallback.
 
 ## Authentication
 
@@ -38,11 +42,11 @@ Authentication requests are no-op acknowledgements because the environment or pi
 
 ## Reserved tool namespaces
 
-pi-acp owns the `mcp__` prefix for bridged MCP tools and the exact `__acp_structured_output` tool. pi extensions must not register names in the `mcp__` or `__acp_` namespaces.
+pi-acp owns the `mcp__` prefix for injected MCP tools. Pi extensions must not register names in that namespace.
 
 ## Version 1 limitations
 
-Only stdio MCP servers are supported. Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. Audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed.
+Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. ACP prompt audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed.
 
 ## Development
 

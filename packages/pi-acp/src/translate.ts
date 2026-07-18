@@ -93,12 +93,15 @@ export function translateEvent(event: AgentSessionEvent, failedResult?: PiResult
         _meta: { toolName: event.toolName },
       }];
     case "tool_execution_update":
-      return [{
+      const update: SessionUpdate = {
         sessionUpdate: "tool_call_update",
         toolCallId: event.toolCallId,
         status: "in_progress",
         content: toContent(event.partialResult as PiResult),
-      }];
+      };
+      const partial = event.partialResult as PiResult;
+      if (partial.details !== undefined) update.rawOutput = partial.details;
+      return [update];
     case "tool_execution_end": {
       const result = failedResult ?? event.result as PiResult;
       const update: SessionUpdate = {

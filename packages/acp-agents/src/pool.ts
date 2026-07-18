@@ -269,7 +269,9 @@ export class AcpAgentPool {
     this.removeExitHook();
     const all = this.allConnections();
     this.byBackend.clear();
-    await Promise.all(all.map((c) => c.dispose()));
+    const results = await Promise.allSettled(all.map((c) => c.dispose()));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
   private allConnections(): PooledConnection[] {

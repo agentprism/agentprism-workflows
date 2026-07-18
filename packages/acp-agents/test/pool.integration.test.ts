@@ -12,7 +12,15 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
-import { AcpAgentRunner } from "../src/index.js";
+import {
+  AcpAgentPool,
+  AcpAgentRunner,
+  PI_DISPOSE_SIGKILL_GRACE_MS,
+  PI_PROCESS_EXIT_MARGIN_MS,
+  PI_PROCESS_SHUTDOWN_ENVELOPE_MS,
+  PiBackend,
+  PooledConnection,
+} from "../src/index.js";
 import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
 interface LogEntry {
@@ -174,4 +182,80 @@ test("dispose() closes every pooled process (multi-process pool)", async () => {
 
   const afterDispose = readLog();
   assert.equal(count(afterDispose, "__exit"), spawned, "dispose() closed every pooled process");
+});
+
+test("Pi child cleanup quarantine prevents reuse and disposes only after the last active close", async () => {
+  const { cwd, readLog } = harness.configure<LogEntry>({
+    turns: [
+      {
+        text: "first",
+        close: {
+          throw: "child process cleanup failed",
+          throwData: { errorKind: "child_cleanup_error", details: { remainingChildren: 1 } },
+        },
+      },
+      { text: "second" },
+    ],
+  }, { backends: ["pi"] });
+  const pool = harness.track(new AcpAgentPool({ size: 1 }));
+  const backend = new PiBackend();
+  const options = { cwd, schema: undefined, policy: {} };
+  const first = await pool.acquire(backend, options);
+  const second = await pool.acquire(backend, options);
+  await first.prompt("first");
+  await second.prompt("second");
+  const originalPid = readLog().find((entry) => entry.method === "newSession")?.pid;
+
+  await assert.rejects(
+    first.release(),
+    (error: { code?: unknown; data?: { errorKind?: unknown } }) =>
+      error.code === -32603 && error.data?.errorKind === "child_cleanup_error",
+  );
+  assert.equal(count(readLog(), "__exit"), 0, "quarantined process remains until its active session closes");
+
+  const replacement = await pool.acquire(backend, options);
+  await replacement.prompt("replacement");
+  const replacementEntry = readLog().filter((entry) => entry.method === "newSession").at(-1);
+  assert.notEqual(replacementEntry?.pid, originalPid, "new work never reuses the quarantined process");
+
+  await second.release();
+  await waitFor(() => readLog().some((entry) => entry.method === "__exit" && entry.pid === originalPid));
+  const oldWire = readLog().filter((entry) => entry.pid === originalPid).map((entry) => entry.method);
+  assert.ok(oldWire.lastIndexOf("closeSession") < oldWire.indexOf("__exit"));
+
+  await replacement.release({ keepOpen: true });
+  await pool.dispose();
+});
+
+test("Pi process disposal memoizes one promise and schedules SIGKILL at exactly 67,000 ms", async () => {
+  assert.equal(PI_PROCESS_SHUTDOWN_ENVELOPE_MS, 66_000);
+  assert.equal(PI_PROCESS_EXIT_MARGIN_MS, 1_000);
+  assert.equal(PI_DISPOSE_SIGKILL_GRACE_MS, 67_000);
+  harness.configure({ ignoreShutdown: true }, { backends: ["pi"] });
+  let scheduled: { callback: () => void; ms: number; unrefCalls: number } | undefined;
+  let clears = 0;
+  const connection = harness.track(PooledConnection.create(new PiBackend(), {
+    onDead: () => undefined,
+    disposeTimer: {
+      set(callback, ms) {
+        scheduled = { callback, ms, unrefCalls: 0 };
+        return { unref: () => { if (scheduled) scheduled.unrefCalls += 1; } };
+      },
+      clear() { clears += 1; },
+    },
+  }));
+  await connection.authMethods();
+  const first = connection.dispose();
+  const joined = connection.dispose();
+  assert.equal(joined, first);
+  await waitFor(() => scheduled !== undefined);
+  assert.equal(scheduled?.ms, 67_000);
+  assert.equal(scheduled?.unrefCalls, 1);
+  let settled = false;
+  void first.finally(() => { settled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(settled, false, "SIGKILL is not sent before the scheduled boundary");
+  scheduled?.callback();
+  await first;
+  assert.equal(clears, 1);
 });

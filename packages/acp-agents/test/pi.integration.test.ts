@@ -2,7 +2,6 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Type } from "typebox";
-import { META_KEYS } from "@automatalabs/shared-types";
 import { AcpAgentRunner } from "../src/index.js";
 import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
@@ -41,9 +40,8 @@ function configure(turns: unknown[]) {
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: true },
-        mcpCapabilities: {},
+        mcpCapabilities: { http: true, sse: true },
         sessionCapabilities: { close: {}, fork: {}, list: {}, resume: {} },
-        _meta: { "@automatalabs/pi-acp": { outputSchema: true } },
       },
       authMethods: PI_AUTH_METHODS,
     },
@@ -54,6 +52,14 @@ function configure(turns: unknown[]) {
         name: "Thinking level",
         currentValue: "medium",
         options: ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value, name: value })),
+      },
+      {
+        id: "model",
+        type: "select",
+        category: "model",
+        name: "Model",
+        currentValue: "",
+        options: [],
       },
     ],
     turns,
@@ -105,18 +111,19 @@ test("Pi auth descriptors preserve all six advertised methods and add per-method
   ]);
 });
 
-test("Pi native schema path sends outputSchema, injects no MCP tool, and parses the final chunk", async () => {
+test("Pi schema path injects HTTP MCP, embeds the common fallback, and sends no private metadata", async () => {
   const { cwd, readLog } = configure([{ text: '{"city":"Oslo","hot":false}' }]);
   const result = await harness.makeRunner().run("classify", { model: "pi", cwd, schema: SCHEMA });
   assert.deepEqual(result, { city: "Oslo", hot: false });
 
   const log = readLog();
   const opened = log.find((entry) => entry.method === "newSession");
-  assert.deepEqual(opened?.params?.mcpServers, []);
+  assert.equal(opened?.params?.mcpServers?.length, 1);
+  assert.equal((opened?.params?.mcpServers?.[0] as { type?: string }).type, "http");
   const prompted = log.find((entry) => entry.method === "prompt");
-  assert.ok(prompted?.params?._meta?.[META_KEYS.outputSchema]);
+  assert.equal(prompted?.params?._meta, undefined);
   const text = prompted?.params?.prompt?.map((block) => block.text ?? "").join("") ?? "";
-  assert.doesNotMatch(text, /The required output schema \(JSON Schema\)/);
+  assert.match(text, /The required output schema \(JSON Schema\)/);
   assert.match(text, /single JSON object/);
 });
 

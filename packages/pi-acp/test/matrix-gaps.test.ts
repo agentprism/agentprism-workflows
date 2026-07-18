@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import test from "node:test";
@@ -89,8 +89,8 @@ test("T8 adapter errors have the exact reserved prefix and fixed-label wire shap
     session_not_forkable: { code: -32602, prefix: "Invalid params", label: "session has no persisted history to fork" },
     mcp_init_error: { code: -32603, prefix: "Internal error", label: "mcp server initialization failed" },
     unsupported_mcp_transport: { code: -32602, prefix: "Invalid params", label: "unsupported mcp transport" },
-    structured_tool_collision: { code: -32603, prefix: "Internal error", label: "structured-output tool unavailable" },
-    invalid_output_schema: { code: -32602, prefix: "Invalid params", label: "invalid output schema" },
+    extension_setup_error: { code: -32603, prefix: "Internal error", label: "pi extension setup failed" },
+    child_cleanup_error: { code: -32603, prefix: "Internal error", label: "child process cleanup failed" },
     invalid_cursor: { code: -32602, prefix: "Invalid params", label: "invalid list cursor" },
     unknown_auth_method: { code: -32602, prefix: "Invalid params", label: "unknown auth method" },
     notification_error: { code: -32603, prefix: "Internal error", label: "notification delivery failed" },
@@ -100,7 +100,9 @@ test("T8 adapter errors have the exact reserved prefix and fixed-label wire shap
   for (const [kind, shape] of Object.entries(expected) as Array<[ErrorKind, typeof expected[ErrorKind]]>) {
     const extras = kind === "mcp_init_error" || kind === "unsupported_mcp_transport"
       ? { server: "server-a" }
-      : undefined;
+      : kind === "child_cleanup_error"
+        ? { details: { remainingChildren: 2 } }
+        : undefined;
     assert.deepEqual(errorWire(adapterError(kind, extras)), {
       code: shape.code,
       message: shape.prefix,
@@ -562,6 +564,7 @@ test("T15b rollback releases every resource after MCP, factory, wrapper, and rep
       cwd: setup.cwd,
       mcpServers: [{ name: "connected", command: "connected", args: [], env: [] }],
     })), (error) => errorKind(error) === "internal_error");
+    assert.equal(failedControl?.abortCalls, 1);
     assert.equal(failedControl?.disposeCalls, 1);
     assert.equal(failedControl?.listenerCount, 0);
     assert.equal(closes, 1);
@@ -600,6 +603,225 @@ test("T15b rollback releases every resource after MCP, factory, wrapper, and rep
     assert.ok(retried.configOptions.length > 0);
     await agent.dispose();
   }
+});
+
+test("A4 failed-open abort deadline overrides the opening error and hidden ownership retries", async () => {
+  const setup = fakeDeps();
+  const id = "failed-open-hidden-cleanup";
+  setup.deps.sessions.create = () => SessionManager.create(setup.cwd, setup.sessionDir, { id });
+  let sleeps = 0;
+  setup.deps.sleep = async () => {
+    sleeps += 1;
+    if (sleeps === 1) return;
+    return new Promise<void>(() => undefined);
+  };
+  let control: ReturnType<typeof fakeSession> | undefined;
+  let abortAttempts = 0;
+  setup.deps.createAgentSession = async (options) => {
+    const created = fakeCreateResult(options);
+    control = created.control;
+    (created.control.session as unknown as { abort(): Promise<void> }).abort = async () => {
+      abortAttempts += 1;
+      if (abortAttempts === 1) await new Promise<void>(() => undefined);
+    };
+    Object.defineProperty(created.control.session.agent, "beforeToolCall", {
+      configurable: true,
+      get: () => undefined,
+      set: () => { throw new Error("wrapper install failed before publication"); },
+    });
+    return created.result;
+  };
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(
+    agent.newSession(context({ cwd: setup.cwd, mcpServers: [] })),
+    (error: { data?: { errorKind?: unknown; details?: { remainingChildren?: unknown } } }) =>
+      error.data?.errorKind === "child_cleanup_error" && error.data.details?.remainingChildren === 0,
+  );
+  assert.equal(control?.disposeCalls, 1, "non-child failed-open resources dispose only once");
+  assert.equal(abortAttempts, 1);
+  await agent.closeSession(context({ sessionId: id }));
+  assert.equal(abortAttempts, 2, "hidden failed-open owner retries the abort/liveness generation");
+  assert.equal(control?.disposeCalls, 1);
+  await agent.dispose();
+});
+
+test("A4 new/load/resume/fork preserve every representative open error unless cleanup fails", { timeout: 30_000 }, async () => {
+  const methodsUnderTest = ["new", "load", "resume", "fork"] as const;
+  const outcomes = [
+    { name: "cancel", code: -32800, kind: undefined, error: () => RequestError.requestCancelled() },
+    { name: "mcp", code: -32603, kind: "mcp_init_error", error: () => adapterError("mcp_init_error", { server: "second" }) },
+    { name: "extension", code: -32603, kind: "extension_setup_error", error: () => adapterError("extension_setup_error") },
+    { name: "replay-other", code: -32603, kind: "session_corrupt", error: () => adapterError("session_corrupt") },
+  ] as const;
+
+  for (const openingMethod of methodsUnderTest) {
+    for (const outcome of outcomes) {
+      for (const cleanupFails of [false, true]) {
+        const setup = fakeDeps();
+        const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: `a4-${openingMethod}-${outcome.name}-source` });
+        source.appendMessage({ role: "user", content: "source", timestamp: 1 } as never);
+        source.appendMessage({
+          role: "assistant",
+          content: [{ type: "text", text: "answer" }],
+          usage: {
+            input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 2,
+        } as never);
+        const events: string[] = [];
+        setup.deps.connectMcpClient = async (server) => fakeMcpHandle({
+          close() { events.push(`mcp-close:${server.name}`); return Promise.resolve(); },
+        });
+        const realCreate = setup.deps.createAgentSession;
+        let abortAttempts = 0;
+        setup.deps.createAgentSession = async (options) => {
+          const result = await realCreate(options);
+          const control = setup.controls.at(-1)!;
+          control.session.abort = async () => {
+            abortAttempts += 1;
+            events.push(`pi-abort:${abortAttempts}`);
+            if (cleanupFails && abortAttempts === 1) throw new Error("injected cleanup failure");
+          };
+          return result;
+        };
+        setup.deps.modelRuntime.getAvailable = async () => { throw outcome.error(); };
+        const agent = new PiAcpAgent(setup.deps);
+        const request = {
+          cwd: setup.cwd,
+          mcpServers: [
+            { name: "first", command: "fixture", args: [], env: [] },
+            { name: "second", command: "fixture", args: [], env: [] },
+          ],
+        };
+        const opening = openingMethod === "new"
+          ? agent.newSession(context(request))
+          : openingMethod === "load"
+            ? agent.loadSession(context({ ...request, sessionId: source.getSessionId() }))
+            : openingMethod === "resume"
+              ? agent.resumeSession(context({ ...request, sessionId: source.getSessionId() }))
+              : agent.forkSession(context({ ...request, sessionId: source.getSessionId() }));
+        await assert.rejects(opening, (error: RequestError) => {
+          if (cleanupFails) {
+            assert.equal(error.code, -32603, `${openingMethod}/${outcome.name}`);
+            assert.deepEqual(error.data, {
+              errorKind: "child_cleanup_error",
+              message: "child process cleanup failed",
+              details: { remainingChildren: 0 },
+            });
+          } else {
+            assert.equal(error.code, outcome.code, `${openingMethod}/${outcome.name}`);
+            assert.equal(errorKind(error), outcome.kind, `${openingMethod}/${outcome.name}`);
+          }
+          return true;
+        });
+        assert.deepEqual(events.slice(0, 3), ["mcp-close:second", "mcp-close:first", "pi-abort:1"],
+          `${openingMethod}/${outcome.name} starts reverse MCP closes before Pi abort`);
+        assert.equal(setup.controls[0]!.disposeCalls, 1);
+
+        if (cleanupFails && (openingMethod === "load" || openingMethod === "resume")) {
+          await agent.closeSession(context({ sessionId: source.getSessionId() }));
+        } else {
+          await agent.dispose();
+        }
+        if (cleanupFails) {
+          assert.equal(abortAttempts, 2, `${openingMethod}/${outcome.name} retained cleanup owner retries`);
+          await agent.dispose();
+        } else {
+          assert.equal(abortAttempts, 1);
+        }
+        assert.equal(setup.controls[0]!.disposeCalls, 1, "non-child resources remain memoized");
+      }
+    }
+  }
+});
+
+test("M8 fork MCP failure occurs before forkFrom and leaves no target journal", async () => {
+  const setup = fakeDeps();
+  const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: "fork-preconnect-source" });
+  source.appendMessage({ role: "user", content: "source", timestamp: Date.now() } as never);
+  source.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "answer" }],
+    usage: {
+      input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as never);
+  const sourcePath = source.getSessionFile();
+  assert.ok(sourcePath);
+  setup.deps.sessions.listAll = async () => [{
+    path: sourcePath,
+    id: source.getSessionId(),
+    cwd: setup.cwd,
+    created: new Date(),
+    modified: new Date(),
+    messageCount: 2,
+    firstMessage: "source",
+    allMessagesText: "source answer",
+  }];
+  let forkCalls = 0;
+  setup.deps.sessions.forkFrom = () => {
+    forkCalls += 1;
+    throw new Error("forkFrom must not run");
+  };
+  setup.deps.connectMcpClient = async () => { throw new Error("MCP connect failed"); };
+  const before = readdirSync(setup.sessionDir).sort();
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(agent.forkSession(context({
+    cwd: setup.cwd,
+    sessionId: source.getSessionId(),
+    mcpServers: [{ name: "fails-before-write", command: "fixture", args: [], env: [] }],
+  })), (error) => errorKind(error) === "mcp_init_error");
+  assert.equal(forkCalls, 0);
+  assert.deepEqual(readdirSync(setup.sessionDir).sort(), before);
+  await agent.dispose();
+});
+
+test("M8 fork cancellation after MCP preparation closes the owner before any journal write", async () => {
+  const setup = fakeDeps();
+  const source = SessionManager.create(setup.cwd, setup.sessionDir, { id: "fork-cancel-source" });
+  source.appendMessage({ role: "user", content: "source", timestamp: 1 } as never);
+  const sourcePath = source.getSessionFile();
+  assert.ok(sourcePath);
+  setup.deps.sessions.listAll = async () => [{
+    path: sourcePath,
+    id: source.getSessionId(),
+    cwd: setup.cwd,
+    created: new Date(),
+    modified: new Date(),
+    messageCount: 1,
+    firstMessage: "source",
+    allMessagesText: "source",
+  }];
+  const request = new AbortController();
+  let forkCalls = 0;
+  let closes = 0;
+  setup.deps.sessions.forkFrom = () => {
+    forkCalls += 1;
+    throw new Error("forkFrom must not run after cancellation");
+  };
+  setup.deps.connectMcpClient = async () => fakeMcpHandle({
+    async listTools() {
+      request.abort(new Error("cancel after MCP preparation"));
+      return { tools: [] };
+    },
+    close() { closes += 1; return Promise.resolve(); },
+  });
+  const before = readdirSync(setup.sessionDir).sort();
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(agent.forkSession(context({
+    cwd: setup.cwd,
+    sessionId: source.getSessionId(),
+    mcpServers: [{ name: "prepared", command: "fixture", args: [], env: [] }],
+  }, undefined, request.signal)));
+  assert.equal(forkCalls, 0);
+  assert.equal(closes, 1);
+  assert.deepEqual(readdirSync(setup.sessionDir).sort(), before);
+  await agent.dispose();
 });
 
 test("T15b irreversible fork failure leaves a complete listable and loadable journal without live leaks", async () => {
@@ -761,7 +983,7 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
     };
 
     const lateConnect = deferred<never>();
-    setup.deps.connectMcpClient = async () => lateConnect.promise;
+    setup.deps.connectMcpClient = () => lateConnect.promise;
     await assert.rejects(
       bridgeMcpServers([server], new AbortController().signal, setup.deps),
       (error) => errorKind(error) === "mcp_init_error",
@@ -770,8 +992,17 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
 
     const lateList = deferred<never>();
     let listCloseCalls = 0;
+    let listBoundedCall = 0;
+    setup.deps.sleep = (_ms, signal) => {
+      listBoundedCall += 1;
+      if (listBoundedCall === 2) return Promise.resolve();
+      return new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
     setup.deps.connectMcpClient = async () => fakeMcpHandle({
-      async listTools() { return lateList.promise; },
+      listTools() { return lateList.promise; },
       async close() { listCloseCalls += 1; },
     });
     await assert.rejects(
@@ -781,12 +1012,21 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
     assert.equal(listCloseCalls, 1);
     lateList.reject(new Error("late list rejection"));
 
+    let boundedCall = 0;
+    setup.deps.sleep = (_ms, signal) => {
+      boundedCall += 1;
+      if (boundedCall === 3) return Promise.resolve();
+      return new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
     const lateCall = deferred<never>();
     setup.deps.connectMcpClient = async () => fakeMcpHandle({
       async listTools() {
         return { tools: [{ name: "slow", inputSchema: { type: "object" } }] };
       },
-      async callTool() { return lateCall.promise; },
+      callTool() { return lateCall.promise; },
     });
     const bridge = await bridgeMcpServers([server], new AbortController().signal, setup.deps);
     await assert.rejects(
@@ -830,6 +1070,17 @@ test("T20 a timed-out real stdio connect kills its spawned child and lifecycle r
   })), (error) => errorKind(error) === "mcp_init_error");
   assert.equal(existsSync(pidPath), true);
   const pid = Number(readFileSync(pidPath, "utf8"));
+  // The pinned stdio transport owns escalation: it first gives the child its
+  // transport grace and then issues SIGKILL.  The adapter must not pre-kill it.
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+      await realSleep(10, new AbortController().signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+      throw error;
+    }
+  }
   assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
   assert.equal((await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }))).sessionId, id);
   await agent.dispose();
@@ -875,15 +1126,21 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
     setup.deps.sessions.create = () => SessionManager.create(setup.cwd, setup.sessionDir, { id });
     const late = deferred<never>();
     if (mode === "timeout") {
-      setup.deps.sleep = async (_ms, signal) => {
-        if (signal.aborted) throw signal.reason;
+      let boundedCall = 0;
+      setup.deps.sleep = (_ms, signal) => {
+        boundedCall += 1;
+        if (boundedCall === 3) return Promise.resolve();
+        return new Promise<void>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
       };
     }
     setup.deps.connectMcpClient = async () => fakeMcpHandle({
       async listTools() { return { tools: [{ name: "remote", inputSchema: { type: "object" } }] }; },
-      async callTool() {
+      callTool() {
         if (mode === "timeout") return late.promise;
-        return { content: [{ type: "text", text: "remote tool error detail" }], isError: true };
+        return Promise.resolve({ content: [{ type: "text", text: "remote tool error detail" }], isError: true });
       },
     });
     const updates: SessionUpdate[] = [];
@@ -913,6 +1170,7 @@ test("T20 missing injected aliases roll back and isError/hung calls become fixed
       if (mode === "timeout") late.reject(new Error("late tools/call rejection"));
       await setImmediatePromise();
       assert.deepEqual(unhandled, []);
+      if (mode === "timeout") setup.deps.sleep = realSleep;
       await agent.dispose();
     } finally {
       process.off("unhandledRejection", onUnhandled);
@@ -972,12 +1230,13 @@ test("T20 tools/call round-trips through new, load, resume, and fork with shared
   assert.equal(setup.createOptions.length, 4);
   for (const options of setup.createOptions) {
     assert.equal(options.modelRuntime, setup.deps.modelRuntime);
-    assert.ok(options.customTools?.some(({ name }) => name === "mcp__server__roundtrip"));
+    assert.ok(options.resourceLoader?.getExtensions().extensions
+      .some((extension) => extension.tools.has("mcp__server__roundtrip")));
   }
   await agent.dispose();
 });
 
-test("T22 each cooperative abort source force-settles a wedged turn once, emits usage, and detaches pi", async () => {
+test("T22 each cooperative abort source drains before settling once and preserves the mode boundary", async () => {
   const unhandled: unknown[] = [];
   const onUnhandled = (error: unknown) => { unhandled.push(error); };
   process.on("unhandledRejection", onUnhandled);
@@ -1009,15 +1268,14 @@ test("T22 each cooperative abort source force-settles a wedged turn once, emits 
       else if (source === "session-cancel") agent.cancel(context({ sessionId: opened.sessionId }) as never);
       else closing = agent.closeSession(context({ sessionId: opened.sessionId }));
       assert.equal(typeof fire, "function");
-      fire?.();
       assert.equal((await pending).stopReason, "cancelled", source);
       if (closing) assert.deepEqual(await closing, {});
       await setImmediatePromise();
       assert.equal(updates.filter(({ sessionUpdate }) => sessionUpdate === "usage_update").length, 1, source);
-      assert.ok((setup.controls[0]?.disposeCalls ?? 0) >= 1, source);
-      assert.throws(
-        () => agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "again" }] })),
-        (error) => errorKind(error) === "session_terminated",
+      assert.equal(
+        (setup.controls[0]?.disposeCalls ?? 0) >= 1,
+        source === "session-close",
+        source,
       );
       setup.controls[0]?.rejectPrompt?.(new Error(`late pi rejection: ${source}`));
       await setImmediatePromise();
@@ -1030,7 +1288,7 @@ test("T22 each cooperative abort source force-settles a wedged turn once, emits 
   }
 });
 
-test("T22 notify failure wins settlement; its later backstop only cleans up with no usage or unhandled rejection", async () => {
+test("T22 notify failure wins settlement after successful abort cleanup with no usage or unhandled rejection", async () => {
   const setup = fakeDeps("wedged");
   let fire: (() => void) | undefined;
   setup.deps.sleep = (_ms, signal) => new Promise<void>((resolve, reject) => {
@@ -1067,17 +1325,13 @@ test("T22 notify failure wins settlement; its later backstop only cleans up with
     await assert.rejects(pending, (error) => errorKind(error) === "notification_error");
     assert.equal(delivered.filter(({ sessionUpdate }) => sessionUpdate === "usage_update").length, 0);
     assert.equal(typeof fire, "function");
-    fire?.();
     await setImmediatePromise();
-    assert.ok((setup.controls[0]?.disposeCalls ?? 0) >= 1);
-    assert.throws(
-      () => agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "again" }] })),
-      (error) => errorKind(error) === "session_terminated",
-    );
+    assert.equal(setup.controls[0]?.disposeCalls, 0);
     setup.controls[0]?.rejectPrompt?.(new Error("late notify-failure pi rejection"));
     await setImmediatePromise();
     assert.deepEqual(unhandled, []);
     assert.equal(delivered.filter(({ sessionUpdate }) => sessionUpdate === "usage_update").length, 0);
+    setup.deps.sleep = realSleep;
     await agent.dispose();
   } finally {
     process.off("unhandledRejection", onUnhandled);

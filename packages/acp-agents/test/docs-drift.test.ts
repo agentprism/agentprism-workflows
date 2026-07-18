@@ -82,17 +82,73 @@ test("the executable Pi contract stays grounded in the frozen pi-acp spec", () =
   const spec = readRepoFile("docs/specs/pi-acp-spec.md");
   assert.ok(spec.includes("## 5. Capability advertisement (`initialize`)"));
   assert.ok(spec.includes("## 8. Error taxonomy and pinned wire codes (`src/errors.ts`)"));
-  assert.ok(spec.includes("### 9.4 Structured output (`src/structured-output.ts`)"));
+  assert.ok(spec.includes("### 9.4 Structured output through client-hosted MCP injection"));
   assert.ok(spec.includes("### 9.5 Auth (`src/auth.ts`)"));
-  assert.ok(spec.includes(`_meta["${PI_ACP_PROTOCOL_CONTRACT.customCapabilityNamespace}"]`));
-  assert.ok(spec.includes(`{ ${PI_ACP_PROTOCOL_CONTRACT.outputSchemaKey}: true }`));
-  assert.ok(spec.includes("mcpCapabilities: {}"));
+  assert.ok(spec.includes("mcpCapabilities: { http: true, sse: true }"));
+  assert.ok(!spec.includes('agentCapabilities._meta["@automatalabs/pi-acp"]'));
+  assert.ok(!spec.includes("{ outputSchema: true }"));
+  for (const retired of [
+    /when armed[^\n]*structured-output tool/i,
+    /install[^\n]*(?:inactive )?structured-output tool/i,
+    /connect the request's stdio MCP servers/i,
+    /configOptions:\s*\[thinkingLevelOption\]/,
+    /wrapper\/translator\/structured tool/i,
+    /createAgentSession\([^\n]*customTools/i,
+    /arm structured output if requested/i,
+    /MCP stdio client factory/i,
+    /Disposal\/disconnect errors[^\n]*never mask/i,
+    /observable structured-tool collision/i,
+  ]) {
+    assert.doesNotMatch(spec, retired, `frozen pi-acp spec retains a retired Pi mechanism: ${retired.source}`);
+  }
+  assert.match(spec, /MCP is connected \*\*before\*\*\s*`forkFrom`/);
+  assert.match(spec, /fork allocates and\s+reserves its target id before MCP connect/);
   for (const methodId of PI_ACP_PROTOCOL_CONTRACT.authMethodIds) {
     assert.ok(spec.includes(methodId), `frozen pi-acp spec must contain auth method ${methodId}`);
   }
   for (const errorKind of PI_ACP_PROTOCOL_CONTRACT.providerErrorKinds) {
     assert.ok(spec.includes(`errorKind:"${errorKind}"`), `frozen pi-acp spec must contain errorKind ${errorKind}`);
   }
+});
+
+test("all seven public guidance files reject the retired Pi channels as whole files", () => {
+  const publicGuidance = [
+    "README.md",
+    "docs/api.md",
+    "docs/design-notes.md",
+    "packages/workflows/README.md",
+    "packages/pi-acp/README.md",
+    "packages/acp-agents/README.md",
+    "docs/specs/acp-auth-spec.md",
+  ];
+  const stalePiClaims = [
+    /Pi[^\n]{0,160}(?:turn-level|turn params?)[^\n]{0,80}(?:_meta\.)?outputSchema/i,
+    /Pi[^\n]{0,160}no MCP injection/i,
+    /Codex\s*\/\s*Pi[^\n]{0,120}final text/i,
+    /Pi[^\n]{0,160}(?:stdio[- ]only|only stdio)/i,
+    /No `model` config option is advertised/i,
+    /Pi[^\n]{0,160}(?:representative|hardcoded)[^\n]{0,80}model list/i,
+    /agentCapabilities\._meta\["@automatalabs\/pi-acp"\]/,
+  ];
+  for (const path of publicGuidance) {
+    const text = readRepoFile(path);
+    for (const stale of stalePiClaims) {
+      assert.doesNotMatch(text, stale, `${path} contains retired Pi guidance: ${stale.source}`);
+    }
+  }
+
+  const structuredGuidance = publicGuidance.slice(0, 5);
+  for (const path of structuredGuidance) {
+    const text = readRepoFile(path);
+    assert.match(text, /client-hosted[^\n]{0,500}(?:HTTP[^\n]{0,160})?StructuredOutput|StructuredOutput[^\n]{0,500}client-hosted/i,
+      `${path} must describe Pi's client-hosted StructuredOutput capture`);
+    assert.match(text, /(?:validated[^\n]{0,80})?(?:final-text|last-text)[^\n]{0,80}fallback|fallback[^\n]{0,80}(?:final-text|last-text)/i,
+      `${path} must retain the common validated text fallback`);
+  }
+  const piReadme = readRepoFile("packages/pi-acp/README.md");
+  assert.match(piReadme, /stdio, Streamable HTTP, and legacy SSE/);
+  assert.match(piReadme, /completed credential- and provider-filter-aware Pi catalog/);
+  assert.match(piReadme, /Client-hosted `acp` transport remains runner-owned/);
 });
 
 test("public package inventories cover every workspace package", () => {

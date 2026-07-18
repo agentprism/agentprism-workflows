@@ -157,9 +157,7 @@ export const ACP_AUTH_REQUIRED_CODE_EXCLUSIVE = -32000 as const;
  *  executable protocol-coverage module makes capability/auth/error drift visible in tests instead
  *  of leaving the built-in coupled only through prose. */
 export const PI_ACP_PROTOCOL_CONTRACT = {
-  customCapabilityNamespace: "@automatalabs/pi-acp",
-  outputSchemaKey: "outputSchema",
-  mcpCapabilities: {},
+  mcpCapabilities: { http: true, sse: true },
   authMethodIds: [
     "anthropic-api-key",
     "openai-api-key",

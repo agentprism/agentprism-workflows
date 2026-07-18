@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { connect, okRunner } from "./_harness.js";
 import { AUTHORING_PROMPT_CONTENT } from "../src/generated/authoring-prompt-content.js";
@@ -61,8 +62,21 @@ test("generated authoring-prompt teaches registered-prefix routing and verbatim 
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("no catalog matching, case folding, bracket parsing"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`codex/gpt-5.6-sol`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`pi/openrouter/vendor/model-id`"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi's native path neither embeds the schema in the prompt nor injects an MCP tool."));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi accepts stdio, Streamable HTTP, and SSE MCP servers."));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("common prompt-embedded schema and validated final-text JSON fallback"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("model resolution does not emit them"));
+});
+
+test("Pi authoring guidance contains only the injected HTTP MCP channel", () => {
+  const sources = [
+    ["models-and-output.md", readFileSync(new URL("../../../skills/agentprism-workflow-authoring/models-and-output.md", import.meta.url), "utf8")],
+    ["reference.md", readFileSync(new URL("../../../skills/agentprism-workflow-authoring/reference.md", import.meta.url), "utf8")],
+    ["generated prompt", AUTHORING_PROMPT_CONTENT],
+  ] as const;
+  for (const [name, text] of sources) {
+    assert.match(text, /Pi[^\n]*client-hosted `StructuredOutput` MCP tool/i, `${name} documents Pi injection`);
+    assert.doesNotMatch(text, /Pi[^\n]*(?:native[^\n]*(?:outputSchema|structured)|_meta\.outputSchema|final-message JSON|no injected MCP tool|neither[^\n]*injects)/i, `${name} has no retired Pi channel claim`);
+  }
 });
 
 test("generated authoring-prompt teaches configOptions and validate-time probe surfacing", () => {

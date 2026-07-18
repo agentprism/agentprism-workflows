@@ -37,11 +37,11 @@ try {
   const shutdown = (code: number): Promise<void> => {
     shuttingDown ??= (async () => {
       try {
-        await withTimeout(agent.dispose(), 5_000);
-      } catch (error) {
-        console.error("shutdown error:", error);
-      } finally {
+        await withTimeout(agent.dispose(), 66_000);
         process.exit(code);
+      } catch {
+        console.error("shutdown cleanup failed");
+        process.exit(1);
       }
     })();
     return shuttingDown;

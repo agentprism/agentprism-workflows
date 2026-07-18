@@ -5,7 +5,7 @@ import test from "node:test";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { PiAcpAgent } from "../src/agent.js";
 import { AUTH_METHODS, authenticateMethod } from "../src/auth.js";
-import { applyConfig, THINKING_LEVELS, thinkingLevelOption } from "../src/config.js";
+import { applyConfig, modelOption, THINKING_LEVELS, thinkingLevelOption } from "../src/config.js";
 import {
   adapterError,
   classifyTerminal,
@@ -17,7 +17,6 @@ import { installPermissionWrapper } from "../src/permissions.js";
 import { convertPromptContent } from "../src/prompt-content.js";
 import { replayEntry } from "../src/replay.js";
 import { stopReasonFor } from "../src/stop-reason.js";
-import { StructuredOutputState } from "../src/structured-output.js";
 import { contentItems, mapKind, toContent, translateEvent } from "../src/translate.js";
 import { promptUsage, usageUpdate } from "../src/usage.js";
 import { context, fakeDeps, fakeSession } from "./helpers/fakes.js";
@@ -60,7 +59,8 @@ test("T2/T2b library entry has only the intended runtime values and no side effe
 test("T3 shutdown source is idempotent, awaited, bounded, and covers every exit trigger", async () => {
   const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
   assert.match(source, /shuttingDown \?\?=/);
-  assert.match(source, /withTimeout\(agent\.dispose\(\), 5_000\)/);
+  assert.match(source, /withTimeout\(agent\.dispose\(\), 66_000\)/);
+  assert.match(source, /shutdown cleanup failed/);
   assert.match(source, /connection\.closed\.then\(\(\) => shutdown\(0\), \(\) => shutdown\(1\)\)/);
   assert.match(source, /SIGTERM/);
   assert.match(source, /SIGINT/);
@@ -150,19 +150,26 @@ test("T7 stop taxonomy rejects errors and maps every successful terminal reason"
   assert.throws(() => stopReasonFor(terminal("error"), false), RequestError);
 });
 
-test("T8 all 26 error rows retain reserved codes, fixed labels, precedence, and redaction", () => {
+test("T8 error rows retain reserved codes, fixed labels, precedence, and redaction", () => {
   const invalid: ErrorKind[] = [
     "invalid_model", "empty_prompt", "session_busy", "invalid_config_value", "invalid_config_type",
     "unknown_config_option", "invalid_cwd", "unknown_session", "session_already_open", "session_terminated",
-    "session_not_forkable", "unsupported_mcp_transport", "invalid_output_schema", "invalid_cursor", "unknown_auth_method",
+    "session_not_forkable", "unsupported_mcp_transport", "invalid_cursor", "unknown_auth_method",
   ];
   const internal: ErrorKind[] = [
     "rate_limit", "billing_error", "provider_error", "session_corrupt", "mcp_init_error",
-    "structured_tool_collision", "notification_error", "internal_error",
+    "extension_setup_error", "child_cleanup_error", "notification_error", "internal_error",
   ];
   assert.equal(adapterError("auth_error").code, -32000);
   for (const kind of invalid) assert.equal(adapterError(kind).code, -32602, kind);
-  for (const kind of internal) assert.equal(adapterError(kind).code, -32603, kind);
+  for (const kind of internal) {
+    const error = kind === "mcp_init_error"
+      ? adapterError(kind, { server: "s" })
+      : kind === "child_cleanup_error"
+        ? adapterError(kind, { details: { remainingChildren: 1 } })
+        : adapterError(kind);
+    assert.equal(error.code, -32603, kind);
+  }
   const server = wire(adapterError("mcp_init_error", { server: "s" }));
   assert.deepEqual(server.data, { errorKind: "mcp_init_error", message: "mcp server initialization failed", server: "s" });
   const diagnostics = [{ type: "provider", timestamp: 7, error: { message: "SECRET", stack: "SECRET stack" }, details: { SECRET: true } }];
@@ -177,14 +184,19 @@ test("T8 all 26 error rows retain reserved codes, fixed labels, precedence, and 
 
 test("T9 thinking/model config is exact, auth-aware, and clamp-reflecting", async () => {
   const fake = fakeSession({});
-  const model = { provider: "test", id: "model" };
-  const modelRuntime = { getModel: () => model, hasConfiguredAuth: () => true } as never;
+  const model = { provider: "test", id: "model", name: "Model" };
+  const modelRuntime = { async getAvailable() { return [model]; } } as never;
   assert.deepEqual((thinkingLevelOption(fake.session).options as Array<{ value: string }>).map(({ value }) => value), THINKING_LEVELS);
-  assert.equal((await applyConfig(fake.session, modelRuntime, "thinkingLevel", "high"))[0]?.currentValue, "high");
-  await assert.rejects(applyConfig(fake.session, modelRuntime, "thinkingLevel", "bogus"), (error) => wire(error as RequestError).data.errorKind === "invalid_config_value");
-  await assert.rejects(applyConfig(fake.session, modelRuntime, "model", true), (error) => wire(error as RequestError).data.errorKind === "invalid_config_type");
-  await assert.rejects(applyConfig(fake.session, { getModel: () => undefined } as never, "model", "x/y"), (error) => wire(error as RequestError).data.errorKind === "invalid_model");
-  await assert.rejects(applyConfig(fake.session, { getModel: () => model, hasConfiguredAuth: () => false } as never, "model", "x/y"), (error) => (error as RequestError).code === -32000);
+  assert.deepEqual(modelOption(fake.session, [model]), {
+    id: "model", name: "Model", type: "select", category: "model", currentValue: "", options: [{ value: "test/model", name: "Model" }],
+  });
+  assert.equal((await applyConfig(fake.session, modelRuntime, [model], "thinkingLevel", "high")).configOptions[0]?.currentValue, "high");
+  await assert.rejects(applyConfig(fake.session, modelRuntime, [model], "thinkingLevel", "bogus"), (error) => wire(error as RequestError).data.errorKind === "invalid_config_value");
+  await assert.rejects(applyConfig(fake.session, modelRuntime, [model], "model", true), (error) => wire(error as RequestError).data.errorKind === "invalid_config_type");
+  await assert.rejects(applyConfig(fake.session, { getAvailable: async () => [] } as never, [model], "model", "x/y"), (error) => wire(error as RequestError).data.errorKind === "invalid_model");
+  const authFailure = fakeSession({});
+  authFailure.session.setModel = async () => { throw new Error("No API key for test/model"); };
+  await assert.rejects(applyConfig(authFailure.session, modelRuntime, [model], "model", "test/model"), (error) => (error as RequestError).code === -32000);
 });
 
 test("T10 initialize advertises only the exact implemented capabilities", () => {
@@ -193,9 +205,8 @@ test("T10 initialize advertises only the exact implemented capabilities", () => 
   assert.deepEqual(initialized.agentCapabilities, {
     loadSession: true,
     promptCapabilities: { image: true },
-    mcpCapabilities: {},
+    mcpCapabilities: { http: true, sse: true },
     sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} },
-    _meta: { "@automatalabs/pi-acp": { outputSchema: true } },
   });
   assert.equal("additionalDirectories" in initialized.agentCapabilities, false);
 });
@@ -228,17 +239,16 @@ test("T11 permission wrapper drains first, delegates fresh/cached allows, and de
   });
 });
 
-test("T12 structured output arms, captures last value, disarms, validates, and detects absence", async () => {
-  const structured = new StructuredOutputState();
-  const fake = fakeSession({ customTools: [structured.tool] });
-  structured.install(fake.session);
-  assert.match(structured.arm(fake.session, { type: "object" }), /__acp_structured_output/);
-  await structured.tool.execute("1", { answer: 1 }, undefined, undefined, {} as never);
-  await structured.tool.execute("2", { answer: 2 }, undefined, undefined, {} as never);
-  assert.equal(structured.takeJson(), '{"answer":2}');
-  structured.disarm(fake.session);
-  assert.throws(() => structured.arm(fake.session, null), (error) => wire(error as RequestError).data.errorKind === "invalid_output_schema");
-  assert.throws(() => new StructuredOutputState().install(fakeSession({}).session), (error) => wire(error as RequestError).data.errorKind === "structured_tool_collision");
+test("S3 pi-acp has no bespoke structured-output channel", async () => {
+  const files = await Promise.all([
+    readFile(new URL("../src/agent.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/session.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/errors.ts", import.meta.url), "utf8"),
+  ]);
+  assert.doesNotMatch(
+    files.join("\n"),
+    /__acp_structured_output|StructuredOutputState|structured_tool_collision|invalid_output_schema|outputSchema/,
+  );
 });
 
 test("T13 auth methods are unconditional and exact; authenticate is ambient/no-op", () => {
@@ -271,7 +281,17 @@ test("T20 MCP result union and deterministic bounded aliases are total", () => {
     { type: "resource", resource: { uri: "r", text: "body" } },
     { type: "resource", resource: { uri: "b", blob: "AA==" } },
   ], structuredContent: { x: 1 } });
-  assert.deepEqual(result.details, { x: 1 });
+  assert.deepEqual(result.details, {
+    content: [
+      { type: "text", text: "t" },
+      { type: "image", data: "i", mimeType: "image/png" },
+      { type: "audio", data: "a", mimeType: "audio/wav" },
+      { type: "resource_link", uri: "u", name: "n" },
+      { type: "resource", resource: { uri: "r", text: "body" } },
+      { type: "resource", resource: { uri: "b", blob: "AA==" } },
+    ],
+    structuredContent: { x: 1 },
+  });
   assert.equal(result.content.length, 6);
   const used = new Set<string>();
   const first = allocateAlias("server", "x".repeat(200), used);

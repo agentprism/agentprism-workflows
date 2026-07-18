@@ -52,12 +52,14 @@ test("T27 README covers invocation, API, built-in routing, T2b disclosure, limit
     "AgentPrism built-in backend",
     'model: "pi"',
     'model: "pi/openrouter/vendor/model-id"',
-    'agentCapabilities._meta["@automatalabs/pi-acp"].outputSchema',
+    "configured `model` select",
     "provider/model-id",
     "-32000",
     "pi-stored-credentials",
+    "stdio, Streamable HTTP, and legacy SSE",
+    "Client-hosted `acp`",
+    "StructuredOutput",
     "mcp__",
-    "__acp_structured_output",
     "tsc -p tsconfig.type-tests.json",
     "small deviation from the test-script example",
     "Version 1 limitations",
@@ -65,4 +67,10 @@ test("T27 README covers invocation, API, built-in routing, T2b disclosure, limit
     "THIRD-PARTY notice",
     "MIT License",
   ]) assert.ok(readme.includes(required), required);
+  for (const retired of [
+    "@automatalabs/pi-acp\"].outputSchema",
+    "__acp_structured_output",
+    "Only stdio MCP",
+    "native schema channel",
+  ]) assert.equal(readme.includes(retired), false, retired);
 });

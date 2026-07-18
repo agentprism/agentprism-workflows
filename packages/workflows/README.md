@@ -696,9 +696,9 @@ formatHarnessConfigReport(report); // the CLI's human table
 ## Structured output
 
 Pass a JSON Schema to `agent({ schema })` (in a script) or `runner.run(prompt, { schema })` (direct)
-and the result is a **validated object** instead of text. The backend constrains output natively
-(Claude `outputFormat`; Codex strict `outputSchema`; pi native `_meta.outputSchema`; prompt/tool-assisted JSON for OpenCode and
-custom agents), then the value is coerced and validated client-side (typebox `Convert` → `Check`); on a miss the runner re-prompts a bounded number of
+and the result is a **validated object** instead of text. Claude and Codex use their agent-specific
+schema channels; Pi and OpenCode use the injected client-hosted HTTP `StructuredOutput` MCP tool plus
+the common prompt/validated-last-text fallback. The value is coerced and validated client-side (typebox `Convert` → `Check`); on a miss the runner re-prompts a bounded number of
 times before failing with a non-recoverable `SCHEMA_NONCOMPLIANCE`.
 
 A **plain JSON Schema object literal** works everywhere (this is the only option inside a script —

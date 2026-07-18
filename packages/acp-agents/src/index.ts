@@ -132,7 +132,17 @@ export type {
 export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from "./registry.js";
 export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./registry.js";
 
-export { PooledConnection, SessionHandle } from "./acp-client.js";
+export {
+  PI_CHILD_CLEANUP_DEADLINE_MS,
+  PI_CLOSE_DELIVERY_MARGIN_MS,
+  PI_CLOSE_SESSION_TIMEOUT_MS,
+  PI_DISPOSE_SIGKILL_GRACE_MS,
+  PI_PROCESS_EXIT_MARGIN_MS,
+  PI_PROCESS_SHUTDOWN_ENVELOPE_MS,
+  PooledConnection,
+  SessionHandle,
+  isChildCleanupError,
+} from "./acp-client.js";
 export type { AcpSessionOptions, PooledConnectionDeps } from "./acp-client.js";
 
 export {

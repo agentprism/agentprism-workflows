@@ -98,7 +98,7 @@ export interface StructuredSession {
   /** The latest turn's assistant text (for prose extraction). */
   lastText(): string;
   /** The backend's native structured result for the latest turn (unvalidated), or undefined. */
-  tryNative(): unknown;
+  tryNative?(): unknown;
   /** Captured StructuredOutput MCP tool arguments, when client-hosted injection is active. */
   tryCaptured?(): unknown | undefined;
 }
@@ -133,7 +133,7 @@ export async function resolveStructuredOutput(
       const validated = validateValue(captured, schema);
       if (validated !== undefined) return validated;
     }
-    const native = session.tryNative();
+    const native = session.tryNative?.();
     if (native !== undefined && native !== null) {
       const validated = validateValue(native, schema);
       if (validated !== undefined) return validated;

@@ -84,8 +84,10 @@ One author API (`schema`), four fulfillment paths — chosen automatically per b
 |---|---|
 | Claude | native `outputFormat`, schema normalized to Anthropic's structured-outputs subset (e.g. `oneOf` → `anyOf`; unsupported keywords/formats stripped on the wire) |
 | Codex | native strict `outputSchema` (OpenAI strict subset normalization) |
-| Pi | native turn-level `_meta.outputSchema` with plain JSON Schema; final-message JSON is parsed; no schema prompt embedding and no injected MCP tool |
+| Pi | a client-hosted `StructuredOutput` MCP tool injected when the agent advertises HTTP MCP support; common prompt-embedded schema and validated final-text JSON fallback |
 | OpenCode / custom ACP | a client-hosted **`StructuredOutput` MCP tool** injected into the session when the agent advertises HTTP MCP support (an agent may show it as `structured_output_StructuredOutput`); otherwise prompt-embedded schema + JSON parse of the final message. Custom backends can opt out of tool injection with `structuredOutputTool: false`. |
+
+Pi accepts stdio, Streamable HTTP, and SSE MCP servers; ACP-transport MCP hosting remains client-side.
 
 In every channel the runner coerces + validates client-side and re-prompts a bounded number of times; the final miss fails the call with non-recoverable `SCHEMA_NONCOMPLIANCE`. Constraints stripped from the wire are still enforced client-side — an exotic schema keyword shows up as re-prompt churn, so keep schemas simple.
 

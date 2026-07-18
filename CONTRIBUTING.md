@@ -44,10 +44,13 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 ## Testing
 
-`pnpm test` runs the full deterministic suite without credentials. Two files contain live tests, and both are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
+`pnpm test` runs the full deterministic suite without credentials. Five files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
 
 - `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, and OpenCode structured-output/pooling paths.
 - `packages/acp-agents/test/auth.live.e2e.test.ts` drives the three first-class auth profiles; individual cases have additional credential/gateway gates.
+- `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_CONTINUATION_LIVE_E2E=1` plus its backend credentials.
+- `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation and additionally requires `AGENTPRISM_ISOLATION_LIVE_E2E=1` plus backend credentials.
+- `packages/pi-acp/test/live.e2e.test.ts` drives Pi structured output, a real HTTP MCP tool round-trip, and tracked-bash stop/reap; it additionally requires `AGENTPRISM_PI_E2E_MODEL` and that model's provider key.
 
 Run the MCP live suite explicitly with real auth:
 
@@ -61,6 +64,7 @@ Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired b
 
 1. **ACP dependency gate** (`node scripts/check-acp-deps.mjs`, also runnable standalone), three sub-checks:
    - *npm freshness*: the ACP client/agent libraries (`@agentclientprotocol/*`, `@automatalabs/codex-acp`, `@earendil-works/pi-coding-agent`) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
+     On a pi runtime bump, re-capture `packages/pi-acp/test/fixtures/provider-error-strings.ts` and re-run the classifier suite so provider prose cannot silently change pause/retry classification.
    - *fork git sync*: our codex-acp fork's published `main` must contain its upstream (`agentclientprotocol/codex-acp`) `main` — versions can't be compared because the fork's version line has diverged, so the check counts unmerged upstream commits. It always works against a **real clone** (no API summary): the working clone (`~/codex-acp`, override with `AGENTPRISM_CODEX_ACP_DIR`) when present, otherwise a managed temp clone the gate creates at `<tmpdir>/codex-acp` and reuses (this is the CI path — public repos, no token). Either way the clone is verified and prepared first: `origin` must be the fork (`VikashLoomba/codex-acp`, matched by owner/repo so https/ssh forms both pass — read-only check, the gate never mutates a repo that isn't provably the fork); the `upstream` remote is added or re-pointed to the true upstream when wrong; both remotes are fetched; the checkout is put on `main` and pulled current (a working clone must be clean and must have no unpushed commits — releases are cut from the *pushed* fork main, so a locally-merged-but-unpushed sync still blocks). Only then are upstream commits counted against the local checkout. On failure it prints the merge → push → `release-fork.yml` → bump sequence.
    - *wrapped runtime freshness*: an adapter can be at npm `latest` while exact-pinning a stale agent runtime inside it (e.g. `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` — the runtime that actually answers prompts), which the freshness check can't see. The gate compares the lockfile's *transitive* resolution of each wrapped runtime against the runtime's npm `latest`. Fix when behind: bump the adapter if its latest already wraps a current runtime, else add a root `pnpm.overrides` pin (then `pnpm install` + run the acp-agents live e2e before pushing). The check warns once an override becomes redundant so versions drift back to upstream-managed.
 
@@ -71,7 +75,7 @@ CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI e
 
 ### When the dependency gate blocks
 
-The gate failing anywhere — pre-push, a PR's required check, or the release workflow — means the same thing: a tracked upstream moved (or freshness could not be verified) and **all merges and releases stay blocked until a maintenance PR lands on `main`**. Triage in this order:
+The gate failing anywhere — pre-push, a PR's required check, or the release workflow — means the same thing: a tracked upstream moved (or freshness could not be verified), so **all merges and releases are blocked; merging the maintenance PR into `main` unblocks them**. Triage in this order:
 
 1. **Identify what is stale** from the gate output: an ACP library behind npm `latest`, the codex-acp fork missing upstream commits, or a wrapped runtime lagging inside a current adapter.
 2. **Read the upstream changes before bumping** — the release notes/changelog, and for substantial jumps the source diff of the surfaces we integrate against. Decide which of three shapes this is:

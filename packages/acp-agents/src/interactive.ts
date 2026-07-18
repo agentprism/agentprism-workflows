@@ -16,7 +16,7 @@ import type { AgentHistoryEntry, AgentSessionRef, McpServerConfig, PromptImage }
 import type { RunOptions } from "@automatalabs/shared-types";
 import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
-import type { PooledConnection, SessionHandle } from "./acp-client.js";
+import { isChildCleanupError, type PooledConnection, type SessionHandle } from "./acp-client.js";
 import type { AcpEventListener, AcpEventName } from "./events.js";
 import { mapThrownError } from "./errors-map.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
@@ -304,10 +304,11 @@ export class InteractiveSession {
   private async doRelease(): Promise<void> {
     this.removeAbort?.();
     this.removeAbort = undefined;
+    let childFailure: unknown;
     try {
       await this.session.release({ keepOpen: this.keepSession });
-    } catch {
-      // best-effort: release must still dispose the dedicated process and unregister.
+    } catch (error) {
+      if (isChildCleanupError(error)) childFailure = error;
     }
     try {
       await this.connection.dispose();
@@ -317,6 +318,7 @@ export class InteractiveSession {
       this.removeSubscriptions();
       this.onReleaseCallback(this);
     }
+    if (childFailure) throw childFailure;
   }
 
   private removeSubscriptions(): void {

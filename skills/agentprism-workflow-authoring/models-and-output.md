@@ -80,7 +80,7 @@ const report = await agent("Review the diff on this branch for correctness bugs.
 report.findings.forEach((f) => log(`${f.file}:${f.line} ${f.summary}`));
 ```
 
-The same schema works on **every** backend; only the fulfillment channel differs, and the runner picks it for you: Claude uses its native `outputFormat`, Codex its strict `outputSchema`, Pi its native plain `_meta.outputSchema` with final-message JSON, and OpenCode / custom ACP agents either get a client-hosted `StructuredOutput` MCP tool injected into the session (when the agent advertises HTTP MCP support) or fall back to a prompt-embedded schema with the final message parsed as JSON. Pi's native path neither embeds the schema in the prompt nor injects an MCP tool. In every channel the runner validates the value client-side (with type coercion) and re-prompts a bounded number of times before failing the call with non-recoverable `SCHEMA_NONCOMPLIANCE`.
+The same schema works on **every** backend; only the fulfillment channel differs, and the runner picks it for you: Claude uses its `outputFormat`, Codex its strict `outputSchema`, while Pi, OpenCode, and eligible custom ACP agents receive a client-hosted `StructuredOutput` MCP tool when they advertise HTTP MCP support. Pi accepts stdio, Streamable HTTP, and SSE MCP servers. If no valid tool capture exists, Pi retains the runner's common prompt-embedded schema and validated final-text JSON fallback. In every channel the runner validates the value client-side (with type coercion) and re-prompts a bounded number of times before failing the call with non-recoverable `SCHEMA_NONCOMPLIANCE`.
 
 Schema authoring rules that keep all channels healthy:
 

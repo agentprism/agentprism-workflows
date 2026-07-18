@@ -178,6 +178,31 @@ test("a DIFFERENT reserved code that merely MENTIONS the auth phrase never mis-r
   }
 });
 
+test("Pi child cleanup is exact, redacted, and non-recoverable while unknown -32603 stays recoverable", () => {
+  const original = {
+    code: -32603,
+    message: "secret-bearing adapter prose",
+    data: { errorKind: "child_cleanup_error", details: { remainingChildren: 2 } },
+  };
+  const mapped = mapThrownError(original, "pi-agent");
+  assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  assert.equal(mapped.recoverable, false);
+  assert.equal(mapped.message, "child process cleanup failed");
+  assert.equal(mapped.agentLabel, "pi-agent");
+  assert.equal(mapped.details, original);
+  assert.doesNotMatch(mapped.message, /secret-bearing/);
+
+  for (const candidate of [
+    { ...original, code: -32602 },
+    { ...original, data: { errorKind: "other" } },
+    { code: -32603, message: "unknown internal failure" },
+  ]) {
+    const generic = mapThrownError(candidate);
+    assert.equal(generic.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(generic.recoverable, true);
+  }
+});
+
 test("AUTH_REQUIRED authContext carries advertised method ids/types/names + backendId only", () => {
   const mapped = mapThrownError(RequestError.authRequired(undefined, "login first"), {
     label: "auth-agent",
