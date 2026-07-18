@@ -1,5 +1,26 @@
 # @automatalabs/acp-agents
 
+## 0.32.0
+
+### Minor Changes
+
+- a3d5613: Recover persisted pending and running workflows whose owning process has exited into an
+  interrupted, resumable pause during construction and cold lookups. Crash snapshots with a
+  journaled prefix use the `crash-residue` positional bridge when the admission environment is
+  stable, while environment drift keeps the run all-live.
+- a3d5613: Enforce run-level agent timeouts as unbypassable total-wall-clock ceilings per attempt, with
+  per-call deadlines only able to tighten them and every retry receiving a fresh clock. Persist and
+  report resolved timeout limits and failures, and close/recycle ACP children that ignore
+  cancellation.
+
+### Patch Changes
+
+- Updated dependencies [a3d5613]
+- Updated dependencies [a3d5613]
+- Updated dependencies [a3d5613]
+- Updated dependencies [a3d5613]
+  - @automatalabs/shared-types@0.25.0
+
 ## 0.31.1
 
 ### Patch Changes
