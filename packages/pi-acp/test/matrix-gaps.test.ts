@@ -57,6 +57,19 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function gatedRealSleep(gatedMs: number, gate: Promise<void>): typeof realSleep {
+  return async (ms, signal) => {
+    if (ms === gatedMs) {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      await Promise.race([gate, aborted]);
+    }
+    return realSleep(ms, signal);
+  };
+}
+
 function fakeCreateResult(options: CreateAgentSessionOptions, behavior: "normal" | "wedged" | "tool" = "normal") {
   const control = fakeSession(options, behavior);
   return {
@@ -1053,13 +1066,20 @@ test("T20 MCP duplicate names, timeouts, detached late failures, and 128-char su
 test("T20 a timed-out real stdio connect kills its spawned child and lifecycle rollback is retryable", async () => {
   const setup = fakeDeps();
   const id = "hung-child-id";
+  const timeoutClock = deferred<void>();
   setup.deps.sessions.create = () => SessionManager.create(setup.cwd, setup.sessionDir, { id });
   setup.deps.mcpTimeoutMs = 1_000;
-  setup.deps.connectMcpClient = (server, signal) => connectDefaultMcpClient(server, signal, 300, realSleep);
+  setup.deps.sleep = gatedRealSleep(1_000, timeoutClock.promise);
+  setup.deps.connectMcpClient = (server, signal) => connectDefaultMcpClient(
+    server,
+    signal,
+    300,
+    gatedRealSleep(300, timeoutClock.promise),
+  );
   const pidPath = `${setup.sessionDir}/hung-mcp.pid`;
   const childScript = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)";
   const agent = new PiAcpAgent(setup.deps);
-  await assert.rejects(agent.newSession(context({
+  const rejection = assert.rejects(agent.newSession(context({
     cwd: setup.cwd,
     mcpServers: [{
       name: "hung-child",
@@ -1068,8 +1088,13 @@ test("T20 a timed-out real stdio connect kills its spawned child and lifecycle r
       env: [],
     }],
   })), (error) => errorKind(error) === "mcp_init_error");
+  for (let attempt = 0; attempt < 500 && !existsSync(pidPath); attempt += 1) {
+    await realSleep(10, new AbortController().signal);
+  }
   assert.equal(existsSync(pidPath), true);
   const pid = Number(readFileSync(pidPath, "utf8"));
+  timeoutClock.resolve();
+  await rejection;
   // The pinned stdio transport owns escalation: it first gives the child its
   // transport grace and then issues SIGKILL.  The adapter must not pre-kill it.
   for (let attempt = 0; attempt < 500; attempt += 1) {

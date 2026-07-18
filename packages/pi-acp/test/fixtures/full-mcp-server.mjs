@@ -39,6 +39,17 @@ export function conformanceProgressOptions(server, onprogress) {
   return { onprogress() {} };
 }
 
+function conformanceRequestSent(server, method) {
+  const state = wireProgressState(server);
+  const waiters = state.requestWaiters.get(method) ?? [];
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  waiters.push({ resolve, reject });
+  state.requestWaiters.set(method, waiters);
+  return promise;
+}
+
 export function connectConformanceServer(server, transport) {
   const state = wireProgressState(server);
   const send = transport.send.bind(transport);
@@ -46,7 +57,16 @@ export function connectConformanceServer(server, transport) {
     if (message && typeof message === "object" && "id" in message && "method" in message && state.pending.length > 0) {
       state.active.set(message.id, state.pending.shift());
     }
-    return send(message, options);
+    const method = message && typeof message === "object" && "method" in message ? message.method : undefined;
+    const waiter = typeof method === "string" ? state.requestWaiters.get(method)?.shift() : undefined;
+    try {
+      const sending = send(message, options);
+      if (waiter) Promise.resolve(sending).then(waiter.resolve, waiter.reject);
+      return sending;
+    } catch (error) {
+      waiter?.reject(error);
+      throw error;
+    }
   };
   const onmessage = transport.onmessage;
   transport.onmessage = (message, extra) => {
@@ -91,7 +111,7 @@ export function createConformanceServer(options = {}) {
       instructions: "fixture instructions",
     },
   );
-  wireProgressStates.set(server, { pending: [], active: new Map() });
+  wireProgressStates.set(server, { pending: [], active: new Map(), requestWaiters: new Map() });
 
   server.setRequestHandler(ListToolsRequestSchema, ({ params }) => {
     if (options.largeCatalog) {
@@ -219,6 +239,7 @@ export function createConformanceServer(options = {}) {
         await new Promise((resolve) => setImmediate(resolve));
       }
       const peer = new AbortController();
+      let rootsPeerRequestSent;
       let markStarted;
       const started = new Promise((resolve) => { markStarted = resolve; });
       const options = {
@@ -233,6 +254,7 @@ export function createConformanceServer(options = {}) {
           metadata: { raceFeature: feature, raceCause: cause },
         }, options);
       } else if (feature === "roots") {
+        if (cause === "peer") rootsPeerRequestSent = conformanceRequestSent(server, "roots/list");
         incoming = server.listRoots(undefined, options);
       } else if (feature === "form") {
         incoming = server.elicitInput({
@@ -256,6 +278,11 @@ export function createConformanceServer(options = {}) {
       // fixture is still awaiting its deterministic outer progress barrier.
       // Observe that rejection immediately, then assert it below.
       incoming.catch(() => undefined);
+      if (rootsPeerRequestSent) {
+        await rootsPeerRequestSent;
+        peer.abort(new Error("fixture peer cancellation"));
+        markStarted();
+      }
       // A deliberately immediate timeout may commit before its fire-and-forget
       // 0/1 progress frame is received. The host-operation barrier in the test
       // triggers that timeout, so it is the deterministic admission proof.
@@ -267,7 +294,7 @@ export function createConformanceServer(options = {}) {
           params: { progressToken: extra._meta.progressToken, progress: 1, total: 1, message: `race-started:${feature}:${cause}` },
         });
       }
-      if (cause === "peer") peer.abort(new Error("fixture peer cancellation"));
+      if (cause === "peer" && !rootsPeerRequestSent) peer.abort(new Error("fixture peer cancellation"));
       if (cause === "transport") {
         if (options.exitOnTransportRace) {
           setImmediate(() => process.exit(0));

@@ -23,6 +23,19 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function gatedRealSleep(gatedMs: number, gate: Promise<void>): typeof realSleep {
+  return async (ms, signal) => {
+    if (ms === gatedMs) {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      await Promise.race([gate, aborted]);
+    }
+    return realSleep(ms, signal);
+  };
+}
+
 async function eventually<T>(operation: () => Promise<T>, timeoutMs = 5_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -92,8 +105,12 @@ test("A1 tracked bash timeout retains the ordinary Pi timeout only after disappe
   const cwd = await mkdtemp(join(tmpdir(), "pi-acp-bash-timeout-"));
   const pidPath = join(cwd, "leader.pid");
   const descendantPath = join(cwd, "descendant.pid");
+  const timeoutClock = deferred<void>();
   const slot = new ChildProcessRegistrySlot({ graceMs: 5_000, sleep: realSleep });
-  const operations = createTrackedBashOperations(slot, undefined, { graceMs: 5_000, sleep: realSleep }, () => {
+  const operations = createTrackedBashOperations(slot, undefined, {
+    graceMs: 5_000,
+    sleep: gatedRealSleep(50, timeoutClock.promise),
+  }, () => {
     assert.fail("successful timeout cleanup must not latch a session failure");
   });
   const running = operations.exec(
@@ -103,7 +120,9 @@ test("A1 tracked bash timeout retains the ordinary Pi timeout only after disappe
   );
   const pid = await readPid(pidPath);
   const descendant = await readPid(descendantPath);
-  await assert.rejects(running, /timeout:0\.05/);
+  const rejection = assert.rejects(running, /timeout:0\.05/);
+  timeoutClock.resolve();
+  await rejection;
   assert.equal(slot.remainingChildren, 0);
   await assertGone(pid);
   await assertGone(descendant);
@@ -318,6 +337,7 @@ test("A1 timeout-owned kill failure latches the record and a later generation re
   if (process.platform === "win32") return;
   const cwd = await mkdtemp(join(tmpdir(), "pi-acp-bash-kill-failure-"));
   const pidPath = join(cwd, "leader.pid");
+  const timeoutClock = deferred<void>();
   let failKill = true;
   let cleanupFailures = 0;
   const groupState = (pgid: number): "alive" | "gone" | "error" => {
@@ -338,7 +358,10 @@ test("A1 timeout-owned kill failure latches the record and a later generation re
       process.kill(-pgid, "SIGKILL");
     },
   });
-  const operations = createTrackedBashOperations(slot, "/bin/bash", { graceMs: 5_000, sleep: realSleep }, () => {
+  const operations = createTrackedBashOperations(slot, "/bin/bash", {
+    graceMs: 5_000,
+    sleep: gatedRealSleep(30, timeoutClock.promise),
+  }, () => {
     cleanupFailures += 1;
   });
   const running = operations.exec(
@@ -347,7 +370,9 @@ test("A1 timeout-owned kill failure latches the record and a later generation re
     { onData() {}, signal: new AbortController().signal, timeout: 0.03, env: { ...process.env } },
   );
   const pid = await readPid(pidPath);
-  await assert.rejects(running);
+  const rejection = assert.rejects(running);
+  timeoutClock.resolve();
+  await rejection;
   assert.equal(cleanupFailures, 1);
   assert.equal(slot.childCleanupFailed, true);
   assert.equal(slot.remainingChildren, 1);

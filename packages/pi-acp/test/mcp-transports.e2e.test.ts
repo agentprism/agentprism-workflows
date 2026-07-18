@@ -48,6 +48,19 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function gatedRealSleep(gatedMs: number, gate: Promise<void>): typeof realSleep {
+  return async (ms, signal) => {
+    if (ms === gatedMs) {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      await Promise.race([gate, aborted]);
+    }
+    return realSleep(ms, signal);
+  };
+}
+
 async function requestJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -132,10 +145,11 @@ async function fatalStreamableHost(
   };
 }
 
-async function requestDrivenIdleHost(): Promise<Host & { methods: string[] }> {
+async function requestDrivenIdleHost(): Promise<Host & { methods: string[]; waitForToolCall(): Promise<void> }> {
   const methods: string[] = [];
   const sessionId = randomUUID();
   const hanging = new Set<ServerResponse>();
+  const toolCallReceived = deferred<void>();
   const http = createServer((req, res) => {
     methods.push(req.method ?? "");
     void (async () => {
@@ -168,6 +182,7 @@ async function requestDrivenIdleHost(): Promise<Host & { methods: string[] }> {
       if (message.method === "tools/call") {
         hanging.add(res);
         res.once("close", () => hanging.delete(res));
+        toolCallReceived.resolve();
         return;
       }
       sendJson(res, { jsonrpc: "2.0", id: message.id, result: {} });
@@ -178,6 +193,7 @@ async function requestDrivenIdleHost(): Promise<Host & { methods: string[] }> {
     url: `http://127.0.0.1:${port}/mcp`,
     methods,
     seenHeaders: [],
+    waitForToolCall: () => toolCallReceived.promise,
     async close() {
       for (const response of hanging) response.destroy();
       http.closeAllConnections();
@@ -1237,8 +1253,12 @@ test("M2 real HTTP close covers absent session, DELETE 405/error/timeout, and un
     const originalError = console.error;
     console.error = (...values: unknown[]) => { stderr.push(values.join(" ")); };
     const lifecycle = new AbortController();
+    const timeoutClock = deferred<void>();
     try {
-      const deps = await resolveDeps({ mcpTimeoutMs: 100, sleep: realSleep });
+      const deps = await resolveDeps({
+        mcpTimeoutMs: 100,
+        sleep: gatedRealSleep(100, timeoutClock.promise),
+      });
       const bridge = await bridgeMcpServers([{
         name: `delete-${deleteMode}`, type: "http", url: host.url, headers: [],
       }], new AbortController().signal, deps, {
@@ -1255,6 +1275,7 @@ test("M2 real HTTP close covers absent session, DELETE 405/error/timeout, and un
       await host.waitForGet();
       host.breakGet("eof");
       await eventually(() => assert.equal(host.methods.filter((method) => method === "DELETE").length, 1));
+      timeoutClock.resolve();
       await bridge.close();
       assert.equal(diagnostics.length, 1);
       if (deleteMode === "405") {
@@ -1275,7 +1296,11 @@ test("M2/M8 request-driven HTTP 405 stays live until the next request timeout di
   const host = await requestDrivenIdleHost();
   const diagnostics: string[] = [];
   const lifecycle = new AbortController();
-  const deps = await resolveDeps({ mcpTimeoutMs: 100, sleep: realSleep });
+  const timeoutClock = deferred<void>();
+  const deps = await resolveDeps({
+    mcpTimeoutMs: 100,
+    sleep: gatedRealSleep(100, timeoutClock.promise),
+  });
   const bridge = await bridgeMcpServers([{
     name: "request-idle", type: "http", url: host.url, headers: [],
   }], new AbortController().signal, deps, {
@@ -1289,6 +1314,18 @@ test("M2/M8 request-driven HTTP 405 stays live until the next request timeout di
     emitDiagnostic: (value) => diagnostics.push(value),
   });
   try {
+    const handle = bridge.clients[0];
+    assert.ok(handle);
+    const callTool = handle.callTool.bind(handle);
+    // Keep the SDK's non-injectable duplicate watchdog out of this race: the
+    // adapter's 100 ms clock below remains the asserted timeout mechanism.
+    handle.callTool = (name, args, signal, _timeoutMs, onprogress) => callTool(
+      name,
+      args,
+      signal,
+      2_147_483_647,
+      onprogress,
+    );
     const registered = new Map<string, ToolDefinition>();
     const factory = typeof bridge.inlineExtension === "function" ? bridge.inlineExtension : bridge.inlineExtension.factory;
     await factory({ registerTool(tool: ToolDefinition) { registered.set(tool.name, tool); } } as unknown as ExtensionAPI);
@@ -1302,7 +1339,13 @@ test("M2/M8 request-driven HTTP 405 stays live until the next request timeout di
     assert.deepEqual(diagnostics, [], "405 is request-driven idle, not fatal transport death");
     const hanging = registered.get("mcp__request-idle__hang");
     assert.ok(hanging);
-    await assert.rejects(hanging.execute("idle-timeout", {}, new AbortController().signal), /timed out/);
+    const rejection = assert.rejects(
+      hanging.execute("idle-timeout", {}, new AbortController().signal),
+      /timed out/,
+    );
+    await host.waitForToolCall();
+    timeoutClock.resolve();
+    await rejection;
     await eventually(() => {
       assert.deepEqual(diagnostics, ["[mcp:request-idle] connection closed; server disabled"]);
       assert.equal(host.methods.filter((method) => method === "DELETE").length, 1);
