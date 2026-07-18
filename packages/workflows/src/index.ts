@@ -31,6 +31,8 @@ export {
   runWorkflow,
   parseWorkflowScript,
   hashCheckpointInputs,
+  resolveAgentTimeoutMs,
+  resolveWorkflowRunLimits,
   redactText,
   truncateUtf8,
   CALL_PATH_FORMAT,
@@ -99,6 +101,9 @@ export { probeHarnessConfig, formatHarnessConfigReport } from "./config.js";
 export type { ProbeHarnessConfigOptions, HarnessConfigReport } from "./config.js";
 export type {
   WorkflowRunOptions,
+  WorkflowRunLimitOptions,
+  WorkflowAgentAttemptControl,
+  WorkflowAgentCallCancellation,
   AgentOptions,
   ExecOptions,
   WorkflowManagerOptions,
@@ -119,6 +124,7 @@ export type {
   WorkflowLogTail,
   WorkflowRunCallStatus,
   WorkflowRunInspectionOptions,
+  WorkflowRunLimits,
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
   WorkflowRunFallback,
@@ -135,6 +141,10 @@ export type {
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayOperationalOption,
+  WorkflowReplayOperationalChange,
+  WorkflowReplayFirstNonReplay,
+  WorkflowReplayEligibility,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,

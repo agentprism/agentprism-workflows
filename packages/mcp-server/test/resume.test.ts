@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 import {
   connect,
@@ -73,7 +73,17 @@ test("resumeFromRunId loads the persisted journal and REPLAYS it (runner is not 
     assert.equal(report?.live, 0);
     assert.equal(report?.failed, 0);
     assert.equal((report?.calls as unknown[])?.length, 2);
-    assert.match(textOf(r2), /^resume: identity-v1, 2 replayed, 0 live, 0 failed$/m);
+    const eligibility = sc2?.replayEligibility as Record<string, unknown> | undefined;
+    assert.equal(eligibility?.strategy, "identity-v1");
+    assert.equal(eligibility?.predictedReplayablePrefix, 2);
+    assert.equal(eligibility?.replayedPrefix, 2);
+    assert.equal(eligibility?.engineVersionComparison, "same");
+    assert.equal(eligibility?.sourceInputsFormat, 2);
+    assert.equal(eligibility?.currentInputsFormat, 2);
+    assert.match(
+      textOf(r2),
+      /^resume: identity-v1; predicted replayable prefix 2; replayed prefix 2; 2 replayed, 0 live, 0 failed$/m,
+    );
     assert.doesNotMatch(textOf(r2), /path-hash|unique-hash|recordedIndex/);
 
     const positional = await client.callTool({
@@ -90,7 +100,165 @@ test("resumeFromRunId loads the persisted journal and REPLAYS it (runner is not 
     assert.equal(positionalReport?.fallbackReason, "forced-positional");
     assert.equal(positionalReport?.eligibility, "safe-prefix");
     assert.equal(positionalReport?.replayed, 2);
-    assert.match(textOf(positional), /^resume: positional-v1\/safe-prefix, 2 replayed, 0 live, 0 failed$/m);
+    assert.match(
+      textOf(positional),
+      /^resume: positional-v1\/safe-prefix \(forced-positional\); predicted replayable prefix 2; replayed prefix 2; 2 replayed, 0 live, 0 failed$/m,
+    );
+  } finally {
+    await dispose();
+  }
+});
+
+test("run, await, inspect, and foreground expose the same replay eligibility diagnostics", async () => {
+  const { runner, calls } = countingRunner();
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const source = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: TWO_AGENT_SCRIPT,
+        agentTimeoutMs: 900_000,
+        agentRetries: 1,
+        concurrency: 2,
+      },
+    });
+    const sourceRunId = String(structured(source)?.runId);
+    const resumeArgs = {
+      script: TWO_AGENT_SCRIPT,
+      resumeFromRunId: sourceRunId,
+      concurrency: 7,
+    } as const;
+
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: { ...resumeArgs, background: true },
+    });
+    const acceptedContent = structured(accepted);
+    const acceptedEligibility = acceptedContent?.replayEligibility as Record<string, unknown>;
+    assert.equal(acceptedEligibility.strategy, "identity-v1");
+    assert.equal(acceptedEligibility.predictedReplayablePrefix, 2);
+    assert.equal(acceptedEligibility.replayedPrefix, 0);
+    assert.equal(acceptedEligibility.replayed, 0);
+    assert.deepEqual(
+      (acceptedEligibility.operationalChanges as Array<Record<string, unknown>>).map((change) => change.detail),
+      [
+        "source recorded agentTimeoutMs=900000; this run: none",
+        "source recorded agentRetries=1; this run: 0",
+        "source recorded concurrency=2; this run: 7",
+      ],
+    );
+    assert.match(textOf(accepted), /predicted replayable prefix 2/);
+
+    const resumedRunId = String(acceptedContent?.runId);
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId: resumedRunId, waitMs: 1_000 },
+    });
+    const awaitedContent = structured(awaited);
+    const terminalEligibility = awaitedContent?.replayEligibility;
+    assert.equal(field(terminalEligibility, "replayedPrefix"), 2);
+    assert.deepEqual(field(awaitedContent?.outcome, "replayEligibility"), terminalEligibility);
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: resumedRunId },
+    });
+    assert.deepEqual(structured(inspected)?.replayEligibility, terminalEligibility);
+    assert.match(textOf(inspected), /replayed prefix 2/);
+
+    const foreground = await client.callTool({ name: "workflow", arguments: resumeArgs });
+    assert.deepEqual(structured(foreground)?.replayEligibility, terminalEligibility);
+    assert.equal(calls(), 2, "operational changes preserve both completed calls across every resume shape");
+  } finally {
+    await dispose();
+  }
+});
+
+test("a zero-prefix background acknowledgement warns with a named first miss", async () => {
+  const { runner, calls } = countingRunner();
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const source = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: "export const meta = { name: 'empty-source', description: 'empty source' }; return null;",
+      },
+    });
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: TWO_AGENT_SCRIPT,
+        resumeFromRunId: String(structured(source)?.runId),
+        background: true,
+      },
+    });
+    const eligibility = structured(accepted)?.replayEligibility;
+    assert.equal(field(eligibility, "predictedReplayablePrefix"), 0);
+    assert.equal(field(field(eligibility, "firstNonReplay"), "reason"), "not-recorded");
+    assert.match(textOf(accepted), /WARNING: resume: identity-v1/);
+    assert.match(textOf(accepted), /first non-replay: call 0 not-recorded/);
+
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
+    });
+    assert.equal(calls(), 2);
+    assert.match(textOf(awaited), /WARNING: resume: identity-v1/);
+    assert.match(textOf(awaited), /first non-replay: call 0 not-recorded/);
+  } finally {
+    await dispose();
+  }
+});
+
+test("format-1 sources replay through the named positional bridge", async () => {
+  const { runner, calls } = countingRunner();
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const source = await client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_SCRIPT, agentTimeoutMs: 900_000 },
+    });
+    const sourceRunId = String(structured(source)?.runId);
+    const file = persistedRunFile(sourceRunId);
+    assert.ok(file);
+    const persisted = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const runtime = field(persisted, "runtime") as Record<string, unknown>;
+    runtime.inputsFormat = 1;
+    writeFileSync(file, JSON.stringify(persisted), "utf8");
+
+    const resumed = await client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_SCRIPT, resumeFromRunId: sourceRunId },
+    });
+    const report = structured(resumed)?.resumeReport;
+    const eligibility = structured(resumed)?.replayEligibility;
+    assert.equal(field(report, "strategy"), "positional-v1");
+    assert.equal(field(report, "fallbackReason"), "inputs-format-legacy");
+    assert.equal(field(report, "replayed"), 2);
+    assert.equal(field(eligibility, "sourceInputsFormat"), 1);
+    assert.equal(field(eligibility, "currentInputsFormat"), 2);
+    assert.equal(calls(), 2);
+    assert.match(textOf(resumed), /inputs-format-legacy/);
+    assert.match(textOf(resumed), /source recorded agentTimeoutMs=900000; this run: none/);
+
+    const missed = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: TWO_AGENT_SCRIPT.replace('agent("alpha"', 'agent("alpha changed"'),
+        resumeFromRunId: sourceRunId,
+      },
+    });
+    const firstNonReplay = field(structured(missed)?.replayEligibility, "firstNonReplay");
+    assert.equal(field(firstNonReplay, "reason"), "positional-miss");
+    assert.equal(
+      field(firstNonReplay, "detail"),
+      "source recorded agentTimeoutMs=900000; this run: none",
+    );
+    assert.match(
+      textOf(missed),
+      /first non-replay: call 0 positional-miss — source recorded agentTimeoutMs=900000; this run: none/,
+    );
+    assert.equal(calls(), 4);
   } finally {
     await dispose();
   }
@@ -195,6 +363,7 @@ return await agent('cached', { resume: { filesystem: 'read-only' } })`;
       arguments: { script: resumedScript, resumeFromRunId: sourceRunId, background: true },
     });
     const targetRunId = String(structured(accepted)?.runId);
+    assert.equal(field(structured(accepted)?.replayEligibility, "predictedReplayablePrefix"), 1);
     await insertedStarted;
     const targetFile = persistedRunFile(targetRunId);
     assert.ok(targetFile, "accepted target already has a durable snapshot");
@@ -202,6 +371,25 @@ return await agent('cached', { resume: { filesystem: 'read-only' } })`;
     assert.equal(field(target.resumeReport, "sourceRunId"), sourceRunId);
     assert.equal(field(target.resumeReport, "strategy"), "identity-v1");
     assert.equal((field(target.resumeSeed, "candidates") as unknown[])?.length, 1);
+
+    const runningAwait = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId: targetRunId, waitMs: 0 },
+    });
+    const runningInspect = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: targetRunId },
+    });
+    assert.equal(structured(runningAwait)?.status, "running");
+    assert.equal(structured(runningAwait)?.outcome, undefined);
+    assert.deepEqual(
+      structured(runningAwait)?.replayEligibility,
+      structured(runningInspect)?.replayEligibility,
+    );
+    assert.equal(
+      field(field(structured(runningAwait)?.replayEligibility, "firstNonReplay"), "reason"),
+      "not-recorded",
+    );
 
     assert.ok(releaseInserted);
     releaseInserted("recorded:inserted");

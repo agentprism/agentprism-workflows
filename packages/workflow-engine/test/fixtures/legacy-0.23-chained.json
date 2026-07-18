@@ -1,0 +1,171 @@
+{
+  "runId": "mrpnqf9e-azqmcv",
+  "workflowName": "xver-chain",
+  "script": "export const meta = { name: \"xver-chain\", description: \"issue2a chained journal\" };\nconst plan = await agent(\"plan the migration\", { label: \"plan:codex\" });\nconst impl = await agent(\"implement milestone 1\", { label: \"impl:codex\" });\nconst review = await agent(\"review milestone 1\", { label: \"review:codex\" });\nreturn { plan, impl, review };\n",
+  "args": {
+    "milestone": 1
+  },
+  "effectiveCwd": "/tmp/kimi-xver3-cwd",
+  "runtime": {
+    "node": "v24.15.0",
+    "v8": "13.6.233.17-node.48",
+    "pathFormat": 1,
+    "inputsFormat": 1
+  },
+  "environment": {
+    "key": "kimi-xver3"
+  },
+  "journal": [
+    {
+      "index": 0,
+      "hash": "4036927ad942a7d35412e391e7a349793485d5c627adc20de5a11090ed3ea7d9",
+      "result": "result-for:plan:codex",
+      "kind": "agent",
+      "scope": "mrpnqf8o-9hmztt",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 2,
+        "cost": 0
+      },
+      "call": {
+        "kind": "agent",
+        "label": "plan:codex"
+      }
+    },
+    {
+      "index": 1,
+      "hash": "98d5c520fb03f7ac815c21293f72667451fcf9fe7d68532a2db9b0846a7a203b",
+      "result": "result-for:impl:codex",
+      "kind": "agent",
+      "scope": "mrpnqf8o-9hmztt",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 2,
+        "cost": 0
+      },
+      "call": {
+        "kind": "agent",
+        "label": "impl:codex"
+      }
+    },
+    {
+      "index": 2,
+      "hash": "8d9a55787c73399976824972f603826f5bb354a77cf7f7b34bb2bbb9f764e6ff",
+      "result": "result-for:review:codex",
+      "kind": "agent",
+      "scope": "mrpnqf8o-9hmztt",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 2,
+        "cost": 0
+      },
+      "call": {
+        "kind": "agent",
+        "label": "review:codex"
+      }
+    }
+  ],
+  "calls": [
+    {
+      "index": 0,
+      "kind": "agent",
+      "hash": "4036927ad942a7d35412e391e7a349793485d5c627adc20de5a11090ed3ea7d9",
+      "path": "2:20<7:3",
+      "inputsHash": "792fed18ffd46b9a2bf5c79775e7e0cd7f7f7a210c096dca69d26a41fb600754",
+      "label": "plan:codex",
+      "outcome": "result",
+      "origin": "journal-replay",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 2,
+        "cost": 0
+      },
+      "budgetDebit": 0,
+      "settlementOrdinal": 1,
+      "scope": "mrpnqf9e-azqmcv"
+    },
+    {
+      "index": 1,
+      "kind": "agent",
+      "hash": "98d5c520fb03f7ac815c21293f72667451fcf9fe7d68532a2db9b0846a7a203b",
+      "path": "3:20",
+      "inputsHash": "bf25dcef93219de60bd1475f5a72a206900a11665351bd8d2c2ae40c40ab6b3d",
+      "label": "impl:codex",
+      "outcome": "result",
+      "origin": "journal-replay",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 2,
+        "cost": 0
+      },
+      "budgetDebit": 0,
+      "settlementOrdinal": 2,
+      "scope": "mrpnqf9e-azqmcv"
+    },
+    {
+      "index": 2,
+      "kind": "agent",
+      "hash": "8d9a55787c73399976824972f603826f5bb354a77cf7f7b34bb2bbb9f764e6ff",
+      "path": "4:22",
+      "inputsHash": "9687327dde7589b7d332f73f02268e6de76dac4ff0cd95099ffeee79332a716f",
+      "label": "review:codex",
+      "outcome": "result",
+      "origin": "journal-replay",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 2,
+        "cost": 0
+      },
+      "budgetDebit": 0,
+      "settlementOrdinal": 3,
+      "scope": "mrpnqf9e-azqmcv"
+    }
+  ],
+  "callsAllocated": 3,
+  "limits": {
+    "maxAgents": 1000,
+    "tokenBudget": null,
+    "concurrency": 8,
+    "agentRetries": 0,
+    "agentTimeoutMs": 900000
+  },
+  "status": "completed",
+  "phases": [],
+  "agents": [],
+  "logs": [],
+  "result": {
+    "plan": "result-for:plan:codex",
+    "impl": "result-for:impl:codex",
+    "review": "result-for:review:codex"
+  },
+  "tokenUsage": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "cost": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0
+  },
+  "startedAt": "2026-07-18T00:57:31.587Z",
+  "updatedAt": "2026-07-18T00:57:31.595Z",
+  "completedAt": "2026-07-18T00:57:31.595Z",
+  "durationMs": 4
+}

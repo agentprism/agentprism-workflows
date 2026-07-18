@@ -24,14 +24,23 @@ import { ErrorCode, McpError, type ElicitRequestFormParams } from "@modelcontext
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
-import { parseWorkflowScript, redactText, truncateUtf8, WorkflowManager } from "@automatalabs/workflows";
+import {
+  parseWorkflowScript,
+  redactText,
+  truncateUtf8,
+  WorkflowError,
+  WorkflowErrorCode,
+  WorkflowManager,
+} from "@automatalabs/workflows";
 import type {
   ExecOptions,
   PersistedRunState,
+  WorkflowAgentCallCancellation,
   WorkflowSnapshot,
   WorkflowBackendConfig,
   WorkflowRunResult,
   WorkflowRunStatus,
+  WorkflowReplayEligibility,
   WorkflowResumeReport,
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
@@ -465,15 +474,57 @@ function formatCompletedSummary(run: WorkflowRunResult): string {
       `tokens: ${run.tokenUsage.total} (input ${run.tokenUsage.input}, output ${run.tokenUsage.output})  cost: $${run.tokenUsage.cost}`,
     );
   }
-  if (run.resumeReport) lines.push(formatResumeSummary(run.resumeReport));
+  if (run.replayEligibility || run.resumeReport) {
+    lines.push(formatResumeSummary(run.replayEligibility, run.resumeReport));
+  }
   return lines.join("\n");
 }
 
-function formatResumeSummary(report: WorkflowResumeReport): string {
-  const strategy = report.strategy === "positional-v1"
-    ? `${report.strategy}/${report.eligibility}`
-    : report.strategy;
-  return `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed`;
+function formatResumeSummary(
+  eligibility: WorkflowReplayEligibility | undefined,
+  report?: WorkflowResumeReport,
+): string {
+  if (!eligibility) {
+    if (!report) return "resume: eligibility unavailable";
+    const strategy = report.strategy === "positional-v1"
+      ? `${report.strategy}/${report.eligibility} (${report.fallbackReason})`
+      : report.strategy === "live"
+        ? `${report.strategy} (${report.disabledReason})`
+        : report.strategy;
+    const first = report.calls.find((decision) => decision.action !== "replayed");
+    return `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed` +
+      (first ? `; first non-replay: call ${first.index} ${first.reason}` : "");
+  }
+  const strategy = eligibility.strategy === "positional-v1"
+    ? `${eligibility.strategy}/${eligibility.eligibility} (${eligibility.fallbackReason})`
+    : eligibility.strategy === "live"
+      ? `${eligibility.strategy} (${eligibility.disabledReason})`
+      : eligibility.strategy;
+  const evaluated = eligibility.replayed + eligibility.live + eligibility.failed > 0;
+  const zeroPrefix = evaluated
+    ? eligibility.replayedPrefix === 0
+    : eligibility.predictedReplayablePrefix === 0;
+  const lines = [
+    `${zeroPrefix ? "WARNING: " : ""}resume: ${strategy}; ` +
+      `predicted replayable prefix ${eligibility.predictedReplayablePrefix}; ` +
+      `replayed prefix ${eligibility.replayedPrefix}; ` +
+      `${eligibility.replayed} replayed, ${eligibility.live} live, ${eligibility.failed} failed`,
+  ];
+  if (eligibility.firstNonReplay) {
+    lines.push(
+      `first non-replay: call ${eligibility.firstNonReplay.index} ${eligibility.firstNonReplay.reason}` +
+        (eligibility.firstNonReplay.detail ? ` — ${eligibility.firstNonReplay.detail}` : ""),
+    );
+  }
+  lines.push(
+    `engine: ${eligibility.sourceEngineVersion ?? "unknown"} -> ${eligibility.currentEngineVersion} ` +
+      `(${eligibility.engineVersionComparison}); inputs format: ` +
+      `${eligibility.sourceInputsFormat ?? "unknown"} -> ${eligibility.currentInputsFormat}`,
+  );
+  if (eligibility.operationalChanges.length > 0) {
+    lines.push(`operational changes: ${eligibility.operationalChanges.map((change) => change.detail).join("; ")}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -493,7 +544,9 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
     lines.push(`recent run log (last ${run.logTail.lines.length} of ${run.logTail.totalLines}):`);
     for (const line of run.logTail.lines) lines.push(`  ${line}`);
   }
-  if (run.resumeReport) lines.push(formatResumeSummary(run.resumeReport));
+  if (run.replayEligibility || run.resumeReport) {
+    lines.push(formatResumeSummary(run.replayEligibility, run.resumeReport));
+  }
   if (run.status === "paused") {
     // Read the STRUCTURED authContext (§2.12) — never the free-form `reason` message string.
     if (run.reason === "auth_required" && run.authContext) {
@@ -528,12 +581,18 @@ function formatRunSummary(run: WorkflowRunResult): string {
   return run.status === "completed" ? formatCompletedSummary(run) : formatTerminalSummary(run);
 }
 
-function inspectionSummaryLines(status: WorkflowRunStatus): string[] {
+function inspectionSummaryLines(
+  status: WorkflowRunStatus,
+  options: { includeReplayEligibility?: boolean } = {},
+): string[] {
   const lines = [`Workflow "${status.workflowName}" is ${status.status}.`, `runId: ${status.runId}`];
   if (status.phases.length > 0) lines.push(`phases: ${status.phases.join(", ")}`);
   if (status.currentPhase) lines.push(`current phase: ${status.currentPhase}`);
   if (status.reason) lines.push(`reason: ${status.reason}`);
   if (status.errorCode) lines.push(`error code: ${status.errorCode}`);
+  if (status.replayEligibility && options.includeReplayEligibility !== false) {
+    lines.push(formatResumeSummary(status.replayEligibility));
+  }
   lines.push(`recent run log (last ${status.logTail.lines.length} of ${status.logTail.totalLines}):`);
   for (const line of status.logTail.lines) lines.push(`  ${line}`);
   lines.push(`recent calls (${status.calls.length} of ${status.truncation.calls.matched} matching):`);
@@ -695,6 +754,19 @@ function formatStopSummary(result: WorkflowStopResult): string {
   return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
 
+function formatAgentCancellationSummary(
+  status: WorkflowRunStatus,
+  cancellation: WorkflowAgentCallCancellation,
+): string {
+  const lines = inspectionSummaryLines(status);
+  lines.splice(
+    2,
+    0,
+    `Agent call ${cancellation.callIndex} ("${cancellation.label}") settled with AGENT_CANCELLED; the workflow run remains live.`,
+  );
+  return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
+}
+
 function readScriptAtAdmission(scriptPath: string): string {
   try {
     return readFileSync(scriptPath, "utf8");
@@ -840,6 +912,7 @@ function persistedOutcome(
   return {
     runId: persisted.runId,
     status: status.status,
+    ...(persisted.limits === undefined ? {} : { limits: persisted.limits }),
     ...(status.status === "completed" && persisted.result !== undefined ? { result: persisted.result } : {}),
     tokenUsage: normalizeTokenUsage(persisted.tokenUsage),
     logs: persisted.logs,
@@ -849,6 +922,9 @@ function persistedOutcome(
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
     ...(persisted.resumeReport === undefined ? {} : { resumeReport: persisted.resumeReport }),
+    ...(persisted.replayEligibility === undefined
+      ? {}
+      : { replayEligibility: persisted.replayEligibility }),
     scriptUri: workflowScriptUri(persisted.runId),
   };
 }
@@ -1002,12 +1078,16 @@ function runEventLogErrorCode(error: unknown): string | undefined {
 }
 
 function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
-  const [heading, runId, ...diagnostics] = inspectionSummaryLines(result);
+  const [heading, runId, ...diagnostics] = inspectionSummaryLines(result, {
+    includeReplayEligibility: false,
+  });
   const lines = [heading, runId];
   lines.push(
     `wait: ${result.wait.returnedBecause} after ${result.wait.elapsedMs}ms (requested ${result.wait.requestedMs}ms)`,
   );
-  if (result.outcome?.resumeReport) lines.push(formatResumeSummary(result.outcome.resumeReport));
+  if (result.replayEligibility || result.outcome?.resumeReport) {
+    lines.push(formatResumeSummary(result.replayEligibility, result.outcome?.resumeReport));
+  }
   if (result.status === "paused" && result.outcome) {
     if (result.reason === "auth_required" && result.outcome.authContext) {
       const backendId = result.outcome.authContext.backendId ?? "?";
@@ -1074,7 +1154,7 @@ export function createWorkflowServer(
   mcp.registerTool(
     "workflow",
     {
-      title: "Run, inspect, await, or stop a dynamic agent workflow",
+      title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
       description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over built-in Claude, Codex, OpenCode, or pi " +
@@ -1083,8 +1163,9 @@ export function createWorkflowServer(
         "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +
         "run from a prior journal prefix. " +
         'Use action:"inspect" with a runId for a safe bounded status, log tail, and attributed call previews. ' +
-        'Use action:"stop" to durably abort a live run; its returned snapshot is the final run fate, ' +
-        "resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
+        'Use action:"stop" to durably abort a live run; add callIndex to cancel only that in-flight agent ' +
+        "and keep the run live. labelGlob remains an output filter in both forms. A whole-run stop returns " +
+        "the final run fate; resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
         "Background is tied to this server process, capped at four active/starting runs, and uses " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
@@ -1130,6 +1211,9 @@ export function createWorkflowServer(
       }
 
       if (parsedInput.action === "stop") {
+        if (!manager.getRun(parsedInput.runId)) {
+          manager.reconcileExternallyDeadRun(parsedInput.runId);
+        }
         const persisted = manager.getPersistence().load(parsedInput.runId);
         if (!persisted) {
           throw new McpError(
@@ -1143,6 +1227,57 @@ export function createWorkflowServer(
           labelGlob: parsedInput.labelGlob,
           logLines: parsedInput.logLines,
         };
+        if (parsedInput.callIndex !== undefined) {
+          if (isAlreadyTerminalForStop(persisted.status)) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Workflow run "${parsedInput.runId}" is already terminal (${persisted.status}); no agent call is in flight to cancel. Whole-run stop without callIndex is a successful no-op for terminal runs.`,
+            );
+          }
+          if (!manager.getRun(parsedInput.runId)) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to cancel in this server process.`,
+            );
+          }
+
+          let cancellation: WorkflowAgentCallCancellation;
+          try {
+            cancellation = await manager.cancelAgentCall(parsedInput.runId, parsedInput.callIndex);
+          } catch (error) {
+            throw new McpError(
+              error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR
+                ? ErrorCode.InternalError
+                : ErrorCode.InvalidParams,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
+          if (!status) {
+            throw new McpError(
+              ErrorCode.InternalError,
+              `Workflow agent cancellation did not produce a snapshot for runId "${parsedInput.runId}".`,
+            );
+          }
+          const lineage = scriptResources.lineage(parsedInput.runId);
+          const projected = addInspectionResourceFields(
+            status,
+            {
+              scriptUri: workflowScriptUri(parsedInput.runId),
+              lineage,
+            },
+            inspectionRetentionMetadata(manager, parsedInput.runId, status),
+          );
+          return {
+            structuredContent: { ...projected },
+            content: [
+              { type: "text", text: formatAgentCancellationSummary(projected, cancellation) },
+              ...scriptResources.links(lineage),
+            ],
+            isError: false,
+          };
+        }
+
         let stopped = false;
         let alreadyTerminal = isAlreadyTerminalForStop(persisted.status);
         if (!alreadyTerminal) {
@@ -1224,6 +1359,9 @@ export function createWorkflowServer(
           logLines: parsedInput.logLines,
         };
         const startedAt = Date.now();
+        if (!manager.getRun(parsedInput.runId)) {
+          manager.reconcileExternallyDeadRun(parsedInput.runId);
+        }
         let status = manager.inspectRun(parsedInput.runId, inspectionOptions);
         if (!status) {
           return {
@@ -1402,8 +1540,12 @@ export function createWorkflowServer(
             admittedScript,
             executionLatch.deny,
           );
+          const admittedRun = manager.getRun(started.runId);
+          if (!admittedRun?.limits) {
+            throw new McpError(ErrorCode.InternalError, "Workflow admission did not resolve run limits");
+          }
           executionLatch.admit();
-          const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
+          const workflowName = admittedRun.snapshot.name;
           backgroundRuns.track(started.runId, started.promise);
           backgroundReservation = false;
           const scriptUri = workflowScriptUri(started.runId);
@@ -1416,6 +1558,10 @@ export function createWorkflowServer(
               status: "running" as const,
               scriptSource,
               scriptUri,
+              limits: admittedRun.limits,
+              ...(admittedRun.replayEligibility === undefined
+                ? {}
+                : { replayEligibility: admittedRun.replayEligibility }),
             },
             content: [
               {
@@ -1423,6 +1569,9 @@ export function createWorkflowServer(
                 text:
                   `Workflow "${workflowName}" started in the background.\n` +
                   `runId: ${started.runId}\n` +
+                  (admittedRun.replayEligibility
+                    ? `${formatResumeSummary(admittedRun.replayEligibility)}\n`
+                    : "") +
                   `Call workflow with action="await" and this runId to wait for its result, or ` +
                   `action="inspect" for an immediate status snapshot.`,
               },

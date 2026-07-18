@@ -206,6 +206,8 @@ export type WorkflowResumeMatch = "path-hash" | "unique-hash" | "index-hash";
 
 export type WorkflowResumeFallbackReason =
   | "legacy-recording"
+  | "crash-residue"
+  | "inputs-format-legacy"
   | "forced-positional"
   | "unsafe-recording"
   | "nested-workflows"
@@ -332,6 +334,75 @@ export type WorkflowResumeReport = WorkflowResumeReportBase &
       }
   );
 
+export type WorkflowReplayOperationalOption =
+  | "agentTimeoutMs"
+  | "agentRetries"
+  | "concurrency";
+
+/** One operational run-bound change observed between a resume source and its new run.
+ *  These values are diagnostic only and never gate replay eligibility. */
+export interface WorkflowReplayOperationalChange {
+  option: WorkflowReplayOperationalOption;
+  source: number | null;
+  current: number | null;
+  detail: string;
+}
+
+export interface WorkflowReplayFirstNonReplay {
+  index: number;
+  action: "live" | "failed";
+  reason:
+    | WorkflowResumeCallLiveReason
+    | WorkflowResumeCallFailedReason
+    | WorkflowResumeDisabledReason
+    | WorkflowResumeFallbackReason;
+  /** Safe diagnostic naming the differing admission or operational value when known. */
+  detail?: string;
+}
+
+interface WorkflowReplayEligibilityBase {
+  sourceRunId: string;
+  /** Admission-time estimate from the durable source prefix. Actual call identity is
+   *  still checked by the selected matcher before any result is replayed. */
+  predictedReplayablePrefix: number;
+  /** Contiguous replayed prefix observed so far in the new run. */
+  replayedPrefix: number;
+  replayed: number;
+  live: number;
+  failed: number;
+  firstNonReplay?: WorkflowReplayFirstNonReplay;
+  sourceEngineVersion?: string;
+  currentEngineVersion: string;
+  engineVersionComparison: "same" | "different" | "source-unknown";
+  sourceInputsFormat?: number;
+  currentInputsFormat: number;
+  operationalChanges: WorkflowReplayOperationalChange[];
+}
+
+/** Bounded resume plan and progress summary suitable for admission, polling, and
+ *  inspection responses. The full per-call decisions remain in WorkflowResumeReport. */
+export type WorkflowReplayEligibility = WorkflowReplayEligibilityBase &
+  (
+    | {
+        strategy: "identity-v1";
+        fallbackReason?: never;
+        disabledReason?: never;
+        eligibility?: never;
+      }
+    | {
+        strategy: "positional-v1";
+        fallbackReason: WorkflowResumeFallbackReason;
+        eligibility: "legacy" | "safe-prefix" | "all-live";
+        disabledReason?: never;
+      }
+    | {
+        strategy: "live";
+        disabledReason: WorkflowResumeDisabledReason;
+        fallbackReason?: never;
+        eligibility?: never;
+      }
+  );
+
 /** One record per TERMINATED call of an engine run, emitted at the call's terminal
  *  transition — including calls that never journal (failures, caught throws,
  *  engine-side deaths, aborts). What the journal is to results, this is to structure. */
@@ -423,6 +494,10 @@ export interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
+  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
+  timeoutMs?: number | null;
+  /** Terminal agent error, including recoverable failures that settled the call to null. */
+  errorCode?: WorkflowErrorCode;
   /** Compact JSON text after structural compaction and redaction; never the raw result. */
   resultPreview: string;
   resultRedacted: boolean;
@@ -443,6 +518,16 @@ export interface WorkflowRunStatusTruncation {
   };
 }
 
+/** Host-resolved execution bounds in force for one run. */
+export interface WorkflowRunLimits {
+  maxAgents: number;
+  tokenBudget: number | null;
+  concurrency: number;
+  agentRetries: number;
+  /** Total-wall-clock ceiling for each attempt; null means the host imposes none. */
+  agentTimeoutMs: number | null;
+}
+
 /** Safe, bounded, point-in-time status used by every run-inspection/polling host. */
 export interface WorkflowRunStatus {
   runId: string;
@@ -452,6 +537,10 @@ export interface WorkflowRunStatus {
   currentPhase?: string;
   reason?: string;
   errorCode?: WorkflowErrorCode;
+  /** Resolved execution bounds. Absent only on legacy persisted rows that predate limits. */
+  limits?: WorkflowRunLimits;
+  /** Resume eligibility and progress. Present only on a run admitted from a source run. */
+  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -520,17 +609,12 @@ export interface WorkflowRunResult<T = unknown> {
   calls?: WorkflowCallRecord[];
   /** Manager-owned correspondence report for a resumeFromRunId execution. */
   resumeReport?: WorkflowResumeReport;
+  /** Bounded admission/progress summary for a resumeFromRunId execution. */
+  replayEligibility?: WorkflowReplayEligibility;
   /** Final number of agent()/checkpoint() call indexes allocated by this engine run. */
   callsAllocated?: number;
-  /** The resolved execution inputs in force for this engine run. Per-call
-   *  script-authored overrides are recorded by each call's input fingerprint. */
-  effectiveLimits?: {
-    maxAgents: number;
-    tokenBudget: number | null;
-    concurrency: number;
-    agentRetries: number;
-    agentTimeoutMs: number | null;
-  };
+  /** The resolved execution inputs in force for this engine run. */
+  effectiveLimits?: WorkflowRunLimits;
   /** Set iff the composed signal was ever observed aborted. */
   abortSignaled?: true;
   /** True when this run invoked workflow(), including a zero-call child workflow. */

@@ -133,6 +133,7 @@ export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from ".
 export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./registry.js";
 
 export {
+  CANCEL_NOT_HONORED_GRACE_MS,
   PI_CHILD_CLEANUP_DEADLINE_MS,
   PI_CLOSE_DELIVERY_MARGIN_MS,
   PI_CLOSE_SESSION_TIMEOUT_MS,

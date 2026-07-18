@@ -226,8 +226,6 @@ describe("live-boundary continuation", () => {
           name: "label",
           script: workflow("", `return await agent('task', { label: 'changed-label' })`),
         },
-        { name: "timeout", script: workflow("timeoutMs: 100") },
-        { name: "retries", script: workflow("retries: 1") },
         { name: "cwd", script: workflow(`cwd: "changed-cwd"`) },
         {
           name: "script backend digest",
@@ -257,6 +255,27 @@ describe("live-boundary continuation", () => {
           { outcome: "skipped", reason: "inputs-mismatch" },
           item.name,
         );
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("keeps an interrupted occurrence eligible when timeout or retry bounds change", async () => {
+    const fixture = tempCwd();
+    try {
+      const source = await recordInterrupted(fixture.cwd);
+      for (const item of [
+        { name: "timeout", script: workflow("timeoutMs: 100") },
+        { name: "retries", script: workflow("retries: 1") },
+      ]) {
+        const result = await runWorkflow(item.script, {
+          cwd: fixture.cwd,
+          persistLogs: false,
+          preparedContinuation: prepared(source.candidate),
+          agent: continuedRunner(source.candidate),
+        });
+        assert.equal(result.result, "continued", item.name);
       }
     } finally {
       fixture.cleanup();

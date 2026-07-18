@@ -48,7 +48,10 @@ test("non-elicitation client receives checkpointContext and resumes with checkpo
     assert.equal(field(completed?.result, "decision"), "ship");
     assert.equal(field(completed?.resumeReport, "strategy"), "identity-v1");
     assert.equal(field(completed?.resumeReport, "replayed"), 1);
-    assert.match(textOf(second), /^resume: identity-v1, 1 replayed, 0 live, 0 failed$/m);
+    assert.match(
+      textOf(second),
+      /^resume: identity-v1; predicted replayable prefix 1; replayed prefix 1; 1 replayed, 0 live, 0 failed$/m,
+    );
 
     // The resumed call has its own run id. Its final persisted journal must retain the
     // synthetic checkpoint reply, so another cold replay needs neither replies nor elicitation.

@@ -318,7 +318,7 @@ describe("checkpoint input recording and byte compatibility", () => {
   it("pins checkpoint fingerprints for omission, values, key ordering, and failures", () => {
     const digest = (canonical: string) => createHash("sha256").update(canonical).digest("hex");
     assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
-    assert.equal(CALL_INPUTS_FORMAT, 1);
+    assert.equal(CALL_INPUTS_FORMAT, 2);
     assert.equal(hashCheckpointInputs({}), digest("{}"));
     assert.equal(
       hashCheckpointInputs({ default: { z: 1, a: 2 } }),

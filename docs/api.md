@@ -61,7 +61,8 @@ manager.on("agentEvent", (e) => ui.stream(e.runId, e));  // live token-level ACP
 
 const { runId, promise } = manager.startInBackground(script, args, { cwd: worktreePath });
 // ... later:
-manager.stop(runId);            // or manager.pause(runId), or await manager.resume(runId)
+await manager.cancelAgentCall(runId, 7); // settle one in-flight agent null; run stays live
+manager.stop(runId);                    // whole-run terminal abort
 ```
 
 ---
@@ -75,17 +76,23 @@ manager.stop(runId);            // or manager.pause(runId), or await manager.res
 | `cwd` | `process.cwd()` | The manager's base directory. Keys run **state/log storage** and is the default run directory when a run passes no `cwd` of its own. |
 | `agent` | — | The injected `AgentRunner`. Required here or per-run (`ExecOptions.agent`); the engine never constructs one. |
 | `concurrency` | 8 | Max concurrent agents per run. |
-| `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and startup stale-run recovery is skipped entirely. |
+| `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and construction/lazy stale-run reconciliation is skipped entirely. |
 | `persistenceRoot` | `AGENTPRISM_PERSISTENCE_ROOT` env, else `~/.agentprism/workflows` | Absolute root for run state/logs. Relative paths throw. |
 | `persistence` | filesystem persistence | Custom `RunPersistence` implementation. Omit it for the default `createRunPersistence(cwd, ..., { persistenceRoot })` path. |
-| `defaultAgentTimeoutMs` | `null` (none) | Per-agent timeout default. |
+| `defaultAgentTimeoutMs` | `null` (none) | Host total-wall-clock ceiling for each agent attempt. |
 | `defaultAgentRetries` | 0 | Retries after *recoverable* agent failures. |
 | `mainModel` | — | Session model spec (registered harness prefix + verbatim id, or backend-only name) used to auto-tier explore-style agents. |
 | `sessionId` | — | Tag for new runs; `listRuns()` filters by it (`listAllRuns()` doesn't). Update via `setSessionId()`. |
 | `agentsDir` | project + user agent dirs | Override the directory scanned for `agentType` definitions. |
 | `loadSavedWorkflow` | — | `(name) => script` resolver enabling nested `workflow("name")` in scripts. `openWorkflowDir(dir).resolve` is a ready-made one. |
 
-On construction, a journaling manager reconciles orphaned `"running"` runs from dead processes to `"paused"` (journal preserved for resume). A `journaling: false` manager never touches persisted state.
+On construction, a journaling manager attempts the lease for persisted `pending`/`running` rows not
+owned in memory. A dead, missing, or corrupt owner lock is replaced; the under-lease reload changes
+only a still-`pending`/`running` row to `paused`, with `pauseReason: "interrupted"` and a reason naming
+the dead PID when the lock supplied one. A live PID—including `EPERM` from the liveness probe—is
+preserved. Cold inspect/list/resume lookups perform the same per-run reconciliation, so a sibling
+process that dies after construction does not remain indefinitely `running`. A `journaling: false`
+manager never performs these writes.
 
 ### <a name="execoptions--per-run"></a>`ExecOptions` — per-run
 
@@ -100,7 +107,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `environmentKey` | Host-supplied non-git environment identity. It must content-address every persistent resource replay-safe calls can observe and remain stable for the run; git workspaces use measured HEAD + dirty digest instead. |
 | `tokenBudget` | Hard cap; once spent, `agent()` throws `TOKEN_BUDGET_EXHAUSTED`. |
 | `maxAgents` | Cap on total agent calls for the run. |
-| `agentTimeoutMs` | Per-agent timeout (`null` = none). |
+| `agentTimeoutMs` | Host total-wall-clock ceiling for each agent attempt (`null` = no host ceiling). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
 | `resumeFromRunId` | Persisted source ID for a **new** managed execution. Requires journaling, must differ from a caller-supplied new `runId`, and is mutually exclusive with `resumeJournal`. Missing sources fail with `PERSISTENCE_ERROR`. |
@@ -109,6 +116,16 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
 | `resumeJournal` | Low-level legacy positional channel. Mutually exclusive with `resumeFromRunId`/`resumePolicy`; manual use permanently marks the result legacy. Prefer manager-owned `resumeFromRunId`. |
+
+A finite `agentTimeoutMs` is an unbypassable host ceiling. An `agent({ timeoutMs })` value may
+shorten it; per-call `null` or omission means uncapped only when the host supplied no ceiling. The
+clock covers the complete attempt rather than idle time, and every retry starts a new clock. Since
+retries are clamped at 3, the maximum timeout envelope is `(resolved retries + 1) × resolved timeout`.
+An exhausted timeout settles the call to `null` with recoverable `AGENT_TIMEOUT` and frees its
+concurrency slot. The runner cancels the ACP turn; after a five-second grace, an uncooperative turn
+is closed where supported and its pooled child is quarantined and recycled after sibling sessions
+drain. A new resume execution does not inherit operational limits from its source; pass the desired
+timeout, retry, concurrency, agent-count, and token-budget values again.
 
 ### `CheckpointOptions` — in-script human gates
 
@@ -133,13 +150,15 @@ explicitly selects `headless: "pause"`.
 |---|---|---|
 | `startInBackground(script, args?, exec?)` | `{ runId, promise }` | Process-lifetime execution. Returns after lease acquisition and fail-fast initial persistence. A supplied `resumeJournal` is sorted and copied into the child run before that save, so replayed prefixes and synthetic checkpoint answers survive later resume hops under the new run ID. The promise rejects on pause/failure/abort (a side-channel catch prevents host unhandled rejections if ignored). |
 | `runSync(script, args?, exec?)` | `Promise<WorkflowRunResult>` | Blocks; always resolves to a **terminal** result (`completed \| paused \| failed \| aborted`) — never throws for ordinary outcomes. |
-| `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, read-only, live-first safe projection; falls back to the manager's project-scoped persistence. Never leases, saves, or changes status. |
+| `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, live-first safe projection; falls back to project-scoped persistence. A cold `pending`/`running` dead-owner row may be lease-reconciled to `paused` / `interrupted`; other rows are not changed. |
+| `reconcileExternallyDeadRun(runId)` | `PersistedRunState \| undefined` | Lease-safe single-run reconciliation used by cold host preflights. Skips manager-owned runs, non-`pending`/`running` states, live owners, and all writes when the manager default is `journaling: false`. |
+| `cancelAgentCall(runId, callIndex)` | `Promise<WorkflowAgentCallCancellation>` | Cancels one uniquely matching in-flight attempt, bypasses retries, and resolves after its `AGENT_CANCELLED` call record and `agentEnd` state are durable. The run signal and `abortSignaled` remain untouched. Misses and duplicate scoped indexes throw with the current call-index/label list. |
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
-| `stop(runId)` | `boolean` | Terminal abort. Not resumable. |
+| `stop(runId)` | `boolean` | Whole-run terminal abort. The same run ID cannot resume in place, but its retained journal can be the source of a new `resumeFromRunId` execution. |
 | `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
-| `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all). |
+| `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all); their existing scan lease-reconciles candidate dead-owner rows without a second directory scan. |
 | `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |
 | `dispose()` / `close()` | — | Facade manager only: detach its `agentEvent` runner subscriptions. Never disposes the runner itself. |
@@ -149,8 +168,14 @@ They fire after every live attempt—including failed retries and pause/failure 
 provider usage when supplied and the existing estimate fallback otherwise. Replayed journal calls
 emit/add nothing. The unchanged successful final total is still emitted, so an observer may receive
 it twice. The latest snapshot is persisted at journal and settlement points and survives cold load.
-If a process dies, stale persisted `running` runs recover to `paused`; the durable prefix can then
-seed a new execution. An in-flight call without a journal result runs again.
+If a process dies, stale persisted `pending`/`running` runs recover under their lease to `paused`
+with `pauseReason: "interrupted"`; the durable prefix can then seed a new execution. An in-flight
+call without a journal result runs again.
+
+Per-call host cancellation is an execution bound, not a replay result. `agent()` receives `null`,
+`parallel()` siblings and gates continue normally, and inspect exposes the failed row with
+`errorCode: "AGENT_CANCELLED"`. No journal entry is written for that null, so a later resume replays
+eligible completed siblings before the cancelled index and executes the cancelled occurrence live.
 
 ### Content-addressed incremental resume
 
@@ -164,7 +189,8 @@ const next = await manager.runSync(script, { maxRounds: 8 }, {
   resumePolicy: "auto", // default; use "positional" only as a migration escape hatch
 });
 
-next.resumeReport; // correspondence for this execution; absent on ordinary/same-ID runs
+next.replayEligibility; // bounded admission/progress summary
+next.resumeReport;      // per-call correspondence; absent on ordinary/same-ID runs
 ```
 
 `runDynamicWorkflow(currentScript, { args: currentArgs, exec: { resumeFromRunId } })` exposes the
@@ -247,12 +273,59 @@ type WorkflowResumeReport = WorkflowResumeReportBase &
       }
     | { strategy: "live"; disabledReason: WorkflowResumeDisabledReason }
   );
+
+interface WorkflowReplayOperationalChange {
+  option: "agentTimeoutMs" | "agentRetries" | "concurrency";
+  source: number | null;
+  current: number | null;
+  detail: string;
+}
+
+interface WorkflowReplayEligibilityBase {
+  sourceRunId: string;
+  predictedReplayablePrefix: number;
+  replayedPrefix: number;
+  replayed: number;
+  live: number;
+  failed: number;
+  firstNonReplay?: {
+    index: number;
+    action: "live" | "failed";
+    reason:
+      | WorkflowResumeCallLiveReason
+      | WorkflowResumeCallFailedReason
+      | WorkflowResumeDisabledReason
+      | WorkflowResumeFallbackReason;
+    detail?: string;
+  };
+  sourceEngineVersion?: string;
+  currentEngineVersion: string;
+  engineVersionComparison: "same" | "different" | "source-unknown";
+  sourceInputsFormat?: number;
+  currentInputsFormat: number;
+  operationalChanges: WorkflowReplayOperationalChange[];
+}
+
+type WorkflowReplayEligibility = WorkflowReplayEligibilityBase &
+  (
+    | { strategy: "identity-v1" }
+    | {
+        strategy: "positional-v1";
+        fallbackReason: WorkflowResumeFallbackReason;
+        eligibility: "legacy" | "safe-prefix" | "all-live";
+      }
+    | { strategy: "live"; disabledReason: WorkflowResumeDisabledReason }
+  );
 ```
 
 `WorkflowRunResult.resumeReport?` and persisted state carry this report for completed, paused, and
-failed resumed runs; ordinary and same-ID recovery runs omit it. MCP foreground results and
-terminal await `outcome` preserve the structured report, while human text contains only the
-compact `resume: <strategy> (<replayed> replayed, <live> live, <failed> failed)` line.
+failed resumed runs; ordinary and same-ID recovery runs omit it. `replayEligibility` is the bounded
+plan/progress surface for every new-run resume. The MCP background acknowledgement, foreground
+result, inspect status, and nonterminal/terminal await status carry it; terminal await `outcome`
+carries the identical final value plus the complete `resumeReport`. Human text names the strategy,
+predicted and observed prefixes, counts, first non-replay and detail when known, source/current
+engine and input formats, and any non-gating operational changes. A zero predicted or observed
+prefix is prefixed with `WARNING`.
 
 #### Identity, safety, and filesystem boundary
 
@@ -282,6 +355,14 @@ safety. The option never reaches `AgentRunner` and changes neither call-hash nor
 bytes. Source and current rows must prove the same safety class, so adding the option cannot bless
 an old cached result.
 
+An agent call's identity hash covers prompt, resolved model, authored mode/config options/tier,
+phase, agent type and resolved definition, and schema. Its separate input fingerprint covers the
+resolved label, per-call cwd, resolved isolation, `keepSession`, images, MCP servers, metadata,
+prompt metadata, and the approved script-backend digest. Host `agentTimeoutMs`, `agentRetries`, and
+`concurrency`, plus per-call `timeoutMs` and `retries`, are operational bounds and enter neither
+hash. They may change on a new-run resume or an interrupted-turn continuation without rejecting an
+otherwise matching call.
+
 Identity matching first considers the original exact group `(kind, call path, identity hash)`. One
 candidate with an equal input fingerprint replays as `"path-hash"`; duplicates are permanently
 ambiguous. With no exact candidate, exactly one original `(kind, identity hash, inputsHash)` row
@@ -291,16 +372,29 @@ matcher never pairs by occurrence ordinal/source order and never uses isolation'
 fallback. Stable explicit labels matter because runner-visible label changes alter `inputsHash`.
 
 Before any new-format cache is considered, admission requires a terminal non-aborted,
-non-isolation source; exact `effectiveCwd`; exact full Node, V8, and fingerprint format versions;
-complete bijective journal/manifest data; and equality between the source's quiescent terminal
-environment and the environment measured at admission. Git identity is exact HEAD plus dirty
-digest. Non-git hosts must supply the same `environmentKey`, which must content-address every
-persistent resource safe calls can observe. The host must exclude other writers from source start
-through terminal capture and again from admission through the resumed run's terminal capture; a
-run-ID lease does not lock a workspace.
+non-isolation source; exact `effectiveCwd`; exact full Node, V8, call-path, and checkpoint-input
+formats; a compatible agent-input format; complete journal/call/allocation metadata; and equality
+between the source's quiescent terminal environment and the environment measured at admission.
+A crash snapshot reconciled to `paused` / `interrupted` has no quiescent terminal environment. It takes the `crash-residue`
+positional bridge before the input-format bridge: an equal source-admission/current environment
+admits the hash-stable legacy prefix, while a missing or drifted environment makes the strategy
+explicitly all-live. No terminal environment is fabricated. Normally settled input formats below 2
+take the input-format positional compatibility bridge; a format greater than the current format is
+`runtime-mismatch`. Git identity is exact HEAD plus dirty digest. Non-git hosts must
+supply the same `environmentKey`, which must content-address every persistent resource safe calls
+can observe. The host must exclude other writers from source start through terminal capture and
+again from admission through the resumed run's terminal capture; a run-ID lease does not lock a
+workspace. The runtime block also records the producing workflow-engine package version. Missing
+or different engine versions are diagnostics in `replayEligibility`, never admission gates.
 
 Automatic policy selects:
 
+- `"positional-v1"` / `"legacy"` with `fallbackReason: "crash-residue"` for a reconciled `paused` / `interrupted` crash
+  snapshot without terminal-environment proof when its admission environment equals the current
+  environment; the same fallback is `"all-live"` when that comparison is missing or unequal;
+- `"positional-v1"` / `"legacy"` with `fallbackReason: "inputs-format-legacy"` for a marked source
+  that settled normally, whose input-fingerprint format is below 2, and whose other admission facts
+  agree;
 - `"identity-v1"` only for a stable source whose represented agent results are safety-marked and
   whose checkpoint results are proven host decisions;
 - `"positional-v1"` / `"safe-prefix"` for a structurally valid, start-to-terminal stable source
@@ -332,30 +426,36 @@ must pass cwd/runtime/terminal-environment admission plus per-call input, safety
 gates. There is no force-identity option. Marker-less recordings and permanent `legacyResume`
 artifacts use historical hash-only positional matching because their newer facts do not exist.
 Manual `resumeJournal` and same-ID `resume()`/`resumeInBackground()` always enter that legacy arm
-and cannot be laundered into an identity-capable hop.
+and cannot be laundered into an identity-capable hop. Aborted or `abortSignaled` sources are never
+served from this arm.
 
-Two fail-safe compatibility changes are intentional. The common terminal gate now rejects aborted
-or `abortSignaled` marker-less/legacy sources instead of serving their journal (advertised MCP
-resume flows were already limited to paused runs). Also, a paused positional-v1 terminal save drops
-inherited source rows the current execution never visited. In a double-hop pause, that old bridged
-tail therefore runs live on hop two instead of replaying from a row absent from hop one's own
-manifest.
+Format-1 fingerprints are never reinterpreted as format 2. A marker-less ≤0.23 crash remains
+`legacy-recording`; a reconciled `paused` / `interrupted` crash takes `crash-residue`; a marked normally settled format-1 source
+takes `inputs-format-legacy`; and a normally settled format-2 source may take identity replay. The
+`inputs-format-legacy` bridge uses
+the established hash-only index/prefix matcher, and every selected row is re-journaled under the
+target's format 2 runtime so its next hop can use identity matching. Positional new-run preparation
+accepts a journal/call row only when its scope is absent, equals the immediate source ID, or names a
+run still persisted in the same run directory. This recovers carried prefixes from ≤0.23 chained
+resumes while excluding engine-minted `-nested<N>` scopes and scopes for deleted ancestors. A
+paused positional terminal save retains only inherited source rows the current execution visited,
+so an unvisited tail runs live on the next hop.
 
 Two source-wide all-live outcomes are normal calibration rather than operational errors. If any
 result row lacks a path/input fact—possible when a deep call stack passes the raw-frame cap or an
 agent `meta` value is not strict JSON—the source is `"manifest-invalid"`; ignoring that row could
-make an ambiguous sibling look unique. A Node or V8 upgrade causes `"runtime-mismatch"` for every
-new-format cache through exact equality, while marker-less legacy journals retain historical
-positional replay. Relaxing that asymmetry requires a new persisted format literal; identity-v1
-bytes are never reinterpreted.
+make an ambiguous sibling look unique. A Node or V8 upgrade causes `"runtime-mismatch"` for marked
+identity/new-format positional sources through exact equality, while marker-less historical
+positional journals do not depend on those fields. An engine package-version difference by itself
+never disables either strategy.
 
 #### Frozen resume reason catalogs
 
 The runtime arrays below are exported by `@automatalabs/workflow-engine` and re-exported by the
 facade. Their literal unions live in `@automatalabs/shared-types`:
 
-- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `forced-positional`, `unsafe-recording`,
-  `nested-workflows`, `legacy-resume`.
+- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `crash-residue`, `inputs-format-legacy`, `forced-positional`,
+  `unsafe-recording`, `nested-workflows`, `legacy-resume`.
 - `RESUME_DISABLED_REASONS`: `unsupported-format`, `source-not-terminal`, `abort-residue`,
   `isolation-recording`, `resume-metadata-missing`, `manifest-invalid`, `cwd-mismatch`,
   `runtime-mismatch`, `environment-missing`, `environment-mismatch`,
@@ -394,6 +494,8 @@ interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
+  timeoutMs?: number | null;
+  errorCode?: WorkflowErrorCode;
   resultPreview: string;
   resultRedacted: boolean;
   resultTruncated: boolean;
@@ -407,10 +509,20 @@ interface WorkflowRunStatus {
   currentPhase?: string;
   reason?: string;
   errorCode?: WorkflowErrorCode;
+  limits?: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
   truncation: WorkflowRunStatusTruncation;
+}
+
+interface WorkflowRunLimits {
+  maxAgents: number;
+  tokenBudget: number | null;
+  concurrency: number;
+  agentRetries: number;
+  agentTimeoutMs: number | null;
 }
 ```
 
@@ -853,7 +965,9 @@ while replay runners require them. `WorkflowCallRecord` is the root-scope termin
 `JournalEntry` adds optional `kind`, `usage`, and `scope`. `PersistedRunState` adds the strict args
 snapshot marker, effective cwd/runtime/environment/limits, manifest and allocation facts,
 abort/nesting/resume markers, model and agents-directory context, `executionMode`, and
-`replayReport`.
+`replayReport`. `RunLease.recoveredOwnerPid` is present only when acquisition replaced a valid lock
+whose PID was dead; recovery uses it for the human interruption reason, while missing/corrupt locks
+leave it absent. Lease release always remains token-matched.
 
 `PersistedRunState`, `PersistedAgentState`, `JournalEntry`, `WorkflowCallRecord`,
 `WorkflowRecordedError`, `AgentResultProvenance`, and `ReplayReport` are documented public types:
@@ -888,6 +1002,12 @@ One agent call per invocation; returns the assistant text, or the **validated ob
 `label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
 
 **Session hand-off.** `run()`'s return value is always the bare result, so the ACP session identity travels out-of-band: `onSessionOpen` fires exactly once for whichever acquisition wins — fresh `session/new`, successful `session/resume`/`session/load`, or the fresh fallback after a reopen failure — and always before that acquisition's prompt. Its `AgentSessionRef` is `{ sessionId, backendId, poolKey?, cwd, reopen: { load, resume, list } }`; `poolKey` pins the effective custom-backend spawn identity. Pair a successful call with `keepSession: true` when the host intends to reopen it. Usage/auth pause errors keep the session open automatically for managed continuation. With `continueFromSession`, the runner prefers currently advertised resume, falls back to load, and reports reattached/skipped provenance. Every non-cancellation failure through the reopen RPC cleans up and opens a fresh session with the original prompt; after reopen succeeds, the turn is committed and receives a fixed continuation instruction. The ref contains no secrets and is JSON-round-trippable.
+
+**Cancellation.** An attempt signal sends ACP `session/cancel` for that session only. If the active
+turn does not finish within five seconds, the client sends capability-gated `session/close`,
+quarantines the pooled child from new work, and disposes it after existing sibling sessions release.
+This policy is identical for every built-in and custom ACP backend. A `child_cleanup_error` returned
+by close remains observable through the runner's normal error path.
 
 **Structured output channels.** Claude and Codex keep their agent-specific schema channels authoritative. Pi, OpenCode, and opted-in custom ACP backends use the client-hosted MCP path: when `RunOptions.schema` is set and initialize advertises HTTP MCP support, the runner appends a client-hosted HTTP MCP server to `session/new.mcpServers`. The injected server is named `structured_output` (or `structured_output_2`, etc. on name collision), runs on `127.0.0.1` with an unguessable token path, and exposes `StructuredOutput`; Pi shows the namespaced alias `mcp__structured_output__StructuredOutput`. Its input schema is the requested JSON Schema and a valid call captures the result. Injected-tool schema runs are serialized per pooled connection. The common prompt-embedded schema plus validated final-text ladder remains the fallback when capture is absent or invalid. User-provided `mcpServers` are preserved and are not part of the resume hash.
 
@@ -1106,7 +1226,8 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `SCRIPT_VALIDATION_ERROR` | no | Script failed parse/validation (bad meta, nondeterministic API, protocol mismatch). |
 | `SCRIPT_ERROR` | no | The script **crashed at runtime**: uncaught throw or unhandled promise rejection in the script body. Run fails. |
 | `WORKFLOW_ABORTED` | — | Actual cancellation (pause/stop/signal). Never used for crashes. |
-| `AGENT_TIMEOUT` | yes | Engine-enforced per-agent timeout. |
+| `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Each retry gets a fresh clock; after exhaustion the call settles to `null`, and an ACP turn that ignores cancel is closed/recycled after its grace period. |
+| `AGENT_CANCELLED` | yes | The host selected one in-flight agent. It settles to `null`, skips retries, leaves the run and siblings live, and creates a failed call record but no replayable journal result. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
@@ -1154,6 +1275,7 @@ interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
 interface WorkflowExecutionToolResult<T = unknown> {
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  limits: WorkflowRunLimits;
   result?: T;                            // completed only
   tokenUsage?: TokenUsage;
   logs?: string[];
@@ -1163,6 +1285,7 @@ interface WorkflowExecutionToolResult<T = unknown> {
   fallbacks?: WorkflowRunFallback[];
   checkpointsTaken?: WorkflowCheckpointTaken[];
   resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
+  replayEligibility?: WorkflowReplayEligibility;
 }
 ```
 
@@ -1180,6 +1303,8 @@ script-backend approval, lease acquisition, and the durable initial save, then r
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
+  limits: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
 }
 ```
 
@@ -1190,7 +1315,13 @@ Cancelling the accepted call cannot abort the run. A fifth run fails with
 `Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
 Foreground, inspect, and await do not consume slots. A background `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
-run's initial durable record, preserving multi-hop resume safety.
+run's initial durable record, preserving multi-hop resume safety. Its acknowledgement includes the
+admission-time `replayEligibility` prediction before the script body is allowed to execute.
+
+Every newly admitted response reports its resolved `limits`. The same object appears on foreground
+results, background acknowledgements, inspect/await status, and terminal await `outcome`; legacy
+persisted records that predate limit storage may omit it. Failed call rows include their resolved
+`timeoutMs` and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT`.
 
 ```ts
 interface WorkflowAwaitMetadata {
@@ -1235,8 +1366,9 @@ into text.
 
 Background means detached from one request, not from the server process. Stdio-host exit, SIGTERM,
 crash, or machine shutdown can stop in-flight work; there is no daemon/worker handoff. The initial
-record and completed call prefix remain durable, later writes are best effort, and the next manager
-recovers an orphaned `running` record to `paused` for an explicit new `resumeFromRunId` execution.
+record and completed call prefix remain durable, later writes are best effort, and construction or
+a cold await/inspect/stop/resume preflight reconciles an orphaned `pending`/`running` record to
+`paused` / `interrupted` for an explicit new `resumeFromRunId` execution.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 

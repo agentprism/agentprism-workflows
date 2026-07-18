@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import type {
   JournalEntry,
@@ -32,6 +35,7 @@ import type {
   PersistedRunState,
 } from "../src/run-persistence.js";
 import { CALL_INPUTS_FORMAT, CALL_PATH_FORMAT, CHECKPOINT_INPUTS_FORMAT } from "../src/workflow.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -248,6 +252,184 @@ describe("incremental resume admission", () => {
     assert.equal(forced.strategy === "positional-v1" && forced.eligibility, "safe-prefix");
   });
 
+  it("bridges older call-input formats through legacy positional matching", () => {
+    const bridged = admission(sourceState(undefined, {
+      runtime: { ...RUNTIME, inputsFormat: 1 },
+    }));
+    assert.deepEqual(bridged, {
+      strategy: "positional-v1",
+      sourceRunId: SOURCE_RUN_ID,
+      requestedPolicy: "auto",
+      fallbackReason: "inputs-format-legacy",
+      eligibility: "legacy",
+    });
+
+    const replay = selectPositionalResume({
+      index: 0,
+      kind: "agent",
+      hash: HASH_A,
+      inputsHash: INPUT_B,
+      eligibility: "legacy",
+      firstMiss: initialPositionalFirstMiss("legacy"),
+      cached: entryFor(agentRow()),
+    });
+    assert.equal(replay.action, "replay", "format-1 input bytes are not reinterpreted");
+
+    const future = admission(sourceState(undefined, {
+      runtime: { ...RUNTIME, inputsFormat: 3 },
+    }));
+    assert.equal(future.strategy, "live");
+    assert.equal(future.strategy === "live" && future.disabledReason, "runtime-mismatch");
+  });
+
+  it("admits crash residue before the input-format and environment gates", () => {
+    for (const inputsFormat of [1, CALL_INPUTS_FORMAT]) {
+      const crashed = sourceState(undefined, {
+        status: "paused",
+        pauseReason: "interrupted",
+        runtime: { ...RUNTIME, inputsFormat },
+        resume: { format: "identity-v1" },
+      });
+      assert.deepEqual(admission(crashed), {
+        strategy: "positional-v1",
+        sourceRunId: SOURCE_RUN_ID,
+        requestedPolicy: "auto",
+        fallbackReason: "crash-residue",
+        eligibility: "legacy",
+      });
+    }
+
+    const drifted = sourceState(undefined, {
+      status: "paused",
+      pauseReason: "interrupted",
+      resume: { format: "identity-v1" },
+    });
+    const driftDecision = admission(drifted, {
+      current: {
+        effectiveCwd: CWD,
+        runtime: RUNTIME,
+        environment: { key: "workspace-v2" },
+      },
+    });
+    assert.deepEqual(driftDecision, {
+      strategy: "positional-v1",
+      sourceRunId: SOURCE_RUN_ID,
+      requestedPolicy: "auto",
+      fallbackReason: "crash-residue",
+      eligibility: "all-live",
+    });
+
+    const unknownEnvironment = admission(drifted, {
+      current: { effectiveCwd: CWD, runtime: RUNTIME },
+    });
+    assert.equal(unknownEnvironment.strategy, "positional-v1");
+    assert.equal(
+      unknownEnvironment.strategy === "positional-v1" && unknownEnvironment.eligibility,
+      "all-live",
+    );
+
+    const markerless = drifted;
+    delete markerless.resume;
+    const markerlessDecision = admission(markerless);
+    assert.equal(markerlessDecision.strategy, "positional-v1");
+    if (markerlessDecision.strategy === "positional-v1") {
+      assert.equal(markerlessDecision.fallbackReason, "legacy-recording");
+    }
+
+    const malformedTerminal = sourceState(undefined, {
+      resume: { format: "identity-v1", terminalEnvironment: {} },
+    });
+    const malformed = admission(malformedTerminal);
+    assert.equal(malformed.strategy === "live" && malformed.disabledReason, "environment-missing");
+  });
+
+  it("replays across every operational-knob change and migrates format 1 positionally", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "resume-knobs-cwd-"));
+    const persistenceRoot = mkdtempSync(join(tmpdir(), "resume-knobs-runs-"));
+    const script = `export const meta = { name: "resume-knobs", description: "resume knobs" };
+const first = await agent("first", { label: "first", resume: { filesystem: "read-only" } });
+const second = await agent("second", { label: "second", resume: { filesystem: "read-only" } });
+return { first, second };`;
+    let liveCalls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      persistenceRoot,
+      environmentKey: "resume-knobs-v1",
+      agent: {
+        async run(prompt) {
+          liveCalls++;
+          return `recorded:${prompt}`;
+        },
+      },
+    });
+    try {
+      const source = await manager.runSync(script, undefined, {
+        agentTimeoutMs: 900,
+        agentRetries: 1,
+        concurrency: 2,
+      });
+      assert.equal(liveCalls, 2);
+      const sourceState = manager.getPersistence().load(source.runId);
+      assert.ok(sourceState?.runtime);
+      sourceState.runtime.engineVersion = "0.25.0";
+      manager.getPersistence().save(sourceState);
+      const variants = [
+        { runId: "timeout-dropped", agentTimeoutMs: null },
+        { runId: "timeout-changed", agentTimeoutMs: 450 },
+        { runId: "retries-changed", agentRetries: 0 },
+        { runId: "concurrency-changed", concurrency: 7 },
+      ] as const;
+      for (const variant of variants) {
+        const resumed = await manager.runSync(script, undefined, {
+          ...variant,
+          resumeFromRunId: source.runId,
+        });
+        assert.equal(resumed.resumeReport?.strategy, "identity-v1", variant.runId);
+        assert.equal(resumed.resumeReport?.replayed, 2, variant.runId);
+        assert.equal(resumed.resumeReport?.live, 0, variant.runId);
+        assert.equal(resumed.replayEligibility?.engineVersionComparison, "different", variant.runId);
+      }
+      assert.equal(liveCalls, 2, "operational changes never invoke the runner for completed calls");
+
+      const persisted = manager.getPersistence().load(source.runId);
+      assert.ok(persisted?.runtime);
+      persisted.runtime.inputsFormat = 1;
+      manager.getPersistence().save(persisted);
+      const bridged = await manager.runSync(script, undefined, {
+        runId: "format-one-bridge",
+        resumeFromRunId: source.runId,
+        agentTimeoutMs: null,
+        agentRetries: 0,
+        concurrency: 9,
+      });
+      assert.equal(bridged.resumeReport?.strategy, "positional-v1");
+      if (bridged.resumeReport?.strategy === "positional-v1") {
+        assert.equal(bridged.resumeReport.fallbackReason, "inputs-format-legacy");
+        assert.equal(bridged.resumeReport.eligibility, "legacy");
+      }
+      assert.equal(bridged.resumeReport?.replayed, 2);
+      assert.equal(liveCalls, 2);
+      const bridgedState = manager.getPersistence().load("format-one-bridge");
+      assert.equal(bridgedState?.runtime?.inputsFormat, 2);
+
+      const upgraded = await manager.runSync(script, undefined, {
+        runId: "format-two-upgraded",
+        resumeFromRunId: "format-one-bridge",
+      });
+      assert.equal(
+        upgraded.resumeReport?.strategy,
+        "identity-v1",
+        "the format-2 target admits identity replay on its next hop",
+      );
+      assert.equal(upgraded.resumeReport?.replayed, 2);
+      assert.equal(upgraded.resumeReport?.live, 0);
+      assert.equal(liveCalls, 2, "format-2 re-journaling enables identity replay on the next hop");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(persistenceRoot, { recursive: true, force: true });
+    }
+  });
+
   it("pins format, status, metadata, runtime, and environment disabled outcomes", () => {
     const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>, string]> = [
       ["unsupported", sourceState(undefined, { resume: { format: "future" } as never }), {}, "unsupported-format"],
@@ -266,7 +448,7 @@ describe("incremental resume admission", () => {
       ["node", sourceState(undefined, { runtime: { ...RUNTIME, node: "v0" } }), {}, "runtime-mismatch"],
       ["v8", sourceState(undefined, { runtime: { ...RUNTIME, v8: "v0" } }), {}, "runtime-mismatch"],
       ["path format", sourceState(undefined, { runtime: { ...RUNTIME, pathFormat: 0 } }), {}, "runtime-mismatch"],
-      ["input format", sourceState(undefined, { runtime: { ...RUNTIME, inputsFormat: 0 } }), {}, "runtime-mismatch"],
+      ["input format", sourceState(undefined, { runtime: { ...RUNTIME, inputsFormat: 3 } }), {}, "runtime-mismatch"],
       ["checkpoint format", sourceState(undefined, { runtime: { ...RUNTIME, checkpointInputsFormat: 0 } }), {}, "runtime-mismatch"],
       ["current environment", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME } }, "environment-missing"],
       ["environment arm", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME, environment: { git: { head: HASH_A, dirtyDigest: HASH_B } } } }, "environment-mismatch"],
@@ -373,7 +555,7 @@ describe("incremental resume admission", () => {
       effectiveCwd: undefined,
       resume: { format: "identity-v1" },
     });
-    assert.equal(admission(missingEnvironmentAndCwd).strategy === "live" && admission(missingEnvironmentAndCwd).disabledReason, "environment-missing");
+    assert.equal(admission(missingEnvironmentAndCwd).strategy === "live" && admission(missingEnvironmentAndCwd).disabledReason, "resume-metadata-missing");
     const cwdAndRuntime = sourceState(undefined, { runtime: { ...RUNTIME, node: "bad" } });
     const current = { effectiveCwd: "/other", runtime: RUNTIME, environment: ENVIRONMENT };
     assert.equal(admission(cwdAndRuntime, { current }).strategy === "live" && admission(cwdAndRuntime, { current }).disabledReason, "cwd-mismatch");

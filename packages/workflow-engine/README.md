@@ -70,6 +70,7 @@ For process-lifetime background execution, use the returned settlement handle:
 ```ts
 const { runId, promise } = manager.startInBackground(script, { topic: "otters" });
 console.log(manager.getSnapshot(runId)?.tokenUsage); // cumulative live usage when known
+await manager.cancelAgentCall(runId, 3); // cancel one in-flight agent; the run stays live
 const terminal = await promise; // rejects for pause, failure, or abort
 ```
 
@@ -78,10 +79,20 @@ detached from the caller, not from the Node process. If `ExecOptions.resumeJourn
 manager sorts and copies the exact entries—including synthetic checkpoint replies—into the new run
 before that save. Replay hits do not emit journal callbacks, so this seeding is what makes the child
 run independently resumable after a second pause or process loss. Each later live journal append
-persists the complete inherited prefix plus suffix. After a crash, stale persisted `running` runs
-recover to `paused`; in-flight unjournaled work may execute again on resume.
+persists the complete inherited prefix plus suffix. A dead owner's persisted `pending` or `running`
+run reconciles under its lease to `paused` with `pauseReason: "interrupted"` during construction or
+a cold inspect/list/resume lookup. Live and permission-protected owner PIDs remain untouched.
+Completed crash-journal entries can replay through `crash-residue`; an in-flight unjournaled call
+executes again on resume.
 
-Inspect a run without executing or leasing it:
+`cancelAgentCall(runId, callIndex)` targets one uniquely matching live attempt. It aborts that
+attempt with recoverable `AGENT_CANCELLED`, races backend cooperation so an ignored signal still
+settles, bypasses retries, and resolves only after the failed call record and `agentEnd` state are
+committed. The script receives `null`; sibling branches continue, the run-level signal and
+`abortSignaled` remain untouched, and no journal result is created. Errors for missing, settled,
+checkpoint, or duplicate scoped indexes list the currently in-flight call-index/label pairs.
+
+Inspect a run without executing it:
 
 ```ts
 const status = manager.inspectRun(result.runId, {
@@ -91,15 +102,21 @@ const status = manager.inspectRun(result.runId, {
 });
 ```
 
-`inspectRun()` is synchronous, read-only, and live-first: it projects the manager's freshest
-in-memory snapshot and journal, then falls back to the same project-scoped persistence used by
-resume. It returns `undefined` for a missing/unreadable ID. `lastN` defaults to 20 (1–50),
+`inspectRun()` is synchronous and live-first: it projects the manager's freshest in-memory snapshot
+and journal, then falls back to the same project-scoped persistence used by resume. A cold persisted
+`pending`/`running` row may be lease-reconciled to `paused` / `interrupted` when its owner is dead;
+all other inspection is non-mutating. It returns `undefined` for a missing/unreadable ID. `lastN` defaults to 20 (1–50),
 `logLines` defaults to 20 (0–50), and `labelGlob` is a case-sensitive whole-label glob where `*`
 matches zero or more Unicode code points, `?` matches one, and backslash escapes the next character
 (a trailing backslash is literal). Filtering precedes latest-N selection; calls are returned in
 ascending call-index order.
 
-The `WorkflowRunStatus` projection is allowlisted: it never exposes script, args, prompts,
+The `WorkflowRunStatus` projection includes the run's resolved limits and, for a new-run resume,
+its bounded `replayEligibility` admission/progress summary. Agent call rows include their
+resolved per-attempt `timeoutMs` and terminal `errorCode`, which keeps failures such as
+`AGENT_TIMEOUT` and `AGENT_CANCELLED` visible even though they have no result journal row. The
+projection is allowlisted:
+it never exposes script, args, prompts,
 histories, journal hashes, session IDs, cwd, checkpoint text/defaults, auth context, or raw results.
 Text and result previews are redacted and capped at 512 UTF-8 bytes; results are structurally
 compacted; at most 64 phases are considered; and the serialized status is capped at 24,576 bytes
@@ -116,7 +133,7 @@ console.log(run.result, run.agentCount, run.durationMs);
 ```
 
 `runWorkflow` returns the `EngineRunResult` (meta / result / logs / phases / agentCount /
-durationMs / runId / tokenUsage / optional `agentSessions`, `fallbacks`, and `checkpointsTaken`). `WorkflowManager` stamps the terminal
+durationMs / runId / tokenUsage / resolved `effectiveLimits` / optional `agentSessions`, `fallbacks`, and `checkpointsTaken`). `WorkflowManager` stamps the terminal
 `status` / `reason` / `resetHint` on top to produce a `WorkflowRunResult`.
 
 ## The script DSL
@@ -157,7 +174,7 @@ const again = await manager.runSync(script, { topic: "otters", expanded: true },
   resumeFromRunId: first.runId,
   resumePolicy: "auto", // default; "positional" is the migration escape hatch
 });
-console.log(again.resumeReport);
+console.log(again.replayEligibility, again.resumeReport);
 ```
 
 The manager admits exact cwd/runtime/terminal-environment state, persists the candidate seed, and
@@ -166,6 +183,18 @@ uncertain, ambiguous, unsafe, or mismatched call runs live. Same-ID `manager.res
 manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
 catalogs, checkpoint source-index rules, and filesystem preconditions are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
+
+The call identity hashes authored behavior; the separate input fingerprint covers label, per-call
+cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentTimeoutMs`,
+`agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, are operational and enter
+neither hash. A crash snapshot reconciled to `paused` / `interrupted` without terminal environment
+proof uses `crash-residue`:
+matching admission environments allow its hash-only positional prefix, while unknown or drifted
+environments are all-live. Normally settled input-fingerprint formats below 2 use the named
+`inputs-format-legacy` positional bridge, including ancestor-scoped prefixes carried by ≤0.23 resume
+hops when the ancestor run is still persisted. The persisted producing engine version is diagnostic only. Background admission,
+inspection, polling, and terminal results expose the same eligibility strategy, predicted/observed
+prefix, first non-replay, version formats, and operational differences.
 
 Separately from replay correspondence, the manager builds a `PreparedContinuation` from a
 usage/auth-paused snapshot's coherent root `calls[]` × `agents[]` join. Both new-run and same-ID
@@ -192,9 +221,18 @@ The worktree and its edits are discarded; return the diff as data. Isolation wit
 declaration never enables non-contiguous replay.
 
 `tokenBudget` caps total spend (per-phase sub-budgets via `phase(title, { budget })`);
-`maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. Defaults
+`maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. `agentTimeoutMs` is a
+total wall-clock ceiling for each attempt. A finite per-call `timeoutMs` can tighten the ceiling but
+cannot raise or disable it; with no host ceiling, per-call `null`/omission is uncapped. Every retry
+gets a fresh clock (at most `(retries + 1) × timeout`, with retries clamped to 3). Exhaustion is a
+recoverable `AGENT_TIMEOUT`, so the call settles to `null` and frees its concurrency slot. The ACP
+runner cancels the session and closes/recycles a child that does not honor cancellation. Defaults
 are exported as `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`, and
 `DEFAULT_AGENT_TIMEOUT_MS`.
+
+New resume executions resolve limits from their own `ExecOptions`; they do not inherit the source
+run's values. Pass operational bounds again when constructing a resume; changing them does not
+invalidate replay or interrupted-turn continuation.
 
 `WorkflowManager` persists run state under `~/.agentprism/workflows` by default. Hosts can
 set `new WorkflowManager({ persistenceRoot: "/absolute/data/root" })`; when omitted,
@@ -314,12 +352,12 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 
 - **Engine** — `runWorkflow`, `parseWorkflowScript`; types `EngineRunResult`,
   `WorkflowRunOptions`, `AgentOptions`, `CheckpointOptions`, `WorkflowAgentOptions`,
-  `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
+  `WorkflowAgentAttemptControl`, `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
   `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, `PreparedContinuation`,
-  `ContinuationCandidate`, and the resume policy/report types.
+  `ContinuationCandidate`, and the resume policy/report/replay-eligibility types.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
-  `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
-  `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,
+  `ManagedRun`, `WorkflowAgentCallCancellation`); `createRunPersistence`, `generateRunId`, and
+  types `RunPersistence`, `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,
   `PersistedAgentState`, `FsLayer`; `readEvents()`/`watchEvents()` options/results/errors; safe
   `inspectRun()` and the `WorkflowRunStatus` / inspection / log-tail / call / truncation contracts.
 - **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /

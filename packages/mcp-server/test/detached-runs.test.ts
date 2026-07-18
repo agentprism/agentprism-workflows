@@ -72,13 +72,30 @@ const TWO_AGENT_BACKGROUND = [
   'return { first, second };',
 ].join("\n");
 
+const EXPECTED_LIMITS = {
+  maxAgents: 1_000,
+  tokenBudget: null,
+  concurrency: 3,
+  agentRetries: 1,
+  agentTimeoutMs: 50_000,
+} as const;
+
 test("background acceptance is immediate and await reports immediate, timeout, cancellation, partial usage, and terminal outcome", async () => {
   const controlled = new ControlledRunner();
   const { client, server, dispose } = await connect(controlled.runner, { listTools: true });
   try {
     const initiating = new AbortController();
     const accepted = await client.callTool(
-      { name: "workflow", arguments: { script: TWO_AGENT_BACKGROUND, background: true } },
+      {
+        name: "workflow",
+        arguments: {
+          script: TWO_AGENT_BACKGROUND,
+          background: true,
+          concurrency: 3,
+          agentRetries: 1,
+          agentTimeoutMs: 50_000,
+        },
+      },
       undefined,
       { signal: initiating.signal },
     );
@@ -88,6 +105,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
       status: "running",
       scriptSource: "inline",
       scriptUri: `workflow://runs/${acceptedRunId}/script`,
+      limits: EXPECTED_LIMITS,
     });
     assert.equal(
       textOf(accepted),
@@ -100,6 +118,12 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     initiating.abort();
     assert.equal(controlled.calls[0].options.signal?.aborted, false, "initiating-call cancellation is detached");
 
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: acceptedRunId },
+    });
+    assert.deepEqual(structured(inspected)?.limits, EXPECTED_LIMITS);
+
     const immediate = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: acceptedRunId, waitMs: 0 },
@@ -107,6 +131,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     assert.equal(structured(immediate)?.wait && field(structured(immediate)?.wait, "returnedBecause"), "immediate");
     assert.equal(structured(immediate)?.outcome, undefined);
     assert.equal(structured(immediate)?.tokenUsage, undefined);
+    assert.deepEqual(structured(immediate)?.limits, EXPECTED_LIMITS);
 
     controlled.resolve(0, { files: ["src/auth.ts"] }, {
       input: 10,
@@ -128,6 +153,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     assert.equal(partialStatus?.currentPhase, "Review");
     assert.ok((field(partialStatus?.logTail, "lines") as string[]).includes("review started"));
     assert.equal(partialStatus?.outcome, undefined);
+    assert.deepEqual(partialStatus?.limits, EXPECTED_LIMITS);
 
     const timed = await client.callTool({
       name: "workflow",
@@ -136,6 +162,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     assert.equal(field(structured(timed)?.wait, "requestedMs"), 15);
     assert.equal(field(structured(timed)?.wait, "returnedBecause"), "timeout");
     assert.ok(Number(field(structured(timed)?.wait, "elapsedMs")) >= 0);
+    assert.deepEqual(structured(timed)?.limits, EXPECTED_LIMITS);
 
     type DirectHandler = (
       args: Record<string, unknown>,
@@ -181,6 +208,8 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     );
     assert.deepEqual(completedStatus?.tokenUsage, field(completedStatus?.outcome, "tokenUsage"));
     assert.equal(field(completedStatus?.tokenUsage, "total"), 42);
+    assert.deepEqual(completedStatus?.limits, EXPECTED_LIMITS);
+    assert.deepEqual(field(completedStatus?.outcome, "limits"), EXPECTED_LIMITS);
 
     const repeated = await client.callTool({
       name: "workflow",
@@ -188,10 +217,69 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     });
     assert.equal(field(structured(repeated)?.wait, "returnedBecause"), "terminal");
     assert.deepEqual(field(structured(repeated)?.outcome, "result"), field(completedStatus?.outcome, "result"));
+    assert.deepEqual(structured(repeated)?.limits, EXPECTED_LIMITS);
   } finally {
     for (let index = 0; index < controlled.calls.length; index++) {
       controlled.calls[index]?.resolve("cleanup");
     }
+    await dispose();
+  }
+});
+
+test("MCP await and inspect expose the resolved timeout and AGENT_TIMEOUT call failure", async () => {
+  let attempts = 0;
+  const runner = makeRunner(
+    () => {
+      attempts += 1;
+      return new Promise(() => {
+        // Deliberately ignore the attempt signal and never settle.
+      });
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  const expectedLimits = {
+    maxAgents: 1_000,
+    tokenBudget: null,
+    concurrency: 2,
+    agentRetries: 0,
+    agentTimeoutMs: 25,
+  } as const;
+  try {
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script:
+          'export const meta = { name: "timed", description: "timed" };\n' +
+          'return await agent("never", { label: "never" });',
+        background: true,
+        concurrency: 2,
+        agentTimeoutMs: 25,
+      },
+    });
+    const runId = runIdOf(accepted);
+    assert.deepEqual(structured(accepted)?.limits, expectedLimits);
+
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 1_000 },
+    });
+    assert.equal(structured(awaited)?.status, "completed");
+    assert.deepEqual(structured(awaited)?.limits, expectedLimits);
+    assert.deepEqual(field(structured(awaited)?.outcome, "limits"), expectedLimits);
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId },
+    });
+    const calls = structured(inspected)?.calls as Array<Record<string, unknown>>;
+    assert.equal(attempts, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.label, "never");
+    assert.equal(calls[0]?.timeoutMs, 25);
+    assert.equal(calls[0]?.errorCode, WorkflowErrorCode.AGENT_TIMEOUT);
+    assert.equal(calls[0]?.resultPreview, "null");
+    assert.deepEqual(structured(inspected)?.limits, expectedLimits);
+  } finally {
     await dispose();
   }
 });
@@ -688,6 +776,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     });
     const secondId = runIdOf(secondAccepted);
     assert.notEqual(secondId, sourceId);
+    assert.equal(field(structured(secondAccepted)?.replayEligibility, "predictedReplayablePrefix"), 10);
     const secondAwait = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: secondId, waitMs: 1_000 },
@@ -698,7 +787,15 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     assert.equal(field(secondReport, "strategy"), "identity-v1");
     assert.equal(field(secondReport, "replayed"), 10);
     assert.equal(field(secondReport, "live"), 2);
-    assert.match(textOf(secondAwait), /^resume: identity-v1, 10 replayed, 2 live, 0 failed$/m);
+    assert.equal(field(structured(secondAwait)?.replayEligibility, "replayedPrefix"), 10);
+    assert.deepEqual(
+      structured(secondAwait)?.replayEligibility,
+      field(structured(secondAwait)?.outcome, "replayEligibility"),
+    );
+    assert.match(
+      textOf(secondAwait),
+      /^resume: identity-v1; predicted replayable prefix 10; replayed prefix 10; 10 replayed, 2 live, 0 failed$/m,
+    );
     const repeated = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: secondId, waitMs: 0 },
@@ -731,6 +828,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     terminalRunId = thirdId;
     assert.notEqual(thirdId, sourceId);
     assert.notEqual(thirdId, secondId);
+    assert.equal(field(structured(thirdAccepted)?.replayEligibility, "predictedReplayablePrefix"), 12);
     const thirdAwait = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: thirdId, waitMs: 1_000 },
@@ -741,13 +839,19 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     assert.equal(field(thirdReport, "strategy"), "identity-v1");
     assert.equal(field(thirdReport, "replayed"), 12);
     assert.equal(field(thirdReport, "live"), 0);
-    assert.match(textOf(thirdAwait), /^resume: identity-v1, 12 replayed, 0 live, 0 failed$/m);
+    const thirdEligibility = structured(thirdAwait)?.replayEligibility;
+    assert.equal(field(thirdEligibility, "replayedPrefix"), 12);
+    assert.deepEqual(thirdEligibility, field(structured(thirdAwait)?.outcome, "replayEligibility"));
+    assert.match(
+      textOf(thirdAwait),
+      /^resume: identity-v1; predicted replayable prefix 12; replayed prefix 12; 12 replayed, 0 live, 0 failed$/m,
+    );
     const inspected = await client.callTool({
       name: "workflow",
       arguments: { action: "inspect", runId: thirdId },
     });
-    assert.equal(Object.hasOwn(structured(inspected) ?? {}, "resumeReport"), false);
-    assert.doesNotMatch(textOf(inspected), /resume:/);
+    assert.deepEqual(structured(inspected)?.replayEligibility, thirdEligibility);
+    assert.match(textOf(inspected), /resume: identity-v1/);
     assert.equal(existsSync(lock), false, "await did not acquire the paused run's lease");
   } finally {
     await dispose();
@@ -764,13 +868,20 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     const persistedReport = field(structured(persisted)?.outcome, "resumeReport");
     assert.equal(field(persistedReport, "strategy"), "identity-v1");
     assert.equal(field(persistedReport, "replayed"), 12);
-    assert.match(textOf(persisted), /^resume: identity-v1, 12 replayed, 0 live, 0 failed$/m);
+    assert.deepEqual(
+      structured(persisted)?.replayEligibility,
+      field(structured(persisted)?.outcome, "replayEligibility"),
+    );
+    assert.match(
+      textOf(persisted),
+      /^resume: identity-v1; predicted replayable prefix 12; replayed prefix 12; 12 replayed, 0 live, 0 failed$/m,
+    );
   } finally {
     await cold.dispose();
   }
 });
 
-test("stale running persistence recovers to paused and resumes from its journal", async () => {
+test("a long-lived server lazily reconciles crash residue for await, inspect, and resume", async () => {
   let sourceCalls = 0;
   const first = await connect(makeRunner(() => {
     sourceCalls++;
@@ -797,8 +908,9 @@ test("stale running persistence recovers to paused and resumes from its journal"
   }));
   delete state.result;
   delete state.completedAt;
+  const resume = state.resume as Record<string, unknown> | undefined;
+  if (resume) delete resume.terminalEnvironment;
   const staleFile = join(dirname(sourceFile), `${staleId}.json`);
-  writeFileSync(staleFile, JSON.stringify(state, null, 2), "utf8");
 
   let resumedCalls = 0;
   const cold = await connect(makeRunner(() => {
@@ -806,22 +918,34 @@ test("stale running persistence recovers to paused and resumes from its journal"
     return "unexpected";
   }), { listTools: true });
   try {
+    writeFileSync(staleFile, JSON.stringify(state, null, 2), "utf8");
     const recovered = await cold.client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: staleId, waitMs: 0 },
     });
     assert.equal(structured(recovered)?.status, "paused");
+    assert.equal(structured(recovered)?.reason, "Interrupted: the owning process exited before completion (PID unavailable); recovered to a resumable pause.");
     assert.equal(field(structured(recovered)?.wait, "returnedBecause"), "terminal");
+    const inspected = await cold.client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: staleId },
+    });
+    assert.equal(structured(inspected)?.status, "paused");
+    assert.equal(structured(inspected)?.reason, structured(recovered)?.reason);
     const resumed = await cold.client.callTool({
       name: "workflow",
       arguments: { script, background: true, resumeFromRunId: staleId },
     });
+    assert.equal(field(structured(resumed)?.replayEligibility, "fallbackReason"), "crash-residue");
+    assert.equal(field(structured(resumed)?.replayEligibility, "predictedReplayablePrefix"), 1);
     const completed = await cold.client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: runIdOf(resumed), waitMs: 1_000 },
     });
     assert.equal(structured(completed)?.status, "completed");
     assert.equal(resumedCalls, 0, "the recovered journal remains resumable");
+    assert.equal(field(field(structured(completed)?.outcome, "resumeReport"), "fallbackReason"), "crash-residue");
+    assert.match(textOf(completed), /resume: positional-v1\/legacy \(crash-residue\)/);
   } finally {
     await cold.dispose();
   }

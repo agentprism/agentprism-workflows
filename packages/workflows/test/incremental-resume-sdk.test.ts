@@ -13,6 +13,7 @@ import {
   WorkflowManager,
   runDynamicWorkflow,
   type ResumePolicy,
+  type WorkflowReplayEligibility,
   type WorkflowResumeReport,
 } from "../src/index.js";
 
@@ -133,9 +134,25 @@ return { one, approval }`, "same-run"));
       failed: 0,
       calls: [],
     };
+    const eligibility: WorkflowReplayEligibility = {
+      strategy: "identity-v1",
+      sourceRunId: "source",
+      predictedReplayablePrefix: 0,
+      replayedPrefix: 0,
+      replayed: 0,
+      live: 0,
+      failed: 0,
+      currentEngineVersion: "0.27.0",
+      engineVersionComparison: "source-unknown",
+      currentInputsFormat: 2,
+      operationalChanges: [],
+    };
     assert.equal(report.requestedPolicy, "auto");
+    assert.equal(eligibility?.strategy, "identity-v1");
     assert.deepEqual(RESUME_FALLBACK_REASONS, [
       "legacy-recording",
+      "crash-residue",
+      "inputs-format-legacy",
       "forced-positional",
       "unsafe-recording",
       "nested-workflows",

@@ -41,6 +41,7 @@ test("input shape: one tool advertises the exact run, inspect, await, and stop f
       "agentTimeoutMs",
       "args",
       "background",
+      "callIndex",
       "checkpointReplies",
       "concurrency",
       "labelGlob",
@@ -168,13 +169,28 @@ test("inspection accepts defaults and exact bounds, and rejects invalid IDs/glob
   }
 });
 
-test("stop requires runId, allows inspection fields, and rejects execution fields and waitMs", () => {
+test("stop requires runId, accepts an optional per-agent callIndex, and rejects execution fields and waitMs", () => {
   assert.deepEqual(
     parseWorkflowToolInput(
-      Schema.parse({ action: "stop", runId: "a-b", lastN: 5, labelGlob: "review:*", logLines: 2 }),
+      Schema.parse({
+        action: "stop",
+        runId: "a-b",
+        callIndex: 7,
+        lastN: 5,
+        labelGlob: "review:*",
+        logLines: 2,
+      }),
     ),
-    { action: "stop", runId: "a-b", lastN: 5, labelGlob: "review:*", logLines: 2 },
+    { action: "stop", runId: "a-b", callIndex: 7, lastN: 5, labelGlob: "review:*", logLines: 2 },
   );
+  assert.equal(
+    parseWorkflowToolInput(Schema.parse({ action: "stop", runId: "a-b" })).callIndex,
+    undefined,
+    "omission retains whole-run stop",
+  );
+  for (const callIndex of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => Schema.parse({ action: "stop", runId: "a-b", callIndex }));
+  }
   for (const input of [
     { action: "stop" },
     { action: "stop", runId: "a-b", script: "x" },
@@ -201,6 +217,7 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "inspect", runId: "a-b", checkpointReplies: { 0: true } },
     { action: "inspect", runId: "a-b", background: false },
     { action: "inspect", runId: "a-b", waitMs: 0 },
+    { action: "inspect", runId: "a-b", callIndex: 0 },
     { action: "await" },
     { action: "await", runId: "a-b", script: "x" },
     { action: "await", runId: "a-b", scriptPath: "/tmp/x.js" },
@@ -214,7 +231,9 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "await", runId: "a-b", resumePolicy: "auto" },
     { action: "await", runId: "a-b", checkpointReplies: { 0: true } },
     { action: "await", runId: "a-b", background: true },
+    { action: "await", runId: "a-b", callIndex: 0 },
     { script: "x", runId: "a-b" },
+    { script: "x", callIndex: 0 },
     { script: "x", waitMs: 0 },
     { action: "run", script: "x", lastN: 1 },
     { action: "run", script: "x", labelGlob: "*" },

@@ -61,8 +61,12 @@ test("run result records compatibility fallback callbacks without parsing modifi
         'modifier: model "gpt-example[high]: reasoning_effort "high" not advertised" unavailable — using the session default',
     },
   ]);
-  assert.deepEqual(result.logs.slice(0, 2), result.fallbacks?.map((entry) => entry.message));
-  assert.equal(result.logs.length, 3, "deduplication does not change the existing log channel");
+  assert.equal(
+    result.logs[0],
+    "agent timeout admission: host ceiling none total wall-clock per attempt; each retry re-arms the clock",
+  );
+  assert.deepEqual(result.logs.slice(1, 3), result.fallbacks?.map((entry) => entry.message));
+  assert.equal(result.logs.length, 4, "deduplication does not change the existing log channel");
 });
 
 test("manager persists fallback observability and replay-only executions omit it", async () => {

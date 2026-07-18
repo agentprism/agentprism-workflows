@@ -98,7 +98,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, total-wall-clock-per-attempt `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
@@ -263,6 +263,9 @@ const background = manager.startInBackground(script, { repo: "agentprism" }, { t
 console.log(background.runId, manager.getSnapshot(background.runId));
 // background.promise resolves only on completion and rejects on pause/failure/abort.
 
+// Settle one runaway agent to null without aborting the run or retrying that call.
+await manager.cancelAgentCall(background.runId, 4);
+
 const status = manager.inspectRun(run.runId, {
   lastN: 10,
   labelGlob: "review-*",
@@ -282,7 +285,7 @@ const next = await manager.runSync(script, { repo: "agentprism", expanded: true 
   resumeFromRunId: run.runId,
   resumePolicy: "auto",
 });
-console.log(next.runId, next.resumeReport);
+console.log(next.runId, next.replayEligibility, next.resumeReport);
 ```
 
 `runSync(script, args?, exec?)` always resolves to a terminal `WorkflowRunResult`. A run **pauses**
@@ -296,6 +299,21 @@ resolves immediately; without one, the default mode still takes `default ?? true
 checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
+
+A finite run-level `agentTimeoutMs` is the ceiling for every attempt. Script-level `timeoutMs` may
+tighten it but cannot raise or disable it; without a host ceiling, per-call `null`/omission is
+uncapped. The clock covers total attempt wall time rather than idle time. Retries each get a fresh
+clock, so the maximum envelope is `(resolved retries + 1) × resolved timeout` (retries are clamped
+at 3). After the final timeout, the call resolves to `null` with recoverable `AGENT_TIMEOUT`,
+releases its concurrency slot, and the ACP runner closes/recycles a backend session that ignores
+cancellation.
+
+`cancelAgentCall(runId, callIndex)` is the stateful host seam for a single live attempt. It returns
+`WorkflowAgentCallCancellation` after the failed record and agent-end state are committed, while
+the script receives `null` and siblings continue. `AGENT_CANCELLED` never retries, never sets the
+run's abort state, and never creates a journal result; inspect exposes the error and a later resume
+runs that occurrence live. A missing, settled, checkpoint, or duplicate scoped index errors with
+the currently in-flight call-index/label pairs.
 
 Usage-limit and auth resumes are continuation-aware by default on both `resumeFromRunId` and
 same-ID `resume()` / `resumeInBackground()`: when the interrupted root call's index, identity hash,
@@ -315,6 +333,8 @@ returns `{ runId, promise: Promise<WorkflowRunResult> }`. The facade keeps an AC
 per-execution `exec.agent` until that promise settles, including rejection. Read live state with
 `getRun()`, `getSnapshot()`, or `inspectRun()`, and subscribe to cumulative `tokenUsage` events while
 work is running. Live attempts update `snapshot.tokenUsage` monotonically; replayed calls add zero.
+Run results expose `effectiveLimits`; inspect status exposes the same values as `limits`, and failed
+agent rows carry their resolved `timeoutMs` plus `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
 under a new run ID, and match safe calls by exact path/hash or unique hash+input fingerprint.
@@ -324,18 +344,35 @@ records are rebound to the current call index/label/phase. `resumePolicy: "posit
 index/prefix matching but cannot bypass new-format input/safety/environment gates. The distinct
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
+Operational limits are resolved from the new execution's `exec` options and manager defaults, not
+copied from the source run; pass the desired timeout/retry/concurrency values again. Host
+`agentTimeoutMs`, `agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, enter
+neither replay identity nor the execution-input fingerprint and may change without invalidating
+completed calls or interrupted-turn continuation.
+
+Crash snapshots reconciled to `paused` / `interrupted` without a terminal environment use the
+`crash-residue` positional bridge: their hash-stable prefix is eligible only when the recorded
+admission environment matches the new run. Normally settled sources with an input-fingerprint format below 2 use the
+`inputs-format-legacy` positional bridge. That bridge also accepts ancestor-scoped rows carried by a
+≤0.23 resume hop when the ancestor run still exists in the same persistence directory; nested and deleted-run scopes stay live. Engine
+package versions are persisted and surfaced as diagnostics but never gate replay. Every new-run
+resume exposes `WorkflowReplayEligibility` on the foreground result and inspection status: strategy,
+predicted and observed replayable prefixes, counts, the first non-replay when known, source/current
+engine and input-format versions, and non-gating operational changes.
 
 The manager's critical initial save contains the complete inherited seed before a background
 acknowledgement. A manager-prepared `resumeFromRunId` hit re-journals the selected value under its
 current target index; same-ID/manual legacy cache hits retain the historical no-journal-callback
 behavior and rely on the already-seeded prefix. Each new run is independently resumable across
-multiple pause/resume hops. Process loss can stop in-flight work; the next manager recovers a stale
-durable `running` record to `paused`, and an unjournaled in-flight call may run again.
+multiple pause/resume hops. Process loss can stop in-flight work; construction and cold
+inspect/list/resume lookups reconcile a dead owner's durable `pending`/`running` record under its
+lease to `paused` with `pauseReason: "interrupted"`. An unjournaled in-flight call may run again.
 
 `inspectRun(runId, options?)` is inherited through this facade and returns the shared
 `WorkflowRunStatus` without importing `@automatalabs/workflow-engine`. It reads the freshest live
-snapshot first and project-scoped persistence second, never executes the script or acquires a run
-lease, and returns `undefined` for an unknown/unreadable ID. The facade also re-exports
+snapshot first and project-scoped persistence second and never executes the script. A cold
+`pending`/`running` row may take a short reconciliation lease when its owner is dead; other rows are
+not changed. It returns `undefined` for an unknown/unreadable ID. The facade also re-exports
 `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
 `WorkflowRunStatusTruncation`, `WorkflowRunStatus`, and `JournalCallMetadata`. Inspection defaults
 to 20 calls and 20 log lines, supports case-sensitive whole-label `*`/`?`/backslash globs, redacts
@@ -808,6 +845,7 @@ RunDynamicWorkflowOptions, RunIsolationSdkOptions, RunIsolationOptions, Isolatio
 IsolationTarget, ReplayRunnerOptions, ReplayRunner, ReplayObservation, ReplayReport,
 ReplayCallReport, ReplayDivergenceEvent, ResolvedIsolationTarget,
 WorkflowRunOptions, AgentOptions, ExecOptions, CheckpointCallContext,
+WorkflowAgentAttemptControl, WorkflowAgentCallCancellation,
 MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,
@@ -819,6 +857,8 @@ ResumePolicy, WorkflowResumeStrategy, WorkflowResumeMatch, WorkflowResumeSafety,
 WorkflowResumeFallbackReason, WorkflowResumeDisabledReason,
 WorkflowResumeCallLiveReason, WorkflowResumeCallFailedReason,
 WorkflowCallReplayProvenance, WorkflowResumeCallDecision, WorkflowResumeReport,
+WorkflowReplayOperationalOption, WorkflowReplayOperationalChange,
+WorkflowReplayFirstNonReplay, WorkflowReplayEligibility,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,

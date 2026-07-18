@@ -1,4 +1,4 @@
-import type { WorkflowRunStatus } from "@automatalabs/workflows";
+import type { WorkflowReplayEligibility, WorkflowRunStatus } from "@automatalabs/workflows";
 
 import type {
   WorkflowBackgroundAccepted,
@@ -12,18 +12,42 @@ import type {
 
 declare const status: WorkflowRunStatus;
 const lineage: WorkflowScriptLineageEntry[] = [];
+const limits = {
+  maxAgents: 1_000,
+  tokenBudget: null,
+  concurrency: 6,
+  agentRetries: 0,
+  agentTimeoutMs: null,
+};
+const replayEligibility: WorkflowReplayEligibility = {
+  strategy: "identity-v1",
+  sourceRunId: "source-run",
+  predictedReplayablePrefix: 1,
+  replayedPrefix: 0,
+  replayed: 0,
+  live: 0,
+  failed: 0,
+  currentEngineVersion: "0.27.0",
+  engineVersionComparison: "source-unknown",
+  currentInputsFormat: 2,
+  operationalChanges: [],
+};
 
 const execution: WorkflowExecutionToolResult = {
   runId: "aa-bb",
   status: "completed",
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
+  limits,
+  replayEligibility,
 };
 const background: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
   scriptSource: "path",
   scriptUri: "workflow://runs/aa-bb/script",
+  limits,
+  replayEligibility,
 };
 const inspection: WorkflowInspectionToolResult = {
   ...status,
@@ -51,11 +75,19 @@ const executionWithoutSource: WorkflowExecutionToolResult = {
   status: "completed",
   scriptUri: "workflow://runs/aa-bb/script",
 };
+// @ts-expect-error execution results require resolved limits
+const executionWithoutLimits: WorkflowExecutionToolResult = {
+  runId: "aa-bb",
+  status: "completed",
+  scriptSource: "inline",
+  scriptUri: "workflow://runs/aa-bb/script",
+};
 // @ts-expect-error background acknowledgements require scriptUri
 const backgroundWithoutUri: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
   scriptSource: "inline",
+  limits,
 };
 // @ts-expect-error inspections require the complete lineage
 const inspectionWithoutLineage: WorkflowInspectionToolResult = {
@@ -89,6 +121,7 @@ void [
   stopped,
   resourceFields,
   executionWithoutSource,
+  executionWithoutLimits,
   backgroundWithoutUri,
   inspectionWithoutLineage,
   awaitWithoutUri,

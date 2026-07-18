@@ -89,6 +89,12 @@ From [`src/index.ts`](./src/index.ts):
 
 **Errors** (runtime, not just types)
 - `WorkflowError` (class) + `WorkflowErrorCode` (enum) + `WorkflowErrorOptions`.
+- `AGENT_TIMEOUT` identifies exhaustion of a recoverable total-wall-clock attempt cap. The engine
+  retries only within its configured bound, then settles the call to `null`; every retry gets a
+  fresh clock.
+- `AGENT_CANCELLED` identifies a host-selected in-flight call. The engine settles that call to
+  `null` without retrying or aborting the owning run; the failed row is observable but is not a
+  replayable journal result.
 - `AuthErrorContext` — the non-secret backend/method summary carried by `AUTH_REQUIRED`.
 - `ProviderUsageLimitContext` — the backend/code and provider-derived reset instant carried by
   `PROVIDER_USAGE_LIMIT`.
@@ -98,7 +104,7 @@ From [`src/index.ts`](./src/index.ts):
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,
   `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`,
   `authContext?`, `agentSessions?`, `fallbacks?`, `checkpointsTaken?`, `calls?`,
-  `resumeReport?`). Paused, failed, and aborted results additionally carry the
+  `resumeReport?`, `replayEligibility?`, `effectiveLimits?`). Paused, failed, and aborted results additionally carry the
   optional redacted final-20 `logTail`; completed results omit it and `logs` remains the full
   compatibility array.
 - `WorkflowRunFallback` — `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?,
@@ -115,10 +121,18 @@ From [`src/index.ts`](./src/index.ts):
 - `ResumePolicy`, `WorkflowResumeStrategy`, `WorkflowResumeMatch`, `WorkflowResumeSafety`,
   `WorkflowResumeFallbackReason`, `WorkflowResumeDisabledReason`,
   `WorkflowResumeCallLiveReason`, `WorkflowResumeCallFailedReason`,
-  `WorkflowCallReplayProvenance`, `WorkflowResumeCallDecision`, and `WorkflowResumeReport` — the
+  `WorkflowCallReplayProvenance`, `WorkflowResumeCallDecision`, `WorkflowResumeReport`,
+  `WorkflowReplayOperationalOption`, `WorkflowReplayOperationalChange`,
+  `WorkflowReplayFirstNonReplay`, and `WorkflowReplayEligibility` — the
   additive content-addressed new-run replay contract. Runtime reason arrays live in
   `@automatalabs/workflow-engine` and are re-exported by `@automatalabs/workflows`; see the
-  [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
+  [incremental resume API](../../docs/api.md#content-addressed-incremental-resume). The
+  `crash-residue` fallback identifies a crash snapshot reconciled to `paused` / `interrupted`
+  without a quiescent terminal environment; eligibility is legacy positional only when its
+  admission environment still matches, otherwise all calls are live. `inputs-format-legacy`
+  identifies a normally settled source below input-fingerprint format 2 that uses hash-only
+  positional replay. Producing/current engine versions are diagnostics in
+  `WorkflowReplayEligibility` and never gate replay.
 - `WorkflowCallRecord` — the terminal call manifest, including optional `path`, agent/checkpoint
   `inputsHash`, `resumeSafety`, and manager-owned replay provenance. Old object literals remain
   valid because every incremental-resume field is optional and omitted when unset.
@@ -127,7 +141,15 @@ From [`src/index.ts`](./src/index.ts):
   remain valid.
 - `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
   `WorkflowRunStatusTruncation`, and `WorkflowRunStatus` — the shared bounded status contract used
-  by SDK and MCP polling/inspection hosts.
+  by SDK and MCP polling/inspection hosts. Agent call status can carry its resolved total-wall-clock
+  `timeoutMs` and terminal `errorCode`, including `AGENT_TIMEOUT` and `AGENT_CANCELLED` for
+  recoverable calls that have no journal result. Resumed results/statuses can carry
+  `replayEligibility`, a bounded admission and
+  progress summary with the predicted/observed prefix, first non-replay, engine/input-format
+  diagnostics, and non-gating operational changes.
+- `WorkflowRunLimits` — resolved `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and
+  per-attempt `agentTimeoutMs`; it is returned as `WorkflowRunResult.effectiveLimits` and as
+  `WorkflowRunStatus.limits` (optional only for legacy persisted records).
 
 **MCP config**
 - `McpServerConfig` (union) + `McpStdioServerConfig`, `McpHttpServerConfig`,

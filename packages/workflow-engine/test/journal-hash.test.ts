@@ -126,8 +126,6 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
           mcpServers: null,
           meta: null,
           promptMeta: null,
-          retries: 0,
-          timeoutMs: null,
         }),
       )
       .digest("hex");

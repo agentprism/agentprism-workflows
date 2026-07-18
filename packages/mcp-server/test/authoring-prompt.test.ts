@@ -45,6 +45,40 @@ test("generated authoring-prompt teaches fail-to-live identity resume semantics"
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
 });
 
+test("generated authoring-prompt teaches bounded attempts and targeted cancellation", () => {
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("total wall-clock ceiling per attempt, not an idle timer"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("(resolved retries + 1) × resolved timeout"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("per-call `timeoutMs` may tighten it but cannot escape it"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("does not inherit host bounds from its source"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('{ action: "stop", runId, callIndex }'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`AGENT_CANCELLED`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("releases its concurrency slot"));
+});
+
+test("generated authoring-prompt teaches resume compatibility and eligibility diagnostics", () => {
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("the identity hash covers prompt, resolved model"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("The separate input fingerprint covers resolved label"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "inputs-format-legacy"'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "crash-residue"'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("ancestor-scoped rows from ≤0.23 resume chains"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume forward across workflow-engine package versions"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("A Node or V8 change produces `runtime-mismatch`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("MCP background admission, foreground completion, both await shapes, and inspect"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("seed-persistence-error"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("resume-fatal-latch"));
+});
+
+test("implementation-train example does not author a timeout escape", () => {
+  const example = readFileSync(
+    new URL(
+      "../../../skills/agentprism-workflow-authoring/examples/implementation-train.workflow.js",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.doesNotMatch(example, /timeoutMs\s*:\s*null/);
+});
+
 test("generated authoring-prompt teaches scriptPath, resources, and stop-patch-resume", () => {
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`scriptPath` (an absolute path on the server's filesystem)"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("workflow://runs/{runId}/script"));

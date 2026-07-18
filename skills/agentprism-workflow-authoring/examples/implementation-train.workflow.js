@@ -148,7 +148,7 @@ const outcome = await gate(
         (feedback
           ? `\nA review board rejected attempt ${attempt}. Their combined feedback (self-contained — do not assume any file exists unless named here):\n${feedback}\nAddress every point, re-verify, and commit before reporting.\n`
           : ""),
-      { label: `implement:r${attempt + 1}`, phase: "Implement", model: "codex/gpt-5.6-sol", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, timeoutMs: null, schema: IMPL_REPORT },
+      { label: `implement:r${attempt + 1}`, phase: "Implement", model: "codex/gpt-5.6-sol", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, schema: IMPL_REPORT },
     ),
   async (report) => {
     round += 1;
@@ -163,7 +163,7 @@ const outcome = await gate(
       return { ok: false, feedback: `Report invalid before any review ran (no review files exist): commitShas must be real SHAs from git log on ${BRANCH} (got ${JSON.stringify(report.commitShas)}). Commit and report accurately.` };
     }
     const verdicts = await parallel(LENSES.map((lens) => () =>
-      agent(lensPrompt(lens, report, round), { label: `review:${lens.key}:r${round}`, phase: "Gate", model: "claude/opus[1m]", cwd: W, retries: 1, timeoutMs: null, schema: VERDICT }),
+      agent(lensPrompt(lens, report, round), { label: `review:${lens.key}:r${round}`, phase: "Gate", model: "claude/opus[1m]", cwd: W, retries: 1, schema: VERDICT }),
     ));
     const paired = LENSES.map((lens, i) => ({ lens: lens.key, verdict: verdicts[i] }));
     const rejections = paired.filter((v) => v.verdict && !v.verdict.ok);
@@ -193,7 +193,7 @@ const adjudication = await agent(
     `Independently verify: re-run greenness yourself, walk the contract against the code, spot-check surprising lens ` +
     `verdicts in BOTH directions (lens verdicts are inputs, not votes). Write your full report to ${D}/final-adjudication.md. ` +
     `Your findings are a CLOSED list — the fix round applies exactly this list and nothing else.`,
-  { label: "adjudicate", phase: "Adjudicate", model: "claude/opus[1m]", cwd: W, retries: 1, timeoutMs: null, schema: ADJUDICATION },
+  { label: "adjudicate", phase: "Adjudicate", model: "claude/opus[1m]", cwd: W, retries: 1, schema: ADJUDICATION },
 );
 if (!adjudication) throw new Error("terminal adjudication produced no result — inspect the run before delivery");
 
@@ -211,7 +211,7 @@ const fixOutcome = await gate(
         `${D}/final-adjudication.md; findings: ${JSON.stringify(adjudication.findings)}). Re-verify everything the fixes ` +
         `touch, run the full verification bar, and commit on ${BRANCH}.` +
         (feedback ? `\nThe adjudicator rejected your previous fix attempt:\n${feedback}\nAddress every residual.` : ""),
-      { label: `fix:r${attempt + 1}`, phase: "Fix", model: "codex/gpt-5.6-sol", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, timeoutMs: null, schema: IMPL_REPORT },
+      { label: `fix:r${attempt + 1}`, phase: "Fix", model: "codex/gpt-5.6-sol", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, schema: IMPL_REPORT },
     ),
   async (fixReport) => {
     if (!fixReport || !fixReport.commitShas.length) return { ok: false, feedback: "No fix commits reported — apply the closed list and report real SHAs." };
@@ -220,7 +220,7 @@ const fixOutcome = await gate(
         `You are the SAME terminal adjudicator. Re-verify EVERY finding from your ${D}/final-adjudication.md against the ` +
         `committed branch (fix report: ${JSON.stringify(fixReport)}), hunt regressions the fixes introduced, and write ` +
         `${D}/final-adjudication-fix.md. approved=true means shippable as-is.`,
-      { label: "adjudicate:fix", phase: "Fix", model: "claude/opus[1m]", cwd: W, retries: 1, timeoutMs: null, schema: ADJUDICATION },
+      { label: "adjudicate:fix", phase: "Fix", model: "claude/opus[1m]", cwd: W, retries: 1, schema: ADJUDICATION },
     );
     if (!verdict) return { ok: false, feedback: "Adjudicator returned no verdict — re-verify your own fixes against the closed list and recommit." };
     return verdict.approved ? { ok: true, verdict } : { ok: false, feedback: verdict.findings.map((f) => `[${f.severity}] ${f.summary}`).join("\n"), verdict };

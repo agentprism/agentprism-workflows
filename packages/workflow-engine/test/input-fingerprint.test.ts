@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { AgentResult, AgentRunner, RunOptions, WorkflowBackendConfig } from "@automatalabs/shared-types";
 import type { TSchema } from "typebox";
-import { MAX_AGENT_RETRIES } from "../src/config.js";
 import { CALL_INPUTS_FORMAT, type WorkflowRunOptions, runWorkflow } from "../src/workflow.js";
 
 type RunOverrides = Omit<WorkflowRunOptions, "agent">;
@@ -34,7 +33,7 @@ return await agent('same-prompt', ${optionsSource})`,
 
 describe("agent input fingerprints", () => {
   it("pins the format and exact canonical bytes for default effective inputs", async () => {
-    assert.equal(CALL_INPUTS_FORMAT, 1);
+    assert.equal(CALL_INPUTS_FORMAT, 2);
     const fingerprint = await fingerprintFor("{}");
     const canonical = JSON.stringify({
       backends: null,
@@ -46,8 +45,6 @@ describe("agent input fingerprints", () => {
       mcpServers: null,
       meta: null,
       promptMeta: null,
-      retries: 0,
-      timeoutMs: null,
     });
     const expected = createHash("sha256").update(canonical).digest("hex");
 
@@ -120,20 +117,20 @@ return await agent('same-prompt')`,
     assert.notEqual(afterCheckpoint, firstDefault, "default labels include the resolved shared agent ordinal");
   });
 
-  it("folds effective timeout and normalized retries into the fingerprint", async () => {
-    const timeout100 = await fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 100 });
-    const timeout200 = await fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 200 });
-    const explicitTimeoutA = await fingerprintFor("{ label: 'fixed', timeoutMs: 300 }", { agentTimeoutMs: 100 });
-    const explicitTimeoutB = await fingerprintFor("{ label: 'fixed', timeoutMs: 300 }", { agentTimeoutMs: 200 });
-    const retries0 = await fingerprintFor("{ label: 'fixed' }", { agentRetries: 0 });
-    const retries1 = await fingerprintFor("{ label: 'fixed' }", { agentRetries: 1 });
-    const capped = await fingerprintFor(`{ label: 'fixed', retries: ${MAX_AGENT_RETRIES} }`);
-    const overCap = await fingerprintFor("{ label: 'fixed', retries: 999 }");
+  it("excludes run-level and per-call operational knobs from the fingerprint", async () => {
+    const baseline = await fingerprintFor("{ label: 'fixed' }");
+    const variants = await Promise.all([
+      fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 100 }),
+      fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 200 }),
+      fingerprintFor("{ label: 'fixed', timeoutMs: null }", { agentTimeoutMs: 100 }),
+      fingerprintFor("{ label: 'fixed', timeoutMs: 50 }", { agentTimeoutMs: 100 }),
+      fingerprintFor("{ label: 'fixed' }", { agentRetries: 1 }),
+      fingerprintFor("{ label: 'fixed', retries: 2 }", { agentRetries: 0 }),
+      fingerprintFor("{ label: 'fixed' }", { concurrency: 1 }),
+      fingerprintFor("{ label: 'fixed' }", { concurrency: 8 }),
+    ]);
 
-    assert.notEqual(timeout100, timeout200);
-    assert.equal(explicitTimeoutA, explicitTimeoutB);
-    assert.notEqual(retries0, retries1);
-    assert.equal(capped, overCap);
+    for (const variant of variants) assert.equal(variant, baseline);
   });
 
   it("folds a canonical digest of the approved backend registry into every call", async () => {

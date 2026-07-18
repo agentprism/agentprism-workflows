@@ -147,6 +147,8 @@ import type {
   RunIsolationOptions,
   RunIsolationSdkOptions,
   WorkflowCallRecord,
+  WorkflowAgentAttemptControl,
+  WorkflowAgentCallCancellation,
   ResumePolicy,
   WorkflowResumeStrategy,
   WorkflowResumeMatch,
@@ -158,6 +160,7 @@ import type {
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayEligibility,
   WorkflowRecordedError,
 } from "../src/index.js";
 import { __setDefaultRunnerFactoryForTests } from "../src/isolation.js";
@@ -178,6 +181,12 @@ type IsolationTypeSurface = [
   WorkflowCallRecord,
   WorkflowRecordedError,
 ];
+
+type AgentCancellationTypeSurface = [
+  WorkflowAgentAttemptControl,
+  WorkflowAgentCallCancellation,
+];
+void (undefined as unknown as AgentCancellationTypeSurface);
 
 // §2.10 host-seam TYPE surface: each name must resolve through the facade barrel or `tsc -p
 // tsconfig.test.json` (spawned below) fails. Covers the shared live/persisted event unions +
@@ -266,15 +275,18 @@ type IncrementalResumeSurface = [
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayEligibility,
 ];
 void (undefined as unknown as IncrementalResumeSurface);
 
 test("incremental resume constants are re-exported by the SDK facade", () => {
   assert.equal(CALL_PATH_FORMAT, 1);
-  assert.equal(CALL_INPUTS_FORMAT, 1);
+  assert.equal(CALL_INPUTS_FORMAT, 2);
   assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
   assert.deepEqual(RESUME_FALLBACK_REASONS, [
     "legacy-recording",
+    "crash-residue",
+    "inputs-format-legacy",
     "forced-positional",
     "unsafe-recording",
     "nested-workflows",
@@ -568,11 +580,13 @@ async function createCheckpointPausedRun(
 test("facade re-exports the public surface", () => {
   assert.equal(typeof createAcpRunner, "function");
   assert.equal(typeof WorkflowManager, "function");
+  assert.equal(typeof WorkflowManager.prototype.cancelAgentCall, "function");
   assert.equal(typeof runWorkflow, "function");
   assert.equal(typeof runDynamicWorkflow, "function");
   assert.equal(typeof runIsolation, "function");
   assert.equal(typeof createReplayRunner, "function");
   assert.equal(typeof WorkflowError, "function");
+  assert.equal(WorkflowErrorCode.AGENT_CANCELLED, "AGENT_CANCELLED");
   assert.equal(typeof toJsonSchema, "function");
   assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };

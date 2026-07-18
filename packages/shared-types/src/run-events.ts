@@ -35,6 +35,8 @@ export interface RunAgentStartPayload extends RunEventOrigin {
   prompt: string;
   model?: string;
   configOptions?: Record<string, string | boolean>;
+  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
+  timeoutMs?: number | null;
   callIndex: number;
 }
 

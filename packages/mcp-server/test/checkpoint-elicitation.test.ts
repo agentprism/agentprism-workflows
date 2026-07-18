@@ -106,7 +106,11 @@ return await checkpoint('Proceed?', { kind: 'confirm', default: true, timeoutMs:
       { index: 0, kind: "checkpoint", action: "live", reason: "inputs-changed" },
     ]);
     assert.equal(conn.requests().length, 2, "the changed call invokes MCP elicitation again");
-    assert.match(textOf(resumed), /^resume: identity-v1, 0 replayed, 1 live, 0 failed$/m);
+    assert.match(
+      textOf(resumed),
+      /^WARNING: resume: identity-v1; predicted replayable prefix 1; replayed prefix 0; 0 replayed, 1 live, 0 failed$/m,
+    );
+    assert.match(textOf(resumed), /first non-replay: call 0 inputs-changed/);
   } finally {
     await conn.dispose();
   }

@@ -25,6 +25,7 @@ import type {
   WorkflowResumeCallDecision,
   WorkflowResumeSafety,
   WorkflowRunFallback,
+  WorkflowRunLimits,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
 import {
@@ -123,6 +124,14 @@ export interface WorkflowCallbackContext {
   scope: string;
 }
 
+/** Narrow host-control seam for one live runner attempt. */
+export interface WorkflowAgentAttemptControl {
+  callIndex: number;
+  label: string;
+  scope: string;
+  controller: AbortController;
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   /**
@@ -156,7 +165,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
-  /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
+  /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
   agentTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
@@ -197,6 +206,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onCheckpointTaken?: (entry: WorkflowCheckpointTaken) => void;
   /** Called at each call's terminal transition after the authoritative manifest append. */
   onCallRecord?: (record: WorkflowCallRecord) => void;
+  /**
+   * Registers one live runner attempt for host-directed per-call cancellation. The optional
+   * cleanup returned by the host is called exactly once when that attempt settles.
+   */
+  onAgentAttempt?: (attempt: WorkflowAgentAttemptControl) => void | (() => void);
   /** Called synchronously when workflow() allocates a unique child-run ordinal. */
   onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
@@ -229,6 +243,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     prompt: string;
     model?: string;
     configOptions?: Record<string, string | boolean>;
+    /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
+    timeoutMs?: number | null;
     callIndex: number;
     scope: string;
   }) => void;
@@ -317,7 +333,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Override timeout for this specific agent. null means no hard timeout. */
+  /** Per-call deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
@@ -479,9 +495,42 @@ export const CALL_PATH_FORMAT = 1;
 /** Maximum unambiguous raw stack depth retained for call-path capture. */
 export const CALL_PATH_RAW_FRAMES = 64;
 /** Observable call-input fingerprint format. Bump when its inputs or encoding change. */
-export const CALL_INPUTS_FORMAT = 1;
+export const CALL_INPUTS_FORMAT = 2;
 /** Observable checkpoint-input fingerprint format. Bump when its inputs or encoding change. */
 export const CHECKPOINT_INPUTS_FORMAT = 1;
+
+export interface WorkflowRunLimitOptions {
+  maxAgents?: number;
+  tokenBudget?: number | null;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+}
+
+/** Resolve the run limits once so admission, persistence, and execution report the same values. */
+export function resolveWorkflowRunLimits(options: WorkflowRunLimitOptions): WorkflowRunLimits {
+  return {
+    maxAgents: options.maxAgents ?? MAX_AGENTS_PER_RUN,
+    tokenBudget: options.tokenBudget ?? null,
+    concurrency: normalizeConcurrency(
+      options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
+    ),
+    agentRetries: normalizeAgentRetries(options.agentRetries ?? 0),
+    agentTimeoutMs: options.agentTimeoutMs !== undefined
+      ? options.agentTimeoutMs
+      : DEFAULT_AGENT_TIMEOUT_MS,
+  };
+}
+
+/** A script may shorten a host deadline, but a finite host deadline is an unbypassable ceiling. */
+export function resolveAgentTimeoutMs(
+  hostTimeoutMs: number | null,
+  callTimeoutMs: number | null | undefined,
+): number | null {
+  if (hostTimeoutMs === null) return callTimeoutMs ?? null;
+  if (callTimeoutMs === null || callTimeoutMs === undefined) return hostTimeoutMs;
+  return Math.min(hostTimeoutMs, callTimeoutMs);
+}
 
 /** Convert a workflow name into the path-free base used for its vm filename. */
 export function sanitizeVmName(name: string): string {
@@ -513,9 +562,13 @@ export async function runWorkflow<T = unknown>(
   // Snapshot tier routing once per run. A missing/unparseable file preserves the
   // historical runner-default behavior unless a tier falls through to mainModel.
   const modelTierConfig = loadModelTierConfig();
-  const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
-  const runAgentRetries = normalizeAgentRetries(options.agentRetries ?? 0);
+  const effectiveLimits = resolveWorkflowRunLimits(options);
+  const {
+    maxAgents,
+    concurrency,
+    agentRetries: runAgentRetries,
+    agentTimeoutMs,
+  } = effectiveLimits;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const callbackContext: WorkflowCallbackContext = { scope: runId };
   const baseCwd = options.cwd ?? process.cwd();
@@ -562,9 +615,6 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agentRunner = options.agent;
-  const concurrency = normalizeConcurrency(
-    options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
-  );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
@@ -632,6 +682,13 @@ export async function runWorkflow<T = unknown>(
     state.logs.push(text);
     logger.log(text);
   };
+
+  if (options.sharedRuntime === undefined) {
+    log(
+      `agent timeout admission: host ceiling ${agentTimeoutMs === null ? "none" : `${agentTimeoutMs}ms`} ` +
+        "total wall-clock per attempt; each retry re-arms the clock",
+    );
+  }
 
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
@@ -977,7 +1034,7 @@ export async function runWorkflow<T = unknown>(
     assertNoModelConfigOption(agentOptions.configOptions, pendingLabel);
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
-    const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
+    const timeout = resolveAgentTimeoutMs(agentTimeoutMs, agentOptions.timeoutMs);
     const retryAttempts =
       agentOptions.retries !== undefined ? normalizeAgentRetries(agentOptions.retries) : runAgentRetries;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
@@ -1002,8 +1059,6 @@ export async function runWorkflow<T = unknown>(
       meta: agentOptions.meta ?? null,
       promptMeta: agentOptions.promptMeta ?? null,
       label,
-      timeoutMs: timeout,
-      retries: retryAttempts,
       backends: backendsDigest,
     });
 
@@ -1064,6 +1119,7 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: displayModel,
         configOptions: agentOptions.configOptions,
+        timeoutMs: timeout,
         callIndex,
         scope: runId,
       }));
@@ -1261,11 +1317,29 @@ export async function runWorkflow<T = unknown>(
           const continueFromSession = attempt === 1 && continuationCandidate && !continuationSkipReason
             ? continuationCandidate.sessionRef
             : undefined;
+          let attemptController: AbortController | undefined;
+          let unregisterAttempt: (() => void) | undefined;
+          let hostAttemptRegistered = false;
           try {
             throwIfAborted();
-            const attemptController = new AbortController();
+            attemptController = new AbortController();
             const attemptSignal = AbortSignal.any([signal, attemptController.signal]);
             attemptsRan++;
+            const registerAttempt = options.onAgentAttempt;
+            if (registerAttempt) {
+              hostAttemptRegistered = true;
+              try {
+                const cleanup = registerAttempt({
+                  callIndex,
+                  label,
+                  scope: runId,
+                  controller: attemptController,
+                });
+                if (typeof cleanup === "function") unregisterAttempt = cleanup;
+              } catch (error) {
+                bestEffortDebug(`agent ${label}: host attempt registration failed: ${errorMessage(error)}`);
+              }
+            }
             let result: unknown;
             try {
               let rawRunnerPromise: Promise<unknown>;
@@ -1368,15 +1442,18 @@ export async function runWorkflow<T = unknown>(
                 throw error;
               }
               observeResumeActivity(rawRunnerPromise);
-              result = await withTimeout(
+              const boundedRunnerPromise = withTimeout(
                 rawRunnerPromise,
                 timeout,
                 label,
                 () => {
                   sealAttempt(slot);
-                  attemptController.abort();
+                  attemptController?.abort();
                 },
               );
+              result = hostAttemptRegistered
+                ? await withAgentCancellation(boundedRunnerPromise, attemptController.signal)
+                : await boundedRunnerPromise;
             } finally {
               sealAttempt(slot);
               if (continueFromSession !== undefined && !signal.aborted) {
@@ -1473,6 +1550,18 @@ export async function runWorkflow<T = unknown>(
             return result;
           } catch (error) {
             if (!slot.sealed) sealAttempt(slot);
+            const cancellationReason = attemptController
+              ? agentCancellationReason(attemptController.signal)
+              : undefined;
+            if (cancellationReason) {
+              logger.error(
+                `agent ${label} attempt ${attempt}/${maxAttempts} cancelled by host: ${cancellationReason.message}`,
+              );
+              recordTokens(null, slot.usage);
+              log(`agent "${label}" cancelled by host; retries skipped`);
+              emitFailure(cancellationReason, "engine", "null", slot, false);
+              return null;
+            }
             if (signal.aborted) {
               emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", slot, true);
               throw error;
@@ -1498,6 +1587,14 @@ export async function runWorkflow<T = unknown>(
             }
             emitFailure(workflowError, "runner", "error", slot, false);
             throw workflowError;
+          } finally {
+            if (unregisterAttempt) {
+              try {
+                unregisterAttempt();
+              } catch (error) {
+                bestEffortDebug(`agent ${label}: host attempt cleanup failed: ${errorMessage(error)}`);
+              }
+            }
           }
         }
         return null;
@@ -2648,13 +2745,7 @@ export async function runWorkflow<T = unknown>(
     ...(resumeReportPlan
       ? { resumeReport: buildResumeReport(resumeReportPlan, [...resumeDecisions.values()]) }
       : {}),
-    effectiveLimits: {
-      maxAgents,
-      tokenBudget: options.tokenBudget ?? null,
-      concurrency,
-      agentRetries: runAgentRetries,
-      agentTimeoutMs,
-    },
+    effectiveLimits,
     ...(abortSignaled ? { abortSignaled: true as const } : {}),
     ...(nestedWorkflows ? { nestedWorkflows: true as const } : {}),
   };
@@ -2979,8 +3070,6 @@ function hashCallInputs(inputs: {
   meta: unknown;
   promptMeta: unknown;
   label: unknown;
-  timeoutMs: unknown;
-  retries: unknown;
   backends: unknown;
 }): string | undefined {
   return hashCanonicalStrictJson(inputs);
@@ -3214,7 +3303,7 @@ async function withTimeout<T>(
       }
       reject(
         new WorkflowError(
-          `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
+          `Agent "${label}" timed out after ${ms}ms of total wall-clock time in this attempt`,
           WorkflowErrorCode.AGENT_TIMEOUT,
           { recoverable: true },
         ),
@@ -3226,5 +3315,34 @@ async function withTimeout<T>(
     return await Promise.race([promise, timeoutPromise]);
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function agentCancellationReason(signal: AbortSignal): WorkflowError | undefined {
+  if (!signal.aborted) return undefined;
+  const reason = signal.reason;
+  return reason instanceof WorkflowError && reason.code === WorkflowErrorCode.AGENT_CANCELLED
+    ? reason
+    : undefined;
+}
+
+/** Settle a selected attempt even when its runner ignores the abort signal. */
+async function withAgentCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  const alreadyCancelled = agentCancellationReason(signal);
+  if (alreadyCancelled) throw alreadyCancelled;
+
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      const reason = agentCancellationReason(signal);
+      if (reason) reject(reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([promise, cancelled]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }

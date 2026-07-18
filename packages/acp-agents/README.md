@@ -50,6 +50,12 @@ try {
 
 `run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, the resume-only `continueFromSession` directive, `onSessionOpen`, `onUsage`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
 
+Aborting `signal` sends ACP `session/cancel` for that session. If its active turn does not settle
+within five seconds, the client sends `session/close` when the agent advertised it and quarantines
+the pooled child. Existing sibling sessions finish and close before the process is recycled; new
+work never enters the quarantined process. The policy is identical for Claude, Codex, OpenCode, pi,
+and custom ACP backends, and a `child_cleanup_error` from close remains observable.
+
 Model routing uses only the first `/`-delimited segment. An ASCII-case-insensitive `claude`, `codex`, `opencode`, `pi`, or registered custom name selects that harness and is stripped exactly once; custom registrations win on collision. A harness name alone is backend-only and issues no model config call. Otherwise the whole string goes unchanged to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). Any remaining id is sent byte-for-byte as `configId: "model"`: catalogs are not matched, brackets and provider prefixes are ordinary characters, no sibling effort/Fast option is driven, and harness errors propagate through the normal agent-error path. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; pi uses `pi/<provider>/<model-id>`. Use backend-only forms for harness-configured models.
 
 `configOptions` exposes every other ACP session option verbatim. Its exact ids and string/boolean
@@ -123,7 +129,14 @@ Use `runner.openSession(options)` when a host needs to hold one ACP session open
 
 Prompt turns are explicit and serialized: call `prompt(content, { images?, promptMeta? })`, await the returned `{ stopReason, text }`, then send the next turn. A second `prompt()` while one is in flight rejects with a host-side error; queue turns in your host if you want queued UX. `text` is only the assistant text from that turn. Per-turn `images` use the same ACP image block path as `run()` and still degrade through capability negotiation when the agent does not advertise image prompts.
 
-`cancel()` sends ACP `session/cancel` for the active turn. `release()` is idempotent: it best-effort closes the ACP session and then disposes the dedicated process. Passing `signal` to `openSession()` releases the session on abort, and `runner.dispose()` releases any still-open interactive sessions before closing the pooled processes. Dedicated process death is observed per session: the wrapper auto-releases, session-scoped listeners see `session_close`, and an in-flight prompt rejects through the normal connection-closed path. `backend_error` is connection-scoped observability on the runner bus only; it is not delivered through `session.on()`.
+`cancel()` sends ACP `session/cancel` for the active turn and applies the same five-second
+close/dispose escalation when the turn ignores it. `release()` is idempotent: it best-effort closes
+the ACP session and then disposes the dedicated process. Passing `signal` to `openSession()`
+releases the session on abort, and `runner.dispose()` releases any still-open interactive sessions
+before closing the pooled processes. Dedicated process death is observed per session: the wrapper
+auto-releases, session-scoped listeners see `session_close`, and an in-flight prompt rejects through
+the normal connection-closed path. `backend_error` is connection-scoped observability on the runner
+bus only; it is not delivered through `session.on()`.
 
 ```ts
 const runner = createAcpRunner();

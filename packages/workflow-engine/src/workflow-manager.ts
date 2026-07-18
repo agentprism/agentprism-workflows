@@ -12,6 +12,7 @@
 
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import type {
   AgentRunner,
   AgentSessionRecord,
@@ -30,6 +31,9 @@ import type {
   WorkflowRunInspectionOptions,
   WorkflowRunResult,
   WorkflowRunStatus,
+  WorkflowReplayEligibility,
+  WorkflowReplayFirstNonReplay,
+  WorkflowReplayOperationalChange,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
 } from "@automatalabs/shared-types";
@@ -68,10 +72,15 @@ import {
   type CheckpointCallContext,
   type CheckpointOptions,
   type EngineRunResult,
+  type WorkflowAgentAttemptControl,
+  type WorkflowRunOptions,
   parseWorkflowScript,
+  resolveWorkflowRunLimits,
   runWorkflow,
 } from "./workflow.js";
 import { createWorkflowLogTail, projectWorkflowRunStatus } from "./run-observability.js";
+
+const ENGINE_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
 export interface ManagedRun {
   runId: string;
@@ -101,6 +110,7 @@ export interface ManagedRun {
   calls: WorkflowCallRecord[];
   effectiveCwd: string;
   runtime: {
+    engineVersion: string;
     node: string;
     v8: string;
     pathFormat: number;
@@ -132,6 +142,8 @@ export interface ManagedRun {
   preparedContinuation?: PreparedContinuation;
   /** Manager-owned report, incrementally updated while the engine is executing. */
   resumeReport?: WorkflowResumeReport;
+  replayEligibility?: WorkflowReplayEligibility;
+  replayEligibilityPlan?: ReplayEligibilityPlan;
   resumeReportPlan?: ResumeReportPlan;
   resumeDecisions?: Map<number, WorkflowResumeCallDecision>;
   executionMode?: PersistedRunState["executionMode"];
@@ -174,9 +186,45 @@ interface ManagerResumeExecution {
   injectedCheckpointReplies?: ReadonlySet<number>;
 }
 
+interface ReplayEligibilityPlan {
+  sourceRunId: string;
+  strategy: WorkflowReplayEligibility["strategy"];
+  fallbackReason?: Extract<WorkflowReplayEligibility, { strategy: "positional-v1" }>["fallbackReason"];
+  eligibility?: Extract<WorkflowReplayEligibility, { strategy: "positional-v1" }>["eligibility"];
+  disabledReason?: Extract<WorkflowReplayEligibility, { strategy: "live" }>["disabledReason"];
+  predictedReplayablePrefix: number;
+  initialFirstNonReplay?: WorkflowReplayFirstNonReplay;
+  sourceEngineVersion?: string;
+  currentEngineVersion: string;
+  engineVersionComparison: WorkflowReplayEligibility["engineVersionComparison"];
+  sourceInputsFormat?: number;
+  currentInputsFormat: number;
+  operationalChanges: WorkflowReplayOperationalChange[];
+}
+
 interface InitializedRun {
   managed: ManagedRun;
   resumeExecution?: ManagerResumeExecution;
+}
+
+/** Durable acknowledgement for one host-cancelled agent call. */
+export interface WorkflowAgentCallCancellation {
+  runId: string;
+  callIndex: number;
+  label: string;
+  scope: string;
+  errorCode: WorkflowErrorCode.AGENT_CANCELLED;
+}
+
+interface PendingAgentCancellation {
+  promise: Promise<WorkflowAgentCallCancellation>;
+  resolve: (result: WorkflowAgentCallCancellation) => void;
+  reject: (error: WorkflowError) => void;
+  settled: boolean;
+}
+
+interface RegisteredAgentAttempt extends WorkflowAgentAttemptControl {
+  cancellation?: PendingAgentCancellation;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -226,7 +274,7 @@ export interface ExecOptions {
   resumeCalls?: WorkflowCallRecord[];
   /** Cap on total agents for this run. */
   maxAgents?: number;
-  /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
+  /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
   agentTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
@@ -274,7 +322,7 @@ export interface WorkflowManagerOptions {
   mainModel?: string;
   /** The session id to tag runs with (see setSessionId). */
   sessionId?: string;
-  /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
+  /** Default host ceiling when a run omits agentTimeoutMs. null means no host ceiling. */
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
@@ -306,12 +354,42 @@ function snapshotArgs(value: unknown): ArgsSnapshot {
 
 function runtimeIdentity(): ManagedRun["runtime"] {
   return {
+    engineVersion: ENGINE_VERSION,
     node: process.version,
     v8: process.versions.v8,
     pathFormat: CALL_PATH_FORMAT,
     inputsFormat: CALL_INPUTS_FORMAT,
     checkpointInputsFormat: CHECKPOINT_INPUTS_FORMAT,
   };
+}
+
+function positionalSourceRows<T extends { index: number; scope?: string }>(
+  rows: T[],
+  sourceRunId: string,
+  persistedRunIds: ReadonlySet<string>,
+): T[] {
+  const latest = new Map<number, T>();
+  for (const row of rows) {
+    if (
+      row.scope === undefined ||
+      row.scope === sourceRunId ||
+      persistedRunIds.has(row.scope)
+    ) {
+      latest.set(row.index, row);
+    }
+  }
+  return [...latest.values()].sort((left, right) => left.index - right.index);
+}
+
+function contiguousIndexes(indexes: Iterable<number>): number {
+  const available = new Set(indexes);
+  let prefix = 0;
+  while (available.has(prefix)) prefix++;
+  return prefix;
+}
+
+function displayOperationalValue(value: number | null): string {
+  return value === null ? "none" : String(value);
 }
 
 function latestRootRows<T extends { index: number; scope?: string }>(rows: T[], runId: string): T[] {
@@ -369,6 +447,12 @@ function runReason(status: RunStatus, error: WorkflowError | undefined): string 
   return error?.message;
 }
 
+function interruptedRunReason(ownerPid: number | undefined): string {
+  return ownerPid === undefined
+    ? "Interrupted: the owning process exited before completion (PID unavailable); recovered to a resumable pause."
+    : `Interrupted: owning process PID ${ownerPid} exited before completion; recovered to a resumable pause.`;
+}
+
 function generateEventStreamId(): string {
   return randomBytes(16).toString("hex");
 }
@@ -418,6 +502,7 @@ export interface WorkflowManager {
  */
 export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
+  private agentAttempts = new Map<string, Set<RegisteredAgentAttempt>>();
   private persistence: RunEventPersistence;
   private cwd: string;
   private concurrency: number;
@@ -477,28 +562,74 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = id;
   }
 
+  private reconcileListedRun(candidate: PersistedRunState): PersistedRunState | null {
+    if (
+      !this.journaling ||
+      this.runs.has(candidate.runId) ||
+      (candidate.status !== "pending" && candidate.status !== "running")
+    ) {
+      return candidate;
+    }
+
+    let lease: RunLease | null;
+    try {
+      lease = this.persistence.acquireRunLease(candidate.runId);
+    } catch {
+      return candidate;
+    }
+    if (!lease) return candidate;
+
+    try {
+      const current = this.persistence.load(candidate.runId);
+      if (!current) return null;
+      if (
+        this.runs.has(candidate.runId) ||
+        (current.status !== "pending" && current.status !== "running")
+      ) {
+        return current;
+      }
+      const reconciled: PersistedRunState = {
+        ...current,
+        status: "paused",
+        pauseReason: "interrupted",
+        reason: interruptedRunReason(lease.recoveredOwnerPid),
+      };
+      this.persistence.save(reconciled);
+      return reconciled;
+    } catch {
+      return candidate;
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
+  }
+
+  private reconcileListedRuns(rows: PersistedRunState[]): PersistedRunState[] {
+    if (!this.journaling) return rows;
+    const reconciled: PersistedRunState[] = [];
+    for (const row of rows) {
+      const current = this.reconcileListedRun(row);
+      if (current) reconciled.push(current);
+    }
+    return reconciled.sort(
+      (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+    );
+  }
+
   /**
-   * On startup, any persisted run still marked "running" belongs to a process
-   * that died mid-run (this fresh manager has it nowhere in memory). Reconcile it
-   * to "paused" — never "failed" — so its journal is preserved and resume() can
-   * replay the completed prefix and finish the rest.
+   * Reconcile one persisted run whose owning process may have exited. The lease
+   * acquisition preserves live/EPERM owners, removes stale or corrupt locks, and
+   * the under-lease reload lets a concurrent completion win over recovery.
    */
+  reconcileExternallyDeadRun(runId: string): PersistedRunState | undefined {
+    const persisted = this.persistence.load(runId);
+    if (!persisted) return undefined;
+    return this.reconcileListedRun(persisted) ?? undefined;
+  }
+
+  /** Reconcile externally interrupted persisted runs when the manager starts. */
   private recoverStaleRuns(): void {
     try {
-      for (const p of this.listAllRuns()) {
-        if (p.status === "running" && !this.runs.has(p.runId)) {
-          const lease = this.persistence.acquireRunLease(p.runId);
-          if (!lease) continue;
-          try {
-            const current = this.persistence.load(p.runId);
-            if (current?.status === "running") {
-              this.persistence.save({ ...current, status: "paused" });
-            }
-          } finally {
-            this.persistence.releaseRunLease(lease);
-          }
-        }
-      }
+      this.reconcileListedRuns(this.persistence.list());
     } catch {
       // Recovery is best-effort; never let it block manager construction.
     }
@@ -594,6 +725,7 @@ export class WorkflowManager extends EventEmitter {
   private acquireResumeSource(runId: string): { lease: RunLease; source: PersistedRunState } {
     let lease: RunLease | null;
     try {
+      this.reconcileExternallyDeadRun(runId);
       lease = this.persistence.acquireRunLease(runId);
     } catch (error) {
       throw this.persistenceError(`failed to acquire resume source lease for ${runId}: ${errorMessage(error)}`, error);
@@ -633,6 +765,200 @@ export class WorkflowManager extends EventEmitter {
             requestedPolicy: admission.requestedPolicy,
             disabledReason: admission.disabledReason,
           };
+  }
+
+  private operationalChanges(
+    source: PersistedRunState,
+    managed: ManagedRun,
+  ): WorkflowReplayOperationalChange[] {
+    if (!source.limits || !managed.limits) return [];
+    const options = ["agentTimeoutMs", "agentRetries", "concurrency"] as const;
+    const changes: WorkflowReplayOperationalChange[] = [];
+    for (const option of options) {
+      const sourceValue = source.limits[option];
+      const currentValue = managed.limits[option];
+      if (sourceValue === currentValue) continue;
+      changes.push({
+        option,
+        source: sourceValue,
+        current: currentValue,
+        detail:
+          `source recorded ${option}=${displayOperationalValue(sourceValue)}; ` +
+          `this run: ${displayOperationalValue(currentValue)}`,
+      });
+    }
+    return changes;
+  }
+
+  private admissionDetail(
+    admission: ResumeAdmissionDecision,
+    source: PersistedRunState,
+    managed: ManagedRun,
+  ): string | undefined {
+    if (admission.strategy !== "live") return undefined;
+    if (admission.disabledReason === "runtime-mismatch") {
+      const sourceRuntime = source.runtime;
+      const comparisons = [
+        ["node", sourceRuntime?.node, managed.runtime.node],
+        ["v8", sourceRuntime?.v8, managed.runtime.v8],
+        ["pathFormat", sourceRuntime?.pathFormat, managed.runtime.pathFormat],
+        ["inputsFormat", sourceRuntime?.inputsFormat, managed.runtime.inputsFormat],
+        [
+          "checkpointInputsFormat",
+          sourceRuntime?.checkpointInputsFormat,
+          managed.runtime.checkpointInputsFormat,
+        ],
+      ] as const;
+      const changed = comparisons.find(([, sourceValue, currentValue]) => sourceValue !== currentValue);
+      if (changed) return `source ${changed[0]}=${String(changed[1])}; this run: ${String(changed[2])}`;
+    }
+    if (admission.disabledReason === "cwd-mismatch") {
+      return "source effectiveCwd differs from this run";
+    }
+    if (admission.disabledReason === "source-not-terminal") {
+      return "source status is not terminal";
+    }
+    if (admission.disabledReason === "unsupported-format") {
+      return "source resume format is unsupported; this run supports identity-v1";
+    }
+    return undefined;
+  }
+
+  private replayEligibilityPlan(
+    admission: ResumeAdmissionDecision,
+    source: PersistedRunState,
+    managed: ManagedRun,
+    predictedReplayablePrefix: number,
+  ): ReplayEligibilityPlan {
+    const sourceEngineVersion = typeof source.runtime?.engineVersion === "string"
+      ? source.runtime.engineVersion
+      : undefined;
+    const sourceInputsFormat = Number.isSafeInteger(source.runtime?.inputsFormat)
+      ? source.runtime?.inputsFormat
+      : undefined;
+    const operationalChanges = this.operationalChanges(source, managed);
+    let initialFirstNonReplay: WorkflowReplayFirstNonReplay | undefined;
+    if (admission.strategy === "live") {
+      const detail = this.admissionDetail(admission, source, managed);
+      initialFirstNonReplay = {
+        index: 0,
+        action: "live",
+        reason: admission.disabledReason,
+        ...(detail === undefined ? {} : { detail }),
+      };
+    } else if (admission.strategy === "positional-v1" && admission.eligibility === "all-live") {
+      initialFirstNonReplay = {
+        index: 0,
+        action: "live",
+        reason: admission.fallbackReason,
+        detail: `resume fallback ${admission.fallbackReason} admits no replayable prefix`,
+      };
+    } else if (
+      predictedReplayablePrefix === 0 ||
+      (
+        Number.isSafeInteger(source.callsAllocated) &&
+        predictedReplayablePrefix < (source.callsAllocated as number)
+      )
+    ) {
+      initialFirstNonReplay = {
+        index: predictedReplayablePrefix,
+        action: "live",
+        reason: "not-recorded",
+        detail: `source has no contiguous replayable result at call ${predictedReplayablePrefix}`,
+      };
+    }
+    return {
+      sourceRunId: admission.sourceRunId,
+      strategy: admission.strategy,
+      ...(admission.strategy === "positional-v1"
+        ? { fallbackReason: admission.fallbackReason, eligibility: admission.eligibility }
+        : admission.strategy === "live"
+          ? { disabledReason: admission.disabledReason }
+          : {}),
+      predictedReplayablePrefix,
+      ...(initialFirstNonReplay === undefined ? {} : { initialFirstNonReplay }),
+      ...(sourceEngineVersion === undefined ? {} : { sourceEngineVersion }),
+      currentEngineVersion: managed.runtime.engineVersion,
+      engineVersionComparison: sourceEngineVersion === undefined
+        ? "source-unknown"
+        : sourceEngineVersion === managed.runtime.engineVersion
+          ? "same"
+          : "different",
+      ...(sourceInputsFormat === undefined ? {} : { sourceInputsFormat }),
+      currentInputsFormat: managed.runtime.inputsFormat,
+      operationalChanges,
+    };
+  }
+
+  private buildReplayEligibility(
+    plan: ReplayEligibilityPlan,
+    report: WorkflowResumeReport,
+  ): WorkflowReplayEligibility {
+    const decisions = [...report.calls].sort((left, right) => left.index - right.index);
+    const byIndex = new Map(decisions.map((decision) => [decision.index, decision] as const));
+    let replayedPrefix = 0;
+    while (byIndex.get(replayedPrefix)?.action === "replayed") replayedPrefix++;
+    const firstDecision = decisions.find((decision) => decision.action !== "replayed");
+    const operationalDetail = plan.operationalChanges.map((change) => change.detail).join("; ");
+    const firstNonReplay: WorkflowReplayFirstNonReplay | undefined = firstDecision
+      ? {
+          index: firstDecision.index,
+          action: firstDecision.action,
+          reason: firstDecision.reason,
+          ...(
+            operationalDetail.length > 0 &&
+            firstDecision.action === "live" &&
+            (firstDecision.reason === "inputs-changed" || firstDecision.reason === "positional-miss")
+              ? { detail: operationalDetail }
+              : {}
+          ),
+        }
+      : plan.initialFirstNonReplay;
+    const summary = {
+      sourceRunId: plan.sourceRunId,
+      strategy: plan.strategy,
+      ...(plan.strategy === "positional-v1"
+        ? { fallbackReason: plan.fallbackReason, eligibility: plan.eligibility }
+        : plan.strategy === "live"
+          ? { disabledReason: plan.disabledReason }
+          : {}),
+      predictedReplayablePrefix: plan.predictedReplayablePrefix,
+      replayedPrefix,
+      replayed: report.replayed,
+      live: report.live,
+      failed: report.failed,
+      ...(firstNonReplay === undefined ? {} : { firstNonReplay }),
+      ...(plan.sourceEngineVersion === undefined ? {} : { sourceEngineVersion: plan.sourceEngineVersion }),
+      currentEngineVersion: plan.currentEngineVersion,
+      engineVersionComparison: plan.engineVersionComparison,
+      ...(plan.sourceInputsFormat === undefined ? {} : { sourceInputsFormat: plan.sourceInputsFormat }),
+      currentInputsFormat: plan.currentInputsFormat,
+      operationalChanges: plan.operationalChanges,
+    };
+    const captured = cloneFrozenStrictJson(summary);
+    if (!captured.ok) throw new TypeError(`replay eligibility is not strict JSON at ${captured.path}`);
+    return captured.clone as unknown as WorkflowReplayEligibility;
+  }
+
+  private initializeResumeReporting(
+    managed: ManagedRun,
+    source: PersistedRunState,
+    admission: ResumeAdmissionDecision,
+    predictedReplayablePrefix: number,
+  ): void {
+    managed.resumeReportPlan = this.reportPlan(admission);
+    managed.resumeDecisions = new Map();
+    managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
+    managed.replayEligibilityPlan = this.replayEligibilityPlan(
+      admission,
+      source,
+      managed,
+      predictedReplayablePrefix,
+    );
+    managed.replayEligibility = this.buildReplayEligibility(
+      managed.replayEligibilityPlan,
+      managed.resumeReport,
+    );
   }
 
   private commitResumeSeed(managed: ManagedRun, remaining: PersistedResumeSeed): void {
@@ -737,6 +1063,7 @@ export class WorkflowManager extends EventEmitter {
       current: {
         effectiveCwd: managed.effectiveCwd,
         runtime: {
+          engineVersion: managed.runtime.engineVersion,
           node: managed.runtime.node,
           v8: managed.runtime.v8,
           pathFormat: managed.runtime.pathFormat,
@@ -749,12 +1076,18 @@ export class WorkflowManager extends EventEmitter {
     });
     managed.newRunResume = true;
     if (source.resume === undefined || source.legacyResume === true) managed.legacyResume = true;
-    managed.resumeReportPlan = this.reportPlan(admission);
-    managed.resumeDecisions = new Map();
-    managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
     managed.preparedContinuation = this.buildPreparedContinuation(source);
 
     if (admission.strategy === "identity-v1") {
+      this.initializeResumeReporting(
+        managed,
+        source,
+        admission,
+        contiguousIndexes([
+          ...admission.seed.candidates.map((candidate) => candidate.recordedIndex),
+          ...(admission.seed.checkpointInjections ?? []).map((injection) => injection.recordedIndex),
+        ]),
+      );
       managed.resumeSeed = admission.seed;
       return {
         preparedResume: {
@@ -768,6 +1101,7 @@ export class WorkflowManager extends EventEmitter {
     }
 
     if (admission.strategy === "live") {
+      this.initializeResumeReporting(managed, source, admission, 0);
       return {
         preparedResume: {
           strategy: admission.strategy,
@@ -779,8 +1113,11 @@ export class WorkflowManager extends EventEmitter {
     }
 
     const sourceJournalRows = this.cloneResumeSourceValue(source.journal ?? [], source.runId);
+    const sourceCallRows = this.cloneResumeSourceValue(source.calls ?? [], source.runId);
+    const persistedRunIds = new Set(this.persistence.list().map((row) => row.runId));
     const sourceJournal = new Map(
-      latestRootRows(sourceJournalRows, source.runId).map((entry) => [entry.index, entry] as const),
+      positionalSourceRows(sourceJournalRows, source.runId, persistedRunIds)
+        .map((entry) => [entry.index, entry] as const),
     );
     const injectedCheckpointReplies = new Set<number>();
     if (admission.legacyCheckpointReply) {
@@ -796,14 +1133,23 @@ export class WorkflowManager extends EventEmitter {
       injectedCheckpointReplies.add(syntheticEntry.index);
     }
     managed.journal = latestRows([...sourceJournal.values()]);
-    managed.calls = latestRootRows(
-      this.cloneResumeSourceValue(source.calls ?? [], source.runId),
-      source.runId,
+    managed.calls = positionalSourceRows(sourceCallRows, source.runId, persistedRunIds);
+    this.initializeResumeReporting(
+      managed,
+      source,
+      admission,
+      admission.eligibility === "all-live" ? 0 : contiguousIndexes(sourceJournal.keys()),
     );
     if (admission.checkpointSeed) managed.resumeSeed = admission.checkpointSeed;
-    const sourceCalls = admission.eligibility === "legacy"
-      ? new Map<number, WorkflowCallRecord>()
-      : new Map(managed.calls.map((call) => [call.index, call] as const));
+    // Marked format-1 rows can republish matching safety/debit provenance under format 2;
+    // markerless legacy rows have no trustworthy source-call facts to promote.
+    const retainSourceCallFacts =
+      admission.eligibility !== "legacy" ||
+      admission.fallbackReason === "inputs-format-legacy" ||
+      admission.fallbackReason === "crash-residue";
+    const sourceCalls = retainSourceCallFacts
+      ? new Map(managed.calls.map((call) => [call.index, call] as const))
+      : new Map<number, WorkflowCallRecord>();
     return {
       preparedResume: {
         strategy: admission.strategy,
@@ -967,6 +1313,15 @@ export class WorkflowManager extends EventEmitter {
       executionSettled: false,
       environmentKey: exec.environmentKey ?? this.environmentKey,
       callsAllocated: 0,
+      limits: resolveWorkflowRunLimits({
+        maxAgents: exec.maxAgents,
+        tokenBudget: exec.tokenBudget,
+        concurrency: exec.concurrency ?? this.concurrency,
+        agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
+        agentTimeoutMs: exec.agentTimeoutMs !== undefined
+          ? exec.agentTimeoutMs
+          : this.defaultAgentTimeoutMs,
+      }),
       mainModel: this.mainModel,
       agentsDir: this.agentsDir,
       executionMode: exec.executionMode,
@@ -1161,6 +1516,7 @@ export class WorkflowManager extends EventEmitter {
       ...(engineResult?.resumeReport ?? managed.resumeReport
         ? { resumeReport: engineResult?.resumeReport ?? managed.resumeReport }
         : {}),
+      ...(managed.replayEligibility ? { replayEligibility: managed.replayEligibility } : {}),
       effectiveLimits: engineResult?.effectiveLimits ?? managed.limits,
       ...(engineResult?.abortSignaled || managed.abortSignaled ? { abortSignaled: true as const } : {}),
       ...(engineResult?.nestedWorkflows || managed.nestedWorkflows ? { nestedWorkflows: true as const } : {}),
@@ -1295,6 +1651,7 @@ export class WorkflowManager extends EventEmitter {
           this.persistRun(managed);
         },
         onCallRecord: (record) => this.recordCallRecord(managed, record),
+        onAgentAttempt: (attempt) => this.registerAgentAttempt(managed, attempt),
         onLog: (message, context) => {
           managed.snapshot.logs.push(message);
           publish(this.createRunEvent("log", {
@@ -1325,6 +1682,7 @@ export class WorkflowManager extends EventEmitter {
             prompt: event.prompt,
             status: "running",
             model: event.model,
+            timeoutMs: event.timeoutMs,
             callIndex: event.callIndex,
             scope: event.scope,
           });
@@ -1369,6 +1727,7 @@ export class WorkflowManager extends EventEmitter {
             ...event,
             scope: event.scope ?? managed.runId,
           }));
+          this.completeAgentCancellation(managed, event);
           progress();
         },
         onAgentHistory: (event) => {
@@ -1407,7 +1766,21 @@ export class WorkflowManager extends EventEmitter {
       managed.executionSettled = true;
       managed.calls = engineResult.calls ?? [];
       managed.callsAllocated = engineResult.callsAllocated;
-      managed.resumeReport = engineResult.resumeReport;
+      if (engineResult.resumeReport && managed.resumeReportPlan) {
+        managed.resumeReport = buildResumeReport(
+          managed.resumeReportPlan,
+          engineResult.resumeReport.calls,
+        );
+        engineResult.resumeReport = managed.resumeReport;
+        if (managed.replayEligibilityPlan) {
+          managed.replayEligibility = this.buildReplayEligibility(
+            managed.replayEligibilityPlan,
+            managed.resumeReport,
+          );
+        }
+      } else {
+        managed.resumeReport = engineResult.resumeReport;
+      }
       managed.limits = engineResult.effectiveLimits;
       if (engineResult.abortSignaled) managed.abortSignaled = true;
       if (engineResult.nestedWorkflows) managed.nestedWorkflows = true;
@@ -1534,6 +1907,12 @@ export class WorkflowManager extends EventEmitter {
       managed.resumeReportPlan,
       [...managed.resumeDecisions.values()],
     );
+    if (managed.replayEligibilityPlan) {
+      managed.replayEligibility = this.buildReplayEligibility(
+        managed.replayEligibilityPlan,
+        managed.resumeReport,
+      );
+    }
     this.persistRun(managed);
   }
 
@@ -1612,6 +1991,145 @@ export class WorkflowManager extends EventEmitter {
       }),
       () => this.persistRun(managed),
       rootScope ? { beforeLive: () => this.persistRun(managed) } : undefined,
+    );
+  }
+
+  private registerAgentAttempt(
+    managed: ManagedRun,
+    control: WorkflowAgentAttemptControl,
+  ): () => void {
+    const attempt: RegisteredAgentAttempt = { ...control };
+    let attempts = this.agentAttempts.get(managed.runId);
+    if (!attempts) {
+      attempts = new Set();
+      this.agentAttempts.set(managed.runId, attempts);
+    }
+    attempts.add(attempt);
+
+    return () => {
+      const current = this.agentAttempts.get(managed.runId);
+      current?.delete(attempt);
+      if (current?.size === 0) this.agentAttempts.delete(managed.runId);
+      if (attempt.cancellation && !attempt.cancellation.settled) {
+        this.rejectAgentCancellation(
+          attempt.cancellation,
+          new WorkflowError(
+            `Agent call ${attempt.callIndex} ("${attempt.label}") settled before host cancellation won the race.`,
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            { recoverable: false },
+          ),
+        );
+      }
+    };
+  }
+
+  private completeAgentCancellation(
+    managed: ManagedRun,
+    event: NonNullable<WorkflowRunOptions["onAgentEnd"]> extends (event: infer Event) => void
+      ? Event
+      : never,
+  ): void {
+    const matching = [...(this.agentAttempts.get(managed.runId) ?? [])].filter(
+      (attempt) =>
+        attempt.callIndex === event.callIndex &&
+        attempt.scope === event.scope &&
+        attempt.cancellation !== undefined &&
+        !attempt.cancellation.settled,
+    );
+    if (matching.length === 0) return;
+
+    let persistenceError: WorkflowError | undefined;
+    if (managed.journaling) {
+      try {
+        this.persistRunOrThrow(managed);
+        if (managed.eventLogIncomplete) {
+          throw new WorkflowError(
+            `Agent call ${event.callIndex} cancellation for run ${managed.runId} could not be durably acknowledged because its event log is incomplete.`,
+            WorkflowErrorCode.PERSISTENCE_ERROR,
+            { recoverable: false },
+          );
+        }
+      } catch (error) {
+        persistenceError = error instanceof WorkflowError
+          ? error
+          : new WorkflowError(
+              `Agent call ${event.callIndex} cancellation for run ${managed.runId} could not be persisted: ${errorMessage(error)}`,
+              WorkflowErrorCode.PERSISTENCE_ERROR,
+              { recoverable: false },
+            );
+      }
+    }
+
+    for (const attempt of matching) {
+      const pending = attempt.cancellation!;
+      if (persistenceError) {
+        this.rejectAgentCancellation(pending, persistenceError);
+      } else if (event.errorCode !== WorkflowErrorCode.AGENT_CANCELLED) {
+        this.rejectAgentCancellation(
+          pending,
+          new WorkflowError(
+            `Agent call ${event.callIndex} ("${attempt.label}") settled before host cancellation won the race.`,
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            { recoverable: false },
+          ),
+        );
+      } else {
+        pending.settled = true;
+        pending.resolve({
+          runId: managed.runId,
+          callIndex: attempt.callIndex,
+          label: attempt.label,
+          scope: attempt.scope,
+          errorCode: WorkflowErrorCode.AGENT_CANCELLED,
+        });
+      }
+    }
+  }
+
+  private rejectAgentCancellation(pending: PendingAgentCancellation, error: WorkflowError): void {
+    if (pending.settled) return;
+    pending.settled = true;
+    pending.reject(error);
+  }
+
+  private currentAgentAttempts(runId: string): RegisteredAgentAttempt[] {
+    return [...(this.agentAttempts.get(runId) ?? [])]
+      .filter((attempt) => !attempt.controller.signal.aborted || attempt.cancellation !== undefined)
+      .sort((left, right) =>
+        left.callIndex - right.callIndex ||
+        left.label.localeCompare(right.label) ||
+        left.scope.localeCompare(right.scope)
+      );
+  }
+
+  private agentCancellationSelectionError(
+    runId: string,
+    callIndex: number,
+    message: string,
+    inFlight = this.currentAgentAttempts(runId),
+  ): WorkflowError {
+    const listing = inFlight.length === 0
+      ? "none"
+      : inFlight
+          .map((attempt) =>
+            `${attempt.callIndex} (${JSON.stringify(attempt.label)}, scope ${JSON.stringify(attempt.scope)})`
+          )
+          .join(", ");
+    return new WorkflowError(
+      `${message} Currently in-flight agent calls (callIndex, label, scope): ${listing}.`,
+      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      {
+        recoverable: false,
+        details: {
+          runId,
+          callIndex,
+          inFlight: inFlight.map((attempt) => ({
+            callIndex: attempt.callIndex,
+            label: attempt.label,
+            scope: attempt.scope,
+          })),
+        },
+      },
     );
   }
 
@@ -1699,6 +2217,7 @@ export class WorkflowManager extends EventEmitter {
       ...(managed.resumeSourceRunId ? { resumeSourceRunId: managed.resumeSourceRunId } : {}),
       ...(managed.resumeSeed ? { resumeSeed: managed.resumeSeed } : {}),
       ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
+      ...(managed.replayEligibility ? { replayEligibility: managed.replayEligibility } : {}),
       mainModel: managed.mainModel,
       agentsDir: managed.agentsDir,
       executionMode: managed.executionMode,
@@ -2053,6 +2572,15 @@ export class WorkflowManager extends EventEmitter {
       executionSettled: false,
       environmentKey: exec.environmentKey ?? this.environmentKey,
       callsAllocated: 0,
+      limits: resolveWorkflowRunLimits({
+        maxAgents: exec.maxAgents,
+        tokenBudget: exec.tokenBudget,
+        concurrency: exec.concurrency ?? this.concurrency,
+        agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
+        agentTimeoutMs: exec.agentTimeoutMs !== undefined
+          ? exec.agentTimeoutMs
+          : this.defaultAgentTimeoutMs,
+      }),
       mainModel: persisted.mainModel ?? this.mainModel,
       agentsDir: persisted.agentsDir ?? this.agentsDir,
       legacyResume: true,
@@ -2094,6 +2622,77 @@ export class WorkflowManager extends EventEmitter {
     const promise = this.executeRun(managed, persisted.script, { ...exec, resumeJournal });
     promise.catch(() => {});
     return { accepted: true, promise };
+  }
+
+  /**
+   * Cancel exactly one in-flight agent call without aborting its owning run. The promise
+   * resolves only after the failed call record and agentEnd state are durable.
+   */
+  async cancelAgentCall(runId: string, callIndex: number): Promise<WorkflowAgentCallCancellation> {
+    if (!Number.isSafeInteger(callIndex) || callIndex < 0) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Agent call index must be a non-negative safe integer; received ${String(callIndex)}.`,
+      );
+    }
+
+    const managed = this.runs.get(runId);
+    if (!managed) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Workflow run "${runId}" is not live and owned by this manager.`,
+      );
+    }
+    if (managed.status !== "running") {
+      const state = managed.status === "completed" || managed.status === "failed" || managed.status === "aborted"
+        ? `already terminal (${managed.status})`
+        : managed.status;
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Workflow run "${runId}" is ${state}; no agent call can be cancelled.`,
+      );
+    }
+
+    const inFlight = this.currentAgentAttempts(runId);
+    const matching = inFlight.filter((attempt) => attempt.callIndex === callIndex);
+    if (matching.length === 0) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Agent call ${callIndex} is not currently in flight in run "${runId}"; it may already be settled, not yet allocated, or a checkpoint.`,
+        inFlight,
+      );
+    }
+    if (matching.length > 1) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Agent call index ${callIndex} is ambiguous in run "${runId}" because ${matching.length} in-flight calls share it.`,
+        inFlight,
+      );
+    }
+
+    const attempt = matching[0]!;
+    if (!attempt.cancellation) {
+      let resolve!: (result: WorkflowAgentCallCancellation) => void;
+      let reject!: (error: WorkflowError) => void;
+      const promise = new Promise<WorkflowAgentCallCancellation>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      attempt.cancellation = { promise, resolve, reject, settled: false };
+      attempt.controller.abort(
+        new WorkflowError(
+          "agent call cancelled by host",
+          WorkflowErrorCode.AGENT_CANCELLED,
+          { recoverable: true },
+        ),
+      );
+    }
+    return attempt.cancellation.promise;
   }
 
   /**
@@ -2187,12 +2786,15 @@ export class WorkflowManager extends EventEmitter {
           errorCode: managed.error?.code,
           logs: managed.snapshot.logs,
           journal: managed.journal,
+          agents: managed.snapshot.agents,
+          limits: managed.limits,
+          replayEligibility: managed.replayEligibility,
         },
         options,
       );
     }
 
-    const persisted = this.persistence.load(runId);
+    const persisted = this.reconcileExternallyDeadRun(runId);
     if (!persisted) return undefined;
     return projectWorkflowRunStatus(
       {
@@ -2205,6 +2807,9 @@ export class WorkflowManager extends EventEmitter {
         errorCode: persisted.errorCode,
         logs: persisted.logs ?? [],
         journal: persisted.journal ?? [],
+        agents: persisted.agents ?? [],
+        limits: persisted.limits,
+        replayEligibility: persisted.replayEligibility,
       },
       options,
     );
@@ -2238,13 +2843,13 @@ export class WorkflowManager extends EventEmitter {
    * reappear when you switch back. Unbound (tests/legacy) returns everything.
    */
   listRuns(): PersistedRunState[] {
-    const all = this.persistence.list();
+    const all = this.reconcileListedRuns(this.persistence.list());
     return this.sessionId ? all.filter((r) => r.sessionId === this.sessionId) : all;
   }
 
   /** All persisted runs regardless of session (used by cross-session recovery). */
   listAllRuns(): PersistedRunState[] {
-    return this.persistence.list();
+    return this.reconcileListedRuns(this.persistence.list());
   }
 
   /**

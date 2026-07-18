@@ -776,6 +776,8 @@ class FakeAgent {
 
   cancel(params) {
     record({ method: "cancel", params });
+    const turn = this.turnBySession.get(params.sessionId);
+    if (turn?.ignoreCancel) return;
     this.cancelled.add(params.sessionId);
     const resolve = this.cancelWaiters.get(params.sessionId);
     if (resolve) {
