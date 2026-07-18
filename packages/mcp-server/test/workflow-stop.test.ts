@@ -223,6 +223,154 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
   }
 });
 
+test("stop with callIndex cancels one agent, keeps the run live, and treats labelGlob only as an output filter", async () => {
+  const controlled = new AbortAwareRunner();
+  const { client, dispose } = await connect(controlled.runner);
+  try {
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "narrow-stop", description: "cancel one branch" };',
+          "const values = await parallel([",
+          '  () => agent("peer", { label: "peer", retries: 3 }),',
+          '  () => agent("cancel", { label: "cancel", retries: 3 }),',
+          "]);",
+          "return { values };",
+        ].join("\n"),
+        background: true,
+      },
+    });
+    const runId = runIdOf(accepted);
+    await waitUntil(() => controlled.calls.length === 2, "both parallel agents should start");
+
+    const missed = await client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId, callIndex: 99 },
+    });
+    assert.equal(missed.isError, true);
+    assert.equal(missed.structuredContent, undefined);
+    assert.match(textOf(missed), /not currently in flight/i);
+    assert.match(textOf(missed), /0 \("peer"/);
+    assert.match(textOf(missed), /1 \("cancel"/);
+    assert.equal(controlled.calls[0].options.signal?.aborted, false);
+    assert.equal(controlled.calls[1].options.signal?.aborted, false);
+
+    const cancelled = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "stop",
+        runId,
+        callIndex: 1,
+        labelGlob: "peer",
+        lastN: 5,
+        logLines: 5,
+      },
+    });
+    assert.equal(cancelled.isError, false, textOf(cancelled));
+    assert.equal(structured(cancelled)?.status, "running");
+    assert.equal(structured(cancelled)?.stopped, undefined);
+    assert.equal(structured(cancelled)?.alreadyTerminal, undefined);
+    assert.equal((structured(cancelled)?.filter as Record<string, unknown>).labelGlob, "peer");
+    assert.deepEqual(structured(cancelled)?.calls, [], "the output glob filters, but does not select, cancellation");
+    assert.match(textOf(cancelled), /Agent call 1 \("cancel"\) settled with AGENT_CANCELLED/i);
+    assert.match(textOf(cancelled), /run remains live/i);
+    assert.equal(controlled.calls[0].options.signal?.aborted, false, "the peer remains untouched");
+    assert.equal(controlled.calls[1].options.signal?.aborted, true, "only call index 1 is aborted");
+    assert.equal(controlled.calls.length, 2, "host cancellation bypasses retries");
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId, lastN: 5, logLines: 5 },
+    });
+    const cancelledCall = (structured(inspected)?.calls as Array<Record<string, unknown>>)
+      .find((call) => call.index === 1);
+    assert.equal(cancelledCall?.errorCode, "AGENT_CANCELLED");
+    const persistedFile = persistedRunFile(runId);
+    assert.ok(persistedFile);
+    const persisted = JSON.parse(readFileSync(persistedFile, "utf8")) as Record<string, unknown>;
+    assert.equal(persisted.status, "running");
+    assert.equal(persisted.abortSignaled, undefined);
+
+    controlled.calls[0].resolve("peer-ok");
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 25_000 },
+    });
+    assert.equal(structured(awaited)?.status, "completed");
+    const outcome = structured(awaited)?.outcome as Record<string, unknown>;
+    assert.equal(
+      JSON.stringify(outcome.result),
+      JSON.stringify({ values: ["peer-ok", null] }),
+    );
+  } finally {
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await dispose();
+  }
+});
+
+test("stop with callIndex reports scoped ambiguity and leaves whole-run stop behavior available", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-cancel-ambiguity-"));
+  const controlled = new AbortAwareRunner();
+  const manager = new WorkflowManager({
+    cwd: root,
+    persistenceRoot: root,
+    agent: controlled.runner,
+    loadSavedWorkflow: (name) => name === "child"
+      ? [
+          'export const meta = { name: "cancel-child", description: "nested call" };',
+          'return await agent("nested", { label: "nested" });',
+        ].join("\n")
+      : undefined,
+  });
+  const connection = await connectWithManager(controlled.runner, manager);
+  try {
+    const accepted = await connection.client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "cancel-ambiguity", description: "duplicate indexes" };',
+          "return await parallel([",
+          '  () => agent("root", { label: "root" }),',
+          '  () => workflow("child"),',
+          "]);",
+        ].join("\n"),
+        background: true,
+      },
+    });
+    const runId = runIdOf(accepted);
+    await waitUntil(() => controlled.calls.length === 2, "root and nested index zero should start");
+
+    const ambiguous = await connection.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId, callIndex: 0 },
+    });
+    assert.equal(ambiguous.isError, true);
+    assert.match(textOf(ambiguous), /ambiguous/i);
+    assert.match(textOf(ambiguous), /"root"/);
+    assert.match(textOf(ambiguous), /"nested"/);
+    assert.equal(controlled.calls.every((call) => call.options.signal?.aborted === false), true);
+
+    const wholeRun = await connection.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId },
+    });
+    assert.equal(wholeRun.isError, false, textOf(wholeRun));
+    assert.equal(structured(wholeRun)?.status, "aborted");
+    assert.equal(structured(wholeRun)?.stopped, true);
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await waitUntil(
+      () => manager.getRun(runId)?.executionSettled === true,
+      "the stopped nested execution should drain before its persistence root is removed",
+    );
+  } finally {
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await connection.client.close().catch(() => {});
+    await connection.server.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("four stopped background runs immediately free every registry slot", async () => {
   const pending: Array<(value: string) => void> = [];
   let calls = 0;
@@ -407,6 +555,15 @@ test("stop is retry-safe for terminal runs and disambiguates unknown and persist
     assert.equal(structured(repeated)?.status, "completed");
     assert.equal(structured(repeated)?.stopped, false);
     assert.equal(structured(repeated)?.alreadyTerminal, true);
+
+    const terminalSelector = await firstConnection.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId: completedRunId, callIndex: 0 },
+    });
+    assert.equal(terminalSelector.isError, true);
+    assert.equal(terminalSelector.structuredContent, undefined);
+    assert.match(textOf(terminalSelector), /already terminal \(completed\)/i);
+    assert.match(textOf(terminalSelector), /without callIndex is a successful no-op/i);
 
     const unknown = await firstConnection.client.callTool({
       name: "workflow",

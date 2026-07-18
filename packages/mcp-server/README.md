@@ -215,6 +215,17 @@ Stop a live run and return its final bounded snapshot:
 { "action": "stop", "runId": "mabc1234-k9x2pq", "lastN": 10, "logLines": 20 }
 ```
 
+Cancel one in-flight agent and return a live bounded snapshot without aborting the run:
+
+```json
+{ "action": "stop", "runId": "mabc1234-k9x2pq", "callIndex": 7, "lastN": 10, "logLines": 20 }
+```
+
+The selected form settles that call to `null` with `AGENT_CANCELLED`, skips retries, and leaves
+sibling calls running. `labelGlob` filters only the returned snapshot. A missing, settled,
+checkpoint, terminal, or ambiguous scoped index is an input error listing the in-flight
+call-index/label pairs.
+
 ### Output
 
 The tool returns both machine-readable `structuredContent` and a human-readable text block. The structured shape pins the durable core of the engine's run result:
@@ -345,7 +356,8 @@ interface WorkflowRunStatus {
 
 Each call has its deterministic index, known agent/checkpoint attribution, a compact JSON
 `resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs` and a
-terminal `errorCode`; a timed-out call therefore remains visible as `AGENT_TIMEOUT`. `limits`
+terminal `errorCode`; timed-out and host-cancelled calls therefore remain visible as
+`AGENT_TIMEOUT` and `AGENT_CANCELLED`. `limits`
 contains `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved
 for this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
@@ -449,7 +461,7 @@ client `resources` capability to gate these server-offered primitives.
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
 - **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix and first non-replay with a derivable detail. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Engine-version differences are surfaced diagnostics, never gates.
-- **Authoritative stop.** `action:"stop"` acts on `running` and `paused` runs live in this server
+- **Authoritative stop.** `action:"stop"` without `callIndex` acts on `running` and `paused` runs live in this server
   process, cancels their agent/checkpoint work, persists `aborted`, appends the durable `stopped`
   event, releases the lease, and returns the final inspection projection inline. Resume is safe
   immediately and an additional await adds nothing. Only backend agent-session wind-down can remain;
@@ -460,6 +472,12 @@ client `resources` capability to gate these server-offered primitives.
   edit the file, then call run with `scriptPath` plus `resumeFromRunId`. Because an in-flight stop
   cannot capture a quiescent terminal environment, the manager may conservatively run that resumed
   script live; the `resumeReport` is authoritative about any calls it could safely replay.
+- **Targeted agent cancellation.** Adding `callIndex` to `action:"stop"` selects one uniquely
+  matching in-flight agent, settles it to `null` with `AGENT_CANCELLED`, and returns a live status.
+  Siblings and the run continue, retries are bypassed, and `labelGlob` remains only an output filter.
+  The cancelled call has a durable failed record but no journal result, so a later resume executes
+  that occurrence live. The engine-owned latch settles even an abort-ignoring runner while the ACP
+  layer closes/recycles a session that ignores cancellation.
 - **Checkpoints.** Foreground uses MCP elicitation when advertised. Background never retains that
   request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus

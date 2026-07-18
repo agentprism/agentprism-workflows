@@ -263,6 +263,9 @@ const background = manager.startInBackground(script, { repo: "agentprism" }, { t
 console.log(background.runId, manager.getSnapshot(background.runId));
 // background.promise resolves only on completion and rejects on pause/failure/abort.
 
+// Settle one runaway agent to null without aborting the run or retrying that call.
+await manager.cancelAgentCall(background.runId, 4);
+
 const status = manager.inspectRun(run.runId, {
   lastN: 10,
   labelGlob: "review-*",
@@ -302,6 +305,13 @@ tighten it but cannot raise or disable it; without a host ceiling, per-call `nul
 uncapped. Retries each get a fresh clock (retries are clamped at 3). After the final timeout, the
 call resolves to `null` with recoverable `AGENT_TIMEOUT`, releases its concurrency slot, and the ACP
 runner closes/recycles a backend session that ignores cancellation.
+
+`cancelAgentCall(runId, callIndex)` is the stateful host seam for a single live attempt. It returns
+`WorkflowAgentCallCancellation` after the failed record and agent-end state are committed, while
+the script receives `null` and siblings continue. `AGENT_CANCELLED` never retries, never sets the
+run's abort state, and never creates a journal result; inspect exposes the error and a later resume
+runs that occurrence live. A missing, settled, checkpoint, or duplicate scoped index errors with
+the currently in-flight call-index/label pairs.
 
 Usage-limit and auth resumes are continuation-aware by default on both `resumeFromRunId` and
 same-ID `resume()` / `resumeInBackground()`: when the interrupted root call's index, identity hash,
@@ -829,6 +839,7 @@ RunDynamicWorkflowOptions, RunIsolationSdkOptions, RunIsolationOptions, Isolatio
 IsolationTarget, ReplayRunnerOptions, ReplayRunner, ReplayObservation, ReplayReport,
 ReplayCallReport, ReplayDivergenceEvent, ResolvedIsolationTarget,
 WorkflowRunOptions, AgentOptions, ExecOptions, CheckpointCallContext,
+WorkflowAgentAttemptControl, WorkflowAgentCallCancellation,
 MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,

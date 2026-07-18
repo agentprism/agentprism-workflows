@@ -24,10 +24,18 @@ import { ErrorCode, McpError, type ElicitRequestFormParams } from "@modelcontext
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
-import { parseWorkflowScript, redactText, truncateUtf8, WorkflowManager } from "@automatalabs/workflows";
+import {
+  parseWorkflowScript,
+  redactText,
+  truncateUtf8,
+  WorkflowError,
+  WorkflowErrorCode,
+  WorkflowManager,
+} from "@automatalabs/workflows";
 import type {
   ExecOptions,
   PersistedRunState,
+  WorkflowAgentCallCancellation,
   WorkflowSnapshot,
   WorkflowBackendConfig,
   WorkflowRunResult,
@@ -746,6 +754,19 @@ function formatStopSummary(result: WorkflowStopResult): string {
   return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
 
+function formatAgentCancellationSummary(
+  status: WorkflowRunStatus,
+  cancellation: WorkflowAgentCallCancellation,
+): string {
+  const lines = inspectionSummaryLines(status);
+  lines.splice(
+    2,
+    0,
+    `Agent call ${cancellation.callIndex} ("${cancellation.label}") settled with AGENT_CANCELLED; the workflow run remains live.`,
+  );
+  return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
+}
+
 function readScriptAtAdmission(scriptPath: string): string {
   try {
     return readFileSync(scriptPath, "utf8");
@@ -1133,7 +1154,7 @@ export function createWorkflowServer(
   mcp.registerTool(
     "workflow",
     {
-      title: "Run, inspect, await, or stop a dynamic agent workflow",
+      title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
       description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over built-in Claude, Codex, OpenCode, or pi " +
@@ -1142,8 +1163,9 @@ export function createWorkflowServer(
         "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +
         "run from a prior journal prefix. " +
         'Use action:"inspect" with a runId for a safe bounded status, log tail, and attributed call previews. ' +
-        'Use action:"stop" to durably abort a live run; its returned snapshot is the final run fate, ' +
-        "resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
+        'Use action:"stop" to durably abort a live run; add callIndex to cancel only that in-flight agent ' +
+        "and keep the run live. labelGlob remains an output filter in both forms. A whole-run stop returns " +
+        "the final run fate; resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
         "Background is tied to this server process, capped at four active/starting runs, and uses " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
@@ -1202,6 +1224,57 @@ export function createWorkflowServer(
           labelGlob: parsedInput.labelGlob,
           logLines: parsedInput.logLines,
         };
+        if (parsedInput.callIndex !== undefined) {
+          if (isAlreadyTerminalForStop(persisted.status)) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Workflow run "${parsedInput.runId}" is already terminal (${persisted.status}); no agent call is in flight to cancel. Whole-run stop without callIndex is a successful no-op for terminal runs.`,
+            );
+          }
+          if (!manager.getRun(parsedInput.runId)) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to cancel in this server process.`,
+            );
+          }
+
+          let cancellation: WorkflowAgentCallCancellation;
+          try {
+            cancellation = await manager.cancelAgentCall(parsedInput.runId, parsedInput.callIndex);
+          } catch (error) {
+            throw new McpError(
+              error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR
+                ? ErrorCode.InternalError
+                : ErrorCode.InvalidParams,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
+          if (!status) {
+            throw new McpError(
+              ErrorCode.InternalError,
+              `Workflow agent cancellation did not produce a snapshot for runId "${parsedInput.runId}".`,
+            );
+          }
+          const lineage = scriptResources.lineage(parsedInput.runId);
+          const projected = addInspectionResourceFields(
+            status,
+            {
+              scriptUri: workflowScriptUri(parsedInput.runId),
+              lineage,
+            },
+            inspectionRetentionMetadata(manager, parsedInput.runId, status),
+          );
+          return {
+            structuredContent: { ...projected },
+            content: [
+              { type: "text", text: formatAgentCancellationSummary(projected, cancellation) },
+              ...scriptResources.links(lineage),
+            ],
+            isError: false,
+          };
+        }
+
         let stopped = false;
         let alreadyTerminal = isAlreadyTerminalForStop(persisted.status);
         if (!alreadyTerminal) {

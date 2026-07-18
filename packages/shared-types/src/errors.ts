@@ -12,6 +12,8 @@
 // constructing this shared error; no provider prose classifier lives at the seam.
 export enum WorkflowErrorCode {
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
+  /** A host cancelled one in-flight agent call without aborting the owning workflow run. */
+  AGENT_CANCELLED = "AGENT_CANCELLED",
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",
   AGENT_LIMIT_EXCEEDED = "AGENT_LIMIT_EXCEEDED",
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",

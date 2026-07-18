@@ -152,6 +152,7 @@ The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elic
 | code | recoverable | engine behavior |
 |---|---|---|
 | `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Every retry gets a fresh clock; after the final attempt the call resolves `null`, and ACP cancel escalates to close/recycle when the turn does not stop. |
+| `AGENT_CANCELLED` | yes | The host selected this in-flight call for cancellation. It resolves `null` immediately through an engine race, skips retries, leaves the run live, and is recorded as a failed call rather than a replayable journal result. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call; same retry-then-`null`. |
 | `AGENT_EXECUTION_ERROR` | yes* | Generic agent failure (*refusal/truncation variants are non-recoverable). |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the re-prompt ladder. Halts the run (catchable in-script). |
@@ -301,7 +302,9 @@ long work uses `background:true` plus bounded `action:"await"`. It supports expl
 `headless: "pause"` checkpoints with `checkpointReplies` from terminal
 `outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a
 saved workflow name. The `workflow` tool is the server's whole tool surface —
-run/resume/inspect/await/stop are action branches, not separate tools. A run that pauses with
+run/resume/inspect/await/stop are action branches, not separate tools. Stop without `callIndex`
+aborts the whole run; stop with `callIndex` cancels only that in-flight agent and returns a live
+inspection snapshot. `labelGlob` filters that snapshot and never selects cancellation. A run that pauses with
 `reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band
 (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also
 get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional
@@ -368,6 +371,7 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
 interface WorkflowStopToolInput {
   action: "stop";
   runId: string;
+  callIndex?: number;  // omitted = whole-run abort; present = cancel one in-flight agent
   lastN?: number;
   labelGlob?: string;
   logLines?: number;
@@ -376,6 +380,11 @@ interface WorkflowStopToolInput {
   waitMs?: never;
 }
 ```
+
+The selected stop form requires a live, uniquely addressable agent attempt. Settled/unallocated
+indexes, checkpoints, duplicate scoped indexes, and terminal runs are errors that enumerate the
+currently in-flight call-index/label pairs. A successful selected cancellation returns the ordinary
+live `WorkflowRunStatus`; whole-run stop returns the terminal `WorkflowStopResult`.
 
 `WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` retains the compatibility shape
 `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message, continuation? }`.

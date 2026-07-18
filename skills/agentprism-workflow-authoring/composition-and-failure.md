@@ -45,6 +45,7 @@ The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` 
 ## Failure semantics — design for `null`
 
 - A **recoverable** failure (timeout, empty output, transient execution error) is retried per the call's `retries` (default 0), then the call **resolves to `null`** — inside `parallel`/`pipeline` *and* as a bare `await agent(...)`. Null-check anything load-bearing, and set `retries: 1–2` on steps you can't afford to lose.
+- A host can settle one runaway in-flight call with MCP `{ action: "stop", runId, callIndex }` or SDK `manager.cancelAgentCall(runId, callIndex)`. The call resolves to `null` with `AGENT_CANCELLED`, skips every configured retry, and does not abort the run or its siblings. Its failed call record is inspectable but is not cached as a journal result, so a later resume runs that occurrence live.
 - A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle. In particular, **always rethrow pause-class errors** (`err.code === "PROVIDER_USAGE_LIMIT"` or `"AUTH_REQUIRED"`): they must propagate out of the script so the engine can pause the run resumably — swallowing one converts that pause into a fake, lossy completion.
 - A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
 - Per-call knobs: `timeoutMs` and `retries`. A finite `timeoutMs` may shorten the host's run-level
@@ -72,5 +73,6 @@ Guard budget-driven loops on `budget.total` being set — with no budget, `remai
 
 The concurrency cap counts active agent attempts, not authored branches. If one `parallel()` branch
 is slow, queued branches begin as other attempts finish. A branch that exhausts its timeout settles
-to `null` after retries and immediately frees its slot, so a single stalled worker cannot hold that
-slot forever when the host configures a finite ceiling.
+to `null` after retries and immediately frees its slot; a host-cancelled branch does the same without
+retrying. Finite ceilings and targeted cancellation keep one stalled worker from holding a slot
+indefinitely.

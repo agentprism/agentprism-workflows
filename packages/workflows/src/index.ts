@@ -102,6 +102,8 @@ export type { ProbeHarnessConfigOptions, HarnessConfigReport } from "./config.js
 export type {
   WorkflowRunOptions,
   WorkflowRunLimitOptions,
+  WorkflowAgentAttemptControl,
+  WorkflowAgentCallCancellation,
   AgentOptions,
   ExecOptions,
   WorkflowManagerOptions,

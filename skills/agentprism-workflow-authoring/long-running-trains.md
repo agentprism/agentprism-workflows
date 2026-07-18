@@ -44,4 +44,7 @@ keeps moving. Each of these prevented — or would have prevented — a real ter
   total wall-clock ceiling for each attempt, and use a smaller per-call `timeoutMs` only where a
   step deserves a tighter deadline. Each retry re-arms the clock. At the concurrency cap, one slow
   `parallel()` branch occupies one slot while other finished branches release theirs; an exhausted
-  timeout settles that branch to `null` and frees its slot for queued work.
+  timeout settles that branch to `null` and frees its slot for queued work. For a live outlier that
+  should stop without tearing down completed siblings, inspect its deterministic index and send
+  `{ action: "stop", runId, callIndex }`; host cancellation also settles `null`, frees the slot, and
+  deliberately skips retries.

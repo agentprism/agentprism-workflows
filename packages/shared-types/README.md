@@ -89,6 +89,9 @@ From [`src/index.ts`](./src/index.ts):
 
 **Errors** (runtime, not just types)
 - `WorkflowError` (class) + `WorkflowErrorCode` (enum) + `WorkflowErrorOptions`.
+- `AGENT_CANCELLED` identifies a host-selected in-flight call. The engine settles that call to
+  `null` without retrying or aborting the owning run; the failed row is observable but is not a
+  replayable journal result.
 - `AuthErrorContext` — the non-secret backend/method summary carried by `AUTH_REQUIRED`.
 - `ProviderUsageLimitContext` — the backend/code and provider-derived reset instant carried by
   `PROVIDER_USAGE_LIMIT`.
@@ -130,8 +133,9 @@ From [`src/index.ts`](./src/index.ts):
 - `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
   `WorkflowRunStatusTruncation`, and `WorkflowRunStatus` — the shared bounded status contract used
   by SDK and MCP polling/inspection hosts. Agent call status can carry its resolved total-wall-clock
-  `timeoutMs` and terminal `errorCode`, including `AGENT_TIMEOUT` for a recoverable call that has no
-  journal result. Resumed results/statuses can carry `replayEligibility`, a bounded admission and
+  `timeoutMs` and terminal `errorCode`, including `AGENT_TIMEOUT` and `AGENT_CANCELLED` for
+  recoverable calls that have no journal result. Resumed results/statuses can carry
+  `replayEligibility`, a bounded admission and
   progress summary with the predicted/observed prefix, first non-replay, engine/input-format
   diagnostics, and non-gating operational changes.
 - `WorkflowRunLimits` — resolved `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and

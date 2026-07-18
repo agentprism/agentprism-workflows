@@ -16,6 +16,7 @@ export {
   type WorkflowRunLimitOptions,
   type WorkflowRunOptions,
   type WorkflowCallbackContext,
+  type WorkflowAgentAttemptControl,
   type WorkflowAgentOptions,
   type AgentOptions,
   type CheckpointOptions,
@@ -29,6 +30,7 @@ export {
   type WorkflowManagerOptions,
   type ExecOptions,
   type ManagedRun,
+  type WorkflowAgentCallCancellation,
 } from "./workflow-manager.js";
 export {
   createRunPersistence,

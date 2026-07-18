@@ -72,6 +72,8 @@ import {
   type CheckpointCallContext,
   type CheckpointOptions,
   type EngineRunResult,
+  type WorkflowAgentAttemptControl,
+  type WorkflowRunOptions,
   parseWorkflowScript,
   resolveWorkflowRunLimits,
   runWorkflow,
@@ -203,6 +205,26 @@ interface ReplayEligibilityPlan {
 interface InitializedRun {
   managed: ManagedRun;
   resumeExecution?: ManagerResumeExecution;
+}
+
+/** Durable acknowledgement for one host-cancelled agent call. */
+export interface WorkflowAgentCallCancellation {
+  runId: string;
+  callIndex: number;
+  label: string;
+  scope: string;
+  errorCode: WorkflowErrorCode.AGENT_CANCELLED;
+}
+
+interface PendingAgentCancellation {
+  promise: Promise<WorkflowAgentCallCancellation>;
+  resolve: (result: WorkflowAgentCallCancellation) => void;
+  reject: (error: WorkflowError) => void;
+  settled: boolean;
+}
+
+interface RegisteredAgentAttempt extends WorkflowAgentAttemptControl {
+  cancellation?: PendingAgentCancellation;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -474,6 +496,7 @@ export interface WorkflowManager {
  */
 export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
+  private agentAttempts = new Map<string, Set<RegisteredAgentAttempt>>();
   private persistence: RunEventPersistence;
   private cwd: string;
   private concurrency: number;
@@ -1573,6 +1596,7 @@ export class WorkflowManager extends EventEmitter {
           this.persistRun(managed);
         },
         onCallRecord: (record) => this.recordCallRecord(managed, record),
+        onAgentAttempt: (attempt) => this.registerAgentAttempt(managed, attempt),
         onLog: (message, context) => {
           managed.snapshot.logs.push(message);
           publish(this.createRunEvent("log", {
@@ -1648,6 +1672,7 @@ export class WorkflowManager extends EventEmitter {
             ...event,
             scope: event.scope ?? managed.runId,
           }));
+          this.completeAgentCancellation(managed, event);
           progress();
         },
         onAgentHistory: (event) => {
@@ -1911,6 +1936,145 @@ export class WorkflowManager extends EventEmitter {
       }),
       () => this.persistRun(managed),
       rootScope ? { beforeLive: () => this.persistRun(managed) } : undefined,
+    );
+  }
+
+  private registerAgentAttempt(
+    managed: ManagedRun,
+    control: WorkflowAgentAttemptControl,
+  ): () => void {
+    const attempt: RegisteredAgentAttempt = { ...control };
+    let attempts = this.agentAttempts.get(managed.runId);
+    if (!attempts) {
+      attempts = new Set();
+      this.agentAttempts.set(managed.runId, attempts);
+    }
+    attempts.add(attempt);
+
+    return () => {
+      const current = this.agentAttempts.get(managed.runId);
+      current?.delete(attempt);
+      if (current?.size === 0) this.agentAttempts.delete(managed.runId);
+      if (attempt.cancellation && !attempt.cancellation.settled) {
+        this.rejectAgentCancellation(
+          attempt.cancellation,
+          new WorkflowError(
+            `Agent call ${attempt.callIndex} ("${attempt.label}") settled before host cancellation won the race.`,
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            { recoverable: false },
+          ),
+        );
+      }
+    };
+  }
+
+  private completeAgentCancellation(
+    managed: ManagedRun,
+    event: NonNullable<WorkflowRunOptions["onAgentEnd"]> extends (event: infer Event) => void
+      ? Event
+      : never,
+  ): void {
+    const matching = [...(this.agentAttempts.get(managed.runId) ?? [])].filter(
+      (attempt) =>
+        attempt.callIndex === event.callIndex &&
+        attempt.scope === event.scope &&
+        attempt.cancellation !== undefined &&
+        !attempt.cancellation.settled,
+    );
+    if (matching.length === 0) return;
+
+    let persistenceError: WorkflowError | undefined;
+    if (managed.journaling) {
+      try {
+        this.persistRunOrThrow(managed);
+        if (managed.eventLogIncomplete) {
+          throw new WorkflowError(
+            `Agent call ${event.callIndex} cancellation for run ${managed.runId} could not be durably acknowledged because its event log is incomplete.`,
+            WorkflowErrorCode.PERSISTENCE_ERROR,
+            { recoverable: false },
+          );
+        }
+      } catch (error) {
+        persistenceError = error instanceof WorkflowError
+          ? error
+          : new WorkflowError(
+              `Agent call ${event.callIndex} cancellation for run ${managed.runId} could not be persisted: ${errorMessage(error)}`,
+              WorkflowErrorCode.PERSISTENCE_ERROR,
+              { recoverable: false },
+            );
+      }
+    }
+
+    for (const attempt of matching) {
+      const pending = attempt.cancellation!;
+      if (persistenceError) {
+        this.rejectAgentCancellation(pending, persistenceError);
+      } else if (event.errorCode !== WorkflowErrorCode.AGENT_CANCELLED) {
+        this.rejectAgentCancellation(
+          pending,
+          new WorkflowError(
+            `Agent call ${event.callIndex} ("${attempt.label}") settled before host cancellation won the race.`,
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            { recoverable: false },
+          ),
+        );
+      } else {
+        pending.settled = true;
+        pending.resolve({
+          runId: managed.runId,
+          callIndex: attempt.callIndex,
+          label: attempt.label,
+          scope: attempt.scope,
+          errorCode: WorkflowErrorCode.AGENT_CANCELLED,
+        });
+      }
+    }
+  }
+
+  private rejectAgentCancellation(pending: PendingAgentCancellation, error: WorkflowError): void {
+    if (pending.settled) return;
+    pending.settled = true;
+    pending.reject(error);
+  }
+
+  private currentAgentAttempts(runId: string): RegisteredAgentAttempt[] {
+    return [...(this.agentAttempts.get(runId) ?? [])]
+      .filter((attempt) => !attempt.controller.signal.aborted || attempt.cancellation !== undefined)
+      .sort((left, right) =>
+        left.callIndex - right.callIndex ||
+        left.label.localeCompare(right.label) ||
+        left.scope.localeCompare(right.scope)
+      );
+  }
+
+  private agentCancellationSelectionError(
+    runId: string,
+    callIndex: number,
+    message: string,
+    inFlight = this.currentAgentAttempts(runId),
+  ): WorkflowError {
+    const listing = inFlight.length === 0
+      ? "none"
+      : inFlight
+          .map((attempt) =>
+            `${attempt.callIndex} (${JSON.stringify(attempt.label)}, scope ${JSON.stringify(attempt.scope)})`
+          )
+          .join(", ");
+    return new WorkflowError(
+      `${message} Currently in-flight agent calls (callIndex, label, scope): ${listing}.`,
+      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      {
+        recoverable: false,
+        details: {
+          runId,
+          callIndex,
+          inFlight: inFlight.map((attempt) => ({
+            callIndex: attempt.callIndex,
+            label: attempt.label,
+            scope: attempt.scope,
+          })),
+        },
+      },
     );
   }
 
@@ -2403,6 +2567,77 @@ export class WorkflowManager extends EventEmitter {
     const promise = this.executeRun(managed, persisted.script, { ...exec, resumeJournal });
     promise.catch(() => {});
     return { accepted: true, promise };
+  }
+
+  /**
+   * Cancel exactly one in-flight agent call without aborting its owning run. The promise
+   * resolves only after the failed call record and agentEnd state are durable.
+   */
+  async cancelAgentCall(runId: string, callIndex: number): Promise<WorkflowAgentCallCancellation> {
+    if (!Number.isSafeInteger(callIndex) || callIndex < 0) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Agent call index must be a non-negative safe integer; received ${String(callIndex)}.`,
+      );
+    }
+
+    const managed = this.runs.get(runId);
+    if (!managed) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Workflow run "${runId}" is not live and owned by this manager.`,
+      );
+    }
+    if (managed.status !== "running") {
+      const state = managed.status === "completed" || managed.status === "failed" || managed.status === "aborted"
+        ? `already terminal (${managed.status})`
+        : managed.status;
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Workflow run "${runId}" is ${state}; no agent call can be cancelled.`,
+      );
+    }
+
+    const inFlight = this.currentAgentAttempts(runId);
+    const matching = inFlight.filter((attempt) => attempt.callIndex === callIndex);
+    if (matching.length === 0) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Agent call ${callIndex} is not currently in flight in run "${runId}"; it may already be settled, not yet allocated, or a checkpoint.`,
+        inFlight,
+      );
+    }
+    if (matching.length > 1) {
+      throw this.agentCancellationSelectionError(
+        runId,
+        callIndex,
+        `Agent call index ${callIndex} is ambiguous in run "${runId}" because ${matching.length} in-flight calls share it.`,
+        inFlight,
+      );
+    }
+
+    const attempt = matching[0]!;
+    if (!attempt.cancellation) {
+      let resolve!: (result: WorkflowAgentCallCancellation) => void;
+      let reject!: (error: WorkflowError) => void;
+      const promise = new Promise<WorkflowAgentCallCancellation>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      attempt.cancellation = { promise, resolve, reject, settled: false };
+      attempt.controller.abort(
+        new WorkflowError(
+          "agent call cancelled by host",
+          WorkflowErrorCode.AGENT_CANCELLED,
+          { recoverable: true },
+        ),
+      );
+    }
+    return attempt.cancellation.promise;
   }
 
   /**

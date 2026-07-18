@@ -30,7 +30,7 @@ export const workflowToolInputShape = {
     .enum(["run", "inspect", "await", "stop"])
     .optional()
     .describe(
-      "Operation. Omit or use run to execute; inspect reads immediately; await waits for terminal status; stop aborts a live run and returns its final snapshot.",
+      "Operation. Omit or use run to execute; inspect reads immediately; await waits for terminal status; stop aborts a live run, or cancels one in-flight agent when callIndex is supplied.",
     ),
   script: z
     .string()
@@ -106,6 +106,15 @@ export const workflowToolInputShape = {
     .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
     .optional()
     .describe("Project-scoped workflow run ID. Required for inspect/await/stop; forbidden for run."),
+  callIndex: z
+    .number()
+    .int()
+    .nonnegative()
+    .safe()
+    .optional()
+    .describe(
+      "With action=stop, cancel exactly this in-flight agent call without aborting the run. Forbidden for every other action.",
+    ),
   lastN: z.number().int().min(1).max(50).optional().describe("Latest matching calls. Default 20; range 1..50."),
   labelGlob: z
     .string()
@@ -138,6 +147,7 @@ interface WorkflowExecuteToolInputBase {
   /** Default false. True acknowledges after admission and executes in this server process. */
   background?: boolean;
   runId?: never;
+  callIndex?: never;
   waitMs?: never;
   lastN?: never;
   labelGlob?: never;
@@ -153,6 +163,7 @@ export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
 export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   action: "inspect";
   runId: string;
+  callIndex?: never;
   script?: never;
   scriptPath?: never;
   background?: never;
@@ -165,6 +176,7 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
 export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   action: "await";
   runId: string;
+  callIndex?: never;
   /** Default 20_000; integer range 0..25_000. Zero is a non-blocking status read. */
   waitMs?: number;
   script?: never;
@@ -178,6 +190,8 @@ export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
 export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
   action: "stop";
   runId: string;
+  /** Omitted for whole-run stop; present to cancel exactly one in-flight agent call. */
+  callIndex?: number;
   script?: never;
   scriptPath?: never;
   background?: never;
@@ -208,6 +222,7 @@ interface RawWorkflowToolInput {
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
   runId?: string;
+  callIndex?: number;
   lastN?: number;
   labelGlob?: string;
   logLines?: number;
@@ -239,7 +254,7 @@ function invalid(message: string): never {
 export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolInput {
   if (raw.action === "inspect") {
     if (!raw.runId) invalid('action="inspect" requires runId');
-    if (hasExecutionFields(raw) || raw.waitMs !== undefined) {
+    if (hasExecutionFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined) {
       invalid('action="inspect" cannot include execution fields');
     }
     return {
@@ -253,7 +268,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
 
   if (raw.action === "await") {
     if (!raw.runId) invalid('action="await" requires runId');
-    if (hasExecutionFields(raw)) {
+    if (hasExecutionFields(raw) || raw.callIndex !== undefined) {
       invalid('action="await" cannot include execution fields');
     }
     return {
@@ -274,6 +289,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
     return {
       action: "stop",
       runId: raw.runId,
+      callIndex: raw.callIndex,
       lastN: raw.lastN,
       labelGlob: raw.labelGlob,
       logLines: raw.logLines,
@@ -282,6 +298,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
 
   if (
     raw.runId !== undefined ||
+    raw.callIndex !== undefined ||
     raw.waitMs !== undefined ||
     raw.lastN !== undefined ||
     raw.labelGlob !== undefined ||

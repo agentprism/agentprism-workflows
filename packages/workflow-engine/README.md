@@ -70,6 +70,7 @@ For process-lifetime background execution, use the returned settlement handle:
 ```ts
 const { runId, promise } = manager.startInBackground(script, { topic: "otters" });
 console.log(manager.getSnapshot(runId)?.tokenUsage); // cumulative live usage when known
+await manager.cancelAgentCall(runId, 3); // cancel one in-flight agent; the run stays live
 const terminal = await promise; // rejects for pause, failure, or abort
 ```
 
@@ -80,6 +81,13 @@ before that save. Replay hits do not emit journal callbacks, so this seeding is 
 run independently resumable after a second pause or process loss. Each later live journal append
 persists the complete inherited prefix plus suffix. After a crash, stale persisted `running` runs
 recover to `paused`; in-flight unjournaled work may execute again on resume.
+
+`cancelAgentCall(runId, callIndex)` targets one uniquely matching live attempt. It aborts that
+attempt with recoverable `AGENT_CANCELLED`, races backend cooperation so an ignored signal still
+settles, bypasses retries, and resolves only after the failed call record and `agentEnd` state are
+committed. The script receives `null`; sibling branches continue, the run-level signal and
+`abortSignaled` remain untouched, and no journal result is created. Errors for missing, settled,
+checkpoint, or duplicate scoped indexes list the currently in-flight call-index/label pairs.
 
 Inspect a run without executing or leasing it:
 
@@ -102,7 +110,8 @@ ascending call-index order.
 The `WorkflowRunStatus` projection includes the run's resolved limits and, for a new-run resume,
 its bounded `replayEligibility` admission/progress summary. Agent call rows include their
 resolved per-attempt `timeoutMs` and terminal `errorCode`, which keeps failures such as
-`AGENT_TIMEOUT` visible even though they have no result journal row. The projection is allowlisted:
+`AGENT_TIMEOUT` and `AGENT_CANCELLED` visible even though they have no result journal row. The
+projection is allowlisted:
 it never exposes script, args, prompts,
 histories, journal hashes, session IDs, cwd, checkpoint text/defaults, auth context, or raw results.
 Text and result previews are redacted and capped at 512 UTF-8 bytes; results are structurally
@@ -336,12 +345,12 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 
 - **Engine** — `runWorkflow`, `parseWorkflowScript`; types `EngineRunResult`,
   `WorkflowRunOptions`, `AgentOptions`, `CheckpointOptions`, `WorkflowAgentOptions`,
-  `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
+  `WorkflowAgentAttemptControl`, `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
   `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, `PreparedContinuation`,
   `ContinuationCandidate`, and the resume policy/report/replay-eligibility types.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
-  `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
-  `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,
+  `ManagedRun`, `WorkflowAgentCallCancellation`); `createRunPersistence`, `generateRunId`, and
+  types `RunPersistence`, `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,
   `PersistedAgentState`, `FsLayer`; `readEvents()`/`watchEvents()` options/results/errors; safe
   `inspectRun()` and the `WorkflowRunStatus` / inspection / log-tail / call / truncation contracts.
 - **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /

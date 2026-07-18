@@ -61,7 +61,8 @@ manager.on("agentEvent", (e) => ui.stream(e.runId, e));  // live token-level ACP
 
 const { runId, promise } = manager.startInBackground(script, args, { cwd: worktreePath });
 // ... later:
-manager.stop(runId);            // or manager.pause(runId), or await manager.resume(runId)
+await manager.cancelAgentCall(runId, 7); // settle one in-flight agent null; run stays live
+manager.stop(runId);                    // whole-run terminal abort
 ```
 
 ---
@@ -142,8 +143,9 @@ explicitly selects `headless: "pause"`.
 | `startInBackground(script, args?, exec?)` | `{ runId, promise }` | Process-lifetime execution. Returns after lease acquisition and fail-fast initial persistence. A supplied `resumeJournal` is sorted and copied into the child run before that save, so replayed prefixes and synthetic checkpoint answers survive later resume hops under the new run ID. The promise rejects on pause/failure/abort (a side-channel catch prevents host unhandled rejections if ignored). |
 | `runSync(script, args?, exec?)` | `Promise<WorkflowRunResult>` | Blocks; always resolves to a **terminal** result (`completed \| paused \| failed \| aborted`) — never throws for ordinary outcomes. |
 | `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, read-only, live-first safe projection; falls back to the manager's project-scoped persistence. Never leases, saves, or changes status. |
+| `cancelAgentCall(runId, callIndex)` | `Promise<WorkflowAgentCallCancellation>` | Cancels one uniquely matching in-flight attempt, bypasses retries, and resolves after its `AGENT_CANCELLED` call record and `agentEnd` state are durable. The run signal and `abortSignaled` remain untouched. Misses and duplicate scoped indexes throw with the current call-index/label list. |
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
-| `stop(runId)` | `boolean` | Terminal abort. Not resumable. |
+| `stop(runId)` | `boolean` | Whole-run terminal abort. The same run ID cannot resume in place, but its retained journal can be the source of a new `resumeFromRunId` execution. |
 | `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
@@ -159,6 +161,11 @@ emit/add nothing. The unchanged successful final total is still emitted, so an o
 it twice. The latest snapshot is persisted at journal and settlement points and survives cold load.
 If a process dies, stale persisted `running` runs recover to `paused`; the durable prefix can then
 seed a new execution. An in-flight call without a journal result runs again.
+
+Per-call host cancellation is an execution bound, not a replay result. `agent()` receives `null`,
+`parallel()` siblings and gates continue normally, and inspect exposes the failed row with
+`errorCode: "AGENT_CANCELLED"`. No journal entry is written for that null, so a later resume replays
+eligible completed siblings before the cancelled index and executes the cancelled occurrence live.
 
 ### Content-addressed incremental resume
 

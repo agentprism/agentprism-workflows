@@ -124,6 +124,14 @@ export interface WorkflowCallbackContext {
   scope: string;
 }
 
+/** Narrow host-control seam for one live runner attempt. */
+export interface WorkflowAgentAttemptControl {
+  callIndex: number;
+  label: string;
+  scope: string;
+  controller: AbortController;
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   /**
@@ -198,6 +206,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onCheckpointTaken?: (entry: WorkflowCheckpointTaken) => void;
   /** Called at each call's terminal transition after the authoritative manifest append. */
   onCallRecord?: (record: WorkflowCallRecord) => void;
+  /**
+   * Registers one live runner attempt for host-directed per-call cancellation. The optional
+   * cleanup returned by the host is called exactly once when that attempt settles.
+   */
+  onAgentAttempt?: (attempt: WorkflowAgentAttemptControl) => void | (() => void);
   /** Called synchronously when workflow() allocates a unique child-run ordinal. */
   onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
@@ -1304,11 +1317,29 @@ export async function runWorkflow<T = unknown>(
           const continueFromSession = attempt === 1 && continuationCandidate && !continuationSkipReason
             ? continuationCandidate.sessionRef
             : undefined;
+          let attemptController: AbortController | undefined;
+          let unregisterAttempt: (() => void) | undefined;
+          let hostAttemptRegistered = false;
           try {
             throwIfAborted();
-            const attemptController = new AbortController();
+            attemptController = new AbortController();
             const attemptSignal = AbortSignal.any([signal, attemptController.signal]);
             attemptsRan++;
+            const registerAttempt = options.onAgentAttempt;
+            if (registerAttempt) {
+              hostAttemptRegistered = true;
+              try {
+                const cleanup = registerAttempt({
+                  callIndex,
+                  label,
+                  scope: runId,
+                  controller: attemptController,
+                });
+                if (typeof cleanup === "function") unregisterAttempt = cleanup;
+              } catch (error) {
+                bestEffortDebug(`agent ${label}: host attempt registration failed: ${errorMessage(error)}`);
+              }
+            }
             let result: unknown;
             try {
               let rawRunnerPromise: Promise<unknown>;
@@ -1411,15 +1442,18 @@ export async function runWorkflow<T = unknown>(
                 throw error;
               }
               observeResumeActivity(rawRunnerPromise);
-              result = await withTimeout(
+              const boundedRunnerPromise = withTimeout(
                 rawRunnerPromise,
                 timeout,
                 label,
                 () => {
                   sealAttempt(slot);
-                  attemptController.abort();
+                  attemptController?.abort();
                 },
               );
+              result = hostAttemptRegistered
+                ? await withAgentCancellation(boundedRunnerPromise, attemptController.signal)
+                : await boundedRunnerPromise;
             } finally {
               sealAttempt(slot);
               if (continueFromSession !== undefined && !signal.aborted) {
@@ -1516,6 +1550,18 @@ export async function runWorkflow<T = unknown>(
             return result;
           } catch (error) {
             if (!slot.sealed) sealAttempt(slot);
+            const cancellationReason = attemptController
+              ? agentCancellationReason(attemptController.signal)
+              : undefined;
+            if (cancellationReason) {
+              logger.error(
+                `agent ${label} attempt ${attempt}/${maxAttempts} cancelled by host: ${cancellationReason.message}`,
+              );
+              recordTokens(null, slot.usage);
+              log(`agent "${label}" cancelled by host; retries skipped`);
+              emitFailure(cancellationReason, "engine", "null", slot, false);
+              return null;
+            }
             if (signal.aborted) {
               emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", slot, true);
               throw error;
@@ -1541,6 +1587,14 @@ export async function runWorkflow<T = unknown>(
             }
             emitFailure(workflowError, "runner", "error", slot, false);
             throw workflowError;
+          } finally {
+            if (unregisterAttempt) {
+              try {
+                unregisterAttempt();
+              } catch (error) {
+                bestEffortDebug(`agent ${label}: host attempt cleanup failed: ${errorMessage(error)}`);
+              }
+            }
           }
         }
         return null;
@@ -3261,5 +3315,34 @@ async function withTimeout<T>(
     return await Promise.race([promise, timeoutPromise]);
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function agentCancellationReason(signal: AbortSignal): WorkflowError | undefined {
+  if (!signal.aborted) return undefined;
+  const reason = signal.reason;
+  return reason instanceof WorkflowError && reason.code === WorkflowErrorCode.AGENT_CANCELLED
+    ? reason
+    : undefined;
+}
+
+/** Settle a selected attempt even when its runner ignores the abort signal. */
+async function withAgentCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  const alreadyCancelled = agentCancellationReason(signal);
+  if (alreadyCancelled) throw alreadyCancelled;
+
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      const reason = agentCancellationReason(signal);
+      if (reason) reject(reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([promise, cancelled]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
