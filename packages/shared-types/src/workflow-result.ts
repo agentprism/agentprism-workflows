@@ -348,6 +348,23 @@ export interface WorkflowReplayOperationalChange {
   detail: string;
 }
 
+export type WorkflowReplayProvenanceField =
+  | "runtime.node"
+  | "runtime.v8"
+  | "environment.identity"
+  | "environment.git.head"
+  | "environment.git.dirtyDigest"
+  | "environment.key";
+
+/** One recorded-world difference observed between a resume source and its new run.
+ *  These values are provenance only and never gate admission, strategy, or replay. */
+export interface WorkflowReplayProvenanceChange {
+  field: WorkflowReplayProvenanceField;
+  source: string | null;
+  current: string | null;
+  detail: string;
+}
+
 export interface WorkflowReplayFirstNonReplay {
   index: number;
   action: "live" | "failed";
@@ -376,6 +393,8 @@ interface WorkflowReplayEligibilityBase {
   engineVersionComparison: "same" | "different" | "source-unknown";
   sourceInputsFormat?: number;
   currentInputsFormat: number;
+  /** Additive for persisted eligibility records written before provenance diagnostics. */
+  provenanceChanges?: WorkflowReplayProvenanceChange[];
   operationalChanges: WorkflowReplayOperationalChange[];
 }
 

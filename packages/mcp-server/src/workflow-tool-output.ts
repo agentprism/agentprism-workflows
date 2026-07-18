@@ -150,6 +150,20 @@ const replayOperationalChangeSchema = z.object({
   detail: z.string(),
 });
 
+const replayProvenanceChangeSchema = z.object({
+  field: z.enum([
+    "runtime.node",
+    "runtime.v8",
+    "environment.identity",
+    "environment.git.head",
+    "environment.git.dirtyDigest",
+    "environment.key",
+  ]),
+  source: z.string().nullable(),
+  current: z.string().nullable(),
+  detail: z.string(),
+});
+
 const replayFirstNonReplaySchema = z.object({
   index: z.number().int().nonnegative(),
   action: z.enum(["live", "failed"]),
@@ -175,6 +189,7 @@ const replayEligibilityBaseShape = {
   engineVersionComparison: z.enum(["same", "different", "source-unknown"]),
   sourceInputsFormat: z.number().int().nonnegative().optional(),
   currentInputsFormat: z.number().int().nonnegative(),
+  provenanceChanges: z.array(replayProvenanceChangeSchema).optional(),
   operationalChanges: z.array(replayOperationalChangeSchema),
 } as const;
 

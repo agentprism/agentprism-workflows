@@ -521,6 +521,11 @@ function formatResumeSummary(
       `(${eligibility.engineVersionComparison}); inputs format: ` +
       `${eligibility.sourceInputsFormat ?? "unknown"} -> ${eligibility.currentInputsFormat}`,
   );
+  if ((eligibility.provenanceChanges?.length ?? 0) > 0) {
+    lines.push(
+      `provenance changes: ${eligibility.provenanceChanges?.map((change) => change.detail).join("; ")}`,
+    );
+  }
   if (eligibility.operationalChanges.length > 0) {
     lines.push(`operational changes: ${eligibility.operationalChanges.map((change) => change.detail).join("; ")}`);
   }

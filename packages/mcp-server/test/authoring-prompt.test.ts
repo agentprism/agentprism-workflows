@@ -39,7 +39,7 @@ test("generated authoring-prompt teaches fail-to-live identity resume semantics"
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("keys always name the checkpoint index in the source run"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('resumePolicy: "positional"'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('source-wide `"manifest-invalid"`'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("A Node or V8 upgrade"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Node/V8 drift is reported provenance"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 6'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 8'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
@@ -60,9 +60,10 @@ test("generated authoring-prompt teaches resume compatibility and eligibility di
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("The separate input fingerprint covers resolved label"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "inputs-format-legacy"'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "crash-residue"'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("with `legacy` prefix eligibility"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("ancestor-scoped rows from ≤0.23 resume chains"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume forward across workflow-engine package versions"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("A Node or V8 change produces `runtime-mismatch`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume across workflow-engine, Node, V8, and current-environment changes"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`replayEligibility.provenanceChanges`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("MCP background admission, foreground completion, both await shapes, and inspect"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("seed-persistence-error"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("resume-fatal-latch"));

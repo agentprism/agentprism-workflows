@@ -24,6 +24,12 @@ const replayEligibility = {
   engineVersionComparison: "different",
   sourceInputsFormat: 1,
   currentInputsFormat: 2,
+  provenanceChanges: [{
+    field: "runtime.node",
+    source: "v24.16.0",
+    current: "v24.17.1",
+    detail: "source recorded runtime.node=v24.16.0; this run: v24.17.1",
+  }],
   operationalChanges: [{
     option: "agentTimeoutMs",
     source: 900_000,

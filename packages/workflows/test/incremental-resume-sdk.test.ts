@@ -145,6 +145,7 @@ return { one, approval }`, "same-run"));
       currentEngineVersion: "0.27.0",
       engineVersionComparison: "source-unknown",
       currentInputsFormat: 2,
+      provenanceChanges: [],
       operationalChanges: [],
     };
     assert.equal(report.requestedPolicy, "auto");

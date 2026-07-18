@@ -282,7 +282,7 @@ describe("incremental resume admission", () => {
     assert.equal(future.strategy === "live" && future.disabledReason, "runtime-mismatch");
   });
 
-  it("admits crash residue before the input-format and environment gates", () => {
+  it("admits crash residue before the input-format bridge without consulting the current environment", () => {
     for (const inputsFormat of [1, CALL_INPUTS_FORMAT]) {
       const crashed = sourceState(undefined, {
         status: "paused",
@@ -316,7 +316,7 @@ describe("incremental resume admission", () => {
       sourceRunId: SOURCE_RUN_ID,
       requestedPolicy: "auto",
       fallbackReason: "crash-residue",
-      eligibility: "all-live",
+      eligibility: "legacy",
     });
 
     const unknownEnvironment = admission(drifted, {
@@ -325,7 +325,7 @@ describe("incremental resume admission", () => {
     assert.equal(unknownEnvironment.strategy, "positional-v1");
     assert.equal(
       unknownEnvironment.strategy === "positional-v1" && unknownEnvironment.eligibility,
-      "all-live",
+      "legacy",
     );
 
     const markerless = drifted;
@@ -340,7 +340,7 @@ describe("incremental resume admission", () => {
       resume: { format: "identity-v1", terminalEnvironment: {} },
     });
     const malformed = admission(malformedTerminal);
-    assert.equal(malformed.strategy === "live" && malformed.disabledReason, "environment-missing");
+    assert.equal(malformed.strategy === "live" && malformed.disabledReason, "source-environment-drift");
   });
 
   it("replays across every operational-knob change and migrates format 1 positionally", async () => {
@@ -430,34 +430,56 @@ return { first, second };`;
     }
   });
 
-  it("pins format, status, metadata, runtime, and environment disabled outcomes", () => {
+  it("pins the remaining format, status, metadata, runtime-format, and intra-run safety outcomes", () => {
     const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>, string]> = [
       ["unsupported", sourceState(undefined, { resume: { format: "future" } as never }), {}, "unsupported-format"],
       ["aborted", sourceState(undefined, { status: "aborted" }), {}, "abort-residue"],
       ["abort signal", sourceState(undefined, { abortSignaled: true }), {}, "abort-residue"],
       ["running", sourceState(undefined, { status: "running" }), {}, "source-not-terminal"],
       ["isolation", sourceState(undefined, { executionMode: { kind: "isolation", baselineRunId: "base" } }), {}, "isolation-recording"],
-      ["terminal environment", sourceState(undefined, { resume: { format: "identity-v1" } }), {}, "environment-missing"],
-      ["source environment", sourceState(undefined, { environment: undefined }), {}, "environment-missing"],
+      ["terminal environment", sourceState(undefined, { resume: { format: "identity-v1" } }), {}, "source-environment-drift"],
+      ["source environment", sourceState(undefined, { environment: undefined }), {}, "source-environment-drift"],
       ["cwd metadata", sourceState(undefined, { effectiveCwd: undefined }), {}, "resume-metadata-missing"],
       ["runtime metadata", sourceState(undefined, { runtime: undefined }), {}, "resume-metadata-missing"],
       ["journal metadata", sourceState(undefined, { journal: undefined }), {}, "resume-metadata-missing"],
       ["manifest metadata", sourceState(undefined, { calls: undefined }), {}, "resume-metadata-missing"],
       ["allocation metadata", sourceState(undefined, { callsAllocated: undefined }), {}, "resume-metadata-missing"],
       ["cwd", sourceState(), { current: { effectiveCwd: "/other", runtime: RUNTIME, environment: ENVIRONMENT } }, "cwd-mismatch"],
-      ["node", sourceState(undefined, { runtime: { ...RUNTIME, node: "v0" } }), {}, "runtime-mismatch"],
-      ["v8", sourceState(undefined, { runtime: { ...RUNTIME, v8: "v0" } }), {}, "runtime-mismatch"],
       ["path format", sourceState(undefined, { runtime: { ...RUNTIME, pathFormat: 0 } }), {}, "runtime-mismatch"],
       ["input format", sourceState(undefined, { runtime: { ...RUNTIME, inputsFormat: 3 } }), {}, "runtime-mismatch"],
       ["checkpoint format", sourceState(undefined, { runtime: { ...RUNTIME, checkpointInputsFormat: 0 } }), {}, "runtime-mismatch"],
-      ["current environment", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME } }, "environment-missing"],
-      ["environment arm", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME, environment: { git: { head: HASH_A, dirtyDigest: HASH_B } } } }, "environment-mismatch"],
-      ["environment value", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME, environment: { key: "other" } } }, "environment-mismatch"],
     ];
     for (const [name, source, overrides, reason] of cases) {
       const decision = admission(source, overrides);
       assert.equal(decision.strategy, "live", name);
       assert.equal(decision.strategy === "live" && decision.disabledReason, reason, name);
+    }
+  });
+
+  it("admits Node, V8, and current-environment drift as provenance instead of vetoes", () => {
+    const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>]> = [
+      ["node", sourceState(undefined, { runtime: { ...RUNTIME, node: "v0" } }), {}],
+      ["v8", sourceState(undefined, { runtime: { ...RUNTIME, v8: "v0" } }), {}],
+      ["current environment missing", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME } }],
+      [
+        "environment identity kind",
+        sourceState(),
+        {
+          current: {
+            effectiveCwd: CWD,
+            runtime: RUNTIME,
+            environment: { git: { head: HASH_A, dirtyDigest: HASH_B } },
+          },
+        },
+      ],
+      [
+        "environment identity value",
+        sourceState(),
+        { current: { effectiveCwd: CWD, runtime: RUNTIME, environment: { key: "other" } } },
+      ],
+    ];
+    for (const [name, source, overrides] of cases) {
+      assert.equal(admission(source, overrides).strategy, "identity-v1", name);
     }
   });
 

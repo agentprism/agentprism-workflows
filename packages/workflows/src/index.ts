@@ -143,6 +143,8 @@ export type {
   WorkflowResumeReport,
   WorkflowReplayOperationalOption,
   WorkflowReplayOperationalChange,
+  WorkflowReplayProvenanceField,
+  WorkflowReplayProvenanceChange,
   WorkflowReplayFirstNonReplay,
   WorkflowReplayEligibility,
 } from "@automatalabs/workflow-engine";

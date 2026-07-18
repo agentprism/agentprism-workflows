@@ -8,6 +8,7 @@ import type {
   WorkflowCallReplayProvenance,
   WorkflowReplayEligibility,
   WorkflowReplayOperationalChange,
+  WorkflowReplayProvenanceChange,
   WorkflowResumeCallDecision,
   WorkflowResumeCallFailedReason,
   WorkflowResumeCallLiveReason,
@@ -169,6 +170,12 @@ const operationalChange: WorkflowReplayOperationalChange = {
   current: null,
   detail: "source recorded agentTimeoutMs=900000; this run: none",
 };
+const provenanceChange: WorkflowReplayProvenanceChange = {
+  field: "runtime.node",
+  source: "v24.16.0",
+  current: "v24.17.1",
+  detail: "source recorded runtime.node=v24.16.0; this run: v24.17.1",
+};
 const replayEligibility: WorkflowReplayEligibility = {
   strategy: "positional-v1",
   sourceRunId: "source-run",
@@ -184,6 +191,7 @@ const replayEligibility: WorkflowReplayEligibility = {
   engineVersionComparison: "different",
   sourceInputsFormat: 1,
   currentInputsFormat: 2,
+  provenanceChanges: [provenanceChange],
   operationalChanges: [operationalChange],
 };
 

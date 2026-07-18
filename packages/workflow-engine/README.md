@@ -177,7 +177,7 @@ const again = await manager.runSync(script, { topic: "otters", expanded: true },
 console.log(again.replayEligibility, again.resumeReport);
 ```
 
-The manager admits exact cwd/runtime/terminal-environment state, persists the candidate seed, and
+The manager admits exact cwd plus compatible format/metadata/manifest state, persists the candidate seed, and
 then matches safety-marked results by exact path/hash or unique hash+input fingerprint. Any
 uncertain, ambiguous, unsafe, or mismatched call runs live. Same-ID `manager.resume(runId)` and
 manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
@@ -187,14 +187,14 @@ catalogs, checkpoint source-index rules, and filesystem preconditions are in the
 The call identity hashes authored behavior; the separate input fingerprint covers label, per-call
 cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentTimeoutMs`,
 `agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, are operational and enter
-neither hash. A crash snapshot reconciled to `paused` / `interrupted` without terminal environment
-proof uses `crash-residue`:
-matching admission environments allow its hash-only positional prefix, while unknown or drifted
-environments are all-live. Normally settled input-fingerprint formats below 2 use the named
+neither hash. For normally settled sources, the recorded start-to-terminal environment comparison
+remains a per-call safety fact. Current-environment, Node, and V8 differences are provenance only.
+A crash snapshot reconciled to `paused` / `interrupted` without terminal environment proof uses
+`crash-residue` with legacy hash-only positional-prefix eligibility. Normally settled input-fingerprint formats below 2 use the named
 `inputs-format-legacy` positional bridge, including ancestor-scoped prefixes carried by ≤0.23 resume
 hops when the ancestor run is still persisted. The persisted producing engine version is diagnostic only. Background admission,
 inspection, polling, and terminal results expose the same eligibility strategy, predicted/observed
-prefix, first non-replay, version formats, and operational differences.
+prefix, first non-replay, version formats, runtime/environment provenance changes, and operational differences.
 
 Separately from replay correspondence, the manager builds a `PreparedContinuation` from a
 usage/auth-paused snapshot's coherent root `calls[]` × `agents[]` join. Both new-run and same-ID

@@ -4,7 +4,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
+import type {
+  AgentRunner,
+  RunOptions,
+  WorkflowReplayProvenanceField,
+} from "@automatalabs/shared-types";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState, RunLease, RunPersistence } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -98,7 +102,105 @@ async function recordSafeSource(
   return result.runId;
 }
 
+const DRIFT_CHECKPOINT_SCRIPT = workflow(`
+const first = await agent("prefix-one", {
+  label: "prefix-one",
+  resume: { filesystem: "read-only" },
+})
+const second = await agent("prefix-two", {
+  label: "prefix-two",
+  resume: { filesystem: "read-only" },
+})
+const approval = await checkpoint("approve", { headless: "pause" })
+const after = await agent("after-checkpoint", {
+  label: "after-checkpoint",
+  resume: { filesystem: "read-only" },
+})
+return { first, second, approval, after }`, "drift-checkpoint");
+
+async function assertDriftedCheckpointResume(
+  targetRunId: string,
+  mutateSource: (manager: WorkflowManager, sourceRunId: string, cwd: string) => void,
+  expectedField: WorkflowReplayProvenanceField,
+): Promise<void> {
+  const dirs = tempDirs("incremental-manager-provenance-");
+  execFileSync("git", ["-C", dirs.cwd, "init", "-q"]);
+  execFileSync("git", ["-C", dirs.cwd, "config", "user.email", "tests@example.com"]);
+  execFileSync("git", ["-C", dirs.cwd, "config", "user.name", "Tests"]);
+  writeFileSync(join(dirs.cwd, "tracked.txt"), "clean\n");
+  execFileSync("git", ["-C", dirs.cwd, "add", "tracked.txt"]);
+  execFileSync("git", ["-C", dirs.cwd, "commit", "-qm", "initial"]);
+  const livePrompts: string[] = [];
+  const manager = new WorkflowManager({
+    cwd: dirs.cwd,
+    persistenceRoot: dirs.root,
+    agent: {
+      async run(prompt) {
+        livePrompts.push(prompt);
+        return `live:${prompt}`;
+      },
+    },
+  });
+  try {
+    const paused = await manager.runSync(DRIFT_CHECKPOINT_SCRIPT);
+    assert.equal(paused.status, "paused");
+    assert.ok(paused.checkpointContext);
+    assert.deepEqual(livePrompts, ["prefix-one", "prefix-two"]);
+
+    mutateSource(manager, paused.runId, dirs.cwd);
+    livePrompts.length = 0;
+    const started = manager.startInBackground(DRIFT_CHECKPOINT_SCRIPT, undefined, {
+      runId: targetRunId,
+      resumeFromRunId: paused.runId,
+      checkpointReplies: { [paused.checkpointContext.callIndex]: true },
+    });
+    const admittedChange = manager.getRun(targetRunId)?.replayEligibility?.provenanceChanges
+      ?.find((change) => change.field === expectedField);
+    assert.ok(admittedChange, `${expectedField} is reported at admission`);
+    assert.notEqual(admittedChange.source, admittedChange.current);
+
+    const resumed = await started.promise;
+    assert.equal(resumed.status, "completed", JSON.stringify(resumed.resumeReport));
+    assert.equal(resumed.resumeReport?.strategy, "identity-v1");
+    assert.equal(resumed.resumeReport?.replayed, 3);
+    assert.equal(resumed.resumeReport?.live, 1);
+    assert.equal(resumed.replayEligibility?.replayedPrefix, 3);
+    assert.ok(resumed.replayEligibility?.provenanceChanges
+      ?.some((change) => change.field === expectedField));
+    assert.deepEqual(livePrompts, ["after-checkpoint"], "the journaled agent prefix makes zero live calls");
+    assert.deepEqual(JSON.parse(JSON.stringify(resumed.result)), {
+      first: "live:prefix-one",
+      second: "live:prefix-two",
+      approval: true,
+      after: "live:after-checkpoint",
+    });
+  } finally {
+    dirs.cleanup();
+  }
+}
+
 describe("WorkflowManager resumeFromRunId admission", () => {
+  it("replays a checkpointed prefix after tracked-file drift and reports the dirty digest", async () => {
+    await assertDriftedCheckpointResume(
+      "dirty-digest-target",
+      (_manager, _sourceRunId, cwd) => writeFileSync(join(cwd, "tracked.txt"), "edited\n"),
+      "environment.git.dirtyDigest",
+    );
+  });
+
+  it("replays a checkpointed prefix across a Node version string change and reports it", async () => {
+    await assertDriftedCheckpointResume(
+      "runtime-node-target",
+      (manager, sourceRunId) => {
+        const source = manager.getPersistence().load(sourceRunId);
+        assert.ok(source?.runtime);
+        source.runtime.node = "v0.0.0-recorded";
+        manager.getPersistence().save(source);
+      },
+      "runtime.node",
+    );
+  });
+
   it("validates exact option combinations before creating a target run", async () => {
     const dirs = tempDirs();
     try {

@@ -30,6 +30,7 @@ const replayEligibility: WorkflowReplayEligibility = {
   currentEngineVersion: "0.27.0",
   engineVersionComparison: "source-unknown",
   currentInputsFormat: 2,
+  provenanceChanges: [],
   operationalChanges: [],
 };
 
