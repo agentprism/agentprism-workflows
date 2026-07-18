@@ -348,9 +348,11 @@ copied from the source run; pass the desired timeout/retry/concurrency values ag
 neither replay identity nor the execution-input fingerprint and may change without invalidating
 completed calls or interrupted-turn continuation.
 
-Sources with an input-fingerprint format below 2 use the `inputs-format-legacy` positional bridge.
-That bridge also accepts ancestor-scoped rows carried by a ≤0.23 resume hop when the ancestor run
-still exists in the same persistence directory; nested and deleted-run scopes stay live. Engine
+Crash snapshots reconciled to `paused` / `interrupted` without a terminal environment use the
+`crash-residue` positional bridge: their hash-stable prefix is eligible only when the recorded
+admission environment matches the new run. Normally settled sources with an input-fingerprint format below 2 use the
+`inputs-format-legacy` positional bridge. That bridge also accepts ancestor-scoped rows carried by a
+≤0.23 resume hop when the ancestor run still exists in the same persistence directory; nested and deleted-run scopes stay live. Engine
 package versions are persisted and surfaced as diagnostics but never gate replay. Every new-run
 resume exposes `WorkflowReplayEligibility` on the foreground result and inspection status: strategy,
 predicted and observed replayable prefixes, counts, the first non-replay when known, source/current
@@ -360,13 +362,15 @@ The manager's critical initial save contains the complete inherited seed before 
 acknowledgement. A manager-prepared `resumeFromRunId` hit re-journals the selected value under its
 current target index; same-ID/manual legacy cache hits retain the historical no-journal-callback
 behavior and rely on the already-seeded prefix. Each new run is independently resumable across
-multiple pause/resume hops. Process loss can stop in-flight work; the next manager recovers a stale
-durable `running` record to `paused`, and an unjournaled in-flight call may run again.
+multiple pause/resume hops. Process loss can stop in-flight work; construction and cold
+inspect/list/resume lookups reconcile a dead owner's durable `pending`/`running` record under its
+lease to `paused` with `pauseReason: "interrupted"`. An unjournaled in-flight call may run again.
 
 `inspectRun(runId, options?)` is inherited through this facade and returns the shared
 `WorkflowRunStatus` without importing `@automatalabs/workflow-engine`. It reads the freshest live
-snapshot first and project-scoped persistence second, never executes the script or acquires a run
-lease, and returns `undefined` for an unknown/unreadable ID. The facade also re-exports
+snapshot first and project-scoped persistence second and never executes the script. A cold
+`pending`/`running` row may take a short reconciliation lease when its owner is dead; other rows are
+not changed. It returns `undefined` for an unknown/unreadable ID. The facade also re-exports
 `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
 `WorkflowRunStatusTruncation`, `WorkflowRunStatus`, and `JournalCallMetadata`. Inspection defaults
 to 20 calls and 20 log lines, supports case-sensitive whole-label `*`/`?`/backslash globs, redacts

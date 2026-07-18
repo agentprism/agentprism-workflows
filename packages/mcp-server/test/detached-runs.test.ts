@@ -881,7 +881,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
   }
 });
 
-test("stale running persistence recovers to paused and resumes from its journal", async () => {
+test("a long-lived server lazily reconciles crash residue for await, inspect, and resume", async () => {
   let sourceCalls = 0;
   const first = await connect(makeRunner(() => {
     sourceCalls++;
@@ -908,8 +908,9 @@ test("stale running persistence recovers to paused and resumes from its journal"
   }));
   delete state.result;
   delete state.completedAt;
+  const resume = state.resume as Record<string, unknown> | undefined;
+  if (resume) delete resume.terminalEnvironment;
   const staleFile = join(dirname(sourceFile), `${staleId}.json`);
-  writeFileSync(staleFile, JSON.stringify(state, null, 2), "utf8");
 
   let resumedCalls = 0;
   const cold = await connect(makeRunner(() => {
@@ -917,22 +918,34 @@ test("stale running persistence recovers to paused and resumes from its journal"
     return "unexpected";
   }), { listTools: true });
   try {
+    writeFileSync(staleFile, JSON.stringify(state, null, 2), "utf8");
     const recovered = await cold.client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: staleId, waitMs: 0 },
     });
     assert.equal(structured(recovered)?.status, "paused");
+    assert.equal(structured(recovered)?.reason, "Interrupted: the owning process exited before completion (PID unavailable); recovered to a resumable pause.");
     assert.equal(field(structured(recovered)?.wait, "returnedBecause"), "terminal");
+    const inspected = await cold.client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: staleId },
+    });
+    assert.equal(structured(inspected)?.status, "paused");
+    assert.equal(structured(inspected)?.reason, structured(recovered)?.reason);
     const resumed = await cold.client.callTool({
       name: "workflow",
       arguments: { script, background: true, resumeFromRunId: staleId },
     });
+    assert.equal(field(structured(resumed)?.replayEligibility, "fallbackReason"), "crash-residue");
+    assert.equal(field(structured(resumed)?.replayEligibility, "predictedReplayablePrefix"), 1);
     const completed = await cold.client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: runIdOf(resumed), waitMs: 1_000 },
     });
     assert.equal(structured(completed)?.status, "completed");
     assert.equal(resumedCalls, 0, "the recovered journal remains resumable");
+    assert.equal(field(field(structured(completed)?.outcome, "resumeReport"), "fallbackReason"), "crash-residue");
+    assert.match(textOf(completed), /resume: positional-v1\/legacy \(crash-residue\)/);
   } finally {
     await cold.dispose();
   }

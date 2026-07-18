@@ -76,7 +76,7 @@ manager.stop(runId);                    // whole-run terminal abort
 | `cwd` | `process.cwd()` | The manager's base directory. Keys run **state/log storage** and is the default run directory when a run passes no `cwd` of its own. |
 | `agent` | — | The injected `AgentRunner`. Required here or per-run (`ExecOptions.agent`); the engine never constructs one. |
 | `concurrency` | 8 | Max concurrent agents per run. |
-| `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and startup stale-run recovery is skipped entirely. |
+| `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and construction/lazy stale-run reconciliation is skipped entirely. |
 | `persistenceRoot` | `AGENTPRISM_PERSISTENCE_ROOT` env, else `~/.agentprism/workflows` | Absolute root for run state/logs. Relative paths throw. |
 | `persistence` | filesystem persistence | Custom `RunPersistence` implementation. Omit it for the default `createRunPersistence(cwd, ..., { persistenceRoot })` path. |
 | `defaultAgentTimeoutMs` | `null` (none) | Host total-wall-clock ceiling for each agent attempt. |
@@ -86,7 +86,13 @@ manager.stop(runId);                    // whole-run terminal abort
 | `agentsDir` | project + user agent dirs | Override the directory scanned for `agentType` definitions. |
 | `loadSavedWorkflow` | — | `(name) => script` resolver enabling nested `workflow("name")` in scripts. `openWorkflowDir(dir).resolve` is a ready-made one. |
 
-On construction, a journaling manager reconciles orphaned `"running"` runs from dead processes to `"paused"` (journal preserved for resume). A `journaling: false` manager never touches persisted state.
+On construction, a journaling manager attempts the lease for persisted `pending`/`running` rows not
+owned in memory. A dead, missing, or corrupt owner lock is replaced; the under-lease reload changes
+only a still-`pending`/`running` row to `paused`, with `pauseReason: "interrupted"` and a reason naming
+the dead PID when the lock supplied one. A live PID—including `EPERM` from the liveness probe—is
+preserved. Cold inspect/list/resume lookups perform the same per-run reconciliation, so a sibling
+process that dies after construction does not remain indefinitely `running`. A `journaling: false`
+manager never performs these writes.
 
 ### <a name="execoptions--per-run"></a>`ExecOptions` — per-run
 
@@ -142,14 +148,15 @@ explicitly selects `headless: "pause"`.
 |---|---|---|
 | `startInBackground(script, args?, exec?)` | `{ runId, promise }` | Process-lifetime execution. Returns after lease acquisition and fail-fast initial persistence. A supplied `resumeJournal` is sorted and copied into the child run before that save, so replayed prefixes and synthetic checkpoint answers survive later resume hops under the new run ID. The promise rejects on pause/failure/abort (a side-channel catch prevents host unhandled rejections if ignored). |
 | `runSync(script, args?, exec?)` | `Promise<WorkflowRunResult>` | Blocks; always resolves to a **terminal** result (`completed \| paused \| failed \| aborted`) — never throws for ordinary outcomes. |
-| `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, read-only, live-first safe projection; falls back to the manager's project-scoped persistence. Never leases, saves, or changes status. |
+| `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, live-first safe projection; falls back to project-scoped persistence. A cold `pending`/`running` dead-owner row may be lease-reconciled to `paused` / `interrupted`; other rows are not changed. |
+| `reconcileExternallyDeadRun(runId)` | `PersistedRunState \| undefined` | Lease-safe single-run reconciliation used by cold host preflights. Skips manager-owned runs, non-`pending`/`running` states, live owners, and all writes when the manager default is `journaling: false`. |
 | `cancelAgentCall(runId, callIndex)` | `Promise<WorkflowAgentCallCancellation>` | Cancels one uniquely matching in-flight attempt, bypasses retries, and resolves after its `AGENT_CANCELLED` call record and `agentEnd` state are durable. The run signal and `abortSignaled` remain untouched. Misses and duplicate scoped indexes throw with the current call-index/label list. |
 | `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
 | `stop(runId)` | `boolean` | Whole-run terminal abort. The same run ID cannot resume in place, but its retained journal can be the source of a new `resumeFromRunId` execution. |
 | `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
-| `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all). |
+| `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all); their existing scan lease-reconciles candidate dead-owner rows without a second directory scan. |
 | `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
 | `setSessionId(id)`, `setMainModel(spec)` | — | Rebind session tagging / tier fallback. |
 | `dispose()` / `close()` | — | Facade manager only: detach its `agentEvent` runner subscriptions. Never disposes the runner itself. |
@@ -159,8 +166,9 @@ They fire after every live attempt—including failed retries and pause/failure 
 provider usage when supplied and the existing estimate fallback otherwise. Replayed journal calls
 emit/add nothing. The unchanged successful final total is still emitted, so an observer may receive
 it twice. The latest snapshot is persisted at journal and settlement points and survives cold load.
-If a process dies, stale persisted `running` runs recover to `paused`; the durable prefix can then
-seed a new execution. An in-flight call without a journal result runs again.
+If a process dies, stale persisted `pending`/`running` runs recover under their lease to `paused`
+with `pauseReason: "interrupted"`; the durable prefix can then seed a new execution. An in-flight
+call without a journal result runs again.
 
 Per-call host cancellation is an execution bound, not a replay result. `agent()` receives `null`,
 `parallel()` siblings and gates continue normally, and inspect exposes the failed row with
@@ -363,10 +371,14 @@ fallback. Stable explicit labels matter because runner-visible label changes alt
 
 Before any new-format cache is considered, admission requires a terminal non-aborted,
 non-isolation source; exact `effectiveCwd`; exact full Node, V8, call-path, and checkpoint-input
-formats; a compatible agent-input format; complete bijective journal/manifest data; and equality
+formats; a compatible agent-input format; complete journal/call/allocation metadata; and equality
 between the source's quiescent terminal environment and the environment measured at admission.
-Input formats below 2 take the positional compatibility bridge; a format greater than the current
-format is `runtime-mismatch`. Git identity is exact HEAD plus dirty digest. Non-git hosts must
+A crash snapshot reconciled to `paused` / `interrupted` has no quiescent terminal environment. It takes the `crash-residue`
+positional bridge before the input-format bridge: an equal source-admission/current environment
+admits the hash-stable legacy prefix, while a missing or drifted environment makes the strategy
+explicitly all-live. No terminal environment is fabricated. Normally settled input formats below 2
+take the input-format positional compatibility bridge; a format greater than the current format is
+`runtime-mismatch`. Git identity is exact HEAD plus dirty digest. Non-git hosts must
 supply the same `environmentKey`, which must content-address every persistent resource safe calls
 can observe. The host must exclude other writers from source start through terminal capture and
 again from admission through the resumed run's terminal capture; a run-ID lease does not lock a
@@ -375,8 +387,12 @@ or different engine versions are diagnostics in `replayEligibility`, never admis
 
 Automatic policy selects:
 
+- `"positional-v1"` / `"legacy"` with `fallbackReason: "crash-residue"` for a reconciled `paused` / `interrupted` crash
+  snapshot without terminal-environment proof when its admission environment equals the current
+  environment; the same fallback is `"all-live"` when that comparison is missing or unequal;
 - `"positional-v1"` / `"legacy"` with `fallbackReason: "inputs-format-legacy"` for a marked source
-  whose input-fingerprint format is below 2 and whose other admission facts agree;
+  that settled normally, whose input-fingerprint format is below 2, and whose other admission facts
+  agree;
 - `"identity-v1"` only for a stable source whose represented agent results are safety-marked and
   whose checkpoint results are proven host decisions;
 - `"positional-v1"` / `"safe-prefix"` for a structurally valid, start-to-terminal stable source
@@ -411,7 +427,10 @@ Manual `resumeJournal` and same-ID `resume()`/`resumeInBackground()` always ente
 and cannot be laundered into an identity-capable hop. Aborted or `abortSignaled` sources are never
 served from this arm.
 
-Format-1 fingerprints are never reinterpreted as format 2. The `inputs-format-legacy` bridge uses
+Format-1 fingerprints are never reinterpreted as format 2. A marker-less ≤0.23 crash remains
+`legacy-recording`; a reconciled `paused` / `interrupted` crash takes `crash-residue`; a marked normally settled format-1 source
+takes `inputs-format-legacy`; and a normally settled format-2 source may take identity replay. The
+`inputs-format-legacy` bridge uses
 the established hash-only index/prefix matcher, and every selected row is re-journaled under the
 target's format 2 runtime so its next hop can use identity matching. Positional new-run preparation
 accepts a journal/call row only when its scope is absent, equals the immediate source ID, or names a
@@ -433,7 +452,7 @@ never disables either strategy.
 The runtime arrays below are exported by `@automatalabs/workflow-engine` and re-exported by the
 facade. Their literal unions live in `@automatalabs/shared-types`:
 
-- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `inputs-format-legacy`, `forced-positional`,
+- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `crash-residue`, `inputs-format-legacy`, `forced-positional`,
   `unsafe-recording`, `nested-workflows`, `legacy-resume`.
 - `RESUME_DISABLED_REASONS`: `unsupported-format`, `source-not-terminal`, `abort-residue`,
   `isolation-recording`, `resume-metadata-missing`, `manifest-invalid`, `cwd-mismatch`,
@@ -944,7 +963,9 @@ while replay runners require them. `WorkflowCallRecord` is the root-scope termin
 `JournalEntry` adds optional `kind`, `usage`, and `scope`. `PersistedRunState` adds the strict args
 snapshot marker, effective cwd/runtime/environment/limits, manifest and allocation facts,
 abort/nesting/resume markers, model and agents-directory context, `executionMode`, and
-`replayReport`.
+`replayReport`. `RunLease.recoveredOwnerPid` is present only when acquisition replaced a valid lock
+whose PID was dead; recovery uses it for the human interruption reason, while missing/corrupt locks
+leave it absent. Lease release always remains token-matched.
 
 `PersistedRunState`, `PersistedAgentState`, `JournalEntry`, `WorkflowCallRecord`,
 `WorkflowRecordedError`, `AgentResultProvenance`, and `ReplayReport` are documented public types:
@@ -1342,8 +1363,9 @@ into text.
 
 Background means detached from one request, not from the server process. Stdio-host exit, SIGTERM,
 crash, or machine shutdown can stop in-flight work; there is no daemon/worker handoff. The initial
-record and completed call prefix remain durable, later writes are best effort, and the next manager
-recovers an orphaned `running` record to `paused` for an explicit new `resumeFromRunId` execution.
+record and completed call prefix remain durable, later writes are best effort, and construction or
+a cold await/inspect/stop/resume preflight reconciles an orphaned `pending`/`running` record to
+`paused` / `interrupted` for an explicit new `resumeFromRunId` execution.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 

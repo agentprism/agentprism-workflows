@@ -25,6 +25,7 @@ export interface PreparedContinuation {
 
 export const RESUME_FALLBACK_REASONS = Object.freeze([
   "legacy-recording",
+  "crash-residue",
   "inputs-format-legacy",
   "forced-positional",
   "unsafe-recording",

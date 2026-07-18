@@ -1211,6 +1211,9 @@ export function createWorkflowServer(
       }
 
       if (parsedInput.action === "stop") {
+        if (!manager.getRun(parsedInput.runId)) {
+          manager.reconcileExternallyDeadRun(parsedInput.runId);
+        }
         const persisted = manager.getPersistence().load(parsedInput.runId);
         if (!persisted) {
           throw new McpError(
@@ -1356,6 +1359,9 @@ export function createWorkflowServer(
           logLines: parsedInput.logLines,
         };
         const startedAt = Date.now();
+        if (!manager.getRun(parsedInput.runId)) {
+          manager.reconcileExternallyDeadRun(parsedInput.runId);
+        }
         let status = manager.inspectRun(parsedInput.runId, inspectionOptions);
         if (!status) {
           return {

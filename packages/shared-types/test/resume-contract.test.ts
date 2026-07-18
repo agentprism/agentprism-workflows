@@ -25,6 +25,7 @@ const STRATEGIES = ["identity-v1", "positional-v1", "live"] as const satisfies r
 const MATCHES = ["path-hash", "unique-hash", "index-hash"] as const satisfies readonly WorkflowResumeMatch[];
 const FALLBACK_REASONS = [
   "legacy-recording",
+  "crash-residue",
   "inputs-format-legacy",
   "forced-positional",
   "unsafe-recording",
@@ -218,7 +219,7 @@ test("incremental resume shared type fixtures cover every public branch", () => 
   assert.deepEqual(POLICIES, ["auto", "positional"]);
   assert.deepEqual(STRATEGIES, ["identity-v1", "positional-v1", "live"]);
   assert.deepEqual(MATCHES, ["path-hash", "unique-hash", "index-hash"]);
-  assert.equal(FALLBACK_REASONS.length, 6);
+  assert.equal(FALLBACK_REASONS.length, 7);
   assert.equal(DISABLED_REASONS.length, 12);
   assert.equal(CALL_LIVE_REASONS.length, 14);
   assert.equal(CALL_FAILED_REASONS.length, 2);

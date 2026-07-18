@@ -151,6 +151,7 @@ return { one, approval }`, "same-run"));
     assert.equal(eligibility?.strategy, "identity-v1");
     assert.deepEqual(RESUME_FALLBACK_REASONS, [
       "legacy-recording",
+      "crash-residue",
       "inputs-format-legacy",
       "forced-positional",
       "unsafe-recording",

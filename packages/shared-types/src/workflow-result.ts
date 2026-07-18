@@ -206,6 +206,7 @@ export type WorkflowResumeMatch = "path-hash" | "unique-hash" | "index-hash";
 
 export type WorkflowResumeFallbackReason =
   | "legacy-recording"
+  | "crash-residue"
   | "inputs-format-legacy"
   | "forced-positional"
   | "unsafe-recording"

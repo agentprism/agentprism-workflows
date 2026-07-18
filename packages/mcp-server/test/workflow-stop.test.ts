@@ -580,10 +580,10 @@ test("stop is retry-safe for terminal runs and disambiguates unknown and persist
   const stale = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
   stale.status = "running";
   delete stale.completedAt;
-  writeFileSync(file, JSON.stringify(stale), "utf8");
 
   const secondConnection = await connect(okRunner());
   try {
+    writeFileSync(file, JSON.stringify(stale), "utf8");
     const notLive = await secondConnection.client.callTool({
       name: "workflow",
       arguments: { action: "stop", runId: completedRunId! },
@@ -592,6 +592,9 @@ test("stop is retry-safe for terminal runs and disambiguates unknown and persist
     assert.match(textOf(notLive), /persisted as paused/);
     assert.match(textOf(notLive), /nothing live to stop in this server process/);
     assert.match(textOf(notLive), /resumeFromRunId/);
+    const reconciled = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    assert.equal(reconciled.pauseReason, "interrupted");
+    assert.match(String(reconciled.reason), /owning process exited before completion/);
   } finally {
     await secondConnection.dispose();
   }

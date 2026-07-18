@@ -285,6 +285,7 @@ test("incremental resume constants are re-exported by the SDK facade", () => {
   assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
   assert.deepEqual(RESUME_FALLBACK_REASONS, [
     "legacy-recording",
+    "crash-residue",
     "inputs-format-legacy",
     "forced-positional",
     "unsafe-recording",

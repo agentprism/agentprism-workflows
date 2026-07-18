@@ -79,8 +79,11 @@ detached from the caller, not from the Node process. If `ExecOptions.resumeJourn
 manager sorts and copies the exact entries—including synthetic checkpoint replies—into the new run
 before that save. Replay hits do not emit journal callbacks, so this seeding is what makes the child
 run independently resumable after a second pause or process loss. Each later live journal append
-persists the complete inherited prefix plus suffix. After a crash, stale persisted `running` runs
-recover to `paused`; in-flight unjournaled work may execute again on resume.
+persists the complete inherited prefix plus suffix. A dead owner's persisted `pending` or `running`
+run reconciles under its lease to `paused` with `pauseReason: "interrupted"` during construction or
+a cold inspect/list/resume lookup. Live and permission-protected owner PIDs remain untouched.
+Completed crash-journal entries can replay through `crash-residue`; an in-flight unjournaled call
+executes again on resume.
 
 `cancelAgentCall(runId, callIndex)` targets one uniquely matching live attempt. It aborts that
 attempt with recoverable `AGENT_CANCELLED`, races backend cooperation so an ignored signal still
@@ -89,7 +92,7 @@ committed. The script receives `null`; sibling branches continue, the run-level 
 `abortSignaled` remain untouched, and no journal result is created. Errors for missing, settled,
 checkpoint, or duplicate scoped indexes list the currently in-flight call-index/label pairs.
 
-Inspect a run without executing or leasing it:
+Inspect a run without executing it:
 
 ```ts
 const status = manager.inspectRun(result.runId, {
@@ -99,9 +102,10 @@ const status = manager.inspectRun(result.runId, {
 });
 ```
 
-`inspectRun()` is synchronous, read-only, and live-first: it projects the manager's freshest
-in-memory snapshot and journal, then falls back to the same project-scoped persistence used by
-resume. It returns `undefined` for a missing/unreadable ID. `lastN` defaults to 20 (1–50),
+`inspectRun()` is synchronous and live-first: it projects the manager's freshest in-memory snapshot
+and journal, then falls back to the same project-scoped persistence used by resume. A cold persisted
+`pending`/`running` row may be lease-reconciled to `paused` / `interrupted` when its owner is dead;
+all other inspection is non-mutating. It returns `undefined` for a missing/unreadable ID. `lastN` defaults to 20 (1–50),
 `logLines` defaults to 20 (0–50), and `labelGlob` is a case-sensitive whole-label glob where `*`
 matches zero or more Unicode code points, `?` matches one, and backslash escapes the next character
 (a trailing backslash is literal). Filtering precedes latest-N selection; calls are returned in
@@ -183,9 +187,12 @@ catalogs, checkpoint source-index rules, and filesystem preconditions are in the
 The call identity hashes authored behavior; the separate input fingerprint covers label, per-call
 cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentTimeoutMs`,
 `agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, are operational and enter
-neither hash. Input-fingerprint formats below 2 use the named `inputs-format-legacy` positional
-bridge, including ancestor-scoped prefixes carried by ≤0.23 resume hops when the ancestor run is
-still persisted. The persisted producing engine version is diagnostic only. Background admission,
+neither hash. A crash snapshot reconciled to `paused` / `interrupted` without terminal environment
+proof uses `crash-residue`:
+matching admission environments allow its hash-only positional prefix, while unknown or drifted
+environments are all-live. Normally settled input-fingerprint formats below 2 use the named
+`inputs-format-legacy` positional bridge, including ancestor-scoped prefixes carried by ≤0.23 resume
+hops when the ancestor run is still persisted. The persisted producing engine version is diagnostic only. Background admission,
 inspection, polling, and terminal results expose the same eligibility strategy, predicted/observed
 prefix, first non-replay, version formats, and operational differences.
 

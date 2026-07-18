@@ -65,6 +65,24 @@ function deferredAgent() {
   };
 }
 
+function persistedRun(runId: string, status: PersistedRunState["status"]): PersistedRunState {
+  return {
+    runId,
+    workflowName: "recovery",
+    script: "export const meta = { name: 'recovery', description: 'recovery' }\nreturn 1",
+    status,
+    phases: ["Recover"],
+    currentPhase: "Recover",
+    agents: [],
+    logs: ["preserved"],
+    journal: [],
+    calls: [],
+    callsAllocated: 0,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:01.000Z",
+  };
+}
+
 function memoryPersistence(): {
   persistence: RunPersistence;
   saves: PersistedRunState[];
@@ -1246,9 +1264,59 @@ test(
 
     const lease = rp.acquireRunLease("stale-lock");
     assert.ok(lease, "dead-pid lock should be stolen");
+    assert.equal(lease.recoveredOwnerPid, 2147483647);
     const lock = JSON.parse(readFileSync(join(runsDir, "stale-lock.lock"), "utf-8")) as { token: string };
     assert.equal(lock.token, lease.token, "stale lock is replaced by the new owner");
     rp.releaseRunLease(lease);
+  }),
+);
+
+test(
+  "run lease removes corrupt locks and preserves live and EPERM owners",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+
+    rp.save(persistedRun("corrupt-lock", "running"));
+    writeFileSync(join(runsDir, "corrupt-lock.lock"), "{not-json", "utf8");
+    const corruptLease = rp.acquireRunLease("corrupt-lock");
+    assert.ok(corruptLease);
+    assert.equal(corruptLease.recoveredOwnerPid, undefined);
+    rp.releaseRunLease(corruptLease);
+
+    rp.save(persistedRun("live-lock", "running"));
+    const liveLease = rp.acquireRunLease("live-lock");
+    assert.ok(liveLease);
+    assert.equal(rp.acquireRunLease("live-lock"), null, "the current live PID remains authoritative");
+    rp.releaseRunLease(liveLease);
+
+    const epermPid = 2147483001;
+    rp.save(persistedRun("eperm-lock", "running"));
+    writeFileSync(
+      join(runsDir, "eperm-lock.lock"),
+      JSON.stringify({
+        runId: "eperm-lock",
+        runPath: join(runsDir, "eperm-lock.json"),
+        pid: epermPid,
+        startedAt: "2026-01-01T00:00:00.000Z",
+        token: "eperm-owner",
+      }),
+      "utf8",
+    );
+    const originalKill = process.kill;
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === epermPid && signal === 0) {
+        throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+      }
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      assert.equal(rp.acquireRunLease("eperm-lock"), null, "EPERM means the owner may be alive");
+      assert.equal(existsSync(join(runsDir, "eperm-lock.lock")), true);
+    } finally {
+      process.kill = originalKill;
+      rp.releaseRunLease({ runId: "eperm-lock", token: "eperm-owner" });
+    }
   }),
 );
 
@@ -1275,20 +1343,147 @@ test(
   "WorkflowManager reconciles a stale 'running' run to 'paused' on construction",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
-    rp.save({
-      runId: "stale",
-      workflowName: "w",
+    const state: PersistedRunState = {
+      ...persistedRun("stale", "running"),
+      resumeSourceRunId: "ancestor",
+    };
+    state.args = { preserve: true };
+    state.tokenUsage = { input: 1, output: 2, total: 3 };
+    state.eventStreamId = "0123456789abcdef0123456789abcdef";
+    state.eventSeq = 7;
+    state.agents = [{
+      id: 1,
+      label: "preserved-agent",
+      prompt: "preserve",
       status: "running",
-      script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
-      phases: [],
-      agents: [],
-      logs: [],
-    } as PersistedRunState);
+      session: {
+        sessionId: "preserved-session",
+        backendId: "custom",
+        reopen: { load: true, resume: true, list: true },
+        callIndex: 0,
+        label: "preserved-agent",
+        keptOpen: true,
+      },
+    }];
+    state.journal = [{ index: 0, hash: "preserved-hash", result: "cached", scope: "stale" }];
+    state.calls = [{
+      index: 0,
+      kind: "agent",
+      hash: "preserved-hash",
+      outcome: "result",
+      origin: "runner",
+      scope: "stale",
+    }];
+    state.callsAllocated = 1;
+    rp.save(state);
+    const before = rp.load("stale");
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    writeFileSync(
+      join(runsDir, "stale.lock"),
+      JSON.stringify({
+        runId: "stale",
+        runPath: join(runsDir, "stale.json"),
+        pid: 2147483647,
+        startedAt: "2026-01-01T00:00:00.000Z",
+        token: "dead-owner",
+      }),
+      "utf8",
+    );
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
-    assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    const recovered = rp.load("stale");
+    assert.equal(recovered?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    assert.equal(recovered?.pauseReason, "interrupted");
+    assert.match(recovered?.reason ?? "", /owning process PID 2147483647 exited/);
+    assert.equal(existsSync(join(runsDir, "stale.lock")), false);
+    const recoveryFields = new Set(["status", "pauseReason", "reason", "updatedAt"]);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(recovered ?? {}).filter(([key]) => !recoveryFields.has(key))),
+      Object.fromEntries(Object.entries(before ?? {}).filter(([key]) => !recoveryFields.has(key))),
+      "recovery preserves every field outside its status vocabulary and write timestamp",
+    );
   }),
 );
+
+test(
+  "lazy inspect and list reconcile missing and corrupt locks once while live owners remain running",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    const rp = createRunPersistence(cwd);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+
+    rp.save(persistedRun("late-missing", "running"));
+    const inspected = manager.inspectRun("late-missing");
+    assert.equal(inspected?.status, "paused");
+    assert.equal(inspected?.reason?.includes("PID unavailable"), true);
+    assert.equal(rp.load("late-missing")?.pauseReason, "interrupted");
+    const firstUpdatedAt = rp.load("late-missing")?.updatedAt;
+    manager.inspectRun("late-missing");
+    manager.listRuns();
+    assert.equal(rp.load("late-missing")?.updatedAt, firstUpdatedAt, "reconciliation is idempotent");
+
+    rp.save(persistedRun("late-corrupt", "pending"));
+    writeFileSync(join(runsDir, "late-corrupt.lock"), "not-json", "utf8");
+    const corrupt = manager.listRuns().find((run) => run.runId === "late-corrupt");
+    assert.equal(corrupt?.status, "paused");
+    assert.equal(corrupt?.pauseReason, "interrupted");
+    assert.equal(existsSync(join(runsDir, "late-corrupt.lock")), false);
+
+    rp.save(persistedRun("late-live", "running"));
+    const liveLease = rp.acquireRunLease("late-live");
+    assert.ok(liveLease);
+    assert.equal(manager.inspectRun("late-live")?.status, "running");
+    assert.equal(rp.load("late-live")?.pauseReason, undefined);
+    assert.equal(existsSync(join(runsDir, "late-live.lock")), true);
+    rp.releaseRunLease(liveLease);
+
+    for (const pauseReason of ["auth_required", "usage_limit", "checkpoint_required"]) {
+      const runId = `preserved-${pauseReason}`;
+      const paused = { ...persistedRun(runId, "paused"), pauseReason };
+      rp.save(paused);
+      const before = rp.load(runId);
+      assert.equal(manager.listRuns().find((run) => run.runId === runId)?.pauseReason, pauseReason);
+      assert.deepEqual(rp.load(runId), before, `${pauseReason} pauses are never swept`);
+    }
+  }),
+);
+
+test("WorkflowManager recovery reloads under the lease so concurrent completion wins", () => {
+  let state = persistedRun("completion-wins", "running");
+  let saveCalls = 0;
+  let releaseCalls = 0;
+  const persistence: RunPersistence = {
+    save(next) {
+      saveCalls++;
+      state = structuredClone(next);
+    },
+    load(runId) {
+      return runId === state.runId ? structuredClone(state) : null;
+    },
+    list() {
+      return [structuredClone(state)];
+    },
+    delete() {
+      return false;
+    },
+    acquireRunLease(runId) {
+      state = { ...state, status: "completed", result: "concurrent-winner" };
+      return { runId, token: "completion-winner" };
+    },
+    releaseRunLease() {
+      releaseCalls++;
+    },
+    getRunsDir() {
+      return "/memory/runs";
+    },
+  };
+
+  const manager = new WorkflowManager({ persistence });
+  assert.equal(manager.inspectRun(state.runId)?.status, "completed");
+  assert.equal(state.result, "concurrent-winner");
+  assert.equal(saveCalls, 0, "the stale listed row is never written over the completion");
+  assert.equal(releaseCalls, 1);
+});
 
 test(
   "WorkflowManager journaling:false never touches persisted run state on construction",
@@ -1305,8 +1500,12 @@ test(
     } as PersistedRunState);
     // A non-journaling manager (the host keeps its own transcript store) must not rewrite
     // run state that belongs to journaling processes — stale-run recovery is gated off.
-    new WorkflowManager({ cwd, journaling: false });
+    const manager = new WorkflowManager({ cwd, journaling: false });
     assert.equal(rp.load("stale")?.status, "running", "journaling:false leaves persisted runs untouched");
+    rp.save(persistedRun("late-stale", "pending"));
+    assert.equal(manager.inspectRun("late-stale")?.status, "pending");
+    assert.equal(manager.listRuns().find((run) => run.runId === "late-stale")?.status, "pending");
+    assert.equal(rp.load("late-stale")?.pauseReason, undefined, "lazy paths also skip reconciliation");
   }),
 );
 

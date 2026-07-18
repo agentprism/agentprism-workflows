@@ -448,10 +448,12 @@ client `resources` capability to gate these server-offered primitives.
   cold awaits poll persistence every 250 ms. Cancelling await clears its timer/poller and returns
   `Workflow await for runId "<runId>" was cancelled; the workflow was not cancelled.` without
   stopping, pausing, resuming, or leasing the run.
-- **Read-only inspection.** `action: "inspect"` reads the manager's freshest in-memory snapshot,
+- **Bounded inspection.** `action: "inspect"` reads the manager's freshest in-memory snapshot,
   then its project-scoped persisted store. It never parses/runs a script, invokes an agent, asks
-  for backend approval, sends progress, elicits, or acquires a run lease. Run ID possession is the
-  capability; UI `sessionId` listing filters do not apply.
+  for backend approval, sends progress, or elicits. A cold persisted `pending`/`running` row may
+  take a short reconciliation lease and become `paused` / `interrupted` when its owner is dead;
+  live or permission-protected owners and every other status remain unchanged. Run ID possession
+  is the capability; UI `sessionId` listing filters do not apply.
 - **Progress notifications.** When the host includes a `progressToken` with the call, the server streams `notifications/progress` as agents settle (it reports `settled / total` agents plus the current phase). With no `progressToken`, progress is a no-op.
   Background runs deliberately have no initiating progress channel; inspect/await are their progress
   surface.
@@ -460,14 +462,15 @@ client `resources` capability to gate these server-offered primitives.
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix and first non-replay with a derivable detail. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Engine-version differences are surfaced diagnostics, never gates.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix and first non-replay with a derivable detail. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Normally settled sources below input format 2 use the named `inputs-format-legacy` positional bridge. A crash snapshot reconciled to `paused` / `interrupted` without terminal environment proof uses `crash-residue`: a matching admission environment permits hash-only prefix replay, while an unknown or drifted environment is explicitly all-live. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Engine-version differences are surfaced diagnostics, never gates.
 - **Authoritative stop.** `action:"stop"` without `callIndex` acts on `running` and `paused` runs live in this server
   process, cancels their agent/checkpoint work, persists `aborted`, appends the durable `stopped`
   event, releases the lease, and returns the final inspection projection inline. Resume is safe
   immediately and an additional await adds nothing. Only backend agent-session wind-down can remain;
   use inspect's per-agent states if that cleanup appears hung. Repeating stop on a terminal run is a
   successful no-op (`stopped:false`, `alreadyTerminal:true`). Unknown runs are not found; a cold
-  persisted `running`/`paused` record has nothing live to stop in this process and should be resumed.
+  dead-owner `pending`/`running` record is first reconciled to `paused` / `interrupted`, and any cold
+  paused record has nothing live to stop in this process and should be resumed.
   Stop retains the journal, record, and script resource, so the kill-patch-resume loop is: stop,
   edit the file, then call run with `scriptPath` plus `resumeFromRunId`. Because an in-flight stop
   cannot capture a quiescent terminal environment, the manager may conservatively run that resumed
@@ -490,9 +493,10 @@ client `resources` capability to gate these server-offered primitives.
   persistence and have no MCP TTL; repeated/cold await works until deletion, corruption, or store
   loss. Background means detached from one request, not from this stdio child. Disconnect does not
   itself abort work while Node stays alive, but host process exit, SIGTERM/SIGKILL, crash, shutdown,
-  or machine loss can stop it. The next manager recovers orphaned durable `running` state to
-  `paused`; completed journal entries remain resumable, while an in-flight unjournaled call can run
-  again. Later persistence after admission is best effort.
+  or machine loss can stop it. Construction and cold inspect/list/await/stop/resume preflights
+  reconcile a dead owner's durable `pending`/`running` state under its lease to `paused` with
+  `pauseReason: "interrupted"`; completed journal entries remain resumable, while an in-flight
+  unjournaled call can run again. Later persistence after admission is best effort.
 
 ---
 

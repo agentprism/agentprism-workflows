@@ -282,6 +282,67 @@ describe("incremental resume admission", () => {
     assert.equal(future.strategy === "live" && future.disabledReason, "runtime-mismatch");
   });
 
+  it("admits crash residue before the input-format and environment gates", () => {
+    for (const inputsFormat of [1, CALL_INPUTS_FORMAT]) {
+      const crashed = sourceState(undefined, {
+        status: "paused",
+        pauseReason: "interrupted",
+        runtime: { ...RUNTIME, inputsFormat },
+        resume: { format: "identity-v1" },
+      });
+      assert.deepEqual(admission(crashed), {
+        strategy: "positional-v1",
+        sourceRunId: SOURCE_RUN_ID,
+        requestedPolicy: "auto",
+        fallbackReason: "crash-residue",
+        eligibility: "legacy",
+      });
+    }
+
+    const drifted = sourceState(undefined, {
+      status: "paused",
+      pauseReason: "interrupted",
+      resume: { format: "identity-v1" },
+    });
+    const driftDecision = admission(drifted, {
+      current: {
+        effectiveCwd: CWD,
+        runtime: RUNTIME,
+        environment: { key: "workspace-v2" },
+      },
+    });
+    assert.deepEqual(driftDecision, {
+      strategy: "positional-v1",
+      sourceRunId: SOURCE_RUN_ID,
+      requestedPolicy: "auto",
+      fallbackReason: "crash-residue",
+      eligibility: "all-live",
+    });
+
+    const unknownEnvironment = admission(drifted, {
+      current: { effectiveCwd: CWD, runtime: RUNTIME },
+    });
+    assert.equal(unknownEnvironment.strategy, "positional-v1");
+    assert.equal(
+      unknownEnvironment.strategy === "positional-v1" && unknownEnvironment.eligibility,
+      "all-live",
+    );
+
+    const markerless = drifted;
+    delete markerless.resume;
+    const markerlessDecision = admission(markerless);
+    assert.equal(markerlessDecision.strategy, "positional-v1");
+    if (markerlessDecision.strategy === "positional-v1") {
+      assert.equal(markerlessDecision.fallbackReason, "legacy-recording");
+    }
+
+    const malformedTerminal = sourceState(undefined, {
+      resume: { format: "identity-v1", terminalEnvironment: {} },
+    });
+    const malformed = admission(malformedTerminal);
+    assert.equal(malformed.strategy === "live" && malformed.disabledReason, "environment-missing");
+  });
+
   it("replays across every operational-knob change and migrates format 1 positionally", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "resume-knobs-cwd-"));
     const persistenceRoot = mkdtempSync(join(tmpdir(), "resume-knobs-runs-"));
@@ -494,7 +555,7 @@ return { first, second };`;
       effectiveCwd: undefined,
       resume: { format: "identity-v1" },
     });
-    assert.equal(admission(missingEnvironmentAndCwd).strategy === "live" && admission(missingEnvironmentAndCwd).disabledReason, "environment-missing");
+    assert.equal(admission(missingEnvironmentAndCwd).strategy === "live" && admission(missingEnvironmentAndCwd).disabledReason, "resume-metadata-missing");
     const cwdAndRuntime = sourceState(undefined, { runtime: { ...RUNTIME, node: "bad" } });
     const current = { effectiveCwd: "/other", runtime: RUNTIME, environment: ENVIRONMENT };
     assert.equal(admission(cwdAndRuntime, { current }).strategy === "live" && admission(cwdAndRuntime, { current }).disabledReason, "cwd-mismatch");

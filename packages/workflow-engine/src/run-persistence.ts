@@ -155,8 +155,8 @@ export interface PersistedRunState {
   reason?: string;
   /** Machine-readable terminal error retained for cold inspection. */
   errorCode?: WorkflowErrorCode;
-  /** Why a paused run is paused (e.g. "usage_limit", "auth_required", or
-   *  "checkpoint_required"). Free-form string — no migration. */
+  /** Why a paused run is paused (e.g. "usage_limit", "auth_required",
+   *  "checkpoint_required", or "interrupted"). Free-form string — no migration. */
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
@@ -237,6 +237,8 @@ export interface RunPersistence {
 export interface RunLease {
   runId: string;
   token: string;
+  /** PID recorded by a dead lock owner replaced while acquiring this lease. */
+  recoveredOwnerPid?: number;
 }
 
 interface LockFile {
@@ -350,16 +352,34 @@ export function createRunPersistence(
 
   const readLock = (runId: string): LockFile | null => readLockAt(primaryLockPath(runId));
 
-  const removeStaleLegacyLock = (runId: string): boolean => {
+  const validLockOwner = (
+    value: LockFile | null,
+    runId: string,
+    expectedRunPath: string,
+  ): value is LockFile =>
+    value !== null &&
+    value.runId === runId &&
+    value.runPath === expectedRunPath &&
+    Number.isInteger(value.pid) &&
+    value.pid > 0 &&
+    typeof value.token === "string";
+
+  const removeStaleLegacyLock = (
+    runId: string,
+  ): { available: boolean; recoveredOwnerPid?: number } => {
     const lock = legacyLockPath(runId);
     const existing = readLockAt(lock);
-    if (existing?.runId === runId && pidIsAlive(existing.pid)) return false;
+    const valid = validLockOwner(existing, runId, legacyRunPath(runId));
+    if (valid && pidIsAlive(existing.pid)) return { available: false };
     try {
       if (_existsSync(lock)) _unlinkSync(lock);
     } catch {
-      return false;
+      return { available: false };
     }
-    return true;
+    return {
+      available: true,
+      ...(valid ? { recoveredOwnerPid: existing.pid } : {}),
+    };
   };
 
   const persistence: RunPersistence = {
@@ -505,7 +525,9 @@ export function createRunPersistence(
       ensureDir();
       const path = primaryRunPath(runId);
       const lock = primaryLockPath(runId);
-      if (!removeStaleLegacyLock(runId)) return null;
+      const legacy = removeStaleLegacyLock(runId);
+      if (!legacy.available) return null;
+      let recoveredOwnerPid = legacy.recoveredOwnerPid;
       for (let attempt = 0; attempt < 2; attempt++) {
         const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
         const payload: LockFile = {
@@ -517,14 +539,20 @@ export function createRunPersistence(
         };
         try {
           _writeFileSync(lock, JSON.stringify(payload, null, 2), { flag: "wx" });
-          return { runId, token };
+          return {
+            runId,
+            token,
+            ...(recoveredOwnerPid === undefined ? {} : { recoveredOwnerPid }),
+          };
         } catch (err) {
           const code = (err as { code?: string }).code;
           if (code !== "EEXIST") throw err;
           const existing = readLock(runId);
-          if (existing && existing.runPath === path && pidIsAlive(existing.pid)) {
+          const valid = validLockOwner(existing, runId, path);
+          if (valid && pidIsAlive(existing.pid)) {
             return null;
           }
+          if (valid) recoveredOwnerPid = existing.pid;
           try {
             _unlinkSync(lock);
           } catch {

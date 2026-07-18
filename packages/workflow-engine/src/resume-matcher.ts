@@ -772,10 +772,7 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
     };
   }
 
-  const resume = source.resume as PersistedRunState["resume"];
-  if (!isRunEnvironmentIdentity(resume?.terminalEnvironment) || !isRunEnvironmentIdentity(source.environment)) {
-    return liveDecision(sourceRunId, requestedPolicy, "environment-missing");
-  }
+  const resume = source.resume as NonNullable<PersistedRunState["resume"]>;
   if (
     !isNonEmptyString(sourceRunId) ||
     typeof source.effectiveCwd !== "string" ||
@@ -805,11 +802,24 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   ) {
     return liveDecision(sourceRunId, requestedPolicy, "runtime-mismatch");
   }
-  if (!isRunEnvironmentIdentity(current.environment)) {
-    return liveDecision(sourceRunId, requestedPolicy, "environment-missing");
-  }
-  if (!environmentsEqual(resume.terminalEnvironment, current.environment)) {
-    return liveDecision(sourceRunId, requestedPolicy, "environment-mismatch");
+
+  if (
+    resume.terminalEnvironment === undefined &&
+    source.status === "paused" &&
+    source.pauseReason === "interrupted"
+  ) {
+    const environmentStable =
+      isRunEnvironmentIdentity(source.environment) &&
+      isRunEnvironmentIdentity(current.environment) &&
+      environmentsEqual(source.environment, current.environment);
+    return {
+      strategy: "positional-v1",
+      sourceRunId,
+      requestedPolicy,
+      fallbackReason: "crash-residue",
+      eligibility: environmentStable ? "legacy" : "all-live",
+      ...(reply ? { legacyCheckpointReply: reply } : {}),
+    };
   }
   if (inputsFormatLegacy) {
     return {
@@ -820,6 +830,17 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
       eligibility: "legacy",
       ...(reply ? { legacyCheckpointReply: reply } : {}),
     };
+  }
+
+  if (
+    !isRunEnvironmentIdentity(resume.terminalEnvironment) ||
+    !isRunEnvironmentIdentity(source.environment) ||
+    !isRunEnvironmentIdentity(current.environment)
+  ) {
+    return liveDecision(sourceRunId, requestedPolicy, "environment-missing");
+  }
+  if (!environmentsEqual(resume.terminalEnvironment, current.environment)) {
+    return liveDecision(sourceRunId, requestedPolicy, "environment-mismatch");
   }
 
   const manifest = validateManifest(source, sourceRunId);

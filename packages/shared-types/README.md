@@ -123,7 +123,10 @@ From [`src/index.ts`](./src/index.ts):
   `WorkflowReplayFirstNonReplay`, and `WorkflowReplayEligibility` — the
   additive content-addressed new-run replay contract. Runtime reason arrays live in
   `@automatalabs/workflow-engine` and are re-exported by `@automatalabs/workflows`; see the
-  [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
+  [incremental resume API](../../docs/api.md#content-addressed-incremental-resume). The
+  `crash-residue` fallback identifies a crash snapshot reconciled to `paused` / `interrupted`
+  without a quiescent terminal environment; eligibility is legacy positional only when its
+  admission environment still matches, otherwise all calls are live.
 - `WorkflowCallRecord` — the terminal call manifest, including optional `path`, agent/checkpoint
   `inputsHash`, `resumeSafety`, and manager-owned replay provenance. Old object literals remain
   valid because every incremental-resume field is optional and omitted when unset.

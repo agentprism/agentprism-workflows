@@ -152,6 +152,7 @@ test("incremental resume format constants and frozen reason arrays match the con
   assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
   assert.deepEqual(RESUME_FALLBACK_REASONS, [
     "legacy-recording",
+    "crash-residue",
     "inputs-format-legacy",
     "forced-positional",
     "unsafe-recording",

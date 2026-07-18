@@ -447,6 +447,12 @@ function runReason(status: RunStatus, error: WorkflowError | undefined): string 
   return error?.message;
 }
 
+function interruptedRunReason(ownerPid: number | undefined): string {
+  return ownerPid === undefined
+    ? "Interrupted: the owning process exited before completion (PID unavailable); recovered to a resumable pause."
+    : `Interrupted: owning process PID ${ownerPid} exited before completion; recovered to a resumable pause.`;
+}
+
 function generateEventStreamId(): string {
   return randomBytes(16).toString("hex");
 }
@@ -556,28 +562,74 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = id;
   }
 
+  private reconcileListedRun(candidate: PersistedRunState): PersistedRunState | null {
+    if (
+      !this.journaling ||
+      this.runs.has(candidate.runId) ||
+      (candidate.status !== "pending" && candidate.status !== "running")
+    ) {
+      return candidate;
+    }
+
+    let lease: RunLease | null;
+    try {
+      lease = this.persistence.acquireRunLease(candidate.runId);
+    } catch {
+      return candidate;
+    }
+    if (!lease) return candidate;
+
+    try {
+      const current = this.persistence.load(candidate.runId);
+      if (!current) return null;
+      if (
+        this.runs.has(candidate.runId) ||
+        (current.status !== "pending" && current.status !== "running")
+      ) {
+        return current;
+      }
+      const reconciled: PersistedRunState = {
+        ...current,
+        status: "paused",
+        pauseReason: "interrupted",
+        reason: interruptedRunReason(lease.recoveredOwnerPid),
+      };
+      this.persistence.save(reconciled);
+      return reconciled;
+    } catch {
+      return candidate;
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
+  }
+
+  private reconcileListedRuns(rows: PersistedRunState[]): PersistedRunState[] {
+    if (!this.journaling) return rows;
+    const reconciled: PersistedRunState[] = [];
+    for (const row of rows) {
+      const current = this.reconcileListedRun(row);
+      if (current) reconciled.push(current);
+    }
+    return reconciled.sort(
+      (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+    );
+  }
+
   /**
-   * On startup, any persisted run still marked "running" belongs to a process
-   * that died mid-run (this fresh manager has it nowhere in memory). Reconcile it
-   * to "paused" — never "failed" — so its journal is preserved and resume() can
-   * replay the completed prefix and finish the rest.
+   * Reconcile one persisted run whose owning process may have exited. The lease
+   * acquisition preserves live/EPERM owners, removes stale or corrupt locks, and
+   * the under-lease reload lets a concurrent completion win over recovery.
    */
+  reconcileExternallyDeadRun(runId: string): PersistedRunState | undefined {
+    const persisted = this.persistence.load(runId);
+    if (!persisted) return undefined;
+    return this.reconcileListedRun(persisted) ?? undefined;
+  }
+
+  /** Reconcile externally interrupted persisted runs when the manager starts. */
   private recoverStaleRuns(): void {
     try {
-      for (const p of this.listAllRuns()) {
-        if (p.status === "running" && !this.runs.has(p.runId)) {
-          const lease = this.persistence.acquireRunLease(p.runId);
-          if (!lease) continue;
-          try {
-            const current = this.persistence.load(p.runId);
-            if (current?.status === "running") {
-              this.persistence.save({ ...current, status: "paused" });
-            }
-          } finally {
-            this.persistence.releaseRunLease(lease);
-          }
-        }
-      }
+      this.reconcileListedRuns(this.persistence.list());
     } catch {
       // Recovery is best-effort; never let it block manager construction.
     }
@@ -673,6 +725,7 @@ export class WorkflowManager extends EventEmitter {
   private acquireResumeSource(runId: string): { lease: RunLease; source: PersistedRunState } {
     let lease: RunLease | null;
     try {
+      this.reconcileExternallyDeadRun(runId);
       lease = this.persistence.acquireRunLease(runId);
     } catch (error) {
       throw this.persistenceError(`failed to acquire resume source lease for ${runId}: ${errorMessage(error)}`, error);
@@ -1091,7 +1144,9 @@ export class WorkflowManager extends EventEmitter {
     // Marked format-1 rows can republish matching safety/debit provenance under format 2;
     // markerless legacy rows have no trustworthy source-call facts to promote.
     const retainSourceCallFacts =
-      admission.eligibility !== "legacy" || admission.fallbackReason === "inputs-format-legacy";
+      admission.eligibility !== "legacy" ||
+      admission.fallbackReason === "inputs-format-legacy" ||
+      admission.fallbackReason === "crash-residue";
     const sourceCalls = retainSourceCallFacts
       ? new Map(managed.calls.map((call) => [call.index, call] as const))
       : new Map<number, WorkflowCallRecord>();
@@ -2739,7 +2794,7 @@ export class WorkflowManager extends EventEmitter {
       );
     }
 
-    const persisted = this.persistence.load(runId);
+    const persisted = this.reconcileExternallyDeadRun(runId);
     if (!persisted) return undefined;
     return projectWorkflowRunStatus(
       {
@@ -2788,13 +2843,13 @@ export class WorkflowManager extends EventEmitter {
    * reappear when you switch back. Unbound (tests/legacy) returns everything.
    */
   listRuns(): PersistedRunState[] {
-    const all = this.persistence.list();
+    const all = this.reconcileListedRuns(this.persistence.list());
     return this.sessionId ? all.filter((r) => r.sessionId === this.sessionId) : all;
   }
 
   /** All persisted runs regardless of session (used by cross-session recovery). */
   listAllRuns(): PersistedRunState[] {
-    return this.persistence.list();
+    return this.reconcileListedRuns(this.persistence.list());
   }
 
   /**
