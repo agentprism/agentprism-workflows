@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.31.1
+
+### Patch Changes
+
+- 0e13e79: Refresh the wrapped `@anthropic-ai/claude-agent-sdk` runtime override to 0.3.214.
+
 ## 0.31.0
 
 ### Minor Changes
