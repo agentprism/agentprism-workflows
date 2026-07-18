@@ -51,11 +51,11 @@ From an ask like that, the agent picks the primitives — `gate()` fix-loops wit
 
 ### Durable runs — resume without re-spending tokens
 
-Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution can replay unchanged, explicitly safe calls even after insertions or reordering; ambiguous, unsafe, or environment-mismatched calls run live. Provider quota and authentication walls don't fail the run either: the run **pauses**, keeps the interrupted ACP session reopenable, and on resume reattaches to continue that exact turn when its call index, identity, execution inputs, backend, cwd, and reopen capability still match. Any uncertainty fails to a fresh live call, while completed prefix calls retain the ordinary journal replay rules.
+Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution can replay unchanged, explicitly safe calls even after insertions or reordering; ambiguous or unsafe calls run live. Current-environment and Node/V8 drift are reported as provenance instead of vetoing replay. Provider quota and authentication walls don't fail the run either: the run **pauses**, keeps the interrupted ACP session reopenable, and on resume reattaches to continue that exact turn when its call index, identity, execution inputs, backend, cwd, and reopen capability still match. Any correspondence uncertainty fails to a fresh live call, while completed prefix calls retain the ordinary journal replay rules.
 
 > **Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.
 >
-> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls and their content-dependent descendants miss. New-format reuse also requires exact cwd/runtime/terminal-workspace admission and `resume: { filesystem: "read-only" }` safety on source and current agents. Identity hits preserve logical budget debit but spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, checkpoints, and filesystem boundaries.
+> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls and their content-dependent descendants miss. New-format reuse also requires exact cwd, compatible format/metadata/manifest admission, recorded start-to-terminal filesystem stability, and `resume: { filesystem: "read-only" }` safety on source and current agents. Identity hits preserve logical budget debit but spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, checkpoints, and filesystem boundaries.
 
 Compact read-only/worktree fan-out:
 
@@ -277,7 +277,7 @@ From a source checkout, point at the built entry instead:
 | `agentTimeoutMs` | number \| null | Per-agent timeout; omit for none. |
 | `tokenBudget` | number \| null | Hard total-token cap for the run; omit for none. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
-| `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format safety/environment gates. Requires `resumeFromRunId`. |
+| `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
 | `runId` | string | Required for inspect/await; the project-scoped run capability returned by execution. |
 | `waitMs` | integer | Await only: default 20,000, range 0–25,000; zero is a non-blocking status read. |

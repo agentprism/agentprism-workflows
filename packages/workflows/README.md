@@ -338,10 +338,11 @@ agent rows carry their resolved `timeoutMs` plus `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
 under a new run ID, and match safe calls by exact path/hash or unique hash+input fingerprint.
-Uncertain, ambiguous, unsafe, or environment-mismatched calls run live. Identity hits preserve
+Uncertain, ambiguous, or unsafe calls run live. Current-environment and Node/V8 differences are
+reported as provenance without changing admission or matching. Identity hits preserve
 script-visible logical budget debit while adding zero current provider usage; replayed session
 records are rebound to the current call index/label/phase. `resumePolicy: "positional"` requests
-index/prefix matching but cannot bypass new-format input/safety/environment gates. The distinct
+index/prefix matching but cannot bypass new-format format/metadata/manifest/input/safety checks. The distinct
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
 Operational limits are resolved from the new execution's `exec` options and manager defaults, not
@@ -351,14 +352,14 @@ neither replay identity nor the execution-input fingerprint and may change witho
 completed calls or interrupted-turn continuation.
 
 Crash snapshots reconciled to `paused` / `interrupted` without a terminal environment use the
-`crash-residue` positional bridge: their hash-stable prefix is eligible only when the recorded
-admission environment matches the new run. Normally settled sources with an input-fingerprint format below 2 use the
+`crash-residue` positional bridge with legacy hash-stable prefix eligibility. Normally settled
+sources with an input-fingerprint format below 2 use the
 `inputs-format-legacy` positional bridge. That bridge also accepts ancestor-scoped rows carried by a
 ≤0.23 resume hop when the ancestor run still exists in the same persistence directory; nested and deleted-run scopes stay live. Engine
 package versions are persisted and surfaced as diagnostics but never gate replay. Every new-run
 resume exposes `WorkflowReplayEligibility` on the foreground result and inspection status: strategy,
 predicted and observed replayable prefixes, counts, the first non-replay when known, source/current
-engine and input-format versions, and non-gating operational changes.
+engine and input-format versions, non-gating runtime/environment provenance changes, and operational changes.
 
 The manager's critical initial save contains the complete inherited seed before a background
 acknowledgement. A manager-prepared `resumeFromRunId` hit re-journals the selected value under its

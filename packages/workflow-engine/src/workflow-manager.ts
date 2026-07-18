@@ -34,12 +34,14 @@ import type {
   WorkflowReplayEligibility,
   WorkflowReplayFirstNonReplay,
   WorkflowReplayOperationalChange,
+  WorkflowReplayProvenanceChange,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
 } from "@automatalabs/shared-types";
 import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { captureRunEnvironment, type RunEnvironmentIdentity } from "./run-environment.js";
+import { isRunEnvironmentIdentity } from "./resume-identity.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -199,6 +201,7 @@ interface ReplayEligibilityPlan {
   engineVersionComparison: WorkflowReplayEligibility["engineVersionComparison"];
   sourceInputsFormat?: number;
   currentInputsFormat: number;
+  provenanceChanges: WorkflowReplayProvenanceChange[];
   operationalChanges: WorkflowReplayOperationalChange[];
 }
 
@@ -390,6 +393,10 @@ function contiguousIndexes(indexes: Iterable<number>): number {
 
 function displayOperationalValue(value: number | null): string {
   return value === null ? "none" : String(value);
+}
+
+function displayProvenanceValue(value: string | null): string {
+  return value === null ? "unavailable" : value;
 }
 
 function latestRootRows<T extends { index: number; scope?: string }>(rows: T[], runId: string): T[] {
@@ -790,6 +797,63 @@ export class WorkflowManager extends EventEmitter {
     return changes;
   }
 
+  private provenanceChanges(
+    admission: ResumeAdmissionDecision,
+    source: PersistedRunState,
+    managed: ManagedRun,
+  ): WorkflowReplayProvenanceChange[] {
+    const changes: WorkflowReplayProvenanceChange[] = [];
+    const append = (
+      field: WorkflowReplayProvenanceChange["field"],
+      sourceValue: string | null,
+      currentValue: string | null,
+      label: string,
+    ): void => {
+      if (sourceValue === currentValue) return;
+      changes.push({
+        field,
+        source: sourceValue,
+        current: currentValue,
+        detail:
+          `source recorded ${label}=${displayProvenanceValue(sourceValue)}; ` +
+          `this run: ${displayProvenanceValue(currentValue)}`,
+      });
+    };
+
+    append("runtime.node", source.runtime?.node ?? null, managed.runtime.node, "runtime.node");
+    append("runtime.v8", source.runtime?.v8 ?? null, managed.runtime.v8, "runtime.v8");
+
+    const recordedTerminal = source.resume?.terminalEnvironment;
+    const recordedEnvironment =
+      admission.strategy === "positional-v1" && admission.fallbackReason === "crash-residue"
+        ? source.environment
+        : isRunEnvironmentIdentity(recordedTerminal)
+          ? recordedTerminal
+          : source.environment;
+    const sourceEnvironment = isRunEnvironmentIdentity(recordedEnvironment)
+      ? recordedEnvironment
+      : undefined;
+    const currentEnvironment = isRunEnvironmentIdentity(managed.environment)
+      ? managed.environment
+      : undefined;
+    const sourceKind = sourceEnvironment?.git ? "git" : sourceEnvironment?.key !== undefined ? "key" : null;
+    const currentKind = currentEnvironment?.git ? "git" : currentEnvironment?.key !== undefined ? "key" : null;
+    if (sourceKind !== currentKind) {
+      append("environment.identity", sourceKind, currentKind, "environment identity");
+    } else if (sourceEnvironment?.git && currentEnvironment?.git) {
+      append("environment.git.head", sourceEnvironment.git.head, currentEnvironment.git.head, "git HEAD");
+      append(
+        "environment.git.dirtyDigest",
+        sourceEnvironment.git.dirtyDigest,
+        currentEnvironment.git.dirtyDigest,
+        "git dirty digest",
+      );
+    } else if (sourceEnvironment?.key !== undefined && currentEnvironment?.key !== undefined) {
+      append("environment.key", sourceEnvironment.key, currentEnvironment.key, "environment key");
+    }
+    return changes;
+  }
+
   private admissionDetail(
     admission: ResumeAdmissionDecision,
     source: PersistedRunState,
@@ -799,8 +863,6 @@ export class WorkflowManager extends EventEmitter {
     if (admission.disabledReason === "runtime-mismatch") {
       const sourceRuntime = source.runtime;
       const comparisons = [
-        ["node", sourceRuntime?.node, managed.runtime.node],
-        ["v8", sourceRuntime?.v8, managed.runtime.v8],
         ["pathFormat", sourceRuntime?.pathFormat, managed.runtime.pathFormat],
         ["inputsFormat", sourceRuntime?.inputsFormat, managed.runtime.inputsFormat],
         [
@@ -837,6 +899,7 @@ export class WorkflowManager extends EventEmitter {
       ? source.runtime?.inputsFormat
       : undefined;
     const operationalChanges = this.operationalChanges(source, managed);
+    const provenanceChanges = this.provenanceChanges(admission, source, managed);
     let initialFirstNonReplay: WorkflowReplayFirstNonReplay | undefined;
     if (admission.strategy === "live") {
       const detail = this.admissionDetail(admission, source, managed);
@@ -886,6 +949,7 @@ export class WorkflowManager extends EventEmitter {
           : "different",
       ...(sourceInputsFormat === undefined ? {} : { sourceInputsFormat }),
       currentInputsFormat: managed.runtime.inputsFormat,
+      provenanceChanges,
       operationalChanges,
     };
   }
@@ -933,6 +997,7 @@ export class WorkflowManager extends EventEmitter {
       engineVersionComparison: plan.engineVersionComparison,
       ...(plan.sourceInputsFormat === undefined ? {} : { sourceInputsFormat: plan.sourceInputsFormat }),
       currentInputsFormat: plan.currentInputsFormat,
+      provenanceChanges: plan.provenanceChanges,
       operationalChanges: plan.operationalChanges,
     };
     const captured = cloneFrozenStrictJson(summary);

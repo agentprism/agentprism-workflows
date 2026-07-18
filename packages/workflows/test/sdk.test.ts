@@ -161,6 +161,8 @@ import type {
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
   WorkflowReplayEligibility,
+  WorkflowReplayProvenanceField,
+  WorkflowReplayProvenanceChange,
   WorkflowRecordedError,
 } from "../src/index.js";
 import { __setDefaultRunnerFactoryForTests } from "../src/isolation.js";
@@ -276,6 +278,8 @@ type IncrementalResumeSurface = [
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
   WorkflowReplayEligibility,
+  WorkflowReplayProvenanceField,
+  WorkflowReplayProvenanceChange,
 ];
 void (undefined as unknown as IncrementalResumeSurface);
 

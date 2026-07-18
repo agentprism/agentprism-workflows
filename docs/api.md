@@ -111,7 +111,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
 | `resumeFromRunId` | Persisted source ID for a **new** managed execution. Requires journaling, must differ from a caller-supplied new `runId`, and is mutually exclusive with `resumeJournal`. Missing sources fail with `PERSISTENCE_ERROR`. |
-| `resumePolicy` | `"auto"` (default) or `"positional"`; requires `resumeFromRunId`. Positional is an index/prefix migration policy, not a bypass for new-format safety/input/environment gates. |
+| `resumePolicy` | `"auto"` (default) or `"positional"`; requires `resumeFromRunId`. Positional is an index/prefix migration policy, not a bypass for new-format format/metadata/manifest/input/safety checks. |
 | `checkpointReplies` | Durable-checkpoint answer channel. With `resumeFromRunId`, keys name call indexes in the **source** run; with same-ID `resume()` they name that persisted run's index. Values must be strict JSON. |
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
@@ -372,26 +372,27 @@ matcher never pairs by occurrence ordinal/source order and never uses isolation'
 fallback. Stable explicit labels matter because runner-visible label changes alter `inputsHash`.
 
 Before any new-format cache is considered, admission requires a terminal non-aborted,
-non-isolation source; exact `effectiveCwd`; exact full Node, V8, call-path, and checkpoint-input
-formats; a compatible agent-input format; complete journal/call/allocation metadata; and equality
-between the source's quiescent terminal environment and the environment measured at admission.
-A crash snapshot reconciled to `paused` / `interrupted` has no quiescent terminal environment. It takes the `crash-residue`
-positional bridge before the input-format bridge: an equal source-admission/current environment
-admits the hash-stable legacy prefix, while a missing or drifted environment makes the strategy
-explicitly all-live. No terminal environment is fabricated. Normally settled input formats below 2
-take the input-format positional compatibility bridge; a format greater than the current format is
-`runtime-mismatch`. Git identity is exact HEAD plus dirty digest. Non-git hosts must
-supply the same `environmentKey`, which must content-address every persistent resource safe calls
-can observe. The host must exclude other writers from source start through terminal capture and
-again from admission through the resumed run's terminal capture; a run-ID lease does not lock a
-workspace. The runtime block also records the producing workflow-engine package version. Missing
-or different engine versions are diagnostics in `replayEligibility`, never admission gates.
+non-isolation source; exact `effectiveCwd`; exact call-path and checkpoint-input formats; a
+compatible agent-input format; and complete journal/call/allocation metadata with a valid
+manifest and seed. A normally settled source also needs recorded start and terminal environments:
+their equality proves intra-run filesystem stability for the per-call safety machinery. Git
+identity is HEAD plus dirty digest; non-Git hosts use `environmentKey`. The current environment and
+current Node/V8 versions do not gate admission or matching. Their differences from the source's
+recorded terminal environment and runtime appear in `replayEligibility.provenanceChanges`.
+
+A crash snapshot reconciled to `paused` / `interrupted` has no quiescent terminal environment. It
+takes the `crash-residue` legacy positional bridge before the input-format bridge, regardless of
+the current environment; its recorded start-environment difference is provenance only. Normally
+settled input formats below 2 take the input-format positional compatibility bridge; a format
+greater than the current format is `runtime-mismatch`. The host must still prevent unrecorded
+writers while a source or resumed run is executing; a run-ID lease does not lock a workspace. The
+runtime block also records the producing workflow-engine package version. Missing or different
+engine versions are diagnostics in `replayEligibility`, never admission gates.
 
 Automatic policy selects:
 
-- `"positional-v1"` / `"legacy"` with `fallbackReason: "crash-residue"` for a reconciled `paused` / `interrupted` crash
-  snapshot without terminal-environment proof when its admission environment equals the current
-  environment; the same fallback is `"all-live"` when that comparison is missing or unequal;
+- `"positional-v1"` / `"legacy"` with `fallbackReason: "crash-residue"` for every reconciled
+  `paused` / `interrupted` crash snapshot without terminal-environment proof;
 - `"positional-v1"` / `"legacy"` with `fallbackReason: "inputs-format-legacy"` for a marked source
   that settled normally, whose input-fingerprint format is below 2, and whose other admission facts
   agree;
@@ -401,7 +402,8 @@ Automatic policy selects:
   that is unsafe for non-contiguous matching; only safety-marked agents and fingerprint-equal host
   checkpoints replay until the first miss;
 - `"positional-v1"` / `"all-live"` for nested-workflow or start-to-terminal-drift fallback;
-- `"live"` for an invalid/unsupported/mismatched new-format source.
+- `"live"` for an invalid or unsupported new-format source, including missing metadata,
+  incompatible format literals, and invalid manifest/seed state.
 
 In identity mode, allocation-ordered decisions close and durably clear the remaining cache before
 an unannotated live agent, nested workflow, live host checkpoint callback, or declared worktree
@@ -422,8 +424,8 @@ injected at a shifted current index.
 #### Positional and legacy compatibility
 
 `resumePolicy: "positional"` requests the index/hash prefix matcher, but a new-format source still
-must pass cwd/runtime/terminal-environment admission plus per-call input, safety, and host-checkpoint
-gates. There is no force-identity option. Marker-less recordings and permanent `legacyResume`
+must pass cwd, format, metadata, manifest, and seed admission plus per-call input, safety, and
+host-checkpoint gates. There is no force-identity option. Marker-less recordings and permanent `legacyResume`
 artifacts use historical hash-only positional matching because their newer facts do not exist.
 Manual `resumeJournal` and same-ID `resume()`/`resumeInBackground()` always enter that legacy arm
 and cannot be laundered into an identity-capable hop. Aborted or `abortSignaled` sources are never

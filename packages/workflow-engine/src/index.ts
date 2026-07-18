@@ -300,6 +300,8 @@ export type {
   WorkflowResumeReport,
   WorkflowReplayOperationalOption,
   WorkflowReplayOperationalChange,
+  WorkflowReplayProvenanceField,
+  WorkflowReplayProvenanceChange,
   WorkflowReplayFirstNonReplay,
   WorkflowReplayEligibility,
   TokenUsage,

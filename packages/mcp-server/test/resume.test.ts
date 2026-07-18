@@ -123,6 +123,12 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
       },
     });
     const sourceRunId = String(structured(source)?.runId);
+    const sourceFile = persistedRunFile(sourceRunId);
+    assert.ok(sourceFile);
+    const persisted = JSON.parse(readFileSync(sourceFile, "utf8")) as Record<string, unknown>;
+    const runtime = field(persisted, "runtime") as Record<string, unknown>;
+    runtime.node = "v0.0.0-recorded";
+    writeFileSync(sourceFile, JSON.stringify(persisted), "utf8");
     const resumeArgs = {
       script: TWO_AGENT_SCRIPT,
       resumeFromRunId: sourceRunId,
@@ -139,6 +145,12 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
     assert.equal(acceptedEligibility.predictedReplayablePrefix, 2);
     assert.equal(acceptedEligibility.replayedPrefix, 0);
     assert.equal(acceptedEligibility.replayed, 0);
+    assert.deepEqual(acceptedEligibility.provenanceChanges, [{
+      field: "runtime.node",
+      source: "v0.0.0-recorded",
+      current: process.version,
+      detail: `source recorded runtime.node=v0.0.0-recorded; this run: ${process.version}`,
+    }]);
     assert.deepEqual(
       (acceptedEligibility.operationalChanges as Array<Record<string, unknown>>).map((change) => change.detail),
       [
@@ -148,6 +160,7 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
       ],
     );
     assert.match(textOf(accepted), /predicted replayable prefix 2/);
+    assert.match(textOf(accepted), /provenance changes: source recorded runtime\.node=v0\.0\.0-recorded/);
 
     const resumedRunId = String(acceptedContent?.runId);
     const awaited = await client.callTool({
@@ -158,6 +171,7 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
     const terminalEligibility = awaitedContent?.replayEligibility;
     assert.equal(field(terminalEligibility, "replayedPrefix"), 2);
     assert.deepEqual(field(awaitedContent?.outcome, "replayEligibility"), terminalEligibility);
+    assert.match(textOf(awaited), /provenance changes: source recorded runtime\.node=v0\.0\.0-recorded/);
 
     const inspected = await client.callTool({
       name: "workflow",
@@ -165,9 +179,11 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
     });
     assert.deepEqual(structured(inspected)?.replayEligibility, terminalEligibility);
     assert.match(textOf(inspected), /replayed prefix 2/);
+    assert.match(textOf(inspected), /provenance changes: source recorded runtime\.node=v0\.0\.0-recorded/);
 
     const foreground = await client.callTool({ name: "workflow", arguments: resumeArgs });
     assert.deepEqual(structured(foreground)?.replayEligibility, terminalEligibility);
+    assert.match(textOf(foreground), /provenance changes: source recorded runtime\.node=v0\.0\.0-recorded/);
     assert.equal(calls(), 2, "operational changes preserve both completed calls across every resume shape");
   } finally {
     await dispose();

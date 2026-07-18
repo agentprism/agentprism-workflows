@@ -40,7 +40,7 @@ async function waitForChildOutput(child: ChildProcess, needle: string): Promise<
   });
 }
 
-test("SIGKILL crash residue is lazily paused and replays only under the matching admission environment", async () => {
+test("SIGKILL crash residue is lazily paused and reports environment drift without vetoing replay", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "agentprism-crash-cwd-"));
   const persistenceRoot = mkdtempSync(join(tmpdir(), "agentprism-crash-runs-"));
   const sourceRunId = "sigkill-source";
@@ -117,12 +117,18 @@ test("SIGKILL crash residue is lazily paused and replays only under the matching
     assert.equal(drifted.resumeReport?.strategy, "positional-v1");
     if (drifted.resumeReport?.strategy === "positional-v1") {
       assert.equal(drifted.resumeReport.fallbackReason, "crash-residue");
-      assert.equal(drifted.resumeReport.eligibility, "all-live");
+      assert.equal(drifted.resumeReport.eligibility, "legacy");
     }
-    assert.equal(drifted.resumeReport?.replayed, 0);
-    assert.equal(drifted.resumeReport?.live, 2);
-    assert.equal(drifted.replayEligibility?.firstNonReplay?.reason, "positional-suffix");
-    assert.deepEqual(livePrompts, ["second", "first", "second"]);
+    assert.equal(drifted.resumeReport?.replayed, 1);
+    assert.equal(drifted.resumeReport?.live, 1);
+    assert.equal(drifted.replayEligibility?.firstNonReplay?.reason, "positional-miss");
+    assert.deepEqual(drifted.replayEligibility?.provenanceChanges, [{
+      field: "environment.key",
+      source: "crash-environment",
+      current: "drifted-environment",
+      detail: "source recorded environment key=crash-environment; this run: drifted-environment",
+    }]);
+    assert.deepEqual(livePrompts, ["second", "second"]);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");

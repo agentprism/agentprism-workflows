@@ -794,8 +794,6 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   const inputsFormatLegacy =
     source.runtime.inputsFormat < 2 && current.runtime.inputsFormat === 2;
   if (
-    source.runtime.node !== current.runtime.node ||
-    source.runtime.v8 !== current.runtime.v8 ||
     source.runtime.pathFormat !== current.runtime.pathFormat ||
     (!inputsFormatLegacy && source.runtime.inputsFormat !== current.runtime.inputsFormat) ||
     source.runtime.checkpointInputsFormat !== current.runtime.checkpointInputsFormat
@@ -808,16 +806,12 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
     source.status === "paused" &&
     source.pauseReason === "interrupted"
   ) {
-    const environmentStable =
-      isRunEnvironmentIdentity(source.environment) &&
-      isRunEnvironmentIdentity(current.environment) &&
-      environmentsEqual(source.environment, current.environment);
     return {
       strategy: "positional-v1",
       sourceRunId,
       requestedPolicy,
       fallbackReason: "crash-residue",
-      eligibility: environmentStable ? "legacy" : "all-live",
+      eligibility: "legacy",
       ...(reply ? { legacyCheckpointReply: reply } : {}),
     };
   }
@@ -830,17 +824,6 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
       eligibility: "legacy",
       ...(reply ? { legacyCheckpointReply: reply } : {}),
     };
-  }
-
-  if (
-    !isRunEnvironmentIdentity(resume.terminalEnvironment) ||
-    !isRunEnvironmentIdentity(source.environment) ||
-    !isRunEnvironmentIdentity(current.environment)
-  ) {
-    return liveDecision(sourceRunId, requestedPolicy, "environment-missing");
-  }
-  if (!environmentsEqual(resume.terminalEnvironment, current.environment)) {
-    return liveDecision(sourceRunId, requestedPolicy, "environment-mismatch");
   }
 
   const manifest = validateManifest(source, sourceRunId);
