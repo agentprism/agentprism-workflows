@@ -61,6 +61,23 @@ function gatedRealSleep(gatedMs: number, gate: Promise<void>): typeof realSleep 
   };
 }
 
+function captureRequestInitiations(url: string): { methods: string[]; restore(): void } {
+  const targetOrigin = new URL(url).origin;
+  const originalFetch = globalThis.fetch;
+  const methods: string[] = [];
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const requestUrl = input instanceof Request ? input.url : String(input);
+    if (new URL(requestUrl).origin === targetOrigin) {
+      methods.push((init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase());
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  return {
+    methods,
+    restore() { globalThis.fetch = originalFetch; },
+  };
+}
+
 async function requestJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -1212,26 +1229,35 @@ test("M2/M8 real Streamable HTTP GET EOF/error disables once, DELETEs once, and 
       isPublished: () => true,
       emitDiagnostic: (value) => diagnostics.push(value),
     });
+    const requests = captureRequestInitiations(host.url);
     try {
       bridge.bindSession({
         getActiveToolNames: () => [],
         setActiveToolsByName() {},
       } as never);
       await host.waitForGet();
-      const beforeFatal = host.methods.length;
+      const ordinaryRequestsAtFatal = requests.methods.filter((method) => method === "GET" || method === "POST").length;
       host.breakGet(mode);
       await eventually(() => {
         assert.deepEqual(diagnostics, [`[mcp:fatal-http-${mode}] connection closed; server disabled`]);
         assert.equal(host.methods.filter((method) => method === "DELETE").length, 1);
       });
-      const afterFatal = host.methods.slice(beforeFatal);
-      assert.deepEqual(afterFatal.filter((method) => method === "GET" || method === "POST"), []);
-      assert.deepEqual(afterFatal.filter((method) => method === "DELETE"), ["DELETE"]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(
+        requests.methods.filter((method) => method === "GET" || method === "POST").length,
+        ordinaryRequestsAtFatal,
+        "fatal disable prevents new GET/POST initiations regardless of in-flight arrival order",
+      );
+      assert.equal(host.methods.filter((method) => method === "DELETE").length, 1);
       assert.equal(diagnostics.some((value) => value.includes("transport error")), false);
     } finally {
-      await bridge.close();
-      lifecycle.abort();
-      await host.close();
+      try {
+        await bridge.close();
+      } finally {
+        lifecycle.abort();
+        requests.restore();
+        await host.close();
+      }
     }
     assert.equal(host.methods.filter((method) => method === "DELETE").length, 1);
   }
@@ -1316,6 +1342,7 @@ test("M2/M8 request-driven HTTP 405 stays live until the next request timeout di
     isPublished: () => true,
     emitDiagnostic: (value) => diagnostics.push(value),
   });
+  const requests = captureRequestInitiations(host.url);
   try {
     const handle = bridge.clients[0];
     assert.ok(handle);
@@ -1353,15 +1380,21 @@ test("M2/M8 request-driven HTTP 405 stays live until the next request timeout di
       assert.deepEqual(diagnostics, ["[mcp:request-idle] connection closed; server disabled"]);
       assert.equal(host.methods.filter((method) => method === "DELETE").length, 1);
     });
-    const getCount = host.methods.filter((method) => method === "GET").length;
-    const postCount = host.methods.filter((method) => method === "POST").length;
+    const requestsAtDisable = [...requests.methods];
     await new Promise((resolve) => setTimeout(resolve, 150));
-    assert.equal(host.methods.filter((method) => method === "GET").length, getCount);
-    assert.equal(host.methods.filter((method) => method === "POST").length, postCount);
+    assert.deepEqual(
+      requests.methods,
+      requestsAtDisable,
+      "disable prevents new request initiations regardless of in-flight arrival order",
+    );
   } finally {
-    await bridge.close();
-    lifecycle.abort();
-    await host.close();
+    try {
+      await bridge.close();
+    } finally {
+      lifecycle.abort();
+      requests.restore();
+      await host.close();
+    }
   }
 });
 
@@ -1382,19 +1415,28 @@ test("M2/M8 real legacy SSE raw error closes synchronously and never reconnects"
     isPublished: () => true,
     emitDiagnostic: (value) => diagnostics.push(value),
   });
+  const requests = captureRequestInitiations(host.url);
   try {
     bridge.bindSession({ getActiveToolNames: () => [...bridge.aliases], setActiveToolsByName() {} } as never);
     assert.equal(host.methods.filter((method) => method === "GET").length, 1);
     host.breakStream();
     await eventually(() => assert.deepEqual(diagnostics, ["[mcp:fatal-sse] connection closed; server disabled"]));
-    const requests = [...host.methods];
+    const requestsAtDisable = [...requests.methods];
     await new Promise((resolve) => setTimeout(resolve, 150));
-    assert.deepEqual(host.methods, requests, "EventSource is synchronously closed with zero reconnect fetches");
+    assert.deepEqual(
+      requests.methods,
+      requestsAtDisable,
+      "EventSource disable prevents new request initiations",
+    );
     assert.equal(diagnostics.some((value) => value.includes("transport error")), false);
   } finally {
-    await bridge.close();
-    lifecycle.abort();
-    await host.close();
+    try {
+      await bridge.close();
+    } finally {
+      lifecycle.abort();
+      requests.restore();
+      await host.close();
+    }
   }
 });
 
@@ -1441,6 +1483,7 @@ test("M2/M8 raw HTTP and SSE opening failures are fatal-only with zero reconnect
     const host = await brokenOpeningHost(kind);
     const diagnostics: string[] = [];
     const deps = await resolveDeps({ mcpTimeoutMs: 2_000, sleep: realSleep });
+    const requests = captureRequestInitiations(host.url);
     try {
       await assert.rejects(bridgeMcpServers([kind === "http"
         ? { name: `opening-${kind}`, type: "http", url: host.url, headers: [] }
@@ -1456,10 +1499,13 @@ test("M2/M8 raw HTTP and SSE opening failures are fatal-only with zero reconnect
         emitDiagnostic: (value) => diagnostics.push(value),
       }), (error: { data?: { errorKind?: unknown; server?: unknown } }) =>
         error.data?.errorKind === "mcp_init_error" && error.data.server === `opening-${kind}`);
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      const requestsAtFailure = [...requests.methods];
+      await new Promise((resolve) => setTimeout(resolve, 150));
       assert.equal(diagnostics.some((value) => value.includes("transport error")), false);
-      assert.equal(host.methods.length, 1, `${kind} opening failure must not reconnect`);
+      assert.equal(requestsAtFailure.length, 1, `${kind} opening failure has exactly one initial request`);
+      assert.deepEqual(requests.methods, requestsAtFailure, `${kind} opening failure must not initiate reconnect`);
     } finally {
+      requests.restore();
       await host.close();
     }
   }
