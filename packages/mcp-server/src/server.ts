@@ -840,6 +840,7 @@ function persistedOutcome(
   return {
     runId: persisted.runId,
     status: status.status,
+    ...(persisted.limits === undefined ? {} : { limits: persisted.limits }),
     ...(status.status === "completed" && persisted.result !== undefined ? { result: persisted.result } : {}),
     tokenUsage: normalizeTokenUsage(persisted.tokenUsage),
     logs: persisted.logs,
@@ -1402,8 +1403,12 @@ export function createWorkflowServer(
             admittedScript,
             executionLatch.deny,
           );
+          const admittedRun = manager.getRun(started.runId);
+          if (!admittedRun?.limits) {
+            throw new McpError(ErrorCode.InternalError, "Workflow admission did not resolve run limits");
+          }
           executionLatch.admit();
-          const workflowName = manager.getRun(started.runId)?.snapshot.name ?? "workflow";
+          const workflowName = admittedRun.snapshot.name;
           backgroundRuns.track(started.runId, started.promise);
           backgroundReservation = false;
           const scriptUri = workflowScriptUri(started.runId);
@@ -1416,6 +1421,7 @@ export function createWorkflowServer(
               status: "running" as const,
               scriptSource,
               scriptUri,
+              limits: admittedRun.limits,
             },
             content: [
               {

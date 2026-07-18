@@ -399,6 +399,8 @@ test("multibyte previews and the whole structured status obey deterministic hard
 
 test("terminal results get exact redacted final-20 tails while completed results retain only full logs", async () => {
   const token = "ghp_abcdefgh12345678";
+  const admissionLog =
+    "agent timeout admission: host ceiling none total wall-clock per attempt; each retry re-arms the clock";
   const loggingPrefix =
     'for (let i = 1; i <= 25; i++) log(i === 10 ? `line-${i} ghp_abcdefgh12345678` : i === 11 ? `line-${i} ${"😀".repeat(1000)}` : `line-${i}`);';
   const manager = new WorkflowManager({ persistence: memoryPersistence().persistence, agent: runnerFrom(() => "ok") });
@@ -406,12 +408,13 @@ test("terminal results get exact redacted final-20 tails while completed results
     `export const meta = { name: "paused", description: "paused" };\n${loggingPrefix}\nawait checkpoint("q", { headless: "pause" });`,
   );
   assert.equal(paused.status, "paused");
-  assert.equal(paused.logs.length, 25, "the compatibility logs remain complete and raw");
-  assert.equal(paused.logs[9]?.includes(token), true);
+  assert.equal(paused.logs.length, 26, "the compatibility logs remain complete and raw");
+  assert.equal(paused.logs[0], admissionLog);
+  assert.equal(paused.logs[10]?.includes(token), true);
   assert.equal(paused.logTail?.lines.length, 20);
   assert.equal(paused.logTail?.lines[0], "line-6");
   assert.equal(paused.logTail?.lines.at(-1), "line-25");
-  assert.equal(paused.logTail?.omittedLines, 5);
+  assert.equal(paused.logTail?.omittedLines, 6);
   assert.equal(paused.logTail?.redactedLines, 1);
   assert.equal(paused.logTail?.truncatedLines, 1);
   assert.equal(paused.logTail?.lines.some((line) => line.includes(token)), false);
@@ -426,7 +429,7 @@ test("terminal results get exact redacted final-20 tails while completed results
   const empty = await manager.runSync(
     'export const meta = { name: "empty", description: "empty" };\nthrow new Error("empty failure");',
   );
-  assert.deepEqual(empty.logTail, createWorkflowLogTail([], 20));
+  assert.deepEqual(empty.logTail, createWorkflowLogTail([admissionLog], 20));
 
   const controller = new AbortController();
   const entered = deferred<void>();
@@ -454,7 +457,7 @@ test("terminal results get exact redacted final-20 tails while completed results
     `export const meta = { name: "completed", description: "completed" };\n${loggingPrefix}\nreturn true;`,
   );
   assert.deepEqual(
-    completed.logs.slice(0, 25),
+    completed.logs.slice(1, 26),
     Array.from({ length: 25 }, (_, index) =>
       index === 9
         ? `line-${index + 1} ghp_abcdefgh12345678`
@@ -463,6 +466,7 @@ test("terminal results get exact redacted final-20 tails while completed results
           : `line-${index + 1}`,
     ),
   );
+  assert.equal(completed.logs[0], admissionLog);
   assert.equal(completed.logTail, undefined);
   assert.equal("logTail" in completed, false);
 });

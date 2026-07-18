@@ -31,6 +31,8 @@ export {
   runWorkflow,
   parseWorkflowScript,
   hashCheckpointInputs,
+  resolveAgentTimeoutMs,
+  resolveWorkflowRunLimits,
   redactText,
   truncateUtf8,
   CALL_PATH_FORMAT,
@@ -99,6 +101,7 @@ export { probeHarnessConfig, formatHarnessConfigReport } from "./config.js";
 export type { ProbeHarnessConfigOptions, HarnessConfigReport } from "./config.js";
 export type {
   WorkflowRunOptions,
+  WorkflowRunLimitOptions,
   AgentOptions,
   ExecOptions,
   WorkflowManagerOptions,
@@ -119,6 +122,7 @@ export type {
   WorkflowLogTail,
   WorkflowRunCallStatus,
   WorkflowRunInspectionOptions,
+  WorkflowRunLimits,
   WorkflowRunStatus,
   WorkflowRunStatusTruncation,
   WorkflowRunFallback,

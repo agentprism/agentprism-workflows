@@ -14,12 +14,29 @@ const baseRun: WorkflowRunResult<null> = {
   agentCount: 0,
   durationMs: 0,
   logs: [],
+  effectiveLimits: {
+    maxAgents: 50,
+    tokenBudget: 100_000,
+    concurrency: 3,
+    agentRetries: 2,
+    agentTimeoutMs: 45_000,
+  },
 };
 
 const resources = {
   scriptSource: "inline" as const,
   scriptUri: "workflow://runs/continuation-schema-run/script",
 };
+
+test("resolved run limits survive MCP run-result projection and schema parsing", () => {
+  const projected = toWorkflowToolResult(baseRun, resources);
+  const parsed = workflowToolOutputShape.safeParse(projected);
+
+  assert.equal(parsed.success, true);
+  if (!parsed.success) assert.fail(parsed.error.message);
+  assert.deepEqual(projected.limits, baseRun.effectiveLimits);
+  assert.deepEqual(parsed.data.limits, baseRun.effectiveLimits);
+});
 
 test("continuation fallbacks survive MCP tool-result projection and schema parsing", () => {
   const fallbacks = [

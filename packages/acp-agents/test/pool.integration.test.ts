@@ -15,6 +15,7 @@ import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import {
   AcpAgentPool,
   AcpAgentRunner,
+  CANCEL_NOT_HONORED_GRACE_MS,
   PI_DISPOSE_SIGKILL_GRACE_MS,
   PI_PROCESS_EXIT_MARGIN_MS,
   PI_PROCESS_SHUTDOWN_ENVELOPE_MS,
@@ -159,6 +160,37 @@ test("opts.signal cancels the session via session/cancel WITHOUT killing the poo
   const after = readLog();
   assert.equal(count(after, "__start"), 1, "the follow-up run REUSED the surviving process");
   assert.equal(count(after, "initialize"), 1, "no re-initialize — same connection");
+});
+
+test("an ACP turn that ignores session/cancel is closed and its pooled child is recycled after the grace", async () => {
+  const { cwd, readLog } = configure({ turns: [{ waitForCancel: true, ignoreCancel: true }] });
+  const runner = makeRunner();
+  const controller = new AbortController();
+  const running = runner.run("ignore cancellation", { cwd, signal: controller.signal });
+
+  await waitFor(() => readLog().some((entry) => entry.method === "prompt"));
+  const abortedAt = Date.now();
+  controller.abort();
+  await assert.rejects(() => running);
+  const elapsedMs = Date.now() - abortedAt;
+
+  await waitFor(() => readLog().some((entry) => entry.method === "__exit"));
+  const log = readLog();
+  assert.ok(
+    elapsedMs >= CANCEL_NOT_HONORED_GRACE_MS - 250,
+    `the prompt settled before the ${CANCEL_NOT_HONORED_GRACE_MS}ms cancel grace (${elapsedMs}ms)`,
+  );
+  assert.ok(
+    elapsedMs < CANCEL_NOT_HONORED_GRACE_MS + 5_000,
+    `cancel escalation exceeded its bounded shutdown envelope (${elapsedMs}ms)`,
+  );
+  assert.equal(count(log, "cancel"), 1, "one session/cancel was sent");
+  assert.equal(count(log, "closeSession"), 1, "session/close followed the ignored cancel");
+  assert.equal(count(log, "__start"), 1, "one pooled child handled the turn");
+  assert.equal(count(log, "__exit"), 1, "the quarantined child was recycled");
+  const wire = log.map((entry) => entry.method);
+  assert.ok(wire.indexOf("cancel") < wire.indexOf("closeSession"));
+  assert.ok(wire.indexOf("closeSession") < wire.indexOf("__exit"));
 });
 
 // ---- dispose() closes EVERY pooled process ------------------------------------------

@@ -47,7 +47,9 @@ The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` 
 - A **recoverable** failure (timeout, empty output, transient execution error) is retried per the call's `retries` (default 0), then the call **resolves to `null`** — inside `parallel`/`pipeline` *and* as a bare `await agent(...)`. Null-check anything load-bearing, and set `retries: 1–2` on steps you can't afford to lose.
 - A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle. In particular, **always rethrow pause-class errors** (`err.code === "PROVIDER_USAGE_LIMIT"` or `"AUTH_REQUIRED"`): they must propagate out of the script so the engine can pause the run resumably — swallowing one converts that pause into a fake, lossy completion.
 - A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
-- Per-call knobs: `timeoutMs` (a step allowed to run long: `timeoutMs: null` disables the clock), `retries`.
+- Per-call knobs: `timeoutMs` and `retries`. A finite `timeoutMs` may shorten the host's run-level
+  `agentTimeoutMs` ceiling; `null` or omission is uncapped only when the host supplied no ceiling.
+  The timeout is total wall-clock time per attempt, and every retry gets a fresh clock.
 - **Make refusal a first-class outcome (STOP-and-report).** For implementation and spec work, give the producer an explicit refusal shape — e.g. `commitShas: []` plus the discrepancy verbatim in a `deviations` field — with the instruction that a cited surface that does not exist as cited means STOP, never improvise. Then make your checker RECOGNIZE that shape: set a flag, exit the loop, skip adjudication, and surface it for the owner. A correct refusal routed into "round failed, try again" wastes every remaining round; the plausible-looking alternative — the agent quietly building around the discrepancy — is worse, because the mismatch is usually a stale base, not a wrong spec.
 - **Treat provider failure as an expected path, not an anomaly.** Rate limits, capacity collapse on newly launched models, and schema-repair exhaustion on oversized outputs all happen mid-run. Keep the recovery knobs at the host level where they are NOT identity-hashed — concurrency caps, engine retries, labels — so a resume can turn them without invalidating completed work. When one panel model's provider degrades, swapping that role to a stable model (an owner decision, disclosed) beats burning rounds on retries.
 
@@ -67,3 +69,8 @@ while (budget.total && budget.remaining() > 50_000 && found.length < 20) {
 ```
 
 Guard budget-driven loops on `budget.total` being set — with no budget, `remaining()` is `Infinity` and only your own counters stop the loop. The run-level token budget and agent-count cap are hard: once exhausted, further `agent()` calls throw. `phase()` also groups agents in progress UIs and run logs; `log(msg)` (and `console.log`) append to the run log — narrate what matters, especially anything you drop or cap.
+
+The concurrency cap counts active agent attempts, not authored branches. If one `parallel()` branch
+is slow, queued branches begin as other attempts finish. A branch that exhausts its timeout settles
+to `null` after retries and immediately frees its slot, so a single stalled worker cannot hold that
+slot forever when the host configures a finite ceiling.

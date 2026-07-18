@@ -30,6 +30,7 @@ import type {
   WorkflowCheckpointTaken,
   WorkflowResumeReport,
   WorkflowRunFallback,
+  WorkflowRunLimits,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { ReplayReport } from "./isolation.js";
@@ -59,6 +60,8 @@ export interface PersistedAgentState {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
+  timeoutMs?: number | null;
   /** This logical call's aggregate token debit (provider total or estimate). */
   tokens?: number;
   callIndex?: number;
@@ -185,13 +188,7 @@ export interface PersistedRunState {
   /** Root-scope terminal-call manifest for this execution. */
   calls?: WorkflowCallRecord[];
   callsAllocated?: number;
-  limits?: {
-    maxAgents: number;
-    tokenBudget: number | null;
-    concurrency: number;
-    agentRetries: number;
-    agentTimeoutMs: number | null;
-  };
+  limits?: WorkflowRunLimits;
   abortSignaled?: true;
   mainModel?: string;
   agentsDir?: string;

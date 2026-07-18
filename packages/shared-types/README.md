@@ -98,7 +98,7 @@ From [`src/index.ts`](./src/index.ts):
 - `WorkflowRunResult<T>` — the public, host-facing run result (`runId`, `status`, `meta`,
   `result`, `phases`, `agentCount`, `durationMs`, `tokenUsage?`, `logs`, `reason?`, `resetHint?`,
   `authContext?`, `agentSessions?`, `fallbacks?`, `checkpointsTaken?`, `calls?`,
-  `resumeReport?`). Paused, failed, and aborted results additionally carry the
+  `resumeReport?`, `effectiveLimits?`). Paused, failed, and aborted results additionally carry the
   optional redacted final-20 `logTail`; completed results omit it and `logs` remains the full
   compatibility array.
 - `WorkflowRunFallback` — `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?,
@@ -127,7 +127,12 @@ From [`src/index.ts`](./src/index.ts):
   remain valid.
 - `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
   `WorkflowRunStatusTruncation`, and `WorkflowRunStatus` — the shared bounded status contract used
-  by SDK and MCP polling/inspection hosts.
+  by SDK and MCP polling/inspection hosts. Agent call status can carry its resolved total-wall-clock
+  `timeoutMs` and terminal `errorCode`, including `AGENT_TIMEOUT` for a recoverable call that has no
+  journal result.
+- `WorkflowRunLimits` — resolved `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and
+  per-attempt `agentTimeoutMs`; it is returned as `WorkflowRunResult.effectiveLimits` and as
+  `WorkflowRunStatus.limits` (optional only for legacy persisted records).
 
 **MCP config**
 - `McpServerConfig` (union) + `McpStdioServerConfig`, `McpHttpServerConfig`,

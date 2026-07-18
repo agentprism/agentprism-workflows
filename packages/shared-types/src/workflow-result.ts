@@ -423,6 +423,10 @@ export interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
+  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
+  timeoutMs?: number | null;
+  /** Terminal agent error, including recoverable failures that settled the call to null. */
+  errorCode?: WorkflowErrorCode;
   /** Compact JSON text after structural compaction and redaction; never the raw result. */
   resultPreview: string;
   resultRedacted: boolean;
@@ -443,6 +447,16 @@ export interface WorkflowRunStatusTruncation {
   };
 }
 
+/** Host-resolved execution bounds in force for one run. */
+export interface WorkflowRunLimits {
+  maxAgents: number;
+  tokenBudget: number | null;
+  concurrency: number;
+  agentRetries: number;
+  /** Total-wall-clock ceiling for each attempt; null means the host imposes none. */
+  agentTimeoutMs: number | null;
+}
+
 /** Safe, bounded, point-in-time status used by every run-inspection/polling host. */
 export interface WorkflowRunStatus {
   runId: string;
@@ -452,6 +466,8 @@ export interface WorkflowRunStatus {
   currentPhase?: string;
   reason?: string;
   errorCode?: WorkflowErrorCode;
+  /** Resolved execution bounds. Absent only on legacy persisted rows that predate limits. */
+  limits?: WorkflowRunLimits;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -522,15 +538,8 @@ export interface WorkflowRunResult<T = unknown> {
   resumeReport?: WorkflowResumeReport;
   /** Final number of agent()/checkpoint() call indexes allocated by this engine run. */
   callsAllocated?: number;
-  /** The resolved execution inputs in force for this engine run. Per-call
-   *  script-authored overrides are recorded by each call's input fingerprint. */
-  effectiveLimits?: {
-    maxAgents: number;
-    tokenBudget: number | null;
-    concurrency: number;
-    agentRetries: number;
-    agentTimeoutMs: number | null;
-  };
+  /** The resolved execution inputs in force for this engine run. */
+  effectiveLimits?: WorkflowRunLimits;
   /** Set iff the composed signal was ever observed aborted. */
   abortSignaled?: true;
   /** True when this run invoked workflow(), including a zero-call child workflow. */

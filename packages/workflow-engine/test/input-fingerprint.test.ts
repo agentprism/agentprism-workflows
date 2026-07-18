@@ -125,13 +125,16 @@ return await agent('same-prompt')`,
     const timeout200 = await fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 200 });
     const explicitTimeoutA = await fingerprintFor("{ label: 'fixed', timeoutMs: 300 }", { agentTimeoutMs: 100 });
     const explicitTimeoutB = await fingerprintFor("{ label: 'fixed', timeoutMs: 300 }", { agentTimeoutMs: 200 });
+    const shorterTimeoutA = await fingerprintFor("{ label: 'fixed', timeoutMs: 50 }", { agentTimeoutMs: 100 });
+    const shorterTimeoutB = await fingerprintFor("{ label: 'fixed', timeoutMs: 50 }", { agentTimeoutMs: 200 });
     const retries0 = await fingerprintFor("{ label: 'fixed' }", { agentRetries: 0 });
     const retries1 = await fingerprintFor("{ label: 'fixed' }", { agentRetries: 1 });
     const capped = await fingerprintFor(`{ label: 'fixed', retries: ${MAX_AGENT_RETRIES} }`);
     const overCap = await fingerprintFor("{ label: 'fixed', retries: 999 }");
 
     assert.notEqual(timeout100, timeout200);
-    assert.equal(explicitTimeoutA, explicitTimeoutB);
+    assert.notEqual(explicitTimeoutA, explicitTimeoutB, "the host ceiling is part of the effective timeout");
+    assert.equal(shorterTimeoutA, shorterTimeoutB, "a shorter per-call timeout is effective under either ceiling");
     assert.notEqual(retries0, retries1);
     assert.equal(capped, overCap);
   });

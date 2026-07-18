@@ -72,13 +72,30 @@ const TWO_AGENT_BACKGROUND = [
   'return { first, second };',
 ].join("\n");
 
+const EXPECTED_LIMITS = {
+  maxAgents: 1_000,
+  tokenBudget: null,
+  concurrency: 3,
+  agentRetries: 1,
+  agentTimeoutMs: 50_000,
+} as const;
+
 test("background acceptance is immediate and await reports immediate, timeout, cancellation, partial usage, and terminal outcome", async () => {
   const controlled = new ControlledRunner();
   const { client, server, dispose } = await connect(controlled.runner, { listTools: true });
   try {
     const initiating = new AbortController();
     const accepted = await client.callTool(
-      { name: "workflow", arguments: { script: TWO_AGENT_BACKGROUND, background: true } },
+      {
+        name: "workflow",
+        arguments: {
+          script: TWO_AGENT_BACKGROUND,
+          background: true,
+          concurrency: 3,
+          agentRetries: 1,
+          agentTimeoutMs: 50_000,
+        },
+      },
       undefined,
       { signal: initiating.signal },
     );
@@ -88,6 +105,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
       status: "running",
       scriptSource: "inline",
       scriptUri: `workflow://runs/${acceptedRunId}/script`,
+      limits: EXPECTED_LIMITS,
     });
     assert.equal(
       textOf(accepted),
@@ -100,6 +118,12 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     initiating.abort();
     assert.equal(controlled.calls[0].options.signal?.aborted, false, "initiating-call cancellation is detached");
 
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId: acceptedRunId },
+    });
+    assert.deepEqual(structured(inspected)?.limits, EXPECTED_LIMITS);
+
     const immediate = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: acceptedRunId, waitMs: 0 },
@@ -107,6 +131,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     assert.equal(structured(immediate)?.wait && field(structured(immediate)?.wait, "returnedBecause"), "immediate");
     assert.equal(structured(immediate)?.outcome, undefined);
     assert.equal(structured(immediate)?.tokenUsage, undefined);
+    assert.deepEqual(structured(immediate)?.limits, EXPECTED_LIMITS);
 
     controlled.resolve(0, { files: ["src/auth.ts"] }, {
       input: 10,
@@ -128,6 +153,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     assert.equal(partialStatus?.currentPhase, "Review");
     assert.ok((field(partialStatus?.logTail, "lines") as string[]).includes("review started"));
     assert.equal(partialStatus?.outcome, undefined);
+    assert.deepEqual(partialStatus?.limits, EXPECTED_LIMITS);
 
     const timed = await client.callTool({
       name: "workflow",
@@ -136,6 +162,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     assert.equal(field(structured(timed)?.wait, "requestedMs"), 15);
     assert.equal(field(structured(timed)?.wait, "returnedBecause"), "timeout");
     assert.ok(Number(field(structured(timed)?.wait, "elapsedMs")) >= 0);
+    assert.deepEqual(structured(timed)?.limits, EXPECTED_LIMITS);
 
     type DirectHandler = (
       args: Record<string, unknown>,
@@ -181,6 +208,8 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     );
     assert.deepEqual(completedStatus?.tokenUsage, field(completedStatus?.outcome, "tokenUsage"));
     assert.equal(field(completedStatus?.tokenUsage, "total"), 42);
+    assert.deepEqual(completedStatus?.limits, EXPECTED_LIMITS);
+    assert.deepEqual(field(completedStatus?.outcome, "limits"), EXPECTED_LIMITS);
 
     const repeated = await client.callTool({
       name: "workflow",
@@ -188,10 +217,69 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     });
     assert.equal(field(structured(repeated)?.wait, "returnedBecause"), "terminal");
     assert.deepEqual(field(structured(repeated)?.outcome, "result"), field(completedStatus?.outcome, "result"));
+    assert.deepEqual(structured(repeated)?.limits, EXPECTED_LIMITS);
   } finally {
     for (let index = 0; index < controlled.calls.length; index++) {
       controlled.calls[index]?.resolve("cleanup");
     }
+    await dispose();
+  }
+});
+
+test("MCP await and inspect expose the resolved timeout and AGENT_TIMEOUT call failure", async () => {
+  let attempts = 0;
+  const runner = makeRunner(
+    () => {
+      attempts += 1;
+      return new Promise(() => {
+        // Deliberately ignore the attempt signal and never settle.
+      });
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  const expectedLimits = {
+    maxAgents: 1_000,
+    tokenBudget: null,
+    concurrency: 2,
+    agentRetries: 0,
+    agentTimeoutMs: 25,
+  } as const;
+  try {
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script:
+          'export const meta = { name: "timed", description: "timed" };\n' +
+          'return await agent("never", { label: "never" });',
+        background: true,
+        concurrency: 2,
+        agentTimeoutMs: 25,
+      },
+    });
+    const runId = runIdOf(accepted);
+    assert.deepEqual(structured(accepted)?.limits, expectedLimits);
+
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 1_000 },
+    });
+    assert.equal(structured(awaited)?.status, "completed");
+    assert.deepEqual(structured(awaited)?.limits, expectedLimits);
+    assert.deepEqual(field(structured(awaited)?.outcome, "limits"), expectedLimits);
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId },
+    });
+    const calls = structured(inspected)?.calls as Array<Record<string, unknown>>;
+    assert.equal(attempts, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.label, "never");
+    assert.equal(calls[0]?.timeoutMs, 25);
+    assert.equal(calls[0]?.errorCode, WorkflowErrorCode.AGENT_TIMEOUT);
+    assert.equal(calls[0]?.resultPreview, "null");
+    assert.deepEqual(structured(inspected)?.limits, expectedLimits);
+  } finally {
     await dispose();
   }
 });

@@ -151,6 +151,8 @@ const CLIENT_INFO = {
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
 /** Bound the best-effort session/close round-trip so a slow agent can't hang run()'s finally. */
 const CLOSE_SESSION_TIMEOUT_MS = 5_000;
+/** Grace for a cancelled prompt/config lifecycle to settle before close + process quarantine. */
+export const CANCEL_NOT_HONORED_GRACE_MS = 5_000;
 export const PI_CHILD_CLEANUP_DEADLINE_MS = 5_000;
 export const PI_CLOSE_DELIVERY_MARGIN_MS = 1_000;
 export const PI_CLOSE_SESSION_TIMEOUT_MS = PI_CHILD_CLEANUP_DEADLINE_MS + PI_CLOSE_DELIVERY_MARGIN_MS;
@@ -1890,7 +1892,7 @@ export class PooledConnection {
     return this.race(this.connection.agent.notify(method, params));
   }
 
-  /** Best-effort ACP cancel for one session (wired to opts.signal). The PROCESS stays pooled. */
+  /** Send ACP cancel for one session. SessionHandle owns the grace/close escalation policy. */
   async cancelSession(sessionId: string): Promise<void> {
     this.client.settlePendingPermissions(sessionId);
     this.client.settlePendingElicitations(sessionId);
@@ -1899,6 +1901,15 @@ export class PooledConnection {
       await this.connection.agent.notify(AGENT_METHODS.session_cancel, { sessionId });
     } catch {
       // best-effort: the session settles as "cancelled" regardless.
+    }
+  }
+
+  /** Quarantine a child whose session ignored cancellation. Existing sibling sessions drain;
+   *  an already-idle connection disposes immediately, otherwise the final release disposes it. */
+  quarantineAfterIgnoredCancel(): void {
+    this.recyclePending = true;
+    if (this._activeSessions === 0 && this._alive) {
+      void this.dispose();
     }
   }
 
@@ -1993,6 +2004,12 @@ export function isChildCleanupError(error: unknown): boolean {
 
 type ModelSelectOption = Extract<SessionConfigOption, { type: "select" }>;
 
+interface ActiveTurn {
+  ended: Promise<void>;
+  resolveEnded(): void;
+  cancellation?: Promise<void>;
+}
+
 /**
  * One agent() run's ACP session on a pooled connection. Owns the per-session cwd/schema/policy,
  * the model-selection state, and the abort wiring. On release() it lets go of the session
@@ -2001,7 +2018,13 @@ type ModelSelectOption = Extract<SessionConfigOption, { type: "select" }>;
 export class SessionHandle implements StructuredSource {
   private configOptions: SessionConfigOption[];
   private removeAbort: (() => void) | undefined;
-  private released = false;
+  private releasePromise: Promise<void> | undefined;
+  private abortCancellation: Promise<void> | undefined;
+  private activeTurn: ActiveTurn | undefined;
+  private resolveReleaseStarted!: () => void;
+  private readonly releaseStarted = new Promise<void>((resolve) => {
+    this.resolveReleaseStarted = resolve;
+  });
 
   constructor(
     private readonly pooled: PooledConnection,
@@ -2014,10 +2037,16 @@ export class SessionHandle implements StructuredSource {
     if (opts.signal) {
       const signal = opts.signal;
       const onAbort = () => {
-        void this.cancel();
+        void this.cancelAfterAbort().catch(() => {
+          // release() replays the same rejection to the runner so child_cleanup_error remains
+          // observable without turning the fire-and-forget abort listener into an unhandled one.
+        });
       };
-      signal.addEventListener("abort", onAbort, { once: true });
-      this.removeAbort = () => signal.removeEventListener("abort", onAbort);
+      if (signal.aborted) onAbort();
+      else {
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.removeAbort = () => signal.removeEventListener("abort", onAbort);
+      }
     }
   }
 
@@ -2115,6 +2144,14 @@ export class SessionHandle implements StructuredSource {
   async prompt(content: string | ContentBlock[], promptMeta?: Record<string, unknown>): Promise<PromptResponse> {
     this.opts.signal?.throwIfAborted();
     this.state.beginTurn();
+    let resolveEnded!: () => void;
+    const turn: ActiveTurn = {
+      ended: new Promise<void>((resolve) => {
+        resolveEnded = resolve;
+      }),
+      resolveEnded: () => resolveEnded(),
+    };
+    this.activeTurn = turn;
     const prompt: ContentBlock[] | string =
       typeof content === "string"
         ? content
@@ -2127,9 +2164,14 @@ export class SessionHandle implements StructuredSource {
       prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
       ...(gatedMeta ? { _meta: gatedMeta } : {}),
     };
-    const response = await this.pooled.prompt(request);
-    this.state.usage.recordPromptUsage(response.usage);
-    return response;
+    try {
+      const response = await this.pooled.prompt(request);
+      this.state.usage.recordPromptUsage(response.usage);
+      return response;
+    } finally {
+      if (this.activeTurn === turn) this.activeTurn = undefined;
+      turn.resolveEnded();
+    }
   }
 
   /** StructuredSource — the latest turn's assistant text. */
@@ -2147,21 +2189,62 @@ export class SessionHandle implements StructuredSource {
     return this.state.rawResultSuccess?.structured_output;
   }
 
-  /** Best-effort ACP cancel (wired to opts.signal). The agent settles the turn as "cancelled". */
+  /** Cancel the active turn. A backend that does not settle within the grace window is closed and
+   *  its pooled child is quarantined for recycle after sibling sessions drain. */
   async cancel(): Promise<void> {
+    const turn = this.activeTurn;
+    if (!turn) {
+      await this.pooled.cancelSession(this.sessionId);
+      return;
+    }
+    await this.cancelTurn(turn);
+  }
+
+  private cancelAfterAbort(): Promise<void> {
+    const turn = this.activeTurn;
+    if (turn) return this.cancelTurn(turn);
+    this.abortCancellation ??= this.cancelAndEscalate(this.releaseStarted);
+    return this.abortCancellation;
+  }
+
+  private cancelTurn(turn: ActiveTurn): Promise<void> {
+    turn.cancellation ??= this.cancelAndEscalate(turn.ended);
+    return turn.cancellation;
+  }
+
+  private async cancelAndEscalate(observedEnd: Promise<void>): Promise<void> {
     await this.pooled.cancelSession(this.sessionId);
+    if (await resolvesWithin(observedEnd, CANCEL_NOT_HONORED_GRACE_MS)) return;
+    this.pooled.quarantineAfterIgnoredCancel();
+    await this.release();
   }
 
   /** Let go of this session WITHOUT killing the pooled process; idempotent.
    *  `keepOpen` skips the release-time best-effort `session/close` so an agent-persisted
    *  session stays re-openable via session/load|resume (RunOptions.keepSession). */
-  async release(options: { keepOpen?: boolean } = {}): Promise<void> {
-    if (this.released) return;
-    this.released = true;
+  release(options: { keepOpen?: boolean } = {}): Promise<void> {
+    this.releasePromise ??= this.releaseOwned(options.keepOpen === true);
+    return this.releasePromise;
+  }
+
+  private async releaseOwned(keepOpen: boolean): Promise<void> {
+    this.resolveReleaseStarted();
     this.removeAbort?.();
     this.removeAbort = undefined;
-    await this.pooled.releaseSession(this.sessionId, options.keepOpen === true);
+    await this.pooled.releaseSession(this.sessionId, keepOpen);
   }
+}
+
+/** Resolve true when `op` settles before the grace period and false when the grace wins. */
+function resolvesWithin(op: Promise<void>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    timer.unref?.();
+    void op.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
 }
 
 /** Resolve `op`, but reject after `ms` so a stuck best-effort wire call can't hang a caller. */

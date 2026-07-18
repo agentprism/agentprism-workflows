@@ -40,3 +40,8 @@ keeps moving. Each of these prevented — or would have prevented — a real ter
   the mid-flight kill that wastes live work. Add caps only when the structure itself is unbounded,
   sized from per-role estimates (one xhigh implement + one four-reviewer verify round with full test
   suites ≈ 3M tokens).
+- **Bound every potentially stalled agent deliberately.** Use a run-level `agentTimeoutMs` as the
+  total wall-clock ceiling for each attempt, and use a smaller per-call `timeoutMs` only where a
+  step deserves a tighter deadline. Each retry re-arms the clock. At the concurrency cap, one slow
+  `parallel()` branch occupies one slot while other finished branches release theirs; an exhausted
+  timeout settles that branch to `null` and frees its slot for queued work.

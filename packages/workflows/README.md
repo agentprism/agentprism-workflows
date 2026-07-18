@@ -98,7 +98,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `tokenBudget`, total-wall-clock-per-attempt `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
@@ -297,6 +297,12 @@ checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a de
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
+A finite run-level `agentTimeoutMs` is the ceiling for every attempt. Script-level `timeoutMs` may
+tighten it but cannot raise or disable it; without a host ceiling, per-call `null`/omission is
+uncapped. Retries each get a fresh clock (retries are clamped at 3). After the final timeout, the
+call resolves to `null` with recoverable `AGENT_TIMEOUT`, releases its concurrency slot, and the ACP
+runner closes/recycles a backend session that ignores cancellation.
+
 Usage-limit and auth resumes are continuation-aware by default on both `resumeFromRunId` and
 same-ID `resume()` / `resumeInBackground()`: when the interrupted root call's index, identity hash,
 full execution-input fingerprint, backend identity, cwd, and reopen support still agree, the manager
@@ -315,6 +321,8 @@ returns `{ runId, promise: Promise<WorkflowRunResult> }`. The facade keeps an AC
 per-execution `exec.agent` until that promise settles, including rejection. Read live state with
 `getRun()`, `getSnapshot()`, or `inspectRun()`, and subscribe to cumulative `tokenUsage` events while
 work is running. Live attempts update `snapshot.tokenUsage` monotonically; replayed calls add zero.
+Run results expose `effectiveLimits`; inspect status exposes the same values as `limits`, and failed
+agent rows carry their resolved `timeoutMs` plus `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
 under a new run ID, and match safe calls by exact path/hash or unique hash+input fingerprint.
@@ -324,6 +332,8 @@ records are rebound to the current call index/label/phase. `resumePolicy: "posit
 index/prefix matching but cannot bypass new-format input/safety/environment gates. The distinct
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
+Operational limits are resolved from the new execution's `exec` options and manager defaults, not
+copied from the source run; pass the desired timeout/retry/concurrency values again.
 
 The manager's critical initial save contains the complete inherited seed before a background
 acknowledgement. A manager-prepared `resumeFromRunId` hit re-journals the selected value under its

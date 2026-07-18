@@ -33,13 +33,20 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
 | `resume` | `{ filesystem: "read-only" }` | Author assertion that the call is safe for content-addressed mainline replay. A non-worktree call must not mutate persistent state; a successfully isolated worktree may contain ordinary checkout edits, but commits and effects outside it remain forbidden. Engine-owned, not passed to the runner, and not hashed. |
 | `cwd` | `string` | Per-session working directory; relative resolves against the run's base cwd. Overridden by worktree isolation. Not hashed. |
-| `timeoutMs` | `number \| null` | Per-call timeout; `null` disables. Defaults to the host's per-agent timeout (none unless configured). |
+| `timeoutMs` | `number \| null` | Total wall-clock cap for each attempt. A finite value may tighten a finite host `agentTimeoutMs` ceiling but cannot raise or disable it. With no host ceiling, a finite value applies and `null`/omitted is uncapped. |
 | `retries` | `number` | Retries after *recoverable* failures (default 0, host-overridable). Exhausted retries ⇒ the call resolves `null`. |
 | `mcpServers` | `McpServerConfig[]` | MCP servers attached to this session. Stdio shape: `{ name, command, args: [], env: [{ name, value }] }` (`args`/`env` required, `env` is name/value pairs, not a map); `{ type: "http" \| "sse", name, url, headers: [] }` also accepted. Not hashed. |
 | `images` | `PromptImage[]` | Base64 image blocks appended to the prompt; backends without image support get a bracketed text note. Not hashed. |
 | `meta` | `object` | ACP `_meta` merged into `session/new` — session-scoped extension passthrough (pairs with custom backends). Not hashed. |
 | `promptMeta` | `object` | ACP `_meta` merged into `session/prompt` — turn-scoped passthrough. Backend-computed keys win on conflict. Not hashed. |
 | `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Usage/auth pause failures are kept open automatically for managed continuation. Not identity-hashed; included in the input fingerprint. |
+
+The timeout clock measures the whole attempt, including backend startup, model/config setup, tool
+work, and streamed output; it is not an idle timer. Each retry starts a fresh clock, so the maximum
+timeout envelope is `(retries + 1) × resolved timeoutMs` (retries are clamped to 3). An exhausted
+timeout is recoverable `AGENT_TIMEOUT`: the call resolves to `null`, releases its concurrency slot,
+and asks the ACP session to cancel. A session that keeps running after the cancellation grace is
+closed where supported and its pooled child is recycled.
 
 ## Model specs & routing
 
@@ -144,7 +151,7 @@ The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elic
 
 | code | recoverable | engine behavior |
 |---|---|---|
-| `AGENT_TIMEOUT` | yes | Retried per `retries`, then the call resolves `null`. |
+| `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Every retry gets a fresh clock; after the final attempt the call resolves `null`, and ACP cancel escalates to close/recycle when the turn does not stop. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call; same retry-then-`null`. |
 | `AGENT_EXECUTION_ERROR` | yes* | Generic agent failure (*refusal/truncation variants are non-recoverable). |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the re-prompt ladder. Halts the run (catchable in-script). |
@@ -268,14 +275,14 @@ const run = await runDynamicWorkflow(script, {
     tokenBudget: 500_000,           // hard cap → budget.total in-script
     maxAgents: 200,
     concurrency: 8,                 // concurrent agents (default 8)
-    agentTimeoutMs: 600_000,
+    agentTimeoutMs: 600_000,         // total wall-clock ceiling for every attempt
     agentRetries: 1,                // default retries for recoverable failures
     confirm: async (text, opts) => true,   // live checkpoint channel; omit = authored headless mode
     onProgress: (snapshot) => {},
   },
 });
 // run.status: "completed" | "paused" | "failed" | "aborted"
-// run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases
+// run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases · run.effectiveLimits
 // run.resumeReport? · run.fallbacks? (compatibility) · run.checkpointsTaken? (absent when empty)
 ```
 
@@ -338,6 +345,7 @@ interface WorkflowBackgroundAccepted {
   status: "running";
   scriptSource: "inline" | "path";
   scriptUri: string;
+  limits: WorkflowRunLimits;
 }
 
 interface WorkflowAwaitMetadata {
@@ -455,6 +463,8 @@ interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
+  timeoutMs?: number | null;
+  errorCode?: string;
   resultPreview: string;
   resultRedacted: boolean;
   resultTruncated: boolean;
@@ -468,6 +478,7 @@ interface WorkflowRunStatus {
   currentPhase?: string;
   reason?: string;
   errorCode?: string;
+  limits?: WorkflowRunLimits; // absent only on legacy persisted records
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -484,6 +495,14 @@ interface WorkflowRunStatus {
       redactedResults: number;
     };
   };
+}
+
+interface WorkflowRunLimits {
+  maxAgents: number;
+  tokenBudget: number | null;
+  concurrency: number;
+  agentRetries: number;
+  agentTimeoutMs: number | null;
 }
 ```
 

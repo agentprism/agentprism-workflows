@@ -69,6 +69,7 @@ import {
   type CheckpointOptions,
   type EngineRunResult,
   parseWorkflowScript,
+  resolveWorkflowRunLimits,
   runWorkflow,
 } from "./workflow.js";
 import { createWorkflowLogTail, projectWorkflowRunStatus } from "./run-observability.js";
@@ -226,7 +227,7 @@ export interface ExecOptions {
   resumeCalls?: WorkflowCallRecord[];
   /** Cap on total agents for this run. */
   maxAgents?: number;
-  /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
+  /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
   agentTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
@@ -274,7 +275,7 @@ export interface WorkflowManagerOptions {
   mainModel?: string;
   /** The session id to tag runs with (see setSessionId). */
   sessionId?: string;
-  /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
+  /** Default host ceiling when a run omits agentTimeoutMs. null means no host ceiling. */
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
@@ -967,6 +968,15 @@ export class WorkflowManager extends EventEmitter {
       executionSettled: false,
       environmentKey: exec.environmentKey ?? this.environmentKey,
       callsAllocated: 0,
+      limits: resolveWorkflowRunLimits({
+        maxAgents: exec.maxAgents,
+        tokenBudget: exec.tokenBudget,
+        concurrency: exec.concurrency ?? this.concurrency,
+        agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
+        agentTimeoutMs: exec.agentTimeoutMs !== undefined
+          ? exec.agentTimeoutMs
+          : this.defaultAgentTimeoutMs,
+      }),
       mainModel: this.mainModel,
       agentsDir: this.agentsDir,
       executionMode: exec.executionMode,
@@ -1325,6 +1335,7 @@ export class WorkflowManager extends EventEmitter {
             prompt: event.prompt,
             status: "running",
             model: event.model,
+            timeoutMs: event.timeoutMs,
             callIndex: event.callIndex,
             scope: event.scope,
           });
@@ -2053,6 +2064,15 @@ export class WorkflowManager extends EventEmitter {
       executionSettled: false,
       environmentKey: exec.environmentKey ?? this.environmentKey,
       callsAllocated: 0,
+      limits: resolveWorkflowRunLimits({
+        maxAgents: exec.maxAgents,
+        tokenBudget: exec.tokenBudget,
+        concurrency: exec.concurrency ?? this.concurrency,
+        agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
+        agentTimeoutMs: exec.agentTimeoutMs !== undefined
+          ? exec.agentTimeoutMs
+          : this.defaultAgentTimeoutMs,
+      }),
       mainModel: persisted.mainModel ?? this.mainModel,
       agentsDir: persisted.agentsDir ?? this.agentsDir,
       legacyResume: true,
@@ -2187,6 +2207,8 @@ export class WorkflowManager extends EventEmitter {
           errorCode: managed.error?.code,
           logs: managed.snapshot.logs,
           journal: managed.journal,
+          agents: managed.snapshot.agents,
+          limits: managed.limits,
         },
         options,
       );
@@ -2205,6 +2227,8 @@ export class WorkflowManager extends EventEmitter {
         errorCode: persisted.errorCode,
         logs: persisted.logs ?? [],
         journal: persisted.journal ?? [],
+        agents: persisted.agents ?? [],
+        limits: persisted.limits,
       },
       options,
     );

@@ -16,6 +16,7 @@ import type {
   WorkflowRecordedError,
   WorkflowRunCallStatus,
   WorkflowRunInspectionOptions,
+  WorkflowRunLimits,
   WorkflowRunStatus,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
@@ -39,6 +40,19 @@ export interface RunObservabilitySource {
   errorCode?: WorkflowErrorCode;
   logs: string[];
   journal: JournalEntry[];
+  agents?: RunObservabilityAgent[];
+  limits?: WorkflowRunLimits;
+}
+
+export interface RunObservabilityAgent {
+  label: string;
+  phase?: string;
+  model?: string;
+  status: "queued" | "running" | "done" | "error" | "skipped";
+  callIndex?: number;
+  scope?: string;
+  timeoutMs?: number | null;
+  errorCode?: WorkflowErrorCode;
 }
 
 interface SanitizedText {
@@ -263,7 +277,7 @@ export function matchesLabelGlob(label: string, pattern: string): boolean {
   return previous[labelPoints.length]!;
 }
 
-function callStatus(entry: JournalEntry): WorkflowRunCallStatus {
+function callStatus(entry: JournalEntry, agent?: RunObservabilityAgent): WorkflowRunCallStatus {
   const metadata = entry.call;
   let kind: WorkflowRunCallStatus["kind"] = "unknown";
   let label: string | undefined;
@@ -295,8 +309,33 @@ function callStatus(entry: JournalEntry): WorkflowRunCallStatus {
     ...(phase === undefined ? {} : { phase: scalar(phase) }),
     ...(model === undefined ? {} : { model: scalar(model) }),
     ...(backendId === undefined ? {} : { backendId: scalar(backendId) }),
+    ...(agent?.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
+    ...(agent?.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
     ...resultPreview(entry.result),
   };
+}
+
+function agentCallStatus(agent: RunObservabilityAgent): WorkflowRunCallStatus {
+  const scalar = (value: string | undefined) => (value === undefined ? undefined : sanitizeText(value).value);
+  return {
+    index: agent.callIndex!,
+    kind: "agent",
+    label: sanitizeText(agent.label).value,
+    ...(agent.phase === undefined ? {} : { phase: scalar(agent.phase) }),
+    ...(agent.model === undefined ? {} : { model: scalar(agent.model) }),
+    ...(agent.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
+    ...(agent.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
+    ...resultPreview(null),
+  };
+}
+
+function filterLabel(entry: JournalEntry): string | undefined {
+  if (entry.call?.kind === "agent") return entry.call.label;
+  return entry.call === undefined ? entry.session?.label : undefined;
+}
+
+function scopedCallKey(scope: string, index: number): string {
+  return `${scope}\u0000${index}`;
 }
 
 export function createWorkflowLogTail(logs: string[], logLines = 20): WorkflowLogTail {
@@ -321,19 +360,41 @@ export function projectWorkflowRunStatus(
   options: WorkflowRunInspectionOptions = {},
 ): WorkflowRunStatus {
   const filter = normalizeInspectionOptions(options);
-  const matchedEntries = source.journal
-    .filter((entry) => {
-      if (filter.labelGlob === undefined) return true;
-      const label = entry.call?.kind === "agent" ? entry.call.label : !entry.call && entry.session ? entry.session.label : undefined;
-      return label !== undefined && matchesLabelGlob(label, filter.labelGlob);
-    })
-    .sort((left, right) => left.index - right.index);
-  const selectedEntries = matchedEntries.slice(-filter.lastN);
+  const agentsByCall = new Map<string, RunObservabilityAgent>();
+  for (const agent of source.agents ?? []) {
+    if (!Number.isSafeInteger(agent.callIndex) || (agent.callIndex ?? -1) < 0) {
+      continue;
+    }
+    agentsByCall.set(scopedCallKey(agent.scope ?? source.runId, agent.callIndex!), agent);
+  }
+  const journalCalls = new Set(
+    source.journal.map((entry) => scopedCallKey(entry.scope ?? source.runId, entry.index)),
+  );
+  const callRows = source.journal.map((entry) => ({
+    label: filterLabel(entry),
+    status: callStatus(
+      entry,
+      agentsByCall.get(scopedCallKey(entry.scope ?? source.runId, entry.index)),
+    ),
+  }));
+  for (const [key, agent] of agentsByCall) {
+    // Successful calls already have journal rows. Failed calls intentionally do not, so project
+    // their terminal agent row to keep recoverable failures such as AGENT_TIMEOUT inspectable.
+    if (!journalCalls.has(key) && agent.status === "error") {
+      callRows.push({ label: agent.label, status: agentCallStatus(agent) });
+    }
+  }
+  const allCalls = callRows.sort((left, right) => left.status.index - right.status.index);
+  const matchedCalls = allCalls.filter((call) =>
+    filter.labelGlob === undefined ||
+    (call.label !== undefined && matchesLabelGlob(call.label, filter.labelGlob))
+  );
+  const selectedCalls = matchedCalls.slice(-filter.lastN);
   const phaseSource = source.phases.slice(-MAX_PHASES).map(sanitizeText);
   let phases = phaseSource.map((phase) => phase.value);
   const logSource = (filter.logLines === 0 ? [] : source.logs.slice(-filter.logLines)).map(sanitizeText);
   let logs = logSource.map((line) => line.value);
-  let calls = selectedEntries.map(callStatus);
+  let calls = selectedCalls.map((call) => call.status);
 
   const status: WorkflowRunStatus = {
     runId: sanitizeText(source.runId).value,
@@ -343,6 +404,7 @@ export function projectWorkflowRunStatus(
     ...(source.currentPhase === undefined ? {} : { currentPhase: sanitizeText(source.currentPhase).value }),
     ...(source.reason === undefined ? {} : { reason: sanitizeText(source.reason).value }),
     ...(source.errorCode === undefined ? {} : { errorCode: source.errorCode }),
+    ...(source.limits === undefined ? {} : { limits: { ...source.limits } }),
     logTail: {
       lines: logs,
       totalLines: source.logs.length,
@@ -371,8 +433,8 @@ export function projectWorkflowRunStatus(
         redacted: logSource.filter((line) => line.redacted).length,
       },
       calls: {
-        total: source.journal.length,
-        matched: matchedEntries.length,
+        total: allCalls.length,
+        matched: matchedCalls.length,
         returned: calls.length,
         shortenedResults: calls.filter((call) => call.resultTruncated).length,
         redactedResults: calls.filter((call) => call.resultRedacted).length,
@@ -657,6 +719,7 @@ export function projectRunEventForPersistence(
         ...(event.configOptions === undefined
           ? {}
           : { configOptions: projectConfigOptions(event.configOptions, state) }),
+        ...(event.timeoutMs === undefined ? {} : { timeoutMs: event.timeoutMs }),
         callIndex: event.callIndex,
       };
       break;

@@ -99,7 +99,10 @@ matches zero or more Unicode code points, `?` matches one, and backslash escapes
 (a trailing backslash is literal). Filtering precedes latest-N selection; calls are returned in
 ascending call-index order.
 
-The `WorkflowRunStatus` projection is allowlisted: it never exposes script, args, prompts,
+The `WorkflowRunStatus` projection includes the run's resolved limits. Agent call rows include their
+resolved per-attempt `timeoutMs` and terminal `errorCode`, which keeps failures such as
+`AGENT_TIMEOUT` visible even though they have no result journal row. The projection is allowlisted:
+it never exposes script, args, prompts,
 histories, journal hashes, session IDs, cwd, checkpoint text/defaults, auth context, or raw results.
 Text and result previews are redacted and capped at 512 UTF-8 bytes; results are structurally
 compacted; at most 64 phases are considered; and the serialized status is capped at 24,576 bytes
@@ -116,7 +119,7 @@ console.log(run.result, run.agentCount, run.durationMs);
 ```
 
 `runWorkflow` returns the `EngineRunResult` (meta / result / logs / phases / agentCount /
-durationMs / runId / tokenUsage / optional `agentSessions`, `fallbacks`, and `checkpointsTaken`). `WorkflowManager` stamps the terminal
+durationMs / runId / tokenUsage / resolved `effectiveLimits` / optional `agentSessions`, `fallbacks`, and `checkpointsTaken`). `WorkflowManager` stamps the terminal
 `status` / `reason` / `resetHint` on top to produce a `WorkflowRunResult`.
 
 ## The script DSL
@@ -192,9 +195,17 @@ The worktree and its edits are discarded; return the diff as data. Isolation wit
 declaration never enables non-contiguous replay.
 
 `tokenBudget` caps total spend (per-phase sub-budgets via `phase(title, { budget })`);
-`maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. Defaults
+`maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. `agentTimeoutMs` is a
+total wall-clock ceiling for each attempt. A finite per-call `timeoutMs` can tighten the ceiling but
+cannot raise or disable it; with no host ceiling, per-call `null`/omission is uncapped. Every retry
+gets a fresh clock (at most `(retries + 1) × timeout`, with retries clamped to 3). Exhaustion is a
+recoverable `AGENT_TIMEOUT`, so the call settles to `null` and frees its concurrency slot. The ACP
+runner cancels the session and closes/recycles a child that does not honor cancellation. Defaults
 are exported as `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`, and
 `DEFAULT_AGENT_TIMEOUT_MS`.
+
+New resume executions resolve limits from their own `ExecOptions`; they do not inherit the source
+run's values. Pass operational bounds again when constructing a resume.
 
 `WorkflowManager` persists run state under `~/.agentprism/workflows` by default. Hosts can
 set `new WorkflowManager({ persistenceRoot: "/absolute/data/root" })`; when omitted,

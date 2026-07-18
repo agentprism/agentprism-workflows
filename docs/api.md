@@ -78,7 +78,7 @@ manager.stop(runId);            // or manager.pause(runId), or await manager.res
 | `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and startup stale-run recovery is skipped entirely. |
 | `persistenceRoot` | `AGENTPRISM_PERSISTENCE_ROOT` env, else `~/.agentprism/workflows` | Absolute root for run state/logs. Relative paths throw. |
 | `persistence` | filesystem persistence | Custom `RunPersistence` implementation. Omit it for the default `createRunPersistence(cwd, ..., { persistenceRoot })` path. |
-| `defaultAgentTimeoutMs` | `null` (none) | Per-agent timeout default. |
+| `defaultAgentTimeoutMs` | `null` (none) | Host total-wall-clock ceiling for each agent attempt. |
 | `defaultAgentRetries` | 0 | Retries after *recoverable* agent failures. |
 | `mainModel` | — | Session model spec (registered harness prefix + verbatim id, or backend-only name) used to auto-tier explore-style agents. |
 | `sessionId` | — | Tag for new runs; `listRuns()` filters by it (`listAllRuns()` doesn't). Update via `setSessionId()`. |
@@ -100,7 +100,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `environmentKey` | Host-supplied non-git environment identity. It must content-address every persistent resource replay-safe calls can observe and remain stable for the run; git workspaces use measured HEAD + dirty digest instead. |
 | `tokenBudget` | Hard cap; once spent, `agent()` throws `TOKEN_BUDGET_EXHAUSTED`. |
 | `maxAgents` | Cap on total agent calls for the run. |
-| `agentTimeoutMs` | Per-agent timeout (`null` = none). |
+| `agentTimeoutMs` | Host total-wall-clock ceiling for each agent attempt (`null` = no host ceiling). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
 | `resumeFromRunId` | Persisted source ID for a **new** managed execution. Requires journaling, must differ from a caller-supplied new `runId`, and is mutually exclusive with `resumeJournal`. Missing sources fail with `PERSISTENCE_ERROR`. |
@@ -109,6 +109,14 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
 | `resumeJournal` | Low-level legacy positional channel. Mutually exclusive with `resumeFromRunId`/`resumePolicy`; manual use permanently marks the result legacy. Prefer manager-owned `resumeFromRunId`. |
+
+A finite `agentTimeoutMs` is an unbypassable host ceiling. An `agent({ timeoutMs })` value may
+shorten it; per-call `null` or omission means uncapped only when the host supplied no ceiling. The
+clock covers the complete attempt rather than idle time, and every retry starts a new clock. Since
+retries are clamped at 3, the maximum timeout envelope is `(agentRetries + 1) × resolved timeout`.
+An exhausted timeout settles the call to `null` with recoverable `AGENT_TIMEOUT` and frees its
+concurrency slot. A new resume execution does not inherit operational limits from its source; pass
+the desired timeout, retry, concurrency, agent-count, and token-budget values again.
 
 ### `CheckpointOptions` — in-script human gates
 
@@ -394,6 +402,8 @@ interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
+  timeoutMs?: number | null;
+  errorCode?: WorkflowErrorCode;
   resultPreview: string;
   resultRedacted: boolean;
   resultTruncated: boolean;
@@ -407,10 +417,19 @@ interface WorkflowRunStatus {
   currentPhase?: string;
   reason?: string;
   errorCode?: WorkflowErrorCode;
+  limits?: WorkflowRunLimits;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
   truncation: WorkflowRunStatusTruncation;
+}
+
+interface WorkflowRunLimits {
+  maxAgents: number;
+  tokenBudget: number | null;
+  concurrency: number;
+  agentRetries: number;
+  agentTimeoutMs: number | null;
 }
 ```
 
@@ -889,6 +908,12 @@ One agent call per invocation; returns the assistant text, or the **validated ob
 
 **Session hand-off.** `run()`'s return value is always the bare result, so the ACP session identity travels out-of-band: `onSessionOpen` fires exactly once for whichever acquisition wins — fresh `session/new`, successful `session/resume`/`session/load`, or the fresh fallback after a reopen failure — and always before that acquisition's prompt. Its `AgentSessionRef` is `{ sessionId, backendId, poolKey?, cwd, reopen: { load, resume, list } }`; `poolKey` pins the effective custom-backend spawn identity. Pair a successful call with `keepSession: true` when the host intends to reopen it. Usage/auth pause errors keep the session open automatically for managed continuation. With `continueFromSession`, the runner prefers currently advertised resume, falls back to load, and reports reattached/skipped provenance. Every non-cancellation failure through the reopen RPC cleans up and opens a fresh session with the original prompt; after reopen succeeds, the turn is committed and receives a fixed continuation instruction. The ref contains no secrets and is JSON-round-trippable.
 
+**Cancellation.** An attempt signal sends ACP `session/cancel` for that session only. If the active
+turn does not finish within five seconds, the client sends capability-gated `session/close`,
+quarantines the pooled child from new work, and disposes it after existing sibling sessions release.
+This policy is identical for every built-in and custom ACP backend. A `child_cleanup_error` returned
+by close remains observable through the runner's normal error path.
+
 **Structured output channels.** Claude and Codex keep their agent-specific schema channels authoritative. Pi, OpenCode, and opted-in custom ACP backends use the client-hosted MCP path: when `RunOptions.schema` is set and initialize advertises HTTP MCP support, the runner appends a client-hosted HTTP MCP server to `session/new.mcpServers`. The injected server is named `structured_output` (or `structured_output_2`, etc. on name collision), runs on `127.0.0.1` with an unguessable token path, and exposes `StructuredOutput`; Pi shows the namespaced alias `mcp__structured_output__StructuredOutput`. Its input schema is the requested JSON Schema and a valid call captures the result. Injected-tool schema runs are serialized per pooled connection. The common prompt-embedded schema plus validated final-text ladder remains the fallback when capture is absent or invalid. User-provided `mcpServers` are preserved and are not part of the resume hash.
 
 **Model specs**: after the engine's existing precedence resolves one effective string, the runner splits it on the first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name, that harness is selected and exactly one segment is stripped; a custom registration wins on collision. A registered harness name by itself is backend-only and issues no model `session/set_config_option`, preserving the harness default. Any other first segment sends the entire authored string unchanged to `AGENTPRISM_DEFAULT_BACKEND` (historical default `claude`), so `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not aliases. When an id remains it is the exact `configId:"model"` value: no case folding, normalization, catalog matching, bracket parsing, sibling effort/Fast option driving, retry, echo verification, or fallback. Brackets, dots, and provider-style prefixes are ordinary id characters. For pi, `pi/<provider>/<model-id>` therefore sends `<provider>/<model-id>` verbatim. Harness rejection follows the existing agent-error path; `onModelFallback` remains source-compatible but model resolution does not emit it. Live-catalog-verified examples: `claude/opus[1m]`, `codex/gpt-5.6-sol`, `opencode/zai/glm-5.2`; use backend-only `claude`, `codex`, `opencode`, or `pi` when the model is configured in the harness.
@@ -1106,7 +1131,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `SCRIPT_VALIDATION_ERROR` | no | Script failed parse/validation (bad meta, nondeterministic API, protocol mismatch). |
 | `SCRIPT_ERROR` | no | The script **crashed at runtime**: uncaught throw or unhandled promise rejection in the script body. Run fails. |
 | `WORKFLOW_ABORTED` | — | Actual cancellation (pause/stop/signal). Never used for crashes. |
-| `AGENT_TIMEOUT` | yes | Engine-enforced per-agent timeout. |
+| `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Each retry gets a fresh clock; after exhaustion the call settles to `null`, and an ACP turn that ignores cancel is closed/recycled after its grace period. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
@@ -1154,6 +1179,7 @@ interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
 interface WorkflowExecutionToolResult<T = unknown> {
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  limits: WorkflowRunLimits;
   result?: T;                            // completed only
   tokenUsage?: TokenUsage;
   logs?: string[];
@@ -1180,6 +1206,7 @@ script-backend approval, lease acquisition, and the durable initial save, then r
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
+  limits: WorkflowRunLimits;
 }
 ```
 
@@ -1191,6 +1218,11 @@ Cancelling the accepted call cannot abort the run. A fifth run fails with
 Foreground, inspect, and await do not consume slots. A background `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
 run's initial durable record, preserving multi-hop resume safety.
+
+Every newly admitted response reports its resolved `limits`. The same object appears on foreground
+results, background acknowledgements, inspect/await status, and terminal await `outcome`; legacy
+persisted records that predate limit storage may omit it. Failed call rows include their resolved
+`timeoutMs` and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT`.
 
 ```ts
 interface WorkflowAwaitMetadata {

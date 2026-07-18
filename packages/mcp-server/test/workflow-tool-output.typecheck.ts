@@ -12,18 +12,27 @@ import type {
 
 declare const status: WorkflowRunStatus;
 const lineage: WorkflowScriptLineageEntry[] = [];
+const limits = {
+  maxAgents: 1_000,
+  tokenBudget: null,
+  concurrency: 6,
+  agentRetries: 0,
+  agentTimeoutMs: null,
+};
 
 const execution: WorkflowExecutionToolResult = {
   runId: "aa-bb",
   status: "completed",
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
+  limits,
 };
 const background: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
   scriptSource: "path",
   scriptUri: "workflow://runs/aa-bb/script",
+  limits,
 };
 const inspection: WorkflowInspectionToolResult = {
   ...status,
@@ -51,11 +60,19 @@ const executionWithoutSource: WorkflowExecutionToolResult = {
   status: "completed",
   scriptUri: "workflow://runs/aa-bb/script",
 };
+// @ts-expect-error execution results require resolved limits
+const executionWithoutLimits: WorkflowExecutionToolResult = {
+  runId: "aa-bb",
+  status: "completed",
+  scriptSource: "inline",
+  scriptUri: "workflow://runs/aa-bb/script",
+};
 // @ts-expect-error background acknowledgements require scriptUri
 const backgroundWithoutUri: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
   scriptSource: "inline",
+  limits,
 };
 // @ts-expect-error inspections require the complete lineage
 const inspectionWithoutLineage: WorkflowInspectionToolResult = {
@@ -89,6 +106,7 @@ void [
   stopped,
   resourceFields,
   executionWithoutSource,
+  executionWithoutLimits,
   backgroundWithoutUri,
   inspectionWithoutLineage,
   awaitWithoutUri,

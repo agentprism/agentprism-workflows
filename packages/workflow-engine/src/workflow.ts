@@ -25,6 +25,7 @@ import type {
   WorkflowResumeCallDecision,
   WorkflowResumeSafety,
   WorkflowRunFallback,
+  WorkflowRunLimits,
   WorkflowRunResult,
 } from "@automatalabs/shared-types";
 import {
@@ -156,7 +157,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
-  /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
+  /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
   agentTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
@@ -229,6 +230,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     prompt: string;
     model?: string;
     configOptions?: Record<string, string | boolean>;
+    /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
+    timeoutMs?: number | null;
     callIndex: number;
     scope: string;
   }) => void;
@@ -317,7 +320,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Override timeout for this specific agent. null means no hard timeout. */
+  /** Per-call deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
@@ -483,6 +486,39 @@ export const CALL_INPUTS_FORMAT = 1;
 /** Observable checkpoint-input fingerprint format. Bump when its inputs or encoding change. */
 export const CHECKPOINT_INPUTS_FORMAT = 1;
 
+export interface WorkflowRunLimitOptions {
+  maxAgents?: number;
+  tokenBudget?: number | null;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+}
+
+/** Resolve the run limits once so admission, persistence, and execution report the same values. */
+export function resolveWorkflowRunLimits(options: WorkflowRunLimitOptions): WorkflowRunLimits {
+  return {
+    maxAgents: options.maxAgents ?? MAX_AGENTS_PER_RUN,
+    tokenBudget: options.tokenBudget ?? null,
+    concurrency: normalizeConcurrency(
+      options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
+    ),
+    agentRetries: normalizeAgentRetries(options.agentRetries ?? 0),
+    agentTimeoutMs: options.agentTimeoutMs !== undefined
+      ? options.agentTimeoutMs
+      : DEFAULT_AGENT_TIMEOUT_MS,
+  };
+}
+
+/** A script may shorten a host deadline, but a finite host deadline is an unbypassable ceiling. */
+export function resolveAgentTimeoutMs(
+  hostTimeoutMs: number | null,
+  callTimeoutMs: number | null | undefined,
+): number | null {
+  if (hostTimeoutMs === null) return callTimeoutMs ?? null;
+  if (callTimeoutMs === null || callTimeoutMs === undefined) return hostTimeoutMs;
+  return Math.min(hostTimeoutMs, callTimeoutMs);
+}
+
 /** Convert a workflow name into the path-free base used for its vm filename. */
 export function sanitizeVmName(name: string): string {
   const sanitized = name.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 64);
@@ -513,9 +549,13 @@ export async function runWorkflow<T = unknown>(
   // Snapshot tier routing once per run. A missing/unparseable file preserves the
   // historical runner-default behavior unless a tier falls through to mainModel.
   const modelTierConfig = loadModelTierConfig();
-  const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
-  const runAgentRetries = normalizeAgentRetries(options.agentRetries ?? 0);
+  const effectiveLimits = resolveWorkflowRunLimits(options);
+  const {
+    maxAgents,
+    concurrency,
+    agentRetries: runAgentRetries,
+    agentTimeoutMs,
+  } = effectiveLimits;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const callbackContext: WorkflowCallbackContext = { scope: runId };
   const baseCwd = options.cwd ?? process.cwd();
@@ -562,9 +602,6 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agentRunner = options.agent;
-  const concurrency = normalizeConcurrency(
-    options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
-  );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
@@ -632,6 +669,13 @@ export async function runWorkflow<T = unknown>(
     state.logs.push(text);
     logger.log(text);
   };
+
+  if (options.sharedRuntime === undefined) {
+    log(
+      `agent timeout admission: host ceiling ${agentTimeoutMs === null ? "none" : `${agentTimeoutMs}ms`} ` +
+        "total wall-clock per attempt; each retry re-arms the clock",
+    );
+  }
 
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
@@ -977,7 +1021,7 @@ export async function runWorkflow<T = unknown>(
     assertNoModelConfigOption(agentOptions.configOptions, pendingLabel);
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
-    const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
+    const timeout = resolveAgentTimeoutMs(agentTimeoutMs, agentOptions.timeoutMs);
     const retryAttempts =
       agentOptions.retries !== undefined ? normalizeAgentRetries(agentOptions.retries) : runAgentRetries;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
@@ -1064,6 +1108,7 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: displayModel,
         configOptions: agentOptions.configOptions,
+        timeoutMs: timeout,
         callIndex,
         scope: runId,
       }));
@@ -2648,13 +2693,7 @@ export async function runWorkflow<T = unknown>(
     ...(resumeReportPlan
       ? { resumeReport: buildResumeReport(resumeReportPlan, [...resumeDecisions.values()]) }
       : {}),
-    effectiveLimits: {
-      maxAgents,
-      tokenBudget: options.tokenBudget ?? null,
-      concurrency,
-      agentRetries: runAgentRetries,
-      agentTimeoutMs,
-    },
+    effectiveLimits,
     ...(abortSignaled ? { abortSignaled: true as const } : {}),
     ...(nestedWorkflows ? { nestedWorkflows: true as const } : {}),
   };
@@ -3214,7 +3253,7 @@ async function withTimeout<T>(
       }
       reject(
         new WorkflowError(
-          `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
+          `Agent "${label}" timed out after ${ms}ms of total wall-clock time in this attempt`,
           WorkflowErrorCode.AGENT_TIMEOUT,
           { recoverable: true },
         ),

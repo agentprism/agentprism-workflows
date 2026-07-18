@@ -23,6 +23,16 @@ function field(value: unknown, key: string): unknown {
   return value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
 }
 
+const LIMITS = {
+  maxAgents: 1_000,
+  tokenBudget: null,
+  concurrency: 6,
+  agentRetries: 0,
+  agentTimeoutMs: null,
+} as const;
+const ADMISSION_LOG =
+  "agent timeout admission: host ceiling none total wall-clock per attempt; each retry re-arms the clock";
+
 function inspectionFixture(status: "running" | "completed" | "aborted" = "running") {
   return {
     runId: "fixture-run",
@@ -30,6 +40,7 @@ function inspectionFixture(status: "running" | "completed" | "aborted" = "runnin
     scriptUri: "workflow://runs/fixture-run/script",
     workflowName: "fixture",
     phases: [],
+    limits: LIMITS,
     logTail: {
       lines: [],
       totalLines: 0,
@@ -56,6 +67,7 @@ const terminalOutcomeFixture = {
   runId: "fixture-run",
   status: "completed" as const,
   scriptUri: "workflow://runs/fixture-run/script",
+  limits: LIMITS,
 };
 
 function outputVariantFixtures() {
@@ -80,6 +92,7 @@ function outputVariantFixtures() {
     status: "running" as const,
     scriptSource: "inline" as const,
     scriptUri: "workflow://runs/fixture-run/script",
+    limits: LIMITS,
   };
   const execution = {
     ...terminalOutcomeFixture,
@@ -125,6 +138,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
       "fallbacks",
       "checkpointsTaken",
       "resumeReport",
+      "limits",
       "workflowName",
       "phases",
       "logTail",
@@ -140,8 +154,8 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
     assert.equal(variants.length, 5);
     assert.deepEqual(variants.map((variant) => variant.required), [
-      ["scriptSource"],
-      ["scriptSource"],
+      ["scriptSource", "limits"],
+      ["scriptSource", "limits"],
       ["workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
       ["workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
       [
@@ -170,6 +184,14 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
   }
 
   const invalid = {
+    "execution without limits": (() => {
+      const { limits: _limits, ...withoutLimits } = fixtures.execution;
+      return withoutLimits;
+    })(),
+    "background without limits": (() => {
+      const { limits: _limits, ...withoutLimits } = fixtures.background;
+      return withoutLimits;
+    })(),
     "background with execution logs": { ...fixtures.background, logs: [] },
     "background with execution usage": {
       ...fixtures.background,
@@ -409,7 +431,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.equal(pausedTail[0], "line-6");
     assert.equal(pausedTail.at(-1), "line-25");
     assert.equal(pausedTail.some((line) => line.includes(token)), false);
-    assert.match(textOf(paused), /recent run log \(last 20 of 25\):/);
+    assert.match(textOf(paused), /recent run log \(last 20 of 26\):/);
     assert.match(textOf(paused), /\n  line-6\n/);
     assert.doesNotMatch(textOf(paused), /\n  line-[1-5]\n/);
     assert.doesNotMatch(textOf(paused), /ghp_/);
@@ -424,7 +446,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.equal(failed.isError, true);
     const failedTail = field(structured(failed)?.logTail, "lines") as string[];
     assert.equal(failedTail[0], "line-6");
-    assert.match(textOf(failed), /recent run log \(last 20 of 25\):/);
+    assert.match(textOf(failed), /recent run log \(last 20 of 26\):/);
 
     const empty = await client.callTool({
       name: "workflow",
@@ -432,8 +454,8 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
         script: 'export const meta = { name: "empty-tail", description: "empty" };\nthrow new Error("boom");',
       },
     });
-    assert.deepEqual(field(structured(empty)?.logTail, "lines"), []);
-    assert.match(textOf(empty), /recent run log \(last 0 of 0\):/);
+    assert.deepEqual(field(structured(empty)?.logTail, "lines"), [ADMISSION_LOG]);
+    assert.match(textOf(empty), /recent run log \(last 1 of 1\):/);
   } finally {
     await dispose();
   }

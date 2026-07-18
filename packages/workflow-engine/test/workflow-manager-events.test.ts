@@ -446,7 +446,7 @@ const EXECUTION_EVENT_NAMES = [
 const EXPECTED_EVENT_KEYS: Record<string, string[]> = {
   log: ["message", "runId", "scope"],
   phase: ["runId", "scope", "title"],
-  agentStart: ["callIndex", "configOptions", "label", "model", "phase", "prompt", "runId", "scope"],
+  agentStart: ["callIndex", "configOptions", "label", "model", "phase", "prompt", "runId", "scope", "timeoutMs"],
   agentEnd: [
     "backendId", "callIndex", "label", "model", "modelFallbacks", "modelResolved", "phase",
     "provenance", "result", "runId", "scope", "session", "tokens", "usage", "worktree",

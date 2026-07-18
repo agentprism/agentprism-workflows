@@ -1,4 +1,4 @@
-import type { TokenUsage } from "@automatalabs/shared-types";
+import type { TokenUsage, WorkflowRunLimits } from "@automatalabs/shared-types";
 import {
   RESUME_CALL_FAILED_REASONS,
   RESUME_CALL_LIVE_REASONS,
@@ -25,6 +25,14 @@ const tokenUsageSchema = z.object({
   cost: z.number(),
   cacheRead: z.number().optional(),
   cacheWrite: z.number().optional(),
+});
+
+const workflowRunLimitsSchema = z.object({
+  maxAgents: z.number().int().positive(),
+  tokenBudget: z.number().nonnegative().nullable(),
+  concurrency: z.number().int().positive(),
+  agentRetries: z.number().int().nonnegative(),
+  agentTimeoutMs: z.number().nonnegative().nullable(),
 });
 
 const authContextSchema = z.object({
@@ -156,6 +164,7 @@ const runStatusShape = {
   currentPhase: z.string().optional(),
   reason: z.string().optional(),
   errorCode: z.string().optional(),
+  limits: workflowRunLimitsSchema.optional(),
   logTail: logTailSchema,
   calls: z.array(
     z.object({
@@ -165,6 +174,8 @@ const runStatusShape = {
       phase: z.string().optional(),
       model: z.string().optional(),
       backendId: z.string().optional(),
+      timeoutMs: z.number().nonnegative().nullable().optional(),
+      errorCode: z.string().optional(),
       resultPreview: z.string(),
       resultRedacted: z.boolean(),
       resultTruncated: z.boolean(),
@@ -192,6 +203,7 @@ const runStatusShape = {
 } as const;
 
 const executionDetailsShape = {
+  limits: workflowRunLimitsSchema.optional(),
   result: z.unknown().optional(),
   tokenUsage: tokenUsageSchema.optional(),
   logs: z.array(z.string()).optional(),
@@ -230,7 +242,7 @@ const inspectionRequired = [
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "limits"] as const;
 const executionDetailFields = [
   "result",
   "tokenUsage",
@@ -305,9 +317,9 @@ export const workflowToolOutputShape = z
     const terminal = terminalStatuses.includes(value.status as typeof terminalStatuses[number]);
     let valid: boolean;
     if (has("scriptSource")) {
-      valid = value.status === "running"
+      valid = has("limits") && (value.status === "running"
         ? hasOnlyFields(value, ["scriptSource"])
-        : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]);
+        : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]));
     } else if (has("stopped") || has("alreadyTerminal")) {
       valid =
         inspectionComplete &&
@@ -331,13 +343,13 @@ export const workflowToolOutputShape = z
     oneOf: [
       {
         title: "Workflow execution",
-        required: ["scriptSource"],
+        required: ["scriptSource", "limits"],
         properties: { status: { enum: terminalStatuses } },
         ...forbidsOutside(["scriptSource", ...executionDetailFields]),
       },
       {
         title: "Workflow background admission",
-        required: ["scriptSource"],
+        required: ["scriptSource", "limits"],
         properties: { status: { const: "running" } },
         ...forbidsOutside(["scriptSource"]),
       },
@@ -392,6 +404,7 @@ export interface WorkflowExecutionOutcome<T = unknown> {
   runId: string;
   status: Exclude<WorkflowRunResult["status"], "pending" | "running">;
   scriptUri: string;
+  limits?: WorkflowRunLimits;
   result?: T;
   tokenUsage?: WorkflowRunResult["tokenUsage"];
   logs?: string[];
@@ -404,11 +417,14 @@ export interface WorkflowExecutionOutcome<T = unknown> {
 }
 
 export interface WorkflowExecutionToolResult<T = unknown>
-  extends WorkflowExecutionOutcome<T>, WorkflowExecutionScriptResourceFields {}
+  extends WorkflowExecutionOutcome<T>, WorkflowExecutionScriptResourceFields {
+  limits: WorkflowRunLimits;
+}
 
 export interface WorkflowBackgroundAccepted extends WorkflowExecutionScriptResourceFields {
   runId: string;
   status: "running";
+  limits: WorkflowRunLimits;
 }
 
 export interface WorkflowAwaitMetadata {
@@ -450,6 +466,7 @@ export function toWorkflowExecutionOutcome<T>(
   return {
     runId: run.runId,
     status: run.status,
+    ...(run.effectiveLimits === undefined ? {} : { limits: run.effectiveLimits }),
     result: run.result,
     tokenUsage: run.tokenUsage,
     logs: run.logs,
@@ -467,8 +484,13 @@ export function toWorkflowToolResult<T>(
   run: WorkflowRunResult<T>,
   resources: WorkflowExecutionScriptResourceFields,
 ): WorkflowExecutionToolResult<T> {
+  const outcome = toWorkflowExecutionOutcome(run, resources);
+  if (outcome.limits === undefined) {
+    throw new TypeError("Current workflow execution result is missing resolved run limits");
+  }
   return {
-    ...toWorkflowExecutionOutcome(run, resources),
+    ...outcome,
+    limits: outcome.limits,
     scriptSource: resources.scriptSource,
   };
 }
