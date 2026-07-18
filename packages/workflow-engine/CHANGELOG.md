@@ -1,5 +1,16 @@
 # @automatalabs/workflow-engine
 
+## 0.28.0
+
+### Minor Changes
+
+- 58606fa: Admit resume sources across current-environment and Node/V8 drift while preserving format, manifest, and per-call safety checks. Resume eligibility now reports typed runtime and environment provenance changes through SDK and MCP result surfaces.
+
+### Patch Changes
+
+- Updated dependencies [58606fa]
+  - @automatalabs/shared-types@0.25.1
+
 ## 0.27.0
 
 ### Minor Changes

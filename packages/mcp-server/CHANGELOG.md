@@ -1,5 +1,14 @@
 # @automatalabs/mcp-server
 
+## 0.16.1
+
+### Patch Changes
+
+- 58606fa: Admit resume sources across current-environment and Node/V8 drift while preserving format, manifest, and per-call safety checks. Resume eligibility now reports typed runtime and environment provenance changes through SDK and MCP result surfaces.
+- Updated dependencies [58606fa]
+  - @automatalabs/shared-types@0.25.1
+  - @automatalabs/workflows@0.39.1
+
 ## 0.16.0
 
 ### Minor Changes
