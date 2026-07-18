@@ -443,13 +443,15 @@ resumes while excluding engine-minted `-nested<N>` scopes and scopes for deleted
 paused positional terminal save retains only inherited source rows the current execution visited,
 so an unvisited tail runs live on the next hop.
 
-Two source-wide all-live outcomes are normal calibration rather than operational errors. If any
-result row lacks a path/input fact—possible when a deep call stack passes the raw-frame cap or an
-agent `meta` value is not strict JSON—the source is `"manifest-invalid"`; ignoring that row could
-make an ambiguous sibling look unique. A Node or V8 upgrade causes `"runtime-mismatch"` for marked
-identity/new-format positional sources through exact equality, while marker-less historical
-positional journals do not depend on those fields. An engine package-version difference by itself
-never disables either strategy.
+An all-live outcome is normal calibration rather than an operational error. Missing resume
+metadata, incompatible format literals, or invalid manifest/seed state can disable new-format
+replay. If any result row lacks a path/input fact—possible when a deep call stack passes the
+raw-frame cap or an agent `meta` value is not strict JSON—the source is `"manifest-invalid"`;
+ignoring that row could make an ambiguous sibling look unique. Normally settled format-1 sources
+use the input-format positional bridge, while a format greater than the current format is
+`"runtime-mismatch"`. Node/V8 and current-environment drift appear as provenance diagnostics and
+never cause all-live. An engine package-version difference is also diagnostic and never disables
+either strategy.
 
 #### Frozen resume reason catalogs
 
