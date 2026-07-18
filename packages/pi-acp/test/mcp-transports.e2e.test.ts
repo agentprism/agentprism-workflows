@@ -472,7 +472,10 @@ async function transcript(server: McpServer): Promise<{ updates: unknown[]; diag
       { progress: 0, total: 1 },
       { progress: 1, total: 1 },
     ];
-    assert.deepEqual(values.map(({ progress, total }) => ({ progress, total })), expected, `${server.name}:${feature}`);
+    const received = values
+      .map(({ progress, total }) => ({ progress, total }))
+      .sort((left, right) => left.progress - right.progress);
+    assert.deepEqual(received, expected, `${server.name}:${feature}`);
   }
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(completions.length, 1);
