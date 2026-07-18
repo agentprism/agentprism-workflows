@@ -121,7 +121,7 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. Every retry re-arms the clock. |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
-| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits exact runtime/cwd/terminal environment and replays only uniquely matching safety-marked calls. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
+| `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible runtime/cwd/terminal environment and replays only eligible calls; pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format input/safety/environment gates. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. Wire keys must be canonical non-negative safe integers. |
 | `runId` | engine run ID | inspect/await/stop only | — | Required for inspect/await/stop; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
@@ -224,6 +224,7 @@ interface WorkflowExecutionToolResult {
   runId: string;
   status: "paused" | "completed" | "failed" | "aborted";
   limits: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
   result?: unknown; // present only on a completed run — the script's resolved value
   tokenUsage?: {
     input: number;
@@ -256,6 +257,7 @@ interface WorkflowBackgroundAccepted {
   scriptSource: "inline" | "path";
   scriptUri: string;
   limits: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
 }
 
 interface WorkflowAwaitMetadata {
@@ -303,10 +305,13 @@ type WorkflowToolResult =
 | `fallbacks` | `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message }[]` | Compatibility surface for non-resolution subsystems or third-party runners; model selection emits none; absent when empty. |
 | `checkpointsTaken` | `{ callIndex, kind, decision, source }[]` | `source` is `"live"`, `"headless-default"`, `"journal-replay"`, or `"injected"`; paused checkpoints are omitted; absent when empty. |
 | `resumeReport` | `WorkflowResumeReport` | Exact strategy/count/per-current-call correspondence for a `resumeFromRunId` execution; absent on ordinary runs. |
+| `replayEligibility` | `WorkflowReplayEligibility` | Bounded resume plan/progress: strategy, predicted and observed prefixes/counts, first non-replay, source/current engine and input formats, and non-gating operational changes. |
 
-These fields appear on foreground execution results and terminal await `outcome` objects. They are
-persisted for cold await, but never copied onto the bounded top-level `WorkflowRunStatus` returned by
-inspect/await.
+`fallbacks`, `checkpointsTaken`, and the full `resumeReport` appear on foreground execution results
+and terminal await `outcome` objects. They are persisted for cold await but are not copied onto the
+bounded top-level status. `replayEligibility` is intentionally common: a resumed background
+acknowledgement, foreground result, inspect, and both nonterminal and terminal await statuses expose
+it, and terminal await `outcome` repeats the identical final value.
 
 Resolved `limits` is a common field rather than an execution-detail field: it appears on foreground
 results, background acknowledgements, inspect/await status, stop status, and terminal await
@@ -330,6 +335,7 @@ interface WorkflowRunStatus {
   reason?: string;
   errorCode?: WorkflowErrorCode;
   limits?: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -417,7 +423,7 @@ client `resources` capability to gate these server-offered primitives.
   request cancellation, progress notifications, live checkpoint elicitation, terminal `isError`,
   and result shape.
 - **Detached admission.** `background:true` returns a running acknowledgement with `runId`,
-  `status`, `scriptSource`, `scriptUri`, resolved `limits`, and the script resource link
+  `status`, `scriptSource`, `scriptUri`, resolved `limits`, optional resume `replayEligibility`, and the script resource link
   after parsing, backend approval, one of four process-local slot reservations, lease acquisition,
   and successful persistence readback. It never awaits agent or script-body completion. A fifth
   active-or-starting request returns
@@ -442,7 +448,7 @@ client `resources` capability to gate these server-offered primitives.
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `resumeReport`; terminal text includes only its compact strategy/count line. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix and first non-replay with a derivable detail. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Engine-version differences are surfaced diagnostics, never gates.
 - **Authoritative stop.** `action:"stop"` acts on `running` and `paused` runs live in this server
   process, cancels their agent/checkpoint work, persists `aborted`, appends the durable `stopped`
   event, releases the lease, and returns the final inspection projection inline. Resume is safe

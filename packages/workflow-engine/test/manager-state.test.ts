@@ -213,7 +213,9 @@ return { count: args.count, answer }`,
       const result = await manager.runSync(script(`return cwd`));
       const persisted = manager.getPersistence().load(result.runId);
       assert.equal(persisted?.effectiveCwd, dirs.cwd);
-      assert.deepEqual(persisted?.runtime, {
+      const { engineVersion, ...runtime } = persisted?.runtime ?? {};
+      assert.match(engineVersion ?? "", /^\d+\.\d+\.\d+(?:-|$)/);
+      assert.deepEqual(runtime, {
         node: process.version,
         v8: process.versions.v8,
         pathFormat: CALL_PATH_FORMAT,

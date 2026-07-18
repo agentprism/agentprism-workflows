@@ -12,6 +12,7 @@
 
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import type {
   AgentRunner,
   AgentSessionRecord,
@@ -30,6 +31,9 @@ import type {
   WorkflowRunInspectionOptions,
   WorkflowRunResult,
   WorkflowRunStatus,
+  WorkflowReplayEligibility,
+  WorkflowReplayFirstNonReplay,
+  WorkflowReplayOperationalChange,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
 } from "@automatalabs/shared-types";
@@ -74,6 +78,8 @@ import {
 } from "./workflow.js";
 import { createWorkflowLogTail, projectWorkflowRunStatus } from "./run-observability.js";
 
+const ENGINE_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
+
 export interface ManagedRun {
   runId: string;
   status: RunStatus;
@@ -102,6 +108,7 @@ export interface ManagedRun {
   calls: WorkflowCallRecord[];
   effectiveCwd: string;
   runtime: {
+    engineVersion: string;
     node: string;
     v8: string;
     pathFormat: number;
@@ -133,6 +140,8 @@ export interface ManagedRun {
   preparedContinuation?: PreparedContinuation;
   /** Manager-owned report, incrementally updated while the engine is executing. */
   resumeReport?: WorkflowResumeReport;
+  replayEligibility?: WorkflowReplayEligibility;
+  replayEligibilityPlan?: ReplayEligibilityPlan;
   resumeReportPlan?: ResumeReportPlan;
   resumeDecisions?: Map<number, WorkflowResumeCallDecision>;
   executionMode?: PersistedRunState["executionMode"];
@@ -173,6 +182,22 @@ interface ManagerResumeExecution {
   preparedResume: PreparedResume;
   resumeJournal?: Map<number, JournalEntry>;
   injectedCheckpointReplies?: ReadonlySet<number>;
+}
+
+interface ReplayEligibilityPlan {
+  sourceRunId: string;
+  strategy: WorkflowReplayEligibility["strategy"];
+  fallbackReason?: Extract<WorkflowReplayEligibility, { strategy: "positional-v1" }>["fallbackReason"];
+  eligibility?: Extract<WorkflowReplayEligibility, { strategy: "positional-v1" }>["eligibility"];
+  disabledReason?: Extract<WorkflowReplayEligibility, { strategy: "live" }>["disabledReason"];
+  predictedReplayablePrefix: number;
+  initialFirstNonReplay?: WorkflowReplayFirstNonReplay;
+  sourceEngineVersion?: string;
+  currentEngineVersion: string;
+  engineVersionComparison: WorkflowReplayEligibility["engineVersionComparison"];
+  sourceInputsFormat?: number;
+  currentInputsFormat: number;
+  operationalChanges: WorkflowReplayOperationalChange[];
 }
 
 interface InitializedRun {
@@ -307,12 +332,42 @@ function snapshotArgs(value: unknown): ArgsSnapshot {
 
 function runtimeIdentity(): ManagedRun["runtime"] {
   return {
+    engineVersion: ENGINE_VERSION,
     node: process.version,
     v8: process.versions.v8,
     pathFormat: CALL_PATH_FORMAT,
     inputsFormat: CALL_INPUTS_FORMAT,
     checkpointInputsFormat: CHECKPOINT_INPUTS_FORMAT,
   };
+}
+
+function positionalSourceRows<T extends { index: number; scope?: string }>(
+  rows: T[],
+  sourceRunId: string,
+  persistedRunIds: ReadonlySet<string>,
+): T[] {
+  const latest = new Map<number, T>();
+  for (const row of rows) {
+    if (
+      row.scope === undefined ||
+      row.scope === sourceRunId ||
+      persistedRunIds.has(row.scope)
+    ) {
+      latest.set(row.index, row);
+    }
+  }
+  return [...latest.values()].sort((left, right) => left.index - right.index);
+}
+
+function contiguousIndexes(indexes: Iterable<number>): number {
+  const available = new Set(indexes);
+  let prefix = 0;
+  while (available.has(prefix)) prefix++;
+  return prefix;
+}
+
+function displayOperationalValue(value: number | null): string {
+  return value === null ? "none" : String(value);
 }
 
 function latestRootRows<T extends { index: number; scope?: string }>(rows: T[], runId: string): T[] {
@@ -636,6 +691,200 @@ export class WorkflowManager extends EventEmitter {
           };
   }
 
+  private operationalChanges(
+    source: PersistedRunState,
+    managed: ManagedRun,
+  ): WorkflowReplayOperationalChange[] {
+    if (!source.limits || !managed.limits) return [];
+    const options = ["agentTimeoutMs", "agentRetries", "concurrency"] as const;
+    const changes: WorkflowReplayOperationalChange[] = [];
+    for (const option of options) {
+      const sourceValue = source.limits[option];
+      const currentValue = managed.limits[option];
+      if (sourceValue === currentValue) continue;
+      changes.push({
+        option,
+        source: sourceValue,
+        current: currentValue,
+        detail:
+          `source recorded ${option}=${displayOperationalValue(sourceValue)}; ` +
+          `this run: ${displayOperationalValue(currentValue)}`,
+      });
+    }
+    return changes;
+  }
+
+  private admissionDetail(
+    admission: ResumeAdmissionDecision,
+    source: PersistedRunState,
+    managed: ManagedRun,
+  ): string | undefined {
+    if (admission.strategy !== "live") return undefined;
+    if (admission.disabledReason === "runtime-mismatch") {
+      const sourceRuntime = source.runtime;
+      const comparisons = [
+        ["node", sourceRuntime?.node, managed.runtime.node],
+        ["v8", sourceRuntime?.v8, managed.runtime.v8],
+        ["pathFormat", sourceRuntime?.pathFormat, managed.runtime.pathFormat],
+        ["inputsFormat", sourceRuntime?.inputsFormat, managed.runtime.inputsFormat],
+        [
+          "checkpointInputsFormat",
+          sourceRuntime?.checkpointInputsFormat,
+          managed.runtime.checkpointInputsFormat,
+        ],
+      ] as const;
+      const changed = comparisons.find(([, sourceValue, currentValue]) => sourceValue !== currentValue);
+      if (changed) return `source ${changed[0]}=${String(changed[1])}; this run: ${String(changed[2])}`;
+    }
+    if (admission.disabledReason === "cwd-mismatch") {
+      return "source effectiveCwd differs from this run";
+    }
+    if (admission.disabledReason === "source-not-terminal") {
+      return "source status is not terminal";
+    }
+    if (admission.disabledReason === "unsupported-format") {
+      return "source resume format is unsupported; this run supports identity-v1";
+    }
+    return undefined;
+  }
+
+  private replayEligibilityPlan(
+    admission: ResumeAdmissionDecision,
+    source: PersistedRunState,
+    managed: ManagedRun,
+    predictedReplayablePrefix: number,
+  ): ReplayEligibilityPlan {
+    const sourceEngineVersion = typeof source.runtime?.engineVersion === "string"
+      ? source.runtime.engineVersion
+      : undefined;
+    const sourceInputsFormat = Number.isSafeInteger(source.runtime?.inputsFormat)
+      ? source.runtime?.inputsFormat
+      : undefined;
+    const operationalChanges = this.operationalChanges(source, managed);
+    let initialFirstNonReplay: WorkflowReplayFirstNonReplay | undefined;
+    if (admission.strategy === "live") {
+      const detail = this.admissionDetail(admission, source, managed);
+      initialFirstNonReplay = {
+        index: 0,
+        action: "live",
+        reason: admission.disabledReason,
+        ...(detail === undefined ? {} : { detail }),
+      };
+    } else if (admission.strategy === "positional-v1" && admission.eligibility === "all-live") {
+      initialFirstNonReplay = {
+        index: 0,
+        action: "live",
+        reason: admission.fallbackReason,
+        detail: `resume fallback ${admission.fallbackReason} admits no replayable prefix`,
+      };
+    } else if (
+      predictedReplayablePrefix === 0 ||
+      (
+        Number.isSafeInteger(source.callsAllocated) &&
+        predictedReplayablePrefix < (source.callsAllocated as number)
+      )
+    ) {
+      initialFirstNonReplay = {
+        index: predictedReplayablePrefix,
+        action: "live",
+        reason: "not-recorded",
+        detail: `source has no contiguous replayable result at call ${predictedReplayablePrefix}`,
+      };
+    }
+    return {
+      sourceRunId: admission.sourceRunId,
+      strategy: admission.strategy,
+      ...(admission.strategy === "positional-v1"
+        ? { fallbackReason: admission.fallbackReason, eligibility: admission.eligibility }
+        : admission.strategy === "live"
+          ? { disabledReason: admission.disabledReason }
+          : {}),
+      predictedReplayablePrefix,
+      ...(initialFirstNonReplay === undefined ? {} : { initialFirstNonReplay }),
+      ...(sourceEngineVersion === undefined ? {} : { sourceEngineVersion }),
+      currentEngineVersion: managed.runtime.engineVersion,
+      engineVersionComparison: sourceEngineVersion === undefined
+        ? "source-unknown"
+        : sourceEngineVersion === managed.runtime.engineVersion
+          ? "same"
+          : "different",
+      ...(sourceInputsFormat === undefined ? {} : { sourceInputsFormat }),
+      currentInputsFormat: managed.runtime.inputsFormat,
+      operationalChanges,
+    };
+  }
+
+  private buildReplayEligibility(
+    plan: ReplayEligibilityPlan,
+    report: WorkflowResumeReport,
+  ): WorkflowReplayEligibility {
+    const decisions = [...report.calls].sort((left, right) => left.index - right.index);
+    const byIndex = new Map(decisions.map((decision) => [decision.index, decision] as const));
+    let replayedPrefix = 0;
+    while (byIndex.get(replayedPrefix)?.action === "replayed") replayedPrefix++;
+    const firstDecision = decisions.find((decision) => decision.action !== "replayed");
+    const operationalDetail = plan.operationalChanges.map((change) => change.detail).join("; ");
+    const firstNonReplay: WorkflowReplayFirstNonReplay | undefined = firstDecision
+      ? {
+          index: firstDecision.index,
+          action: firstDecision.action,
+          reason: firstDecision.reason,
+          ...(
+            operationalDetail.length > 0 &&
+            firstDecision.action === "live" &&
+            (firstDecision.reason === "inputs-changed" || firstDecision.reason === "positional-miss")
+              ? { detail: operationalDetail }
+              : {}
+          ),
+        }
+      : plan.initialFirstNonReplay;
+    const summary = {
+      sourceRunId: plan.sourceRunId,
+      strategy: plan.strategy,
+      ...(plan.strategy === "positional-v1"
+        ? { fallbackReason: plan.fallbackReason, eligibility: plan.eligibility }
+        : plan.strategy === "live"
+          ? { disabledReason: plan.disabledReason }
+          : {}),
+      predictedReplayablePrefix: plan.predictedReplayablePrefix,
+      replayedPrefix,
+      replayed: report.replayed,
+      live: report.live,
+      failed: report.failed,
+      ...(firstNonReplay === undefined ? {} : { firstNonReplay }),
+      ...(plan.sourceEngineVersion === undefined ? {} : { sourceEngineVersion: plan.sourceEngineVersion }),
+      currentEngineVersion: plan.currentEngineVersion,
+      engineVersionComparison: plan.engineVersionComparison,
+      ...(plan.sourceInputsFormat === undefined ? {} : { sourceInputsFormat: plan.sourceInputsFormat }),
+      currentInputsFormat: plan.currentInputsFormat,
+      operationalChanges: plan.operationalChanges,
+    };
+    const captured = cloneFrozenStrictJson(summary);
+    if (!captured.ok) throw new TypeError(`replay eligibility is not strict JSON at ${captured.path}`);
+    return captured.clone as unknown as WorkflowReplayEligibility;
+  }
+
+  private initializeResumeReporting(
+    managed: ManagedRun,
+    source: PersistedRunState,
+    admission: ResumeAdmissionDecision,
+    predictedReplayablePrefix: number,
+  ): void {
+    managed.resumeReportPlan = this.reportPlan(admission);
+    managed.resumeDecisions = new Map();
+    managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
+    managed.replayEligibilityPlan = this.replayEligibilityPlan(
+      admission,
+      source,
+      managed,
+      predictedReplayablePrefix,
+    );
+    managed.replayEligibility = this.buildReplayEligibility(
+      managed.replayEligibilityPlan,
+      managed.resumeReport,
+    );
+  }
+
   private commitResumeSeed(managed: ManagedRun, remaining: PersistedResumeSeed): void {
     managed.resumeSeed = remaining;
     try {
@@ -738,6 +987,7 @@ export class WorkflowManager extends EventEmitter {
       current: {
         effectiveCwd: managed.effectiveCwd,
         runtime: {
+          engineVersion: managed.runtime.engineVersion,
           node: managed.runtime.node,
           v8: managed.runtime.v8,
           pathFormat: managed.runtime.pathFormat,
@@ -750,12 +1000,18 @@ export class WorkflowManager extends EventEmitter {
     });
     managed.newRunResume = true;
     if (source.resume === undefined || source.legacyResume === true) managed.legacyResume = true;
-    managed.resumeReportPlan = this.reportPlan(admission);
-    managed.resumeDecisions = new Map();
-    managed.resumeReport = buildResumeReport(managed.resumeReportPlan, []);
     managed.preparedContinuation = this.buildPreparedContinuation(source);
 
     if (admission.strategy === "identity-v1") {
+      this.initializeResumeReporting(
+        managed,
+        source,
+        admission,
+        contiguousIndexes([
+          ...admission.seed.candidates.map((candidate) => candidate.recordedIndex),
+          ...(admission.seed.checkpointInjections ?? []).map((injection) => injection.recordedIndex),
+        ]),
+      );
       managed.resumeSeed = admission.seed;
       return {
         preparedResume: {
@@ -769,6 +1025,7 @@ export class WorkflowManager extends EventEmitter {
     }
 
     if (admission.strategy === "live") {
+      this.initializeResumeReporting(managed, source, admission, 0);
       return {
         preparedResume: {
           strategy: admission.strategy,
@@ -780,8 +1037,11 @@ export class WorkflowManager extends EventEmitter {
     }
 
     const sourceJournalRows = this.cloneResumeSourceValue(source.journal ?? [], source.runId);
+    const sourceCallRows = this.cloneResumeSourceValue(source.calls ?? [], source.runId);
+    const persistedRunIds = new Set(this.persistence.list().map((row) => row.runId));
     const sourceJournal = new Map(
-      latestRootRows(sourceJournalRows, source.runId).map((entry) => [entry.index, entry] as const),
+      positionalSourceRows(sourceJournalRows, source.runId, persistedRunIds)
+        .map((entry) => [entry.index, entry] as const),
     );
     const injectedCheckpointReplies = new Set<number>();
     if (admission.legacyCheckpointReply) {
@@ -797,14 +1057,21 @@ export class WorkflowManager extends EventEmitter {
       injectedCheckpointReplies.add(syntheticEntry.index);
     }
     managed.journal = latestRows([...sourceJournal.values()]);
-    managed.calls = latestRootRows(
-      this.cloneResumeSourceValue(source.calls ?? [], source.runId),
-      source.runId,
+    managed.calls = positionalSourceRows(sourceCallRows, source.runId, persistedRunIds);
+    this.initializeResumeReporting(
+      managed,
+      source,
+      admission,
+      admission.eligibility === "all-live" ? 0 : contiguousIndexes(sourceJournal.keys()),
     );
     if (admission.checkpointSeed) managed.resumeSeed = admission.checkpointSeed;
-    const sourceCalls = admission.eligibility === "legacy"
-      ? new Map<number, WorkflowCallRecord>()
-      : new Map(managed.calls.map((call) => [call.index, call] as const));
+    // Marked format-1 rows can republish matching safety/debit provenance under format 2;
+    // markerless legacy rows have no trustworthy source-call facts to promote.
+    const retainSourceCallFacts =
+      admission.eligibility !== "legacy" || admission.fallbackReason === "inputs-format-legacy";
+    const sourceCalls = retainSourceCallFacts
+      ? new Map(managed.calls.map((call) => [call.index, call] as const))
+      : new Map<number, WorkflowCallRecord>();
     return {
       preparedResume: {
         strategy: admission.strategy,
@@ -1171,6 +1438,7 @@ export class WorkflowManager extends EventEmitter {
       ...(engineResult?.resumeReport ?? managed.resumeReport
         ? { resumeReport: engineResult?.resumeReport ?? managed.resumeReport }
         : {}),
+      ...(managed.replayEligibility ? { replayEligibility: managed.replayEligibility } : {}),
       effectiveLimits: engineResult?.effectiveLimits ?? managed.limits,
       ...(engineResult?.abortSignaled || managed.abortSignaled ? { abortSignaled: true as const } : {}),
       ...(engineResult?.nestedWorkflows || managed.nestedWorkflows ? { nestedWorkflows: true as const } : {}),
@@ -1418,7 +1686,21 @@ export class WorkflowManager extends EventEmitter {
       managed.executionSettled = true;
       managed.calls = engineResult.calls ?? [];
       managed.callsAllocated = engineResult.callsAllocated;
-      managed.resumeReport = engineResult.resumeReport;
+      if (engineResult.resumeReport && managed.resumeReportPlan) {
+        managed.resumeReport = buildResumeReport(
+          managed.resumeReportPlan,
+          engineResult.resumeReport.calls,
+        );
+        engineResult.resumeReport = managed.resumeReport;
+        if (managed.replayEligibilityPlan) {
+          managed.replayEligibility = this.buildReplayEligibility(
+            managed.replayEligibilityPlan,
+            managed.resumeReport,
+          );
+        }
+      } else {
+        managed.resumeReport = engineResult.resumeReport;
+      }
       managed.limits = engineResult.effectiveLimits;
       if (engineResult.abortSignaled) managed.abortSignaled = true;
       if (engineResult.nestedWorkflows) managed.nestedWorkflows = true;
@@ -1545,6 +1827,12 @@ export class WorkflowManager extends EventEmitter {
       managed.resumeReportPlan,
       [...managed.resumeDecisions.values()],
     );
+    if (managed.replayEligibilityPlan) {
+      managed.replayEligibility = this.buildReplayEligibility(
+        managed.replayEligibilityPlan,
+        managed.resumeReport,
+      );
+    }
     this.persistRun(managed);
   }
 
@@ -1710,6 +1998,7 @@ export class WorkflowManager extends EventEmitter {
       ...(managed.resumeSourceRunId ? { resumeSourceRunId: managed.resumeSourceRunId } : {}),
       ...(managed.resumeSeed ? { resumeSeed: managed.resumeSeed } : {}),
       ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
+      ...(managed.replayEligibility ? { replayEligibility: managed.replayEligibility } : {}),
       mainModel: managed.mainModel,
       agentsDir: managed.agentsDir,
       executionMode: managed.executionMode,
@@ -2209,6 +2498,7 @@ export class WorkflowManager extends EventEmitter {
           journal: managed.journal,
           agents: managed.snapshot.agents,
           limits: managed.limits,
+          replayEligibility: managed.replayEligibility,
         },
         options,
       );
@@ -2229,6 +2519,7 @@ export class WorkflowManager extends EventEmitter {
         journal: persisted.journal ?? [],
         agents: persisted.agents ?? [],
         limits: persisted.limits,
+        replayEligibility: persisted.replayEligibility,
       },
       options,
     );

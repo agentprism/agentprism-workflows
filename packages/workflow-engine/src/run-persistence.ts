@@ -28,6 +28,7 @@ import type {
   JournalEntry,
   WorkflowCallRecord,
   WorkflowCheckpointTaken,
+  WorkflowReplayEligibility,
   WorkflowResumeReport,
   WorkflowRunFallback,
   WorkflowRunLimits,
@@ -131,6 +132,8 @@ export interface PersistedRunState {
   /** The directory the run actually executed in. */
   effectiveCwd?: string;
   runtime?: {
+    /** Producing workflow-engine package version. Diagnostic only; never an admission gate. */
+    engineVersion?: string;
     node: string;
     v8: string;
     pathFormat: number;
@@ -143,6 +146,7 @@ export interface PersistedRunState {
   readonly resumeSourceRunId?: string;
   resumeSeed?: PersistedResumeSeed;
   resumeReport?: WorkflowResumeReport;
+  replayEligibility?: WorkflowReplayEligibility;
   /** The session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;

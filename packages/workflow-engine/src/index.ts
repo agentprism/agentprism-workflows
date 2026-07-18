@@ -296,5 +296,9 @@ export type {
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayOperationalOption,
+  WorkflowReplayOperationalChange,
+  WorkflowReplayFirstNonReplay,
+  WorkflowReplayEligibility,
   TokenUsage,
 } from "@automatalabs/shared-types";

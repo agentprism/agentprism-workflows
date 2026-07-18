@@ -32,6 +32,7 @@ import type {
   WorkflowBackendConfig,
   WorkflowRunResult,
   WorkflowRunStatus,
+  WorkflowReplayEligibility,
   WorkflowResumeReport,
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
@@ -465,15 +466,57 @@ function formatCompletedSummary(run: WorkflowRunResult): string {
       `tokens: ${run.tokenUsage.total} (input ${run.tokenUsage.input}, output ${run.tokenUsage.output})  cost: $${run.tokenUsage.cost}`,
     );
   }
-  if (run.resumeReport) lines.push(formatResumeSummary(run.resumeReport));
+  if (run.replayEligibility || run.resumeReport) {
+    lines.push(formatResumeSummary(run.replayEligibility, run.resumeReport));
+  }
   return lines.join("\n");
 }
 
-function formatResumeSummary(report: WorkflowResumeReport): string {
-  const strategy = report.strategy === "positional-v1"
-    ? `${report.strategy}/${report.eligibility}`
-    : report.strategy;
-  return `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed`;
+function formatResumeSummary(
+  eligibility: WorkflowReplayEligibility | undefined,
+  report?: WorkflowResumeReport,
+): string {
+  if (!eligibility) {
+    if (!report) return "resume: eligibility unavailable";
+    const strategy = report.strategy === "positional-v1"
+      ? `${report.strategy}/${report.eligibility} (${report.fallbackReason})`
+      : report.strategy === "live"
+        ? `${report.strategy} (${report.disabledReason})`
+        : report.strategy;
+    const first = report.calls.find((decision) => decision.action !== "replayed");
+    return `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed` +
+      (first ? `; first non-replay: call ${first.index} ${first.reason}` : "");
+  }
+  const strategy = eligibility.strategy === "positional-v1"
+    ? `${eligibility.strategy}/${eligibility.eligibility} (${eligibility.fallbackReason})`
+    : eligibility.strategy === "live"
+      ? `${eligibility.strategy} (${eligibility.disabledReason})`
+      : eligibility.strategy;
+  const evaluated = eligibility.replayed + eligibility.live + eligibility.failed > 0;
+  const zeroPrefix = evaluated
+    ? eligibility.replayedPrefix === 0
+    : eligibility.predictedReplayablePrefix === 0;
+  const lines = [
+    `${zeroPrefix ? "WARNING: " : ""}resume: ${strategy}; ` +
+      `predicted replayable prefix ${eligibility.predictedReplayablePrefix}; ` +
+      `replayed prefix ${eligibility.replayedPrefix}; ` +
+      `${eligibility.replayed} replayed, ${eligibility.live} live, ${eligibility.failed} failed`,
+  ];
+  if (eligibility.firstNonReplay) {
+    lines.push(
+      `first non-replay: call ${eligibility.firstNonReplay.index} ${eligibility.firstNonReplay.reason}` +
+        (eligibility.firstNonReplay.detail ? ` — ${eligibility.firstNonReplay.detail}` : ""),
+    );
+  }
+  lines.push(
+    `engine: ${eligibility.sourceEngineVersion ?? "unknown"} -> ${eligibility.currentEngineVersion} ` +
+      `(${eligibility.engineVersionComparison}); inputs format: ` +
+      `${eligibility.sourceInputsFormat ?? "unknown"} -> ${eligibility.currentInputsFormat}`,
+  );
+  if (eligibility.operationalChanges.length > 0) {
+    lines.push(`operational changes: ${eligibility.operationalChanges.map((change) => change.detail).join("; ")}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -493,7 +536,9 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
     lines.push(`recent run log (last ${run.logTail.lines.length} of ${run.logTail.totalLines}):`);
     for (const line of run.logTail.lines) lines.push(`  ${line}`);
   }
-  if (run.resumeReport) lines.push(formatResumeSummary(run.resumeReport));
+  if (run.replayEligibility || run.resumeReport) {
+    lines.push(formatResumeSummary(run.replayEligibility, run.resumeReport));
+  }
   if (run.status === "paused") {
     // Read the STRUCTURED authContext (§2.12) — never the free-form `reason` message string.
     if (run.reason === "auth_required" && run.authContext) {
@@ -528,12 +573,18 @@ function formatRunSummary(run: WorkflowRunResult): string {
   return run.status === "completed" ? formatCompletedSummary(run) : formatTerminalSummary(run);
 }
 
-function inspectionSummaryLines(status: WorkflowRunStatus): string[] {
+function inspectionSummaryLines(
+  status: WorkflowRunStatus,
+  options: { includeReplayEligibility?: boolean } = {},
+): string[] {
   const lines = [`Workflow "${status.workflowName}" is ${status.status}.`, `runId: ${status.runId}`];
   if (status.phases.length > 0) lines.push(`phases: ${status.phases.join(", ")}`);
   if (status.currentPhase) lines.push(`current phase: ${status.currentPhase}`);
   if (status.reason) lines.push(`reason: ${status.reason}`);
   if (status.errorCode) lines.push(`error code: ${status.errorCode}`);
+  if (status.replayEligibility && options.includeReplayEligibility !== false) {
+    lines.push(formatResumeSummary(status.replayEligibility));
+  }
   lines.push(`recent run log (last ${status.logTail.lines.length} of ${status.logTail.totalLines}):`);
   for (const line of status.logTail.lines) lines.push(`  ${line}`);
   lines.push(`recent calls (${status.calls.length} of ${status.truncation.calls.matched} matching):`);
@@ -850,6 +901,9 @@ function persistedOutcome(
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
     ...(persisted.resumeReport === undefined ? {} : { resumeReport: persisted.resumeReport }),
+    ...(persisted.replayEligibility === undefined
+      ? {}
+      : { replayEligibility: persisted.replayEligibility }),
     scriptUri: workflowScriptUri(persisted.runId),
   };
 }
@@ -1003,12 +1057,16 @@ function runEventLogErrorCode(error: unknown): string | undefined {
 }
 
 function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
-  const [heading, runId, ...diagnostics] = inspectionSummaryLines(result);
+  const [heading, runId, ...diagnostics] = inspectionSummaryLines(result, {
+    includeReplayEligibility: false,
+  });
   const lines = [heading, runId];
   lines.push(
     `wait: ${result.wait.returnedBecause} after ${result.wait.elapsedMs}ms (requested ${result.wait.requestedMs}ms)`,
   );
-  if (result.outcome?.resumeReport) lines.push(formatResumeSummary(result.outcome.resumeReport));
+  if (result.replayEligibility || result.outcome?.resumeReport) {
+    lines.push(formatResumeSummary(result.replayEligibility, result.outcome?.resumeReport));
+  }
   if (result.status === "paused" && result.outcome) {
     if (result.reason === "auth_required" && result.outcome.authContext) {
       const backendId = result.outcome.authContext.backendId ?? "?";
@@ -1422,6 +1480,9 @@ export function createWorkflowServer(
               scriptSource,
               scriptUri,
               limits: admittedRun.limits,
+              ...(admittedRun.replayEligibility === undefined
+                ? {}
+                : { replayEligibility: admittedRun.replayEligibility }),
             },
             content: [
               {
@@ -1429,6 +1490,9 @@ export function createWorkflowServer(
                 text:
                   `Workflow "${workflowName}" started in the background.\n` +
                   `runId: ${started.runId}\n` +
+                  (admittedRun.replayEligibility
+                    ? `${formatResumeSummary(admittedRun.replayEligibility)}\n`
+                    : "") +
                   `Call workflow with action="await" and this runId to wait for its result, or ` +
                   `action="inspect" for an immediate status snapshot.`,
               },

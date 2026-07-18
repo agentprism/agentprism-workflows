@@ -6,6 +6,8 @@ import type {
   ResumePolicy,
   WorkflowCallRecord,
   WorkflowCallReplayProvenance,
+  WorkflowReplayEligibility,
+  WorkflowReplayOperationalChange,
   WorkflowResumeCallDecision,
   WorkflowResumeCallFailedReason,
   WorkflowResumeCallLiveReason,
@@ -23,6 +25,7 @@ const STRATEGIES = ["identity-v1", "positional-v1", "live"] as const satisfies r
 const MATCHES = ["path-hash", "unique-hash", "index-hash"] as const satisfies readonly WorkflowResumeMatch[];
 const FALLBACK_REASONS = [
   "legacy-recording",
+  "inputs-format-legacy",
   "forced-positional",
   "unsafe-recording",
   "nested-workflows",
@@ -159,6 +162,29 @@ const liveReport: WorkflowResumeReport = {
   failed: 0,
   calls: [],
 };
+const operationalChange: WorkflowReplayOperationalChange = {
+  option: "agentTimeoutMs",
+  source: 900_000,
+  current: null,
+  detail: "source recorded agentTimeoutMs=900000; this run: none",
+};
+const replayEligibility: WorkflowReplayEligibility = {
+  strategy: "positional-v1",
+  sourceRunId: "source-run",
+  fallbackReason: "inputs-format-legacy",
+  eligibility: "legacy",
+  predictedReplayablePrefix: 2,
+  replayedPrefix: 0,
+  replayed: 0,
+  live: 0,
+  failed: 0,
+  sourceEngineVersion: "0.26.0",
+  currentEngineVersion: "0.27.0",
+  engineVersionComparison: "different",
+  sourceInputsFormat: 1,
+  currentInputsFormat: 2,
+  operationalChanges: [operationalChange],
+};
 
 const legacyJournal: JournalEntry = { index: 0, hash: "legacy", result: "cached" };
 const legacyCall: WorkflowCallRecord = {
@@ -192,7 +218,7 @@ test("incremental resume shared type fixtures cover every public branch", () => 
   assert.deepEqual(POLICIES, ["auto", "positional"]);
   assert.deepEqual(STRATEGIES, ["identity-v1", "positional-v1", "live"]);
   assert.deepEqual(MATCHES, ["path-hash", "unique-hash", "index-hash"]);
-  assert.equal(FALLBACK_REASONS.length, 5);
+  assert.equal(FALLBACK_REASONS.length, 6);
   assert.equal(DISABLED_REASONS.length, 12);
   assert.equal(CALL_LIVE_REASONS.length, 14);
   assert.equal(CALL_FAILED_REASONS.length, 2);
@@ -202,6 +228,9 @@ test("incremental resume shared type fixtures cover every public branch", () => 
   assert.equal(resumeResult.resumeReport?.strategy, "identity-v1");
   assert.equal(positionalReport.eligibility, "safe-prefix");
   assert.equal(liveReport.disabledReason, "runtime-mismatch");
+  assert.equal(replayEligibility.fallbackReason, "inputs-format-legacy");
+  assert.equal(replayEligibility.predictedReplayablePrefix, 2);
+  assert.equal(replayEligibility.operationalChanges[0]?.option, "agentTimeoutMs");
 });
 
 test("legacy object literals omit every additive resume field", () => {
@@ -210,6 +239,7 @@ test("legacy object literals omit every additive resume field", () => {
   assert.equal(legacyCall.resumeSafety, undefined);
   assert.equal(legacyCall.replay, undefined);
   assert.equal(legacyResult.resumeReport, undefined);
+  assert.equal(legacyResult.replayEligibility, undefined);
   assert.equal(Object.hasOwn(legacyCall, "resumeSafety"), false);
   assert.equal(Object.hasOwn(legacyCall, "replay"), false);
   assert.equal(Object.hasOwn(legacyResult, "resumeReport"), false);

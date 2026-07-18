@@ -482,7 +482,7 @@ export const CALL_PATH_FORMAT = 1;
 /** Maximum unambiguous raw stack depth retained for call-path capture. */
 export const CALL_PATH_RAW_FRAMES = 64;
 /** Observable call-input fingerprint format. Bump when its inputs or encoding change. */
-export const CALL_INPUTS_FORMAT = 1;
+export const CALL_INPUTS_FORMAT = 2;
 /** Observable checkpoint-input fingerprint format. Bump when its inputs or encoding change. */
 export const CHECKPOINT_INPUTS_FORMAT = 1;
 
@@ -1046,8 +1046,6 @@ export async function runWorkflow<T = unknown>(
       meta: agentOptions.meta ?? null,
       promptMeta: agentOptions.promptMeta ?? null,
       label,
-      timeoutMs: timeout,
-      retries: retryAttempts,
       backends: backendsDigest,
     });
 
@@ -3018,8 +3016,6 @@ function hashCallInputs(inputs: {
   meta: unknown;
   promptMeta: unknown;
   label: unknown;
-  timeoutMs: unknown;
-  retries: unknown;
   backends: unknown;
 }): string | undefined {
   return hashCanonicalStrictJson(inputs);

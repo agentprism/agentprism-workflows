@@ -123,7 +123,7 @@ const legacyState: PersistedRunState = {
     node: "v22.0.0",
     v8: "12.4",
     pathFormat: CALL_PATH_FORMAT,
-    inputsFormat: CALL_INPUTS_FORMAT,
+    inputsFormat: 1,
   },
 };
 const identityState: PersistedRunState = {
@@ -148,10 +148,11 @@ const identityState: PersistedRunState = {
 
 test("incremental resume format constants and frozen reason arrays match the contract", () => {
   assert.equal(CALL_PATH_FORMAT, 1);
-  assert.equal(CALL_INPUTS_FORMAT, 1);
+  assert.equal(CALL_INPUTS_FORMAT, 2);
   assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
   assert.deepEqual(RESUME_FALLBACK_REASONS, [
     "legacy-recording",
+    "inputs-format-legacy",
     "forced-positional",
     "unsafe-recording",
     "nested-workflows",
@@ -235,9 +236,11 @@ test("legacy persisted state remains valid and omits additive resume fields", ()
     inputsFormat: 1,
   });
   assert.equal(json.runtime?.checkpointInputsFormat, undefined);
+  assert.equal(json.runtime?.engineVersion, undefined);
   assert.equal(json.resume, undefined);
   assert.equal(json.resumeSeed, undefined);
   assert.equal(json.resumeReport, undefined);
+  assert.equal(json.replayEligibility, undefined);
   assert.equal(Object.hasOwn(json, "resume"), false);
   assert.equal(Object.hasOwn(json, "resumeSeed"), false);
   assert.equal(Object.hasOwn(json, "resumeReport"), false);

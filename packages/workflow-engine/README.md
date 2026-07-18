@@ -99,7 +99,8 @@ matches zero or more Unicode code points, `?` matches one, and backslash escapes
 (a trailing backslash is literal). Filtering precedes latest-N selection; calls are returned in
 ascending call-index order.
 
-The `WorkflowRunStatus` projection includes the run's resolved limits. Agent call rows include their
+The `WorkflowRunStatus` projection includes the run's resolved limits and, for a new-run resume,
+its bounded `replayEligibility` admission/progress summary. Agent call rows include their
 resolved per-attempt `timeoutMs` and terminal `errorCode`, which keeps failures such as
 `AGENT_TIMEOUT` visible even though they have no result journal row. The projection is allowlisted:
 it never exposes script, args, prompts,
@@ -160,7 +161,7 @@ const again = await manager.runSync(script, { topic: "otters", expanded: true },
   resumeFromRunId: first.runId,
   resumePolicy: "auto", // default; "positional" is the migration escape hatch
 });
-console.log(again.resumeReport);
+console.log(again.replayEligibility, again.resumeReport);
 ```
 
 The manager admits exact cwd/runtime/terminal-environment state, persists the candidate seed, and
@@ -169,6 +170,15 @@ uncertain, ambiguous, unsafe, or mismatched call runs live. Same-ID `manager.res
 manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
 catalogs, checkpoint source-index rules, and filesystem preconditions are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
+
+The call identity hashes authored behavior; the separate input fingerprint covers label, per-call
+cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentTimeoutMs`,
+`agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, are operational and enter
+neither hash. Input-fingerprint formats below 2 use the named `inputs-format-legacy` positional
+bridge, including ancestor-scoped prefixes carried by ≤0.23 resume hops when the ancestor run is
+still persisted. The persisted producing engine version is diagnostic only. Background admission,
+inspection, polling, and terminal results expose the same eligibility strategy, predicted/observed
+prefix, first non-replay, version formats, and operational differences.
 
 Separately from replay correspondence, the manager builds a `PreparedContinuation` from a
 usage/auth-paused snapshot's coherent root `calls[]` × `agents[]` join. Both new-run and same-ID
@@ -205,7 +215,8 @@ are exported as `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`, an
 `DEFAULT_AGENT_TIMEOUT_MS`.
 
 New resume executions resolve limits from their own `ExecOptions`; they do not inherit the source
-run's values. Pass operational bounds again when constructing a resume.
+run's values. Pass operational bounds again when constructing a resume; changing them does not
+invalidate replay or interrupted-turn continuation.
 
 `WorkflowManager` persists run state under `~/.agentprism/workflows` by default. Hosts can
 set `new WorkflowManager({ persistenceRoot: "/absolute/data/root" })`; when omitted,
@@ -327,7 +338,7 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
   `WorkflowRunOptions`, `AgentOptions`, `CheckpointOptions`, `WorkflowAgentOptions`,
   `SharedRuntime`; `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
   `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, `PreparedContinuation`,
-  `ContinuationCandidate`, and the resume policy/report types.
+  `ContinuationCandidate`, and the resume policy/report/replay-eligibility types.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
   `ManagedRun`); `createRunPersistence`, `generateRunId`, and types `RunPersistence`,
   `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,

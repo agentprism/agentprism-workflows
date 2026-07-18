@@ -206,6 +206,7 @@ export type WorkflowResumeMatch = "path-hash" | "unique-hash" | "index-hash";
 
 export type WorkflowResumeFallbackReason =
   | "legacy-recording"
+  | "inputs-format-legacy"
   | "forced-positional"
   | "unsafe-recording"
   | "nested-workflows"
@@ -311,6 +312,75 @@ interface WorkflowResumeReportBase {
 }
 
 export type WorkflowResumeReport = WorkflowResumeReportBase &
+  (
+    | {
+        strategy: "identity-v1";
+        fallbackReason?: never;
+        disabledReason?: never;
+        eligibility?: never;
+      }
+    | {
+        strategy: "positional-v1";
+        fallbackReason: WorkflowResumeFallbackReason;
+        eligibility: "legacy" | "safe-prefix" | "all-live";
+        disabledReason?: never;
+      }
+    | {
+        strategy: "live";
+        disabledReason: WorkflowResumeDisabledReason;
+        fallbackReason?: never;
+        eligibility?: never;
+      }
+  );
+
+export type WorkflowReplayOperationalOption =
+  | "agentTimeoutMs"
+  | "agentRetries"
+  | "concurrency";
+
+/** One operational run-bound change observed between a resume source and its new run.
+ *  These values are diagnostic only and never gate replay eligibility. */
+export interface WorkflowReplayOperationalChange {
+  option: WorkflowReplayOperationalOption;
+  source: number | null;
+  current: number | null;
+  detail: string;
+}
+
+export interface WorkflowReplayFirstNonReplay {
+  index: number;
+  action: "live" | "failed";
+  reason:
+    | WorkflowResumeCallLiveReason
+    | WorkflowResumeCallFailedReason
+    | WorkflowResumeDisabledReason
+    | WorkflowResumeFallbackReason;
+  /** Safe diagnostic naming the differing admission or operational value when known. */
+  detail?: string;
+}
+
+interface WorkflowReplayEligibilityBase {
+  sourceRunId: string;
+  /** Admission-time estimate from the durable source prefix. Actual call identity is
+   *  still checked by the selected matcher before any result is replayed. */
+  predictedReplayablePrefix: number;
+  /** Contiguous replayed prefix observed so far in the new run. */
+  replayedPrefix: number;
+  replayed: number;
+  live: number;
+  failed: number;
+  firstNonReplay?: WorkflowReplayFirstNonReplay;
+  sourceEngineVersion?: string;
+  currentEngineVersion: string;
+  engineVersionComparison: "same" | "different" | "source-unknown";
+  sourceInputsFormat?: number;
+  currentInputsFormat: number;
+  operationalChanges: WorkflowReplayOperationalChange[];
+}
+
+/** Bounded resume plan and progress summary suitable for admission, polling, and
+ *  inspection responses. The full per-call decisions remain in WorkflowResumeReport. */
+export type WorkflowReplayEligibility = WorkflowReplayEligibilityBase &
   (
     | {
         strategy: "identity-v1";
@@ -468,6 +538,8 @@ export interface WorkflowRunStatus {
   errorCode?: WorkflowErrorCode;
   /** Resolved execution bounds. Absent only on legacy persisted rows that predate limits. */
   limits?: WorkflowRunLimits;
+  /** Resume eligibility and progress. Present only on a run admitted from a source run. */
+  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -536,6 +608,8 @@ export interface WorkflowRunResult<T = unknown> {
   calls?: WorkflowCallRecord[];
   /** Manager-owned correspondence report for a resumeFromRunId execution. */
   resumeReport?: WorkflowResumeReport;
+  /** Bounded admission/progress summary for a resumeFromRunId execution. */
+  replayEligibility?: WorkflowReplayEligibility;
   /** Final number of agent()/checkpoint() call indexes allocated by this engine run. */
   callsAllocated?: number;
   /** The resolved execution inputs in force for this engine run. */

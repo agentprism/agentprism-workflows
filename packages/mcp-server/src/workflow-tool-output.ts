@@ -1,4 +1,4 @@
-import type { TokenUsage, WorkflowRunLimits } from "@automatalabs/shared-types";
+import type { TokenUsage, WorkflowReplayEligibility, WorkflowRunLimits } from "@automatalabs/shared-types";
 import {
   RESUME_CALL_FAILED_REASONS,
   RESUME_CALL_LIVE_REASONS,
@@ -143,6 +143,59 @@ const resumeReportSchema = z.discriminatedUnion("strategy", [
   }),
 ]);
 
+const replayOperationalChangeSchema = z.object({
+  option: z.enum(["agentTimeoutMs", "agentRetries", "concurrency"]),
+  source: z.number().nullable(),
+  current: z.number().nullable(),
+  detail: z.string(),
+});
+
+const replayFirstNonReplaySchema = z.object({
+  index: z.number().int().nonnegative(),
+  action: z.enum(["live", "failed"]),
+  reason: z.enum([
+    ...RESUME_CALL_LIVE_REASONS,
+    ...RESUME_CALL_FAILED_REASONS,
+    ...RESUME_DISABLED_REASONS,
+    ...RESUME_FALLBACK_REASONS,
+  ]),
+  detail: z.string().optional(),
+});
+
+const replayEligibilityBaseShape = {
+  sourceRunId: z.string(),
+  predictedReplayablePrefix: z.number().int().nonnegative(),
+  replayedPrefix: z.number().int().nonnegative(),
+  replayed: z.number().int().nonnegative(),
+  live: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+  firstNonReplay: replayFirstNonReplaySchema.optional(),
+  sourceEngineVersion: z.string().optional(),
+  currentEngineVersion: z.string(),
+  engineVersionComparison: z.enum(["same", "different", "source-unknown"]),
+  sourceInputsFormat: z.number().int().nonnegative().optional(),
+  currentInputsFormat: z.number().int().nonnegative(),
+  operationalChanges: z.array(replayOperationalChangeSchema),
+} as const;
+
+const replayEligibilitySchema = z.discriminatedUnion("strategy", [
+  z.object({
+    ...replayEligibilityBaseShape,
+    strategy: z.literal("identity-v1"),
+  }),
+  z.object({
+    ...replayEligibilityBaseShape,
+    strategy: z.literal("positional-v1"),
+    fallbackReason: z.enum(RESUME_FALLBACK_REASONS),
+    eligibility: z.enum(["legacy", "safe-prefix", "all-live"]),
+  }),
+  z.object({
+    ...replayEligibilityBaseShape,
+    strategy: z.literal("live"),
+    disabledReason: z.enum(RESUME_DISABLED_REASONS),
+  }),
+]);
+
 const scriptSourceSchema = z.enum(["inline", "path"]);
 
 const scriptLineageEntrySchema = z.object({
@@ -165,6 +218,7 @@ const runStatusShape = {
   reason: z.string().optional(),
   errorCode: z.string().optional(),
   limits: workflowRunLimitsSchema.optional(),
+  replayEligibility: replayEligibilitySchema.optional(),
   logTail: logTailSchema,
   calls: z.array(
     z.object({
@@ -204,6 +258,7 @@ const runStatusShape = {
 
 const executionDetailsShape = {
   limits: workflowRunLimitsSchema.optional(),
+  replayEligibility: replayEligibilitySchema.optional(),
   result: z.unknown().optional(),
   tokenUsage: tokenUsageSchema.optional(),
   logs: z.array(z.string()).optional(),
@@ -242,7 +297,7 @@ const inspectionRequired = [
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri", "limits"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "limits", "replayEligibility"] as const;
 const executionDetailFields = [
   "result",
   "tokenUsage",
@@ -405,6 +460,7 @@ export interface WorkflowExecutionOutcome<T = unknown> {
   status: Exclude<WorkflowRunResult["status"], "pending" | "running">;
   scriptUri: string;
   limits?: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
   result?: T;
   tokenUsage?: WorkflowRunResult["tokenUsage"];
   logs?: string[];
@@ -425,6 +481,7 @@ export interface WorkflowBackgroundAccepted extends WorkflowExecutionScriptResou
   runId: string;
   status: "running";
   limits: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
 }
 
 export interface WorkflowAwaitMetadata {
@@ -467,6 +524,7 @@ export function toWorkflowExecutionOutcome<T>(
     runId: run.runId,
     status: run.status,
     ...(run.effectiveLimits === undefined ? {} : { limits: run.effectiveLimits }),
+    ...(run.replayEligibility === undefined ? {} : { replayEligibility: run.replayEligibility }),
     result: run.result,
     tokenUsage: run.tokenUsage,
     logs: run.logs,

@@ -40,6 +40,7 @@ const RESUME_MATCHES = new Set(["path-hash", "unique-hash", "index-hash"]);
 const RESUME_SAFETY = new Set(["declared-read-only", "isolated-worktree"]);
 
 export interface ResumeRuntimeIdentity {
+  engineVersion?: string;
   node: string;
   v8: string;
   pathFormat: number;
@@ -793,11 +794,13 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   if (source.effectiveCwd !== current.effectiveCwd) {
     return liveDecision(sourceRunId, requestedPolicy, "cwd-mismatch");
   }
+  const inputsFormatLegacy =
+    source.runtime.inputsFormat < 2 && current.runtime.inputsFormat === 2;
   if (
     source.runtime.node !== current.runtime.node ||
     source.runtime.v8 !== current.runtime.v8 ||
     source.runtime.pathFormat !== current.runtime.pathFormat ||
-    source.runtime.inputsFormat !== current.runtime.inputsFormat ||
+    (!inputsFormatLegacy && source.runtime.inputsFormat !== current.runtime.inputsFormat) ||
     source.runtime.checkpointInputsFormat !== current.runtime.checkpointInputsFormat
   ) {
     return liveDecision(sourceRunId, requestedPolicy, "runtime-mismatch");
@@ -807,6 +810,16 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   }
   if (!environmentsEqual(resume.terminalEnvironment, current.environment)) {
     return liveDecision(sourceRunId, requestedPolicy, "environment-mismatch");
+  }
+  if (inputsFormatLegacy) {
+    return {
+      strategy: "positional-v1",
+      sourceRunId,
+      requestedPolicy,
+      fallbackReason: "inputs-format-legacy",
+      eligibility: "legacy",
+      ...(reply ? { legacyCheckpointReply: reply } : {}),
+    };
   }
 
   const manifest = validateManifest(source, sourceRunId);

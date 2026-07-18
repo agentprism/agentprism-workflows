@@ -1,4 +1,4 @@
-import type { WorkflowRunStatus } from "@automatalabs/workflows";
+import type { WorkflowReplayEligibility, WorkflowRunStatus } from "@automatalabs/workflows";
 
 import type {
   WorkflowBackgroundAccepted,
@@ -19,6 +19,19 @@ const limits = {
   agentRetries: 0,
   agentTimeoutMs: null,
 };
+const replayEligibility: WorkflowReplayEligibility = {
+  strategy: "identity-v1",
+  sourceRunId: "source-run",
+  predictedReplayablePrefix: 1,
+  replayedPrefix: 0,
+  replayed: 0,
+  live: 0,
+  failed: 0,
+  currentEngineVersion: "0.27.0",
+  engineVersionComparison: "source-unknown",
+  currentInputsFormat: 2,
+  operationalChanges: [],
+};
 
 const execution: WorkflowExecutionToolResult = {
   runId: "aa-bb",
@@ -26,6 +39,7 @@ const execution: WorkflowExecutionToolResult = {
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
   limits,
+  replayEligibility,
 };
 const background: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
@@ -33,6 +47,7 @@ const background: WorkflowBackgroundAccepted = {
   scriptSource: "path",
   scriptUri: "workflow://runs/aa-bb/script",
   limits,
+  replayEligibility,
 };
 const inspection: WorkflowInspectionToolResult = {
   ...status,

@@ -139,6 +139,10 @@ export type {
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayOperationalOption,
+  WorkflowReplayOperationalChange,
+  WorkflowReplayFirstNonReplay,
+  WorkflowReplayEligibility,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,

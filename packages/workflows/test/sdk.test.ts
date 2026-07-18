@@ -158,6 +158,7 @@ import type {
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayEligibility,
   WorkflowRecordedError,
 } from "../src/index.js";
 import { __setDefaultRunnerFactoryForTests } from "../src/isolation.js";
@@ -266,15 +267,17 @@ type IncrementalResumeSurface = [
   WorkflowCallReplayProvenance,
   WorkflowResumeCallDecision,
   WorkflowResumeReport,
+  WorkflowReplayEligibility,
 ];
 void (undefined as unknown as IncrementalResumeSurface);
 
 test("incremental resume constants are re-exported by the SDK facade", () => {
   assert.equal(CALL_PATH_FORMAT, 1);
-  assert.equal(CALL_INPUTS_FORMAT, 1);
+  assert.equal(CALL_INPUTS_FORMAT, 2);
   assert.equal(CHECKPOINT_INPUTS_FORMAT, 1);
   assert.deepEqual(RESUME_FALLBACK_REASONS, [
     "legacy-recording",
+    "inputs-format-legacy",
     "forced-positional",
     "unsafe-recording",
     "nested-workflows",

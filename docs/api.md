@@ -172,7 +172,8 @@ const next = await manager.runSync(script, { maxRounds: 8 }, {
   resumePolicy: "auto", // default; use "positional" only as a migration escape hatch
 });
 
-next.resumeReport; // correspondence for this execution; absent on ordinary/same-ID runs
+next.replayEligibility; // bounded admission/progress summary
+next.resumeReport;      // per-call correspondence; absent on ordinary/same-ID runs
 ```
 
 `runDynamicWorkflow(currentScript, { args: currentArgs, exec: { resumeFromRunId } })` exposes the
@@ -255,12 +256,59 @@ type WorkflowResumeReport = WorkflowResumeReportBase &
       }
     | { strategy: "live"; disabledReason: WorkflowResumeDisabledReason }
   );
+
+interface WorkflowReplayOperationalChange {
+  option: "agentTimeoutMs" | "agentRetries" | "concurrency";
+  source: number | null;
+  current: number | null;
+  detail: string;
+}
+
+interface WorkflowReplayEligibilityBase {
+  sourceRunId: string;
+  predictedReplayablePrefix: number;
+  replayedPrefix: number;
+  replayed: number;
+  live: number;
+  failed: number;
+  firstNonReplay?: {
+    index: number;
+    action: "live" | "failed";
+    reason:
+      | WorkflowResumeCallLiveReason
+      | WorkflowResumeCallFailedReason
+      | WorkflowResumeDisabledReason
+      | WorkflowResumeFallbackReason;
+    detail?: string;
+  };
+  sourceEngineVersion?: string;
+  currentEngineVersion: string;
+  engineVersionComparison: "same" | "different" | "source-unknown";
+  sourceInputsFormat?: number;
+  currentInputsFormat: number;
+  operationalChanges: WorkflowReplayOperationalChange[];
+}
+
+type WorkflowReplayEligibility = WorkflowReplayEligibilityBase &
+  (
+    | { strategy: "identity-v1" }
+    | {
+        strategy: "positional-v1";
+        fallbackReason: WorkflowResumeFallbackReason;
+        eligibility: "legacy" | "safe-prefix" | "all-live";
+      }
+    | { strategy: "live"; disabledReason: WorkflowResumeDisabledReason }
+  );
 ```
 
 `WorkflowRunResult.resumeReport?` and persisted state carry this report for completed, paused, and
-failed resumed runs; ordinary and same-ID recovery runs omit it. MCP foreground results and
-terminal await `outcome` preserve the structured report, while human text contains only the
-compact `resume: <strategy> (<replayed> replayed, <live> live, <failed> failed)` line.
+failed resumed runs; ordinary and same-ID recovery runs omit it. `replayEligibility` is the bounded
+plan/progress surface for every new-run resume. The MCP background acknowledgement, foreground
+result, inspect status, and nonterminal/terminal await status carry it; terminal await `outcome`
+carries the identical final value plus the complete `resumeReport`. Human text names the strategy,
+predicted and observed prefixes, counts, first non-replay and detail when known, source/current
+engine and input formats, and any non-gating operational changes. A zero predicted or observed
+prefix is prefixed with `WARNING`.
 
 #### Identity, safety, and filesystem boundary
 
@@ -290,6 +338,14 @@ safety. The option never reaches `AgentRunner` and changes neither call-hash nor
 bytes. Source and current rows must prove the same safety class, so adding the option cannot bless
 an old cached result.
 
+An agent call's identity hash covers prompt, resolved model, authored mode/config options/tier,
+phase, agent type and resolved definition, and schema. Its separate input fingerprint covers the
+resolved label, per-call cwd, resolved isolation, `keepSession`, images, MCP servers, metadata,
+prompt metadata, and the approved script-backend digest. Host `agentTimeoutMs`, `agentRetries`, and
+`concurrency`, plus per-call `timeoutMs` and `retries`, are operational bounds and enter neither
+hash. They may change on a new-run resume or an interrupted-turn continuation without rejecting an
+otherwise matching call.
+
 Identity matching first considers the original exact group `(kind, call path, identity hash)`. One
 candidate with an equal input fingerprint replays as `"path-hash"`; duplicates are permanently
 ambiguous. With no exact candidate, exactly one original `(kind, identity hash, inputsHash)` row
@@ -299,16 +355,21 @@ matcher never pairs by occurrence ordinal/source order and never uses isolation'
 fallback. Stable explicit labels matter because runner-visible label changes alter `inputsHash`.
 
 Before any new-format cache is considered, admission requires a terminal non-aborted,
-non-isolation source; exact `effectiveCwd`; exact full Node, V8, and fingerprint format versions;
-complete bijective journal/manifest data; and equality between the source's quiescent terminal
-environment and the environment measured at admission. Git identity is exact HEAD plus dirty
-digest. Non-git hosts must supply the same `environmentKey`, which must content-address every
-persistent resource safe calls can observe. The host must exclude other writers from source start
-through terminal capture and again from admission through the resumed run's terminal capture; a
-run-ID lease does not lock a workspace.
+non-isolation source; exact `effectiveCwd`; exact full Node, V8, call-path, and checkpoint-input
+formats; a compatible agent-input format; complete bijective journal/manifest data; and equality
+between the source's quiescent terminal environment and the environment measured at admission.
+Input formats below 2 take the positional compatibility bridge; a format greater than the current
+format is `runtime-mismatch`. Git identity is exact HEAD plus dirty digest. Non-git hosts must
+supply the same `environmentKey`, which must content-address every persistent resource safe calls
+can observe. The host must exclude other writers from source start through terminal capture and
+again from admission through the resumed run's terminal capture; a run-ID lease does not lock a
+workspace. The runtime block also records the producing workflow-engine package version. Missing
+or different engine versions are diagnostics in `replayEligibility`, never admission gates.
 
 Automatic policy selects:
 
+- `"positional-v1"` / `"legacy"` with `fallbackReason: "inputs-format-legacy"` for a marked source
+  whose input-fingerprint format is below 2 and whose other admission facts agree;
 - `"identity-v1"` only for a stable source whose represented agent results are safety-marked and
   whose checkpoint results are proven host decisions;
 - `"positional-v1"` / `"safe-prefix"` for a structurally valid, start-to-terminal stable source
@@ -340,30 +401,33 @@ must pass cwd/runtime/terminal-environment admission plus per-call input, safety
 gates. There is no force-identity option. Marker-less recordings and permanent `legacyResume`
 artifacts use historical hash-only positional matching because their newer facts do not exist.
 Manual `resumeJournal` and same-ID `resume()`/`resumeInBackground()` always enter that legacy arm
-and cannot be laundered into an identity-capable hop.
+and cannot be laundered into an identity-capable hop. Aborted or `abortSignaled` sources are never
+served from this arm.
 
-Two fail-safe compatibility changes are intentional. The common terminal gate now rejects aborted
-or `abortSignaled` marker-less/legacy sources instead of serving their journal (advertised MCP
-resume flows were already limited to paused runs). Also, a paused positional-v1 terminal save drops
-inherited source rows the current execution never visited. In a double-hop pause, that old bridged
-tail therefore runs live on hop two instead of replaying from a row absent from hop one's own
-manifest.
+Format-1 fingerprints are never reinterpreted as format 2. The `inputs-format-legacy` bridge uses
+the established hash-only index/prefix matcher, and every selected row is re-journaled under the
+target's format 2 runtime so its next hop can use identity matching. Positional new-run preparation
+accepts a journal/call row only when its scope is absent, equals the immediate source ID, or names a
+run still persisted in the same run directory. This recovers carried prefixes from ≤0.23 chained
+resumes while excluding engine-minted `-nested<N>` scopes and scopes for deleted ancestors. A
+paused positional terminal save retains only inherited source rows the current execution visited,
+so an unvisited tail runs live on the next hop.
 
 Two source-wide all-live outcomes are normal calibration rather than operational errors. If any
 result row lacks a path/input fact—possible when a deep call stack passes the raw-frame cap or an
 agent `meta` value is not strict JSON—the source is `"manifest-invalid"`; ignoring that row could
-make an ambiguous sibling look unique. A Node or V8 upgrade causes `"runtime-mismatch"` for every
-new-format cache through exact equality, while marker-less legacy journals retain historical
-positional replay. Relaxing that asymmetry requires a new persisted format literal; identity-v1
-bytes are never reinterpreted.
+make an ambiguous sibling look unique. A Node or V8 upgrade causes `"runtime-mismatch"` for marked
+identity/new-format positional sources through exact equality, while marker-less historical
+positional journals do not depend on those fields. An engine package-version difference by itself
+never disables either strategy.
 
 #### Frozen resume reason catalogs
 
 The runtime arrays below are exported by `@automatalabs/workflow-engine` and re-exported by the
 facade. Their literal unions live in `@automatalabs/shared-types`:
 
-- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `forced-positional`, `unsafe-recording`,
-  `nested-workflows`, `legacy-resume`.
+- `RESUME_FALLBACK_REASONS`: `legacy-recording`, `inputs-format-legacy`, `forced-positional`,
+  `unsafe-recording`, `nested-workflows`, `legacy-resume`.
 - `RESUME_DISABLED_REASONS`: `unsupported-format`, `source-not-terminal`, `abort-residue`,
   `isolation-recording`, `resume-metadata-missing`, `manifest-invalid`, `cwd-mismatch`,
   `runtime-mismatch`, `environment-missing`, `environment-mismatch`,
@@ -418,6 +482,7 @@ interface WorkflowRunStatus {
   reason?: string;
   errorCode?: WorkflowErrorCode;
   limits?: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -1189,6 +1254,7 @@ interface WorkflowExecutionToolResult<T = unknown> {
   fallbacks?: WorkflowRunFallback[];
   checkpointsTaken?: WorkflowCheckpointTaken[];
   resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
+  replayEligibility?: WorkflowReplayEligibility;
 }
 ```
 
@@ -1207,6 +1273,7 @@ interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
   limits: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
 }
 ```
 
@@ -1217,7 +1284,8 @@ Cancelling the accepted call cannot abort the run. A fifth run fails with
 `Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
 Foreground, inspect, and await do not consume slots. A background `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
-run's initial durable record, preserving multi-hop resume safety.
+run's initial durable record, preserving multi-hop resume safety. Its acknowledgement includes the
+admission-time `replayEligibility` prediction before the script body is allowed to execute.
 
 Every newly admitted response reports its resolved `limits`. The same object appears on foreground
 results, background acknowledgements, inspect/await status, and terminal await `outcome`; legacy

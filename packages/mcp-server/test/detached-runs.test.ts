@@ -776,6 +776,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     });
     const secondId = runIdOf(secondAccepted);
     assert.notEqual(secondId, sourceId);
+    assert.equal(field(structured(secondAccepted)?.replayEligibility, "predictedReplayablePrefix"), 10);
     const secondAwait = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: secondId, waitMs: 1_000 },
@@ -786,7 +787,15 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     assert.equal(field(secondReport, "strategy"), "identity-v1");
     assert.equal(field(secondReport, "replayed"), 10);
     assert.equal(field(secondReport, "live"), 2);
-    assert.match(textOf(secondAwait), /^resume: identity-v1, 10 replayed, 2 live, 0 failed$/m);
+    assert.equal(field(structured(secondAwait)?.replayEligibility, "replayedPrefix"), 10);
+    assert.deepEqual(
+      structured(secondAwait)?.replayEligibility,
+      field(structured(secondAwait)?.outcome, "replayEligibility"),
+    );
+    assert.match(
+      textOf(secondAwait),
+      /^resume: identity-v1; predicted replayable prefix 10; replayed prefix 10; 10 replayed, 2 live, 0 failed$/m,
+    );
     const repeated = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: secondId, waitMs: 0 },
@@ -819,6 +828,7 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     terminalRunId = thirdId;
     assert.notEqual(thirdId, sourceId);
     assert.notEqual(thirdId, secondId);
+    assert.equal(field(structured(thirdAccepted)?.replayEligibility, "predictedReplayablePrefix"), 12);
     const thirdAwait = await client.callTool({
       name: "workflow",
       arguments: { action: "await", runId: thirdId, waitMs: 1_000 },
@@ -829,13 +839,19 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     assert.equal(field(thirdReport, "strategy"), "identity-v1");
     assert.equal(field(thirdReport, "replayed"), 12);
     assert.equal(field(thirdReport, "live"), 0);
-    assert.match(textOf(thirdAwait), /^resume: identity-v1, 12 replayed, 0 live, 0 failed$/m);
+    const thirdEligibility = structured(thirdAwait)?.replayEligibility;
+    assert.equal(field(thirdEligibility, "replayedPrefix"), 12);
+    assert.deepEqual(thirdEligibility, field(structured(thirdAwait)?.outcome, "replayEligibility"));
+    assert.match(
+      textOf(thirdAwait),
+      /^resume: identity-v1; predicted replayable prefix 12; replayed prefix 12; 12 replayed, 0 live, 0 failed$/m,
+    );
     const inspected = await client.callTool({
       name: "workflow",
       arguments: { action: "inspect", runId: thirdId },
     });
-    assert.equal(Object.hasOwn(structured(inspected) ?? {}, "resumeReport"), false);
-    assert.doesNotMatch(textOf(inspected), /resume:/);
+    assert.deepEqual(structured(inspected)?.replayEligibility, thirdEligibility);
+    assert.match(textOf(inspected), /resume: identity-v1/);
     assert.equal(existsSync(lock), false, "await did not acquire the paused run's lease");
   } finally {
     await dispose();
@@ -852,7 +868,14 @@ test("MCP multi-hop background resume preserves all eleven agents under each new
     const persistedReport = field(structured(persisted)?.outcome, "resumeReport");
     assert.equal(field(persistedReport, "strategy"), "identity-v1");
     assert.equal(field(persistedReport, "replayed"), 12);
-    assert.match(textOf(persisted), /^resume: identity-v1, 12 replayed, 0 live, 0 failed$/m);
+    assert.deepEqual(
+      structured(persisted)?.replayEligibility,
+      field(structured(persisted)?.outcome, "replayEligibility"),
+    );
+    assert.match(
+      textOf(persisted),
+      /^resume: identity-v1; predicted replayable prefix 12; replayed prefix 12; 12 replayed, 0 live, 0 failed$/m,
+    );
   } finally {
     await cold.dispose();
   }

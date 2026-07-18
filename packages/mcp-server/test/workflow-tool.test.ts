@@ -138,6 +138,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
       "fallbacks",
       "checkpointsTaken",
       "resumeReport",
+      "replayEligibility",
       "limits",
       "workflowName",
       "phases",

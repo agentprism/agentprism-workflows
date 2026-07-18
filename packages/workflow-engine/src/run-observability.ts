@@ -18,6 +18,7 @@ import type {
   WorkflowRunInspectionOptions,
   WorkflowRunLimits,
   WorkflowRunStatus,
+  WorkflowReplayEligibility,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { RunStatus } from "./run-persistence.js";
@@ -42,6 +43,7 @@ export interface RunObservabilitySource {
   journal: JournalEntry[];
   agents?: RunObservabilityAgent[];
   limits?: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
 }
 
 export interface RunObservabilityAgent {
@@ -405,6 +407,9 @@ export function projectWorkflowRunStatus(
     ...(source.reason === undefined ? {} : { reason: sanitizeText(source.reason).value }),
     ...(source.errorCode === undefined ? {} : { errorCode: source.errorCode }),
     ...(source.limits === undefined ? {} : { limits: { ...source.limits } }),
+    ...(source.replayEligibility === undefined
+      ? {}
+      : { replayEligibility: source.replayEligibility }),
     logTail: {
       lines: logs,
       totalLines: source.logs.length,
