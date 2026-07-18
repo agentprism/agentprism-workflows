@@ -302,9 +302,11 @@ implementation, and per-agent timeout/retry defaults.
 
 A finite run-level `agentTimeoutMs` is the ceiling for every attempt. Script-level `timeoutMs` may
 tighten it but cannot raise or disable it; without a host ceiling, per-call `null`/omission is
-uncapped. Retries each get a fresh clock (retries are clamped at 3). After the final timeout, the
-call resolves to `null` with recoverable `AGENT_TIMEOUT`, releases its concurrency slot, and the ACP
-runner closes/recycles a backend session that ignores cancellation.
+uncapped. The clock covers total attempt wall time rather than idle time. Retries each get a fresh
+clock, so the maximum envelope is `(resolved retries + 1) × resolved timeout` (retries are clamped
+at 3). After the final timeout, the call resolves to `null` with recoverable `AGENT_TIMEOUT`,
+releases its concurrency slot, and the ACP runner closes/recycles a backend session that ignores
+cancellation.
 
 `cancelAgentCall(runId, callIndex)` is the stateful host seam for a single live attempt. It returns
 `WorkflowAgentCallCancellation` after the failed record and agent-end state are committed, while

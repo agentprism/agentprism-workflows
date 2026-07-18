@@ -48,6 +48,10 @@ timeout is recoverable `AGENT_TIMEOUT`: the call resolves to `null`, releases it
 and asks the ACP session to cancel. A session that keeps running after the cancellation grace is
 closed where supported and its pooled child is recycled.
 
+Every new run, including one admitted with `resumeFromRunId`, resolves host limits from that run's
+request. It does not inherit `agentTimeoutMs`, retries, concurrency, agent-count, or token-budget
+values from its source, so pass every operational bound the resumed execution should use.
+
 ## Model specs & routing
 
 A `model` string is resolved solely from its first segment, then delegated to the harness:
@@ -352,6 +356,7 @@ interface WorkflowBackgroundAccepted {
   scriptSource: "inline" | "path";
   scriptUri: string;
   limits: WorkflowRunLimits;
+  replayEligibility?: WorkflowReplayEligibility;
 }
 
 interface WorkflowAwaitMetadata {
@@ -492,6 +497,7 @@ interface WorkflowRunStatus {
   reason?: string;
   errorCode?: string;
   limits?: WorkflowRunLimits; // absent only on legacy persisted records
+  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };

@@ -120,10 +120,12 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 A finite `agentTimeoutMs` is an unbypassable host ceiling. An `agent({ timeoutMs })` value may
 shorten it; per-call `null` or omission means uncapped only when the host supplied no ceiling. The
 clock covers the complete attempt rather than idle time, and every retry starts a new clock. Since
-retries are clamped at 3, the maximum timeout envelope is `(agentRetries + 1) × resolved timeout`.
+retries are clamped at 3, the maximum timeout envelope is `(resolved retries + 1) × resolved timeout`.
 An exhausted timeout settles the call to `null` with recoverable `AGENT_TIMEOUT` and frees its
-concurrency slot. A new resume execution does not inherit operational limits from its source; pass
-the desired timeout, retry, concurrency, agent-count, and token-budget values again.
+concurrency slot. The runner cancels the ACP turn; after a five-second grace, an uncooperative turn
+is closed where supported and its pooled child is quarantined and recycled after sibling sessions
+drain. A new resume execution does not inherit operational limits from its source; pass the desired
+timeout, retry, concurrency, agent-count, and token-budget values again.
 
 ### `CheckpointOptions` — in-script human gates
 
@@ -1225,6 +1227,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `SCRIPT_ERROR` | no | The script **crashed at runtime**: uncaught throw or unhandled promise rejection in the script body. Run fails. |
 | `WORKFLOW_ABORTED` | — | Actual cancellation (pause/stop/signal). Never used for crashes. |
 | `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Each retry gets a fresh clock; after exhaustion the call settles to `null`, and an ACP turn that ignores cancel is closed/recycled after its grace period. |
+| `AGENT_CANCELLED` | yes | The host selected one in-flight agent. It settles to `null`, skips retries, leaves the run and siblings live, and creates a failed call record but no replayable journal result. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |

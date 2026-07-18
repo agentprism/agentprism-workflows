@@ -89,6 +89,9 @@ From [`src/index.ts`](./src/index.ts):
 
 **Errors** (runtime, not just types)
 - `WorkflowError` (class) + `WorkflowErrorCode` (enum) + `WorkflowErrorOptions`.
+- `AGENT_TIMEOUT` identifies exhaustion of a recoverable total-wall-clock attempt cap. The engine
+  retries only within its configured bound, then settles the call to `null`; every retry gets a
+  fresh clock.
 - `AGENT_CANCELLED` identifies a host-selected in-flight call. The engine settles that call to
   `null` without retrying or aborting the owning run; the failed row is observable but is not a
   replayable journal result.
@@ -126,7 +129,10 @@ From [`src/index.ts`](./src/index.ts):
   [incremental resume API](../../docs/api.md#content-addressed-incremental-resume). The
   `crash-residue` fallback identifies a crash snapshot reconciled to `paused` / `interrupted`
   without a quiescent terminal environment; eligibility is legacy positional only when its
-  admission environment still matches, otherwise all calls are live.
+  admission environment still matches, otherwise all calls are live. `inputs-format-legacy`
+  identifies a normally settled source below input-fingerprint format 2 that uses hash-only
+  positional replay. Producing/current engine versions are diagnostics in
+  `WorkflowReplayEligibility` and never gate replay.
 - `WorkflowCallRecord` — the terminal call manifest, including optional `path`, agent/checkpoint
   `inputsHash`, `resumeSafety`, and manager-owned replay provenance. Old object literals remain
   valid because every incremental-resume field is optional and omitted when unset.
