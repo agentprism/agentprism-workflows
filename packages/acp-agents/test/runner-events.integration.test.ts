@@ -4,6 +4,7 @@
 // typed bus -> on() listeners — is exercised; only the agent on the far end is faked.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type {
   AcpEventContext,
   AcpRunnerEventMap,
@@ -130,7 +131,16 @@ const ALL_SESSION_UPDATES: AcpSessionUpdate[] = [
 
 test("callIndex reaches every session event, survives tombstones and retries, and stays off-wire", async () => {
   const callIndex = 987654321;
+  const initializeMeta = {
+    vendor: "event-fixture",
+    nested: { flags: ["complete", "frozen"] },
+  };
   const { cwd, readLog } = configure({
+    initialize: {
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: { sessionCapabilities: { close: {} } },
+      _meta: initializeMeta,
+    },
     turns: [
       {
         toolCall: { title: "Read file", kind: "read" },
@@ -200,6 +210,25 @@ test("callIndex reaches every session event, survives tombstones and retries, an
   }
   assert.ok(observed.every(({ event }) => event.callIndex === callIndex));
   assert.ok(observed.every(({ event }) => event.runId === "run-call-index"));
+  assert.ok(
+    observed.every(({ event }) =>
+      assert.deepEqual(event.initializeMeta, initializeMeta) === undefined
+    ),
+  );
+  for (const sessionId of opened) {
+    const events = observed.filter(({ event }) => event.sessionId === sessionId);
+    assert.ok(events.length > 0);
+    assert.ok(
+      events.every(({ event }) =>
+        event.initializeMeta === events[0].event.initializeMeta
+      ),
+      "one stable metadata snapshot is shared by every event for a session",
+    );
+  }
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(observed[0].event)),
+    observed[0].event,
+  );
   assert.equal(new Set(opened).size, 2, "retry opened a distinct ACP session");
   assert.ok(opened.every((sessionId) => !sessionId.includes(String(callIndex))));
   assert.equal(lateUpdateAfterClose, true, "late update resolved correlation from the tombstone");
@@ -210,6 +239,7 @@ test("callIndex reaches every session event, survives tombstones and retries, an
   for (const entry of newSessionRequests) {
     assert.equal("callIndex" in entry.params, false);
     assert.equal(JSON.stringify(entry.params).includes("callIndex"), false);
+    assert.equal(JSON.stringify(entry.params).includes("event-fixture"), false);
     assert.deepEqual(entry.params._meta, { runId: "run-call-index" });
   }
 });

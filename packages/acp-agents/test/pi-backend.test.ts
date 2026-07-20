@@ -28,7 +28,6 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
 test("PiBackend exposes the standard injected structured-output posture", () => {
   const backend = new PiBackend();
   assert.equal(backend.id, "pi");
-  assert.equal(backend.stripsRoutingPrefix, true);
   assert.equal(backend.embedSchemaInPrompt, true);
   assert.equal(backend.injectStructuredOutputTool, true);
   assert.equal(backend.customCapabilities, undefined);

@@ -607,6 +607,9 @@ npx @automatalabs/workflows config claude --json    # machine-readable report
 
 Harness names are the routing names: built-in `claude` / `codex` / `opencode` / `pi` plus any custom backend registered via the `AGENTPRISM_BACKENDS` env var (registered customs also join the no-argument default set). Each harness opens one session without a prompt — zero tokens — and its catalog is read fresh; a harness that cannot spawn or authenticate reports `probed: false` with the reason and never blocks the others.
 
+The no-argument built-in sequence comes from `BUILTIN_BACKEND_IDS`; authoring prose describes the
+current registry rows and does not define a separate supported-backend list.
+
 | flag | meaning |
 |---|---|
 | `--cwd <dir>` | session cwd for the probes (default: the current directory — harnesses may resolve project-level config, and hence their catalog, from it) |

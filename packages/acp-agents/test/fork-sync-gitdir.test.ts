@@ -1,10 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { existsSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // scripts/check-acp-deps.mjs fork-sync check, exercised end-to-end against hermetic fixtures.
@@ -22,6 +31,24 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../scripts/check-acp-deps.mjs");
 const DEAD_REGISTRY = "http://127.0.0.1:9";
+
+function resolveGitBinary(): string {
+  const candidates = process.platform === "win32" ? ["git.exe", "git.cmd", "git"] : ["git"];
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    for (const name of candidates) {
+      const candidate = join(directory, name);
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch {
+        // Keep searching PATH.
+      }
+    }
+  }
+  throw new Error("git executable is required for fork-sync tests");
+}
+
+const REAL_GIT = resolveGitBinary();
 
 // git-location env vars that must never leak into the setup git calls below.
 const GIT_LOCATION_ENV = [
@@ -88,6 +115,31 @@ function runGate(env: Record<string, string>): string {
     env: cleanEnv({ AGENTPRISM_NPM_REGISTRY: DEAD_REGISTRY, GIT_TERMINAL_PROMPT: "0", ...env }),
   });
   return `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+}
+
+function installGitFailureInterceptor(tmp: string): { bin: string; log: string } {
+  const bin = join(tmp, "intercept-bin");
+  const log = join(tmp, "git-calls.log");
+  mkdirSync(bin, { recursive: true });
+  const executable = join(bin, "git");
+  writeFileSync(executable, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+appendFileSync(process.env.AGENTPRISM_TEST_GIT_LOG, JSON.stringify(args) + "\\n");
+const command = args[0] === "-C" ? args[2] : args[0];
+if (command === process.env.AGENTPRISM_TEST_GIT_FAIL) {
+  process.stderr.write("injected " + command + " failure\\n");
+  process.exit(86);
+}
+const result = spawnSync(process.env.AGENTPRISM_TEST_REAL_GIT, args, {
+  env: process.env,
+  stdio: "inherit",
+});
+process.exit(result.status ?? 1);
+`);
+  chmodSync(executable, 0o755);
+  return { bin, log };
 }
 
 test("fork-sync honours -C and ignores a hook-leaked GIT_DIR (#162)", { timeout: 120_000 }, () => {
@@ -167,6 +219,83 @@ test("fork-sync clones to the temp dir when no working clone exists, and reuses 
   }
 });
 
+test("a disposable broken clone is deleted and re-cloned exactly once", { timeout: 120_000 }, () => {
+  const tmp = mkdtempSync(join(tmpdir(), "acp-fork-sync-"));
+  try {
+    const { originBare, upstreamBare } = makeForkFixture(tmp);
+    const scratch = join(tmp, "scratch");
+    const disposable = join(scratch, "codex-acp");
+    const wrongBare = join(tmp, "remotes", "wrong-owner", "wrong-repo");
+    mkdirSync(scratch);
+    initRepo(wrongBare, true);
+    git("clone", "--quiet", wrongBare, disposable);
+
+    const out = runGate({
+      AGENTPRISM_CODEX_ACP_DIR: join(tmp, "does-not-exist"),
+      AGENTPRISM_CODEX_ACP_ORIGIN_URL: originBare,
+      AGENTPRISM_CODEX_ACP_UPSTREAM_URL: upstreamBare,
+      TMPDIR: scratch,
+    });
+
+    assert.equal(
+      out.split("no local fork clone found — cloning").length - 1,
+      1,
+      `the one-repair contract must perform exactly one replacement clone:\n${out}`,
+    );
+    assert.ok(out.includes("in sync"), out);
+    assert.equal(git("-C", disposable, "remote", "get-url", "origin").trim(), originBare);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("working-clone fetch, ls-remote, and pull failures are single-attempt and never repaired", { timeout: 120_000 }, () => {
+  const source = readFileSync(SCRIPT, "utf8");
+  const gitWrapper = /execFileSync\("git",[\s\S]*?timeout:\s*([0-9_]+)/.exec(source);
+  assert.ok(gitWrapper, "the gate must keep one central synchronous Git wrapper");
+  assert.equal(Number(gitWrapper[1].replaceAll("_", "")), 120_000);
+
+  for (const operation of ["fetch", "ls-remote", "pull"] as const) {
+    const tmp = mkdtempSync(join(tmpdir(), `acp-fork-${operation}-failure-`));
+    try {
+      const { fork } = makeForkFixture(tmp);
+      const sentinel = join(fork, "WORKING_CLONE_SENTINEL");
+      writeFileSync(sentinel, "must survive a failed gate\n");
+      git("-C", fork, "add", "WORKING_CLONE_SENTINEL");
+      git("-C", fork, "commit", "-m", "working clone sentinel");
+      git("-C", fork, "push", "--quiet", "origin", "main");
+      const interceptor = installGitFailureInterceptor(tmp);
+
+      const out = runGate({
+        PATH: `${interceptor.bin}${delimiter}${process.env.PATH ?? ""}`,
+        AGENTPRISM_CODEX_ACP_DIR: fork,
+        AGENTPRISM_TEST_GIT_LOG: interceptor.log,
+        AGENTPRISM_TEST_GIT_FAIL: operation,
+        AGENTPRISM_TEST_REAL_GIT: REAL_GIT,
+      });
+
+      const calls = readFileSync(interceptor.log, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      const commandOf = (args: string[]): string => args[0] === "-C" ? args[2] : args[0];
+      const failedCalls = calls.filter((args) => commandOf(args) === operation);
+      assert.equal(failedCalls.length, 1, `${operation} must not be retried:\n${JSON.stringify(calls)}`);
+      if (operation === "pull") {
+        assert.ok(failedCalls[0].includes("--ff-only"), JSON.stringify(failedCalls[0]));
+      }
+      assert.equal(calls.some((args) => commandOf(args) === "clone"), false, JSON.stringify(calls));
+      assert.ok(out.includes(`injected ${operation} failure`), out);
+      assert.ok(out.includes("could not verify fork sync"), out);
+      assert.ok(out.includes("fails closed"), out);
+      assert.ok(existsSync(sentinel), `${operation} failure deleted or repaired the working clone`);
+      assert.ok(!out.includes("no local fork clone found — cloning"), out);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
 test("fork-sync blocks on a dirty working clone", { timeout: 120_000 }, () => {
   const tmp = mkdtempSync(join(tmpdir(), "acp-fork-sync-"));
   try {
@@ -176,6 +305,8 @@ test("fork-sync blocks on a dirty working clone", { timeout: 120_000 }, () => {
     assert.ok(out.includes("uncommitted changes"), out);
     assert.ok(out.includes("could not verify fork sync"), out);
     assert.ok(out.includes("fails closed"), out);
+    assert.ok(existsSync(join(fork, "WIP")), "a selected working clone must never be deleted or repaired");
+    assert.ok(!out.includes("no local fork clone found — cloning"), out);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

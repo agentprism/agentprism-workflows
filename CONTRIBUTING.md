@@ -28,7 +28,7 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 |---|---|
 | `packages/shared-types` | The `AgentRunner` seam + shared types. |
 | `packages/workflow-engine` | The deterministic engine (realm, parallel/pipeline, journal/resume, budget, worktree). |
-| `packages/acp-agents` | ACP client + Claude/Codex/OpenCode/custom backends (the `AgentRunner` implementation, pooling, auth/session lifecycle). |
+| `packages/acp-agents` | ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, pooling, auth/session lifecycle). |
 | `packages/mcp-server` | The stdio MCP server / composition root (bin `agentprism-workflow`; workflow + auth tools). |
 | `packages/workflows` | The importable SDK facade. |
 | `packages/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` events. |
@@ -46,8 +46,8 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 `pnpm test` runs the full deterministic suite without credentials. Five files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
 
-- `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, and OpenCode structured-output/pooling paths.
-- `packages/acp-agents/test/auth.live.e2e.test.ts` drives the three first-class auth profiles; individual cases have additional credential/gateway gates.
+- `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, OpenCode, and pi structured-output/pooling paths.
+- `packages/acp-agents/test/auth.live.e2e.test.ts` drives the four built-in auth profiles; individual cases have additional credential/gateway gates.
 - `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_CONTINUATION_LIVE_E2E=1` plus its backend credentials.
 - `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation and additionally requires `AGENTPRISM_ISOLATION_LIVE_E2E=1` plus backend credentials.
 - `packages/pi-acp/test/live.e2e.test.ts` drives Pi structured output, a real HTTP MCP tool round-trip, and tracked-bash stop/reap; it additionally requires `AGENTPRISM_PI_E2E_MODEL` and that model's provider key.
@@ -76,6 +76,22 @@ CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI e
 ### When the dependency gate blocks
 
 The gate failing anywhere — pre-push, a PR's required check, or the release workflow — means the same thing: a tracked upstream moved (or freshness could not be verified), so **all merges and releases are blocked; merging the maintenance PR into `main` unblocks them**. Triage in this order:
+
+The authored backend registry generates the preinstall-safe snapshot at
+`scripts/acp-backends.manifest.json`. After changing a built-in definition, regenerate and check
+that snapshot before running the zero-dependency gate:
+
+```bash
+pnpm generate:acp-backends-manifest
+pnpm check:acp-backends-manifest
+node scripts/check-acp-deps.mjs
+```
+
+The generator/check runs after install because it imports the TypeScript registry and verifies
+installed npm-server engine declarations. The final command intentionally reads only repository
+JSON and Node built-ins, so it remains valid before `pnpm install`. A malformed, stale, empty, or
+inconsistent manifest blocks before any network request; fix the named backend/field and regenerate
+instead of editing the JSON by hand.
 
 1. **Identify what is stale** from the gate output: an ACP library behind npm `latest`, the codex-acp fork missing upstream commits, or a wrapped runtime lagging inside a current adapter.
 2. **Read the upstream changes before bumping** — the release notes/changelog, and for substantial jumps the source diff of the surfaces we integrate against. Decide which of three shapes this is:

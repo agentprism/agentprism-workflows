@@ -61,12 +61,13 @@ import {
   type AcpEventSink,
   type AcpRunnerEventMap,
 } from "./events.js";
-import type { Backend, BuiltinBackendId } from "./backend.js";
+import type { Backend } from "./backend.js";
 import { InteractiveSession, type InteractiveSessionOptions } from "./interactive.js";
-import { ClaudeBackend } from "./backends/claude.js";
-import { CodexBackend } from "./backends/codex.js";
-import { OpenCodeBackend } from "./backends/opencode.js";
-import { PiBackend } from "./backends/pi.js";
+import {
+  BUILTIN_BACKENDS,
+  BUILTIN_BACKEND_IDS,
+  builtinBackend,
+} from "./backends/builtins.js";
 import { CustomAcpBackend } from "./backends/custom.js";
 import {
   registryWithRunBackends,
@@ -532,7 +533,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
   /** Ids of every configured backend (built-ins + AcpRunnerOptions.backends). */
   listBackends(): string[] {
-    const ids = new Set<string>(["claude", "codex", "opencode", "pi"]);
+    const ids = new Set<string>(BUILTIN_BACKEND_IDS);
     for (const name of this.backends.keys()) ids.add(name);
     return [...ids];
   }
@@ -1475,19 +1476,6 @@ export function selectBackend(opts: { model?: string; tier?: string }, registry?
   return resolveModelRoute(opts.model ?? opts.tier, registry).backend;
 }
 
-function builtinBackend(id: BuiltinBackendId): Backend {
-  switch (id) {
-    case "claude":
-      return new ClaudeBackend();
-    case "codex":
-      return new CodexBackend();
-    case "opencode":
-      return new OpenCodeBackend();
-    case "pi":
-      return new PiBackend();
-  }
-}
-
 interface ModelRoute {
   backend: Backend;
   modelSpec: string | undefined;
@@ -1504,14 +1492,8 @@ function resolveModelRoute(spec: string | undefined, registry?: BackendRegistry)
   const custom = registry?.get(firstSegment);
   if (custom) return { backend: new CustomAcpBackend(custom), modelSpec: inner };
 
-  if (
-    firstSegment === "claude" ||
-    firstSegment === "codex" ||
-    firstSegment === "opencode" ||
-    firstSegment === "pi"
-  ) {
-    return { backend: builtinBackend(firstSegment), modelSpec: inner };
-  }
+  const builtIn = builtinBackend(firstSegment);
+  if (builtIn) return { backend: builtIn, modelSpec: inner };
 
   return { backend: defaultBackend(registry), modelSpec: spec };
 }
@@ -1525,6 +1507,9 @@ function sessionRefFor(session: SessionHandle, backend: Backend, cwd: string): A
     sessionId: session.sessionId,
     backendId: backend.id,
     poolKey: backend.poolKey ?? backend.id,
+    ...(session.initializeMeta !== undefined
+      ? { initializeMeta: session.initializeMeta }
+      : {}),
     cwd,
     reopen: {
       load: caps?.supportsLoadSession === true,
@@ -1646,8 +1631,11 @@ function defaultBackend(registry?: BackendRegistry): Backend {
     const config = registry.get(name);
     if (config) return new CustomAcpBackend(config);
   }
-  if (name === "opencode" || name === "codex" || name === "pi") return builtinBackend(name);
-  return builtinBackend("claude");
+  if (name) {
+    const builtIn = builtinBackend(name);
+    if (builtIn) return builtIn;
+  }
+  return BUILTIN_BACKENDS.claude.create();
 }
 
 function asciiLowercase(value: string): string {

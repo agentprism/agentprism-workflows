@@ -10,7 +10,7 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { isWorkflowError, WorkflowErrorCode, type AgentUsage, type McpServerConfig } from "@automatalabs/shared-types";
-import { AcpAgentRunner } from "../src/index.js";
+import { AcpAgentRunner, BUILTIN_BACKEND_IDS } from "../src/index.js";
 import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
@@ -837,15 +837,16 @@ test("an unadvertised Fast-mode token stays inside the id without a fallback eve
 test("backend-only specs select no model for every built-in harness", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   const runner = makeRunner();
-  for (const model of ["claude", "codex", "opencode", "pi"]) {
+  for (const model of BUILTIN_BACKEND_IDS) {
     assert.equal(await runner.run("hi", { model, cwd }), "ok");
   }
   assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 0);
 });
 
-test("routing strips at most one segment and sends authored brackets, dots, and provider prefixes byte-for-byte", async () => {
+test("routing preserves every recognized remainder and every unknown full spec byte-for-byte", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   const fallbacks: string[] = [];
+  const resolved: string[] = [];
   const runner = makeRunner();
   const cases = [
     ["claude/anthropic/claude.4[high]", "anthropic/claude.4[high]"],
@@ -854,17 +855,37 @@ test("routing strips at most one segment and sends authored brackets, dots, and 
     ["pi/openrouter/vendor/model.5[max]", "openrouter/vendor/model.5[max]"],
     ["anthropic/claude.4[high]", "anthropic/claude.4[high]"],
     ["claude/codex/gpt.5[high]", "codex/gpt.5[high]"],
+    ["claude/", ""],
+    ["ClAuDe/MiXeD/Case", "MiXeD/Case"],
+    ["codex/  spaced ! model  ", "  spaced ! model  "],
+    ["opencode/模型/Ä", "模型/Ä"],
+    ["CLÄUDE/model", "CLÄUDE/model"],
   ] as const;
   for (const [model] of cases) {
     assert.equal(
-      await runner.run("hi", { model, cwd, onModelFallback: (spec) => fallbacks.push(spec) }),
+      await runner.run("hi", {
+        model,
+        cwd,
+        onModelResolved: (value) => resolved.push(value),
+        onModelFallback: (spec) => fallbacks.push(spec),
+      }),
       "ok",
     );
   }
+  assert.equal(
+    await runner.run("tier", {
+      tier: "CoDeX/Tier/Value",
+      cwd,
+      onModelResolved: (value) => resolved.push(value),
+    }),
+    "ok",
+  );
 
   const calls = readLog().filter((entry) => entry.method === "setSessionConfigOption");
-  assert.deepEqual(calls.map((entry) => entry.params?.configId), cases.map(() => "model"));
-  assert.deepEqual(calls.map((entry) => entry.params?.value), cases.map(([, value]) => value));
+  const expected = [...cases.map(([, value]) => value), "Tier/Value"];
+  assert.deepEqual(calls.map((entry) => entry.params?.configId), expected.map(() => "model"));
+  assert.deepEqual(calls.map((entry) => entry.params?.value), expected);
+  assert.deepEqual(resolved, expected);
   assert.deepEqual(fallbacks, []);
 });
 

@@ -10,6 +10,7 @@
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
+import type { AuthProfile } from "../auth/auth-profile.js";
 import type {
   Backend,
   ProviderErrorClassification,
@@ -19,18 +20,37 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { codexAuthProfile } from "../auth/auth-profiles.js";
 import { GATED_CUSTOM_META_KEYS } from "../capabilities.js";
+import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
 import { toStrictJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
+import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
 
+/** Codex auth adaptation, including its existing spawn-time pre-auth environment channel. */
+export const codexAuthProfile: AuthProfile = {
+  backendId: "codex",
+  clientAuthCapabilities: ({ onAuth }) => ({ terminal: false, gateway: onAuth }),
+  describe: (_method, base) => base,
+  buildMeta: (_method, resolution) => resolution.meta,
+  spawnAuthEnv: (intent) => {
+    if (intent.methodId !== "api-key" && intent.methodId !== "gateway") return undefined;
+    const meta = intent.authenticateMeta;
+    return {
+      DEFAULT_AUTH_REQUEST: JSON.stringify({
+        methodId: intent.methodId,
+        ...(meta ? { _meta: meta } : {}),
+      }),
+    };
+  },
+};
+
 export class CodexBackend implements Backend {
   readonly id = "codex" as const;
-  /** Pure-data codex auth profile (§3.3): no terminal, gateway follows `onAuth`, and the
-   *  `DEFAULT_AUTH_REQUEST` spawn-env lever for api-key/gateway intents. */
-  readonly authProfile = codexAuthProfile;
+
+  constructor(readonly authProfile: AuthProfile = codexAuthProfile) {}
+
   readonly customCapabilities = {
     namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
     gatedKeys: GATED_CUSTOM_META_KEYS,
@@ -89,6 +109,34 @@ export class CodexBackend implements Backend {
     return parseFinalJson(source.finalMessageText());
   }
 }
+
+export const codexBackendDefinition = defineBuiltinBackend({
+  id: "codex",
+  authProfile: codexAuthProfile,
+  create: (authProfile) => new CodexBackend(authProfile),
+  release: {
+    engine: { node: ">=22" },
+    server: { kind: "npm-package", package: "@automatalabs/codex-acp" },
+    freshness: {
+      npm: ["@agentclientprotocol/sdk", "@automatalabs/codex-acp"],
+      forks: [
+        {
+          package: "@automatalabs/codex-acp",
+          envDir: "AGENTPRISM_CODEX_ACP_DIR",
+          defaultDirs: ["$HOME/codex-acp"],
+          tempCloneName: "codex-acp",
+          originUrl: "https://github.com/VikashLoomba/codex-acp.git",
+          originUrlEnv: "AGENTPRISM_CODEX_ACP_ORIGIN_URL",
+          upstreamUrl: "https://github.com/agentclientprotocol/codex-acp.git",
+          upstreamUrlEnv: "AGENTPRISM_CODEX_ACP_UPSTREAM_URL",
+          upstreamRemote: "upstream",
+        },
+      ],
+      wrappedRuntimes: [],
+    },
+  },
+  protocolCoverage: BUILTIN_PROTOCOL_COVERAGE.codex,
+});
 
 function providerUsageLimit(
   providerCode: string,

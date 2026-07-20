@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "backends": [
+    {
+      "id": "claude",
+      "engine": {
+        "node": ">=22"
+      },
+      "server": {
+        "kind": "npm-package",
+        "package": "@agentclientprotocol/claude-agent-acp"
+      },
+      "freshness": {
+        "npm": [
+          "@agentclientprotocol/sdk",
+          "@agentclientprotocol/claude-agent-acp"
+        ],
+        "forks": [],
+        "wrappedRuntimes": [
+          {
+            "adapterPackage": "@agentclientprotocol/claude-agent-acp",
+            "runtimePackage": "@anthropic-ai/claude-agent-sdk"
+          }
+        ]
+      }
+    },
+    {
+      "id": "codex",
+      "engine": {
+        "node": ">=22"
+      },
+      "server": {
+        "kind": "npm-package",
+        "package": "@automatalabs/codex-acp"
+      },
+      "freshness": {
+        "npm": [
+          "@agentclientprotocol/sdk",
+          "@automatalabs/codex-acp"
+        ],
+        "forks": [
+          {
+            "package": "@automatalabs/codex-acp",
+            "envDir": "AGENTPRISM_CODEX_ACP_DIR",
+            "defaultDirs": [
+              "$HOME/codex-acp"
+            ],
+            "tempCloneName": "codex-acp",
+            "originUrl": "https://github.com/VikashLoomba/codex-acp.git",
+            "originUrlEnv": "AGENTPRISM_CODEX_ACP_ORIGIN_URL",
+            "upstreamUrl": "https://github.com/agentclientprotocol/codex-acp.git",
+            "upstreamUrlEnv": "AGENTPRISM_CODEX_ACP_UPSTREAM_URL",
+            "upstreamRemote": "upstream"
+          }
+        ],
+        "wrappedRuntimes": []
+      }
+    },
+    {
+      "id": "opencode",
+      "engine": {
+        "node": ">=22"
+      },
+      "server": {
+        "kind": "system-command",
+        "command": "opencode",
+        "optionalPackageProbe": "opencode-ai"
+      },
+      "freshness": {
+        "npm": [
+          "@agentclientprotocol/sdk"
+        ],
+        "forks": [],
+        "wrappedRuntimes": []
+      }
+    },
+    {
+      "id": "pi",
+      "engine": {
+        "node": ">=22.19.0"
+      },
+      "server": {
+        "kind": "workspace-package",
+        "package": "@automatalabs/pi-acp",
+        "path": "packages/pi-acp"
+      },
+      "freshness": {
+        "npm": [
+          "@agentclientprotocol/sdk",
+          "@earendil-works/pi-coding-agent"
+        ],
+        "forks": [],
+        "wrappedRuntimes": []
+      }
+    }
+  ]
+}

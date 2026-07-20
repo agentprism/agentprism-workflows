@@ -122,13 +122,21 @@ test("reactive: -32000 -> onAuth env resolution -> retry-once -> success (no pau
     calls += 1;
     return { outcome: "env", values: { FAKE_AUTH_TOKEN: "secret-value" } };
   };
-  const result = await makeRunner({ onAuth, authCapabilities: { gateway: true } }).run("hi", {
+  const runner = makeRunner({ onAuth, authCapabilities: { gateway: true } });
+  const opened: Array<Record<string, unknown>> = [];
+  runner.on("session_open", (event) => opened.push(event));
+  const result = await runner.run("hi", {
     model: "claude",
     cwd,
     label: "reactive",
   });
   assert.equal(result, "ok");
   assert.equal(calls, 1);
+  assert.equal(opened.length, 1, "only the successful retry opens a registered session");
+  assert.deepEqual(opened[0]?.initializeMeta, {
+    fixture: "inline-auth-initialize",
+    nested: { stable: true },
+  });
   // The unauthenticated -32000 and the authenticated session ran on DIFFERENT processes (§2.6 gap-3):
   // the stale connection was recycled and a fresh process spawned WITH the env overlay.
   const sessions = newSessions(readLog());

@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
+import type { AuthProfile } from "../auth/auth-profile.js";
 import type {
   Backend,
   ProviderErrorClassification,
@@ -14,17 +15,25 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { opencodeAuthProfile } from "../auth/auth-profiles.js";
+import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
 import { toJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
+import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
 
+/** OpenCode auth adaptation: its terminal login follows host TTY and has no gateway flow. */
+export const opencodeAuthProfile: AuthProfile = {
+  backendId: "opencode",
+  clientAuthCapabilities: ({ terminal }) => ({ terminal, gateway: false }),
+  describe: (_method, base) => base,
+};
+
 export class OpenCodeBackend implements Backend {
   readonly id = "opencode" as const;
-  /** Pure-data opencode auth profile (§3.4): terminal follows the host TTY; no gateway/logout. */
-  readonly authProfile = opencodeAuthProfile;
-  readonly stripsRoutingPrefix = true;
+
+  constructor(readonly authProfile: AuthProfile = opencodeAuthProfile) {}
+
   readonly embedSchemaInPrompt = true;
   readonly injectStructuredOutputTool = true;
 
@@ -71,6 +80,26 @@ export class OpenCodeBackend implements Backend {
     return parseFinalJson(source.finalMessageText());
   }
 }
+
+export const opencodeBackendDefinition = defineBuiltinBackend({
+  id: "opencode",
+  authProfile: opencodeAuthProfile,
+  create: (authProfile) => new OpenCodeBackend(authProfile),
+  release: {
+    engine: { node: ">=22" },
+    server: {
+      kind: "system-command",
+      command: "opencode",
+      optionalPackageProbe: "opencode-ai",
+    },
+    freshness: {
+      npm: ["@agentclientprotocol/sdk"],
+      forks: [],
+      wrappedRuntimes: [],
+    },
+  },
+  protocolCoverage: BUILTIN_PROTOCOL_COVERAGE.opencode,
+});
 
 function providerUsageLimit(
   providerCode: string | undefined,

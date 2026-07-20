@@ -10,7 +10,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { probeHarnessConfig, formatHarnessConfigReport } from "../src/config.js";
 import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
-import type { SessionConfigOption } from "@automatalabs/acp-agents";
+import {
+  BUILTIN_BACKEND_IDS,
+  type SessionConfigOption,
+} from "@automatalabs/acp-agents";
 
 const ROOT = resolve(import.meta.dirname, "../../..");
 const CLI = resolve(import.meta.dirname, "../src/cli.ts");
@@ -88,11 +91,11 @@ test("default targets are the built-ins; catalogs and probe cwd flow through", a
       const report = await probeHarnessConfig({ cwd: HOME });
       assert.equal(report.ok, true);
       assert.equal(report.exitCode, 0);
-      assert.deepEqual(probes.map((probe) => probe.spec), ["claude", "codex", "opencode", "pi"]);
+      assert.deepEqual(probes.map((probe) => probe.spec), BUILTIN_BACKEND_IDS);
       assert.ok(probes.every((probe) => probe.cwd === HOME));
       assert.deepEqual(
         report.harnessOptions.map((harness) => harness.backendId),
-        ["claude", "codex", "opencode", "pi"],
+        BUILTIN_BACKEND_IDS,
       );
       assert.ok(report.harnessOptions.every((harness) => harness.probed));
       assert.deepEqual(report.harnessOptions[0].options, ADVERTISED_OPTIONS);
@@ -118,7 +121,7 @@ test("registered custom backends join the default target list (env and programma
   try {
     await withEnv("AGENTPRISM_BACKENDS", JSON.stringify({ browser: { command: "browser-acp" } }), async () => {
       const report = await probeHarnessConfig({ backends: { visual: { command: "visual-acp" } } });
-      assert.deepEqual(probes, ["claude", "codex", "opencode", "pi", "browser", "visual"]);
+      assert.deepEqual(probes, [...BUILTIN_BACKEND_IDS, "browser", "visual"]);
       assert.equal(report.ok, true);
     });
   } finally {
@@ -245,7 +248,7 @@ test("CLI: no-arg config probes every built-in harness and exits 0", () => {
   assert.equal(report.ok, true);
   assert.deepEqual(
     report.harnessOptions.map((harness: { backendId: string }) => harness.backendId),
-    ["claude", "codex", "opencode", "pi"],
+    BUILTIN_BACKEND_IDS,
   );
   const model = report.harnessOptions[0].options.find((option: { id: string }) => option.id === "model");
   assert.ok(

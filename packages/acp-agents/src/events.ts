@@ -29,7 +29,7 @@ export type AcpUpdateKind = AcpSessionUpdate["sessionUpdate"];
 export interface AcpEventContext {
   /** ACP session id this event pertains to. */
   sessionId: string;
-  /** Backend that produced it ("claude" | "codex" | "opencode" | "pi" | custom name). */
+  /** Registry built-in or custom backend that produced it. */
   backendId: BackendId;
   /** `RunOptions.label` of the originating run(), if one was set. */
   label?: string;
@@ -37,6 +37,8 @@ export interface AcpEventContext {
   runId?: string;
   /** `RunOptions.callIndex` for the agent() call that opened this session, when supplied. */
   callIndex?: number;
+  /** Per-session snapshot of initialize-response `_meta`, omitted when absent or null. */
+  initializeMeta?: Readonly<Record<string, unknown>>;
 }
 
 /** Per-discriminant events: key = ACP `sessionUpdate` string, payload = that variant + context. */

@@ -7,7 +7,10 @@
 // this FIRST so `model` / `configOptions` values come from the live catalog, not memory.
 
 import { redactText } from "@automatalabs/workflow-engine";
-import { resolveBackendRegistry } from "@automatalabs/acp-agents";
+import {
+  BUILTIN_BACKEND_IDS,
+  resolveBackendRegistry,
+} from "@automatalabs/acp-agents";
 import type { CustomBackendConfig } from "@automatalabs/acp-agents";
 import { createValidateProbeRunner } from "./validate-internal.js";
 import { renderHarnessOptionLines } from "./validate.js";
@@ -38,7 +41,6 @@ export interface HarnessConfigReport {
   harnessOptions: ValidateHarnessOptions[];
 }
 
-const BUILTIN_HARNESSES = ["claude", "codex", "opencode", "pi"] as const;
 const DEFAULT_PROBE_TIMEOUT_MS = 60_000;
 
 /**
@@ -60,7 +62,7 @@ export async function probeHarnessConfig(
     ...new Set(
       options.harnesses && options.harnesses.length > 0
         ? options.harnesses
-        : [...BUILTIN_HARNESSES, ...registry.keys()],
+        : [...BUILTIN_BACKEND_IDS, ...registry.keys()],
     ),
   ];
 

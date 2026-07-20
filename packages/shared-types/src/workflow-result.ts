@@ -87,6 +87,8 @@ export interface AgentSessionRef {
    *  is the SAME logical process identity that owns the recorded session. ADDITIVE and NOT a hash
    *  input; absent on legacy pre-poolKey refs. */
   poolKey?: string;
+  /** Recursively frozen JSON snapshot of initialize-response `_meta`, when the agent sent it. */
+  initializeMeta?: Readonly<Record<string, unknown>>;
   /** ABSOLUTE working directory the session was opened with. Sessions are cwd-scoped on
    *  agents that key their stores by workspace — pass this back when re-opening. */
   cwd: string;

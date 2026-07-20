@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
+import type { ClientSideConnection, InitializeResponse } from "@agentclientprotocol/sdk";
 import {
   ACP_AUTH_REQUIRED_CODE_EXCLUSIVE,
   AGENT_METHOD_COVERAGE,
@@ -17,6 +18,32 @@ import {
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
 } from "../src/index.js";
+
+type Expect<T extends true> = T;
+type _InitializeMetaSchemaPinned = Expect<
+  Exclude<InitializeResponse["_meta"], null | undefined> extends Record<string, unknown>
+    ? true
+    : false
+>;
+
+function compileGenericSdkOverloads(connection: ClientSideConnection): void {
+  const request: Promise<{ exact: true }> = connection.request<
+    { exact: true },
+    { value: string }
+  >("example.test/generic", { value: "verbatim" });
+  const notification: Promise<void> = connection.notify<{ value: string }>(
+    "example.test/notification",
+    { value: "verbatim" },
+  );
+  void request;
+  void notification;
+}
+void compileGenericSdkOverloads;
+
+test("SDK initialize metadata schema and generic request/notify overloads remain present", () => {
+  const meta: InitializeResponse["_meta"] = { nested: { supported: true } };
+  assert.deepEqual(meta, { nested: { supported: true } });
+});
 
 function sorted(values: Iterable<string>): string[] {
   return [...values].sort((a, b) => a.localeCompare(b));
@@ -112,6 +139,8 @@ test("the cross-agent _meta convention keys are pinned and still present in the 
 
 test("every dist-probed AUTH_META_MATRIX row's capability literal is present in that agent's dist", () => {
   for (const row of AUTH_META_MATRIX) {
+    assert.equal(row.status, "supported-today", `${row.agent}/${row.capability} must describe delivered behavior`);
+    assert.ok(!Object.hasOwn(row, "owner"), `${row.agent}/${row.capability} must not publish deferred ownership`);
     if (row.distProbe === "claude") {
       assert.ok(CLAUDE_DIST.includes(row.capability), `claude dist must still carry "${row.capability}" (§3.6)`);
     } else if (row.distProbe === "codex") {

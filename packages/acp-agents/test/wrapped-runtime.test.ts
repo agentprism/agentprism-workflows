@@ -47,10 +47,31 @@ function makeFixtureRoot(opts: {
   const tmp = mkdtempSync(join(tmpdir(), "acp-wrapped-"));
   mkdirSync(join(tmp, "scripts"), { recursive: true });
   copyFileSync(REAL_SCRIPT, join(tmp, "scripts", "check-acp-deps.mjs"));
+  writeFileSync(
+    join(tmp, "scripts", "acp-backends.manifest.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      backends: [{
+        id: "fixture",
+        engine: { node: ">=22" },
+        server: { kind: "system-command", command: "fixture" },
+        freshness: {
+          npm: [ADAPTER],
+          forks: [],
+          wrappedRuntimes: [{ adapterPackage: ADAPTER, runtimePackage: SDK }],
+        },
+      }],
+    }),
+  );
   mkdirSync(join(tmp, "packages", "fixture"), { recursive: true });
   writeFileSync(
     join(tmp, "packages", "fixture", "package.json"),
     JSON.stringify({ name: "fixture", dependencies: { [ADAPTER]: "0.59.0" } }),
+  );
+  mkdirSync(join(tmp, "packages", "acp-agents"), { recursive: true });
+  writeFileSync(
+    join(tmp, "packages", "acp-agents", "package.json"),
+    JSON.stringify({ name: "@automatalabs/acp-agents", engines: { node: ">=22" } }),
   );
   writeFileSync(
     join(tmp, "package.json"),
@@ -148,8 +169,8 @@ test("wrapped runtime missing from the lockfile fails closed", { timeout: 30_000
   try {
     const { out, status } = await runScript(root, registry.url);
     assert.equal(status, 1, `fail-closed expected (staleness that cannot be ruled out blocks):\n${out}`);
-    assert.ok(out.includes(`${SDK} (wrapped by ${ADAPTER}) not found in pnpm-lock.yaml`), out);
-    assert.ok(out.includes("the gate fails closed"), out);
+    assert.ok(out.includes(`${SDK}`), out);
+    assert.ok(out.includes("has no transitive pnpm-lock.yaml resolution"), out);
   } finally {
     await registry.close();
     rmSync(root, { recursive: true, force: true });
