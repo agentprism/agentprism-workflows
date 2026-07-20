@@ -100,7 +100,7 @@ interface BuiltinBackendDefinition<Id extends string> {
 }
 ```
 
-The helper owns the composition, rather than each runner caller remembering it. At module initialization it throws if `authProfile.backendId !== id`. On every `create()` it calls the supplied constructor callback with that exact profile instance and throws if the result's `id` differs from the definition id or its `authProfile` is not the exact supplied object. The returned definition and its release-metadata containers are frozen. The callback and checks make profile attachment executable and testable.
+The helper owns the composition, rather than each runner caller remembering it. At module initialization it throws if `authProfile.backendId !== id`. On every `create()` it calls the supplied constructor callback with that exact profile instance and throws if the result's `id` differs from the definition id or its `authProfile` is not the exact supplied object. The returned definition is frozen. Every object and array reachable through `definition.release` is recursively frozen, including `engine`, `server`, `freshness`, fork rows, wrapper rows, and every nested array. In strict-mode tests, assigning a release field or mutating a nested array must throw and leave the definition unchanged. This deep-freeze obligation is deliberately limited to the definition-owned release tree: the helper does not recursively freeze the pre-existing auth-profile object or the centralized protocol-coverage row. The callback and checks make profile attachment executable and testable without changing ownership of those referenced public objects.
 
 Each public class constructor takes its profile with the colocated profile as its default, for example `constructor(readonly authProfile: AuthProfile = claudeAuthProfile)`. Consequently both `builtinBackend("claude")` and existing direct construction with `new ClaudeBackend()` retain the current profile behavior. Custom backends remain profile-less and outside `BUILTIN_BACKENDS`.
 
@@ -129,15 +129,16 @@ All four current runner identity sites become table consumers:
 
 The refactor preserves these ordered rules exactly:
 
-1. The effective spec is `model ?? tier`.
-2. An absent spec selects the configured default.
-3. The first slash-delimited segment alone is ASCII-lowercased for routing. Non-ASCII characters and the remainder are not transformed.
-4. A custom registry match is checked first and shadows a built-in of the same lowercased name.
-5. A built-in match is checked second through `builtinBackend(firstSegment)`.
-6. For a recognized custom or built-in prefix, the substring after the first slash is passed to model selection verbatim. No slash means no model-selection call. Empty substrings, additional slashes, whitespace, punctuation, and casing in the remainder are not normalized.
-7. For an unrecognized prefix, the full original spec is passed verbatim to the configured default backend.
-8. `AGENTPRISM_DEFAULT_BACKEND` is ASCII-lowercased. A custom registry match wins, then a built-in table match. An absent, empty, or unknown setting selects Claude.
-9. Custom pool identity remains `name + spawn-config hash`; built-ins continue to default to the logical id because they define no `poolKey`.
+1. Before either custom or built-in lookup, the effective custom registry layers run-scoped entries under host entries: run-scoped entries are inserted first, host entries second, and the host wins an equal normalized name. A script can never replace an operator-configured backend.
+2. The effective spec is `model ?? tier`.
+3. An absent spec selects the configured default.
+4. The first slash-delimited segment alone is ASCII-lowercased for routing. Non-ASCII characters and the remainder are not transformed.
+5. A match in the effective custom registry is checked first and shadows a built-in of the same lowercased name.
+6. A built-in match is checked second through `builtinBackend(firstSegment)`.
+7. For a recognized custom or built-in prefix, the substring after the first slash is passed to model selection verbatim. No slash means no model-selection call. Empty substrings, additional slashes, whitespace, punctuation, and casing in the remainder are not normalized.
+8. For an unrecognized prefix, the full original spec is passed verbatim to the configured default backend.
+9. `AGENTPRISM_DEFAULT_BACKEND` is ASCII-lowercased. A match in the effective custom registry wins, then a built-in table match. An absent, empty, or unknown setting selects Claude.
+10. Custom pool identity remains `name + spawn-config hash`; built-ins continue to default to the logical id because they define no `poolKey`.
 
 No row may add a model catalog, alias table, provider mapping, or routing priority. The connected agent's model option remains authoritative, and `applyModelSelection` continues sending the resolved model string and reporting the same string without modification.
 
@@ -194,7 +195,7 @@ interface AcpBackendsManifestV1 {
 }
 ```
 
-`defaultDirs` stores portable tokens, not machine-expanded paths. Version 1 permits exactly `$HOME/<single-relative-path>` tokens; the gate expands `$HOME` with `homedir()` at runtime. Absolute developer paths, `..`, globs, and arbitrary environment substitution are invalid. All ids/package names/commands/paths/remotes/env names must be non-empty strings. Backend ids and every array within a row must be duplicate-free. Backend ids must be unique and in the same order as `BUILTIN_BACKEND_IDS`.
+`schemaVersion` must be a JSON number whose parsed value is exactly `1`; a string, boolean, `null`, array, object, non-integer, or any other numeric value is invalid. `defaultDirs` stores portable tokens, not machine-expanded paths. Version 1 permits exactly `$HOME/<single-relative-path>` tokens; the gate expands `$HOME` with `homedir()` at runtime. Absolute developer paths, `..`, globs, and arbitrary environment substitution are invalid. All ids, package names, commands, paths, remotes, environment names, and `engine.node` values must be non-empty strings. Because `engine.node` is a minimum floor rather than a general dependency range, its canonical zero-dependency grammar is `/^>=(0|[1-9]\d*)(?:\.(0|[1-9]\d*)\.(0|[1-9]\d*))?$/`: exactly `>=MAJOR` or `>=MAJOR.MINOR.PATCH`, without whitespace, leading zeroes, prereleases, upper bounds, or unions. Values such as `""`, `"22"`, and `"banana"` are blockers. Backend ids and every array within a row must be duplicate-free. Backend ids must be unique and in the same order as `BUILTIN_BACKEND_IDS`.
 
 Cross-field validation is mandatory:
 
@@ -219,13 +220,19 @@ The initial generated rows encode the current real topology:
 
 The Codex fork object must preserve: `$HOME/codex-acp`; temporary clone name `codex-acp`; origin `https://github.com/VikashLoomba/codex-acp.git`; upstream `https://github.com/agentclientprotocol/codex-acp.git`; override variables `AGENTPRISM_CODEX_ACP_ORIGIN_URL` and `AGENTPRISM_CODEX_ACP_UPSTREAM_URL`; and remote name `upstream`.
 
-The table records engine floors as release/deployment metadata. It does not add a runtime router rejection. Package `engines`, CI Node selection, packaging tests, and the onboarding checklist enforce the floor at install/build/release boundaries.
+The table records engine floors as release/deployment metadata. It does not add a runtime router rejection. Provenance and divergence detection are frozen per server kind:
+
+- For a `workspace-package` server, the named workspace package's `package.json#engines.node` is authoritative. The table and generated manifest must equal it byte-for-byte; absent or divergent values fail generation, the preinstall manifest check, and the registry test. Thus pi's row must equal `packages/pi-acp/package.json`, currently `>=22.19.0`.
+- For an `npm-package` server, `packages/acp-agents/package.json#engines.node` is the authoritative host floor and the row must equal it byte-for-byte. When the resolved installed server package also declares `package.json#engines.node`, the after-install generator/check additionally requires that declaration to equal the same value. When the upstream package omits the field, the checklist records evidence of the absence and runtime validation at the host floor.
+- For a `system-command` server, `packages/acp-agents/package.json#engines.node` is the authoritative host floor. The checklist separately records the command's external runtime prerequisite and requires the table/host floor to be raised together if that prerequisite is higher.
+
+The after-install generator owns installed-package inspection; the zero-dependency preinstall gate never resolves `node_modules`. It still verifies every workspace-package row against its repository package and every npm-package/system-command row against the acp-agents host package. CI Node selection, packaging tests, and the checklist supply the remaining install/build/release evidence.
 
 ### 3.4 Freshness-gate refactor
 
 `scripts/check-acp-deps.mjs` deletes the authored package work list `ACP_DEP_MATCHERS` and the authored `FORK_SYNC` and `WRAPPED_RUNTIMES` objects. It parses and strictly validates `scripts/acp-backends.manifest.json`, derives the three existing checks, and otherwise retains their semantics.
 
-One reverse-coverage policy remains deliberately outside the manifest: `MANIFEST_COVERAGE_PREFIXES = ["@agentclientprotocol/"] as const`. Before any network request, the zero-dependency gate scans `dependencies`, `devDependencies`, and `optionalDependencies` in every `packages/*/package.json`; a name matching that prefix but absent from the union of all rows' `freshness.npm` entries is a blocker naming the package and workspace. This prefix is not a source of npm/fork/wrapper work and is not a built-in identity list. It exists because a manifest cannot detect a package omitted from itself. The nonstandard Codex package remains loud through the npm-server and fork cross-field rules; the nonstandard pi runtime is pinned by the required initial projection and its golden test.
+One reverse-coverage policy remains deliberately outside the manifest, expressed as valid zero-dependency JavaScript in the `.mjs` gate: `const MANIFEST_COVERAGE_PREFIXES = Object.freeze(["@agentclientprotocol/"]);`. Before any network request, the gate scans `dependencies`, `devDependencies`, and `optionalDependencies` in every `packages/*/package.json`; a name matching that prefix but absent from the union of all rows' `freshness.npm` entries is a blocker naming the package and workspace. This scan deliberately mirrors the current gate's `packages/*` and three-field scope; root-manifest and `peerDependencies` discovery are not silently implied. The prefix is not a source of npm/fork/wrapper work and is not a built-in identity list. It exists because a manifest cannot detect a package omitted from itself. The nonstandard Codex package remains loud through the npm-server and fork cross-field rules; the nonstandard pi runtime is pinned by the required initial projection and its golden test.
 
 - npm freshness compares every manifest-declared direct tracked package's lockfile version with npm `latest`;
 - fork freshness verifies a real clone's remotes, fetches origin/upstream, and checks containment against the pushed fork default branch;
@@ -248,10 +255,11 @@ The normal test suite must prove all of the following:
 2. Table keys, row ids, profile ids, factory result ids, central protocol-coverage keys, and manifest ids are the same ordered set.
 3. Every factory result carries the exact profile object declared by its row.
 4. Every server/dependency/fork/wrapper cross-field rule in §3.2 holds, including direct-only validation for `freshness.npm`, transitive-only validation for wrapped runtimes, and no installation requirement for an optional system-command probe.
-5. Every workspace dependency matching `MANIFEST_COVERAGE_PREFIXES` appears in at least one `freshness.npm` array; an unrepresented match fails before network access.
-6. The gate derives current npm/fork/wrapper work only from a supplied manifest fixture; adding a fixture row activates each relevant check without editing gate source.
-7. A missing manifest, bad JSON, unknown schema version, unknown field, duplicate id/dependency, missing package/lock entry, reverse-coverage miss, workspace mismatch, illegal `$HOME` token, inconsistent server relation, or generator drift exits `1` with the backend id and field path in the diagnostic.
-8. The manifest path and generator command are documented in the dependency-gate runbook.
+5. Every engine value satisfies the canonical floor grammar and the §3.3 source-of-truth parity rule for its server kind; an upstream npm server that adds or changes `engines.node`, a workspace server mismatch, or a stale fallback host floor fails loudly.
+6. Every workspace dependency matching `MANIFEST_COVERAGE_PREFIXES` appears in at least one `freshness.npm` array; an unrepresented match fails before network access.
+7. The gate derives current npm/fork/wrapper work only from a supplied manifest fixture; adding a fixture row activates each relevant check without editing gate source.
+8. A missing manifest, bad JSON, nonnumeric or unknown schema version, unknown field, invalid engine floor, duplicate id/dependency, missing package/lock entry, reverse-coverage miss, workspace mismatch, illegal `$HOME` token, inconsistent server relation, or generator drift exits `1` with the backend id and field path in the diagnostic.
+9. The dependency-gate runbook test in §10.6 proves that the manifest path and generation/check commands are present in the named runbook section.
 
 ## 4. Protocol coverage, initialization metadata, and extensions
 
@@ -261,7 +269,7 @@ The normal test suite must prove all of the following:
 
 Keep `packages/acp-agents/src/protocol-coverage.ts` centralized. ACP method classification, SDK schema tripwires, auth/meta conventions, and installed-distribution probes are cross-backend policy and must be compared as one matrix. Moving fragments into adapter files would hide omissions and make SDK bumps harder to audit.
 
-Add `BUILTIN_PROTOCOL_COVERAGE`, an immutable object with one key per built-in. Each value is a `BuiltinProtocolCoverageRow` that references the universal client/agent method classifications and declares that backend's auth/meta convention rows and required installed-dist or live probes. Every backend definition links to `BUILTIN_PROTOCOL_COVERAGE.<id>`. The registry integrity test enforces exact key parity; therefore a table row cannot land without an explicit protocol-coverage disposition.
+Add `BUILTIN_PROTOCOL_COVERAGE`, an immutable object with one key per built-in. Each value is a `BuiltinProtocolCoverageRow` that references the universal client/agent method classifications and declares that backend's auth/meta convention rows and required installed-dist or live probes. Every backend definition must receive the exact central row object, not a copy: for every `id`, `BUILTIN_BACKENDS[id].protocolCoverage === BUILTIN_PROTOCOL_COVERAGE[id]`. The registry integrity test enforces both exact key parity and this reference-identity assertion; therefore a table row cannot land without an explicit central protocol-coverage disposition, and a backend file cannot fork the drift anchor behind an equal-looking object.
 
 The existing exported constants and types remain exported. `protocol-coverage.ts` must not import `BuiltinBackendId`, the table, or concrete backend files; parity is enforced from the higher registry test to avoid a runtime cycle.
 
@@ -311,7 +319,7 @@ Routing, pooling, auth, and capability negotiation retain their current behavior
 
 `initializeMeta` is additive and optional. Its absence preserves byte-equivalent serialized refs/events. Its presence can add data to journaled session records and workflow results but cannot affect journal hash inputs that did not previously include it; any persistence hash/projection with an explicit allowlist must be deliberately updated and regression-tested so resume remains deterministic.
 
-Each affected publishable package receives an appropriate changeset. At minimum, additive exports and session/event types require minor releases of `@automatalabs/acp-agents` and packages that re-export the changed types; removal of the deprecated member must be assessed under the repository's established pre-1.0 semver policy and documented in changelogs. `@automatalabs/pi-acp` receives a changeset only if its published code or metadata changes.
+Each affected publishable package receives an explicit changeset. `@automatalabs/acp-agents` receives a **minor** changeset covering the additive registry/event surface and removal of the deprecated `stripsRoutingPrefix` member. This contract chooses minor rather than leaving the breaking-member bump ambiguous: the package is pre-1.0, the removed field is documented as unused, and the repository previously shipped removal of the dead `ModelRoute.useRegex` public field in the `0.18.0` minor release. Any package that publishes or re-exports the added session/event types, including `@automatalabs/shared-types` and `@automatalabs/workflows` when their public declarations change, also receives a minor changeset. A package changed only in user-facing prose receives a patch changeset when that prose ships in the package. `@automatalabs/pi-acp` receives a changeset only if its published code or metadata changes.
 
 No opt-in configuration is added. The registry drives production immediately after merge, the generated manifest drives every dependency gate invocation immediately, and `initializeMeta` appears automatically whenever an agent sends it.
 
@@ -323,9 +331,9 @@ No opt-in configuration is added. The registry drives production immediately aft
 
 The following is enforced by types, table validation, generator drift, unit/integration tests, or the preinstall gate. A new built-in cannot pass CI without it:
 
-- a literal table row whose key, definition id, profile id, factory id, coverage key, and generated manifest id agree;
+- a literal table row whose key, definition id, profile id, factory id, exact central coverage-row reference, and generated manifest id agree;
 - a factory that attaches the exact colocated auth-profile object;
-- a complete release-metadata row with engine, topology, npm, fork, and wrapper fields (empty arrays are explicit dispositions);
+- a complete release-metadata row with engine, topology, npm, fork, and wrapper fields (empty arrays are explicit dispositions), plus canonical engine-floor syntax and exact §3.3 package-manifest parity;
 - a canonical regenerated manifest;
 - declared package dependencies and direct lockfile resolutions for every `freshness.npm` entry, plus transitive lockfile resolution for every wrapped runtime;
 - reverse coverage from every workspace dependency matching `MANIFEST_COVERAGE_PREFIXES` to at least one `freshness.npm` row;
@@ -341,10 +349,10 @@ The following is enforced by types, table validation, generator drift, unit/inte
 
 Add `docs/backend-onboarding-checklist.md` as the single checked-in backend-onboarding checklist. It must require a link or a written `not applicable` rationale for every item below and must state that a backend implementation PR cannot merge until every item is completed. These items remain human-reviewed because semantic quality cannot be proved merely by registry shape. A repository-wide pull-request template is not used because these obligations apply only to built-in backend onboarding and would add irrelevant ceremony to every other PR.
 
-- Verify the real backend package/system prerequisite, license, spawn command/bin resolution, environment overrides, shutdown behavior, and minimum Node engine. For a new workspace server, add workspace package metadata, root TypeScript project references, build/test scripts, package exports/bin/files, packaging tests, and changeset configuration.
+- Verify the real backend package/system prerequisite, license, spawn command/bin resolution, environment overrides, shutdown behavior, and minimum Node engine. Record which §3.3 engine source applied; for an npm package with no `engines.node`, link evidence of that absence and runtime validation at the fallback floor; for a system command, link its runtime prerequisite and raise both the host package and row if necessary. For a new workspace server, add workspace package metadata, root TypeScript project references, build/test scripts, package exports/bin/files, packaging tests, and changeset configuration.
 - Inspect the agent's complete ACP initialize capabilities and custom `_meta` conventions. Add its row to centralized protocol coverage, installed-dist probes where source is available, auth profile, auth/meta matrix, and capability tests. Empty/unsupported capabilities must be explicit.
 - Exercise permissions, elicitation, fs/terminal/MCP handlers, session lifecycle, cancellation, structured output, provider errors, auth, pool reuse, and extension passthrough as applicable. “Same as another backend” requires a test, not a prose assumption.
-- Update user/API/readme examples, environment-variable documentation, package export docs, changelogs, and the dependency-gate triage runbook. Preserve public re-export shims for any relocated symbols.
+- Update user/API/readme examples, environment-variable documentation, package export docs, changelogs, and the `CONTRIBUTING.md` section headed `When the dependency gate blocks`. Preserve public re-export shims for any relocated symbols. Human review owns the accuracy of the runbook instructions; the normal test suite separately enforces the literal manifest path and commands in §10.6.
 - Update MCP authoring source material, not only its generated prompt. This includes the relevant `skills/agentprism-workflow-authoring/*.md` routing/model/configuration tables. Run `node scripts/generate-authoring-prompt.mjs`, commit the regenerated prompt artifact, and pass both the generated-prompt drift test and its routing sentinel assertions.
 - Update `packages/mcp-server/src/server.ts` backend/tool descriptions that enumerate supported agents and their routing syntax.
 - Add the backend to `packages/mcp-server/test/live-backend.e2e.test.ts`: its backend union, executable/bin probe table, environment scope table, setup/auth diagnostic, the existing structured-output/pooling matrix, and one schema-less smoke run. Run the real authenticated live leg and record the command/result in the PR. The existing pre-push live gate remains mandatory.
@@ -368,8 +376,11 @@ Failures are deterministic and scoped as follows:
 | table key, definition id, profile id, or factory id mismatch | module load/factory test | throw with the expected and actual ids; do not construct or route |
 | `builtinBackend` receives an unknown string | public lookup | return `undefined`; do not throw or fall back |
 | default-backend setting is absent/empty/unknown | default routing | construct Claude from its ordinary table row |
+| host and run-scoped custom names collide | effective-registry construction | keep the host entry; do not route to the script entry |
 | custom and built-in names collide | route selection | construct custom backend; built-in remains enumerable |
 | manifest missing/malformed/stale/inconsistent | generator check or preinstall gate | name the file/backend/field, exit `1`, do not fall back to source constants |
+| schema version is not numeric `1`, or `engine.node` is empty/noncanonical | generator check or preinstall gate | name the field, exit `1` before network access |
+| row engine floor differs from its §3.3 package-manifest source | generator, preinstall gate where repository-readable, or registry test | name the backend and both values, exit `1`; never choose one silently |
 | npm registry unavailable after the three attempts in §3.4 | preinstall gate | fail closed, exit `1` |
 | working-clone Git operation fails on its single attempt | preinstall gate | fail closed, exit `1`; do not delete or repair the working clone |
 | disposable clone still fails after its one delete/reclone repair | preinstall gate | fail closed, exit `1` |
@@ -423,6 +434,12 @@ These exclusions are complete scope boundaries, not permission to ship a partial
 16. **Validate only manifest-to-workspace dependency direction.** Rejected because a newly added `@agentclientprotocol/*` dependency could then be omitted from the table and manifest while every table/manifest parity test still passed. The reverse prefix check makes that omission fail before network access.
 17. **Delegate workflow harness enumeration to `ValidateProbeRunner.listBackends()`.** Rejected because that interface does not expose the method and widening it would duplicate rather than simplify the existing explicit `options.harnesses` filtering path. Directly composing `BUILTIN_BACKEND_IDS` with registry keys changes only the duplicated source list.
 18. **Put the onboarding checklist in a repository-wide pull-request template.** Rejected because the repository has no such template and backend-specific evidence would burden unrelated PRs. The pinned `docs/backend-onboarding-checklist.md` path gives backend changes one reviewable artifact.
+19. **Treat every `engine.node` value as table-authored prose checked only by reviewers.** Rejected because a package engine can move while the row remains stale. The chosen per-kind provenance makes workspace and host-package parity mechanical, checks an installed npm server's declared engine after install, and reserves human evidence only for an npm package that omits the field or a system command outside the workspace.
+20. **Accept deep equality or key-set parity for protocol coverage.** Rejected because an adapter could pass a divergent copy while preserving keys and current values, fragmenting the single drift anchor. Reference identity to `BUILTIN_PROTOCOL_COVERAGE[id]` is cheaper and exact.
+21. **Leave the manifest path and generator commands as a human-only runbook check.** Rejected because §3.5 promises that missed mechanical surfaces fail in the normal suite. A narrow content test guarantees discoverability while checklist review still owns instructional quality.
+22. **Shallow-freeze only the release root.** Rejected because nested arrays and fork objects would remain mutable and could change generated output after module load. Recursive freezing is confined to the definition-owned release tree so it does not seize ownership of shared profile or coverage objects.
+23. **Leave the `stripsRoutingPrefix` bump level to implementation or force a 1.0 major.** Rejected because an unfrozen bump makes release behavior ambiguous, while a major would conflict with the repository's concrete `0.18.0` minor precedent for removing the dead `ModelRoute.useRegex` field. This contract pins an `@automatalabs/acp-agents` minor.
+24. **Accept arbitrary npm semver-range syntax for `engine.node`.** Rejected because this field represents one minimum floor and the preinstall validator cannot depend on a semver package. The canonical `>=MAJOR`/`>=MAJOR.MINOR.PATCH` grammar covers the required rows and stays zero-dependency.
 
 ## 10. Test plan
 
@@ -431,25 +448,26 @@ These exclusions are complete scope boundaries, not permission to ship a partial
 ### 10.1 Registry and type tests
 
 - Compile-time: `BuiltinBackendId` accepts exactly the keys of `typeof BUILTIN_BACKENDS`; a fixture fifth row widens the type without editing a union.
-- Runtime: assert exact initial order, key/id/profile/coverage parity, exact profile object identity, class direct-construction compatibility, frozen definitions, and `builtinBackend` unknown/prototype/case behavior.
+- Runtime: assert exact initial order, key/id/profile/coverage parity, exact profile object identity, `definition.protocolCoverage === BUILTIN_PROTOCOL_COVERAGE[id]`, class direct-construction compatibility, frozen definition roots, and `builtinBackend` unknown/prototype/case behavior. In strict mode, attempt assignment at every release-metadata object depth and mutation of `freshness.npm`, `freshness.forks`, `defaultDirs`, and `wrappedRuntimes`; each must throw, every object/array reachable through `release` must satisfy `Object.isFrozen`, and serialized release metadata must remain unchanged. The referenced auth profile and central coverage row are not asserted as helper-owned deep-freeze targets.
 - Source drift: assert runner and workflows production source import registry APIs and contain none of the deleted concrete imports/list/switch/boolean-chain patterns.
 - Workflows config: with no explicit harnesses, assert targets are `BUILTIN_BACKEND_IDS` followed by custom registry keys with first occurrence winning; with a non-empty `options.harnesses`, assert the caller's deduplicated order is used and no default target is added. The `ValidateProbeRunner` fake continues to implement only `probeConfigOptions` and `dispose`.
 - Public API: compile imports from the root, `backend.ts`, existing backend class paths, and `auth/auth-profiles.ts` shims.
 
 ### 10.2 Routing and pool tests
 
-- Preserve and expand table-driven cases for absent specs; recognized prefixes with no slash, empty remainder, mixed-case prefix, multiple slashes, whitespace, punctuation, and mixed-case model remainder; unknown prefixes; and `tier` when `model` is absent.
+- Preserve and expand table-driven cases for absent specs; recognized prefixes with no slash, empty remainder, mixed-case prefix, multiple slashes, whitespace, punctuation, non-ASCII model remainder, and mixed-case model remainder; unknown prefixes; and `tier` when `model` is absent. Include `CLÄUDE/model` as an unrecognized prefix: only ASCII letters become lowercase, the non-ASCII `Ä` is unchanged, and the full original string reaches the default backend verbatim.
 - Assert the exact string delivered to `selectModel` and `onModelResolved` for every case.
-- Assert custom `claude` shadows the table row, host custom entries still beat run-scoped entries, and all built-ins remain listed once.
+- Assert custom `claude` shadows the table row; when host and run-scoped registries define the same normalized custom name, the host entry wins before custom-versus-built-in lookup; and all built-ins remain listed once.
 - Assert an absent, empty, valid mixed-case, custom, and unknown `AGENTPRISM_DEFAULT_BACKEND`; unknown remains Claude.
 - Preserve two same-name custom configurations with different command/args/env and prove distinct spawn-hash pool keys/processes.
 
 ### 10.3 Manifest and gate tests
 
 - Golden generator check for the four required rows and canonical bytes.
-- Schema fixture matrix for every invalid condition in §§3.2, 3.5, and 7, with exit `1` and redacted diagnostics.
+- Schema fixture matrix for every invalid condition in §§3.2, 3.5, and 7, with exit `1` and redacted diagnostics. Include `schemaVersion` values `"1"`, `null`, `1.5`, and `2`; `engine.node` values `""`, `"22"`, `"banana"`, `">=022"`, and `">=22 || >=24"`; and valid boundary controls `">=22"` and `">=22.19.0`.
 - Reverse-coverage fixtures add an undeclared `@agentclientprotocol/example-agent` dependency in each of `dependencies`, `devDependencies`, and `optionalDependencies`; each fails before a network stub is called, while adding it to one `freshness.npm` row passes and activates the ordinary npm check.
 - Cross-field fixtures prove `freshness.npm` requires a direct workspace dependency and importer lock resolution, a wrapped `runtimePackage` needs only transitive lock resolution, and `optionalPackageProbe` may be absent from manifests and the lockfile.
+- Engine-provenance fixtures prove: a workspace server row must exactly equal its package's `engines.node`; every npm server row exactly follows the acp-agents host floor and, when the installed server declares an engine, that declaration must equal the same floor; an npm server with no declaration requires the checklist evidence but no invented upstream value; and a system-command row exactly follows the host floor. For the initial rows, assert pi equals `packages/pi-acp/package.json`, while Claude/Codex/OpenCode satisfy the applicable npm/system rule. Each repository-readable divergence fails with both values and no network call; an installed-package mismatch fails in the after-install generator test.
 - Parameterized gate fixtures prove adding a manifest npm/fork/wrapper relationship activates the existing algorithm without source edits.
 - Preserve npm's three-attempt 10-second-timeout/backoff/404 behavior; prove working-clone Git calls are single-attempt and never repaired; prove a disposable clone receives exactly one delete/reclone repair; and preserve exact lock resolution, fork remote identity/clean/pushed/default-branch/containment, wrapped transitive runtime, and redundant override tests.
 - Run the gate from the repository with dependencies unavailable to the script, proving it imports only Node built-ins and JSON.
@@ -474,6 +492,7 @@ These exclusions are complete scope boundaries, not permission to ship a partial
 
 ### 10.6 Documentation, authoring, packaging, and live validation
 
+- Add a normal-suite runbook-content test scoped to the `CONTRIBUTING.md` section headed `When the dependency gate blocks`. It must find the exact literals `scripts/acp-backends.manifest.json`, `pnpm generate:acp-backends-manifest`, `pnpm check:acp-backends-manifest`, and `node scripts/check-acp-deps.mjs` within that section; moving or omitting any literal fails with the missing token. This is the mechanical half of §3.5.9; review still validates that the surrounding instructions are accurate.
 - Run the generated authoring-prompt drift test and routing sentinel assertions after updating authoring source files.
 - Run doc/API/export compile checks and packaging tests, including the pi workspace package topology.
 - Run build, typecheck, all package tests, and changeset validation.
@@ -503,7 +522,7 @@ Intermediate commits may temporarily fail, but the implementation PR is not merg
 
 ### 12.1 Author-round verification pin
 
-At the start of author round 2 on 2026-07-19, a new temporary clone of `https://github.com/agentclientprotocol/typescript-sdk.git` was created. npm reported `@agentclientprotocol/sdk` `latest` as `1.2.1`. GitHub's current latest release was `v1.2.1`; its tag and release target resolve to commit `26da1ae7ab66fae0f5e77272dee3e5d562d24aee`, and the checked-out package reports version `1.2.1`. The freshly fetched upstream `main` was `0daecae58483e362753004c985119865d7cc6edd`.
+At the start of author round 3 on 2026-07-19, a new temporary clone of `https://github.com/agentclientprotocol/typescript-sdk.git` was created. npm reported `@agentclientprotocol/sdk` `latest` as `1.2.1`. GitHub's current latest release was `v1.2.1`; its tag and release target resolve to commit `26da1ae7ab66fae0f5e77272dee3e5d562d24aee`, and the checked-out package reports version `1.2.1`. The freshly fetched upstream `main` was `0daecae58483e362753004c985119865d7cc6edd`.
 
 At that pin:
 
@@ -562,6 +581,8 @@ All local references below are pinned to `248aa1b374d0f2a0343a4c2e9e07d9bd7e0089
 - OpenCode's package-probe/system-command topology: `packages/acp-agents/src/backends/opencode.ts:45-54`, `packages/acp-agents/src/backends/opencode.ts:120-133`.
 - Pi's workspace-package bin resolution: `packages/acp-agents/src/backends/pi.ts:46-61`.
 - Pi packaging, gate-tracking, project-reference, and release guards: `packages/pi-acp/test/packaging.test.ts:8-40`.
+- Dependency-gate command/runbook location and current triage contract: `CONTRIBUTING.md:63-85`.
+- Changesets configuration and the concrete minor-release precedent for dead public-field removal: `.changeset/config.json:1-10`, `packages/acp-agents/CHANGELOG.md:408-419`.
 
 ### 13.3 Protocol, metadata, events, and extensions
 
