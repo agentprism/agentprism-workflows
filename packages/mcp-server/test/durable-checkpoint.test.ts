@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { connect, countingRunner, okRunner, structured, textOf } from "./_harness.js";
+import { connect, countingRunner, makeRunner, okRunner, structured, textOf } from "./_harness.js";
 
 function field(value: unknown, key: string): unknown {
   return value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
@@ -119,6 +119,45 @@ return { decision }`;
     assert.deepEqual(completed?.checkpointsTaken, [
       { callIndex: 2, kind: "confirm", decision: true, source: "injected" },
     ]);
+  } finally {
+    await dispose();
+  }
+});
+
+test("terminal summary reports a supplied checkpoint reply that did not exactly target the live checkpoint", async () => {
+  let sourceRoute = true;
+  const runner = makeRunner(() => sourceRoute ? "source-route" : "diverged-route");
+  const script = `export const meta = { name: 'unapplied-checkpoint-reply', description: 'reply diagnostics' }
+const route = await agent('choose-route', { label: 'choose-route' })
+if (route === 'source-route') {
+  return await checkpoint('approve same text', { headless: 'pause', default: false })
+}
+return await checkpoint('approve same text', { headless: 'pause', default: false })`;
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const first = await client.callTool({ name: "workflow", arguments: { script } });
+    const paused = structured(first);
+    assert.equal(paused?.status, "paused");
+    const callIndex = Number(field(paused?.checkpointContext, "callIndex"));
+
+    sourceRoute = false;
+    const second = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script,
+        resumeFromRunId: String(paused?.runId),
+        checkpointReplies: { [callIndex]: true },
+      },
+    });
+    const resumed = structured(second);
+    assert.equal(resumed?.status, "paused");
+    const checkpointReply = field(resumed?.resumeReport, "checkpointReply");
+    assert.equal(field(checkpointReply, "status"), "not-applied");
+    assert.match(
+      textOf(second),
+      new RegExp(`checkpointReplies for call ${callIndex} was not applied: ` +
+        "the checkpoint was not reached at its recorded call site after a live prefix"),
+    );
   } finally {
     await dispose();
   }
