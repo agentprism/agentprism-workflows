@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   copyFileSync,
   mkdirSync,
   mkdtempSync,
@@ -12,7 +13,7 @@ import {
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BUILTIN_BACKENDS,
@@ -118,13 +119,18 @@ function fixtureRoot(options: {
   return root;
 }
 
-function runGate(root: string, registryUrl: string): Promise<{ status: number | null; out: string }> {
+function runGate(
+  root: string,
+  registryUrl: string,
+  environment: Record<string, string> = {},
+): Promise<{ status: number | null; out: string }> {
   return new Promise((done, fail) => {
     const child = spawn(process.execPath, [join(root, "scripts", "check-acp-deps.mjs")], {
       env: {
         ...process.env,
         AGENTPRISM_NPM_REGISTRY: registryUrl,
         AGENTPRISM_CODEX_ACP_DIR: secretMarker,
+        ...environment,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -134,6 +140,31 @@ function runGate(root: string, registryUrl: string): Promise<{ status: number | 
     child.on("error", fail);
     child.on("close", (status) => done({ status, out }));
   });
+}
+
+function installManifestGitFixture(root: string): { bin: string; log: string } {
+  const bin = join(root, "fixture-bin");
+  const log = join(root, "fixture-git.log");
+  mkdirSync(bin, { recursive: true });
+  const executable = join(bin, "git");
+  writeFileSync(executable, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(process.env.FIXTURE_GIT_LOG, JSON.stringify(args) + "\\n");
+const command = args[2];
+const rest = args.slice(3);
+if (command === "remote" && rest[0] === "get-url") {
+  process.stdout.write(rest[1] === "origin" ? process.env.FIXTURE_GIT_ORIGIN : process.env.FIXTURE_GIT_UPSTREAM);
+} else if (command === "ls-remote") {
+  process.stdout.write("ref: refs/heads/main\\tHEAD\\nfixture\\tHEAD\\n");
+} else if (command === "rev-parse" && rest.includes("--abbrev-ref")) {
+  process.stdout.write("main\\n");
+} else if (command === "rev-list") {
+  process.stdout.write("0\\n");
+}
+`);
+  chmodSync(executable, 0o755);
+  return { bin, log };
 }
 
 function generatorFixture(installedClaudeEngine?: string): string {
@@ -692,7 +723,96 @@ test("manifest-declared npm and wrapped-runtime work activate without gate sourc
   }
 });
 
-test("npm 404 is single-attempt and non-404 failures retain three attempts with backoff", { timeout: 15_000 }, async () => {
+test("a supplied fifth-backend fork relationship activates without gate source edits", async () => {
+  const FIFTH = "@agentclientprotocol/fifth-backend";
+  const originUrl = "https://git.invalid/runtime-owner/fifth-backend.git";
+  const upstreamUrl = "https://git.invalid/runtime-upstream/fifth-backend.git";
+  const fifth = baseBackend();
+  fifth.id = "fifth";
+  fifth.server.command = "fifth";
+  fifth.freshness.npm = [FIFTH];
+  fifth.freshness.forks = [{
+    package: FIFTH,
+    envDir: "AGENTPRISM_FIFTH_BACKEND_DIR",
+    defaultDirs: ["$HOME/fifth-backend"],
+    tempCloneName: "fifth-backend",
+    originUrl: "https://git.invalid/declared-owner/fifth-backend.git",
+    originUrlEnv: "AGENTPRISM_FIFTH_BACKEND_ORIGIN_URL",
+    upstreamUrl: "https://git.invalid/declared-upstream/fifth-backend.git",
+    upstreamUrlEnv: "AGENTPRISM_FIFTH_BACKEND_UPSTREAM_URL",
+    upstreamRemote: "source",
+  }];
+  const manifest = baseManifest();
+  manifest.backends.push(fifth);
+  const root = fixtureRoot({
+    manifest,
+    packageManifest: {
+      name: "@automatalabs/acp-agents",
+      engines: { node: ">=22" },
+      dependencies: { [SDK]: "^1.2.1", [FIFTH]: "^5.0.0" },
+    },
+    lock: lockfile({ [SDK]: "1.2.1", [FIFTH]: "5.0.0" }),
+  });
+  const workingClone = join(root, "fifth-working-clone");
+  mkdirSync(join(workingClone, ".git"), { recursive: true });
+  const gitFixture = installManifestGitFixture(root);
+  const server = await registry({
+    [`/${SDK}/latest`]: { body: { version: "1.2.1" } },
+    [`/${FIFTH}/latest`]: { body: { version: "5.0.0" } },
+  });
+  try {
+    const result = await runGate(root, server.url, {
+      PATH: `${gitFixture.bin}${delimiter}${process.env.PATH ?? ""}`,
+      FIXTURE_GIT_LOG: gitFixture.log,
+      FIXTURE_GIT_ORIGIN: originUrl,
+      FIXTURE_GIT_UPSTREAM: upstreamUrl,
+      AGENTPRISM_FIFTH_BACKEND_DIR: workingClone,
+      AGENTPRISM_FIFTH_BACKEND_ORIGIN_URL: originUrl,
+      AGENTPRISM_FIFTH_BACKEND_UPSTREAM_URL: upstreamUrl,
+    });
+    assert.equal(result.status, 0, result.out);
+    assert.ok(server.requests.includes(`/${FIFTH}/latest`));
+    assert.match(result.out, new RegExp(`fork ${workingClone.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(result.out, /runtime-upstream\/fifth-backend#main/);
+
+    const calls = readFileSync(gitFixture.log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(calls.some((args) => args.includes("source") && args.includes("fetch")));
+    assert.ok(calls.some((args) => args.includes("source") && args.includes("ls-remote")));
+    assert.ok(calls.some((args) => args.includes("pull") && args.includes("--ff-only")));
+    assert.equal(calls.some((args) => args.includes("clone")), false);
+    assert.equal(
+      readFileSync(join(root, "scripts", "check-acp-deps.mjs"), "utf8"),
+      readFileSync(gateSource, "utf8"),
+    );
+  } finally {
+    await server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("npm retries pin three attempts, a 10-second timeout, and 1.5/3-second backoff", { timeout: 15_000 }, async () => {
+  const source = readFileSync(gateSource, "utf8");
+  const constant = (name: string): number => {
+    const match = new RegExp(`const ${name} = ([0-9_]+);`).exec(source);
+    assert.ok(match, `${name} must remain an explicit zero-dependency numeric constant`);
+    return Number(match[1].replaceAll("_", ""));
+  };
+  const attemptsContract = constant("FETCH_ATTEMPTS");
+  const timeoutContract = constant("FETCH_TIMEOUT_MS");
+  const retryDelayContract = constant("RETRY_DELAY_MS");
+  assert.equal(attemptsContract, 3);
+  assert.equal(timeoutContract, 10_000);
+  assert.equal(retryDelayContract, 1_500);
+  assert.deepEqual([1, 2].map((attempt) => retryDelayContract * attempt), [1_500, 3_000]);
+  assert.match(source, /signal:\s*AbortSignal\.timeout\(FETCH_TIMEOUT_MS\)/);
+  assert.match(
+    source,
+    /attempt\s*<\s*FETCH_ATTEMPTS\)\s*await new Promise\(\(r\)\s*=>\s*setTimeout\(r,\s*RETRY_DELAY_MS\s*\*\s*attempt\)\)/,
+  );
+
   const notFound = await registry({ [`/${SDK}/latest`]: { status: 404 } });
   const root404 = fixtureRoot();
   try {

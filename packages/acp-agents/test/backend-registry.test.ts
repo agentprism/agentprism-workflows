@@ -207,11 +207,9 @@ test("source drift locks registry imports and import hygiene, including type-onl
     runner,
     /function defaultBackend[\s\S]*?registry\.get\(name\)[\s\S]*?builtinBackend\(name\)[\s\S]*?BUILTIN_BACKENDS\.claude\.create\(\)/,
   );
-  assert.doesNotMatch(runner, /from "\.\/backends\/(?:claude|codex|opencode|pi)\.js"/);
-  assert.doesNotMatch(
-    runner,
-    /function builtinBackend|(?:firstSegment|name)\s*===\s*["'](?:claude|codex|opencode|pi)["']/,
-  );
+  assertNoConcreteBackendDependencies(runner, new Set(["builtins", "custom"]));
+  assertNoIdentityEqualityBranches(runner);
+  assert.doesNotMatch(runner, /\bfunction\s+builtinBackend\b/);
   assert.match(
     workflows,
     /from "@automatalabs\/acp-agents"[\s\S]*?\[\.\.\.BUILTIN_BACKEND_IDS, \.\.\.registry\.keys\(\)\]/,
@@ -229,8 +227,7 @@ test("source drift locks registry imports and import hygiene, including type-onl
   }
   assert.doesNotMatch(define, forbiddenDefineDependency);
 
-  const forbiddenCoverageDependency =
-    /BuiltinBackendId|BUILTIN_BACKENDS|["'][^"']*backends\/(?:claude|codex|opencode|pi)(?:\.js)?["']/;
+  const forbiddenCoverageDependency = /BuiltinBackendId|BUILTIN_BACKENDS/;
   for (const syntax of [
     'import { ClaudeBackend } from "./backends/claude.js"',
     'import type { ClaudeBackend } from "./backends/claude.js"',
@@ -238,11 +235,56 @@ test("source drift locks registry imports and import hygiene, including type-onl
     'type ConcreteBackend = import("./backends/claude.js").ClaudeBackend',
     'import type { BuiltinBackendId } from "./backend.js"',
   ]) {
-    assert.match(syntax, forbiddenCoverageDependency);
+    if (syntax.includes("BuiltinBackendId")) {
+      assert.match(syntax, forbiddenCoverageDependency);
+    } else {
+      assert.throws(() => assertNoConcreteBackendDependencies(syntax), /claude/);
+    }
   }
   assert.doesNotMatch(coverage, forbiddenCoverageDependency);
+  assertNoConcreteBackendDependencies(coverage);
   assert.doesNotMatch(backend, /BuiltinBackendId\s*=\s*["']/);
 });
+
+test("source drift rules catch a fifth backend without adding its identity to the test", () => {
+  for (const dependency of [
+    'import { FifthBackend } from "./backends/fifth.js"',
+    'import type { FifthBackend } from "./backends/fifth.js"',
+    'import { type FifthBackend } from "./backends/fifth.js"',
+    'type FifthBackend = import("./backends/fifth.js").FifthBackend',
+  ]) {
+    assert.throws(
+      () => assertNoConcreteBackendDependencies(dependency, new Set(["builtins", "custom"])),
+      /fifth/,
+    );
+  }
+
+  for (const branch of [
+    'if (firstSegment === "fifth") return new FifthBackend()',
+    'if ("fifth" != name) return builtinBackend(name)',
+    'const fifthId = "fifth"; if (firstSegment === fifthId) return new FifthBackend()',
+  ]) {
+    assert.throws(() => assertNoIdentityEqualityBranches(branch), /backend identity equality branch/);
+  }
+});
+
+function assertNoConcreteBackendDependencies(
+  source: string,
+  allowedModules: ReadonlySet<string> = new Set(),
+): void {
+  const moduleSpecifiers = [...source.matchAll(/\b(?:from\s*|import\s*\()\s*["']([^"']+)["']/g)]
+    .map((match) => match[1]);
+  const forbidden = moduleSpecifiers
+    .map((specifier) => /(?:^|\/)backends\/([^/]+?)(?:\.(?:js|ts))?$/.exec(specifier)?.[1])
+    .filter((module): module is string => module !== undefined && !allowedModules.has(module));
+  assert.deepEqual(forbidden, [], `concrete backend dependencies are forbidden: ${forbidden.join(", ")}`);
+}
+
+function assertNoIdentityEqualityBranches(source: string): void {
+  const identityEqualityBranch =
+    /(?:\b(?:firstSegment|name)\s*(?:={2,3}|!={1,2})|(?:={2,3}|!={1,2})\s*\b(?:firstSegment|name))/;
+  assert.doesNotMatch(source, identityEqualityBranch, "backend identity equality branch is forbidden");
+}
 
 function assertFrozenTree(value: unknown): void {
   if (value === null || typeof value !== "object") return;

@@ -1,6 +1,7 @@
 ---
 "@automatalabs/acp-agents": minor
 "@automatalabs/shared-types": minor
+"@automatalabs/workflow-engine": minor
 "@automatalabs/workflows": minor
 "@automatalabs/mcp-server": patch
 ---
