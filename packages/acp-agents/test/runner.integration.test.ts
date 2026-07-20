@@ -1126,6 +1126,34 @@ test("probeConfigOptions can select the routed model and returns its echoed cata
   assert.equal(readLog().filter((entry) => entry.method === "closeSession").length, 1);
 });
 
+test("probeConfigOptions preserves OpenCode's full slash-containing provider/model identity", async () => {
+  const innerModel = "openrouter/anthropic/claude-opus-4.6";
+  const advertised = [
+    {
+      id: "model",
+      type: "select",
+      name: "Model",
+      category: "model",
+      currentValue: "default-model",
+      options: [{ value: innerModel, name: "Provider-scoped model" }],
+    },
+  ];
+  const { cwd, readLog } = configure({ configOptions: advertised });
+
+  const probed = await makeRunner().probeConfigOptions(`opencode/${innerModel}`, {
+    cwd,
+    selectModel: true,
+  });
+
+  assert.equal(probed.backendId, "opencode");
+  assert.equal(probed.options[0]?.currentValue, innerModel);
+  const selected = readLog().filter((entry) => entry.method === "setSessionConfigOption");
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0]?.params?.configId, "model");
+  assert.equal(selected[0]?.params?.value, innerModel);
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+});
+
 test("probeConfigOptions propagates an authentication failure cleanly", async () => {
   const { cwd, readLog } = configure({ authRequiredOnNewSession: true });
   await assert.rejects(

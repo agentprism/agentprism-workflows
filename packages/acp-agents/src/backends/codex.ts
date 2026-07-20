@@ -112,6 +112,7 @@ export class CodexBackend implements Backend {
 
 export const codexBackendDefinition = defineBuiltinBackend({
   id: "codex",
+  thoughtLevelDomainSemantics: "ordered",
   authProfile: codexAuthProfile,
   create: (authProfile) => new CodexBackend(authProfile),
   release: {

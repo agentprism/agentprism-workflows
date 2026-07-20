@@ -77,7 +77,13 @@ export {
 
 // ── Token-free script validation: static parse + mock-runner dry run. Also the core of
 //    the `agentprism-workflows validate` CLI (./cli.ts). ──
-export { validateWorkflowScript, fabricateFromSchema, formatValidateReport, MOCK_TOKENS_PER_AGENT } from "./validate.js";
+export {
+  validateWorkflowScript,
+  fabricateFromSchema,
+  formatValidateReport,
+  MOCK_TOKENS_PER_AGENT,
+  ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT,
+} from "./validate.js";
 export type {
   MockAnswerJson,
   MockAnswerRule,

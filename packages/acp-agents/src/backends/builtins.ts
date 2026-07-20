@@ -2,6 +2,7 @@ import type { Backend } from "../backend.js";
 import { claudeBackendDefinition } from "./claude.js";
 import { codexBackendDefinition } from "./codex.js";
 import type { BuiltinBackendDefinition } from "./define.js";
+import type { ThoughtLevelDomainSemantics } from "./define.js";
 import { opencodeBackendDefinition } from "./opencode.js";
 import { piBackendDefinition } from "./pi.js";
 
@@ -39,4 +40,12 @@ function isBuiltinBackendId(id: string): id is BuiltinBackendId {
 /** Exact, case-sensitive lookup for an untrusted id. Routing owns normalization and fallback. */
 export function builtinBackend(id: string): Backend | undefined {
   return isBuiltinBackendId(id) ? BUILTIN_BACKENDS[id].create() : undefined;
+}
+
+/** Exact lookup for registry-owned thought-level semantics. Unknown/custom backends have no row;
+ *  consumers must take the safe `exact-set` branch for them. */
+export function builtinThoughtLevelDomainSemantics(
+  id: string,
+): ThoughtLevelDomainSemantics | undefined {
+  return isBuiltinBackendId(id) ? BUILTIN_BACKENDS[id].thoughtLevelDomainSemantics : undefined;
 }

@@ -20,6 +20,7 @@ import {
   redactText,
 } from "@automatalabs/workflow-engine";
 import {
+  builtinThoughtLevelDomainSemantics,
   registryWithRunBackends,
   resolveBackendRegistry,
   selectBackend,
@@ -28,6 +29,7 @@ import type {
   BackendRegistry,
   CustomBackendConfig,
   SessionConfigOption,
+  ThoughtLevelDomainSemantics,
 } from "@automatalabs/acp-agents";
 import type { WorkflowDir } from "@automatalabs/workflow-engine";
 import type { AgentRunner, AgentUsage, WorkflowMeta } from "@automatalabs/shared-types";
@@ -756,9 +758,14 @@ interface MockRunOptions {
  *  budget-guarded script paths deterministically. */
 export const MOCK_TOKENS_PER_AGENT = 1000;
 
+/** Maximum advertised model count for client-side ordered thought-domain enumeration.
+ *  Larger catalogs stay on exact advertised-value validation so zero-token validation remains bounded. */
+export const ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT = 32;
+
 interface RoutedBackend {
   backendId: string;
   display: string;
+  thoughtLevelDomainSemantics: ThoughtLevelDomainSemantics;
 }
 
 function routeBackend(
@@ -768,13 +775,20 @@ function routeBackend(
   hostRegistry: BackendRegistry,
   declared: Record<string, CustomBackendConfig> | undefined,
 ): RoutedBackend {
-  const backendId = selectBackend({ model, tier }, registry).id;
+  const backend = selectBackend({ model, tier }, registry);
+  const backendId = backend.id;
   const scriptDeclared =
     !hostRegistry.has(backendId) &&
     Object.keys(declared ?? {}).some((name) => name.toLowerCase() === backendId.toLowerCase());
   return {
     backendId,
     display: scriptDeclared ? `${backendId} (script-declared)` : backendId,
+    // Auth profiles are a built-in-only contract. A custom backend that shadows a built-in id
+    // therefore stays exact-set instead of inheriting that built-in's ordering declaration.
+    thoughtLevelDomainSemantics:
+      (backend.authProfile === undefined
+        ? undefined
+        : builtinThoughtLevelDomainSemantics(backendId)) ?? "exact-set",
   };
 }
 
@@ -796,6 +810,7 @@ interface ProbeStageResult {
 interface ConfigProbeTarget {
   backendId: string;
   model?: string;
+  thoughtLevelDomainSemantics: ThoughtLevelDomainSemantics;
 }
 
 function configCatalogKey(backendId: string, model: string | undefined): string {
@@ -810,10 +825,15 @@ function configProbeTargets(
 ): ConfigProbeTarget[] {
   const targets = new Map<string, ConfigProbeTarget>();
   for (const call of calls) {
-    const backendId = routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId;
+    const routed = routeBackend(call.model, call.tier, registry, hostRegistry, declared);
+    const backendId = routed.backendId;
     const target: ConfigProbeTarget = call.model === undefined
-      ? { backendId }
-      : { backendId, model: call.model };
+      ? { backendId, thoughtLevelDomainSemantics: routed.thoughtLevelDomainSemantics }
+      : {
+          backendId,
+          model: call.model,
+          thoughtLevelDomainSemantics: routed.thoughtLevelDomainSemantics,
+        };
     targets.set(configCatalogKey(backendId, call.model), target);
   }
   return [...targets.values()].sort((left, right) =>
@@ -849,32 +869,81 @@ async function probeHarnessConfigOptions(
       warnings.push(
         `could not probe ${probeTargetName(target)} — configOptions on its calls are unverified: ${reason}`,
       );
-      harnessOptions.push({ ...target, probed: false, error: reason });
+      harnessOptions.push({
+        backendId: target.backendId,
+        ...(target.model === undefined ? {} : { model: target.model }),
+        probed: false,
+        error: reason,
+      });
     }
     return { harnessOptions, catalogs };
   }
 
   try {
-    for (const target of targets) {
+    const failures = new Map<string, string>();
+    const probeTarget = async (
+      target: ConfigProbeTarget,
+      reportHarness: boolean,
+    ): Promise<SessionConfigOption[] | undefined> => {
+      const key = configCatalogKey(target.backendId, target.model);
+      const cached = catalogs.get(key);
+      if (cached) return cached;
+      if (failures.has(key)) return undefined;
       try {
         const result = await runner.probeConfigOptions(target.model ?? target.backendId, {
           cwd,
           selectModel: target.model !== undefined,
         });
-        catalogs.set(configCatalogKey(target.backendId, target.model), result.options);
-        harnessOptions.push({
-          backendId: result.backendId,
-          ...(target.model === undefined ? {} : { model: target.model }),
-          probed: true,
-          options: result.options,
-        });
+        catalogs.set(key, result.options);
+        if (reportHarness) {
+          harnessOptions.push({
+            backendId: result.backendId,
+            ...(target.model === undefined ? {} : { model: target.model }),
+            probed: true,
+            options: result.options,
+          });
+        }
+        return result.options;
       } catch (error) {
         const reason = errorMessage(error);
-        warnings.push(
-          `could not probe ${probeTargetName(target)} — configOptions on its calls are unverified: ${reason}`,
-        );
-        harnessOptions.push({ ...target, probed: false, error: reason });
+        failures.set(key, reason);
+        if (reportHarness) {
+          warnings.push(
+            `could not probe ${probeTargetName(target)} — configOptions on its calls are unverified: ${reason}`,
+          );
+          harnessOptions.push({
+            backendId: target.backendId,
+            ...(target.model === undefined ? {} : { model: target.model }),
+            probed: false,
+            error: reason,
+          });
+        }
+        return undefined;
       }
+    };
+
+    for (const target of targets) await probeTarget(target, true);
+
+    const orderedTargets = new Map<string, ConfigProbeTarget[]>();
+    for (const target of targets) {
+      if (target.thoughtLevelDomainSemantics !== "ordered") continue;
+      const catalog = catalogs.get(configCatalogKey(target.backendId, target.model));
+      if (!catalog?.some((option) =>
+        isThoughtLevelSelect(option) &&
+        recognizedSelectValues(option, selectChoiceValues(option)) === undefined
+      )) continue;
+      const backendTargets = orderedTargets.get(target.backendId) ?? [];
+      backendTargets.push(target);
+      orderedTargets.set(target.backendId, backendTargets);
+    }
+    for (const [backendId, backendTargets] of orderedTargets) {
+      await enumerateOrderedThoughtLevelDomains(
+        backendId,
+        backendTargets,
+        catalogs,
+        probeTarget,
+        warnings,
+      );
     }
   } finally {
     try {
@@ -884,6 +953,184 @@ async function probeHarnessConfigOptions(
     }
   }
   return { harnessOptions, catalogs };
+}
+
+function isThoughtLevelSelect(
+  option: SessionConfigOption,
+): option is Extract<SessionConfigOption, { type: "select" }> {
+  return option.type === "select" &&
+    (option.category === "thought_level" || option.id === "thinkingLevel");
+}
+
+const NON_ORDERED_THOUGHT_LEVEL_SENTINELS = new Set(["default"]);
+
+async function enumerateOrderedThoughtLevelDomains(
+  backendId: string,
+  targets: readonly ConfigProbeTarget[],
+  catalogs: Map<string, SessionConfigOption[]>,
+  probeTarget: (
+    target: ConfigProbeTarget,
+    reportHarness: boolean,
+  ) => Promise<SessionConfigOption[] | undefined>,
+  warnings: string[],
+): Promise<void> {
+  const seedCatalogs = targets.flatMap((target) => {
+    const catalog = catalogs.get(configCatalogKey(target.backendId, target.model));
+    return catalog ? [catalog] : [];
+  });
+  const modelOption = seedCatalogs
+    .flatMap((catalog) => catalog)
+    .find((option): option is Extract<SessionConfigOption, { type: "select" }> =>
+      option.type === "select" && option.id === "model"
+    );
+  if (!modelOption) {
+    warnings.push(
+      `skipped ordered thought-level domain enumeration for ${backendId}: no advertised model select option; ` +
+        "using exact advertised-value validation",
+    );
+    return;
+  }
+
+  const models = [...new Set(selectChoiceValues(modelOption))];
+  if (models.length > ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT) {
+    warnings.push(
+      `skipped ordered thought-level domain enumeration for ${backendId}: advertised ${models.length} models, ` +
+        `above the limit of ${ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT}; using exact advertised-value validation`,
+    );
+    return;
+  }
+  if (models.length === 0) {
+    warnings.push(
+      `skipped ordered thought-level domain enumeration for ${backendId}: the advertised model select has no values; ` +
+        "using exact advertised-value validation",
+    );
+    return;
+  }
+
+  const orderedSubsets = new Map<string, string[][]>();
+  const sentinels = new Map<string, string[]>();
+  for (const model of models) {
+    const modelSpec = `${backendId}/${model}`;
+    const catalog = await probeTarget({
+      backendId,
+      model: modelSpec,
+      thoughtLevelDomainSemantics: "ordered",
+    }, false);
+    if (!catalog) {
+      warnings.push(
+        `could not complete ordered thought-level domain enumeration for ${backendId}: ` +
+          `model ${JSON.stringify(model)} could not be probed; using exact advertised-value validation`,
+      );
+      return;
+    }
+    for (const option of catalog) {
+      if (!isThoughtLevelSelect(option)) continue;
+      const values = selectChoiceValues(option);
+      const ordered = values.filter((value) => !NON_ORDERED_THOUGHT_LEVEL_SENTINELS.has(value));
+      const optionSentinels = values.filter((value) => NON_ORDERED_THOUGHT_LEVEL_SENTINELS.has(value));
+      const subsets = orderedSubsets.get(option.id) ?? [];
+      subsets.push(ordered);
+      orderedSubsets.set(option.id, subsets);
+      const knownSentinels = sentinels.get(option.id) ?? [];
+      for (const sentinel of optionSentinels) {
+        if (!knownSentinels.includes(sentinel)) knownSentinels.push(sentinel);
+      }
+      sentinels.set(option.id, knownSentinels);
+    }
+  }
+
+  const recognizedByOption = new Map<string, string[]>();
+  for (const [optionId, subsets] of orderedSubsets) {
+    const ordered = mergeOrderedSubsets(subsets);
+    if (!ordered) {
+      warnings.push(
+        `could not merge advertised thought-level orders for ${backendId} option ${JSON.stringify(optionId)}; ` +
+          "using exact advertised-value validation",
+      );
+      return;
+    }
+    const recognized = [...ordered, ...(sentinels.get(optionId) ?? [])];
+    if (recognized.length > 0) recognizedByOption.set(optionId, recognized);
+  }
+  attachClientRecognizedDomains(catalogs, backendId, recognizedByOption);
+}
+
+function mergeOrderedSubsets(subsets: readonly (readonly string[])[]): string[] | undefined {
+  const firstSeen = new Map<string, number>();
+  const outgoing = new Map<string, Set<string>>();
+  const indegree = new Map<string, number>();
+  for (const subset of subsets) {
+    const unique = [...new Set(subset)];
+    for (const value of unique) {
+      if (!firstSeen.has(value)) firstSeen.set(value, firstSeen.size);
+      if (!outgoing.has(value)) outgoing.set(value, new Set());
+      if (!indegree.has(value)) indegree.set(value, 0);
+    }
+    for (let index = 1; index < unique.length; index++) {
+      const before = unique[index - 1];
+      const after = unique[index];
+      if (before === undefined || after === undefined) continue;
+      const edges = outgoing.get(before)!;
+      if (edges.has(after)) continue;
+      edges.add(after);
+      indegree.set(after, (indegree.get(after) ?? 0) + 1);
+    }
+  }
+
+  const ready = [...indegree]
+    .filter(([, count]) => count === 0)
+    .map(([value]) => value);
+  const compare = (left: string, right: string) =>
+    (firstSeen.get(left) ?? 0) - (firstSeen.get(right) ?? 0) || left.localeCompare(right);
+  ready.sort(compare);
+  const merged: string[] = [];
+  while (ready.length > 0) {
+    const value = ready.shift()!;
+    merged.push(value);
+    for (const after of outgoing.get(value) ?? []) {
+      const remaining = (indegree.get(after) ?? 0) - 1;
+      indegree.set(after, remaining);
+      if (remaining === 0) {
+        ready.push(after);
+        ready.sort(compare);
+      }
+    }
+  }
+  return merged.length === indegree.size ? merged : undefined;
+}
+
+function attachClientRecognizedDomains(
+  catalogs: Map<string, SessionConfigOption[]>,
+  backendId: string,
+  recognizedByOption: ReadonlyMap<string, readonly string[]>,
+): void {
+  for (const [key, catalog] of catalogs) {
+    const [catalogBackend] = JSON.parse(key) as [string, string | null];
+    if (catalogBackend !== backendId) continue;
+    for (const option of catalog) {
+      if (!isThoughtLevelSelect(option)) continue;
+      const supported = selectChoiceValues(option);
+      if (recognizedSelectValues(option, supported)) continue;
+      const recognized = recognizedByOption.get(option.id);
+      if (!recognized || !supported.every((value) => recognized.includes(value))) continue;
+      const meta = option._meta && typeof option._meta === "object" && !Array.isArray(option._meta)
+        ? option._meta
+        : {};
+      const existingNamespace = meta[CONFIG_OPTION_META_NAMESPACE];
+      const namespace = existingNamespace &&
+          typeof existingNamespace === "object" &&
+          !Array.isArray(existingNamespace)
+        ? existingNamespace as Record<string, unknown>
+        : {};
+      option._meta = {
+        ...meta,
+        [CONFIG_OPTION_META_NAMESPACE]: {
+          ...namespace,
+          recognizedValues: [...recognized],
+        },
+      };
+    }
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -958,10 +1205,11 @@ function configOptionErrors(
           continue;
         }
 
-        if (option.category === "thought_level" || option.id === "thinkingLevel") {
-          warnings.push(
-            `agent "${call.label}" configOptions option ${JSON.stringify(id)} value ${authored} is not advertised by ` +
-              `${callModelName(backendId, call.model)}; no recognized domain was advertised, so clamp eligibility is unverified`,
+        if (isThoughtLevelSelect(option)) {
+          errors.push(
+            `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} is not advertised by ` +
+              `${callModelName(backendId, call.model)}; advertised alternatives: ${displayAlternatives(choices)}; ` +
+              "no recognized ordered domain is available, so the value must match exactly",
           );
         } else {
           errors.push(
@@ -1011,14 +1259,17 @@ function clampSelectValue(
   recognized: readonly string[],
 ): string | undefined {
   if (supported.includes(requested)) return requested;
-  const requestedIndex = recognized.indexOf(requested);
+  const orderedRecognized = recognized.filter(
+    (value) => !NON_ORDERED_THOUGHT_LEVEL_SENTINELS.has(value),
+  );
+  const requestedIndex = orderedRecognized.indexOf(requested);
   if (requestedIndex < 0) return undefined;
-  for (let index = requestedIndex; index < recognized.length; index++) {
-    const candidate = recognized[index];
+  for (let index = requestedIndex; index < orderedRecognized.length; index++) {
+    const candidate = orderedRecognized[index];
     if (candidate !== undefined && supported.includes(candidate)) return candidate;
   }
   for (let index = requestedIndex - 1; index >= 0; index--) {
-    const candidate = recognized[index];
+    const candidate = orderedRecognized[index];
     if (candidate !== undefined && supported.includes(candidate)) return candidate;
   }
   return undefined;

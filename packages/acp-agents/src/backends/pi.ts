@@ -96,6 +96,7 @@ export class PiBackend implements Backend {
 
 export const piBackendDefinition = defineBuiltinBackend({
   id: "pi",
+  thoughtLevelDomainSemantics: "ordered",
   authProfile: piAuthProfile,
   create: (authProfile) => new PiBackend(authProfile),
   release: {

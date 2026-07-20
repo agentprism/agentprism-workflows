@@ -12,6 +12,7 @@ import {
   OpenCodeBackend,
   PiBackend,
   builtinBackend,
+  builtinThoughtLevelDomainSemantics,
   claudeAuthProfile,
   codexAuthProfile,
   opencodeAuthProfile,
@@ -23,6 +24,7 @@ import {
   type BuiltinBackendReleaseMetadata,
   type BuiltinProtocolCoverageRow,
   type TerminalLaunch,
+  type ThoughtLevelDomainSemantics,
 } from "../src/index.js";
 import type { BuiltinBackendId as CompatibilityBuiltinBackendId } from "../src/backend.js";
 import { claudeAuthProfile as ShimClaudeProfile } from "../src/auth/auth-profiles.js";
@@ -53,7 +55,8 @@ const rootTypeLocks: [
   BuiltinProtocolCoverageRow | undefined,
   AuthProfile | undefined,
   TerminalLaunch | undefined,
-] = [undefined, undefined, undefined, undefined, undefined];
+  ThoughtLevelDomainSemantics | undefined,
+] = [undefined, undefined, undefined, undefined, undefined, undefined];
 void rootTypeLocks;
 
 test("registry order, ids, profiles, factories, and central coverage are exactly aligned", () => {
@@ -73,11 +76,19 @@ test("registry order, ids, profiles, factories, and central coverage are exactly
     opencode: OpenCodeBackend,
     pi: PiBackend,
   } as const;
+  const thoughtLevelDomains = {
+    claude: "ordered",
+    codex: "ordered",
+    opencode: "exact-set",
+    pi: "ordered",
+  } as const;
 
   for (const id of BUILTIN_BACKEND_IDS) {
     const definition = BUILTIN_BACKENDS[id];
     const backend = definition.create();
     assert.equal(definition.id, id);
+    assert.equal(definition.thoughtLevelDomainSemantics, thoughtLevelDomains[id]);
+    assert.equal(builtinThoughtLevelDomainSemantics(id), thoughtLevelDomains[id]);
     assert.equal(definition.authProfile.backendId, id);
     assert.equal(backend.id, id);
     assert.strictEqual(definition.authProfile, profiles[id]);
@@ -95,6 +106,7 @@ test("registry order, ids, profiles, factories, and central coverage are exactly
   assert.strictEqual(new PiBackend().authProfile, piAuthProfile);
   assert.strictEqual(ShimClaudeProfile, claudeAuthProfile);
   assert.strictEqual(PathClaudeBackend, ClaudeBackend);
+  assert.equal(builtinThoughtLevelDomainSemantics("custom"), undefined);
 });
 
 test("public lookup is own-property, exact-case, non-normalizing, and non-fallback", () => {
@@ -151,6 +163,7 @@ test("definition helper rejects profile, factory id, and profile-object mismatch
   assert.throws(
     () => defineBuiltinBackend({
       id: "other",
+      thoughtLevelDomainSemantics: "exact-set",
       authProfile: profile,
       create: (attached) => backend("other", attached) as never,
       release,
@@ -161,6 +174,7 @@ test("definition helper rejects profile, factory id, and profile-object mismatch
 
   const wrongId = defineBuiltinBackend({
     id: "fixture",
+    thoughtLevelDomainSemantics: "exact-set",
     authProfile: profile,
     create: (attached) => backend("different", attached),
     release,
@@ -171,6 +185,7 @@ test("definition helper rejects profile, factory id, and profile-object mismatch
   const copiedProfile = { ...profile };
   const wrongProfile = defineBuiltinBackend({
     id: "fixture",
+    thoughtLevelDomainSemantics: "exact-set",
     authProfile: profile,
     create: () => backend("fixture", copiedProfile),
     release,

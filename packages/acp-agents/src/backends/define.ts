@@ -38,8 +38,12 @@ export interface BuiltinBackendReleaseMetadata {
   };
 }
 
+/** Whether thought-level select values form an ordered ladder or only an exact supported set. */
+export type ThoughtLevelDomainSemantics = "ordered" | "exact-set";
+
 export interface BuiltinBackendDefinition<Id extends string> {
   readonly id: Id;
+  readonly thoughtLevelDomainSemantics: ThoughtLevelDomainSemantics;
   readonly authProfile: AuthProfile;
   readonly create: () => Backend & {
     readonly id: Id;
@@ -51,6 +55,7 @@ export interface BuiltinBackendDefinition<Id extends string> {
 
 export interface DefineBuiltinBackendOptions<Id extends string> {
   readonly id: Id;
+  readonly thoughtLevelDomainSemantics: ThoughtLevelDomainSemantics;
   readonly authProfile: AuthProfile;
   readonly create: (authProfile: AuthProfile) => Backend & {
     readonly id: Id;
@@ -73,6 +78,7 @@ export function defineBuiltinBackend<const Id extends string>(
   const release = cloneAndFreeze(options.release);
   const definition: BuiltinBackendDefinition<Id> = {
     id: options.id,
+    thoughtLevelDomainSemantics: options.thoughtLevelDomainSemantics,
     authProfile: options.authProfile,
     release,
     protocolCoverage: options.protocolCoverage,

@@ -225,11 +225,13 @@ export {
   BUILTIN_BACKENDS,
   BUILTIN_BACKEND_IDS,
   builtinBackend,
+  builtinThoughtLevelDomainSemantics,
 } from "./backends/builtins.js";
 export type { BuiltinBackendId } from "./backends/builtins.js";
 export type {
   BuiltinBackendDefinition,
   BuiltinBackendReleaseMetadata,
+  ThoughtLevelDomainSemantics,
 } from "./backends/define.js";
 export { ClaudeBackend } from "./backends/claude.js";
 export { CodexBackend } from "./backends/codex.js";
