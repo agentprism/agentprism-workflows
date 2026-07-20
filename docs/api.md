@@ -1224,7 +1224,7 @@ for every new first-class row.
 
 Workflow scripts may *declare* backends via `meta.backends`, but declarations are inert until the composition root approves them (`allowScriptBackends` / `ExecOptions.scriptBackends` / `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`).
 
-**Environment variables**: `AGENTPRISM_ACP_POOL_SIZE` (processes per backend, default 1), `AGENTPRISM_ACP_INIT_TIMEOUT_MS` (initialize handshake deadline, default 60s), `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex` | `opencode` | `pi` | custom name), `AGENTPRISM_BACKENDS` (host custom-backend registry JSON), `AGENTPRISM_PERSISTENCE_ROOT`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_OPENCODE_E2E_MODEL` (live e2e only; default `opencode/openrouter/moonshotai/kimi-k3`), `AGENTPRISM_PI_E2E_MODEL` (live e2e only; default `openrouter/moonshotai/kimi-k3`), plus the per-backend `*_CMD`/`_ARGS`/`_BIN` above.
+**Environment variables**: `AGENTPRISM_ACP_POOL_SIZE` (processes per backend, default 1), `AGENTPRISM_ACP_INIT_TIMEOUT_MS` (initialize handshake deadline, default 60s), `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex` | `opencode` | `pi` | custom name), `AGENTPRISM_BACKENDS` (host custom-backend registry JSON), `AGENTPRISM_PERSISTENCE_ROOT`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_OPENCODE_E2E_MODEL` (live e2e only; default `opencode/openrouter/moonshotai/kimi-k3`), `AGENTPRISM_PI_E2E_MODEL` (live e2e only; default `openrouter/google/gemini-2.5-flash`), plus the per-backend `*_CMD`/`_ARGS`/`_BIN` above.
 
 ---
 

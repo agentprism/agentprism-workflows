@@ -139,6 +139,8 @@ test("the cross-agent _meta convention keys are pinned and still present in the 
 
 test("every dist-probed AUTH_META_MATRIX row's capability literal is present in that agent's dist", () => {
   for (const row of AUTH_META_MATRIX) {
+    assert.equal(row.status, "supported-today", `${row.agent}/${row.capability} must describe delivered behavior`);
+    assert.ok(!Object.hasOwn(row, "owner"), `${row.agent}/${row.capability} must not publish deferred ownership`);
     if (row.distProbe === "claude") {
       assert.ok(CLAUDE_DIST.includes(row.capability), `claude dist must still carry "${row.capability}" (§3.6)`);
     } else if (row.distProbe === "codex") {

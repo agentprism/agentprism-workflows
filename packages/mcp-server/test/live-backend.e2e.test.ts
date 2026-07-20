@@ -63,7 +63,9 @@ const BACKEND_SCOPE: Record<Exclude<Backend, "opencode">, string> = {
 };
 
 const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/openrouter/moonshotai/kimi-k3";
-const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL ?? "openrouter/moonshotai/kimi-k3";
+// Kimi K3 can exceed the MCP request deadline under provider load. Gemini Flash exercises the
+// same Pi/OpenRouter routing and native schema path with enough latency headroom for all four calls.
+const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL ?? "openrouter/google/gemini-2.5-flash";
 
 function resolveOpenCodeBin(): string {
   if (process.env.AGENTPRISM_OPENCODE_ACP_CMD) return process.env.AGENTPRISM_OPENCODE_ACP_CMD;

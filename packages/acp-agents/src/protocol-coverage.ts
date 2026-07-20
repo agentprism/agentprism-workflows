@@ -177,9 +177,8 @@ export interface AuthMetaMatrixRow {
   readonly capability: string;
   /** Wire direction: A→C agent→client, C→A client→agent, C↔A both, — none, agent-internal. */
   readonly direction: "A→C" | "C→A" | "C↔A" | "—" | "agent-internal";
-  readonly status: "supported-today" | "work-item";
-  /** Owning §/PR for a work item; omitted for supported-today rows. */
-  readonly owner?: string;
+  /** Every published row describes behavior delivered and verified by the current implementation. */
+  readonly status: "supported-today";
   /** When set, the literal is asserted present in this backend's INSTALLED dist (claude/codex only;
    *  opencode ships a compiled binary with no consumable source — §3.4, grounded by live-e2e). */
   readonly distProbe?: "claude" | "codex";
@@ -194,14 +193,14 @@ export interface AuthMetaMatrixRow {
  *  surface. OpenCode ships a compiled binary with no consumable source (§3.4), so its row has no dist
  *  probe (grounded instead by the §4.6.3 live-e2e). */
 const AUTH_META_MATRIX_ROWS = [
-  { agent: "claude", capability: "gateway", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "claude" },
-  { agent: "claude", capability: "terminal-auth", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "claude" },
-  { agent: "codex", capability: "api-key", direction: "A→C", status: "work-item", owner: "§1.3/PR3", distProbe: "codex" },
-  { agent: "codex", capability: "gateway", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "codex" },
-  { agent: "codex", capability: "DEFAULT_AUTH_REQUEST", direction: "C→A", status: "work-item", owner: "§3.3/PR7", distProbe: "codex" },
-  { agent: "codex", capability: "persist", direction: "C→A", status: "work-item", owner: "§3.6/PR7", distProbe: "codex" },
-  { agent: "opencode", capability: "terminal-auth", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3" },
-  { agent: "all", capability: "provider env keys", direction: "C→A", status: "work-item", owner: "§2.8/§3.4/PR3" },
+  { agent: "claude", capability: "gateway", direction: "C↔A", status: "supported-today", distProbe: "claude" },
+  { agent: "claude", capability: "terminal-auth", direction: "C↔A", status: "supported-today", distProbe: "claude" },
+  { agent: "codex", capability: "api-key", direction: "A→C", status: "supported-today", distProbe: "codex" },
+  { agent: "codex", capability: "gateway", direction: "C↔A", status: "supported-today", distProbe: "codex" },
+  { agent: "codex", capability: "DEFAULT_AUTH_REQUEST", direction: "C→A", status: "supported-today", distProbe: "codex" },
+  { agent: "codex", capability: "persist", direction: "C→A", status: "supported-today", distProbe: "codex" },
+  { agent: "opencode", capability: "terminal-auth", direction: "C↔A", status: "supported-today" },
+  { agent: "all", capability: "provider env keys", direction: "C→A", status: "supported-today" },
 ] satisfies readonly AuthMetaMatrixRow[];
 
 export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
