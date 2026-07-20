@@ -1,5 +1,15 @@
 # @automatalabs/acp-agents
 
+## 0.34.3
+
+### Patch Changes
+
+- 5cf8f96: Advertise Pi thinking levels per selected model, reject unrecognized values, and clamp recognized
+  model gaps through Pi's SDK. Validate workflow thought levels against each call's selected model,
+  including explicit clamp warnings and safe handling for backends without recognized-domain metadata.
+- Updated dependencies [5cf8f96]
+  - @automatalabs/pi-acp@0.2.1
+
 ## 0.34.2
 
 ### Patch Changes
