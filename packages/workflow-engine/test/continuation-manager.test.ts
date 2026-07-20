@@ -158,7 +158,7 @@ describe("WorkflowManager continuation wiring", () => {
         const completed = await started.promise;
         assert.equal(completed.status, "completed");
         assert.equal(completed.result, "continued result");
-        assert.equal(completed.resumeReport?.strategy, "positional-v1");
+        assert.equal(completed.resumeReport?.strategy, "identity-v1");
         assert.equal(test.states.get(runId)?.resumeSourceRunId, "fanout-source");
       }
       assert.deepEqual(runner.directives.map((directive) => directive?.sessionId), [

@@ -117,6 +117,7 @@ export type {
   PersistedAgentState,
   PersistedResumeFormat,
   PersistedResumeCandidate,
+  PersistedResumeCallBlocker,
   PersistedCheckpointInjection,
   PersistedResumeSeed,
   PersistedRunLineageTombstone,

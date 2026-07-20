@@ -473,7 +473,7 @@ export interface WorkflowCallRecord {
   /** What this logical call added to the run's script-visible spent value. Zero on
    *  journal-replayed rows; absent on checkpoint rows. */
   budgetDebit?: number;
-  /** Why this recorded agent result is safe for content-addressed mainline replay.
+  /** Why this agent occurrence is safe for content-addressed mainline resume.
    *  "declared-read-only" reflects the authored assertion at allocation.
    *  "isolated-worktree" is written only after createWorktree() returned
    *  isolated:true. Absent for checkpoints and every unproved agent call. */

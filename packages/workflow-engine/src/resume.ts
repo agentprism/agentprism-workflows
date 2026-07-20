@@ -74,9 +74,7 @@ export function validateResumeSafetyMarker(
   record: WorkflowCallRecord,
   legacyResume: boolean,
 ): boolean {
-  if (record.kind !== "agent" || record.outcome !== "result") {
-    return record.resumeSafety === undefined;
-  }
+  if (record.kind !== "agent") return record.resumeSafety === undefined;
   if (
     record.resumeSafety !== undefined &&
     record.resumeSafety !== "declared-read-only" &&
@@ -85,7 +83,7 @@ export function validateResumeSafetyMarker(
     return false;
   }
   if (record.origin === "journal-replay") {
-    if (legacyResume) return record.resumeSafety === undefined;
+    if (record.outcome !== "result" || legacyResume) return record.resumeSafety === undefined;
     if (
       record.resumeSafety === undefined ||
       record.replay === undefined ||

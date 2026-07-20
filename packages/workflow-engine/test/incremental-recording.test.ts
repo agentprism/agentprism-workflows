@@ -109,7 +109,7 @@ return await agent("null", { resume: nullProto })`),
     }
   });
 
-  it("records result-only safety and propagates only validated positional source markers", async () => {
+  it("records occurrence safety and propagates only validated positional source markers", async () => {
     const rows: WorkflowCallRecord[] = [];
     const live = await runWorkflow(
       script(`
@@ -124,7 +124,7 @@ return { safe, unsafe, empty }`),
       },
     );
     assert.equal(live.result && typeof live.result, "object");
-    assert.deepEqual(rows.map((row) => row.resumeSafety), ["declared-read-only", undefined, undefined]);
+    assert.deepEqual(rows.map((row) => row.resumeSafety), ["declared-read-only", undefined, "declared-read-only"]);
     assert.deepEqual(rows.map((row) => row.outcome), ["result", "result", "null"]);
 
     const journal: JournalEntry = {
@@ -246,7 +246,7 @@ return { safe, unsafe, empty }`),
     );
     assert.equal(
       validateResumeSafetyMarker(resultRow({ outcome: "error", resumeSafety: "declared-read-only" }), false),
-      false,
+      true,
     );
   });
 
@@ -602,24 +602,37 @@ describe("managed identity-v1 persistence", () => {
     }
   });
 
-  it("omits terminal identity for floated effects and never retrofits after late settlement", async () => {
+  it("finalizes safe floated calls while unsafe activity omits terminal identity", async () => {
     const dirs = tempDirs();
     const floatedAgent = deferred<string>();
+    const unsafeAgent = deferred<string>();
     const floatedCheckpoint = deferred<unknown>();
     try {
       const manager = new WorkflowManager({
         cwd: dirs.cwd,
         persistenceRoot: dirs.root,
         environmentKey: "static-key",
-        agent: { async run() { return await floatedAgent.promise; } },
+        agent: {
+          async run(prompt) {
+            return await (prompt === "unsafe" ? unsafeAgent.promise : floatedAgent.promise);
+          },
+        },
       });
       const agentRun = await manager.runSync(
         script(`void agent("floated", { resume: { filesystem: "read-only" } })\nreturn "early"`, "floated-agent"),
       );
-      assert.equal(manager.getPersistence().load(agentRun.runId)?.resume?.terminalEnvironment, undefined);
+      assert.deepEqual(manager.getPersistence().load(agentRun.runId)?.resume?.terminalEnvironment, { key: "static-key" });
       floatedAgent.resolve("late");
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(manager.getPersistence().load(agentRun.runId)?.resume?.terminalEnvironment, undefined);
+      assert.deepEqual(manager.getPersistence().load(agentRun.runId)?.resume?.terminalEnvironment, { key: "static-key" });
+
+      const unsafeRun = await manager.runSync(
+        script(`void agent("unsafe")\nreturn "early"`, "floated-unsafe-agent"),
+      );
+      assert.equal(manager.getPersistence().load(unsafeRun.runId)?.resume?.terminalEnvironment, undefined);
+      unsafeAgent.resolve("late");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(manager.getPersistence().load(unsafeRun.runId)?.resume?.terminalEnvironment, undefined);
 
       const checkpointRun = await manager.runSync(
         script(`void checkpoint("floated")\nreturn "early"`, "floated-checkpoint"),

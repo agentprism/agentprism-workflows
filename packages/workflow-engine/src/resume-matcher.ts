@@ -16,6 +16,7 @@ import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   type PersistedCheckpointInjection,
   type PersistedResumeCandidate,
+  type PersistedResumeCallBlocker,
   type PersistedResumeSeed,
   type PersistedRunState,
 } from "./run-persistence.js";
@@ -100,7 +101,10 @@ export interface ParsedCheckpointReply {
 
 export type IndexedResumeSource =
   | { type: "candidate"; candidate: PersistedResumeCandidate }
+  | { type: "blocker"; blocker: PersistedResumeCallBlocker }
   | { type: "injection"; injection: PersistedCheckpointInjection };
+
+type ReplayableIndexedResumeSource = Exclude<IndexedResumeSource, { type: "blocker" }>;
 
 export interface ResumeCandidateIndexes {
   readonly exact: ReadonlyMap<ResumeExactKey, readonly IndexedResumeSource[]>;
@@ -128,7 +132,7 @@ export interface ResumeMatchInput {
 export type ResumeMatchDecision =
   | {
       action: "replay";
-      source: IndexedResumeSource;
+      source: ReplayableIndexedResumeSource;
       match: "path-hash" | "unique-hash";
     }
   | {
@@ -186,6 +190,7 @@ type ValidatedManifest = {
 
 type ValidatedSeed = {
   candidates: PersistedResumeCandidate[];
+  blockers: PersistedResumeCallBlocker[];
   injections: PersistedCheckpointInjection[];
 };
 
@@ -504,6 +509,34 @@ function validateCandidate(value: unknown): PersistedResumeCandidate | undefined
   return strictClone(value as unknown as PersistedResumeCandidate);
 }
 
+function validateCallBlocker(value: unknown): PersistedResumeCallBlocker | undefined {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.sourceRunId) ||
+    !isNonNegativeSafeInteger(value.recordedIndex) ||
+    !validateBasicCall(value.call, value.sourceRunId) ||
+    !validateCallFacts(value.call) ||
+    value.call.index !== value.recordedIndex ||
+    value.call.outcome === "result" ||
+    !isPath(value.call.path) ||
+    !isHash(value.call.inputsHash)
+  ) {
+    return undefined;
+  }
+  if (value.call.kind === "agent") {
+    if (value.call.resumeSafety === undefined) return undefined;
+  } else if (
+    value.call.origin !== "engine" ||
+    value.call.aborted !== true ||
+    !isRecord(value.call.error) ||
+    value.call.error.form !== "workflow-error" ||
+    value.call.error.code !== WorkflowErrorCode.WORKFLOW_ABORTED
+  ) {
+    return undefined;
+  }
+  return strictClone(value as unknown as PersistedResumeCallBlocker);
+}
+
 function validateInjection(value: unknown): PersistedCheckpointInjection | undefined {
   if (!isRecord(value)) return undefined;
   if (
@@ -521,18 +554,20 @@ function validateInjection(value: unknown): PersistedCheckpointInjection | undef
 }
 
 function validateSeed(source: PersistedRunState, sourceRunId: string): ValidatedSeed | undefined {
-  if (source.resumeSeed === undefined) return { candidates: [], injections: [] };
+  if (source.resumeSeed === undefined) return { candidates: [], blockers: [], injections: [] };
   const seed = source.resumeSeed as unknown;
   if (
     !isRecord(seed) ||
     seed.format !== "identity-v1" ||
     seed.sourceRunId !== sourceRunId ||
     !Array.isArray(seed.candidates) ||
+    (seed.callBlockers !== undefined && !Array.isArray(seed.callBlockers)) ||
     (seed.checkpointInjections !== undefined && !Array.isArray(seed.checkpointInjections))
   ) {
     return undefined;
   }
   const candidates: PersistedResumeCandidate[] = [];
+  const blockers: PersistedResumeCallBlocker[] = [];
   const injections: PersistedCheckpointInjection[] = [];
   const occurrences = new Set<string>();
   for (const value of seed.candidates) {
@@ -543,6 +578,14 @@ function validateSeed(source: PersistedRunState, sourceRunId: string): Validated
     occurrences.add(key);
     candidates.push(candidate);
   }
+  for (const value of seed.callBlockers ?? []) {
+    const blocker = validateCallBlocker(value);
+    if (!blocker) return undefined;
+    const key = resumeOccurrenceKey(blocker.sourceRunId, blocker.recordedIndex);
+    if (occurrences.has(key)) return undefined;
+    occurrences.add(key);
+    blockers.push(blocker);
+  }
   for (const value of seed.checkpointInjections ?? []) {
     const injection = validateInjection(value);
     if (!injection) return undefined;
@@ -551,7 +594,7 @@ function validateSeed(source: PersistedRunState, sourceRunId: string): Validated
     occurrences.add(key);
     injections.push(injection);
   }
-  return { candidates, injections };
+  return { candidates, blockers, injections };
 }
 
 function validationError(message: string): WorkflowError {
@@ -645,10 +688,15 @@ function pendingInjection(
     candidate.call.hash === call.hash &&
     candidate.call.inputsHash === call.inputsHash,
   );
+  const duplicateBlocker = seed.blockers.some((blocker) =>
+    blocker.call.kind === "checkpoint" &&
+    blocker.call.hash === call.hash &&
+    blocker.call.inputsHash === call.inputsHash,
+  );
   const duplicateInjection = seed.injections.some((injection) =>
     injection.hash === call.hash && injection.inputsHash === call.inputsHash,
   );
-  if (duplicateRoot || duplicateCandidate || duplicateInjection) return { valid: true };
+  if (duplicateRoot || duplicateCandidate || duplicateBlocker || duplicateInjection) return { valid: true };
   const injection = strictClone<PersistedCheckpointInjection>({
     sourceRunId: source.runId,
     recordedIndex: call.index,
@@ -691,15 +739,29 @@ export function cloneResumeCandidate(
   });
 }
 
+function cloneResumeCallBlocker(
+  sourceRunId: string,
+  call: WorkflowCallRecord,
+): PersistedResumeCallBlocker | undefined {
+  return validateCallBlocker({
+    sourceRunId,
+    recordedIndex: call.index,
+    call,
+  });
+}
+
 export function normalizeResumeSeed(input: {
   sourceRunId: string;
   promoted?: readonly PersistedResumeCandidate[];
   retained?: readonly PersistedResumeCandidate[];
+  promotedBlockers?: readonly PersistedResumeCallBlocker[];
+  retainedBlockers?: readonly PersistedResumeCallBlocker[];
   retainedInjections?: readonly PersistedCheckpointInjection[];
   pendingInjection?: PersistedCheckpointInjection;
 }): PersistedResumeSeed | undefined {
   if (!isNonEmptyString(input.sourceRunId)) return undefined;
   const candidates: PersistedResumeCandidate[] = [];
+  const callBlockers: PersistedResumeCallBlocker[] = [];
   const checkpointInjections: PersistedCheckpointInjection[] = [];
   const occurrences = new Set<string>();
   for (const value of [...(input.promoted ?? []), ...(input.retained ?? [])]) {
@@ -709,6 +771,14 @@ export function normalizeResumeSeed(input: {
     if (occurrences.has(key)) return undefined;
     occurrences.add(key);
     candidates.push(candidate);
+  }
+  for (const value of [...(input.promotedBlockers ?? []), ...(input.retainedBlockers ?? [])]) {
+    const blocker = validateCallBlocker(value);
+    if (!blocker) return undefined;
+    const key = resumeOccurrenceKey(blocker.sourceRunId, blocker.recordedIndex);
+    if (occurrences.has(key)) return undefined;
+    occurrences.add(key);
+    callBlockers.push(blocker);
   }
   for (const value of [
     ...(input.retainedInjections ?? []),
@@ -725,6 +795,7 @@ export function normalizeResumeSeed(input: {
     format: "identity-v1",
     sourceRunId: input.sourceRunId,
     candidates,
+    ...(callBlockers.length === 0 ? {} : { callBlockers }),
     ...(checkpointInjections.length === 0 ? {} : { checkpointInjections }),
   });
 }
@@ -836,13 +907,21 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   const preparedInjection = pendingInjection(source, manifest.calls, retained, reply);
   if (!preparedInjection.valid) return liveDecision(sourceRunId, requestedPolicy, "manifest-invalid");
 
+  const promotedBlockers = manifest.calls
+    .filter((call) => call.outcome !== "result")
+    .map((call) => cloneResumeCallBlocker(sourceRunId, call))
+    .filter((blocker): blocker is PersistedResumeCallBlocker => blocker !== undefined);
+  const blockerIndexes = new Set(promotedBlockers.map((blocker) => blocker.recordedIndex));
+
   const pendingRepresented =
     source.status === "paused" &&
     source.pauseReason === "checkpoint_required" &&
     preparedInjection.injection !== undefined;
   const pendingIndex = preparedInjection.injection?.recordedIndex;
   const allCallsRepresented = manifest.calls.every((call) =>
-    call.outcome === "result" || (pendingRepresented && call.index === pendingIndex),
+    call.outcome === "result" ||
+    blockerIndexes.has(call.index) ||
+    (pendingRepresented && call.index === pendingIndex),
   );
   const filesystemStable = environmentsEqual(source.environment, resume.terminalEnvironment);
   const allAgentsSafe =
@@ -900,7 +979,9 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   const seed = normalizeResumeSeed({
     sourceRunId,
     promoted,
+    promotedBlockers,
     retained: retained.candidates,
+    retainedBlockers: retained.blockers,
     retainedInjections: retained.injections,
     pendingInjection: preparedInjection.injection,
   });
@@ -917,6 +998,14 @@ function indexedSourceFacts(source: IndexedResumeSource): {
   if (source.type === "injection") {
     return { kind: "checkpoint", ...source.injection };
   }
+  if (source.type === "blocker") {
+    return {
+      kind: source.blocker.call.kind,
+      hash: source.blocker.call.hash,
+      path: source.blocker.call.path as string,
+      inputsHash: source.blocker.call.inputsHash as string,
+    };
+  }
   return {
     kind: source.candidate.call.kind,
     hash: source.candidate.call.hash,
@@ -928,6 +1017,7 @@ function indexedSourceFacts(source: IndexedResumeSource): {
 export function buildResumeCandidateIndexes(seed: PersistedResumeSeed): ResumeCandidateIndexes {
   const sources: IndexedResumeSource[] = [
     ...seed.candidates.map((candidate) => ({ type: "candidate" as const, candidate })),
+    ...(seed.callBlockers ?? []).map((blocker) => ({ type: "blocker" as const, blocker })),
     ...(seed.checkpointInjections ?? []).map((injection) => ({ type: "injection" as const, injection })),
   ];
   const exact = buildResumeExactIndex(sources, indexedSourceFacts);
@@ -965,7 +1055,11 @@ export function buildResumeCandidateIndexes(seed: PersistedResumeSeed): ResumeCa
 }
 
 export function indexedSourceOccurrence(source: IndexedResumeSource): string {
-  const value = source.type === "candidate" ? source.candidate : source.injection;
+  const value = source.type === "candidate"
+    ? source.candidate
+    : source.type === "blocker"
+      ? source.blocker
+      : source.injection;
   return resumeOccurrenceKey(value.sourceRunId, value.recordedIndex);
 }
 
@@ -1085,6 +1179,15 @@ export function selectResumeCandidate(
   const selected = selectedSource(indexes, input);
   if (selected.reason) return selected.reason;
   const source = selected.source as IndexedResumeSource;
+  if (source.type === "blocker") {
+    const closesSuffix = input.kind === "agent" && currentSafety(input) === undefined;
+    return {
+      action: "live",
+      reason: "not-recorded",
+      remove: source,
+      ...(closesSuffix ? { closesSuffix: true as const } : {}),
+    };
+  }
   if (
     input.kind === "agent" &&
     source.type === "candidate" &&
