@@ -1,5 +1,13 @@
 # @automatalabs/shared-types
 
+## 0.26.0
+
+### Minor Changes
+
+- 82ede81: Add the executable built-in backend registry and generated dependency manifest, expose recursively
+  frozen initialize metadata on session refs and events, preserve generic ACP extension passthrough,
+  and document the registry-driven onboarding and routing contract.
+
 ## 0.25.1
 
 ### Patch Changes
