@@ -24,6 +24,7 @@ import {
   formatValidateReport,
   validateWorkflowScript,
   MOCK_TOKENS_PER_AGENT,
+  ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT,
 } from "../src/validate.js";
 import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
 import type { SessionConfigOption } from "@automatalabs/acp-agents";
@@ -223,6 +224,28 @@ function piThinkingOptions(supported: readonly string[]): SessionConfigOption[] 
   }];
 }
 
+function modelSelect(models: readonly string[], current: string): SessionConfigOption {
+  return {
+    id: "model",
+    type: "select",
+    name: "Model",
+    category: "model",
+    currentValue: current,
+    options: models.map((value) => ({ value, name: value })),
+  };
+}
+
+function thoughtSelect(id: string, values: readonly string[]): SessionConfigOption {
+  return {
+    id,
+    type: "select",
+    name: "Effort",
+    category: "thought_level",
+    currentValue: values[0] ?? "default",
+    options: values.map((value) => ({ value, name: value })),
+  };
+}
+
 test("pi thinkingLevel validation probes the call model and passes over-ceiling values with a clamp warning", async () => {
   const probes: Array<{ spec: string | undefined; selectModel: boolean | undefined }> = [];
   const restore = setValidateProbeFactoryForTests(() => ({
@@ -248,6 +271,7 @@ test("pi thinkingLevel validation probes the call model and passes over-ceiling 
     assert.match(report.warnings.join("\n"), /capped-call/);
     assert.match(report.warnings.join("\n"), /pi model "pi\/test\/capped"/);
     assert.match(report.warnings.join("\n"), /will clamp to "high"/);
+    assert.doesNotMatch(report.warnings.join("\n"), /domain enumeration/);
   } finally {
     restore();
   }
@@ -326,33 +350,235 @@ test("recognized interior-gap thinkingLevel clamps upward in advertised order", 
   }
 });
 
-test("thought-level validation without a recognized domain degrades to an unverified warning", async () => {
+test("codex enumerates one ordered union per backend, clamps a lower-ceiling model, and rejects unknown values", async () => {
+  const perModel = {
+    "gpt-six": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-four": ["low", "medium", "high", "xhigh"],
+  } as const;
+  const models = Object.keys(perModel);
+  const probes: string[] = [];
   const restore = setValidateProbeFactoryForTests(() => ({
-    async probeConfigOptions() {
+    async probeConfigOptions(spec, opts) {
+      assert.equal(opts?.selectModel, true);
+      probes.push(spec ?? "");
+      const model = spec?.slice("codex/".length) as keyof typeof perModel;
       return {
-        backendId: "claude",
-        options: [{
-          id: "reasoning_effort",
-          type: "select",
-          name: "Reasoning effort",
-          category: "thought_level",
-          currentValue: "low",
-          options: [{ value: "low", name: "Low" }],
-        }],
+        backendId: "codex",
+        options: [modelSelect(models, model), thoughtSelect("reasoning_effort", perModel[model])],
       };
     },
     async dispose() {},
   }));
   try {
     const report = await validateWorkflowScript([
-      'export const meta = { name: "future-domain", description: "d" };',
-      'return agent("x", { label: "future-call", configOptions: { reasoning_effort: "higher" } });',
+      'export const meta = { name: "codex-domain", description: "d" };',
+      'await agent("a", { label: "six-supported", model: "codex/gpt-six", configOptions: { reasoning_effort: "ultra" } });',
+      'await agent("b", { label: "four-clamp", model: "codex/gpt-four", configOptions: { reasoning_effort: "ultra" } });',
+      'return agent("c", { label: "four-unknown", model: "codex/gpt-four", configOptions: { reasoning_effort: "warp" } });',
     ].join("\n"));
 
-    assert.equal(report.ok, true);
-    assert.equal(report.exitCode, 0);
-    assert.match(report.warnings.join("\n"), /no recognized domain was advertised/);
-    assert.match(report.warnings.join("\n"), /clamp eligibility is unverified/);
+    assert.equal(report.ok, false);
+    assert.equal(report.exitCode, 2);
+    assert.deepEqual(probes, ["codex/gpt-four", "codex/gpt-six"]);
+    assert.match(report.warnings.join("\n"), /four-clamp[\s\S]*will clamp to "xhigh"/);
+    assert.doesNotMatch(report.warnings.join("\n"), /six-supported/);
+    assert.match(report.dryRun?.reason ?? "", /four-unknown[\s\S]*warp/);
+    const expectedDomain = [...new Set(Object.values(perModel).flat())];
+    const fourCatalog = report.dryRun?.harnessOptions?.find((entry) => entry.model === "codex/gpt-four");
+    const effort = fourCatalog?.options?.find((option) => option.id === "reasoning_effort");
+    const namespace = effort?._meta?.["@automatalabs/agentprism"] as
+      | { recognizedValues?: unknown }
+      | undefined;
+    assert.deepEqual(namespace?.recognizedValues, expectedDomain);
+  } finally {
+    restore();
+  }
+});
+
+test("claude does not borrow effort for an effort-absent model and keeps default outside clamp ordering", async () => {
+  const perModel = {
+    opus: ["default", "low", "medium", "high", "xhigh"],
+    sonnet: ["default", "low", "medium"],
+    haiku: undefined,
+  } as const;
+  const models = Object.keys(perModel);
+  const probes: string[] = [];
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec) {
+      probes.push(spec ?? "");
+      const model = spec?.slice("claude/".length) as keyof typeof perModel;
+      const effort = perModel[model];
+      return {
+        backendId: "claude",
+        options: [
+          modelSelect(models, model),
+          ...(effort === undefined ? [] : [thoughtSelect("effort", effort)]),
+        ],
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "claude-domain", description: "d" };',
+      'await agent("a", { label: "haiku-absent", model: "claude/haiku", configOptions: { effort: "high" } });',
+      'await agent("b", { label: "sonnet-clamp", model: "claude/sonnet", configOptions: { effort: "high" } });',
+      'return agent("c", { label: "sonnet-default", model: "claude/sonnet", configOptions: { effort: "default" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, false);
+    assert.deepEqual(probes, ["claude/haiku", "claude/sonnet", "claude/opus"]);
+    assert.deepEqual(
+      report.dryRun?.harnessOptions?.find((entry) => entry.model === "claude/haiku")?.options?.map(({ id }) => id),
+      ["model"],
+    );
+    assert.match(report.dryRun?.reason ?? "", /haiku-absent[\s\S]*option "effort"[\s\S]*unknown/);
+    assert.match(report.warnings.join("\n"), /sonnet-clamp[\s\S]*will clamp to "medium"/);
+    assert.doesNotMatch(report.warnings.join("\n"), /will clamp to "default"/);
+    assert.doesNotMatch(report.warnings.join("\n"), /sonnet-default/);
+    const sonnet = report.dryRun?.harnessOptions?.find((entry) => entry.model === "claude/sonnet");
+    const effort = sonnet?.options?.find((option) => option.id === "effort");
+    const namespace = effort?._meta?.["@automatalabs/agentprism"] as
+      | { recognizedValues?: unknown }
+      | undefined;
+    assert.deepEqual(namespace?.recognizedValues, ["low", "medium", "high", "xhigh", "default"]);
+  } finally {
+    restore();
+  }
+});
+
+test("opencode keeps full provider/model identities distinct and exact-rejects without enumeration", async () => {
+  const perModel = {
+    "openrouter/anthropic/claude-opus-4.6": ["low", "high"],
+    "direct/anthropic/claude-opus-4.6": ["eco", "turbo"],
+  } as const;
+  const probes: Array<{ spec: string | undefined; selectModel: boolean | undefined }> = [];
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec, opts) {
+      probes.push({ spec, selectModel: opts?.selectModel });
+      const model = spec?.slice("opencode/".length) as keyof typeof perModel;
+      return {
+        backendId: "opencode",
+        options: [
+          modelSelect(Object.keys(perModel), model),
+          thoughtSelect("effort", perModel[model]),
+        ],
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "opencode-exact", description: "d" };',
+      'await agent("a", { label: "openrouter-valid", model: "opencode/openrouter/anthropic/claude-opus-4.6", configOptions: { effort: "high" } });',
+      'return agent("b", { label: "direct-reject", model: "opencode/direct/anthropic/claude-opus-4.6", configOptions: { effort: "high" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, false);
+    assert.deepEqual(probes, [
+      { spec: "opencode/direct/anthropic/claude-opus-4.6", selectModel: true },
+      { spec: "opencode/openrouter/anthropic/claude-opus-4.6", selectModel: true },
+    ]);
+    assert.match(report.dryRun?.reason ?? "", /direct-reject[\s\S]*advertised alternatives: "eco", "turbo"/);
+    assert.match(report.dryRun?.reason ?? "", /must match exactly/);
+    assert.doesNotMatch(report.warnings.join("\n"), /clamp|enumeration/);
+  } finally {
+    restore();
+  }
+});
+
+test("ordered-domain cost guard skips catalogs above 32 models, warns, and exact-rejects", async () => {
+  const models = Array.from(
+    { length: ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT + 1 },
+    (_, index) => `model-${index}`,
+  );
+  const probes: string[] = [];
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec) {
+      probes.push(spec ?? "");
+      return {
+        backendId: "codex",
+        options: [modelSelect(models, "model-0"), thoughtSelect("reasoning_effort", ["low"])],
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "cost-guard", description: "d" };',
+      'return agent("x", { label: "guarded-call", model: "codex/model-0", configOptions: { reasoning_effort: "high" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, false);
+    assert.deepEqual(probes, ["codex/model-0"]);
+    assert.match(
+      report.warnings.join("\n"),
+      new RegExp(`advertised ${models.length} models[\\s\\S]*limit of ${ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT}`),
+    );
+    assert.match(report.dryRun?.reason ?? "", /guarded-call[\s\S]*must match exactly/);
+  } finally {
+    restore();
+  }
+});
+
+test("undeclared/custom backend semantics default to exact-set and never enumerate", async () => {
+  const probes: string[] = [];
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec) {
+      probes.push(spec ?? "");
+      return {
+        backendId: "future",
+        options: [
+          modelSelect(["model-a", "model-b"], "model-a"),
+          thoughtSelect("effort", ["low"]),
+        ],
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "custom-exact", description: "d", backends: { future: { command: "future-acp" } } };',
+      'return agent("x", { label: "custom-call", model: "future/model-a", configOptions: { effort: "high" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, false);
+    assert.deepEqual(probes, ["future/model-a"]);
+    assert.match(report.dryRun?.reason ?? "", /custom-call[\s\S]*must match exactly/);
+    assert.doesNotMatch(report.warnings.join("\n"), /ordered thought-level domain enumeration/);
+  } finally {
+    restore();
+  }
+});
+
+test("inconsistent ordered subsets warn and fall back to exact advertised-value validation", async () => {
+  const perModel = {
+    alpha: ["low", "high"],
+    beta: ["high", "low", "xhigh"],
+  } as const;
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec) {
+      const model = spec?.slice("codex/".length) as keyof typeof perModel;
+      return {
+        backendId: "codex",
+        options: [
+          modelSelect(Object.keys(perModel), model),
+          thoughtSelect("reasoning_effort", perModel[model]),
+        ],
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "inconsistent-domain", description: "d" };',
+      'return agent("x", { label: "inconsistent-call", model: "codex/alpha", configOptions: { reasoning_effort: "xhigh" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, false);
+    assert.match(report.warnings.join("\n"), /could not merge advertised thought-level orders/);
+    assert.match(report.dryRun?.reason ?? "", /inconsistent-call[\s\S]*must match exactly/);
+    assert.doesNotMatch(report.warnings.join("\n"), /will clamp/);
   } finally {
     restore();
   }

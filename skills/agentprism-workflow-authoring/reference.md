@@ -88,10 +88,13 @@ config-options table — `agentprism-workflows config <harness>`, or any validat
 picking an id or select value, and run the validator every time after authoring.
 
 For Pi, use `thinkingLevel` only with an explicit Pi model when the level matters. Validation
-selects that call's model before reading the option: listed values pass unchanged, SDK-recognized
-but unsupported values warn with the effective ordered clamp, and unrecognized values fail with
-exit `2`. A thought-level option from another backend that does not advertise a recognized domain
-leaves an unadvertised value valid but warns that clamp eligibility is unverified.
+selects that call's model before reading the option: listed values pass unchanged, recognized but
+unsupported ordered values warn with the effective clamp, and unrecognized values fail with exit
+`2`. Pi advertises its domain directly. Claude and Codex derive missing domains by enumerating up to
+32 advertised models and consistently merging their effort orders; Claude does not borrow `effort`
+for a model that omits the option, and its `default` sentinel is outside clamp ordering. OpenCode and
+custom/unknown backends are exact-set, so every unadvertised thought-level value fails instead of
+clamping. A too-large or inconsistent ordered catalog warns and takes that same exact path.
 
 ## Structured output channels
 
@@ -549,7 +552,7 @@ Backend auth comes from the machine the host runs on: Claude via a logged-in Cla
 npx @automatalabs/workflows validate <workflow-file> [options]
 ```
 
-Zero tokens: a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). Afterward, validation opens each distinct routed `{ backend, model }` pair once without a prompt, selects the authored call model verbatim, and surfaces its echoed model-specific config-options table in both human and JSON reports, even when the script authors none. It checks exact authored ids, select values, boolean types, and the reserved `"model"` key; errors name the call label, authored value, and alternatives and exit `2`. Pi's `thinkingLevel` metadata makes the distinction exact: supported values pass, recognized unsupported values pass with an ordered clamp warning, and unrecognized values fail. An unenriched thought-level option leaves an unadvertised value valid with an unverified-clamp warning. A pair's spawn/auth/model-selection/session failure adds one warning, reports `probed:false`, and skips only that pair's checks—it never fails validation by itself. Catalogs are read afresh on every validation. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
+Zero tokens: a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). Afterward, validation opens each distinct routed `{ backend, model }` pair once without a prompt, selects the authored call model verbatim, and surfaces its echoed model-specific config-options table in both human and JSON reports, even when the script authors none. It checks exact authored ids, select values, boolean types, and the reserved `"model"` key; errors name the call label, authored value, and alternatives and exit `2`. Self-advertised recognized domains win. Otherwise, Claude/Codex enumerate up to 32 picker-visible models and merge consistent effort orders before using the same ordered clamp path. Pi already advertises its domain. OpenCode, custom/unknown backends, too-large catalogs, and inconsistent orders use exact advertised-value validation. Claude effort omission is model-specific and its `default` sentinel is excluded from ceiling ordering. A pair's spawn/auth/model-selection/session failure adds one warning, reports `probed:false`, and skips only that pair's checks—it never fails validation by itself. Catalogs are read afresh on every validation. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
 
 | flag | meaning |
 |---|---|

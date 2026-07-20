@@ -121,7 +121,11 @@ test("generated authoring-prompt teaches configOptions and validate-time probe s
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("marks it `probed:false`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi's thought-level option is named `thinkingLevel`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("warning that names the effective clamp target"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("clamp eligibility is unverified"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Claude and Codex are also ordered"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("OpenCode and custom/unknown backends use exact-set validation"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Enumeration is bounded at 32 advertised models"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Claude effort absence remains model-specific"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`default` never becomes a ceiling target"));
 });
 
 test("prompts/list advertises author-workflow with the optional task argument", async () => {

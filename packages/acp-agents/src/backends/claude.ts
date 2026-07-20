@@ -98,6 +98,7 @@ export class ClaudeBackend implements Backend {
 
 export const claudeBackendDefinition = defineBuiltinBackend({
   id: "claude",
+  thoughtLevelDomainSemantics: "ordered",
   authProfile: claudeAuthProfile,
   create: (authProfile) => new ClaudeBackend(authProfile),
   release: {

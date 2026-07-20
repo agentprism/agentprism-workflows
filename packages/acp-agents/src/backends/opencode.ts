@@ -83,6 +83,7 @@ export class OpenCodeBackend implements Backend {
 
 export const opencodeBackendDefinition = defineBuiltinBackend({
   id: "opencode",
+  thoughtLevelDomainSemantics: "exact-set",
   authProfile: opencodeAuthProfile,
   create: (authProfile) => new OpenCodeBackend(authProfile),
   release: {

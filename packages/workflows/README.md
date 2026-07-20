@@ -654,10 +654,16 @@ reserved `"model"` id make the report invalid with exit code `2`; each diagnosti
 authored value, and advertised alternatives. For select options carrying
 `_meta["@automatalabs/agentprism"].recognizedValues`, a supported value passes, an unsupported but
 recognized value passes with a warning naming the effective clamp target, and an unrecognized value
-is invalid. Pi's `thinkingLevel` option publishes this metadata from Pi's own ordered domain. Other
-backends are not assigned a guessed domain: an unadvertised thought-level value without the metadata
-is left valid with an explicit "clamp eligibility is unverified" warning. Exit codes are `0` valid,
-`1` parse failure, `2` dry-run or config-option failure, `3` usage error.
+is invalid. Pi's `thinkingLevel` option publishes this metadata from Pi's own ordered domain and
+therefore needs no extra probes. For an ordered built-in that omits the metadata (Claude or Codex),
+validation reads its advertised model picker, probes each selectable model through the same
+per-`{ backend, model }` cache, merges consistent per-model thought-level orders, and applies the
+same recognized-value/clamp path. Claude models that omit `effort` do not inherit another model's
+option, and its `default` sentinel is recognized but excluded from ceiling ordering. Enumeration is
+skipped, with a warning, when a picker advertises more than 32 models or the orders cannot be merged.
+OpenCode and custom/unknown backends are exact-set: an unadvertised thought-level value is invalid
+instead of clamping. Exit codes are `0` valid, `1` parse failure, `2` dry-run or config-option failure,
+`3` usage error.
 
 Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
 NAME and resolve nested `workflow("<name>")` calls from your folder), `--parse-only`,

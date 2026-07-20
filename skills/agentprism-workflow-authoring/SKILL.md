@@ -61,7 +61,7 @@ Running scripts happens through the MCP server's `workflow` tool — server setu
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.
 - [ ] Model specs only where a specific backend earns its keep; use a registered prefix plus a live-catalog-verified id (or backend-only form), and expect harness rejection rather than client fallback.
 - [ ] Model ids and effort values were read from `npx @automatalabs/workflows config` (or a validator report), not recalled from memory.
-- [ ] Every `configOptions` id/value comes from the selected model's advertised-options table; `"model"` stays in the dedicated field, and any Pi `thinkingLevel` clamp warning is intentional.
+- [ ] Every `configOptions` id/value comes from the selected model's advertised-options table; `"model"` stays in the dedicated field, and any ordered thought-level clamp warning is intentional.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
 - [ ] Every `resume: { filesystem: "read-only" }` assertion is true for all persistent/ambient effects; unordered parallel siblings do not communicate through files, and worktree calls do not commit or mutate outside the throwaway checkout.
 - [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.

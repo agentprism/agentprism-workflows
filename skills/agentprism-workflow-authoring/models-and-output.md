@@ -58,11 +58,15 @@ const review = await agent(REVIEW_PROMPT, {
 ```
 
 Validation selects `openrouter/vendor/model-id` before reading Pi's choices. A listed value passes
-unchanged. A Pi-recognized value above the model's ceiling or in a model-specific gap passes with a
-warning that names the effective clamp target. A value outside Pi's SDK-derived recognized domain
-fails validation with exit code `2`. The validator does not invent domains for other backends: when
-a thought-level option omits recognized-domain metadata, an unadvertised value gets an explicit
-"clamp eligibility is unverified" warning instead of a guessed error.
+unchanged. A recognized value above an ordered backend model's ceiling or in a model-specific gap
+passes with a warning that names the effective clamp target. Pi advertises its SDK-derived domain
+directly. Claude and Codex are also ordered; when their options omit domain metadata, validation
+enumerates the advertised models and merges their per-model effort orders. Claude's missing
+`effort` option means that model does not support it, and `default` never becomes a ceiling target.
+OpenCode and custom/unknown backends use exact-set validation because their values have no declared
+total order. In every case, an unrecognized or exact-set-unadvertised value fails with exit code `2`.
+Enumeration is bounded at 32 advertised models; a larger or inconsistently ordered catalog warns
+and uses exact advertised-value validation.
 
 Two things worth designing for:
 
