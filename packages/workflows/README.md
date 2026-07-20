@@ -296,7 +296,22 @@ resolves immediately; without one, the default mode still takes `default ?? true
 `headless: "abort"` aborts. Only `headless: "pause"` returns `reason: "checkpoint_required"` plus
 `checkpointContext`; resume with `checkpointReplies: { [context.callIndex]: decision }` (or a live
 `confirm`). The injected answer is journaled and replayed, so a detached run never pauses for a
-checkpoint unless the author opts in. `WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
+checkpoint unless the author opts in. `checkpointReplies` works with the default `"auto"` policy;
+it does not require `resumePolicy: "positional"` or any other particular policy. The supplied JSON
+decision is returned verbatim from `checkpoint()` (`kind: "confirm"` therefore normally receives a
+boolean).
+
+Resume guarantees journal/script replay integrity and checkpoint-reply targeting only. It never
+assumes or guarantees that the filesystem, external systems, agent output semantics, or any other
+part of the world stayed fresh between runs. If an unsafe prefix must run live, a supplied reply is
+injected only when execution reaches the exact recorded checkpoint call site with the same
+checkpoint identity and inputs; content-only matching is insufficient after that live prefix. A
+reply that is not applied is reported in `resumeReport` and terminal summaries. Authors who want a
+decision bound to changing content should interpolate that content into the checkpoint prompt so it
+participates in the checkpoint's hashed replay identity and a divergence re-asks instead of
+injecting.
+
+`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
 `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
 implementation, and per-agent timeout/retry defaults.
 
@@ -361,7 +376,7 @@ sources with an input-fingerprint format below 2 use the
 ≤0.23 resume hop when the ancestor run still exists in the same persistence directory; nested and deleted-run scopes stay live. Engine
 package versions are persisted and surfaced as diagnostics but never gate replay. Every new-run
 resume exposes `WorkflowReplayEligibility` on the foreground result and inspection status: strategy,
-predicted and observed replayable prefixes, counts, the first non-replay when known, source/current
+an admission-time upper bound and the observed replayable prefix, counts, the first non-replay when known, source/current
 engine and input-format versions, non-gating runtime/environment provenance changes, and operational changes.
 
 The manager's critical initial save contains the complete inherited seed before a background

@@ -123,7 +123,7 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input/safety checks. Requires `resumeFromRunId`. |
-| `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. Wire keys must be canonical non-negative safe integers. |
+| `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
 | `runId` | engine run ID | inspect/await/stop only | — | Required for inspect/await/stop; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
 | `lastN` | integer 1–50 | inspect/await/stop only | `20` | Latest matching journal calls. Filtering happens before this selection. |
@@ -493,7 +493,14 @@ client `resources` capability to gate these server-offered primitives.
   request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus
   `outcome.checkpointContext`. Resume by starting a new run with `resumeFromRunId` and
-  `checkpointReplies`.
+  `checkpointReplies`; no particular `resumePolicy` is required, and the decision value becomes the
+  checkpoint result verbatim. The engine guarantees journal/script replay integrity and reply
+  targeting only—never that the filesystem, external state, agent semantics, or any other part of
+  the world stayed fresh. After an unsafe prefix runs live, injection requires the exact recorded
+  checkpoint call site, identity, and inputs; a content-only match is not enough. An unapplied reply
+  is explicit in `resumeReport` and the terminal text. To bind approval to changing content,
+  interpolate that content into the checkpoint prompt so it participates in the hashed checkpoint
+  identity and changed content re-asks.
 - **Auth pauses.** Await reports `auth_required`/`AUTH_REQUIRED` and the non-secret
   `outcome.authContext`. Log the named backend CLI in out-of-band, then start a new run with
   `resumeFromRunId`; no MCP credential channel is added.
