@@ -46,6 +46,24 @@ and before the prompt. There are no aliases, coercion, client-side vocabulary, d
 catalogs. Never put `"model"` in `configOptions`; use the dedicated `model` field. A harness
 rejection follows the ordinary agent-error path.
 
+Pi's thought-level option is named `thinkingLevel`, and its choices depend on the exact model in
+the same call:
+
+```js
+const review = await agent(REVIEW_PROMPT, {
+  label: "pi-review",
+  model: "pi/openrouter/vendor/model-id",
+  configOptions: { thinkingLevel: "high" },
+});
+```
+
+Validation selects `openrouter/vendor/model-id` before reading Pi's choices. A listed value passes
+unchanged. A Pi-recognized value above the model's ceiling or in a model-specific gap passes with a
+warning that names the effective clamp target. A value outside Pi's SDK-derived recognized domain
+fails validation with exit code `2`. The validator does not invent domains for other backends: when
+a thought-level option omits recognized-domain metadata, an unadvertised value gets an explicit
+"clamp eligibility is unverified" warning instead of a guessed error.
+
 Two things worth designing for:
 
 - **Cross-vendor independence.** Reviewing or verifying with a *different* vendor than the one that produced the work removes correlated blind spots — an agent family tends to approve its own idioms. When correctness matters, judge across vendors.

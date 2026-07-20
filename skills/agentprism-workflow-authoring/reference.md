@@ -87,6 +87,12 @@ session. The catalog varies by harness version, login, and machine, so read a li
 config-options table — `agentprism-workflows config <harness>`, or any validate report — before
 picking an id or select value, and run the validator every time after authoring.
 
+For Pi, use `thinkingLevel` only with an explicit Pi model when the level matters. Validation
+selects that call's model before reading the option: listed values pass unchanged, SDK-recognized
+but unsupported values warn with the effective ordered clamp, and unrecognized values fail with
+exit `2`. A thought-level option from another backend that does not advertise a recognized domain
+leaves an unadvertised value valid but warns that clamp eligibility is unverified.
+
 ## Structured output channels
 
 One author API (`schema`), four fulfillment paths — chosen automatically per backend:
@@ -543,7 +549,7 @@ Backend auth comes from the machine the host runs on: Claude via a logged-in Cla
 npx @automatalabs/workflows validate <workflow-file> [options]
 ```
 
-Zero tokens: a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). Afterward, validation opens each distinct routed ACP harness once without a prompt and surfaces its full advertised config-options table in both human and JSON reports, even when the script authors none. It checks exact authored ids, select values, boolean types, and the reserved `"model"` key; errors name the call label, authored value, and advertised alternatives and exit `2`. A harness spawn/auth/session failure adds one warning, reports `probed:false`, and skips only that harness's checks—it never fails validation by itself. Catalogs are read afresh on every validation. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
+Zero tokens: a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). Afterward, validation opens each distinct routed `{ backend, model }` pair once without a prompt, selects the authored call model verbatim, and surfaces its echoed model-specific config-options table in both human and JSON reports, even when the script authors none. It checks exact authored ids, select values, boolean types, and the reserved `"model"` key; errors name the call label, authored value, and alternatives and exit `2`. Pi's `thinkingLevel` metadata makes the distinction exact: supported values pass, recognized unsupported values pass with an ordered clamp warning, and unrecognized values fail. An unenriched thought-level option leaves an unadvertised value valid with an unverified-clamp warning. A pair's spawn/auth/model-selection/session failure adds one warning, reports `probed:false`, and skips only that pair's checks—it never fails validation by itself. Catalogs are read afresh on every validation. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
 
 | flag | meaning |
 |---|---|

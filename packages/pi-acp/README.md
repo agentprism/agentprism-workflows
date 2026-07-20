@@ -21,6 +21,23 @@ await runner.run("Review this change", { model: "pi/openrouter/vendor/model-id" 
 
 The runner strips exactly the first `pi/` segment and sends the remaining `provider/model-id` verbatim through ACP's reserved `model` config channel. Pi-acp advertises a configured `model` select populated from the completed credential- and provider-filter-aware Pi catalog; set requests refresh and require membership in that same catalog. An unknown model rejects with JSON-RPC `-32602` and `data.errorKind = "invalid_model"`.
 
+### Thinking levels
+
+Pi-acp's `thinkingLevel` select is model-aware. Its visible choices are Pi's
+`getSupportedThinkingLevels()` result for the selected model, in Pi's order: a model capped at
+`high` does not advertise `xhigh` or `max`, and a non-reasoning model advertises only `off`. Before
+a model is selected, the option uses Pi's complete recognized domain as an unknown-model
+best-effort fallback. That domain is derived once from Pi's helper with a synthetic model that
+supports every level; pi-acp does not maintain a parallel hardcoded vocabulary.
+
+The option carries the additive ACP metadata
+`_meta["@automatalabs/agentprism"].recognizedValues`. The visible choices remain the supported
+subset, while this metadata contains Pi's complete ordered domain so clients can distinguish an
+unsupported recognized value from garbage. A supported set request is applied unchanged. A
+recognized but unsupported request is clamped with Pi's `clampThinkingLevel()` and the response
+echoes the effective level. An unrecognized value fails loudly with JSON-RPC `-32602` and
+`data.errorKind = "invalid_config_value"`; it is never handed to Pi's lowest-level fallback.
+
 ## MCP and structured output
 
 Pi-acp serves stdio, Streamable HTTP, and legacy SSE MCP servers and consumes stable tools, resources, prompts, completion, logging, pagination, progress, and dynamic tool registration. It also provides MCP client sampling, the workspace root, and form/URL elicitation. Client-hosted `acp` transport remains runner-owned. For `agent({ schema })`, Pi receives the runner's client-hosted HTTP `StructuredOutput` tool through this standard MCP path and retains the common prompt-embedded schema plus validated last-text fallback.

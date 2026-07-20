@@ -2,7 +2,7 @@
 // direct nondeterministic call expressions) followed by an optional DRY RUN — the script
 // executes for real in the engine's deterministic realm, but every agent() call is served by
 // an in-process mock AgentRunner that fabricates schema-conforming results. Afterward, each
-// routed ACP harness is opened once without a prompt to read its advertised config options.
+// routed ACP backend/model pair is opened once without a prompt to read its advertised config options.
 // No tokens are spent, a mock live confirm resolves checkpoints to their declared defaults,
 // and run state is journaled nowhere (journaling off + a throwaway persistence root for the run lease).
 //
@@ -123,6 +123,8 @@ export interface ValidatedAgentCall {
 
 export interface ValidateHarnessOptions {
   backendId: string;
+  /** The call's verbatim selected model; absent means the harness/session default. */
+  model?: string;
   probed: boolean;
   /** Present when probed=false: the harness's spawn/auth/session error. */
   error?: string;
@@ -157,7 +159,7 @@ export interface ValidateWorkflowReport {
     phasesVisited: string[];
     logs: string[];
     durationMs: number;
-    /** Fresh, per-run advertised config-option catalogs for every routed harness. */
+    /** Fresh, per-run advertised config-option catalogs for every routed backend/model pair. */
     harnessOptions?: ValidateHarnessOptions[];
     /** The script's return value, composed from fabricated agent results. */
     result?: unknown;
@@ -172,6 +174,7 @@ const MAX_MOCK_ANSWER_GLOB_LENGTH = 256;
 const MAX_MOCK_ANSWER_SEQUENCE_LENGTH = 256;
 const MAX_MOCK_ANSWER_DEPTH = 32;
 const MAX_FIXTURE_REASON_LENGTH = 1024;
+const CONFIG_OPTION_META_NAMESPACE = "@automatalabs/agentprism";
 
 type GlobToken = { kind: "literal"; value: string } | { kind: "one" } | { kind: "many" };
 
@@ -790,6 +793,40 @@ interface ProbeStageResult {
   catalogs: Map<string, SessionConfigOption[]>;
 }
 
+interface ConfigProbeTarget {
+  backendId: string;
+  model?: string;
+}
+
+function configCatalogKey(backendId: string, model: string | undefined): string {
+  return JSON.stringify([backendId, model ?? null]);
+}
+
+function configProbeTargets(
+  calls: ValidatedAgentCall[],
+  registry: BackendRegistry,
+  hostRegistry: BackendRegistry,
+  declared: Record<string, CustomBackendConfig> | undefined,
+): ConfigProbeTarget[] {
+  const targets = new Map<string, ConfigProbeTarget>();
+  for (const call of calls) {
+    const backendId = routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId;
+    const target: ConfigProbeTarget = call.model === undefined
+      ? { backendId }
+      : { backendId, model: call.model };
+    targets.set(configCatalogKey(backendId, call.model), target);
+  }
+  return [...targets.values()].sort((left, right) =>
+    left.backendId.localeCompare(right.backendId) || (left.model ?? "").localeCompare(right.model ?? ""),
+  );
+}
+
+function probeTargetName(target: ConfigProbeTarget): string {
+  return target.model === undefined
+    ? `${target.backendId} (session default model)`
+    : `${target.backendId} model ${JSON.stringify(target.model)}`;
+}
+
 async function probeHarnessConfigOptions(
   calls: ValidatedAgentCall[],
   cwd: string,
@@ -798,47 +835,45 @@ async function probeHarnessConfigOptions(
   declared: Record<string, CustomBackendConfig> | undefined,
   warnings: string[],
 ): Promise<ProbeStageResult> {
-  const backendIds = [
-    ...new Set(
-      calls.map((call) =>
-        routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId,
-      ),
-    ),
-  ].sort();
+  const targets = configProbeTargets(calls, registry, hostRegistry, declared);
   const harnessOptions: ValidateHarnessOptions[] = [];
   const catalogs = new Map<string, SessionConfigOption[]>();
-  if (backendIds.length === 0) return { harnessOptions, catalogs };
+  if (targets.length === 0) return { harnessOptions, catalogs };
 
   let runner: ReturnType<typeof createValidateProbeRunner>;
   try {
     runner = createValidateProbeRunner(registryOptions(registry));
   } catch (error) {
     const reason = errorMessage(error);
-    for (const backendId of backendIds) {
+    for (const target of targets) {
       warnings.push(
-        `could not probe ${backendId} — configOptions on its calls are unverified: ${reason}`,
+        `could not probe ${probeTargetName(target)} — configOptions on its calls are unverified: ${reason}`,
       );
-      harnessOptions.push({ backendId, probed: false, error: reason });
+      harnessOptions.push({ ...target, probed: false, error: reason });
     }
     return { harnessOptions, catalogs };
   }
 
   try {
-    for (const backendId of backendIds) {
+    for (const target of targets) {
       try {
-        const result = await runner.probeConfigOptions(backendId, { cwd });
-        catalogs.set(backendId, result.options);
+        const result = await runner.probeConfigOptions(target.model ?? target.backendId, {
+          cwd,
+          selectModel: target.model !== undefined,
+        });
+        catalogs.set(configCatalogKey(target.backendId, target.model), result.options);
         harnessOptions.push({
           backendId: result.backendId,
+          ...(target.model === undefined ? {} : { model: target.model }),
           probed: true,
           options: result.options,
         });
       } catch (error) {
         const reason = errorMessage(error);
         warnings.push(
-          `could not probe ${backendId} — configOptions on its calls are unverified: ${reason}`,
+          `could not probe ${probeTargetName(target)} — configOptions on its calls are unverified: ${reason}`,
         );
-        harnessOptions.push({ backendId, probed: false, error: reason });
+        harnessOptions.push({ ...target, probed: false, error: reason });
       }
     }
   } finally {
@@ -861,12 +896,13 @@ function configOptionErrors(
   registry: BackendRegistry,
   hostRegistry: BackendRegistry,
   declared: Record<string, CustomBackendConfig> | undefined,
+  warnings: string[],
 ): string[] {
   const errors: string[] = [];
   for (const call of calls) {
     if (!call.configOptions || Object.keys(call.configOptions).length === 0) continue;
     const backendId = routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId;
-    const advertised = catalogs.get(backendId);
+    const advertised = catalogs.get(configCatalogKey(backendId, call.model));
     if (!advertised) continue;
     const optionIds = advertised.map((option) => option.id);
     for (const [id, value] of Object.entries(call.configOptions as Record<string, unknown>)) {
@@ -888,7 +924,46 @@ function configOptionErrors(
       }
       if (option.type === "select") {
         const choices = selectChoiceValues(option);
-        if (typeof value !== "string" || !choices.includes(value)) {
+        if (typeof value !== "string") {
+          errors.push(
+            `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} is not an advertised select value; ` +
+              `advertised alternatives: ${displayAlternatives(choices)}`,
+          );
+          continue;
+        }
+        if (choices.includes(value)) continue;
+
+        const recognized = recognizedSelectValues(option, choices);
+        if (recognized) {
+          if (!recognized.includes(value)) {
+            errors.push(
+              `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} is not recognized for ` +
+                `${callModelName(backendId, call.model)}; valid values: ${displayAlternatives(recognized)}`,
+            );
+            continue;
+          }
+          const effective = clampSelectValue(value, choices, recognized);
+          if (effective !== undefined) {
+            warnings.push(
+              `agent "${call.label}" configOptions option ${JSON.stringify(id)} value ${authored} is unsupported by ` +
+                `${callModelName(backendId, call.model)} and will clamp to ${JSON.stringify(effective)}; ` +
+                `supported values: ${displayAlternatives(choices)}`,
+            );
+            continue;
+          }
+          errors.push(
+            `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} cannot clamp for ` +
+              `${callModelName(backendId, call.model)} because it advertises no supported values`,
+          );
+          continue;
+        }
+
+        if (option.category === "thought_level" || option.id === "thinkingLevel") {
+          warnings.push(
+            `agent "${call.label}" configOptions option ${JSON.stringify(id)} value ${authored} is not advertised by ` +
+              `${callModelName(backendId, call.model)}; no recognized domain was advertised, so clamp eligibility is unverified`,
+          );
+        } else {
           errors.push(
             `agent "${call.label}" configOptions option ${JSON.stringify(id)} authored value ${authored} is not an advertised select value; ` +
               `advertised alternatives: ${displayAlternatives(choices)}`,
@@ -907,6 +982,48 @@ function configOptionErrors(
   return errors;
 }
 
+function callModelName(backendId: string, model: string | undefined): string {
+  return model === undefined
+    ? `${backendId} session default model`
+    : `${backendId} model ${JSON.stringify(model)}`;
+}
+
+function recognizedSelectValues(
+  option: Extract<SessionConfigOption, { type: "select" }>,
+  supported: readonly string[],
+): string[] | undefined {
+  const namespace = option._meta?.[CONFIG_OPTION_META_NAMESPACE];
+  if (namespace === null || typeof namespace !== "object" || Array.isArray(namespace)) return undefined;
+  const values = (namespace as { recognizedValues?: unknown }).recognizedValues;
+  if (!Array.isArray(values) || values.length === 0 || !values.every((value) => typeof value === "string")) {
+    return undefined;
+  }
+  const recognized = values as string[];
+  if (new Set(recognized).size !== recognized.length || !supported.every((value) => recognized.includes(value))) {
+    return undefined;
+  }
+  return recognized;
+}
+
+function clampSelectValue(
+  requested: string,
+  supported: readonly string[],
+  recognized: readonly string[],
+): string | undefined {
+  if (supported.includes(requested)) return requested;
+  const requestedIndex = recognized.indexOf(requested);
+  if (requestedIndex < 0) return undefined;
+  for (let index = requestedIndex; index < recognized.length; index++) {
+    const candidate = recognized[index];
+    if (candidate !== undefined && supported.includes(candidate)) return candidate;
+  }
+  for (let index = requestedIndex - 1; index >= 0; index--) {
+    const candidate = recognized[index];
+    if (candidate !== undefined && supported.includes(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 function selectChoiceValues(option: Extract<SessionConfigOption, { type: "select" }>): string[] {
   return option.options.flatMap((entry) => ("options" in entry ? entry.options : [entry])).map((entry) => entry.value);
 }
@@ -921,7 +1038,7 @@ function displayAlternatives(values: readonly string[]): string {
 
 /**
  * Validate a workflow script: parse it, dry-run against a mock AgentRunner, then probe
- * each routed harness's advertised config options. Never throws for an invalid script —
+ * each routed backend/model pair's advertised config options. Never throws for an invalid script —
  * read `report.ok` / `report.exitCode`.
  */
 export async function validateWorkflowScript(
@@ -1150,6 +1267,7 @@ export async function validateWorkflowScript(
       backendRegistry,
       hostRegistry,
       declaredBackends,
+      warnings,
     );
     const ok = runOk && optionErrors.length === 0;
     const runReason = timedOut ? `dry run exceeded ${timeoutMs}ms and was aborted` : run.reason;
@@ -1210,11 +1328,14 @@ export function renderHarnessOptionLines(
 ): string[] {
   const lines: string[] = [];
   for (const harness of harnesses) {
+    const target = harness.model === undefined
+      ? harness.backendId
+      : `${harness.backendId} (model ${JSON.stringify(harness.model)})`;
     if (!harness.probed) {
-      lines.push(`${indent}${harness.backendId}: probe failed — ${harness.error ?? "unknown error"}`);
+      lines.push(`${indent}${target}: probe failed — ${harness.error ?? "unknown error"}`);
       continue;
     }
-    lines.push(`${indent}${harness.backendId}:`);
+    lines.push(`${indent}${target}:`);
     lines.push(`${indent}  id | type | current | choices`);
     if ((harness.options ?? []).length === 0) {
       lines.push(`${indent}  (none advertised)`);

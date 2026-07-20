@@ -227,7 +227,7 @@ export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
   const sessionDir = mkdtempSync(`${tmpdir()}/pi-acp-sessions-`);
   const controls: FakeSessionControl[] = [];
   const createOptions: CreateAgentSessionOptions[] = [];
-  const model = { provider: "test", id: "model", name: "Test model", contextWindow: 100 };
+  const model = { provider: "test", id: "model", name: "Test model", contextWindow: 100, reasoning: true };
   const modelRuntime = {
     getModel(provider: string, id: string) { return provider === "test" && id === "model" ? model : undefined; },
     async getAvailable() { return [model]; },

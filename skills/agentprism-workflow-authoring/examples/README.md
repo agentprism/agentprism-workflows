@@ -14,7 +14,7 @@ worked examples aren't enough. The first two are **verbatim copies** of the runn
 
 `resume-loop-cap.workflow.js` defaults to eight rounds and therefore validates successfully without args. Its six-round failure is intentional: call the MCP `workflow` tool with `args: { "maxRounds": 6 }`, then repeat the script with `args: { "maxRounds": 8 }` and the returned `runId` as `resumeFromRunId`. Identity matching pairs each call by its content (prompt, model, options, input fingerprint), so keep the cap out of the agent prompt — a changed prompt is a changed identity and that round runs live. The `resume: { filesystem: "read-only" }` declaration is what makes the recording eligible for identity replay at all; it is an authored promise that the call only reads the admitted workspace.
 
-Validate either one for free (zero tokens; each routed harness opens one no-prompt option probe,
+Validate either one for free (zero tokens; each routed backend/model pair opens one no-prompt option probe,
 with a warning-only degradation when unavailable):
 
 ```bash
