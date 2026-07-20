@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 0.34.4
+
+### Patch Changes
+
+- f2dbaa5: Declare ordered versus exact-set thought-level semantics for every built-in ACP backend. Derive
+  missing ordered domains from model-specific zero-token catalogs, clamp recognized values safely,
+  and exact-reject OpenCode, custom, oversized, or inconsistent catalogs.
+
 ## 0.34.3
 
 ### Patch Changes
