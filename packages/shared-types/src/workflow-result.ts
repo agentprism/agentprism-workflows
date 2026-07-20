@@ -249,6 +249,28 @@ export type WorkflowResumeCallFailedReason =
   | "seed-persistence-error"
   | "resume-fatal-latch";
 
+export type WorkflowCheckpointReplyNotAppliedReason =
+  | "checkpoint-identity-mismatch"
+  | "checkpoint-not-reached-at-recorded-call-site";
+
+export interface WorkflowCheckpointReplyNotApplied {
+  recordedIndex: number;
+  status: "not-applied";
+  reason: WorkflowCheckpointReplyNotAppliedReason;
+  /** Safe host-facing explanation. The supplied decision value is never included. */
+  message: string;
+  /** Current checkpoint call that exposed the mismatch, when one was reached. */
+  callIndex?: number;
+}
+
+export type WorkflowCheckpointReplyReport =
+  | {
+      recordedIndex: number;
+      status: "applied";
+      callIndex: number;
+    }
+  | WorkflowCheckpointReplyNotApplied;
+
 export type WorkflowResumeSafety =
   | "declared-read-only"
   | "isolated-worktree";
@@ -286,6 +308,9 @@ export type WorkflowResumeCallDecision =
       kind: "agent" | "checkpoint";
       action: "live";
       reason: WorkflowResumeCallLiveReason;
+      /** Present on a live checkpoint decision when a supplied reply did not exactly
+       *  target that checkpoint occurrence. */
+      checkpointReply?: WorkflowCheckpointReplyNotApplied;
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
@@ -312,6 +337,8 @@ interface WorkflowResumeReportBase {
   failed: number;
   /** One decision per root call, ordered by current execution index. */
   calls: WorkflowResumeCallDecision[];
+  /** Outcome of the single durable checkpoint reply admitted for this execution. */
+  checkpointReply?: WorkflowCheckpointReplyReport;
 }
 
 export type WorkflowResumeReport = WorkflowResumeReportBase &
@@ -381,8 +408,8 @@ export interface WorkflowReplayFirstNonReplay {
 
 interface WorkflowReplayEligibilityBase {
   sourceRunId: string;
-  /** Admission-time estimate from the durable source prefix. Actual call identity is
-   *  still checked by the selected matcher before any result is replayed. */
+  /** Admission-time upper bound from the durable source prefix. Actual call identity,
+   *  inputs, and current safety are still checked before any result is replayed. */
   predictedReplayablePrefix: number;
   /** Contiguous replayed prefix observed so far in the new run. */
   replayedPrefix: number;

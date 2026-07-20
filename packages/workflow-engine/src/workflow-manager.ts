@@ -391,6 +391,36 @@ function contiguousIndexes(indexes: Iterable<number>): number {
   return prefix;
 }
 
+function predictedPositionalReplayablePrefix(
+  eligibility: Extract<ResumeAdmissionDecision, { strategy: "positional-v1" }>["eligibility"],
+  journal: ReadonlyMap<number, JournalEntry>,
+  calls: readonly WorkflowCallRecord[],
+): number {
+  if (eligibility === "all-live") return 0;
+  if (eligibility === "legacy") return contiguousIndexes(journal.keys());
+  const callsByIndex = new Map(calls.map((call) => [call.index, call] as const));
+  let prefix = 0;
+  while (true) {
+    const entry = journal.get(prefix);
+    const call = callsByIndex.get(prefix);
+    if (
+      entry === undefined ||
+      call === undefined ||
+      call.outcome !== "result" ||
+      call.hash !== entry.hash ||
+      (call.kind === "agent"
+        ? call.resumeSafety === undefined
+        : !(
+            call.origin === "confirm" ||
+            (call.origin === "journal-replay" && call.replay?.checkpointHostDecision === true)
+          ))
+    ) {
+      return prefix;
+    }
+    prefix++;
+  }
+}
+
 function displayOperationalValue(value: number | null): string {
   return value === null ? "none" : String(value);
 }
@@ -757,12 +787,18 @@ export class WorkflowManager extends EventEmitter {
           strategy: admission.strategy,
           sourceRunId: admission.sourceRunId,
           requestedPolicy: admission.requestedPolicy,
+          ...(admission.checkpointReplyIndex === undefined
+            ? {}
+            : { checkpointReplyIndex: admission.checkpointReplyIndex }),
         }
       : admission.strategy === "positional-v1"
         ? {
             strategy: admission.strategy,
             sourceRunId: admission.sourceRunId,
             requestedPolicy: admission.requestedPolicy,
+            ...(admission.checkpointReplyIndex === undefined
+              ? {}
+              : { checkpointReplyIndex: admission.checkpointReplyIndex }),
             fallbackReason: admission.fallbackReason,
             eligibility: admission.eligibility,
           }
@@ -770,6 +806,9 @@ export class WorkflowManager extends EventEmitter {
             strategy: admission.strategy,
             sourceRunId: admission.sourceRunId,
             requestedPolicy: admission.requestedPolicy,
+            ...(admission.checkpointReplyIndex === undefined
+              ? {}
+              : { checkpointReplyIndex: admission.checkpointReplyIndex }),
             disabledReason: admission.disabledReason,
           };
   }
@@ -1159,6 +1198,9 @@ export class WorkflowManager extends EventEmitter {
           strategy: admission.strategy,
           sourceRunId: admission.sourceRunId,
           requestedPolicy: admission.requestedPolicy,
+          ...(admission.checkpointReplyIndex === undefined
+            ? {}
+            : { checkpointReplyIndex: admission.checkpointReplyIndex }),
           seed: admission.seed,
           commitSeed: (remaining) => this.commitResumeSeed(managed, remaining),
         },
@@ -1172,6 +1214,9 @@ export class WorkflowManager extends EventEmitter {
           strategy: admission.strategy,
           sourceRunId: admission.sourceRunId,
           requestedPolicy: admission.requestedPolicy,
+          ...(admission.checkpointReplyIndex === undefined
+            ? {}
+            : { checkpointReplyIndex: admission.checkpointReplyIndex }),
           disabledReason: admission.disabledReason,
         },
       };
@@ -1203,7 +1248,7 @@ export class WorkflowManager extends EventEmitter {
       managed,
       source,
       admission,
-      admission.eligibility === "all-live" ? 0 : contiguousIndexes(sourceJournal.keys()),
+      predictedPositionalReplayablePrefix(admission.eligibility, sourceJournal, managed.calls),
     );
     if (admission.checkpointSeed) managed.resumeSeed = admission.checkpointSeed;
     // Marked format-1 rows can republish matching safety/debit provenance under format 2;
@@ -1220,6 +1265,9 @@ export class WorkflowManager extends EventEmitter {
         strategy: admission.strategy,
         sourceRunId: admission.sourceRunId,
         requestedPolicy: admission.requestedPolicy,
+        ...(admission.checkpointReplyIndex === undefined
+          ? {}
+          : { checkpointReplyIndex: admission.checkpointReplyIndex }),
         fallbackReason: admission.fallbackReason,
         eligibility: admission.eligibility,
         sourceCalls,
@@ -1835,6 +1883,7 @@ export class WorkflowManager extends EventEmitter {
         managed.resumeReport = buildResumeReport(
           managed.resumeReportPlan,
           engineResult.resumeReport.calls,
+          true,
         );
         engineResult.resumeReport = managed.resumeReport;
         if (managed.replayEligibilityPlan) {
@@ -1902,6 +1951,7 @@ export class WorkflowManager extends EventEmitter {
         managed.status = "failed";
       }
       managed.error = workflowError;
+      this.finalizeResumeReport(managed);
       managed.result = this.composeResult(managed, workflowError);
 
       if (paused) {
@@ -1979,6 +2029,21 @@ export class WorkflowManager extends EventEmitter {
       );
     }
     this.persistRun(managed);
+  }
+
+  private finalizeResumeReport(managed: ManagedRun): void {
+    if (!managed.resumeReportPlan || !managed.resumeDecisions) return;
+    managed.resumeReport = buildResumeReport(
+      managed.resumeReportPlan,
+      [...managed.resumeDecisions.values()],
+      true,
+    );
+    if (managed.replayEligibilityPlan) {
+      managed.replayEligibility = this.buildReplayEligibility(
+        managed.replayEligibilityPlan,
+        managed.resumeReport,
+      );
+    }
   }
 
   private recordJournalEntry(managed: ManagedRun, entry: JournalEntry): void {

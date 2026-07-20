@@ -110,6 +110,7 @@ export type PreparedResume =
       strategy: "identity-v1";
       sourceRunId: string;
       requestedPolicy: ResumePolicy;
+      checkpointReplyIndex?: number;
       seed: PersistedResumeSeed;
       /** Synchronously replace the durable remaining seed. Throws PERSISTENCE_ERROR
        *  on failure; the engine must not expose a replay/live decision first. */
@@ -119,6 +120,7 @@ export type PreparedResume =
       strategy: "positional-v1";
       sourceRunId: string;
       requestedPolicy: ResumePolicy;
+      checkpointReplyIndex?: number;
       fallbackReason: WorkflowResumeFallbackReason;
       /** "legacy" is the exact historical matcher. "safe-prefix" permits only
        *  safety-marked new-format hits. "all-live" initializes firstMiss to 0. */
@@ -137,5 +139,6 @@ export type PreparedResume =
       strategy: "live";
       sourceRunId: string;
       requestedPolicy: ResumePolicy;
+      checkpointReplyIndex?: number;
       disabledReason: WorkflowResumeDisabledReason;
     };
