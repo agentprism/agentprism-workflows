@@ -91,6 +91,26 @@ const checkpointTakenSchema = z.object({
   source: z.enum(["live", "headless-default", "journal-replay", "injected"]),
 });
 
+const checkpointReplyNotAppliedSchema = z.object({
+  recordedIndex: z.number().int().nonnegative(),
+  status: z.literal("not-applied"),
+  reason: z.enum([
+    "checkpoint-identity-mismatch",
+    "checkpoint-not-reached-at-recorded-call-site",
+  ]),
+  message: z.string(),
+  callIndex: z.number().int().nonnegative().optional(),
+});
+
+const checkpointReplyReportSchema = z.discriminatedUnion("status", [
+  z.object({
+    recordedIndex: z.number().int().nonnegative(),
+    status: z.literal("applied"),
+    callIndex: z.number().int().nonnegative(),
+  }),
+  checkpointReplyNotAppliedSchema,
+]);
+
 const resumeCallDecisionSchema = z.discriminatedUnion("action", [
   z.object({
     index: z.number().int().nonnegative(),
@@ -107,6 +127,7 @@ const resumeCallDecisionSchema = z.discriminatedUnion("action", [
     kind: z.enum(["agent", "checkpoint"]),
     action: z.literal("live"),
     reason: z.enum(RESUME_CALL_LIVE_REASONS),
+    checkpointReply: checkpointReplyNotAppliedSchema.optional(),
   }),
   z.object({
     index: z.number().int().nonnegative(),
@@ -123,6 +144,7 @@ const resumeReportBaseShape = {
   live: z.number().int().nonnegative(),
   failed: z.number().int().nonnegative(),
   calls: z.array(resumeCallDecisionSchema),
+  checkpointReply: checkpointReplyReportSchema.optional(),
 } as const;
 
 const resumeReportSchema = z.discriminatedUnion("strategy", [

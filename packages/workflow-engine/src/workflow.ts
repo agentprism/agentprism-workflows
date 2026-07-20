@@ -53,6 +53,7 @@ import type { PreparedContinuation, PreparedResume } from "./resume.js";
 import {
   buildResumeCandidateIndexes,
   buildResumeReport,
+  checkpointReplyNotApplied,
   indexedSourceOccurrence,
   initialPositionalFirstMiss,
   selectPositionalResume,
@@ -769,12 +770,18 @@ export async function runWorkflow<T = unknown>(
           strategy: preparedResume.strategy,
           sourceRunId: preparedResume.sourceRunId,
           requestedPolicy: preparedResume.requestedPolicy,
+          ...(preparedResume.checkpointReplyIndex === undefined
+            ? {}
+            : { checkpointReplyIndex: preparedResume.checkpointReplyIndex }),
         }
       : preparedResume.strategy === "positional-v1"
         ? {
             strategy: preparedResume.strategy,
             sourceRunId: preparedResume.sourceRunId,
             requestedPolicy: preparedResume.requestedPolicy,
+            ...(preparedResume.checkpointReplyIndex === undefined
+              ? {}
+              : { checkpointReplyIndex: preparedResume.checkpointReplyIndex }),
             fallbackReason: preparedResume.fallbackReason,
             eligibility: preparedResume.eligibility,
           }
@@ -782,6 +789,9 @@ export async function runWorkflow<T = unknown>(
             strategy: preparedResume.strategy,
             sourceRunId: preparedResume.sourceRunId,
             requestedPolicy: preparedResume.requestedPolicy,
+            ...(preparedResume.checkpointReplyIndex === undefined
+              ? {}
+              : { checkpointReplyIndex: preparedResume.checkpointReplyIndex }),
             disabledReason: preparedResume.disabledReason,
           }
     : undefined;
@@ -813,6 +823,7 @@ export async function runWorkflow<T = unknown>(
   const positionalCheckpointSeed = preparedResume?.strategy === "positional-v1" && preparedResume.checkpoint
     ? createResumeSeedController(preparedResume.checkpoint.seed, preparedResume.checkpoint.commitSeed)
     : undefined;
+  let checkpointReplyApplied = false;
 
   const appendResumeDecisionGate = (): ResumeDecisionGate | undefined => {
     if (!preparedResume) return undefined;
@@ -2469,6 +2480,7 @@ export async function runWorkflow<T = unknown>(
       try {
         await enterResumeDecision(gate, decisionCall);
         let liveReason: Extract<WorkflowResumeCallDecision, { action: "live" }>;
+        let checkpointReplyInputsChanged = false;
 
         if (preparedResume.strategy === "identity-v1") {
           const match = selectResumeCandidate((identitySeed as ResumeSeedController).indexes, {
@@ -2493,6 +2505,7 @@ export async function runWorkflow<T = unknown>(
               ? match.source.candidate
               : match.source.injection;
             const checkpointInjected = match.source.type === "injection" ? true as const : undefined;
+            if (checkpointInjected) checkpointReplyApplied = true;
             emitResumeDecision({
               index: callIndex,
               kind: "checkpoint",
@@ -2527,8 +2540,9 @@ export async function runWorkflow<T = unknown>(
             action: "live",
             reason: match.reason,
           };
+          checkpointReplyInputsChanged = match.reason === "inputs-changed";
         } else if (preparedResume.strategy === "positional-v1") {
-          if (positionalCheckpointSeed && callIndex < state.firstMiss) {
+          if (positionalCheckpointSeed) {
             const injectionMatch = selectResumeCandidate(positionalCheckpointSeed.indexes, {
               kind: "checkpoint",
               hash: callHash,
@@ -2537,7 +2551,11 @@ export async function runWorkflow<T = unknown>(
               cacheOpen: true,
               consumed: positionalCheckpointSeed.consumed,
             });
-            if (injectionMatch.action === "replay" && injectionMatch.source.type === "injection") {
+            if (
+              injectionMatch.action === "replay" &&
+              injectionMatch.source.type === "injection" &&
+              (injectionMatch.match === "path-hash" || callIndex < state.firstMiss)
+            ) {
               const injection = injectionMatch.source.injection;
               const resultSnapshot = strictSnapshot(
                 injection.decision,
@@ -2551,6 +2569,7 @@ export async function runWorkflow<T = unknown>(
               if (callIndex !== injection.recordedIndex) {
                 state.firstMiss = Math.min(state.firstMiss, callIndex + 1);
               }
+              checkpointReplyApplied = true;
               emitResumeDecision({
                 index: callIndex,
                 kind: "checkpoint",
@@ -2571,6 +2590,8 @@ export async function runWorkflow<T = unknown>(
                 manifestProvenance: true,
               });
             }
+            checkpointReplyInputsChanged =
+              injectionMatch.action === "live" && injectionMatch.reason === "inputs-changed";
           }
 
           const sourceCall = positionalSourceCall(preparedResume, callIndex, "checkpoint", callHash);
@@ -2596,6 +2617,7 @@ export async function runWorkflow<T = unknown>(
             const checkpointInjected = options.injectedCheckpointReplies?.has(callIndex)
               ? true as const
               : undefined;
+            if (checkpointInjected) checkpointReplyApplied = true;
             emitResumeDecision({
               index: callIndex,
               kind: "checkpoint",
@@ -2632,6 +2654,16 @@ export async function runWorkflow<T = unknown>(
         }
 
         if (options.confirm) options.onResumeFilesystemTainted?.();
+        if (preparedResume.checkpointReplyIndex !== undefined && !checkpointReplyApplied) {
+          liveReason = {
+            ...liveReason,
+            checkpointReply: checkpointReplyNotApplied(
+              preparedResume.checkpointReplyIndex,
+              callIndex,
+              checkpointReplyInputsChanged,
+            ),
+          };
+        }
         emitResumeDecision(liveReason);
         gate.release();
       } catch (error) {
@@ -2851,7 +2883,7 @@ export async function runWorkflow<T = unknown>(
     calls: Object.freeze([...state.calls]) as WorkflowCallRecord[],
     callsAllocated: state.callSeq,
     ...(resumeReportPlan
-      ? { resumeReport: buildResumeReport(resumeReportPlan, [...resumeDecisions.values()]) }
+      ? { resumeReport: buildResumeReport(resumeReportPlan, [...resumeDecisions.values()], true) }
       : {}),
     effectiveLimits,
     ...(abortSignaled ? { abortSignaled: true as const } : {}),

@@ -492,8 +492,14 @@ function formatResumeSummary(
         ? `${report.strategy} (${report.disabledReason})`
         : report.strategy;
     const first = report.calls.find((decision) => decision.action !== "replayed");
-    return `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed` +
-      (first ? `; first non-replay: call ${first.index} ${first.reason}` : "");
+    const lines = [
+      `resume: ${strategy}, ${report.replayed} replayed, ${report.live} live, ${report.failed} failed` +
+        (first ? `; first non-replay: call ${first.index} ${first.reason}` : ""),
+    ];
+    if (report.checkpointReply?.status === "not-applied") {
+      lines.push(report.checkpointReply.message);
+    }
+    return lines.join("\n");
   }
   const strategy = eligibility.strategy === "positional-v1"
     ? `${eligibility.strategy}/${eligibility.eligibility} (${eligibility.fallbackReason})`
@@ -509,7 +515,11 @@ function formatResumeSummary(
       `predicted replayable prefix ${eligibility.predictedReplayablePrefix}; ` +
       `replayed prefix ${eligibility.replayedPrefix}; ` +
       `${eligibility.replayed} replayed, ${eligibility.live} live, ${eligibility.failed} failed`,
+    "prediction is an admission-time upper bound; every call is checked before replay",
   ];
+  if (report?.checkpointReply?.status === "not-applied") {
+    lines.push(report.checkpointReply.message);
+  }
   if (eligibility.firstNonReplay) {
     lines.push(
       `first non-replay: call ${eligibility.firstNonReplay.index} ${eligibility.firstNonReplay.reason}` +
