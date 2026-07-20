@@ -1,5 +1,12 @@
 # @automatalabs/acp-agents
 
+## 0.34.2
+
+### Patch Changes
+
+- Updated dependencies [2561f67]
+  - @automatalabs/shared-types@0.26.2
+
 ## 0.34.1
 
 ### Patch Changes

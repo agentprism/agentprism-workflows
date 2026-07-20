@@ -1,5 +1,17 @@
 # @automatalabs/mcp-server
 
+## 0.16.6
+
+### Patch Changes
+
+- 2561f67: Honor durable `checkpointReplies` when resuming a positional (non-`resume`-declared) run. Previously a background run paused at a durable `checkpoint(..., { headless: "pause" })` could not be continued: resuming with `resumeFromRunId` + `checkpointReplies` took the positional fallback, re-ran the whole agent prefix live, re-reached the checkpoint, and re-paused. The recorded reply is now applied after the live prefix, matched to the checkpoint's exact call path-hash so a reply only ever applies to the occurrence it targeted.
+
+  The resume report and the MCP workflow result now surface a `checkpointReply` outcome: `applied` (with the current call index), or `not-applied` with a safe reason (`checkpoint-identity-mismatch` or `checkpoint-not-reached-at-recorded-call-site`). The not-applied report never echoes the supplied decision value.
+
+- Updated dependencies [2561f67]
+  - @automatalabs/shared-types@0.26.2
+  - @automatalabs/workflows@0.40.3
+
 ## 0.16.5
 
 ### Patch Changes
