@@ -1,5 +1,14 @@
 # @automatalabs/mcp-server
 
+## 0.16.5
+
+### Patch Changes
+
+- 6f47267: Persist terminal-shaped interruption rows for every allocated call when a run halts, and retain non-result identity blockers so completed calls remain safely replayable across usage, auth, checkpoint, and host interruptions.
+- Updated dependencies [6f47267]
+  - @automatalabs/shared-types@0.26.1
+  - @automatalabs/workflows@0.40.2
+
 ## 0.16.4
 
 ### Patch Changes
