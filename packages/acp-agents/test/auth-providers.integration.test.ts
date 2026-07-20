@@ -180,6 +180,42 @@ test("setProvider records durable routing: the pool recycles and a fresh connect
   assert.equal(count(log, "__start"), 3);
 });
 
+test("vertex routing records its durable _meta.claudeCode.vertex and replays it on a fresh connection", async () => {
+  const { cwd, readLog } = configure({
+    providersSupport: true,
+    providers: { set: {} },
+    turns: [{ text: "routed" }, { text: "routed" }],
+  });
+  const runner = makeRunner();
+  // Seed a pooled process BEFORE the routing change, so a stale reuse-without-replay would show.
+  assert.equal(await runner.run("one", { model: "claude", cwd }), "routed");
+
+  await runner.setProvider({
+    model: "claude",
+    providerId: "main",
+    apiType: "vertex",
+    baseUrl: "https://vertex.test/v1",
+    vertex: { projectId: "proj-123", region: "us-east1" },
+    meta: { source: "explicit" },
+  });
+
+  assert.equal(await runner.run("two", { model: "claude", cwd }), "routed");
+
+  const log = readLog();
+  const sets = log.filter((entry) => entry.method === "setProvider");
+  assert.equal(sets.length, 2, "the explicit vertex set + exactly one replay on the fresh pooled connection");
+  const vertexMeta = { claudeCode: { vertex: { projectId: "proj-123", region: "us-east1" } } };
+  for (const set of sets) {
+    assert.equal(set.params?.apiType, "vertex");
+    assert.equal(set.params?.baseUrl, "https://vertex.test/v1");
+  }
+  // Immediate call carries both the request-scoped meta and the durable vertex config, deep-merged.
+  assert.deepEqual(sets[0]?.params?._meta, { source: "explicit", claudeCode: { vertex: { projectId: "proj-123", region: "us-east1" } } });
+  // The REPLAY carries the durable vertex config so the 0.60.0 agent accepts it — and nothing else
+  // (the request-scoped `source` meta is not replayed).
+  assert.deepEqual(sets[1]?.params?._meta, vertexMeta);
+});
+
 test("disableProvider drops the recorded routing: later connections do not replay it", async () => {
   const { cwd, readLog } = configure({
     providersSupport: true,

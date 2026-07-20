@@ -90,7 +90,7 @@ import {
   type AuthMethodType,
   type BackendAuthState,
 } from "./auth/auth-store.js";
-import { ProviderStore } from "./provider-store.js";
+import { ProviderStore, providerVertexMeta } from "./provider-store.js";
 import type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
 import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 import {
@@ -213,6 +213,10 @@ export interface SetProviderOptions extends AuthProviderRoutingOptions {
   apiType: SetProviderRequest["apiType"];
   baseUrl: SetProviderRequest["baseUrl"];
   headers?: SetProviderRequest["headers"];
+  /** Durable Vertex project/region — required by the Claude agent's `vertex` apiType
+   *  (claude-agent-acp >= 0.60.0), sent as `_meta.claudeCode.vertex` on the wire AND recorded so
+   *  every replayed `providers/set` on a fresh pooled connection is accepted. */
+  vertex?: { projectId: string; region: string };
 }
 
 /** Options for AcpAgentRunner.disableProvider(). */
@@ -320,6 +324,25 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
    *  and the run NEVER pauses; when unset, a -32000 run pauses with reason:"auth_required" (§2.12,
    *  PR4). Mutually exclusive with pause by construction. */
   onAuth?: AuthResolver;
+}
+
+/** Combine the request-scoped `_meta` passthrough with the durable Vertex routing config for the
+ *  immediate `providers/set` wire call. Generic `_meta` stays request-scoped (never recorded); the
+ *  Vertex config is deep-merged under `claudeCode.vertex` so it survives both the call and replay.
+ *  Returns undefined when neither is present. */
+function mergeProviderMeta(
+  meta: Record<string, unknown> | undefined,
+  vertex: { projectId: string; region: string } | undefined,
+): Record<string, unknown> | undefined {
+  if (!vertex) return meta;
+  const vertexMeta = providerVertexMeta(vertex);
+  if (!meta) return vertexMeta;
+  const existingClaudeCode =
+    typeof meta.claudeCode === "object" && meta.claudeCode !== null ? (meta.claudeCode as Record<string, unknown>) : {};
+  return {
+    ...meta,
+    claudeCode: { ...existingClaudeCode, vertex: (vertexMeta.claudeCode as { vertex: unknown }).vertex },
+  };
 }
 
 /**
@@ -564,7 +587,9 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
    *  so without the record this dedicated connection's dispose would silently discard it (the
    *  providers/* sibling of the dispose-after-authenticate bug). Every later connection replays
    *  the intent at initialize, and the pool recycles so no session runs under stale routing.
-   *  The request-scoped `meta` passthrough rides the immediate call only; it is not replayed. */
+   *  The durable `meta` (e.g. the vertex `_meta.claudeCode.vertex` project/region that the 0.60.0+
+ *  Claude agent stores as provider config) is recorded alongside and replayed verbatim, so a
+ *  reconstructed `providers/set` on a fresh connection is accepted rather than rejected. */
   async setProvider(opts: SetProviderOptions): Promise<SetProviderResponse | void> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     validateRequiredString(opts.providerId, opts.label, "setProvider", "providerId");
@@ -575,12 +600,13 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     const backend = selectBackend(opts, this.backends);
     const connection = this.createDedicatedConnection(backend, () => undefined);
     try {
+      const wireMeta = mergeProviderMeta(opts.meta, opts.vertex);
       const request: SetProviderRequest = {
         providerId: opts.providerId,
         apiType: opts.apiType,
         baseUrl: opts.baseUrl,
         ...(opts.headers ? { headers: opts.headers } : {}),
-        ...(opts.meta ? { _meta: opts.meta } : {}),
+        ...(wireMeta ? { _meta: wireMeta } : {}),
       };
       const response = await connection.setProvider(request, opts.label);
       this.providerStore.record(backend.poolKey ?? backend.id, {
@@ -588,6 +614,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         apiType: opts.apiType,
         baseUrl: opts.baseUrl,
         ...(opts.headers ? { headers: opts.headers } : {}),
+        ...(opts.vertex ? { vertex: opts.vertex } : {}),
       });
       this.pool.recycle(backend.poolKey ?? backend.id);
       opts.signal?.throwIfAborted();

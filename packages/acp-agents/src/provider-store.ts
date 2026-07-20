@@ -13,15 +13,31 @@
 // exclusively by the connection replay).
 import type { SetProviderRequest } from "@agentclientprotocol/sdk";
 
+/** The durable Vertex routing config, shaped for the Claude agent's `providers/set` `_meta`
+ *  (claude-agent-acp >= 0.60.0 reads `_meta.claudeCode.vertex.{projectId,region}`). Used to build
+ *  the wire request on both the immediate call and every replay. */
+export function providerVertexMeta(vertex: { projectId: string; region: string }): Record<string, unknown> {
+  return { claudeCode: { vertex: { projectId: vertex.projectId, region: vertex.region } } };
+}
+
 /** One recorded `providers/set` — the full replacement configuration for one provider. The
  *  request-scoped `_meta` passthrough is deliberately NOT recorded: it rides the immediate wire
- *  call only, while the intent captures the durable routing config. */
+ *  call only, while the intent captures the durable routing config. The `vertex` project/region ARE
+ *  durable routing config, not request-scoped: the Claude agent's `vertex` apiType
+ *  (claude-agent-acp >= 0.60.0) reads them from `_meta.claudeCode.vertex` and stores them as
+ *  provider config, so a replayed `providers/set` that dropped them would be rejected and every
+ *  pooled connection would fail to route. They are carried as a typed field (not generic `_meta`)
+ *  so the request-scoped-`_meta`-is-not-replayed contract is unchanged. Non-credential; secrets
+ *  stay in `headers`. */
 export interface ProviderIntent {
   providerId: SetProviderRequest["providerId"];
   apiType: SetProviderRequest["apiType"];
   baseUrl: SetProviderRequest["baseUrl"];
   /** SECRET gateway headers, replayed verbatim and never surfaced anywhere else. */
   headers?: SetProviderRequest["headers"];
+  /** Durable Vertex project/region — replayed into `_meta.claudeCode.vertex` on every
+   *  reconstructed `providers/set`. Present only for `apiType === "vertex"`. */
+  vertex?: { projectId: string; region: string };
 }
 
 interface PoolEntry {
@@ -49,7 +65,11 @@ export class ProviderStore {
       this.byPool.set(poolKey, entry);
     }
     zeroizeHeaders(entry.intents.get(intent.providerId));
-    entry.intents.set(intent.providerId, { ...intent, ...(intent.headers ? { headers: { ...intent.headers } } : {}) });
+    entry.intents.set(intent.providerId, {
+      ...intent,
+      ...(intent.headers ? { headers: { ...intent.headers } } : {}),
+      ...(intent.vertex ? { vertex: { ...intent.vertex } } : {}),
+    });
     entry.generation += 1;
   }
 

@@ -139,6 +139,7 @@ import {
   type ConnectionAuthStamp,
 } from "./auth/auth-store.js";
 import type { ProviderStore } from "./provider-store.js";
+import { providerVertexMeta } from "./provider-store.js";
 
 /** A benign client identity. NOT JetBrains/IntelliJ 2026.1 — that exact identity makes
  *  codex-acp disable session config options (including the model-selection channel). */
@@ -1527,6 +1528,7 @@ export class PooledConnection {
           apiType: intent.apiType,
           baseUrl: intent.baseUrl,
           ...(intent.headers ? { headers: intent.headers } : {}),
+          ...(intent.vertex ? { _meta: providerVertexMeta(intent.vertex) } : {}),
         });
       }
     } else if (intents.length > 0) {
