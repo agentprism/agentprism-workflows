@@ -1,5 +1,15 @@
 # @automatalabs/workflows
 
+## 0.40.2
+
+### Patch Changes
+
+- 6f47267: Persist terminal-shaped interruption rows for every allocated call when a run halts, and retain non-result identity blockers so completed calls remain safely replayable across usage, auth, checkpoint, and host interruptions.
+- Updated dependencies [6f47267]
+  - @automatalabs/workflow-engine@0.29.1
+  - @automatalabs/shared-types@0.26.1
+  - @automatalabs/acp-agents@0.34.1
+
 ## 0.40.1
 
 ### Patch Changes
