@@ -106,7 +106,7 @@ export const piBackendDefinition = defineBuiltinBackend({
       path: "packages/pi-acp",
     },
     freshness: {
-      npm: ["@agentclientprotocol/sdk", "@earendil-works/pi-coding-agent"],
+      npm: ["@agentclientprotocol/sdk", "@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"],
       forks: [],
       wrappedRuntimes: [],
     },

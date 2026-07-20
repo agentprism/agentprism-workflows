@@ -5,7 +5,12 @@ import test from "node:test";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { PiAcpAgent } from "../src/agent.js";
 import { AUTH_METHODS, authenticateMethod } from "../src/auth.js";
-import { applyConfig, modelOption, THINKING_LEVELS, thinkingLevelOption } from "../src/config.js";
+import {
+  applyConfig,
+  modelOption,
+  RECOGNIZED_THINKING_LEVELS,
+  thinkingLevelOption,
+} from "../src/config.js";
 import {
   adapterError,
   classifyTerminal,
@@ -186,7 +191,10 @@ test("T9 thinking/model config is exact, auth-aware, and clamp-reflecting", asyn
   const fake = fakeSession({});
   const model = { provider: "test", id: "model", name: "Model" };
   const modelRuntime = { async getAvailable() { return [model]; } } as never;
-  assert.deepEqual((thinkingLevelOption(fake.session).options as Array<{ value: string }>).map(({ value }) => value), THINKING_LEVELS);
+  assert.deepEqual(
+    (thinkingLevelOption(fake.session).options as Array<{ value: string }>).map(({ value }) => value),
+    RECOGNIZED_THINKING_LEVELS,
+  );
   assert.deepEqual(modelOption(fake.session, [model]), {
     id: "model", name: "Model", type: "select", category: "model", currentValue: "", options: [{ value: "test/model", name: "Model" }],
   });

@@ -156,6 +156,12 @@ export interface ProbedConfigOptions {
   options: SessionConfigOption[];
 }
 
+export interface ProbeConfigOptionsOptions {
+  cwd?: string;
+  /** Apply the routed model selection before returning the echoed catalog. Default false. */
+  selectModel?: boolean;
+}
+
 interface LifecycleRoutingOptions {
   /** Model spec used only to select the backend process. */
   model?: string;
@@ -471,7 +477,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
   /** Route a model spec, open exactly one session without prompting, and return the agent's
    *  advertised config-option catalog verbatim. */
-  async probeConfigOptions(spec?: string, opts: { cwd?: string } = {}): Promise<ProbedConfigOptions> {
+  async probeConfigOptions(spec?: string, opts: ProbeConfigOptionsOptions = {}): Promise<ProbedConfigOptions> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     const cwd = opts.cwd ?? process.cwd();
     const prepared = this.prepareSession({ model: spec }, {
@@ -482,6 +488,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     let session: SessionHandle | undefined;
     try {
       session = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
+      if (opts.selectModel) await applyModelSelection(session, prepared.modelSpec, {});
       return {
         backendId: prepared.backend.id,
         options: session.advertisedConfigOptions,

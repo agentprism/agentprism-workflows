@@ -1098,6 +1098,34 @@ test("probeConfigOptions opens and closes exactly one session without sending a 
   assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 0);
 });
 
+test("probeConfigOptions can select the routed model and returns its echoed catalog without prompting", async () => {
+  const advertised = [
+    {
+      id: "model",
+      type: "select",
+      name: "Model",
+      category: "model",
+      currentValue: "default-model",
+      options: [{ value: "selected-model", name: "Selected model" }],
+    },
+  ];
+  const { cwd, readLog } = configure({ configOptions: advertised });
+
+  const probed = await makeRunner().probeConfigOptions("codex/selected-model", {
+    cwd,
+    selectModel: true,
+  });
+
+  assert.equal(probed.backendId, "codex");
+  assert.equal(probed.options[0]?.currentValue, "selected-model");
+  const selected = readLog().filter((entry) => entry.method === "setSessionConfigOption");
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0]?.params?.configId, "model");
+  assert.equal(selected[0]?.params?.value, "selected-model");
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+  assert.equal(readLog().filter((entry) => entry.method === "closeSession").length, 1);
+});
+
 test("probeConfigOptions propagates an authentication failure cleanly", async () => {
   const { cwd, readLog } = configure({ authRequiredOnNewSession: true });
   await assert.rejects(

@@ -5,7 +5,10 @@ import {
 } from "@automatalabs/acp-agents";
 
 export interface ValidateProbeRunner {
-  probeConfigOptions(spec?: string, opts?: { cwd?: string }): Promise<ProbedConfigOptions>;
+  probeConfigOptions(
+    spec?: string,
+    opts?: { cwd?: string; selectModel?: boolean },
+  ): Promise<ProbedConfigOptions>;
   dispose(): Promise<void>;
 }
 

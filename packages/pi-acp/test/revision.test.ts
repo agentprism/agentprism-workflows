@@ -176,8 +176,8 @@ test("T9 journal-restored model/thinking values are initial and later sets win a
   }];
   setup.deps.sessions.open = () => manager;
   const models = new Map([
-    ["restored-model", { provider: "test", id: "restored-model", contextWindow: 100 }],
-    ["later-model", { provider: "test", id: "later-model", contextWindow: 200 }],
+    ["restored-model", { provider: "test", id: "restored-model", contextWindow: 100, reasoning: true }],
+    ["later-model", { provider: "test", id: "later-model", contextWindow: 200, reasoning: true }],
   ]);
   setup.deps.modelRuntime = {
     getModel(provider: string, id: string) { return provider === "test" ? models.get(id) : undefined; },

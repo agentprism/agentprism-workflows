@@ -217,6 +217,7 @@ export type {
   ListProvidersOptions,
   ListSessionsOptions,
   LogoutOptions,
+  ProbeConfigOptionsOptions,
   ProbedConfigOptions,
   ReattachSessionOptions,
   SetProviderOptions,

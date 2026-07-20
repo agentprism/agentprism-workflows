@@ -21,6 +21,7 @@ export type {
   LogoutOptions,
   ProviderCapableRunner,
   ProbedConfigOptions,
+  ProbeConfigOptionsOptions,
   ReattachSessionOptions,
   SetProviderOptions,
 } from "./runner.js";

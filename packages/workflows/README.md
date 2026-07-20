@@ -637,20 +637,27 @@ Three passes: a **static parse** (the `meta` literal, syntax, and direct nondete
 expressions), then a **dry run** — the script executes in the real engine realm while every
 `agent()` call is served by an in-process mock `AgentRunner` that fabricates schema-conforming
 results. The dry run catches what a parse can't: thunk-vs-promise mistakes, reference errors,
-broken plumbing between calls. Finally, validation opens one no-prompt session on every distinct routed ACP harness,
-surfaces the complete advertised config-option catalog, and checks every authored `configOptions`
-bag against it. This probe uses zero tokens. A harness that cannot spawn, authenticate, or open a
-session contributes one warning and `probed:false`; only that harness's option checks are skipped,
-so probe failure alone never invalidates the script. There is no cached catalog or opt-out flag.
+broken plumbing between calls. Finally, validation opens one no-prompt session for every distinct
+routed `{ backend, model }` pair, selects that call's model verbatim when one was authored, surfaces
+the echoed model-specific config-option catalog, and checks every authored `configOptions` bag
+against it. This probe uses zero tokens. A pair that cannot spawn, authenticate, select its model,
+or open a session contributes one warning and `probed:false`; only that pair's option checks are
+skipped, so probe failure alone never invalidates the script. There is no cached catalog or opt-out
+flag.
 A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"`
 dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort.
 Script-declared `meta.backends` are treated as approved (with a warning that real runs require
 approval). The report lists every agent call with its backend attribution and `configOptions`
-echo, every checkpoint, the full option table for every routed harness (even when no call authors
+echo, every checkpoint, the full option table for every routed backend/model pair (even when no call authors
 options), and warnings. Unknown ids, invalid select values, non-boolean boolean values, and the
 reserved `"model"` id make the report invalid with exit code `2`; each diagnostic names the call,
-authored value, and advertised alternatives. Exit codes are `0` valid, `1` parse failure, `2`
-dry-run or config-option failure, `3` usage error.
+authored value, and advertised alternatives. For select options carrying
+`_meta["@automatalabs/agentprism"].recognizedValues`, a supported value passes, an unsupported but
+recognized value passes with a warning naming the effective clamp target, and an unrecognized value
+is invalid. Pi's `thinkingLevel` option publishes this metadata from Pi's own ordered domain. Other
+backends are not assigned a guessed domain: an unadvertised thought-level value without the metadata
+is left valid with an explicit "clamp eligibility is unverified" warning. Exit codes are `0` valid,
+`1` parse failure, `2` dry-run or config-option failure, `3` usage error.
 
 Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
 NAME and resolve nested `workflow("<name>")` calls from your folder), `--parse-only`,
@@ -705,7 +712,7 @@ const report = await validateWorkflowScript(script, { args: { target: "src/" }, 
 report.ok;                 // parse ok AND dry run completed
 report.dryRun?.agentCalls; // calls include mockAnswer: { glob, sequenceIndex?, sequenceLength? }
 report.dryRun?.harnessOptions;
-// [{ backendId, probed, options?: SessionConfigOption[], error?: string }]
+// [{ backendId, model?, probed, options?: SessionConfigOption[], error?: string }]
 report.dryRun?.mockAnswers;// normalized rule counters + item-level unused records
 report.warnings;           // approval reminders, phase mismatches, headless-abort checkpoints, …
 ```
@@ -740,7 +747,7 @@ import { probeHarnessConfig, formatHarnessConfigReport } from "@automatalabs/wor
 
 const report = await probeHarnessConfig({ harnesses: ["codex"] });
 report.ok;             // every requested harness probed
-report.harnessOptions; // [{ backendId, probed, options?: SessionConfigOption[], error?: string }]
+report.harnessOptions; // [{ backendId, model?, probed, options?: SessionConfigOption[], error?: string }]
 formatHarnessConfigReport(report); // the CLI's human table
 ```
 
@@ -820,6 +827,12 @@ opens because the dedicated `model` field is its only channel. Run `validate` an
 harness's advertised-options table before choosing ids or select values. A live harness rejection
 otherwise follows the existing agent-error path.
 
+Pi exposes `thinkingLevel` through that same surface. The validator selects each call's Pi model
+before reading the option, so a call can safely differ from the session default. Values shown in the
+model-specific choices are applied unchanged. A Pi-recognized value above the model ceiling or in a
+model gap validates with a warning and clamps in Pi's order; a value outside Pi's recognized domain
+fails validation with exit code `2`.
+
 ---
 
 ## Exports
@@ -881,7 +894,7 @@ WorkflowReplayFirstNonReplay, WorkflowReplayEligibility,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
-InteractiveSessionOptions, InteractiveTurn, ProbedConfigOptions, SessionConfigOption,
+InteractiveSessionOptions, InteractiveTurn, ProbeConfigOptionsOptions, ProbedConfigOptions, SessionConfigOption,
 PermissionResolver,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
 ProviderCapableRunner,        // duck-type gate for the MCP provider tools (providers/list|set|disable)

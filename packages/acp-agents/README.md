@@ -70,11 +70,19 @@ Read a routed harness's live catalog without sending a prompt:
 const { backendId, options } = await runner.probeConfigOptions("codex", {
   cwd: "/abs/path/to/worktree",
 });
+
+const selected = await runner.probeConfigOptions("pi/openrouter/vendor/model-id", {
+  cwd: "/abs/path/to/worktree",
+  selectModel: true,
+});
 ```
 
 `probeConfigOptions()` uses the normal first-segment routing and pool, opens exactly one session,
-returns the advertised `SessionConfigOption[]` shapes verbatim, then closes that session. Spawn,
-authentication, and session-open failures throw normally; the API does not cache catalogs.
+returns the advertised `SessionConfigOption[]` shapes verbatim, then closes that session. By
+default it reads the session-default catalog without making a model config request. With
+`selectModel: true`, it first sends the routed model remainder verbatim and returns the echoed,
+model-specific catalog; no prompt is sent in either mode. Spawn, authentication, model-selection,
+and session-open failures throw normally; the API does not cache catalogs.
 
 ### Image attachments (`images`)
 
@@ -233,7 +241,7 @@ From [`src/index.ts`](./src/index.ts):
 - **Auth/provider lifecycle methods** — `describeAuthMethods()`, `completeAuth()`, `runner.auth`, `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support. A successful `setProvider()` records a durable routing intent (`ProviderStore`) replayed on every fresh connection's `initialize` — provider config is in-process agent state for e.g. codex-acp, so record → recycle → replay is what makes it stick across the pool.
 - **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, `resumeSession()`, and `forkSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
-- **`ProbedConfigOptions` / `SessionConfigOption`** — the routed probe result and verbatim ACP advertised-option wire shape.
+- **`ProbeConfigOptionsOptions` / `ProbedConfigOptions` / `SessionConfigOption`** — the no-prompt probe controls, routed result, and verbatim ACP advertised-option wire shape.
 - **`AcpRunnerOptions.onElicitation`** — runner-wide ACP elicitation responder; sessions can override with `InteractiveSessionOptions.onElicitation`.
 - **`selectBackend({ model, tier }, registry?)`** — deterministic first-segment routing; registered custom names take priority, then the four built-ins, otherwise the configured default.
 - **`ClaudeBackend` / `CodexBackend` / `OpenCodeBackend` / `PiBackend`** — the four built-in backend strategies (spawn config + per-backend schema/auth wiring). OpenCode is host-resolved rather than bundled; pi uses bundled `@automatalabs/pi-acp`.

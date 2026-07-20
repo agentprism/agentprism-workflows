@@ -47,6 +47,11 @@ const ADVERTISED_OPTIONS: SessionConfigOption[] = [
       { value: "low", name: "Low" },
       { value: "high", name: "High" },
     ],
+    _meta: {
+      "@automatalabs/agentprism": {
+        recognizedValues: ["low", "high"],
+      },
+    },
   },
   {
     id: "fast_mode",
@@ -59,7 +64,7 @@ const ADVERTISED_OPTIONS: SessionConfigOption[] = [
 
 setValidateProbeFactoryForTests(() => ({
   async probeConfigOptions(spec) {
-    return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+    return { backendId: spec?.split("/", 1)[0] ?? "claude", options: ADVERTISED_OPTIONS };
   },
   async dispose() {},
 }));
@@ -113,16 +118,20 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
   assert.equal(report.warnings.length, 0);
 });
 
-test("validate probes each distinct routed harness once and surfaces catalogs without authored configOptions", async () => {
+test("validate probes each distinct routed backend/model pair and surfaces catalogs without authored configOptions", async () => {
   const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
   process.env.AGENTPRISM_DEFAULT_BACKEND = "browser";
-  const probes: Array<{ spec?: string; cwd?: string }> = [];
+  const probes: Array<{
+    spec: string | undefined;
+    cwd: string | undefined;
+    selectModel: boolean | undefined;
+  }> = [];
   const restore = setValidateProbeFactoryForTests((backends) => {
     assert.ok(backends?.browser, "script-declared custom backend reaches the probe runner registry");
     return {
       async probeConfigOptions(spec, opts) {
-        probes.push({ spec, cwd: opts?.cwd });
-        return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+        probes.push({ spec, cwd: opts?.cwd, selectModel: opts?.selectModel });
+        return { backendId: spec?.split("/", 1)[0] ?? "claude", options: ADVERTISED_OPTIONS };
       },
       async dispose() {},
     };
@@ -140,9 +149,17 @@ test("validate probes each distinct routed harness once and surfaces catalogs wi
     );
 
     assert.equal(report.ok, true);
-    assert.deepEqual(probes.map((probe) => probe.spec), ["browser", "codex"]);
+    assert.deepEqual(probes.map((probe) => probe.spec), ["browser", "browser/visual", "codex/gpt"]);
     assert.ok(probes.every((probe) => probe.cwd === TEST_HOME));
-    assert.deepEqual(report.dryRun?.harnessOptions?.map((harness) => harness.backendId), ["browser", "codex"]);
+    assert.deepEqual(probes.map((probe) => probe.selectModel), [false, true, true]);
+    assert.deepEqual(
+      report.dryRun?.harnessOptions?.map(({ backendId, model }) => ({ backendId, model })),
+      [
+        { backendId: "browser", model: undefined },
+        { backendId: "browser", model: "browser/visual" },
+        { backendId: "codex", model: "codex/gpt" },
+      ],
+    );
     assert.ok(report.dryRun?.harnessOptions?.every((harness) => harness.probed));
     assert.deepEqual(report.dryRun?.harnessOptions?.[0].options, ADVERTISED_OPTIONS);
     assert.equal(report.dryRun?.agentCalls[0].configOptions, undefined);
@@ -177,7 +194,7 @@ test("config-option error classes make validation INVALID with labels, values, a
   }
   for (const value of ["wat", "extreme", "1", "shadow"]) assert.match(reason, new RegExp(value));
   assert.match(reason, /advertised alternatives: option ids/);
-  assert.match(reason, /advertised alternatives: "low", "high"/);
+  assert.match(reason, /valid values: "low", "high"/);
   assert.match(reason, /advertised alternatives: true, false/);
   assert.match(reason, /use the call's model field/);
   assert.deepEqual(plain(report.dryRun?.agentCalls.map((call) => call.configOptions)), [
@@ -188,13 +205,166 @@ test("config-option error classes make validation INVALID with labels, values, a
   ]);
 });
 
-test("probe failure warns once per harness, reports probed:false, and skips its option checks", async () => {
+const PI_THINKING_DOMAIN = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function piThinkingOptions(supported: readonly string[]): SessionConfigOption[] {
+  return [{
+    id: "thinkingLevel",
+    type: "select",
+    name: "Thinking level",
+    category: "thought_level",
+    currentValue: supported.includes("medium") ? "medium" : supported[0] ?? "off",
+    options: supported.map((value) => ({ value, name: value })),
+    _meta: {
+      "@automatalabs/agentprism": {
+        recognizedValues: PI_THINKING_DOMAIN,
+      },
+    },
+  }];
+}
+
+test("pi thinkingLevel validation probes the call model and passes over-ceiling values with a clamp warning", async () => {
+  const probes: Array<{ spec: string | undefined; selectModel: boolean | undefined }> = [];
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec, opts) {
+      probes.push({ spec, selectModel: opts?.selectModel });
+      const supported = spec === "pi/test/capped"
+        ? PI_THINKING_DOMAIN.slice(0, PI_THINKING_DOMAIN.indexOf("high") + 1)
+        : PI_THINKING_DOMAIN;
+      return { backendId: "pi", options: piThinkingOptions(supported) };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "pi-clamp", description: "d" };',
+      'return agent("x", { label: "capped-call", model: "pi/test/capped", configOptions: { thinkingLevel: "xhigh" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, true);
+    assert.equal(report.exitCode, 0);
+    assert.deepEqual(probes, [{ spec: "pi/test/capped", selectModel: true }]);
+    assert.equal(report.dryRun?.harnessOptions?.[0]?.model, "pi/test/capped");
+    assert.match(report.warnings.join("\n"), /capped-call/);
+    assert.match(report.warnings.join("\n"), /pi model "pi\/test\/capped"/);
+    assert.match(report.warnings.join("\n"), /will clamp to "high"/);
+  } finally {
+    restore();
+  }
+});
+
+test("pi thinkingLevel validation passes supported values unchanged without a clamp warning", async () => {
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions() {
+      return {
+        backendId: "pi",
+        options: piThinkingOptions(PI_THINKING_DOMAIN.slice(0, PI_THINKING_DOMAIN.indexOf("high") + 1)),
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "pi-supported", description: "d" };',
+      'return agent("x", { label: "supported-call", model: "pi/test/capped", configOptions: { thinkingLevel: "high" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, true);
+    assert.equal(report.exitCode, 0);
+    assert.doesNotMatch(report.warnings.join("\n"), /clamp/);
+  } finally {
+    restore();
+  }
+});
+
+test("pi thinkingLevel validation fails unrecognized garbage with exit 2, model, and valid domain", async () => {
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions() {
+      return {
+        backendId: "pi",
+        options: piThinkingOptions(PI_THINKING_DOMAIN.slice(0, PI_THINKING_DOMAIN.indexOf("high") + 1)),
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "pi-garbage", description: "d" };',
+      'return agent("x", { label: "garbage-call", model: "pi/test/capped", configOptions: { thinkingLevel: "ultrahigh" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, false);
+    assert.equal(report.exitCode, 2);
+    assert.match(report.dryRun?.reason ?? "", /garbage-call/);
+    assert.match(report.dryRun?.reason ?? "", /pi model "pi\/test\/capped"/);
+    assert.match(report.dryRun?.reason ?? "", /"off".*"max"/);
+    assert.match(report.dryRun?.reason ?? "", /ultrahigh/);
+  } finally {
+    restore();
+  }
+});
+
+test("recognized interior-gap thinkingLevel clamps upward in advertised order", async () => {
+  const supported = PI_THINKING_DOMAIN.filter((value) => value !== "low" && value !== "xhigh" && value !== "max");
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions() {
+      return { backendId: "pi", options: piThinkingOptions(supported) };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "pi-gap", description: "d" };',
+      'return agent("x", { label: "gap-call", model: "pi/test/gap", configOptions: { thinkingLevel: "low" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, true);
+    assert.equal(report.exitCode, 0);
+    assert.match(report.warnings.join("\n"), /will clamp to "medium"/);
+  } finally {
+    restore();
+  }
+});
+
+test("thought-level validation without a recognized domain degrades to an unverified warning", async () => {
+  const restore = setValidateProbeFactoryForTests(() => ({
+    async probeConfigOptions() {
+      return {
+        backendId: "claude",
+        options: [{
+          id: "reasoning_effort",
+          type: "select",
+          name: "Reasoning effort",
+          category: "thought_level",
+          currentValue: "low",
+          options: [{ value: "low", name: "Low" }],
+        }],
+      };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await validateWorkflowScript([
+      'export const meta = { name: "future-domain", description: "d" };',
+      'return agent("x", { label: "future-call", configOptions: { reasoning_effort: "higher" } });',
+    ].join("\n"));
+
+    assert.equal(report.ok, true);
+    assert.equal(report.exitCode, 0);
+    assert.match(report.warnings.join("\n"), /no recognized domain was advertised/);
+    assert.match(report.warnings.join("\n"), /clamp eligibility is unverified/);
+  } finally {
+    restore();
+  }
+});
+
+test("probe failure warns once per backend/model pair, reports probed:false, and skips its option checks", async () => {
   const probes: string[] = [];
   const restore = setValidateProbeFactoryForTests(() => ({
     async probeConfigOptions(spec) {
       probes.push(spec ?? "claude");
-      if (spec === "codex") throw new Error("login required by fake codex");
-      return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+      if (spec?.startsWith("codex")) throw new Error("login required by fake codex");
+      return { backendId: spec?.split("/", 1)[0] ?? "claude", options: ADVERTISED_OPTIONS };
     },
     async dispose() {},
   }));
@@ -210,17 +380,29 @@ test("probe failure warns once per harness, reports probed:false, and skips its 
     );
 
     assert.equal(report.ok, true, "an unverified unknown option is skipped, not failed");
-    assert.deepEqual(probes, ["claude", "codex"]);
-    const codex = report.dryRun?.harnessOptions?.find((harness) => harness.backendId === "codex");
-    assert.deepEqual(codex, {
-      backendId: "codex",
-      probed: false,
-      error: "login required by fake codex",
-    });
-    assert.equal(report.warnings.filter((warning) => /could not probe codex/.test(warning)).length, 1);
+    assert.deepEqual(probes, ["claude", "codex/gpt", "codex/other"]);
+    const codex = report.dryRun?.harnessOptions?.filter((harness) => harness.backendId === "codex");
+    assert.deepEqual(codex, [
+      {
+        backendId: "codex",
+        model: "codex/gpt",
+        probed: false,
+        error: "login required by fake codex",
+      },
+      {
+        backendId: "codex",
+        model: "codex/other",
+        probed: false,
+        error: "login required by fake codex",
+      },
+    ]);
+    assert.equal(report.warnings.filter((warning) => /could not probe codex/.test(warning)).length, 2);
     assert.match(report.warnings.join("\n"), /configOptions on its calls are unverified/);
     assert.doesNotMatch(report.dryRun?.reason ?? "", /mystery/);
-    assert.match(formatValidateReport(report), /codex: probe failed — login required by fake codex/);
+    assert.match(
+      formatValidateReport(report),
+      /codex \(model "codex\/gpt"\): probe failed — login required by fake codex/,
+    );
   } finally {
     restore();
   }

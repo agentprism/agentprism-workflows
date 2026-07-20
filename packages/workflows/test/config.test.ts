@@ -277,6 +277,21 @@ test("C3 CLI: config pi executes the hermetic real-pi origin probe and exposes m
   assert.equal(report.harnessOptions.length, 1);
   assert.equal(report.harnessOptions[0]?.backendId, "pi");
   assert.deepEqual(report.harnessOptions[0]?.options.map(({ id }) => id), ["thinkingLevel", "model"]);
+  const thinking = report.harnessOptions[0]?.options[0];
+  assert.equal(thinking?.type, "select");
+  assert.deepEqual(
+    thinking?.type === "select"
+      ? thinking.options.flatMap((entry) => "options" in entry ? entry.options : [entry]).map(({ value }) => value)
+      : [],
+    ["off"],
+  );
+  const thinkingMeta = thinking?._meta?.["@automatalabs/agentprism"] as
+    | { recognizedValues?: unknown }
+    | undefined;
+  const recognizedValues = thinkingMeta?.recognizedValues;
+  assert.ok(Array.isArray(recognizedValues));
+  assert.equal(recognizedValues.length, 7);
+  assert.ok(recognizedValues.includes("max"));
   const model = report.harnessOptions[0]?.options[1];
   assert.equal(model?.type, "select");
   assert.ok(model?.type === "select" && model.options.length > 0);

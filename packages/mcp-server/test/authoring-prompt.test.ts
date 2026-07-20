@@ -119,6 +119,9 @@ test("generated authoring-prompt teaches configOptions and validate-time probe s
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Ids and string/boolean values pass through verbatim"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("advertised-options table"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("marks it `probed:false`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi's thought-level option is named `thinkingLevel`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("warning that names the effective clamp target"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("clamp eligibility is unverified"));
 });
 
 test("prompts/list advertises author-workflow with the optional task argument", async () => {
