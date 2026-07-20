@@ -23,10 +23,5 @@
     "@types/node": "^22.10.0",
     "tsx": "^4.22.4",
     "typescript": "^5.7.0"
-  },
-  "pnpm": {
-    "overrides": {
-      "@anthropic-ai/claude-agent-sdk": "0.3.215"
-    }
   }
 }
