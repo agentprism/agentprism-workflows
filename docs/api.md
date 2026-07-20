@@ -380,6 +380,13 @@ identity is HEAD plus dirty digest; non-Git hosts use `environmentKey`. The curr
 current Node/V8 versions do not gate admission or matching. Their differences from the source's
 recorded terminal environment and runtime appear in `replayEligibility.provenanceChanges`.
 
+The terminal manifest is dense even when a pause or halt catches allocated calls in flight. Those
+occurrences carry `outcome: "error"`, `origin: "engine"`, and no journal result, so they execute
+live on resume. Safety-proved non-result agent rows remain in the identity seed as non-replayable
+blockers until their occurrence is reached. A blocker participates in exact/content ambiguity but
+can never return a value; this preserves alignment while allowing completed calls after a gap to
+replay.
+
 A crash snapshot reconciled to `paused` / `interrupted` has no quiescent terminal environment. It
 takes the `crash-residue` legacy positional bridge before the input-format bridge, regardless of
 the current environment; its recorded start-environment difference is provenance only. Normally
@@ -396,7 +403,7 @@ Automatic policy selects:
 - `"positional-v1"` / `"legacy"` with `fallbackReason: "inputs-format-legacy"` for a marked source
   that settled normally, whose input-fingerprint format is below 2, and whose other admission facts
   agree;
-- `"identity-v1"` only for a stable source whose represented agent results are safety-marked and
+- `"identity-v1"` only for a stable source whose represented agent occurrences are safety-marked and
   whose checkpoint results are proven host decisions;
 - `"positional-v1"` / `"safe-prefix"` for a structurally valid, start-to-terminal stable source
   that is unsafe for non-contiguous matching; only safety-marked agents and fingerprint-equal host

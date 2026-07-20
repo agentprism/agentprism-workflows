@@ -42,6 +42,7 @@ export {
   type PersistedAgentState,
   type PersistedResumeFormat,
   type PersistedResumeCandidate,
+  type PersistedResumeCallBlocker,
   type PersistedCheckpointInjection,
   type PersistedResumeSeed,
   type PersistedRunLineageTombstone,

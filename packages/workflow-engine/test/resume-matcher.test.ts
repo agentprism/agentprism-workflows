@@ -31,6 +31,7 @@ import {
 import type {
   PersistedCheckpointInjection,
   PersistedResumeCandidate,
+  PersistedResumeCallBlocker,
   PersistedResumeSeed,
   PersistedRunState,
 } from "../src/run-persistence.js";
@@ -169,6 +170,26 @@ function injection(index = 0, overrides: Partial<PersistedCheckpointInjection> =
   };
 }
 
+function blocker(index = 0, overrides: Partial<WorkflowCallRecord> = {}): PersistedResumeCallBlocker {
+  return {
+    sourceRunId: SOURCE_RUN_ID,
+    recordedIndex: index,
+    call: agentRow(index, {
+      outcome: "error",
+      origin: "engine",
+      error: {
+        form: "workflow-error",
+        message: "interrupted",
+        code: WorkflowErrorCode.WORKFLOW_ABORTED,
+        recoverable: true,
+      },
+      aborted: true,
+      budgetDebit: 0,
+      ...overrides,
+    }),
+  };
+}
+
 function seed(
   candidates: PersistedResumeCandidate[] = [candidate()],
   checkpointInjections: PersistedCheckpointInjection[] = [],
@@ -236,6 +257,12 @@ describe("incremental resume admission", () => {
     const failed = admission(sourceState([failedCall]));
     assert.equal(failed.strategy, "positional-v1");
     assert.equal(failed.strategy === "positional-v1" && failed.fallbackReason, "unsafe-recording");
+
+    const interrupted = blocker().call;
+    const interruptedDecision = admission(sourceState([interrupted]));
+    assert.equal(interruptedDecision.strategy, "identity-v1");
+    assert.equal(interruptedDecision.strategy === "identity-v1" && interruptedDecision.seed.candidates.length, 0);
+    assert.equal(interruptedDecision.strategy === "identity-v1" && interruptedDecision.seed.callBlockers?.length, 1);
 
     const nested = admission(sourceState(undefined, { nestedWorkflows: true }));
     assert.equal(nested.strategy, "positional-v1");
@@ -618,6 +645,21 @@ return { first, second };`;
     });
     assert.equal(admission(invalidImmediate).strategy === "live" && admission(invalidImmediate).disabledReason, "resume-seed-invalid");
 
+    const invalidBlocker = blocker();
+    invalidBlocker.recordedIndex = 1;
+    const withInvalidBlocker = sourceState(undefined, {
+      resumeSeed: {
+        format: "identity-v1",
+        sourceRunId: SOURCE_RUN_ID,
+        candidates: [],
+        callBlockers: [invalidBlocker],
+      },
+    });
+    assert.equal(
+      admission(withInvalidBlocker).strategy === "live" && admission(withInvalidBlocker).disabledReason,
+      "resume-seed-invalid",
+    );
+
     const collision = normalizeResumeSeed({
       sourceRunId: SOURCE_RUN_ID,
       promoted: [candidate()],
@@ -776,6 +818,29 @@ describe("identity candidate indexes and selection", () => {
 
     const changedAtSamePath = selectResumeCandidate(indexes, matchInput({ hash: HASH_B }));
     assert.deepEqual(changedAtSamePath, { action: "live", reason: "not-recorded" });
+  });
+
+  it("runs call blockers live and keeps them in identity multiplicity", () => {
+    const blockedSeed: PersistedResumeSeed = {
+      format: "identity-v1",
+      sourceRunId: SOURCE_RUN_ID,
+      candidates: [],
+      callBlockers: [blocker()],
+    };
+    const indexes = buildResumeCandidateIndexes(blockedSeed);
+    const blocked = selectResumeCandidate(indexes, matchInput());
+    assert.equal(blocked.action, "live");
+    assert.equal(blocked.action === "live" && blocked.reason, "not-recorded");
+    assert.equal(blocked.action === "live" && blocked.remove?.type, "blocker");
+
+    const ambiguous = buildResumeCandidateIndexes({
+      ...blockedSeed,
+      candidates: [candidate()],
+    });
+    assert.deepEqual(selectResumeCandidate(ambiguous, matchInput()), {
+      action: "live",
+      reason: "ambiguous-identity",
+    });
   });
 
   it("orders cache, path, inputs, mismatch, and consumption decisions", () => {

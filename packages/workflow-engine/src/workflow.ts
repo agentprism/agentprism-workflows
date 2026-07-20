@@ -115,6 +115,7 @@ export interface SharedRuntime {
   resumeActivity?: {
     active: number;
     invalid: boolean;
+    retired?: boolean;
     onActivity?: (active: number) => void;
   };
 }
@@ -656,6 +657,7 @@ export async function runWorkflow<T = unknown>(
     const settleActivity = () => {
       if (observed) return;
       observed = true;
+      if (resumeActivity.retired) return;
       transitionResumeActivity(-1);
     };
     void promise.then(settleActivity, settleActivity);
@@ -795,6 +797,9 @@ export async function runWorkflow<T = unknown>(
     const indexes = buildResumeCandidateIndexes(seed);
     const occurrences = [
       ...seed.candidates.map((candidate) => indexedSourceOccurrence({ type: "candidate", candidate })),
+      ...(seed.callBlockers ?? []).map((blocker) =>
+        indexedSourceOccurrence({ type: "blocker", blocker }),
+      ),
       ...(seed.checkpointInjections ?? []).map((injection) =>
         indexedSourceOccurrence({ type: "injection", injection }),
       ),
@@ -862,6 +867,9 @@ export async function runWorkflow<T = unknown>(
   };
 
   const remainingResumeSeed = (controller: ResumeSeedController): PersistedResumeSeed => {
+    const callBlockers = (controller.seed.callBlockers ?? []).filter((blocker) =>
+      !controller.consumed.has(indexedSourceOccurrence({ type: "blocker", blocker })),
+    );
     const checkpointInjections = (controller.seed.checkpointInjections ?? []).filter((injection) =>
       !controller.consumed.has(indexedSourceOccurrence({ type: "injection", injection })),
     );
@@ -871,6 +879,7 @@ export async function runWorkflow<T = unknown>(
       candidates: controller.seed.candidates.filter((candidate) =>
         !controller.consumed.has(indexedSourceOccurrence({ type: "candidate", candidate })),
       ),
+      ...(callBlockers.length === 0 ? {} : { callBlockers }),
       ...(checkpointInjections.length === 0 ? {} : { checkpointInjections }),
     };
     const captured = cloneFrozenStrictJson(next);
@@ -933,6 +942,24 @@ export async function runWorkflow<T = unknown>(
     guardTerminal("onCallRecord", () => options.onCallRecord?.(record));
     return record;
   };
+
+  // Allocation happens before limiter admission, so a run can halt while calls are
+  // either executing or still queued. Keep the engine-owned identity closures alive
+  // until settlement and synchronously turn every remaining allocation into an
+  // aborted engine row when the run stops. This preserves the dense manifest without
+  // waiting for a backend that may ignore cancellation during wind-down. Only a root
+  // set made entirely of declared-read-only agents can retire that pending activity;
+  // unsafe, nested, and checkpoint work keeps the existing quiescence barrier.
+  const unsettledCallInterruptions = new Map<() => void, boolean>();
+  const interruptUnsettledCalls = () => {
+    const terminalSafe = [...unsettledCallInterruptions.values()].every(Boolean);
+    for (const interrupt of [...unsettledCallInterruptions.keys()]) interrupt();
+    if (options.sharedRuntime === undefined && terminalSafe && !nestedWorkflows && !resumeActivity.retired) {
+      resumeActivity.retired = true;
+      while (resumeActivity.active > 0) transitionResumeActivity(-1);
+    }
+  };
+  signal.addEventListener("abort", interruptUnsettledCalls, { once: true });
 
   const strictSnapshot = (value: unknown, description: string, agentLabel?: string): unknown => {
     const captured = cloneFrozenStrictJson(value);
@@ -1070,6 +1097,7 @@ export async function runWorkflow<T = unknown>(
     reportRootCallAllocated(callIndex);
 
     let settled: WorkflowCallRecord | undefined;
+    let interrupt: (() => void) | undefined;
     const settle = (
       terminal: Omit<
         WorkflowCallRecord,
@@ -1077,6 +1105,7 @@ export async function runWorkflow<T = unknown>(
       >,
     ): WorkflowCallRecord => {
       if (settled) return settled;
+      if (interrupt) unsettledCallInterruptions.delete(interrupt);
       settled = appendCallRecord({
         index: callIndex,
         kind: "agent",
@@ -1132,6 +1161,44 @@ export async function runWorkflow<T = unknown>(
           ? "declared-read-only"
           : undefined
       : undefined;
+
+    interrupt = () => {
+      if (settled) return;
+      const error = new WorkflowError(
+        `agent "${label}" interrupted because workflow execution halted`,
+        WorkflowErrorCode.WORKFLOW_ABORTED,
+        { recoverable: true, agentLabel: label },
+      );
+      const errorRecord = projectRecordedError(error);
+      settle({
+        outcome: "error",
+        origin: "engine",
+        error: errorRecord,
+        aborted: true,
+        budgetDebit: 0,
+        ...(currentReplaySafety === "declared-read-only"
+          ? { resumeSafety: currentReplaySafety }
+          : {}),
+      });
+      if (agentStartEmitted) {
+        emitAgentEnd({
+          label,
+          phase: assignedPhase,
+          result: null,
+          tokens: 0,
+          model: displayModel,
+          error: error.message,
+          errorCode: error.code,
+          recoverable: error.recoverable,
+          errorRecord,
+        });
+      }
+    };
+    unsettledCallInterruptions.set(interrupt, currentReplaySafety === "declared-read-only");
+    if (signal.aborted) {
+      interrupt();
+      throwIfAborted();
+    }
 
     const runLive = () => limiter(async () => {
       const maxAttempts = retryAttempts + 1;
@@ -1220,6 +1287,7 @@ export async function runWorkflow<T = unknown>(
         slot: AttemptSlots | undefined,
         aborted: boolean,
       ) => {
+        if (settled) return;
         applyBudgetReplay(slot?.budgetReplay?.settlementOrdinal);
         const errorRecord = projectRecordedError(thrown);
         const workflowError = wrapError(thrown, { agentLabel: label });
@@ -1246,6 +1314,14 @@ export async function runWorkflow<T = unknown>(
           ...(worktree?.isolated ? { worktree: true } : {}),
           ...(runCwd !== undefined && origin === "runner" ? { resolvedCwd: runCwd } : {}),
           budgetDebit,
+          ...(resumeDeclared && resolvedIsolation === undefined
+            ? { resumeSafety: "declared-read-only" as const }
+            : resumeDeclared &&
+                resolvedIsolation === "worktree" &&
+                worktree?.isolated &&
+                agentOptions.cwd === undefined
+              ? { resumeSafety: "isolated-worktree" as const }
+              : {}),
           ...(slot?.provenance ? { provenance: slot.provenance } : {}),
         });
         emitAgentEnd({
@@ -1489,7 +1565,7 @@ export async function runWorkflow<T = unknown>(
             const usage = terminalUsage();
             const session = sessionRecord(slot, agentOptions.keepSession === true);
             if (session) state.agentSessions.push(session);
-            settle({
+            const terminalRecord = settle({
               outcome: "result",
               origin: "runner",
               attempts: attemptsRan,
@@ -1510,6 +1586,7 @@ export async function runWorkflow<T = unknown>(
                   : {}),
               ...(slot.provenance ? { provenance: slot.provenance } : {}),
             });
+            if (terminalRecord.outcome !== "result") return result;
             if (journaling) {
               const entry = deepFreeze({
                 index: callIndex,
@@ -1620,6 +1697,7 @@ export async function runWorkflow<T = unknown>(
       manifestProvenance: boolean;
     }): Promise<unknown> => {
       await Promise.resolve();
+      throwIfAborted();
       if (input.rebindSession) shared.spent += input.logicalBudgetDebit as number;
 
       emitAgentStart();
@@ -1638,7 +1716,7 @@ export async function runWorkflow<T = unknown>(
       }
       const cachedUsage = input.entry.usage ? copyValidUsage(input.entry.usage) : undefined;
       if (cachedSession) state.agentSessions.push(cachedSession);
-      settle({
+      const terminalRecord = settle({
         outcome: "result",
         origin: "journal-replay",
         ...(cachedUsage ? { usage: cachedUsage } : {}),
@@ -1660,6 +1738,7 @@ export async function runWorkflow<T = unknown>(
             }
           : {}),
       });
+      if (terminalRecord.outcome !== "result") return input.resultSnapshot;
       const entry = deepFreeze({
         index: callIndex,
         hash: callHash,
@@ -2299,6 +2378,7 @@ export async function runWorkflow<T = unknown>(
     onAllocated(callIndex);
     reportRootCallAllocated(callIndex);
     let settled: WorkflowCallRecord | undefined;
+    let interrupt: (() => void) | undefined;
     const settle = (
       terminal: Omit<
         WorkflowCallRecord,
@@ -2306,6 +2386,7 @@ export async function runWorkflow<T = unknown>(
       >,
     ): WorkflowCallRecord => {
       if (settled) return settled;
+      if (interrupt) unsettledCallInterruptions.delete(interrupt);
       settled = appendCallRecord({
         index: callIndex,
         kind: "checkpoint",
@@ -2316,6 +2397,25 @@ export async function runWorkflow<T = unknown>(
       });
       return settled;
     };
+    interrupt = () => {
+      if (settled) return;
+      const error = new WorkflowError(
+        `checkpoint "${promptText}" interrupted because workflow execution halted`,
+        WorkflowErrorCode.WORKFLOW_ABORTED,
+        { recoverable: true },
+      );
+      settle({
+        outcome: "error",
+        origin: "engine",
+        error: projectRecordedError(error),
+        aborted: true,
+      });
+    };
+    unsettledCallInterruptions.set(interrupt, false);
+    if (signal.aborted) {
+      interrupt();
+      throwIfAborted();
+    }
     shared.agentCount++;
 
     const replayCheckpoint = (input: {
@@ -2327,7 +2427,7 @@ export async function runWorkflow<T = unknown>(
       checkpointHostDecision: boolean;
       manifestProvenance: boolean;
     }): unknown => {
-      settle({
+      const terminalRecord = settle({
         outcome: "result",
         origin: "journal-replay",
         ...(input.manifestProvenance
@@ -2342,6 +2442,7 @@ export async function runWorkflow<T = unknown>(
             }
           : {}),
       });
+      if (terminalRecord.outcome !== "result") return input.resultSnapshot;
       const journalEntry = deepFreeze({
         index: callIndex,
         hash: callHash,
@@ -2599,7 +2700,8 @@ export async function runWorkflow<T = unknown>(
       }
       throwIfAborted();
       const replySnapshot = strictSnapshot(reply, `checkpoint "${promptText}" reply`);
-      settle({ outcome: "result", origin });
+      const terminalRecord = settle({ outcome: "result", origin });
+      if (terminalRecord.outcome !== "result") return reply;
       if (journaling) {
         const entry = deepFreeze({
           index: callIndex,
@@ -2702,6 +2804,7 @@ export async function runWorkflow<T = unknown>(
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   let result: unknown;
+  let scriptFailed = false;
   try {
     const scriptPromise = new vm.Script(wrapped, { filename: vmFilename }).runInContext(context) as Promise<unknown>;
     // If the tripwire fires while the script is still running, the run fails NOW with
@@ -2710,12 +2813,17 @@ export async function runWorkflow<T = unknown>(
     result = await Promise.race([scriptPromise, tripwire.tripped]);
     await tripwire.drain();
   } catch (error) {
+    scriptFailed = true;
     // A WorkflowError crossing the script boundary keeps its classification (abort, budget,
     // usage limit, tripwire). Anything else IS the script crashing — label it SCRIPT_ERROR,
     // never WORKFLOW_ABORTED (nobody cancelled anything).
     if (error instanceof WorkflowError) throw error;
     throw new WorkflowError(errorMessage(error), WorkflowErrorCode.SCRIPT_ERROR, { recoverable: false });
   } finally {
+    if (unsettledCallInterruptions.size > 0 && !signal.aborted) {
+      if (scriptFailed) faults.abort();
+      else interruptUnsettledCalls();
+    }
     tripwire.retire();
   }
 

@@ -178,7 +178,9 @@ console.log(again.replayEligibility, again.resumeReport);
 ```
 
 The manager admits exact cwd plus compatible format/metadata/manifest state, persists the candidate seed, and
-then matches safety-marked results by exact path/hash or unique hash+input fingerprint. Any
+then matches safety-marked results by exact path/hash or unique hash+input fingerprint. Allocated calls that
+halt without a result are persisted as engine interruption rows; non-result seed blockers make those
+occurrences run live without letting an identical result sibling become spuriously unique. Any
 uncertain, ambiguous, unsafe, or mismatched call runs live. Same-ID `manager.resume(runId)` and
 manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
 catalogs, checkpoint source-index rules, and filesystem preconditions are in the

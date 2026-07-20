@@ -135,7 +135,7 @@ From [`src/index.ts`](./src/index.ts):
   positional replay. Producing/current engine versions and runtime/environment provenance changes
   are diagnostics in `WorkflowReplayEligibility` and never gate replay.
 - `WorkflowCallRecord` — the terminal call manifest, including optional `path`, agent/checkpoint
-  `inputsHash`, `resumeSafety`, and manager-owned replay provenance. Old object literals remain
+  `inputsHash`, occurrence-level `resumeSafety`, and manager-owned replay provenance. Old object literals remain
   valid because every incremental-resume field is optional and omitted when unset.
 - `JournalCallMetadata` and optional `JournalEntry.call` — replay-neutral agent/checkpoint
   attribution (`kind`, label, phase, resolved model, actual backend). Legacy entries without it

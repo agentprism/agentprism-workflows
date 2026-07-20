@@ -89,6 +89,15 @@ export interface PersistedResumeCandidate {
   logicalBudgetDebit?: number;
 }
 
+/** A settled non-result occurrence retained in the identity matcher. It can never
+ *  replay, but it prevents a result sibling with the same identity from becoming
+ *  spuriously unique and is consumed when the current execution reaches it. */
+export interface PersistedResumeCallBlocker {
+  sourceRunId: string;
+  recordedIndex: number;
+  call: WorkflowCallRecord;
+}
+
 export interface PersistedCheckpointInjection {
   sourceRunId: string;
   recordedIndex: number;
@@ -105,6 +114,7 @@ export interface PersistedResumeSeed {
    *  older hop and retain that run ID themselves. */
   sourceRunId: string;
   candidates: PersistedResumeCandidate[];
+  callBlockers?: PersistedResumeCallBlocker[];
   checkpointInjections?: PersistedCheckpointInjection[];
 }
 

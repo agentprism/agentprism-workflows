@@ -176,7 +176,7 @@ export type WorkflowResumeSafety =
 export interface WorkflowCallRecord {
   // existing fields unchanged
 
-  /** Why this recorded agent result is safe for content-addressed mainline replay.
+  /** Why this agent occurrence is safe for content-addressed mainline resume.
    *  "declared-read-only" reflects the authored assertion at allocation.
    *  "isolated-worktree" is written only after createWorktree() returned
    *  isolated:true. Absent for checkpoints and every unproved agent call. */
@@ -187,20 +187,19 @@ export interface WorkflowCallRecord {
 Rules:
 
 - `resume: { filesystem: "read-only" }` on a call that does not request worktree isolation records
-  `"declared-read-only"` on an `outcome: "result"` row. Safety markers are omitted on
-  `"null"`/`"error"` rows, which are never identity candidates.
+  `"declared-read-only"` on result and non-result rows. Non-result rows never replay, but their
+  marker allows them to participate as safe identity blockers.
 - A call resolved to `isolation: "worktree"` records `"isolated-worktree"` only when the same
   `resume` declaration is present, the manifest already records `worktree: true`, and the worktree
-  was derived from the run's admitted `effectiveCwd` (a per-agent `cwd` is absent), and the row has
-  `outcome: "result"`. An unannotated, failed, degraded, or external-base worktree records no
-  safety marker.
+  was derived from the run's admitted `effectiveCwd` (a per-agent `cwd` is absent). An unannotated,
+  pre-isolation interruption, degraded, or external-base worktree records no safety marker.
 - A journal-replayed call carries the selected source row's safety marker only when the current
   authored inputs still assert the same safety class.
 - Checkpoint journal rows need no filesystem marker. Proven host-decision replays and injections
   invoke no host code; engine-headless decisions run fresh but do not taint the workspace. Live
   host callbacks are covered by the barrier in §2.9.
 
-Persisted-marker validation is exact. Checkpoint and non-result rows must omit `resumeSafety`.
+Persisted-marker validation is exact. Checkpoint rows must omit `resumeSafety`.
 `"declared-read-only"` requires an agent row whose resolved `isolation` is absent.
 `"isolated-worktree"` requires `isolation: "worktree"` and either (a) an origin-`"runner"` row
 with `worktree: true`, or (b) an origin-`"journal-replay"` row with mainline `replay` provenance
@@ -537,8 +536,10 @@ For a new-format source, validate in this order:
    equal to rule 7's origin-selected debit; a checkpoint candidate omits that field and satisfies
    rule 7's host-decision origin/provenance proof, including its checkpoint `inputsHash`. Every
    injection has a non-empty source ID, non-negative safe `recordedIndex`, non-empty NUL-free path,
-   lowercase SHA-256 hash, a lowercase SHA-256 `inputsHash`, and a strict-JSON decision. No two
-   candidates/injections share
+   lowercase SHA-256 hash, a lowercase SHA-256 `inputsHash`, and a strict-JSON decision. A call
+   blocker carries a validated non-result terminal call with required path/input facts; agent
+   blockers require an admissible safety marker, while checkpoint blockers are engine-aborted
+   `WORKFLOW_ABORTED` rows. No two candidates/blockers/injections share
    `(sourceRunId, recordedIndex)`. This validator runs before flattening.
 
 Outcomes:
@@ -549,7 +550,8 @@ Outcomes:
   reply passed the row/context/uniqueness checks, and that resulting injection represents that
   exact non-result checkpoint row. Define `allCallsRepresented` as: every root call row has
   `outcome: "result"`, except that exact one pending row may be non-result when
-  `pendingRepresented` is true. Any other `"null"`/`"error"` row remains a barrier.
+  `pendingRepresented` is true. A validated non-result call blocker also represents its exact
+  occurrence without making it replayable.
 - Compute `filesystemStable = environmentsEqual(source.environment,
   source.resume.terminalEnvironment)`, `allAgentsSafe` (every root agent row and remaining agent
   candidate has `resumeSafety`), and `allCheckpointResultsHostDecisions` (every root checkpoint
@@ -559,10 +561,9 @@ Outcomes:
   `!allAgentsSafe || !allCheckpointResultsHostDecisions || !allCallsRepresented` ->
   `"unsafe-recording"`.
   Here `"unsafe-recording"` means "not eligible for non-contiguous identity serving": either an
-  unproved agent, a headless checkpoint outcome that v1 deliberately re-executes, or a caught/
-  terminal call failure that must remain an occurrence/positional barrier rather than disappearing
-  from the result-only seed. The sole exception is a pending checkpoint whose newly supplied host
-  reply is itself the durable identity record for that row.
+  unproved agent or a headless checkpoint outcome that v1 deliberately re-executes. A safety-proved
+  non-result agent remains an explicit, non-replayable seed blocker. The pending-checkpoint
+  exception uses the newly supplied host reply as the durable identity record for that row.
 - With a fallback reason, select `"positional-v1"`. Its eligibility is `"all-live"` when
   `nestedWorkflows` or `!filesystemStable`, otherwise `"safe-prefix"`. Thus a nested source or a
   source whose final modeled tree differs from the tree its leading readers observed serves no
@@ -589,26 +590,26 @@ is not replaced by a later failure.
 
 The source may be paused or failed and therefore may represent only a reached prefix/branch of the
 script, but its manifest is complete for every root call it actually allocated: indexes are dense,
-every allocated primitive has settled, and every result is journal-paired. The validator examines
-every existing agent row for safety and requires the quiescent terminal identity of §2.3. An
-interrupted/floated call omits `terminalEnvironment` and selects all-live before this point. This is
-still less restrictive than isolation preflight, which additionally requires a completed recording
-for comparison.
+every allocated primitive has a terminal-shaped row, and every result is journal-paired. On halt,
+the engine synchronously records every outstanding allocation as an engine-aborted error before the
+manager saves terminal state. Safety-proved interruptions retire resume activity for terminal
+environment capture without waiting for backend wind-down. Isolation preflight remains stricter
+and additionally requires a completed recording for comparison.
 
-A checkpoint pause is the only non-result call row treated as represented for identity. It is
+A checkpoint pause supplied with a validated reply is represented by its injection. It is
 admitted only for the execution
 that supplies its validated reply, and the prepared injection remains in the original multiplicity
-groups. Without a reply, with a non-injectable duplicate, or for every other call failure, the row
-selects positional fallback. This exception is what lets an identity run pause for a human and
+groups. Without a reply or with a non-injectable duplicate, the row selects positional fallback.
+Safety-proved agent failures instead become call blockers. This is what lets an identity run pause for a human and
 continue with its unconsumed seed without forgetting an ambiguity blocker.
 
 Rule 7 is intentionally source-wide in v1. An excluded row cannot simply disappear from the seed:
 it must still block an otherwise-unique exact/content group, including after a selected sibling is
-consumed and a paused run flattens across generations. Persisting ambiguity tombstones would be a
-second correspondence format. Rather than let missing capture data make another row look unique,
-v1 treats any result row missing path/input/debit as `"manifest-invalid"` and serves nothing. This
-is conservative for a deep-stack or non-strict-meta row, but it is decidable and fail-to-live; a
-future format may add durable tombstones without changing v1 semantics.
+consumed and a paused run flattens across generations. Non-result call blockers supply that durable
+ambiguity fact and are consumed when the current execution reaches them. A result row still cannot
+be reduced to a blocker because doing so would discard a replayable value; v1 treats any result row
+missing path/input/debit as `"manifest-invalid"` and serves nothing. This
+is conservative for a deep-stack or non-strict-meta row, but it is decidable and fail-to-live.
 
 Frozen exported run-level reason arrays keep code, docs, and tests aligned:
 
@@ -653,6 +654,13 @@ export interface PersistedResumeCandidate {
   logicalBudgetDebit?: number;
 }
 
+export interface PersistedResumeCallBlocker {
+  sourceRunId: string;
+  recordedIndex: number;
+  /** Frozen non-result terminal call; it participates in matching but never replays. */
+  call: WorkflowCallRecord;
+}
+
 export interface PersistedCheckpointInjection {
   sourceRunId: string;
   recordedIndex: number;
@@ -669,6 +677,7 @@ export interface PersistedResumeSeed {
    *  older hop and retain that run ID themselves. */
   sourceRunId: string;
   candidates: PersistedResumeCandidate[];
+  callBlockers?: PersistedResumeCallBlocker[];
   checkpointInjections?: PersistedCheckpointInjection[];
 }
 
@@ -735,10 +744,11 @@ identity-replayed source row (`call.budgetDebit === 0`) from losing the original
 the next hop.
 
 The seed contains the source agent result pairs admitted by §2.5 plus only the proven-host subset
-of checkpoint result pairs, the prepared pending injection if any, and any validated unconsumed
-candidates/injections inherited from the source's own seed, all as strict-JSON clones. It is
+of checkpoint result pairs, validated non-result call blockers, the prepared pending injection if
+any, and any validated unconsumed candidates/blockers/injections inherited from the source's own
+seed, all as strict-JSON clones. It is
 written before `startInBackground()` returns. Each binding decision removes the selected or
-invalidated source candidates from the in-memory seed before the decision is exposed to script
+invalidated source candidates/blockers from the in-memory seed before the decision is exposed to script
 code; `preparedResume.commitSeed` persists that smaller seed. A replay also emits a fresh
 `JournalEntry` under the current index before returning the value. That entry uses the current
 hash/scope/call diagnostics and the rebound session record from §2.11.
@@ -756,11 +766,11 @@ proved quiescence; when its next admission again selects `"identity-v1"`, the ma
 seed. The union must remain unique by `(sourceRunId, recordedIndex)`; an unexpected collision has
 no winner and selects `"resume-seed-invalid"` before the target starts. A checkpoint pause with a
 valid supplied reply
-qualifies through `pendingRepresented` in §2.5. A source with another call failure selects
-positional fallback and does not carry the candidate seed; it cannot forget that failed row and
-then claim unique identity correspondence. Candidates promoted from current rows use the immediate
+qualifies through `pendingRepresented` in §2.5. Other validated non-result occurrences retain their
+call blockers, so the source cannot forget a failed row and then claim unique identity
+correspondence. Candidates and blockers promoted from current rows use the immediate
 interrupted run ID; older candidates retain their original run ID. If the interrupted execution
-had already crossed the unsafe-live barrier (§2.9), every remaining candidate and injection was
+had already crossed the unsafe-live barrier (§2.9), every remaining candidate, blocker, and injection was
 synchronously removed at that barrier. Thus a later hop cannot resurrect a candidate that unsafe
 live work made stale.
 
@@ -1586,7 +1596,7 @@ bijection on the next hop.
   initial/terminal JSON fixtures pin the marker, checkpoint-input format, and terminal-environment
   omission/presence rules.
 - **Format/admission matrix:** absent marker -> legacy positional; safe v1 -> identity; a v1 source
-  with an unsafe agent, headless checkpoint, caught call failure, or nested workflow selects
+  with an unsafe agent, headless checkpoint, or nested workflow selects
   positional-v1 when its required terminal environment is present; legacy-resume -> positional-v1;
   unsupported/malformed/aborted/missing terminal env/cwd or
   runtime or checkpoint-input-format mismatch/environment mismatch/source drift/invalid retained
@@ -1596,7 +1606,8 @@ bijection on the next hop.
   fail before run creation; any result row missing path/input/debit disables the source so it cannot
   disappear as an ambiguity blocker; journal/result pairing is bijective, so a result row missing
   its journal also cannot disappear; root indexes must densely equal the manager-observed
-  `callsAllocated`, including failed/paused runs, so a missing highest row is detected; a
+  `callsAllocated`, including failed/paused runs, and every engine halt writes the interrupted rows
+  needed to satisfy that invariant; a
   replay-origin agent row missing its provenance debit is
   invalid rather than falling back to physical zero; exact first-failure reason precedence is
   pinned.

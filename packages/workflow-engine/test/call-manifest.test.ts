@@ -213,7 +213,7 @@ return { a, c }`,
     controller.abort();
     await assert.rejects(run, (error: unknown) => error instanceof WorkflowError);
     assert.equal(engineRows.length, 1);
-    assert.equal(engineRows[0].origin, "runner");
+    assert.equal(engineRows[0].origin, "engine");
     assert.equal(engineRows[0].aborted, true);
   });
 
@@ -288,7 +288,7 @@ return await pending`,
     assert.deepEqual(result.calls?.map((row) => row.settlementOrdinal), [1, 2]);
   });
 
-  it("leaves pre-allocation gate failures invisible and exposes floated incompleteness", async () => {
+  it("leaves pre-allocation gate failures invisible and settles floated allocations", async () => {
     const gated = await runWorkflow(
       meta(
         "pre-gate",
@@ -310,9 +310,11 @@ return 'done'`,
       },
     );
     assert.equal(floated.callsAllocated, 1);
-    assert.equal(floated.calls?.length, 0);
+    assert.equal(floated.calls?.length, 1);
+    assert.equal(floated.calls?.[0].origin, "engine");
+    assert.equal(floated.calls?.[0].error?.code, WorkflowErrorCode.WORKFLOW_ABORTED);
     finish("late");
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(floated.calls?.length, 0, "the returned authoritative snapshot is not mutated by the late settlement");
+    assert.equal(floated.calls?.length, 1, "the returned authoritative snapshot is not mutated by the late settlement");
   });
 });

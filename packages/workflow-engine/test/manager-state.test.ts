@@ -265,7 +265,7 @@ return { count: args.count, answer }`,
     }
   });
 
-  it("drops journal, manifest, and agent events that arrive after terminal save", async () => {
+  it("persists floated interruption and drops terminal events that arrive after the save", async () => {
     const dirs = tempDirs();
     try {
       let finish!: (value: string) => void;
@@ -287,7 +287,7 @@ return { count: args.count, answer }`,
       await new Promise((resolve) => setTimeout(resolve, 10));
       const after = manager.getPersistence().load(result.runId);
       assert.deepEqual(after, before);
-      assert.deepEqual({ journalEvents, recordEvents, endEvents }, { journalEvents: 0, recordEvents: 0, endEvents: 0 });
+      assert.deepEqual({ journalEvents, recordEvents, endEvents }, { journalEvents: 0, recordEvents: 1, endEvents: 1 });
     } finally {
       dirs.cleanup();
     }

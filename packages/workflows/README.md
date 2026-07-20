@@ -338,7 +338,10 @@ agent rows carry their resolved `timeoutMs` plus `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
 under a new run ID, and match safe calls by exact path/hash or unique hash+input fingerprint.
-Uncertain, ambiguous, or unsafe calls run live. Current-environment and Node/V8 differences are
+Every allocated call receives a terminal manifest row even when the run halts around it. A
+non-result occurrence remains live on resume and stays in the identity seed as an ambiguity
+blocker until reached, so completed siblings on either side can replay safely. Uncertain,
+ambiguous, or unsafe calls run live. Current-environment and Node/V8 differences are
 reported as provenance without changing admission or matching. Identity hits preserve
 script-visible logical budget debit while adding zero current provider usage; replayed session
 records are rebound to the current call index/label/phase. `resumePolicy: "positional"` requests
