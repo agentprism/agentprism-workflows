@@ -60,6 +60,8 @@ The package ships one executable:
 
 Running it starts the MCP server on stdio: it builds an ACP-backed `AgentRunner`, injects it into a `WorkflowManager`, registers the `workflow` tool, and connects a `StdioServerTransport`. It speaks the MCP protocol — it is not an interactive CLI. Launch it from an MCP host, or pipe JSON-RPC to it yourself for testing.
 
+On stdin EOF, transport close, `SIGINT`, or `SIGTERM`, the server stops accepting new tool calls and disposes the ACP runner before exiting. That closes every pooled backend process with its existing graceful `SIGTERM`/`SIGKILL` teardown. Cleanup has a five-second hard deadline, so a stuck backend cannot leave the server alive. Client disconnects exit with code `0`; signal shutdowns use conventional `SIGINT`/`SIGTERM` exit codes `130`/`143`.
+
 ---
 
 ## Register it in an MCP host

@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createAcpRunner } from "@automatalabs/workflows";
 
+import { installMcpServerLifecycle } from "./lifecycle.js";
 import { createWorkflowServer } from "./server.js";
 
 export { createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
@@ -17,6 +18,7 @@ export type {
   CreateWorkflowServerOptions,
   WorkflowConfirmCallback,
   WorkflowCheckpointOptions,
+  WorkflowServer,
 } from "./server.js";
 export { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 export type {
@@ -48,6 +50,8 @@ export type {
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
+export { installMcpServerLifecycle, SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
+export type { McpServerLifecycle, McpServerLifecycleOptions, McpServerShutdownReason, WorkflowServerControl } from "./lifecycle.js";
 
 /**
  * Bootstrap the MCP `workflow` server over stdio. Composition root: build the ACP-backed
@@ -60,6 +64,8 @@ export async function main(): Promise<void> {
   const server = createWorkflowServer(runner);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Install after connect because the SDK takes transport callback ownership during connect.
+  installMcpServerLifecycle({ runner, server, transport });
 }
 
 // Back-compat: `node dist/index.js` was the documented registration path before the dedicated
