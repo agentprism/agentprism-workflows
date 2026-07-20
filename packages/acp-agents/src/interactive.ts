@@ -291,6 +291,9 @@ export class InteractiveSession {
     return {
       sessionId: this.sessionId,
       backendId: this.backendId,
+      ...(this.session.initializeMeta !== undefined
+        ? { initializeMeta: this.session.initializeMeta }
+        : {}),
       cwd: this.cwd,
       reopen: {
         load: caps?.supportsLoadSession === true,

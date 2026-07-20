@@ -1162,7 +1162,7 @@ export function createWorkflowServer(
       title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
       description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
-        "script orchestrates agent() subagents (and optional checkpoint() gates) over built-in Claude, Codex, OpenCode, or pi " +
+        "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
         "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
         "read once and snapshotted at admission. Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +

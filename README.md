@@ -405,6 +405,13 @@ Pass a JSON Schema as `agent({ schema })` and the result is a **validated object
 
 ## Backends & selection
 
+The public `@automatalabs/acp-agents` registry is the executable source of built-in identity:
+`BUILTIN_BACKENDS`, ordered `BUILTIN_BACKEND_IDS`, exact-case `builtinBackend(id)`, and
+`BUILTIN_PROTOCOL_COVERAGE`. `BuiltinBackendId`, `BuiltinBackendDefinition`,
+`BuiltinBackendReleaseMetadata`, and `BuiltinProtocolCoverageRow` are exported types. Adding a
+first-class backend follows the checked-in [backend onboarding checklist](docs/backend-onboarding-checklist.md),
+including manifest regeneration, protocol disposition, documentation, packaging, and live evidence.
+
 The backend is chosen per `agent()` call from the effective `model`/`tier` spec with one deterministic rule:
 
 - Split on the first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name, route there and strip exactly that segment. Custom registrations take priority on a name collision.
@@ -421,6 +428,11 @@ before choosing ids or select values.
 Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. Pi model specs use `pi/<provider>/<model-id>`; prefer backend-only forms when the desired model is configured inside the harness.
 
 One long-lived ACP process per backend is **pooled** and reused across `agent()` calls (one spawn + one `initialize`). Calls normally open a fresh session; an eligible resume of a usage/auth-paused occurrence instead reopens that occurrence's recorded session and continues it. Worktree-isolated calls always stay on the fresh path, preserving isolation through each new session's `cwd`.
+
+When an agent returns initialize-response `_meta`, every session ref and session-scoped runner event
+includes it as a stable, recursively frozen `initializeMeta` snapshot. Absent or `null` metadata is
+omitted. This observation-only field does not change routing, authentication, pooling, retries,
+hashes, capabilities, or wire requests.
 
 ### Custom backends — run *any* ACP agent
 

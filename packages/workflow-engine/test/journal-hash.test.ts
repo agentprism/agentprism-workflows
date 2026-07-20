@@ -83,6 +83,7 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
       sessionId: "continuation-session",
       backendId: "codex",
       poolKey: "codex",
+      initializeMeta: { vendor: "hash-neutral", nested: { stable: true } },
       cwd: "/workspace/project",
       reopen: { load: true, resume: true, list: false, fork: false },
     };
@@ -140,6 +141,11 @@ describe("journal hash (hashAgentCall byte-stability)", () => {
     assert.equal(plain.inputsHash, expectedInputs);
     assert.equal(adjacent.inputsHash, expectedInputs);
     assert.equal(adjacent.entry.session?.poolKey, "codex");
+    assert.deepEqual(adjacent.entry.session?.initializeMeta, sessionRef.initializeMeta);
+    assert.deepEqual(adjacent.result.agentSessions?.[0]?.initializeMeta, sessionRef.initializeMeta);
+    const roundTrippedSession = JSON.parse(JSON.stringify(adjacent.entry.session));
+    assert.deepEqual(roundTrippedSession.initializeMeta, sessionRef.initializeMeta);
+    assert.equal(roundTrippedSession.sessionId, sessionRef.sessionId);
     assert.deepEqual(adjacent.result.calls?.[0]?.provenance, {
       source: "live",
       continuation: { reattached: true, method: "resume" },

@@ -23,7 +23,6 @@ import { parseFinalJson } from "../structured-output.js";
 
 export class CustomAcpBackend implements Backend {
   readonly id: string;
-  readonly stripsRoutingPrefix = true;
   /** id + spawn-config hash: two registries (e.g. two scripts' `meta.backends`) may declare
    *  the SAME name with DIFFERENT commands — the pool must never share a process across them. */
   readonly poolKey: string;

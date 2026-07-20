@@ -33,7 +33,6 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
 test("OpenCodeBackend exposes its id and generic structured-output flags", () => {
   const backend = new OpenCodeBackend();
   assert.equal(backend.id, "opencode");
-  assert.equal(backend.stripsRoutingPrefix, true);
   assert.equal(backend.embedSchemaInPrompt, true);
   assert.equal(backend.injectStructuredOutputTool, true);
 });

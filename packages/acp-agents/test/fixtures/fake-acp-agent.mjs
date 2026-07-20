@@ -261,6 +261,27 @@ class FakeAgent {
     };
   }
 
+  async extMethod(method, params) {
+    const fixture = scenario.extensionRequest;
+    record({ method: "extensionRequest", extensionMethod: method, params });
+    if (fixture?.method === method) {
+      if (fixture.exitBeforeResponse === true) process.exit(17);
+      if (fixture.error) {
+        throw new RequestError(
+          fixture.error.code,
+          fixture.error.message,
+          clone(fixture.error.data),
+        );
+      }
+      return clone(fixture.response);
+    }
+    throw RequestError.methodNotFound(method);
+  }
+
+  async extNotification(method, params) {
+    record({ method: "extensionNotification", extensionMethod: method, params });
+  }
+
   newSession(params) {
     record({ method: "newSession", params });
     this.newSessionAttempts = (this.newSessionAttempts ?? 0) + 1;

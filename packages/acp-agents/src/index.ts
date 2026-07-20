@@ -50,7 +50,7 @@ export type { ProviderIntent } from "./provider-store.js";
 // Per-agent auth profiles (§3): the pure-data adapters wired onto the built-in backends. Custom
 // backends supply none (conformance-by-absence, §3.5).
 export { claudeAuthProfile, codexAuthProfile, opencodeAuthProfile, piAuthProfile } from "./auth/auth-profiles.js";
-export type { AuthProfile, TerminalLaunch } from "./auth/auth-profiles.js";
+export type { AuthProfile, TerminalLaunch } from "./auth/auth-profile.js";
 export { InteractiveSession } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
@@ -156,9 +156,15 @@ export {
   CODEX_SPAWN_AUTH_ENV,
   HANDLED_AUTH_METHOD_TYPES,
   PI_ACP_PROTOCOL_CONTRACT,
+  BUILTIN_PROTOCOL_COVERAGE,
   assertAuthCapabilityShape,
 } from "./protocol-coverage.js";
-export type { AgentMethodCoverage, AuthMetaMatrixRow, ClientMethodCoverage } from "./protocol-coverage.js";
+export type {
+  AgentMethodCoverage,
+  AuthMetaMatrixRow,
+  BuiltinProtocolCoverageRow,
+  ClientMethodCoverage,
+} from "./protocol-coverage.js";
 
 // ACP capability negotiation: parse/validate the initialize response and gate what the client
 // sends (custom `_meta` keys, MCP transports) on what the connected agent advertised.
@@ -208,13 +214,22 @@ export type {
 export type {
   Backend,
   BackendId,
-  BuiltinBackendId,
   ProviderErrorClassification,
   ProviderErrorMetadata,
   SessionMetaInputs,
   SpawnConfig,
   StructuredSource,
 } from "./backend.js";
+export {
+  BUILTIN_BACKENDS,
+  BUILTIN_BACKEND_IDS,
+  builtinBackend,
+} from "./backends/builtins.js";
+export type { BuiltinBackendId } from "./backends/builtins.js";
+export type {
+  BuiltinBackendDefinition,
+  BuiltinBackendReleaseMetadata,
+} from "./backends/define.js";
 export { ClaudeBackend } from "./backends/claude.js";
 export { CodexBackend } from "./backends/codex.js";
 export { OpenCodeBackend } from "./backends/opencode.js";

@@ -5,12 +5,94 @@ import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
 interface LogEntry {
   method: string;
+  extensionMethod?: string;
   params?: {
     sessionId?: string;
     configId?: string;
     value?: unknown;
   };
 }
+
+test("generic custom request and notification preserve exact types, methods, params, and response", async () => {
+  const { cwd, readLog } = configure({
+    extensionRequest: {
+      method: "example.test/echo",
+      response: { echoed: "exact", count: 2 },
+    },
+    turns: [{ text: "unused" }],
+  });
+  const session = await makeRunner().openSession({ model: "codex", cwd });
+
+  const response = await session.request<
+    { echoed: string; count: number },
+    { text: string; values: number[] }
+  >("example.test/echo", { text: "Exact Case", values: [1, 2] });
+  assert.deepEqual(response, { echoed: "exact", count: 2 });
+
+  await session.notify<{ enabled: boolean; label: string }>(
+    "example.test/observe",
+    { enabled: true, label: "verbatim" },
+  );
+
+  const deadline = Date.now() + 5_000;
+  while (
+    !readLog().some((entry) => entry.method === "extensionNotification") &&
+    Date.now() < deadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const request = readLog().find((entry) => entry.method === "extensionRequest");
+  const notification = readLog().find(
+    (entry) => entry.method === "extensionNotification",
+  );
+  assert.equal(request?.extensionMethod, "example.test/echo");
+  assert.deepEqual(request?.params, { text: "Exact Case", values: [1, 2] });
+  assert.equal(notification?.extensionMethod, "example.test/observe");
+  assert.deepEqual(notification?.params, { enabled: true, label: "verbatim" });
+  await session.release();
+});
+
+test("generic custom request preserves an agent-provided numeric error, message, and data", async () => {
+  const { cwd } = configure({
+    extensionRequest: {
+      method: "example.test/fail",
+      error: {
+        code: -32042,
+        message: "Extension rejected exactly",
+        data: { reason: "fixture", retryable: false },
+      },
+    },
+    turns: [{ text: "unused" }],
+  });
+  const session = await makeRunner().openSession({ model: "codex", cwd });
+  await assert.rejects(
+    () => session.request("example.test/fail", { opaque: "request" }),
+    (error: unknown) => {
+      const requestError = error as { name?: string; code?: number; message?: string; data?: unknown };
+      assert.equal(requestError.name, "RequestError");
+      assert.equal(requestError.code, -32042);
+      assert.equal(requestError.message, "Extension rejected exactly");
+      assert.deepEqual(requestError.data, { reason: "fixture", retryable: false });
+      return true;
+    },
+  );
+  await session.release();
+});
+
+test("generic custom request races process death instead of hanging", { timeout: 10_000 }, async () => {
+  const { cwd } = configure({
+    extensionRequest: {
+      method: "example.test/die",
+      exitBeforeResponse: true,
+    },
+    turns: [{ text: "unused" }],
+  });
+  const session = await makeRunner().openSession({ model: "codex", cwd });
+  await assert.rejects(
+    () => session.request("example.test/die", { exact: true }),
+    /process|exited|closed|connection/i,
+  );
+});
 
 const harness = createFakeAgentHarness({ prefix: "acp-passthrough-it-", backends: ["codex"] });
 const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);

@@ -22,7 +22,7 @@ export type AgentMethodCoverage = "driven" | "passthrough" | "guarded";
  *  Agent side: 16 operational methods are driven (plus initialize), 0 are guarded, and the
  *  passthrough remainder is nes/*, document/*, and mcp/message. The raw escape hatch remains
  *  blocked for session-stateful new/load/resume/fork even though each has a driven wrapper. */
-export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> = {
+export const CLIENT_METHOD_COVERAGE: Readonly<Record<ClientMethod, ClientMethodCoverage>> = Object.freeze({
   [CLIENT_METHODS.session_request_permission]: "served",
   [CLIENT_METHODS.session_update]: "served",
   [CLIENT_METHODS.fs_read_text_file]: "served",
@@ -37,9 +37,9 @@ export const CLIENT_METHOD_COVERAGE: Record<ClientMethod, ClientMethodCoverage> 
   [CLIENT_METHODS.mcp_disconnect]: "served",
   [CLIENT_METHODS.elicitation_create]: "served",
   [CLIENT_METHODS.elicitation_complete]: "served",
-};
+});
 
-export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
+export const AGENT_METHOD_COVERAGE: Readonly<Record<AgentMethod, AgentMethodCoverage>> = Object.freeze({
   [AGENT_METHODS.initialize]: "driven",
   [AGENT_METHODS.authenticate]: "driven",
   [AGENT_METHODS.providers_list]: "driven",
@@ -68,7 +68,7 @@ export const AGENT_METHOD_COVERAGE: Record<AgentMethod, AgentMethodCoverage> = {
   [AGENT_METHODS.document_did_close]: "passthrough",
   [AGENT_METHODS.document_did_save]: "passthrough",
   [AGENT_METHODS.document_did_focus]: "passthrough",
-};
+});
 
 // ---------------------------------------------------------------------------------------------
 // Auth advertisement drift tripwire (§1.2 / §4.6.4). The client auth advertisement rides on the
@@ -172,7 +172,7 @@ export const PI_ACP_PROTOCOL_CONTRACT = {
 /** One row of the §3.6 full `_meta` support matrix, landed as executable data (not prose) so an
  *  SDK/agent bump that changes a `_meta` surface trips the drift suite (§4.6.4 item 4). */
 export interface AuthMetaMatrixRow {
-  readonly agent: "claude" | "codex" | "opencode" | "all";
+  readonly agent: string;
   /** A stable literal that MUST still be present in the cited artifact/spec — the drift anchor. */
   readonly capability: string;
   /** Wire direction: A→C agent→client, C→A client→agent, C↔A both, — none, agent-internal. */
@@ -193,7 +193,7 @@ export interface AuthMetaMatrixRow {
  *  the installed agent dist — so neither the spec nor an agent bump can silently drift a `_meta`
  *  surface. OpenCode ships a compiled binary with no consumable source (§3.4), so its row has no dist
  *  probe (grounded instead by the §4.6.3 live-e2e). */
-export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = [
+const AUTH_META_MATRIX_ROWS = [
   { agent: "claude", capability: "gateway", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "claude" },
   { agent: "claude", capability: "terminal-auth", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3", distProbe: "claude" },
   { agent: "codex", capability: "api-key", direction: "A→C", status: "work-item", owner: "§1.3/PR3", distProbe: "codex" },
@@ -202,4 +202,40 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = [
   { agent: "codex", capability: "persist", direction: "C→A", status: "work-item", owner: "§3.6/PR7", distProbe: "codex" },
   { agent: "opencode", capability: "terminal-auth", direction: "C↔A", status: "work-item", owner: "§1.2-§1.3/PR2-PR3" },
   { agent: "all", capability: "provider env keys", direction: "C→A", status: "work-item", owner: "§2.8/§3.4/PR3" },
-];
+] satisfies readonly AuthMetaMatrixRow[];
+
+export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
+  AUTH_META_MATRIX_ROWS.map((row) => Object.freeze(row)),
+);
+
+/** One built-in's reference to universal ACP classifications and backend-specific live evidence. */
+export interface BuiltinProtocolCoverageRow {
+  readonly clientMethods: Readonly<Record<string, ClientMethodCoverage>>;
+  readonly agentMethods: Readonly<Record<string, AgentMethodCoverage>>;
+  readonly authMeta: readonly AuthMetaMatrixRow[];
+  readonly installedDistProbes: readonly string[];
+  readonly liveProbes: readonly string[];
+}
+
+function coverageRow(
+  id: string,
+  installedDistProbes: readonly string[],
+): BuiltinProtocolCoverageRow {
+  return Object.freeze({
+    clientMethods: CLIENT_METHOD_COVERAGE,
+    agentMethods: AGENT_METHOD_COVERAGE,
+    authMeta: Object.freeze(
+      AUTH_META_MATRIX.filter((row) => row.agent === id || row.agent === "all"),
+    ),
+    installedDistProbes: Object.freeze([...installedDistProbes]),
+    liveProbes: Object.freeze([id]),
+  });
+}
+
+/** Central backend dispositions. Registry tests enforce exact key and reference parity. */
+export const BUILTIN_PROTOCOL_COVERAGE = Object.freeze({
+  claude: coverageRow("claude", ["claude"]),
+  codex: coverageRow("codex", ["codex"]),
+  opencode: coverageRow("opencode", []),
+  pi: coverageRow("pi", []),
+});

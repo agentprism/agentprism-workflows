@@ -9,10 +9,10 @@
 //      _claude/sdkMessage; Codex/OpenCode/Pi: JSON.parse the final assistant message off the stream).
 import type { TSchema } from "typebox";
 import type { ProviderUsageLimitContext } from "@automatalabs/shared-types";
-import type { AuthProfile } from "./auth/auth-profiles.js";
+import type { AuthProfile } from "./auth/auth-profile.js";
 
-/** The built-in backends. Custom registry backends extend the id space beyond these. */
-export type BuiltinBackendId = "claude" | "codex" | "opencode" | "pi";
+/** Compatibility type path; the registry table is the only authored built-in identity source. */
+export type { BuiltinBackendId } from "./backends/builtins.js";
 /** A backend id: one of the built-ins, or the registered name of a custom ACP backend
  *  (see registry.ts). The pool keys connections by this id, so ids must be stable. */
 export type BackendId = string;
@@ -64,9 +64,6 @@ export interface Backend {
    *  with DIFFERENT commands (script-declared `meta.backends`): keying the pool by name alone
    *  would hand run B a pooled process spawned from run A's command. */
   readonly poolKey?: string;
-  /** @deprecated Prefix stripping is defined solely by the runner's registered first-segment
-   *  routing. This compatibility property is no longer consulted. */
-  readonly stripsRoutingPrefix?: boolean;
   /** When true, the runner EMBEDS the JSON Schema in the prompt text on schema runs. For the
    *  native built-ins the native constraint channel is authoritative and this stays unset; a
    *  generic backend sets it because its agent may ignore the `_meta.outputSchema` forward entirely —

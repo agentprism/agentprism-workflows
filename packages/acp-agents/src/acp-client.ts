@@ -183,6 +183,7 @@ interface SessionTombstone {
   readonly label?: string;
   readonly runId?: string;
   readonly callIndex?: number;
+  readonly initializeMeta?: Readonly<Record<string, unknown>>;
 }
 
 const parseConnectMcpRequest = (params: unknown): ConnectMcpRequest => params as ConnectMcpRequest;
@@ -217,6 +218,7 @@ class SessionState {
     readonly label?: string,
     readonly runId?: string,
     readonly callIndex?: number,
+    readonly initializeMeta?: Readonly<Record<string, unknown>>,
     modes?: SessionModeState | null,
     readonly mcpServerIds: readonly string[] = [],
     private readonly retainSessionLog = true,
@@ -351,6 +353,28 @@ function finiteEpochSeconds(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+/** Clone the JSON-RPC value once per session and recursively freeze that session-owned snapshot. */
+function initializeMetaSnapshot(
+  capabilities: NegotiatedCapabilities | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+  const source = capabilities?.initializeMeta;
+  if (source === undefined || source === null) return undefined;
+  const clone = JSON.parse(JSON.stringify(source)) as Record<string, unknown>;
+  return freezeJson(clone) as Readonly<Record<string, unknown>>;
+}
+
+function freezeJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    for (const entry of value) freezeJson(entry);
+    return Object.freeze(value);
+  }
+  if (value !== null && typeof value === "object") {
+    for (const entry of Object.values(value)) freezeJson(entry);
+    return Object.freeze(value);
+  }
+  return value;
+}
+
 /** The single client-side handler set for one pooled connection (registered on the SDK's fluent
  *  client() app). It ROUTES every notification and permission request to the per-session
  *  SessionState by `sessionId`, so one process can serve many concurrent sessions without their
@@ -385,6 +409,9 @@ class MultiplexClient {
       ...(context?.label !== undefined ? { label: context.label } : {}),
       ...(context?.runId !== undefined ? { runId: context.runId } : {}),
       ...(context?.callIndex !== undefined ? { callIndex: context.callIndex } : {}),
+      ...(context?.initializeMeta !== undefined
+        ? { initializeMeta: context.initializeMeta }
+        : {}),
     };
   }
 
@@ -436,6 +463,7 @@ class MultiplexClient {
         label: state.label,
         runId: state.runId,
         callIndex: state.callIndex,
+        initializeMeta: state.initializeMeta,
       });
       while (this.tombstones.size > TOMBSTONE_SESSION_CAP) {
         const oldest = this.tombstones.keys().next().value;
@@ -1597,6 +1625,7 @@ export class PooledConnection {
       ...(meta ? { _meta: meta } : {}),
     };
     const response = await this.race(this.connection.agent.request(AGENT_METHODS.session_new, request));
+    const initializeMeta = initializeMetaSnapshot(this.negotiated);
     const state = new SessionState(
       opts.cwd,
       opts.policy,
@@ -1605,6 +1634,7 @@ export class PooledConnection {
       opts.label,
       opts.runId,
       opts.callIndex,
+      initializeMeta,
       response.modes,
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
@@ -1627,22 +1657,23 @@ export class PooledConnection {
   async forkSession(sourceSessionId: string, opts: AcpSessionOptions): Promise<SessionHandle> {
     this._activeSessions += 1;
     let registeredSessionId: string | undefined;
-    const state = new SessionState(
-      opts.cwd,
-      opts.policy,
-      opts.permissionResolver,
-      opts.elicitationResolver,
-      opts.label,
-      opts.runId,
-      opts.callIndex,
-      undefined,
-      acpMcpServerIds(opts.mcpServers),
-      opts.retainSessionLog ?? true,
-    );
     try {
       await this.ready;
       this.assertLifecycleSupported(AGENT_METHODS.session_fork, opts.label);
       this.assertSupportedMcpServers(opts);
+      const state = new SessionState(
+        opts.cwd,
+        opts.policy,
+        opts.permissionResolver,
+        opts.elicitationResolver,
+        opts.label,
+        opts.runId,
+        opts.callIndex,
+        initializeMetaSnapshot(this.negotiated),
+        undefined,
+        acpMcpServerIds(opts.mcpServers),
+        opts.retainSessionLog ?? true,
+      );
       const meta = this.sessionRequestMeta(opts);
       const request = {
         sessionId: sourceSessionId,
@@ -1701,22 +1732,23 @@ export class PooledConnection {
     opts: AcpSessionOptions,
   ): Promise<SessionHandle> {
     let registered = false;
-    const state = new SessionState(
-      opts.cwd,
-      opts.policy,
-      opts.permissionResolver,
-      opts.elicitationResolver,
-      opts.label,
-      opts.runId,
-      opts.callIndex,
-      undefined,
-      acpMcpServerIds(opts.mcpServers),
-      opts.retainSessionLog ?? true,
-    );
     try {
       await this.ready;
       this.assertLifecycleSupported(method, opts.label);
       this.assertSupportedMcpServers(opts);
+      const state = new SessionState(
+        opts.cwd,
+        opts.policy,
+        opts.permissionResolver,
+        opts.elicitationResolver,
+        opts.label,
+        opts.runId,
+        opts.callIndex,
+        initializeMetaSnapshot(this.negotiated),
+        undefined,
+        acpMcpServerIds(opts.mcpServers),
+        opts.retainSessionLog ?? true,
+      );
       const meta = this.sessionRequestMeta(opts);
       const request = {
         sessionId,
@@ -2078,6 +2110,11 @@ export class SessionHandle implements StructuredSource {
   /** The connection-level initialize response parsed before this session was opened. */
   get capabilities(): NegotiatedCapabilities | undefined {
     return this.pooled.capabilities;
+  }
+
+  /** Stable per-session initialize metadata snapshot used by refs and every event context. */
+  get initializeMeta(): Readonly<Record<string, unknown>> | undefined {
+    return this.state.initializeMeta;
   }
 
   /** The agent-advertised session config options in their verbatim ACP wire shapes. */

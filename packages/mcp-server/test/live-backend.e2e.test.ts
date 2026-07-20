@@ -26,8 +26,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type { BuiltinBackendId } from "@automatalabs/acp-agents";
 
-type Backend = "claude" | "codex" | "opencode" | "pi";
+type Backend = BuiltinBackendId;
 
 // Skip-by-default gate. node:test treats a string `skip` as the skip reason.
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
@@ -106,8 +107,10 @@ const AGENT_PROMPT =
 
 const OPENCODE_AGENT_PROMPT =
   'Return a JSON object describing a code repository with exactly these values: repo="agentprism" and fileCount=42.';
+const SMOKE_PROMPT = "Reply with exactly LIVE_SMOKE_OK and no other text. Do not call tools.";
 
-/** A meta + 3-schema'd-agent parallel() workflow script (concurrency 3 => 3 live sessions on
+/** A meta + 3-schema'd-agent parallel() workflow plus one schema-less smoke call (concurrency 3
+ *  => 3 simultaneous live sessions, followed by one ordinary text session, all on
  *  ONE pooled process). For injected-tool backends (OpenCode) the runner SERIALIZES the three
  *  schema runs internally — instance-global name-keyed MCP registries expose every registered
  *  tool to every live session, so overlapping injected sessions would leak captures across
@@ -124,7 +127,8 @@ function buildScript(backend: Backend, modelSpec?: string): string {
     `  () => agent(${JSON.stringify(prompt)}, { label: 'a2', phase: 'Fan', schema: SMALL${modelEntry} }),`,
     `  () => agent(${JSON.stringify(prompt)}, { label: 'a3', phase: 'Fan', schema: SMALL${modelEntry} }),`,
     `]);`,
-    `return results;`,
+    `const smoke = await agent(${JSON.stringify(SMOKE_PROMPT)}, { label: 'smoke', phase: 'Fan'${modelEntry} });`,
+    `return { structured: results, smoke };`,
   ].join("\n");
 }
 
@@ -141,6 +145,8 @@ interface LiveOutcome {
   resultCount: number;
   allValidated: boolean;
   perResult: PerResult[];
+  smokeValue: unknown;
+  smokePass: boolean;
   progressEvents: number;
   serverPid: number | null;
   backendPids: number[];
@@ -181,6 +187,8 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
     resultCount: 0,
     allValidated: false,
     perResult: [],
+    smokeValue: null,
+    smokePass: false,
     progressEvents: 0,
     serverPid: null,
     backendPids: [],
@@ -276,7 +284,10 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
     const sc = asObject(res.structuredContent) ?? {};
     out.status = sc.status ?? null;
     out.isError = res.isError === true;
-    const arr = Array.isArray(sc.result) ? sc.result : [];
+    const result = asObject(sc.result) ?? {};
+    const arr = Array.isArray(result.structured) ? result.structured : [];
+    out.smokeValue = result.smoke;
+    out.smokePass = result.smoke === "LIVE_SMOKE_OK";
     out.resultCount = arr.length;
     let allOk = arr.length === 3;
     for (const r of arr) {
@@ -320,6 +331,7 @@ function diag(backend: Backend, out: LiveOutcome): string {
     `\n--- live ${backend} e2e diagnostics ---`,
     `ran=${out.ran} status=${JSON.stringify(out.status)} isError=${out.isError}`,
     `resultCount=${out.resultCount} allValidated=${out.allValidated} progressEvents=${out.progressEvents}`,
+    `smokePass=${out.smokePass} smokeValue=${JSON.stringify(out.smokeValue)}`,
     `serverPid=${out.serverPid} backendPids=${JSON.stringify(out.backendPids)} backendProcCount=${out.backendProcCount}`,
     `pollSamples=${out.pollSamples} samplesWithBackend=${out.samplesWithBackend} maxSamplesForOnePid=${out.maxSamplesForOnePid}`,
     `perResult=${JSON.stringify(out.perResult)}`,
@@ -369,16 +381,19 @@ function assertBackend(backend: Backend, out: LiveOutcome): void {
   }
   assert.equal(out.allValidated, true, `live ${backend} all 3 results schema-validate${d()}`);
 
+  // Schema-less seam: the same registry-routed backend also returns ordinary assistant text.
+  assert.equal(out.smokePass, true, `live ${backend} schema-less smoke must return LIVE_SMOKE_OK${d()}`);
+
   // Progress fired.
   assert.ok(out.progressEvents > 0, `live ${backend} emitted at least one progress event${d()}`);
 
   // Crux 2: pooling reuse — EXACTLY ONE long-lived backend subprocess (a DIRECT child of the
-  // server) served all three sessions. >1 distinct child PID would mean a per-session spawn.
+  // server) served all four sessions. >1 distinct child PID would mean a per-session spawn.
   assert.ok(out.samplesWithBackend > 0, `live ${backend} never observed the backend subprocess via ps${d()}`);
   assert.equal(
     out.backendProcCount,
     1,
-    `live ${backend} pooling reuse: exactly ONE backend subprocess must serve all 3 sessions${d()}`,
+    `live ${backend} pooling reuse: exactly ONE backend subprocess must serve all 4 sessions${d()}`,
   );
   // The single process is long-lived (seen across multiple polls + still alive after the run).
   assert.ok(out.maxSamplesForOnePid >= 2, `live ${backend} the one backend process must be long-lived${d()}`);

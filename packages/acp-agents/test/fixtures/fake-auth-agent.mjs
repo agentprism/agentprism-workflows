@@ -102,6 +102,7 @@ class FakeAuthAgent {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: { sessionCapabilities: { close: {} }, auth: { logout: {} } },
       authMethods,
+      _meta: { fixture: "inline-auth-initialize", nested: { stable: true } },
     };
   }
 

@@ -7,6 +7,8 @@
     "build": "pnpm -r exec tsc -b",
     "typecheck": "pnpm -r exec tsc --noEmit",
     "test": "pnpm build && pnpm -r test",
+    "generate:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts",
+    "check:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts --check",
     "changeset": "changeset",
     "version": "changeset version",
     "release": "pnpm build && changeset publish",

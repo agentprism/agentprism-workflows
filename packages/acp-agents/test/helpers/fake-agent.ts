@@ -2,7 +2,12 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { AcpAgentRunner, type AcpRunnerOptions } from "../../src/index.js";
+import {
+  AcpAgentRunner,
+  BUILTIN_BACKEND_IDS,
+  type AcpRunnerOptions,
+  type BuiltinBackendId,
+} from "../../src/index.js";
 
 export const FAKE_AGENT_FIXTURE = fileURLToPath(new URL("../fixtures/fake-acp-agent.mjs", import.meta.url));
 
@@ -22,7 +27,7 @@ export const TEST_ENV_VARS = [
   "AGENTPRISM_DEFAULT_BACKEND",
 ] as const;
 
-type FakeBackend = "claude" | "codex" | "opencode" | "pi";
+type FakeBackend = BuiltinBackendId;
 
 export interface FakeAgentConfigureOptions {
   /** Prefix for the per-test temp worktree/log directory. */
@@ -57,7 +62,7 @@ export function configure<TLogEntry = { method: string }>(
 ): FakeAgentConfig<TLogEntry> {
   const dir = mkdtempSync(path.join(tmpdir(), options.prefix ?? "acp-it-"));
   const log = path.join(dir, "log.jsonl");
-  const backends = options.backends ?? ["claude", "codex", "opencode", "pi"];
+  const backends = options.backends ?? BUILTIN_BACKEND_IDS;
   if (backends.includes("claude")) {
     process.env.AGENTPRISM_CLAUDE_ACP_CMD = process.execPath;
     process.env.AGENTPRISM_CLAUDE_ACP_ARGS = FAKE_AGENT_FIXTURE;

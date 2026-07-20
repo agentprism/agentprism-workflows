@@ -167,6 +167,36 @@ test("fork-sync clones to the temp dir when no working clone exists, and reuses 
   }
 });
 
+test("a disposable broken clone is deleted and re-cloned exactly once", { timeout: 120_000 }, () => {
+  const tmp = mkdtempSync(join(tmpdir(), "acp-fork-sync-"));
+  try {
+    const { originBare, upstreamBare } = makeForkFixture(tmp);
+    const scratch = join(tmp, "scratch");
+    const disposable = join(scratch, "codex-acp");
+    const wrongBare = join(tmp, "remotes", "wrong-owner", "wrong-repo");
+    mkdirSync(scratch);
+    initRepo(wrongBare, true);
+    git("clone", "--quiet", wrongBare, disposable);
+
+    const out = runGate({
+      AGENTPRISM_CODEX_ACP_DIR: join(tmp, "does-not-exist"),
+      AGENTPRISM_CODEX_ACP_ORIGIN_URL: originBare,
+      AGENTPRISM_CODEX_ACP_UPSTREAM_URL: upstreamBare,
+      TMPDIR: scratch,
+    });
+
+    assert.equal(
+      out.split("no local fork clone found — cloning").length - 1,
+      1,
+      `the one-repair contract must perform exactly one replacement clone:\n${out}`,
+    );
+    assert.ok(out.includes("in sync"), out);
+    assert.equal(git("-C", disposable, "remote", "get-url", "origin").trim(), originBare);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("fork-sync blocks on a dirty working clone", { timeout: 120_000 }, () => {
   const tmp = mkdtempSync(join(tmpdir(), "acp-fork-sync-"));
   try {
@@ -176,6 +206,8 @@ test("fork-sync blocks on a dirty working clone", { timeout: 120_000 }, () => {
     assert.ok(out.includes("uncommitted changes"), out);
     assert.ok(out.includes("could not verify fork sync"), out);
     assert.ok(out.includes("fails closed"), out);
+    assert.ok(existsSync(join(fork, "WIP")), "a selected working clone must never be deleted or repaired");
+    assert.ok(!out.includes("no local fork clone found — cloning"), out);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

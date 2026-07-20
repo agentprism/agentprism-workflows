@@ -77,6 +77,22 @@ CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI e
 
 The gate failing anywhere — pre-push, a PR's required check, or the release workflow — means the same thing: a tracked upstream moved (or freshness could not be verified), so **all merges and releases are blocked; merging the maintenance PR into `main` unblocks them**. Triage in this order:
 
+The authored backend registry generates the preinstall-safe snapshot at
+`scripts/acp-backends.manifest.json`. After changing a built-in definition, regenerate and check
+that snapshot before running the zero-dependency gate:
+
+```bash
+pnpm generate:acp-backends-manifest
+pnpm check:acp-backends-manifest
+node scripts/check-acp-deps.mjs
+```
+
+The generator/check runs after install because it imports the TypeScript registry and verifies
+installed npm-server engine declarations. The final command intentionally reads only repository
+JSON and Node built-ins, so it remains valid before `pnpm install`. A malformed, stale, empty, or
+inconsistent manifest blocks before any network request; fix the named backend/field and regenerate
+instead of editing the JSON by hand.
+
 1. **Identify what is stale** from the gate output: an ACP library behind npm `latest`, the codex-acp fork missing upstream commits, or a wrapped runtime lagging inside a current adapter.
 2. **Read the upstream changes before bumping** — the release notes/changelog, and for substantial jumps the source diff of the surfaces we integrate against. Decide which of three shapes this is:
    - *Mechanical*: no cited surface changed — bump the pin (or merge upstream into the fork and cut a fork release), `pnpm install`, add a changeset, run the full suite plus the live e2e.

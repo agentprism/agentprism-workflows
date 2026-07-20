@@ -1,4 +1,4 @@
-// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.56.0 (over the Claude
+// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.59.0 (over the Claude
 // Agent SDK). Structured output rides the vendor `_meta.claudeCode` channel at session/new:
 //   options.outputFormat = { type:"json_schema", schema }   // the SDK's native constraint
 //   emitRawSDKMessages = true                                // MANDATORY to READ the result
@@ -7,6 +7,7 @@
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
 import type { ClaudeCodeSessionMeta } from "@automatalabs/shared-types";
+import type { AuthProfile } from "../auth/auth-profile.js";
 import type {
   Backend,
   ProviderErrorClassification,
@@ -15,15 +16,24 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { claudeAuthProfile } from "../auth/auth-profiles.js";
+import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
 import { toAnthropicJsonSchema } from "../schema-strict.js";
+import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
 
+/** Claude auth adaptation: terminal follows host TTY and gateway follows the host resolver. */
+export const claudeAuthProfile: AuthProfile = {
+  backendId: "claude",
+  clientAuthCapabilities: ({ onAuth, terminal }) => ({ terminal, gateway: onAuth }),
+  describe: (_method, base) => base,
+  buildMeta: (_method, resolution) => resolution.meta,
+};
+
 export class ClaudeBackend implements Backend {
   readonly id = "claude" as const;
-  /** Pure-data claude auth profile (§3.2): terminal follows the host TTY, gateway follows `onAuth`. */
-  readonly authProfile = claudeAuthProfile;
+
+  constructor(readonly authProfile: AuthProfile = claudeAuthProfile) {}
 
   classifyProviderError(
     error: unknown,
@@ -85,6 +95,33 @@ export class ClaudeBackend implements Backend {
     return source.rawStructuredOutput();
   }
 }
+
+export const claudeBackendDefinition = defineBuiltinBackend({
+  id: "claude",
+  authProfile: claudeAuthProfile,
+  create: (authProfile) => new ClaudeBackend(authProfile),
+  release: {
+    engine: { node: ">=22" },
+    server: {
+      kind: "npm-package",
+      package: "@agentclientprotocol/claude-agent-acp",
+    },
+    freshness: {
+      npm: [
+        "@agentclientprotocol/sdk",
+        "@agentclientprotocol/claude-agent-acp",
+      ],
+      forks: [],
+      wrappedRuntimes: [
+        {
+          adapterPackage: "@agentclientprotocol/claude-agent-acp",
+          runtimePackage: "@anthropic-ai/claude-agent-sdk",
+        },
+      ],
+    },
+  },
+  protocolCoverage: BUILTIN_PROTOCOL_COVERAGE.claude,
+});
 
 function providerUsageLimit(
   providerCode: string | undefined,

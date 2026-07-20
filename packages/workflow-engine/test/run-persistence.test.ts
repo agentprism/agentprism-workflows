@@ -795,6 +795,7 @@ test(
     const ref: AgentSessionRef = {
       sessionId: "session-cold-restart",
       backendId: "custom-acp",
+      initializeMeta: { vendor: "persisted", nested: { count: 2 } },
       cwd,
       reopen: { load: true, resume: false, list: true },
     };

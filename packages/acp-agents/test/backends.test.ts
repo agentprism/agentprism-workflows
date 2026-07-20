@@ -134,7 +134,6 @@ test("CodexBackend.nativeStructured reads ONLY the final message — a schema-sh
 test("OpenCodeBackend is the third built-in backend", () => {
   const backend: Backend = new OpenCodeBackend();
   assert.equal(backend.id, "opencode");
-  assert.equal(backend.stripsRoutingPrefix, true);
   assert.equal(backend.embedSchemaInPrompt, true);
   assert.equal(backend.injectStructuredOutputTool, true);
 });
@@ -183,6 +182,12 @@ test("selectBackend honors AGENTPRISM_DEFAULT_BACKEND when nothing else matches"
     process.env.AGENTPRISM_DEFAULT_BACKEND = "pi";
     assert.equal(selectBackend({}).id, "pi");
     assert.equal(selectBackend({ model: "openrouter/vendor/model" }).id, "pi");
+    process.env.AGENTPRISM_DEFAULT_BACKEND = "CoDeX";
+    assert.equal(selectBackend({}).id, "codex");
+    process.env.AGENTPRISM_DEFAULT_BACKEND = "";
+    assert.equal(selectBackend({}).id, "claude");
+    process.env.AGENTPRISM_DEFAULT_BACKEND = "unknown";
+    assert.equal(selectBackend({}).id, "claude");
   } finally {
     if (prev === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
     else process.env.AGENTPRISM_DEFAULT_BACKEND = prev;

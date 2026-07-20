@@ -28,75 +28,68 @@
 // Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 
 import { readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const manifestPath = join(repoRoot, "scripts", "acp-backends.manifest.json");
+const MANIFEST_COVERAGE_PREFIXES = Object.freeze(["@agentclientprotocol/"]);
+const NODE_FLOOR = /^>=(0|[1-9]\d*)(?:\.(0|[1-9]\d*)\.(0|[1-9]\d*))?$/;
+const HOME_TOKEN = /^\$HOME\/(.+)$/;
 
-// A dependency is ACP-tracked if its name matches any of these. Extend when a new
-// ACP client/agent library is adopted (custom agents shipped as npm packages belong here too).
-const ACP_DEP_MATCHERS = [
-  (name) => name.startsWith("@agentclientprotocol/"),
-  (name) => name === "@automatalabs/codex-acp",
-  (name) => name === "@earendil-works/pi-coding-agent",
-];
+const backendManifest = loadBackendManifest();
+const manifestNpm = new Set(
+  backendManifest.backends.flatMap((backend) => backend.freshness.npm),
+);
+if (manifestNpm.size === 0) {
+  manifestFailure("backends derived freshness.npm set must not be empty");
+}
 
-// Forks we maintain whose published default branch must contain their upstream's default branch.
-// envDir overrides the clone location entirely; otherwise defaultDirs are tried in order; when no
-// clone exists, one is created at <tmpdir>/<tempCloneName> and reused across runs (this is what CI
-// uses — the gate never trusts an API summary over a real clone). The *UrlEnv overrides are
-// hermetic test seams (like AGENTPRISM_NPM_REGISTRY); production runs never set them.
-const FORK_SYNC = {
-  "@automatalabs/codex-acp": {
-    envDir: "AGENTPRISM_CODEX_ACP_DIR",
-    defaultDirs: [join(homedir(), "codex-acp")],
-    tempCloneName: "codex-acp",
-    originUrl: "https://github.com/VikashLoomba/codex-acp.git",
-    originUrlEnv: "AGENTPRISM_CODEX_ACP_ORIGIN_URL",
-    upstreamUrl: "https://github.com/agentclientprotocol/codex-acp.git",
-    upstreamUrlEnv: "AGENTPRISM_CODEX_ACP_UPSTREAM_URL",
-    upstreamRemote: "upstream",
-  },
-};
-
-// Adapter packages that wrap an agent runtime whose freshness matters independently of the
-// adapter's own version. Fix when behind: bump the adapter if its latest already wraps a current
-// runtime, else pin a root pnpm override until upstream catches up (and drop the override once it
-// does — the check warns when an override has become redundant).
-const WRAPPED_RUNTIMES = {
-  "@agentclientprotocol/claude-agent-acp": { wraps: "@anthropic-ai/claude-agent-sdk" },
-};
+// These three work sets are projections of the committed manifest, never authored gate lists.
+const FORK_SYNC = Object.freeze(
+  backendManifest.backends.flatMap((backend) =>
+    backend.freshness.forks.map((fork) => ({
+      dep: fork.package,
+      config: {
+        ...fork,
+        defaultDirs: fork.defaultDirs.map(expandHomeToken),
+      },
+    })),
+  ),
+);
+const WRAPPED_RUNTIMES = Object.freeze(
+  backendManifest.backends.flatMap((backend) =>
+    backend.freshness.wrappedRuntimes.map((wrapped) => ({
+      dep: wrapped.adapterPackage,
+      wraps: wrapped.runtimePackage,
+    })),
+  ),
+);
 
 // Env override exists for hermetic tests (point at a local stub registry); production runs never set it.
 const REGISTRY = process.env.AGENTPRISM_NPM_REGISTRY || "https://registry.npmjs.org";
 const FETCH_TIMEOUT_MS = 10_000;
 
-function isTracked(name) {
-  return ACP_DEP_MATCHERS.some((m) => m(name));
-}
-
-// ---- collect tracked deps from every workspace package.json ------------------------------------
-const tracked = []; // { dep, specifier, pkgName }
+// ---- collect direct deps from every workspace package.json --------------------------------------
+const workspacePackages = [];
+const directDependencies = [];
 for (const entry of readdirSync(join(repoRoot, "packages"), { withFileTypes: true })) {
   if (!entry.isDirectory()) continue;
   let manifest;
+  const packagePath = join(repoRoot, "packages", entry.name, "package.json");
   try {
-    manifest = JSON.parse(readFileSync(join(repoRoot, "packages", entry.name, "package.json"), "utf8"));
+    manifest = JSON.parse(readFileSync(packagePath, "utf8"));
   } catch {
     continue;
   }
+  workspacePackages.push({ manifest, packagePath });
   for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
     for (const [dep, specifier] of Object.entries(manifest[field] ?? {})) {
-      if (isTracked(dep)) tracked.push({ dep, specifier, pkgName: manifest.name });
+      directDependencies.push({ dep, specifier, pkgName: manifest.name, packagePath, field });
     }
   }
-}
-
-if (tracked.length === 0) {
-  console.error("acp-deps: no tracked ACP dependencies found — check ACP_DEP_MATCHERS in scripts/check-acp-deps.mjs");
-  process.exit(1);
 }
 
 // ---- resolve locked versions from pnpm-lock.yaml ------------------------------------------------
@@ -123,6 +116,250 @@ function lockedTransitiveVersions(dep) {
   const re = new RegExp(`^ {2}'?${escaped}@([0-9][^'(:\\n]*)`, "gm");
   const versions = new Set([...lockfile.matchAll(re)].map((m) => m[1].trim()));
   return versions.size > 0 ? [...versions] : null;
+}
+
+validateRepositoryProjection();
+
+const tracked = [...manifestNpm].map((dep) => {
+  const declaration = directDependencies.find((entry) => entry.dep === dep);
+  return {
+    dep,
+    specifier: declaration.specifier,
+    pkgName: declaration.pkgName,
+  };
+});
+
+function validateRepositoryProjection() {
+  for (const dependency of directDependencies) {
+    if (
+      MANIFEST_COVERAGE_PREFIXES.some((prefix) => dependency.dep.startsWith(prefix)) &&
+      !manifestNpm.has(dependency.dep)
+    ) {
+      manifestFailure(
+        `freshness.npm omits ${dependency.dep} declared by ${dependency.pkgName} (${dependency.packagePath})`,
+      );
+    }
+  }
+
+  for (const dep of manifestNpm) {
+    if (!directDependencies.some((entry) => entry.dep === dep)) {
+      manifestFailure(`freshness.npm dependency ${dep} is not a direct workspace dependency`);
+    }
+    if (!lockedVersion(dep)) {
+      manifestFailure(`freshness.npm dependency ${dep} has no pnpm-lock.yaml importer resolution`);
+    }
+  }
+
+  const host = workspacePackages.find(
+    ({ manifest }) => manifest.name === "@automatalabs/acp-agents",
+  );
+  const hostFloor = host?.manifest.engines?.node;
+  if (typeof hostFloor !== "string" || hostFloor.length === 0) {
+    manifestFailure("packages/acp-agents/package.json engines.node is required");
+  }
+
+  for (const backend of backendManifest.backends) {
+    const { server } = backend;
+    if (server.kind === "workspace-package") {
+      const packagePath = resolve(repoRoot, server.path, "package.json");
+      if (!packagePath.startsWith(`${resolve(repoRoot)}${process.platform === "win32" ? "\\" : "/"}`)) {
+        manifestFailure(`backend ${backend.id} server.path escapes the repository`);
+      }
+      let workspace;
+      try {
+        workspace = JSON.parse(readFileSync(packagePath, "utf8"));
+      } catch {
+        manifestFailure(`backend ${backend.id} server.path does not resolve to a workspace package.json`);
+      }
+      if (workspace.name !== server.package) {
+        manifestFailure(
+          `backend ${backend.id} server.package ${server.package} differs from ${server.path}/package.json name ${String(workspace.name)}`,
+        );
+      }
+      if (workspace.engines?.node !== backend.engine.node) {
+        manifestFailure(
+          `backend ${backend.id} engine.node ${backend.engine.node} differs from ${server.path}/package.json engines.node ${String(workspace.engines?.node)}`,
+        );
+      }
+    } else if (backend.engine.node !== hostFloor) {
+      manifestFailure(
+        `backend ${backend.id} engine.node ${backend.engine.node} differs from packages/acp-agents/package.json engines.node ${hostFloor}`,
+      );
+    }
+
+    for (const wrapped of backend.freshness.wrappedRuntimes) {
+      if (!lockedTransitiveVersions(wrapped.runtimePackage)) {
+        manifestFailure(
+          `backend ${backend.id} freshness.wrappedRuntimes runtimePackage ${wrapped.runtimePackage} has no transitive pnpm-lock.yaml resolution`,
+        );
+      }
+    }
+  }
+}
+
+function loadBackendManifest() {
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (error) {
+    manifestFailure(`cannot read or parse ${manifestPath} (${errorMessage(error)})`);
+  }
+
+  exactObject(parsed, ["schemaVersion", "backends"], [], "manifest");
+  if (typeof parsed.schemaVersion !== "number" || parsed.schemaVersion !== 1) {
+    manifestFailure("manifest.schemaVersion must be the number 1");
+  }
+  if (!Array.isArray(parsed.backends)) manifestFailure("manifest.backends must be an array");
+  if (parsed.backends.length === 0) manifestFailure("manifest.backends must not be empty");
+  duplicateFree(parsed.backends.map((row) => row?.id), "manifest.backends ids");
+  parsed.backends.forEach((backend, index) => validateBackendRow(backend, index));
+  return parsed;
+}
+
+function validateBackendRow(backend, index) {
+  const path = `manifest.backends[${index}]`;
+  exactObject(backend, ["id", "engine", "server", "freshness"], [], path);
+  nonemptyString(backend.id, `${path}.id`);
+
+  exactObject(backend.engine, ["node"], [], `${path}.engine`);
+  nonemptyString(backend.engine.node, `${path}.engine.node`);
+  if (!NODE_FLOOR.test(backend.engine.node)) {
+    manifestFailure(`${path}.engine.node must be >=MAJOR or >=MAJOR.MINOR.PATCH`);
+  }
+
+  exactObject(backend.server, ["kind"], ["package", "path", "command", "optionalPackageProbe"], `${path}.server`, false);
+  if (backend.server.kind === "npm-package") {
+    exactObject(backend.server, ["kind", "package"], [], `${path}.server`);
+    nonemptyString(backend.server.package, `${path}.server.package`);
+  } else if (backend.server.kind === "workspace-package") {
+    exactObject(backend.server, ["kind", "package", "path"], [], `${path}.server`);
+    nonemptyString(backend.server.package, `${path}.server.package`);
+    nonemptyString(backend.server.path, `${path}.server.path`);
+    if (isAbsolute(backend.server.path) || backend.server.path.split(/[\\/]/).includes("..")) {
+      manifestFailure(`${path}.server.path must be a repository-relative path`);
+    }
+  } else if (backend.server.kind === "system-command") {
+    exactObject(backend.server, ["kind", "command"], ["optionalPackageProbe"], `${path}.server`);
+    nonemptyString(backend.server.command, `${path}.server.command`);
+    if ("optionalPackageProbe" in backend.server) {
+      nonemptyString(backend.server.optionalPackageProbe, `${path}.server.optionalPackageProbe`);
+    }
+  } else {
+    manifestFailure(`${path}.server.kind is unrecognized`);
+  }
+
+  exactObject(backend.freshness, ["npm", "forks", "wrappedRuntimes"], [], `${path}.freshness`);
+  stringArray(backend.freshness.npm, `${path}.freshness.npm`);
+  objectArray(backend.freshness.forks, `${path}.freshness.forks`);
+  objectArray(backend.freshness.wrappedRuntimes, `${path}.freshness.wrappedRuntimes`);
+  duplicateFree(
+    backend.freshness.forks.map((fork) => [
+      fork?.package,
+      fork?.envDir,
+      ...(Array.isArray(fork?.defaultDirs) ? fork.defaultDirs : []),
+      fork?.tempCloneName,
+      fork?.originUrl,
+      fork?.originUrlEnv,
+      fork?.upstreamUrl,
+      fork?.upstreamUrlEnv,
+      fork?.upstreamRemote,
+    ].join("\u0000")),
+    `${path}.freshness.forks`,
+  );
+  duplicateFree(
+    backend.freshness.wrappedRuntimes.map((wrapped) =>
+      `${wrapped?.adapterPackage}\u0000${wrapped?.runtimePackage}`
+    ),
+    `${path}.freshness.wrappedRuntimes`,
+  );
+
+  const npm = new Set(backend.freshness.npm);
+  if (backend.server.kind === "npm-package" && !npm.has(backend.server.package)) {
+    manifestFailure(`${path}.server.package must appear in ${path}.freshness.npm`);
+  }
+
+  backend.freshness.forks.forEach((fork, forkIndex) => {
+    const forkPath = `${path}.freshness.forks[${forkIndex}]`;
+    exactObject(fork, [
+      "package", "envDir", "defaultDirs", "tempCloneName", "originUrl", "originUrlEnv",
+      "upstreamUrl", "upstreamUrlEnv", "upstreamRemote",
+    ], [], forkPath);
+    for (const field of [
+      "package", "envDir", "tempCloneName", "originUrl", "originUrlEnv", "upstreamUrl",
+      "upstreamUrlEnv", "upstreamRemote",
+    ]) nonemptyString(fork[field], `${forkPath}.${field}`);
+    stringArray(fork.defaultDirs, `${forkPath}.defaultDirs`);
+    for (const token of fork.defaultDirs) validateHomeToken(token, `${forkPath}.defaultDirs`);
+    if (!npm.has(fork.package)) manifestFailure(`${forkPath}.package must appear in ${path}.freshness.npm`);
+  });
+
+  backend.freshness.wrappedRuntimes.forEach((wrapped, wrappedIndex) => {
+    const wrappedPath = `${path}.freshness.wrappedRuntimes[${wrappedIndex}]`;
+    exactObject(wrapped, ["adapterPackage", "runtimePackage"], [], wrappedPath);
+    nonemptyString(wrapped.adapterPackage, `${wrappedPath}.adapterPackage`);
+    nonemptyString(wrapped.runtimePackage, `${wrappedPath}.runtimePackage`);
+    if (!npm.has(wrapped.adapterPackage)) {
+      manifestFailure(`${wrappedPath}.adapterPackage must appear in ${path}.freshness.npm`);
+    }
+  });
+}
+
+function exactObject(value, required, optional, path, checkKeys = true) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    manifestFailure(`${path} must be an object`);
+  }
+  for (const key of required) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) manifestFailure(`${path}.${key} is required`);
+  }
+  if (checkKeys) {
+    const allowed = new Set([...required, ...optional]);
+    for (const key of Object.keys(value)) {
+      if (!allowed.has(key)) manifestFailure(`${path}.${key} is an unrecognized field`);
+    }
+  }
+}
+
+function nonemptyString(value, path) {
+  if (typeof value !== "string" || value.length === 0) manifestFailure(`${path} must be a non-empty string`);
+}
+
+function stringArray(value, path) {
+  if (!Array.isArray(value)) manifestFailure(`${path} must be an array`);
+  value.forEach((entry, index) => nonemptyString(entry, `${path}[${index}]`));
+  duplicateFree(value, path);
+}
+
+function objectArray(value, path) {
+  if (!Array.isArray(value)) manifestFailure(`${path} must be an array`);
+}
+
+function duplicateFree(value, path) {
+  if (new Set(value).size !== value.length) manifestFailure(`${path} must be duplicate-free`);
+}
+
+function validateHomeToken(token, path) {
+  const match = HOME_TOKEN.exec(token);
+  if (!match) manifestFailure(`${path} contains an invalid $HOME token`);
+  const segments = match[1].split("/");
+  if (
+    segments.some((segment) =>
+      segment.length === 0 || segment === "." || segment === ".." || /[\\*?\[\]{}$]/.test(segment)
+    )
+  ) manifestFailure(`${path} contains an invalid $HOME relative path`);
+}
+
+function expandHomeToken(token) {
+  validateHomeToken(token, "manifest freshness.forks.defaultDirs");
+  return join(homedir(), token.slice("$HOME/".length));
+}
+
+function manifestFailure(message) {
+  console.error(`acp-deps: ${manifestPath}: ${message}`);
+  process.exit(1);
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // Root pnpm overrides (package.json "pnpm".overrides) — consulted only to warn when an override
@@ -357,9 +594,9 @@ function checkFork(cfg) {
 }
 
 const forkSync = Promise.all(
-  Object.entries(FORK_SYNC)
-    .filter(([dep]) => tracked.some((t) => t.dep === dep))
-    .map(async ([dep, cfg]) => {
+  FORK_SYNC
+    .filter(({ dep }) => tracked.some((t) => t.dep === dep))
+    .map(async ({ dep, config: cfg }) => {
       try {
         const result = checkFork(cfg);
         if (result.missing > 0) {
@@ -384,9 +621,9 @@ function exactPin(spec) {
 }
 
 const wrappedRuntimes = Promise.all(
-  Object.entries(WRAPPED_RUNTIMES)
-    .filter(([dep]) => tracked.some((t) => t.dep === dep))
-    .map(async ([dep, { wraps }]) => {
+  WRAPPED_RUNTIMES
+    .filter(({ dep }) => tracked.some((t) => t.dep === dep))
+    .map(async ({ dep, wraps }) => {
       const locked = lockedTransitiveVersions(wraps);
       if (!locked) {
         blockers.push(
