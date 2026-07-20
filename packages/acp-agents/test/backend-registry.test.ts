@@ -195,21 +195,52 @@ test("source drift locks registry imports and import hygiene, including type-onl
   assert.match(runner, /from "\.\/backends\/builtins\.js"/);
   assert.match(runner, /BUILTIN_BACKEND_IDS/);
   assert.match(runner, /builtinBackend/);
+  assert.match(
+    runner,
+    /listBackends\(\)[\s\S]*?new Set<string>\(BUILTIN_BACKEND_IDS\)/,
+  );
+  assert.match(
+    runner,
+    /const custom = registry\?\.get\(firstSegment\);[\s\S]*?const builtIn = builtinBackend\(firstSegment\);/,
+  );
+  assert.match(
+    runner,
+    /function defaultBackend[\s\S]*?registry\.get\(name\)[\s\S]*?builtinBackend\(name\)[\s\S]*?BUILTIN_BACKENDS\.claude\.create\(\)/,
+  );
   assert.doesNotMatch(runner, /from "\.\/backends\/(?:claude|codex|opencode|pi)\.js"/);
-  assert.doesNotMatch(runner, /switch\s*\([^)]*(?:backend|id)/i);
   assert.doesNotMatch(
     runner,
-    /===\s*"claude"\s*\|\||===\s*"codex"\s*\|\||===\s*"opencode"\s*\|\||===\s*"pi"\s*\|\|/,
+    /function builtinBackend|(?:firstSegment|name)\s*===\s*["'](?:claude|codex|opencode|pi)["']/,
   );
-  assert.match(workflows, /BUILTIN_BACKEND_IDS/);
+  assert.match(
+    workflows,
+    /from "@automatalabs\/acp-agents"[\s\S]*?\[\.\.\.BUILTIN_BACKEND_IDS, \.\.\.registry\.keys\(\)\]/,
+  );
   assert.doesNotMatch(workflows, /BUILTIN_HARNESSES/);
 
-  const forbiddenDefineDependency = /(?:import(?:\s+type)?|import\s*\()[\s\S]*?(?:builtins|BUILTIN_BACKENDS)/;
+  const forbiddenDefineDependency = /BUILTIN_BACKENDS|["'][^"']*builtins(?:\.js)?["']/;
+  for (const syntax of [
+    'import { BUILTIN_BACKENDS } from "./builtins.js"',
+    'import type { BuiltinBackendId } from "./builtins.js"',
+    'import { type BuiltinBackendId } from "./builtins.js"',
+    'type RegistryId = import("./builtins.js").BuiltinBackendId',
+  ]) {
+    assert.match(syntax, forbiddenDefineDependency);
+  }
   assert.doesNotMatch(define, forbiddenDefineDependency);
-  assert.doesNotMatch(
-    coverage,
-    /BuiltinBackendId|BUILTIN_BACKENDS|from\s+["'][^"']*backends\/(?:claude|codex|opencode|pi)/,
-  );
+
+  const forbiddenCoverageDependency =
+    /BuiltinBackendId|BUILTIN_BACKENDS|["'][^"']*backends\/(?:claude|codex|opencode|pi)(?:\.js)?["']/;
+  for (const syntax of [
+    'import { ClaudeBackend } from "./backends/claude.js"',
+    'import type { ClaudeBackend } from "./backends/claude.js"',
+    'import { type ClaudeBackend } from "./backends/claude.js"',
+    'type ConcreteBackend = import("./backends/claude.js").ClaudeBackend',
+    'import type { BuiltinBackendId } from "./backend.js"',
+  ]) {
+    assert.match(syntax, forbiddenCoverageDependency);
+  }
+  assert.doesNotMatch(coverage, forbiddenCoverageDependency);
   assert.doesNotMatch(backend, /BuiltinBackendId\s*=\s*["']/);
 });
 
