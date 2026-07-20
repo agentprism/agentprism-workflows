@@ -1,5 +1,16 @@
 # @automatalabs/mcp-server
 
+## 0.16.3
+
+### Patch Changes
+
+- 82ede81: Add the executable built-in backend registry and generated dependency manifest, expose recursively
+  frozen initialize metadata on session refs and events, preserve generic ACP extension passthrough,
+  and document the registry-driven onboarding and routing contract.
+- Updated dependencies [82ede81]
+  - @automatalabs/shared-types@0.26.0
+  - @automatalabs/workflows@0.40.0
+
 ## 0.16.2
 
 ### Patch Changes
