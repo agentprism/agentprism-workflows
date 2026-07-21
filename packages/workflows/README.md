@@ -11,14 +11,15 @@ or a registered custom ACP agent — driving the actual subprocess to completion
 
 This package is the **canonical SDK** that the stdio MCP server
 [`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server) is built on.
-If you want to expose a `workflow` tool to an MCP host (Claude Code, Zed, …), use that package; if
-you want to embed the runner in your own program, use this one.
+Its CLI can also delegate to a build-time embedded copy of that server with the `mcp` subcommand,
+so an MCP host can expose the `workflow` tool without a separate package install. The standalone
+MCP server package remains independently published, while programs embedding the runner continue
+to use this package's workflow/runner APIs.
 
-It is a **programmatic library**, not an MCP stdio server. It is a thin facade over the engine +
-ACP packages and adds ACP-defaulted helpers for ordinary runs (`runDynamicWorkflow`) and
-substitution tests (`runIsolation`). The ACP layer does use `@modelcontextprotocol/sdk` internally
-when it hosts the optional StructuredOutput tool for eligible agents; consumers still interact
-through this SDK's workflow/runner APIs rather than MCP server schemas.
+The SDK itself remains a thin programmatic facade over the engine + ACP packages, with
+ACP-defaulted helpers for ordinary runs (`runDynamicWorkflow`) and substitution tests
+(`runIsolation`). The ACP layer also uses `@modelcontextprotocol/sdk` internally when it hosts the
+optional StructuredOutput tool for eligible agents.
 
 ---
 
@@ -775,6 +776,36 @@ formatHarnessConfigReport(report); // the CLI's human table
 
 `probeHarnessConfig({ harnesses?, backends?, cwd?, timeoutMs? })` — `backends` merges over
 `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
+
+---
+
+## Launching the MCP server — `agentprism-workflows mcp`
+
+Register the bundled stdio server directly from the workflows package; no separate
+`@automatalabs/mcp-server` installation is required:
+
+```json
+{
+  "mcpServers": {
+    "agentprism-workflow": {
+      "command": "npx",
+      "args": ["-y", "@automatalabs/workflows", "mcp"]
+    }
+  }
+}
+```
+
+For the source inner loop, build workflows before launching its compiled CLI:
+
+```bash
+pnpm --filter @automatalabs/workflows build
+node packages/workflows/dist/cli.js mcp
+```
+
+If the embedded bundle is absent in a monorepo checkout, the command falls back to the built
+`packages/mcp-server/dist/cli.js`. A root `pnpm build` therefore also supports development before
+running `node packages/workflows/dist/cli.js mcp`. The independently published
+`@automatalabs/mcp-server` package and `agentprism-workflow` bin remain available.
 
 ---
 
