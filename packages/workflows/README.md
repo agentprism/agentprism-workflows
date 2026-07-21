@@ -117,21 +117,21 @@ Every script **must** begin with `export const meta = { name, description, phase
 statement, and must be **deterministic** — `Date.now()`, `Math.random()`, and `new Date()` are
 unavailable inside the realm (they would break journal replay on resume).
 
-Replay-safe read-only/worktree fan-out is explicit:
+Completed reader/worktree calls both use ordinary journal replay:
 
 ```js
 const [audit, experiment] = await parallel([
   () => agent("Audit src/api without changing files.", {
-    label: "audit:api", resume: { filesystem: "read-only" },
+    label: "audit:api",
   }),
   () => agent("Try the worker fix in isolation; return a unified diff.", {
-    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+    label: "try:worker", isolation: "worktree",
   }),
 ]);
 ```
 
-The worktree and edits are discarded; return the diff as data. The declaration is required for
-content-addressed reuse in both arms—worktree isolation alone is not a safety proof. See the
+The worktree and edits are discarded; return the diff as data. Replay requires matching journal
+identity/input facts, not a filesystem-safety declaration. See the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 
 ### Substitution testing (isolation mode)
@@ -303,7 +303,7 @@ boolean).
 
 Resume guarantees journal/script replay integrity and checkpoint-reply targeting only. It never
 assumes or guarantees that the filesystem, external systems, agent output semantics, or any other
-part of the world stayed fresh between runs. If an unsafe prefix must run live, a supplied reply is
+part of the world stayed fresh between runs. If a prior correspondence miss runs live, a supplied reply is
 injected only when execution reaches the exact recorded checkpoint call site with the same
 checkpoint identity and inputs; content-only matching is insufficient after that live prefix. A
 reply that is not applied is reported in `resumeReport` and terminal summaries. Authors who want a
@@ -352,15 +352,15 @@ Run results expose `effectiveLimits`; inspect status exposes the same values as 
 agent rows carry their resolved `timeoutMs` plus `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
-under a new run ID, and match safe calls by exact path/hash or unique hash+input fingerprint.
+under a new run ID, and match completed calls by exact path/hash or unique hash+input fingerprint.
 Every allocated call receives a terminal manifest row even when the run halts around it. A
 non-result occurrence remains live on resume and stays in the identity seed as an ambiguity
-blocker until reached, so completed siblings on either side can replay safely. Uncertain,
-ambiguous, or unsafe calls run live. Current-environment and Node/V8 differences are
+blocker until reached, so completed siblings on either side can replay. Uncertain,
+ambiguous, or mismatched calls run live. Filesystem/current-environment and Node/V8 differences are
 reported as provenance without changing admission or matching. Identity hits preserve
 script-visible logical budget debit while adding zero current provider usage; replayed session
 records are rebound to the current call index/label/phase. `resumePolicy: "positional"` requests
-index/prefix matching but cannot bypass new-format format/metadata/manifest/input/safety checks. The distinct
+index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. The distinct
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
 Operational limits are resolved from the new execution's `exec` options and manager defaults, not
@@ -369,9 +369,8 @@ copied from the source run; pass the desired timeout/retry/concurrency values ag
 neither replay identity nor the execution-input fingerprint and may change without invalidating
 completed calls or interrupted-turn continuation.
 
-Crash snapshots reconciled to `paused` / `interrupted` without a terminal environment use the
-`crash-residue` positional bridge with legacy hash-stable prefix eligibility. Normally settled
-sources with an input-fingerprint format below 2 use the
+Current-format crash snapshots reconciled to `paused` / `interrupted` use identity correspondence
+even without terminal-environment capture. Sources with an input-fingerprint format below 2 use the
 `inputs-format-legacy` positional bridge. That bridge also accepts ancestor-scoped rows carried by a
 ≤0.23 resume hop when the ancestor run still exists in the same persistence directory; nested and deleted-run scopes stay live. Engine
 package versions are persisted and surfaced as diagnostics but never gate replay. Every new-run
@@ -544,7 +543,7 @@ Semantics worth knowing:
   is always treated as a verbatim script, never a name.
 - **Versioning is git's job.** Same-ID `resume()` reloads the exact persisted script. A new
   `resumeFromRunId` execution can use an edited script: changed calls run live, while uniquely
-  matching safety-marked calls may move and replay after admission.
+  matching completed calls may move and replay after admission.
 - **`resolve()` validates name shape strictly** (one flat path segment) — inline nested scripts
   fall through to verbatim parsing, and path traversal out of the configured dirs is impossible.
 
@@ -621,7 +620,7 @@ ships no runtime code).
 
 | global | what it does |
 |--------|--------------|
-| `agent(prompt, options?)` | Run ONE subagent to completion; returns its result (text, or the validated object with `options.schema`). `options.resume: { filesystem: "read-only" }` is the author safety declaration for content-addressed replay. |
+| `agent(prompt, options?)` | Run ONE subagent to completion; returns its result (text, or the validated object with `options.schema`). The legacy `options.resume` annotation is accepted but replay-neutral. |
 | `parallel(thunks)` | Run an array of **thunks** (`() => Promise`) concurrently; resolves in input order. |
 | `pipeline(items, ...stages)` | Map `items` through sequential async stages, concurrently across items. |
 | `workflow(nameOrScript, args?)` | Run a saved (or inline) workflow nested in this run, sharing its limiter/budget. |

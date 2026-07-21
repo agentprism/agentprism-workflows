@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -91,6 +92,24 @@ async function recordInterrupted(
 
 function prepared(candidate: ContinuationCandidate): PreparedContinuation {
   return { candidatesByIndex: new Map([[candidate.callIndex, candidate]]) };
+}
+
+function legacyInputsHash(overrides: Record<string, unknown> = {}): string {
+  const canonical = JSON.stringify({
+    backends: null,
+    cwd: null,
+    images: null,
+    isolation: null,
+    keepSession: false,
+    label: "worker",
+    mcpServers: null,
+    meta: null,
+    promptMeta: null,
+    retries: 1,
+    timeoutMs: null,
+    ...overrides,
+  });
+  return createHash("sha256").update(canonical).digest("hex");
 }
 
 function continuedRunner(
@@ -277,6 +296,50 @@ describe("live-boundary continuation", () => {
         });
         assert.equal(result.result, "continued", item.name);
       }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("compares format-1 continuation candidates with the legacy fingerprint", async () => {
+    const fixture = tempCwd();
+    const sourceScript = workflow("retries: 1, timeoutMs: null");
+    try {
+      const source = await recordInterrupted(fixture.cwd, sourceScript);
+      const legacyCandidate: ContinuationCandidate = {
+        ...source.candidate,
+        inputsFormat: 1,
+        inputsHash: legacyInputsHash(),
+      };
+      const continued = await runWorkflow(sourceScript, {
+        cwd: fixture.cwd,
+        persistLogs: false,
+        preparedContinuation: prepared(legacyCandidate),
+        agent: continuedRunner(legacyCandidate),
+      });
+      assert.equal(continued.result, "continued");
+
+      const fallbacks: WorkflowRunFallback[] = [];
+      const changed = await runWorkflow(
+        workflow("retries: 1, timeoutMs: null, meta: { changed: true }"),
+        {
+          cwd: fixture.cwd,
+          persistLogs: false,
+          preparedContinuation: prepared(legacyCandidate),
+          agent: {
+            async run(_prompt, options) {
+              assert.equal(options.continueFromSession, undefined);
+              return "fresh";
+            },
+          },
+          onFallback: (fallback) => fallbacks.push(fallback),
+        },
+      );
+      assert.equal(changed.result, "fresh");
+      assert.deepEqual(fallbacks[0]?.continuation, {
+        outcome: "skipped",
+        reason: "inputs-mismatch",
+      });
     } finally {
       fixture.cleanup();
     }

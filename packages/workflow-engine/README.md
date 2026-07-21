@@ -82,8 +82,8 @@ run independently resumable after a second pause or process loss. Each later liv
 persists the complete inherited prefix plus suffix. A dead owner's persisted `pending` or `running`
 run reconciles under its lease to `paused` with `pauseReason: "interrupted"` during construction or
 a cold inspect/list/resume lookup. Live and permission-protected owner PIDs remain untouched.
-Completed crash-journal entries can replay through `crash-residue`; an in-flight unjournaled call
-executes again on resume.
+Completed current-format crash-journal entries use identity replay; an in-flight unjournaled call
+executes again on resume. Missing terminal-environment capture is diagnostic only.
 
 `cancelAgentCall(runId, callIndex)` targets one uniquely matching live attempt. It aborts that
 attempt with recoverable `AGENT_CANCELLED`, races backend cooperation so an ignored signal still
@@ -142,7 +142,7 @@ Inside a workflow body these are available as globals (no imports):
 
 - `agent(prompt, opts?)` — run one subagent. `opts` includes `label`, `phase`, `schema`
   (typebox → validated object), `model`, `mode`, `tier`, `agentType`,
-  `isolation: "worktree"`, `resume: { filesystem: "read-only" }`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`,
+  `isolation: "worktree"`, legacy replay-neutral `resume: { filesystem: "read-only" }`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`,
   `keepSession`, `timeoutMs`, `retries`. The single call into your `AgentRunner`.
 - `parallel([() => agent(...), ...])` — run thunks concurrently (bounded by the run's
   concurrency limiter).
@@ -178,21 +178,22 @@ console.log(again.replayEligibility, again.resumeReport);
 ```
 
 The manager admits exact cwd plus compatible format/metadata/manifest state, persists the candidate seed, and
-then matches safety-marked results by exact path/hash or unique hash+input fingerprint. Allocated calls that
+then matches completed results by exact path/hash or unique hash+input fingerprint. Allocated calls that
 halt without a result are persisted as engine interruption rows; non-result seed blockers make those
 occurrences run live without letting an identical result sibling become spuriously unique. Any
-uncertain, ambiguous, unsafe, or mismatched call runs live. Same-ID `manager.resume(runId)` and
+uncertain, ambiguous, or mismatched call runs live. Same-ID `manager.resume(runId)` and
 manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
-catalogs, checkpoint source-index rules, and filesystem preconditions are in the
+catalogs, and checkpoint source-index rules are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 
 The call identity hashes authored behavior; the separate input fingerprint covers label, per-call
 cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentTimeoutMs`,
 `agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, are operational and enter
-neither hash. For normally settled sources, the recorded start-to-terminal environment comparison
-remains a per-call safety fact. Current-environment, Node, and V8 differences are provenance only.
-A crash snapshot reconciled to `paused` / `interrupted` without terminal environment proof uses
-`crash-residue` with legacy hash-only positional-prefix eligibility. Normally settled input-fingerprint formats below 2 use the named
+neither hash. Captured start/terminal environment values, current environment, Node, and V8 are
+provenance only and never gate matching. Reporting compares the recorded terminal environment (or
+start environment when no terminal capture exists) with the current environment. A current-format crash snapshot reconciled to
+`paused` / `interrupted` uses its identity manifest even without terminal environment capture.
+Input-fingerprint formats below 2 use the named
 `inputs-format-legacy` positional bridge, including ancestor-scoped prefixes carried by ≤0.23 resume
 hops when the ancestor run is still persisted. The persisted producing engine version is diagnostic only. Background admission,
 inspection, polling, and terminal results expose the same eligibility strategy, predicted/observed
@@ -203,24 +204,27 @@ usage/auth-paused snapshot's coherent root `calls[]` × `agents[]` join. Both ne
 resume paths thread it to the live boundary. On attempt one, an exact call-index/hash/input/cwd
 match that is not worktree-isolated passes the recorded session ref to the runner; every failed
 gate runs fresh and emits a guarded `kind: "continuation"` notice with its exact reason. Candidates
+carry their persisted input format so format-1 interrupted sessions are checked with the legacy
+fingerprint (including its historical retry/timeout fields) rather than compared to incompatible
+format-2 bytes. Unsupported formats and changed semantic inputs still run fresh. Candidates
 are rebuilt per execution, so multiple new-run consumers may independently reopen the same paused
 source session. Nested workflows receive no continuation channel.
 
-Inside a script, a compact replay-safe fan-out looks like:
+Inside a script, a compact journal-replay fan-out looks like:
 
 ```js
 const [audit, experiment] = await parallel([
   () => agent("Audit src/api without changing files.", {
-    label: "audit:api", resume: { filesystem: "read-only" },
+    label: "audit:api",
   }),
   () => agent("Try the worker fix in isolation; return a unified diff.", {
-    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+    label: "try:worker", isolation: "worktree",
   }),
 ]);
 ```
 
-The worktree and its edits are discarded; return the diff as data. Isolation without the explicit
-declaration never enables non-contiguous replay.
+The worktree and its edits are discarded; return the diff as data. Both calls replay from matching
+journal rows without a filesystem-safety declaration.
 
 `tokenBudget` caps total spend (per-phase sub-budgets via `phase(title, { budget })`);
 `maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. `agentTimeoutMs` is a

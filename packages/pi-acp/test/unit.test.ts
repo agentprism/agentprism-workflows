@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { RequestError } from "@agentclientprotocol/sdk";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { PiAcpAgent } from "../src/agent.js";
 import { AUTH_METHODS, authenticateMethod } from "../src/auth.js";
 import {
@@ -127,6 +128,19 @@ test("T5 live translation and result projection cover the pinned rows", () => {
   for (const marker of ["agent_start", "agent_end", "turn_start", "message_start", "agent_settled"] as const) {
     assert.deepEqual(translateEvent({ type: marker } as never), []);
   }
+  const summarizationRetries: AgentSessionEvent[] = [
+    {
+      type: "summarization_retry_scheduled",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 250,
+      errorMessage: "transient summary failure",
+    },
+    { type: "summarization_retry_attempt_start", source: "branchSummary" },
+    { type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" },
+    { type: "summarization_retry_finished" },
+  ];
+  for (const event of summarizationRetries) assert.deepEqual(translateEvent(event), []);
   for (const marker of ["done", "error"] as const) {
     assert.deepEqual(translateEvent({ type: "message_update", message: {} as never, assistantMessageEvent: { type: marker } } as never), []);
   }

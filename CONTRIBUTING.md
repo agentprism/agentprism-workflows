@@ -48,8 +48,8 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 - `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, OpenCode, and pi structured-output/pooling paths.
 - `packages/acp-agents/test/auth.live.e2e.test.ts` drives the four built-in auth profiles; individual cases have additional credential/gateway gates.
-- `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_CONTINUATION_LIVE_E2E=1` plus its backend credentials.
-- `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation and additionally requires `AGENTPRISM_ISOLATION_LIVE_E2E=1` plus backend credentials.
+- `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_PI_E2E_MODEL` plus that model's provider key.
+- `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation through the default backend; `AGENTPRISM_ISOLATION_E2E_MODEL` may reroute its isolated leg.
 - `packages/pi-acp/test/live.e2e.test.ts` drives Pi structured output, a real HTTP MCP tool round-trip, and tracked-bash stop/reap; it additionally requires `AGENTPRISM_PI_E2E_MODEL` and that model's provider key.
 
 Run the MCP live suite explicitly with real auth:
@@ -95,7 +95,7 @@ instead of editing the JSON by hand.
 
 1. **Identify what is stale** from the gate output: an ACP library behind npm `latest`, the codex-acp fork missing upstream commits, or a wrapped runtime lagging inside a current adapter.
 2. **Read the upstream changes before bumping** — the release notes/changelog, and for substantial jumps the source diff of the surfaces we integrate against. Decide which of three shapes this is:
-   - *Mechanical*: no cited surface changed — bump the pin (or merge upstream into the fork and cut a fork release), `pnpm install`, add a changeset, run the full suite plus the live e2e.
+   - *Mechanical*: no cited surface changed — bump the pin (for the codex-acp fork: follow "The codex-acp fork leg" under Releasing below — merge upstream, push, the fork **auto-releases**, then bump the pin here), `pnpm install`, add a changeset, run the full suite plus the live e2e.
    - *Upstream broke or changed our integration surface*: adapt the agentprism packages to the new API as part of the same PR — the bump and the adaptation land together, never a pin held back to avoid the work.
    - *Upstream added capability we should exploit*: land the mechanical bump first to unblock the gate, and file an issue for the capability work so it is tracked, not lost.
 3. **Land the maintenance PR** — its own CI passes because its tree carries the fixed pins, which is exactly why a stale gate never wedges the repo: the fix PR is always mergeable. Once it merges, every blocked PR unblocks on rebase/re-run, and the next push to `main` versions and publishes normally.
@@ -114,22 +114,68 @@ The gate verifies **authenticity, not relevance** — choosing the right sentenc
 
 Tests: `packages/mcp-server/test/workflow-source-gate.test.ts` (hermetic fixture transcripts covering every provenance trap).
 
+## Generated artifacts and the doc-sync map
+
+When you change a source-of-truth surface, regenerate/update its dependents **in the same PR**. Guard tests fail loudly naming each file, but this is the full map so nothing has to be discovered by failure:
+
+- **Authoring skill → MCP `author-workflow` prompt.** `skills/agentprism-workflow-authoring/**` is the single source of truth. After ANY edit there, run `pnpm generate:authoring-prompt` (alias for `node scripts/generate-authoring-prompt.mjs`) to regenerate `packages/mcp-server/src/generated/authoring-prompt-content.ts`, and commit both together. The drift test (`packages/mcp-server/test/authoring-prompt.test.ts`) fails whenever the skill and the generated file disagree. The generator throws on missing rewrite markers — including SKILL.md's hand-maintained `<!-- guide-index:begin/end -->` block — rather than shipping dangling pointers.
+- **Installed skills do not track this repo.** Consumers — including dev machines driving this repo with coding agents — install the skill via `npx skills add VikashLoomba/agentprism-workflows` ([skills.sh](https://skills.sh)), which copies it under `~/.agents/skills/` (Claude Code reads it through a `~/.claude/skills/` symlink). After merging skill changes to `main`, **re-run that install on each machine**: a stale installed copy keeps teaching agents retired contracts. The root `skills-lock.json` is the skills.sh lockfile for *third-party* skills installed INTO this repo; it is unrelated to publishing ours.
+- **Backend registry → gate manifest.** After changing a built-in backend definition: `pnpm generate:acp-backends-manifest` then `pnpm check:acp-backends-manifest` (see the dependency-gate runbook above). Never hand-edit `scripts/acp-backends.manifest.json`.
+- **Dependency pins → welded tests and docs.** A dependency bump moves, at minimum: the exact-pin map in `packages/pi-acp/test/packaging.test.ts`; `FIXTURE_PI_PIN` plus the cited fixture strings in `packages/pi-acp/test/fixtures/provider-error-strings.ts` (re-verify each string against the new version's installed dists before advancing the pin); `@earendil-works/pi-agent-core` in pi-acp's devDependencies, which moves in lockstep with the pi runtime **even though the gate output does not list it**; installed-version citations in `docs/api.md` and `docs/design-notes.md`; and the version in the `docs/specs/acp-auth-spec.md` §3.3 Codex heading. The docs-drift suite (`packages/acp-agents/test/docs-drift.test.ts`) also welds the event-name tables (the workflows and acp-agents READMEs plus `docs/api.md`), the mcp-server README contract tokens, and this file's own package inventory. Fix what the guards name; never loosen a guard to make an edit pass.
+- **Post-publish smoke for the coordinated Pi/MCP train.** After a release that touches the pi-acp ↔ mcp-server wiring, run `node scripts/smoke-pi-mcp-release.mjs`: it installs the just-published **public** artifacts into a fresh directory (workspace links cannot satisfy it) and exercises the train end to end. It is not wired into CI — running it is part of release verification for that train.
+
 ## Releasing
 
-Versioning is managed with **[Changesets](https://github.com/changesets/changesets)**.
+All `@automatalabs/*` packages are versioned with **[Semantic Versioning](https://semver.org)**: **patch** = fixes that change no documented behavior, **minor** = backward-compatible additions or behavior changes, **major** = a break in the documented contract. Versioning is managed with **[Changesets](https://github.com/changesets/changesets)** — a changeset records which packages a PR changes and which SemVer bump each deserves. Merging a changeset-bearing PR to `main` **IS** the release — everything after that merge is automation. This section is the complete path from unstaged changes to published npm packages; a person or agent following it needs nothing that isn't written here or in the files it names.
+
+The three root scripts (you normally run only the first; CI runs the others):
 
 ```bash
 pnpm changeset        # describe your change + pick bump levels
-pnpm version          # changeset version — applies bumps + changelogs (usually via the release PR)
-pnpm release          # pnpm build && changeset publish (CI only)
+pnpm version          # changeset version — applies bumps + changelogs (runs inside the Version Packages PR)
+pnpm release          # pnpm build && changeset publish (runs in release.yml's publish leg)
 ```
 
-Publishing runs from [`.github/workflows/release.yml`](.github/workflows/release.yml) on push to `main`, via **OIDC trusted publishing** (no long-lived npm token; SLSA provenance):
+### End to end: unstaged changes → npm
 
-1. Check/bump the ACP protocol deps (`@agentclientprotocol/sdk`, `@agentclientprotocol/claude-agent-acp`, `@automatalabs/codex-acp`) to current before cutting a release.
-2. Add a changeset (`pnpm changeset`) in your PR describing the change + bump levels, and merge it to `main`.
-3. That's it — the pipeline does the rest: Changesets opens the mechanical **"Version Packages"** PR (bumps + changelogs) with the release app token, queues auto-merge on it, GitHub lands it the moment the required `Build & test` check passes, and the merge push runs the publish leg via `changeset publish`. Merging a changeset-bearing PR to `main` IS the release. (Without the `RELEASE_APP_CLIENT_ID`/`RELEASE_APP_PRIVATE_KEY` secrets the Version PR is still created but awaits a manual merge.)
+0. **Preconditions** (once per machine): Node ≥ 22 + pnpm 10, `pnpm install` run at the root (this wires the pre-push hook via the `prepare` script's `core.hooksPath`); `gh` authenticated; the agent CLIs logged in for the pre-push live e2e (Claude Code, Codex, OpenCode, pi — see Testing above); optionally a codex-acp fork clone at `~/codex-acp` (the dependency gate manages its own temp clone when absent).
+1. **Branch** off current `origin/main`. `main` is protected by a ruleset requiring the `Build & test` check, so all work lands by PR.
+2. **Verify locally against the exact CI bar**:
 
-The Codex `outputSchema` forward lives in the published `@automatalabs/codex-acp` fork (exact-pinned by `acp-agents`), so a change to that wire key is a **coordinated release**: publish the fork first, then bump the pinned dep. The repo is licensed Apache-2.0 (`LICENSE`).
+   ```bash
+   pnpm -r exec tsc -b               # build — CI invokes tsc directly, NOT package build scripts
+   pnpm -r exec tsc --noEmit         # typecheck
+   pnpm -r test                      # AGENTPRISM_LIVE_E2E stays unset, exactly like CI
+   node scripts/check-acp-deps.mjs   # the dependency gate — when red, see the runbook above
+   ```
+
+   Guard tests are executable documentation: on a dependency bump, the pin-contract tests (`packages/pi-acp/test/packaging.test.ts`, `packages/pi-acp/test/fixtures/provider-error-strings.ts`) and the docs-drift tests (`packages/acp-agents/test/docs-drift.test.ts`) fail loudly, naming every file that must move with the bump. Fix what they name; never loosen them. The complete inventory of generated artifacts and welded doc surfaces lives in "Generated artifacts and the doc-sync map" above.
+3. **Add a changeset** — `pnpm changeset`, selecting every package whose *published artifact or behavior* changes, with the semver bump each deserves. Workspace dependents are bumped automatically at version time (`updateInternalDependencies: "patch"` in `.changeset/config.json`), so list direct changes only. Check yourself with `pnpm changeset status --since=origin/main`: it previews exactly which packages will release, and it **errors** when packages changed but no changeset covers them (use `pnpm changeset add --empty` to deliberately release nothing). No changeset ⇒ merging releases nothing (correct for docs/CI-only PRs).
+4. **Push** — the pre-push hook (Testing above) runs the dependency gate and the live 4-backend e2e (~60–120 s, real tokens, no bypass).
+5. **Open the PR and merge it** — the required check is `Build & test` (that exact string — the ruleset matches it verbatim). `gh pr merge --squash --auto` is the normal path.
+6. **Automation takes over on the push to `main`** ([`release.yml`](.github/workflows/release.yml); its header comments are the authoritative mechanics):
+   - The dependency gate runs FIRST and fails closed: a red gate files/updates a **"Release blocked: ACP dependency gate failed"** issue, comments on any open Version PR, and nothing versions or publishes until a maintenance PR lands (runbook above).
+   - `changesets/action` opens/updates the mechanical **"Version Packages"** PR (bumps + changelogs) with the release app token and queues auto-merge; GitHub lands it the moment its own `Build & test` check passes.
+   - That merge push re-runs `release.yml`, whose publish leg (`pnpm release` = `pnpm build && changeset publish`) publishes every bumped package via **npm OIDC trusted publishing** (no npm token; SLSA provenance). This requires a trusted publisher configured on npmjs.com for each `@automatalabs/*` package pointing at this repo + `.github/workflows/release.yml`.
+   - **Manual fallback**: without the `RELEASE_APP_CLIENT_ID`/`RELEASE_APP_PRIVATE_KEY` secrets the Version PR is still created (plain `GITHUB_TOKEN`) but auto-merge is not queued — a human merges it, and that merge still triggers the publish leg.
+7. **Verify it shipped** — every release, no exceptions:
+
+   ```bash
+   gh run list --workflow=release.yml --branch=main --limit 3   # your merge's run AND the publish-leg run both green
+   gh pr list --search "Version Packages in:title" --state all --limit 3   # the Version PR is MERGED
+   npm view @automatalabs/<pkg> version                         # matches what the merged Version PR gave that package
+   ```
+
+   Registry propagation can lag a minute or two — retry before concluding failure. A Version PR sitting OPEN with green checks and no auto-merge queued means the app secrets are absent or broken → merge it manually (step 6's fallback). A failed release run with a red gate → the "Release blocked" issue carries the gate output; follow the runbook above. For a release touching the pi-acp ↔ mcp-server wiring, additionally run the post-publish smoke: `node scripts/smoke-pi-mcp-release.mjs` (doc-sync map above).
+
+### The codex-acp fork leg (when the dependency gate demands it)
+
+`@automatalabs/codex-acp` releases from its own repo (`VikashLoomba/codex-acp`), **automatically**: pushing fork `main` with green CI fires its `release-fork.yml` (bump size inferred from commit subjects since the last tag; its `workflow_dispatch` exists only for explicit bump overrides and dry runs), which tags, creates the GitHub release, and chain-dispatches `publish-oidc.yml` to publish to npm. There is no manual trigger to pull on the happy path. The full sequence:
+
+1. In `~/codex-acp`: `git fetch upstream main && git merge upstream/main` — resolve the recurring `package.json`/`package-lock.json` version+description conflict in the **fork's** favor (its version line is independent of upstream's), sanity-build, and `git push origin main`. The gate requires the clone to be clean **and pushed** — a locally-merged-but-unpushed sync still blocks.
+2. Watch `gh run list --repo VikashLoomba/codex-acp` until CI → `Release (fork)` → `Publish (OIDC)` are all green, then confirm `npm view @automatalabs/codex-acp version` advanced.
+3. Bump the exact pin in `packages/acp-agents/package.json` to that new version as part of the same maintenance PR here (never a separate later PR — the gate compares the pin against npm `latest`).
+
+The Codex `outputSchema` forward lives in that fork (exact-pinned by `acp-agents`), so any change to that wire key is a **coordinated release**: publish the fork first, then bump the pinned dep. The repo is licensed Apache-2.0 (`LICENSE`).
 
 CI (`.github/workflows/ci.yml`) runs on every PR and push: frozen install → `tsc -b` → `tsc --noEmit` → `pnpm -r test` on Node 24 / pnpm 10. `main` has an active ruleset requiring the `Build & test` check on every merge.

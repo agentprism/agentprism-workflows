@@ -43,8 +43,7 @@ test(
 
       const modelOverride =
         process.env.AGENTPRISM_ISOLATION_E2E_MODEL ??
-        process.env.AGENTPRISM_DEFAULT_BACKEND ??
-        "claude";
+        "claude/sonnet";
       const isolated = await runIsolation({
         baselineRunId: baseline.runId,
         live: [{ label: "step-2", model: modelOverride }],

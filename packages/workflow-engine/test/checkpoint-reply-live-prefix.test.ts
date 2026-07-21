@@ -29,7 +29,7 @@ function unappliedReply(result: WorkflowRunResult) {
   return reply;
 }
 
-describe("checkpointReplies after a live positional prefix", () => {
+describe("checkpointReplies with journal replay and live calls", () => {
   it("continues an ordinary undeclared-agent script by exact checkpoint call identity", async () => {
     const dirs = tempRoot();
     let generation = "source";
@@ -64,12 +64,12 @@ return { first, second, approval, after }`, "ordinary-checkpoint-reply");
       });
 
       assert.equal(resumed.status, "completed");
-      assert.equal(resumed.resumeReport?.strategy, "positional-v1");
-      assert.equal(resumed.replayEligibility?.predictedReplayablePrefix, 0);
-      assert.deepEqual(livePrompts, ["prefix-one", "prefix-two", "after-checkpoint"]);
+      assert.equal(resumed.resumeReport?.strategy, "identity-v1");
+      assert.equal(resumed.replayEligibility?.predictedReplayablePrefix, 3);
+      assert.deepEqual(livePrompts, ["after-checkpoint"]);
       assert.deepEqual(JSON.parse(JSON.stringify(resumed.result)), {
-        first: "resumed:prefix-one",
-        second: "resumed:prefix-two",
+        first: "source:prefix-one",
+        second: "source:prefix-two",
         approval: true,
         after: "resumed:after-checkpoint",
       });
@@ -102,13 +102,14 @@ if (route === "source-route") {
   return await checkpoint("approve same text", { headless: "pause", default: false })
 }
 return await checkpoint("approve same text", { headless: "pause", default: false })`, "checkpoint-site-divergence");
+    const changedScript = script.replace('agent("choose-route"', 'agent("choose-route-changed"');
     try {
       const paused = await manager.runSync(script);
       assert.equal(paused.status, "paused");
       assert.ok(paused.checkpointContext);
 
       source = false;
-      const resumed = await manager.runSync(script, undefined, {
+      const resumed = await manager.runSync(changedScript, undefined, {
         resumeFromRunId: paused.runId,
         checkpointReplies: { [paused.checkpointContext.callIndex]: true },
       });
@@ -133,13 +134,14 @@ return await checkpoint("approve same text", { headless: "pause", default: false
     const script = workflow(`
 const artifact = await agent("produce-artifact", { label: "produce-artifact" })
 return await checkpoint(\`approve artifact: \${artifact}\`, { headless: "pause", default: false })`, "checkpoint-input-divergence");
+    const changedScript = script.replace('agent("produce-artifact"', 'agent("produce-artifact-changed"');
     try {
       const paused = await manager.runSync(script);
       assert.equal(paused.status, "paused");
       assert.ok(paused.checkpointContext);
 
       generation = "changed";
-      const resumed = await manager.runSync(script, undefined, {
+      const resumed = await manager.runSync(changedScript, undefined, {
         resumeFromRunId: paused.runId,
         checkpointReplies: { [paused.checkpointContext.callIndex]: true },
       });
@@ -164,13 +166,14 @@ return await checkpoint(\`approve artifact: \${artifact}\`, { headless: "pause",
     const script = workflow(`
 const artifact = await agent("produce-default", { label: "produce-default" })
 return await checkpoint("approve artifact", { headless: "pause", default: artifact })`, "checkpoint-fingerprint-divergence");
+    const changedScript = script.replace('agent("produce-default"', 'agent("produce-default-changed"');
     try {
       const paused = await manager.runSync(script);
       assert.equal(paused.status, "paused");
       assert.ok(paused.checkpointContext);
 
       generation = "changed";
-      const resumed = await manager.runSync(script, undefined, {
+      const resumed = await manager.runSync(changedScript, undefined, {
         resumeFromRunId: paused.runId,
         checkpointReplies: { [paused.checkpointContext.callIndex]: true },
       });
@@ -195,13 +198,17 @@ return await checkpoint("approve artifact", { headless: "pause", default: artifa
 const current = await agent("inspect-current-state", { label: "inspect-current-state" })
 const approved = await checkpoint("approve current state", { headless: "pause", default: false })
 return { current, approved }`, "checkpoint-exact-after-live");
+    const changedScript = script.replace(
+      'agent("inspect-current-state"',
+      'agent("inspect-current-state-changed"',
+    );
     try {
       const paused = await manager.runSync(script);
       assert.equal(paused.status, "paused");
       assert.ok(paused.checkpointContext);
 
       generation = "changed";
-      const resumed = await manager.runSync(script, undefined, {
+      const resumed = await manager.runSync(changedScript, undefined, {
         resumeFromRunId: paused.runId,
         checkpointReplies: { [paused.checkpointContext.callIndex]: true },
       });
@@ -220,7 +227,7 @@ return { current, approved }`, "checkpoint-exact-after-live");
     }
   });
 
-  it("predicts no safe-prefix replay through an undeclared source agent", async () => {
+  it("replays an ordinary source without requiring filesystem declarations", async () => {
     const dirs = tempRoot();
     let liveCalls = 0;
     const manager = new WorkflowManager({
@@ -236,12 +243,12 @@ return await agent("ordinary-two", { label: "ordinary-two" })`, "safe-prefix-pre
       assert.equal(source.status, "completed");
       const resumed = await manager.runSync(script, undefined, { resumeFromRunId: source.runId });
       assert.equal(resumed.status, "completed");
-      assert.equal(resumed.resumeReport?.strategy, "positional-v1");
-      assert.equal(resumed.replayEligibility?.predictedReplayablePrefix, 0);
-      assert.equal(resumed.replayEligibility?.replayedPrefix, 0);
-      assert.equal(resumed.resumeReport?.replayed, 0);
-      assert.equal(resumed.resumeReport?.live, 2);
-      assert.equal(liveCalls, 4);
+      assert.equal(resumed.resumeReport?.strategy, "identity-v1");
+      assert.equal(resumed.replayEligibility?.predictedReplayablePrefix, 2);
+      assert.equal(resumed.replayEligibility?.replayedPrefix, 2);
+      assert.equal(resumed.resumeReport?.replayed, 2);
+      assert.equal(resumed.resumeReport?.live, 0);
+      assert.equal(liveCalls, 2);
     } finally {
       dirs.cleanup();
     }

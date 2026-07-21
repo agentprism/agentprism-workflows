@@ -133,6 +133,7 @@ if (route === 'source-route') {
   return await checkpoint('approve same text', { headless: 'pause', default: false })
 }
 return await checkpoint('approve same text', { headless: 'pause', default: false })`;
+  const changedScript = script.replace("agent('choose-route'", "agent('choose-route-changed'");
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
     const first = await client.callTool({ name: "workflow", arguments: { script } });
@@ -144,7 +145,7 @@ return await checkpoint('approve same text', { headless: 'pause', default: false
     const second = await client.callTool({
       name: "workflow",
       arguments: {
-        script,
+        script: changedScript,
         resumeFromRunId: String(paused?.runId),
         checkpointReplies: { [callIndex]: true },
       },

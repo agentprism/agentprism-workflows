@@ -88,7 +88,7 @@ const createAgentSession = async (options) => {
   const agent = new Agent({
     initialState: { model, systemPrompt: "Hermetic AgentPrism e2e", tools: [] },
     getApiKey: () => "hermetic-key",
-    streamFunction: streamFn,
+    streamFn,
   });
   const session = new AgentSession({
     agent,

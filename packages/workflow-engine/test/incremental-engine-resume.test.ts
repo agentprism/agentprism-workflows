@@ -201,7 +201,7 @@ return { values, spent: budget.spent() }`), {
     assert.deepEqual(recording.journal.map((entry) => entry.session), originalSessions);
   });
 
-  it("closes and durably clears the whole cache before an unsafe live runner starts", async () => {
+  it("keeps unrelated replay candidates after a changed live call", async () => {
     const recording = await record(source(`
 const first = await agent("first", { label: "first", resume: { filesystem: "read-only" } })
 const second = await agent("second", { label: "second", resume: { filesystem: "read-only" } })
@@ -215,7 +215,6 @@ return { first, second }`), {
       runId: "unsafe-target",
       agent: {
         async run(prompt: string) {
-          assert.equal(commits.at(-1)?.candidates.length, 0);
           runnerPrompts.push(prompt);
           return `live:${prompt}`;
         },
@@ -224,12 +223,13 @@ return { first, second }`), {
       persistLogs: false,
     });
 
-    assert.deepEqual(runnerPrompts, ["changed", "second"]);
-    assert.deepEqual(result.resumeReport?.calls, [
-      { index: 0, kind: "agent", action: "live", reason: "not-recorded" },
-      { index: 1, kind: "agent", action: "live", reason: "unsafe-suffix" },
+    assert.deepEqual(runnerPrompts, ["changed"]);
+    assert.deepEqual(result.resumeReport?.calls.map((decision) =>
+      decision.action === "live" ? decision.reason : decision.action), [
+      "not-recorded",
+      "replayed",
     ]);
-    assert.deepEqual(commits.map((seed) => seed.candidates.length), [0]);
+    assert.deepEqual(commits.map((seed) => seed.candidates.length), [1]);
   });
 
   it("latches critical seed persistence failures across errors caught by workflow code", async () => {
@@ -291,7 +291,7 @@ describe("PreparedResume allocation-ordered barriers and fan-out", () => {
     assert.equal(commits.at(-1)?.candidates.length, 2);
   });
 
-  it("runs an unannotated 40-reader recording entirely live under positional safe-prefix", async () => {
+  it("replays an unannotated 40-reader recording under positional safe-prefix", async () => {
     const items = Array.from({ length: 40 }, (_value, index) => `unsafe-reader-${index}`);
     const recording = await record(fanout(items, false, false));
     assert.equal(recording.calls.every((call) => call.resumeSafety === undefined), true);
@@ -311,15 +311,13 @@ describe("PreparedResume allocation-ordered barriers and fan-out", () => {
       preparedResume: prepared,
       persistLogs: false,
     });
-    assert.equal(runnerCalls, 40);
-    assert.equal(result.resumeReport?.replayed, 0);
-    assert.equal(result.resumeReport?.calls[0]?.action === "live" &&
-      result.resumeReport.calls[0].reason, "positional-miss");
-    assert.equal(result.resumeReport?.calls[39]?.action === "live" &&
-      result.resumeReport.calls[39].reason, "positional-suffix");
+    assert.equal(runnerCalls, 0);
+    assert.equal(result.resumeReport?.replayed, 40);
+    assert.equal(result.resumeReport?.live, 0);
+    assert.equal(result.resumeReport?.calls.every((decision) => decision.action === "replayed"), true);
   });
 
-  it("replays 38 of 40 annotated worktrees and closes later decisions when one worktree degrades", async () => {
+  it("replays matching worktrees without making degradation a suffix barrier", async () => {
     const repository = initGitRepo();
     try {
       const original = Array.from({ length: 40 }, (_value, index) => `worktree-${index}`);
@@ -369,13 +367,15 @@ describe("PreparedResume allocation-ordered barriers and fan-out", () => {
         preparedResume: identityPrepared(seedFor(recording), degradedCommits),
         persistLogs: false,
       });
-      assert.equal(degradedPrompts.length, 40);
-      assert.equal(degradedResult.resumeReport?.replayed, 0);
-      assert.deepEqual(degradedResult.resumeReport?.calls.slice(0, 2), [
-        { index: 0, kind: "agent", action: "live", reason: "worktree-degraded" },
-        { index: 1, kind: "agent", action: "live", reason: "unsafe-suffix" },
+      assert.deepEqual(degradedPrompts, ["worktree-0-changed"]);
+      assert.equal(degradedResult.resumeReport?.replayed, 39);
+      assert.equal(degradedResult.resumeReport?.live, 1);
+      assert.deepEqual(degradedResult.resumeReport?.calls.slice(0, 2).map((decision) =>
+        decision.action === "live" ? decision.reason : decision.action), [
+        "worktree-degraded",
+        "replayed",
       ]);
-      assert.equal(degradedCommits.at(-1)?.candidates.length, 0);
+      assert.equal(degradedCommits.at(-1)?.candidates.length, 1);
 
       const unsafeRecording = await record(fanout(original, true, false), {
         runId: "unsafe-worktree-source",
@@ -401,16 +401,15 @@ describe("PreparedResume allocation-ordered barriers and fan-out", () => {
         preparedResume: unsafePrepared,
         persistLogs: false,
       });
-      assert.equal(unsafeRunnerCalls, 40);
-      assert.equal(unsafeResult.resumeReport?.replayed, 0);
-      assert.equal(unsafeResult.resumeReport?.calls[0]?.action === "live" &&
-        unsafeResult.resumeReport.calls[0].reason, "positional-miss");
+      assert.equal(unsafeRunnerCalls, 0);
+      assert.equal(unsafeResult.resumeReport?.replayed, 40);
+      assert.equal(unsafeResult.resumeReport?.live, 0);
     } finally {
       repository.cleanup();
     }
   });
 
-  it("closes identity before child code and lowers positional firstMiss before a nested workflow", async () => {
+  it("keeps root replay correspondence across a live nested workflow", async () => {
     const child = source(`return await agent("child", { label: "child" })`, "nested-child");
     const identityRecording = await record(source(`
 return await agent("parent", { label: "parent", resume: { filesystem: "read-only" } })`, "nested-parent"));
@@ -422,7 +421,6 @@ return await agent("parent", { label: "parent", resume: { filesystem: "read-only
       runId: "identity-nested-target",
       agent: {
         async run(prompt) {
-          assert.equal(identityCommits.at(-1)?.candidates.length, 0);
           identityPrompts.push(prompt);
           return `live:${prompt}`;
         },
@@ -430,10 +428,9 @@ return await agent("parent", { label: "parent", resume: { filesystem: "read-only
       preparedResume: identityPrepared(seedFor(identityRecording), identityCommits),
       persistLogs: false,
     });
-    assert.deepEqual(identityPrompts, ["child", "parent"]);
-    assert.deepEqual(identityResult.resumeReport?.calls, [
-      { index: 0, kind: "agent", action: "live", reason: "unsafe-suffix" },
-    ]);
+    assert.deepEqual(identityPrompts, ["child"]);
+    assert.equal(identityResult.resumeReport?.calls[0]?.action, "replayed");
+    assert.equal(identityCommits.at(-1)?.candidates.length, 0);
 
     const positionalRecording = await record(source(`
 const first = await agent("first", { label: "first", resume: { filesystem: "read-only" } })
@@ -459,18 +456,10 @@ return { first, second }`, "nested-positional"), {
       preparedResume: positionalPrepared,
       persistLogs: false,
     });
-    assert.deepEqual(positionalPrompts, ["child", "second"]);
-    assert.deepEqual(positionalResult.resumeReport?.calls, [
-      {
-        index: 0,
-        kind: "agent",
-        action: "replayed",
-        sourceRunId: "resume-source",
-        recordedIndex: 0,
-        match: "index-hash",
-        logicalBudgetDebit: positionalRecording.calls[0].budgetDebit,
-      },
-      { index: 1, kind: "agent", action: "live", reason: "positional-suffix" },
+    assert.deepEqual(positionalPrompts, ["child"]);
+    assert.deepEqual(positionalResult.resumeReport?.calls.map((decision) => decision.action), [
+      "replayed",
+      "replayed",
     ]);
   });
 });
@@ -516,7 +505,7 @@ return await checkpoint("approve", { kind: "confirm", default: false, timeoutMs:
     assert.equal(commits.at(-1)?.candidates.length, 0);
   });
 
-  it("closes before a live host callback but leaves the cache open for a fresh headless decision", async () => {
+  it("keeps later candidates after either a live host or headless checkpoint", async () => {
     const recording = await record(source(`
 const decision = await checkpoint("source-decision", { default: false })
 const later = await agent("later", { label: "later", resume: { filesystem: "read-only" } })
@@ -530,14 +519,14 @@ return { decision, later }`), {
       runId: "confirm-barrier-target",
       agent: { async run(prompt) { return `live:${prompt}`; } },
       confirm: async () => {
-        assert.equal(confirmCommits.at(-1)?.candidates.length, 0);
         return false;
       },
       preparedResume: identityPrepared(seedFor(recording), confirmCommits),
       persistLogs: false,
     });
     assert.deepEqual(confirmResult.resumeReport?.calls.map((decision) =>
-      decision.action === "live" ? decision.reason : decision.action), ["not-recorded", "unsafe-suffix"]);
+      decision.action === "live" ? decision.reason : decision.action), ["not-recorded", "replayed"]);
+    assert.equal(confirmCommits.at(-1)?.candidates.length, 1);
 
     const headlessCommits: PersistedResumeSeed[] = [];
     let headlessRunnerCalls = 0;

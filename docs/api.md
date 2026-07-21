@@ -104,14 +104,14 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `agent` | Per-run `AgentRunner` override. |
 | `signal` / `externalSignal` | Host `AbortSignal` that aborts this run (aliases). |
 | `journaling` | Per-run journaling override. |
-| `environmentKey` | Host-supplied non-git environment identity. It must content-address every persistent resource replay-safe calls can observe and remain stable for the run; git workspaces use measured HEAD + dirty digest instead. |
+| `environmentKey` | Host-supplied non-git environment label used for replay provenance diagnostics. It never gates journal replay; git workspaces report measured HEAD + dirty digest instead. |
 | `tokenBudget` | Hard cap; once spent, `agent()` throws `TOKEN_BUDGET_EXHAUSTED`. |
 | `maxAgents` | Cap on total agent calls for the run. |
 | `agentTimeoutMs` | Host total-wall-clock ceiling for each agent attempt (`null` = no host ceiling). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
 | `resumeFromRunId` | Persisted source ID for a **new** managed execution. Requires journaling, must differ from a caller-supplied new `runId`, and is mutually exclusive with `resumeJournal`. Missing sources fail with `PERSISTENCE_ERROR`. |
-| `resumePolicy` | `"auto"` (default) or `"positional"`; requires `resumeFromRunId`. Positional is an index/prefix migration policy, not a bypass for new-format format/metadata/manifest/input/safety checks. |
+| `resumePolicy` | `"auto"` (default) or `"positional"`; requires `resumeFromRunId`. Positional is an index/prefix migration policy, not a bypass for new-format format/metadata/manifest/input checks. |
 | `checkpointReplies` | Durable-checkpoint answer channel. With `resumeFromRunId`, keys name call indexes in the **source** run; with same-ID `resume()` they name that persisted run's index. Values must be strict JSON. |
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
@@ -208,7 +208,10 @@ on `usage_limit` or `auth_required`, the manager joins the root error call recor
 error agent/session row by call index and builds `PreparedContinuation`. At the live boundary,
 attempt one reattaches only when index, identity hash, complete execution-input fingerprint, cwd
 equality/existence, non-worktree isolation, and the runner's backend/`poolKey`/current reopen gates
-all pass. Each rejected gate emits a `kind: "continuation"` skip notice and runs fresh; successful
+all pass. The source call's persisted input-fingerprint format selects the comparison algorithm, so
+format-1 paused runs compare against the equivalent legacy fingerprint while current runs use format
+2; unsupported formats and genuine semantic input changes still fail to fresh. Each rejected gate
+emits a `kind: "continuation"` skip notice and runs fresh; successful
 resume/load emits a reattached notice and a diagnostic journal marker. This works for identity,
 positional, and all-live correspondence strategies and for same-ID recovery, which has no
 `PreparedResume`. Candidate consumption is per execution: several new-run targets may independently
@@ -228,7 +231,7 @@ The public correspondence types are exported by `@automatalabs/shared-types`,
 type ResumePolicy = "auto" | "positional";
 type WorkflowResumeStrategy = "identity-v1" | "positional-v1" | "live";
 type WorkflowResumeMatch = "path-hash" | "unique-hash" | "index-hash";
-type WorkflowResumeSafety = "declared-read-only" | "isolated-worktree";
+type WorkflowResumeSafety = "declared-read-only" | "isolated-worktree"; // legacy diagnostics only
 
 type WorkflowResumeCallDecision =
   | {
@@ -327,33 +330,27 @@ predicted and observed prefixes, counts, first non-replay and detail when known,
 engine and input formats, and any non-gating operational changes. A zero predicted or observed
 prefix is prefixed with `WARNING`.
 
-#### Identity, safety, and filesystem boundary
+#### Identity, correspondence, and world neutrality
 
-An author opts an agent result into non-contiguous reuse with the engine-owned DSL option:
+Every completed agent result participates in non-contiguous reuse without an author annotation:
 
 ```js
 const findings = await parallel([
   () => agent("Audit src/api without changing files.", {
     label: "audit:api",
-    resume: { filesystem: "read-only" },
   }),
   () => agent("Try the fix in isolation; return a unified diff.", {
     label: "try:worker",
     isolation: "worktree",
-    resume: { filesystem: "read-only" },
   }),
 ]);
 ```
 
-For a non-worktree call, the declaration promises that the call may read the admitted workspace
-but creates, modifies, or deletes no persistent filesystem/external state and has no load-bearing
-ambient dependency. For a successfully created engine worktree, ordinary edits inside that
-throwaway checkout are allowed and discarded; commits, shared `.git` mutations, ignored or
-out-of-tree artifacts, and external effects remain forbidden. A per-agent external `cwd`, failed
-or degraded worktree, missing declaration, mode, tool allowlist, or prose instruction proves no
-safety. The option never reaches `AgentRunner` and changes neither call-hash nor input-fingerprint
-bytes. Source and current rows must prove the same safety class, so adding the option cannot bless
-an old cached result.
+The legacy `resume: { filesystem: "read-only" }` option remains accepted so old scripts and
+journals load. It is recorded only as diagnostic provenance, never reaches `AgentRunner`, changes
+neither call-hash nor input-fingerprint bytes, and has no effect on admission or matching. New
+scripts should omit it. Reader, writer, worktree, and unannotated calls all follow the same journal
+correspondence rule.
 
 An agent call's identity hash covers prompt, resolved model, authored mode/config options/tier,
 phase, agent type and resolved definition, and schema. Its separate input fingerprint covers the
@@ -367,80 +364,74 @@ Identity matching first considers the original exact group `(kind, call path, id
 candidate with an equal input fingerprint replays as `"path-hash"`; duplicates are permanently
 ambiguous. With no exact candidate, exactly one original `(kind, identity hash, inputsHash)` row
 may move after an insertion/deletion and replay as `"unique-hash"`. Missing/different inputs,
-duplicate content, consumed candidates, empty schema-less output, or changed safety run live. The
+duplicate content, consumed candidates, or empty schema-less output run live. The
 matcher never pairs by occurrence ordinal/source order and never uses isolation's path-only
 fallback. Stable explicit labels matter because runner-visible label changes alter `inputsHash`.
 
-Before any new-format cache is considered, admission requires a terminal non-aborted,
+Before any new-format journal is considered, admission requires a terminal non-aborted,
 non-isolation source; exact `effectiveCwd`; exact call-path and checkpoint-input formats; a
 compatible agent-input format; and complete journal/call/allocation metadata with a valid
-manifest and seed. A normally settled source also needs recorded start and terminal environments:
-their equality proves intra-run filesystem stability for the per-call safety machinery. Git
-identity is HEAD plus dirty digest; non-Git hosts use `environmentKey`. The current environment and
-current Node/V8 versions do not gate admission or matching. Their differences from the source's
-recorded terminal environment and runtime appear in `replayEligibility.provenanceChanges`.
+manifest and seed. These are journal-integrity and execution-correspondence checks. Git HEAD/dirty
+digest, `environmentKey`, captured start/terminal environment values, Node/V8, and producing engine
+version are diagnostics only. Provenance compares the recorded terminal environment (or start
+environment when no terminal capture exists) with the current environment. Differences may appear
+in `replayEligibility.provenanceChanges`; none disables replay or changes a per-call decision.
 
 The terminal manifest is dense even when a pause or halt catches allocated calls in flight. Those
 occurrences carry `outcome: "error"`, `origin: "engine"`, and no journal result, so they execute
-live on resume. Safety-proved non-result agent rows remain in the identity seed as non-replayable
+live on resume. Non-result agent rows remain in the identity seed as non-replayable
 blockers until their occurrence is reached. A blocker participates in exact/content ambiguity but
 can never return a value; this preserves alignment while allowing completed calls after a gap to
 replay.
 
-A crash snapshot reconciled to `paused` / `interrupted` has no quiescent terminal environment. It
-takes the `crash-residue` legacy positional bridge before the input-format bridge, regardless of
-the current environment; its recorded start-environment difference is provenance only. Normally
-settled input formats below 2 take the input-format positional compatibility bridge; a format
-greater than the current format is `runtime-mismatch`. The host must still prevent unrecorded
-writers while a source or resumed run is executing; a run-ID lease does not lock a workspace. The
-runtime block also records the producing workflow-engine package version. Missing or different
-engine versions are diagnostics in `replayEligibility`, never admission gates.
+A current-format crash snapshot reconciled to `paused` / `interrupted` uses its valid identity
+manifest even though it has no quiescent terminal-environment capture. Input formats below 2 take
+the input-format positional compatibility bridge; a format greater than the current format is
+`runtime-mismatch`. The run-ID lease protects run persistence, not the workspace. The engine does
+not attempt to restore or judge filesystem state: replayed writers do not recreate their writes,
+and later live agents navigate the world they actually encounter.
 
 Automatic policy selects:
 
-- `"positional-v1"` / `"legacy"` with `fallbackReason: "crash-residue"` for every reconciled
-  `paused` / `interrupted` crash snapshot without terminal-environment proof;
 - `"positional-v1"` / `"legacy"` with `fallbackReason: "inputs-format-legacy"` for a marked source
-  that settled normally, whose input-fingerprint format is below 2, and whose other admission facts
-  agree;
-- `"identity-v1"` only for a stable source whose represented agent occurrences are safety-marked and
-  whose checkpoint results are proven host decisions;
-- `"positional-v1"` / `"safe-prefix"` for a structurally valid, start-to-terminal stable source
-  that is unsafe for non-contiguous matching; only safety-marked agents and fingerprint-equal host
-  checkpoints replay until the first miss;
-- `"positional-v1"` / `"all-live"` for nested-workflow or start-to-terminal-drift fallback;
+  whose input-fingerprint format is below 2 and whose other structural admission facts agree;
+- `"identity-v1"` for a current-format source with a valid represented call manifest and seed,
+  including current-format crash snapshots without terminal-environment capture, unannotated
+  agents, headless checkpoints, nested workflows, and source-world drift;
+- `"positional-v1"` / `"safe-prefix"` when explicitly requested or when a structurally valid
+  source cannot represent every non-result occurrence in the identity seed;
 - `"live"` for an invalid or unsupported new-format source, including missing metadata,
   incompatible format literals, and invalid manifest/seed state.
 
-In identity mode, allocation-ordered decisions close and durably clear the remaining cache before
-an unannotated live agent, nested workflow, live host checkpoint callback, or declared worktree
-that fails/degrades can act. Declared readers and successfully isolated declared worktrees keep it
-open; their runners may execute concurrently because the declaration forbids cross-call side
-channels. `parallel()` siblings that communicate through files or ambient resources violate this
-contract and must be sequenced instead.
+Identity decisions are independent per recorded occurrence. A changed call runs live without
+clearing unmatched candidates, so matching calls later in source order, after a live writer, or on
+the other side of a nested workflow can still replay. This remains true when a worktree degrades or
+a live host checkpoint callback runs. The engine never uses ambient/world effects as an implicit
+dependency graph.
 
 Identity replays add the preserved source logical debit once to script-visible
 `budget.spent()`/`remaining()` and phase/run gates, but current `tokenUsage`, provider cost, and the
 current physical `WorkflowCallRecord.budgetDebit` remain zero. Replayed agent sessions open no new
 session: their record keeps source session/backend/cwd/reopen fields and rebinds only the current
-call index, label, and phase. Proven host checkpoint decisions use the same identity rules plus an
-equal fingerprint of `default`, `headless`, and `timeoutMs`; source headless decisions always run
-fresh. New-run `checkpointReplies` keys name source indexes, and an unambiguous reply may be
-injected at a shifted current index.
+call index, label, and phase. Completed checkpoint decisions use the same identity rules plus an
+equal fingerprint of `default`, `headless`, and `timeoutMs`, regardless of host/headless origin.
+New-run `checkpointReplies` keys name source indexes. A reply may follow a uniquely moved checkpoint
+while earlier correspondence remains intact; after a prior live divergence it must reach the exact
+recorded path, preventing a different same-text branch from consuming the human decision.
 
 #### Positional and legacy compatibility
 
 `resumePolicy: "positional"` requests the index/hash prefix matcher, but a new-format source still
-must pass cwd, format, metadata, manifest, and seed admission plus per-call input, safety, and
-host-checkpoint gates. There is no force-identity option. Marker-less recordings and permanent `legacyResume`
+must pass cwd, format, metadata, manifest, and seed admission plus per-call input agreement. There
+is no force-identity option. Marker-less recordings and permanent `legacyResume`
 artifacts use historical hash-only positional matching because their newer facts do not exist.
 Manual `resumeJournal` and same-ID `resume()`/`resumeInBackground()` always enter that legacy arm
 and cannot be laundered into an identity-capable hop. Aborted or `abortSignaled` sources are never
 served from this arm.
 
 Format-1 fingerprints are never reinterpreted as format 2. A marker-less ≤0.23 crash remains
-`legacy-recording`; a reconciled `paused` / `interrupted` crash takes `crash-residue`; a marked normally settled format-1 source
-takes `inputs-format-legacy`; and a normally settled format-2 source may take identity replay. The
+`legacy-recording`; a marked format-1 source takes `inputs-format-legacy`; and a valid format-2
+source, including crash residue, may take identity replay. The
 `inputs-format-legacy` bridge uses
 the established hash-only index/prefix matcher, and every selected row is re-journaled under the
 target's format 2 runtime so its next hop can use identity matching. Positional new-run preparation
@@ -450,15 +441,14 @@ resumes while excluding engine-minted `-nested<N>` scopes and scopes for deleted
 paused positional terminal save retains only inherited source rows the current execution visited,
 so an unvisited tail runs live on the next hop.
 
-An all-live outcome is normal calibration rather than an operational error. Missing resume
-metadata, incompatible format literals, or invalid manifest/seed state can disable new-format
-replay. If any result row lacks a path/input fact—possible when a deep call stack passes the
-raw-frame cap or an agent `meta` value is not strict JSON—the source is `"manifest-invalid"`;
-ignoring that row could make an ambiguous sibling look unique. Normally settled format-1 sources
-use the input-format positional bridge, while a format greater than the current format is
-`"runtime-mismatch"`. Node/V8 and current-environment drift appear as provenance diagnostics and
-never cause all-live. An engine package-version difference is also diagnostic and never disables
-either strategy.
+An all-live outcome is normal when correspondence cannot be established, not when the world
+changed. Missing resume metadata, incompatible format literals, or invalid manifest/seed state can
+disable new-format replay. If any result row lacks a path/input fact—possible when a deep call stack
+passes the raw-frame cap or an agent `meta` value is not strict JSON—the source is
+`"manifest-invalid"`; ignoring that row could make an ambiguous sibling look unique. Format-1
+sources use the input-format positional bridge, while a format greater than the current format is
+`"runtime-mismatch"`. Filesystem/environment, Node/V8, and engine-version differences are
+diagnostics only.
 
 #### Frozen resume reason catalogs
 
@@ -476,6 +466,11 @@ facade. Their literal unions live in `@automatalabs/shared-types`:
   `ambiguous-content`, `candidate-consumed`, `empty-output`, `safety-changed`, `unsafe-suffix`,
   `worktree-degraded`.
 - `RESUME_CALL_FAILED_REASONS`: `seed-persistence-error`, `resume-fatal-latch`.
+
+The catalogs are wire-compatible with existing journals and consumers. World/safety-era literals
+such as `crash-residue`, `unsafe-recording`, `nested-workflows`,
+`source-environment-drift`, `safety-changed`, and `unsafe-suffix` remain parseable but are not
+world-state gates in the current automatic contract.
 
 Every branch follows fail-to-live: the report explains why a call ran or why resume was disabled;
 no reason authorizes a possibly stale value.
@@ -1169,7 +1164,7 @@ await runner.logout({ model: "codex" });
 Installed adapter status from the bundled dists:
 
 - `@agentclientprotocol/claude-agent-acp@0.60.0`: advertises `auth.logout`, implements `logout`, and implements `authenticate` for its gateway auth methods; terminal login methods are advertised only when the client advertises terminal auth support. As of 0.60.0 it advertises `providers` and implements `providers/list`, `providers/set`, and `providers/disable` for a single provider `providerId` `"main"` supporting `apiType` `anthropic`, `bedrock`, and `vertex`; `providers/set` rejects any other `providerId`/`apiType` with invalid-params, and `vertex` additionally requires `_meta.claudeCode.vertex.{projectId,region}` (recorded as durable routing config and replayed on every reconstructed `providers/set`, so pooled connections re-route correctly). `providers/disable` is idempotent.
-- `@automatalabs/codex-acp@1.6.9`: advertises `auth.logout`, implements `authenticate` (`api-key`, `chat-gpt`, and `gateway` when gateway support is advertised), and implements `logout`. As of 1.6.0 (upstream sync) it also advertises `providers` and implements `providers/list`, `providers/set`, and `providers/disable` for its single client-configurable custom gateway provider: `providerId` `"custom-gateway"`, `supported: ["openai"]`, `required: false`, `current` carrying only the non-secret `{ apiType, baseUrl }` (never headers) and `null` while unconfigured; `providers/set` rejects any other `providerId`/`apiType` with invalid-params and `providers/disable` is idempotent. Its separate reasoning-effort options remain agent-owned configuration; model-spec brackets are never interpreted by this client.
+- `@automatalabs/codex-acp@1.6.10`: advertises `auth.logout`, implements `authenticate` (`api-key`, `chat-gpt`, and `gateway` when gateway support is advertised), and implements `logout`. As of 1.6.0 (upstream sync) it also advertises `providers` and implements `providers/list`, `providers/set`, and `providers/disable` for its single client-configurable custom gateway provider: `providerId` `"custom-gateway"`, `supported: ["openai"]`, `required: false`, `current` carrying only the non-secret `{ apiType, baseUrl }` (never headers) and `null` while unconfigured; `providers/set` rejects any other `providerId`/`apiType` with invalid-params and `providers/disable` is idempotent. Its separate reasoning-effort options remain agent-owned configuration; model-spec brackets are never interpreted by this client.
 - Host-resolved OpenCode (`opencode-ai` 1.17.14 in the verified profile): advertises the `opencode-login` terminal-style method when the client advertises terminal auth, acknowledges `authenticate`, and relies on its provider credential store; it does not advertise logout. The credential-gated live suite verifies the installed executable because OpenCode is not bundled.
 - `@automatalabs/pi-acp`: unconditionally advertises `anthropic-api-key`, `openai-api-key`, `gemini-api-key`, `xai-api-key`, `openrouter-api-key`, and `pi-stored-credentials`. The first five are `env_var` methods; the stored-credentials method is a bare `agent` method backed by `~/.pi/agent/auth.json`. Authentication is ambient/no-op, while a known model with missing credentials rejects with ACP `-32000`.
 
@@ -1240,7 +1235,7 @@ await chat.prompt("Revise section 3 — the user wants X.");
 
 Set `agent(prompt, { keepSession: true })` in the script (or `RunOptions.keepSession` on direct `run()` calls) when you intend to re-open: it skips the release-time best-effort `session/close`, guaranteeing the agent-persisted session is untouched. Without it the record is still surfaced, and the four first-class agents keep closed sessions loadable — but `keepSession` is the explicit, agent-agnostic contract. Check `reopen.load`/`reopen.resume` before offering re-attach and optional `reopen.fork` before offering a fork in UI: an agent that persists nothing advertises none of them, and its sessions are reachable only while held open (`openSession`). The fork flag is optional so records written before this field existed remain valid.
 
-Lifecycle methods are capability-gated after initialize. In particular, `forkSession()` requires `sessionCapabilities.fork`; when absent it throws a non-recoverable `WorkflowError` naming the backend and `session/fork` before any fork request is sent. The installed `@agentclientprotocol/claude-agent-acp@0.60.0` advertises `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close/fork (fork verified live: the forked session carries the source conversation's context). `@automatalabs/codex-acp@1.6.9` advertises `loadSession: true` plus list/delete/resume/close — no fork yet. OpenCode advertises load/list/resume/close/fork (also verified live). `@automatalabs/pi-acp` advertises load plus list/resume/close/fork and deliberately omits delete; unsupported lifecycle methods still fail through the same gate.
+Lifecycle methods are capability-gated after initialize. In particular, `forkSession()` requires `sessionCapabilities.fork`; when absent it throws a non-recoverable `WorkflowError` naming the backend and `session/fork` before any fork request is sent. The installed `@agentclientprotocol/claude-agent-acp@0.60.0` advertises `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close/fork (fork verified live: the forked session carries the source conversation's context). `@automatalabs/codex-acp@1.6.10` advertises `loadSession: true` plus list/delete/resume/close — no fork yet. OpenCode advertises load/list/resume/close/fork (also verified live). `@automatalabs/pi-acp` advertises load plus list/resume/close/fork and deliberately omits delete; unsupported lifecycle methods still fail through the same gate.
 
 ### Capabilities
 
@@ -1274,7 +1269,7 @@ Two gates run before any prompt tokens are spent:
 - The agent must advertise `agentCapabilities.mcpCapabilities.acp === true`; otherwise the ACP server config fails with non-recoverable `SCRIPT_VALIDATION_ERROR`.
 - The runner must have a complete `clientHandlers.mcp`; declaring `{ type: "acp" }` without a handler is also a non-recoverable config error.
 
-Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.60.0` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp@1.6.9` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, OpenCode advertises HTTP/SSE MCP support, and `@automatalabs/pi-acp` serves stdio, Streamable HTTP, and SSE while advertising `{ http:true, sse:true }`. Pi also consumes the stable MCP base protocol plus sampling, roots, and form/URL elicitation; client-hosted `acp` remains runner-owned.
+Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.60.0` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp@1.6.10` advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, OpenCode advertises HTTP/SSE MCP support, and `@automatalabs/pi-acp` serves stdio, Streamable HTTP, and SSE while advertising `{ http:true, sse:true }`. Pi also consumes the stable MCP base protocol plus sampling, roots, and form/URL elicitation; client-hosted `acp` remains runner-owned.
 
 ---
 

@@ -128,6 +128,9 @@ export function translateEvent(event: AgentSessionEvent, failedResult?: PiResult
     case "thinking_level_changed":
     case "auto_retry_start":
     case "auto_retry_end":
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
       return [];
     default: {
       const exhaustive: never = event;

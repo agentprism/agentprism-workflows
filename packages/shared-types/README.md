@@ -128,15 +128,16 @@ From [`src/index.ts`](./src/index.ts):
   additive content-addressed new-run replay contract. Runtime reason arrays live in
   `@automatalabs/workflow-engine` and are re-exported by `@automatalabs/workflows`; see the
   [incremental resume API](../../docs/api.md#content-addressed-incremental-resume). The
-  `crash-residue` fallback identifies a crash snapshot reconciled to `paused` / `interrupted`
-  without a quiescent terminal environment and gives its hash-stable prefix legacy positional
-  eligibility. `inputs-format-legacy`
-  identifies a normally settled source below input-fingerprint format 2 that uses hash-only
-  positional replay. Producing/current engine versions and runtime/environment provenance changes
-  are diagnostics in `WorkflowReplayEligibility` and never gate replay.
+  Historical safety/world reason literals such as `crash-residue` remain in the wire unions so old
+  journals and consumers continue to parse. Current-format crash snapshots use identity matching
+  even without a terminal-environment capture. `inputs-format-legacy` identifies a source below
+  input-fingerprint format 2 that uses hash-only positional replay. Producing/current engine
+  versions and runtime/environment provenance changes are diagnostics in
+  `WorkflowReplayEligibility` and never gate replay.
 - `WorkflowCallRecord` — the terminal call manifest, including optional `path`, agent/checkpoint
-  `inputsHash`, occurrence-level `resumeSafety`, and manager-owned replay provenance. Old object literals remain
-  valid because every incremental-resume field is optional and omitted when unset.
+  `inputsHash`, legacy diagnostic `resumeSafety`, and manager-owned replay provenance. Replay is
+  determined by call correspondence, never this marker. Old object literals remain valid because
+  every incremental-resume field is optional and omitted when unset.
 - `JournalCallMetadata` and optional `JournalEntry.call` — replay-neutral agent/checkpoint
   attribution (`kind`, label, phase, resolved model, actual backend). Legacy entries without it
   remain valid.

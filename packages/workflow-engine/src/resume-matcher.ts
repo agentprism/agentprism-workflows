@@ -21,19 +21,15 @@ import {
   type PersistedResumeSeed,
   type PersistedRunState,
 } from "./run-persistence.js";
-import type { RunEnvironmentIdentity } from "./run-environment.js";
 import {
   appendIndexValue,
   buildResumeExactIndex,
-  environmentsEqual,
-  isRunEnvironmentIdentity,
   resumeContentKey,
   resumeExactKey,
   resumeOccurrenceKey,
   type ResumeContentKey,
   type ResumeExactKey,
 } from "./resume-identity.js";
-import { validateResumeSafetyMarker } from "./resume.js";
 import { cloneFrozenStrictJson, cloneStrictJsonValue, deepFreeze } from "./strict-json.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -41,10 +37,7 @@ const TERMINAL_STATUSES = new Set(["completed", "paused", "failed"]);
 const RESUME_MATCHES = new Set(["path-hash", "unique-hash", "index-hash"]);
 const RESUME_SAFETY = new Set(["declared-read-only", "isolated-worktree"]);
 
-export interface ResumeRuntimeIdentity {
-  engineVersion?: string;
-  node: string;
-  v8: string;
+export interface ResumeFormatIdentity {
   pathFormat: number;
   inputsFormat: number;
   checkpointInputsFormat: number;
@@ -55,8 +48,7 @@ export interface ResumeAdmissionInput {
   requestedPolicy: ResumePolicy;
   current: {
     effectiveCwd: string;
-    runtime: ResumeRuntimeIdentity;
-    environment?: RunEnvironmentIdentity;
+    runtime: ResumeFormatIdentity;
   };
   checkpointReplies?: Record<string, unknown>;
 }
@@ -64,9 +56,6 @@ export interface ResumeAdmissionInput {
 export interface ResumeAdmissionFacts {
   pendingRepresented: boolean;
   allCallsRepresented: boolean;
-  filesystemStable: boolean;
-  allAgentsSafe: boolean;
-  allCheckpointResultsHostDecisions: boolean;
 }
 
 export type ResumeAdmissionDecision =
@@ -125,12 +114,8 @@ export interface ResumeMatchInput {
   hash: string;
   path?: string;
   inputsHash?: string;
-  cacheOpen: boolean;
   consumed: ReadonlySet<string>;
   hasSchema?: boolean;
-  resumeDeclared?: boolean;
-  resolvedIsolation?: "worktree";
-  hasAgentCwd?: boolean;
 }
 
 export type ResumeMatchDecision =
@@ -151,11 +136,8 @@ export type ResumeMatchDecision =
         | "ambiguous-content"
         | "candidate-consumed"
         | "empty-output"
-        | "safety-changed"
-        | "unsafe-suffix"
       >;
       remove?: IndexedResumeSource;
-      closesSuffix?: true;
     };
 
 export interface PositionalResumeMatchInput {
@@ -168,9 +150,6 @@ export interface PositionalResumeMatchInput {
   cached?: JournalEntry;
   sourceCall?: WorkflowCallRecord;
   hasSchema?: boolean;
-  resumeDeclared?: boolean;
-  resolvedIsolation?: "worktree";
-  hasAgentCwd?: boolean;
 }
 
 export type PositionalResumeMatchDecision =
@@ -347,17 +326,6 @@ function effectiveLogicalDebit(call: WorkflowCallRecord): number | undefined {
   return undefined;
 }
 
-function isHostCheckpointDecision(call: WorkflowCallRecord): boolean {
-  return call.kind === "checkpoint" && call.outcome === "result" && (
-    call.origin === "confirm" ||
-    (call.origin === "journal-replay" && call.replay?.checkpointHostDecision === true)
-  );
-}
-
-function isValidSafetyMarker(call: WorkflowCallRecord): boolean {
-  return validateResumeSafetyMarker(call, false);
-}
-
 function validateReplayForCall(call: WorkflowCallRecord): boolean {
   const mustHaveReplay = call.origin === "journal-replay" && call.outcome === "result";
   if (!mustHaveReplay) return call.replay === undefined;
@@ -365,8 +333,6 @@ function validateReplayForCall(call: WorkflowCallRecord): boolean {
   if (call.kind === "agent") {
     return (
       isFiniteNonNegative(call.replay.logicalBudgetDebit) &&
-      isResumeSafety(call.replay.sourceResumeSafety) &&
-      call.replay.sourceResumeSafety === call.resumeSafety &&
       call.replay.checkpointHostDecision === undefined &&
       call.replay.checkpointInjected === undefined
     );
@@ -374,7 +340,7 @@ function validateReplayForCall(call: WorkflowCallRecord): boolean {
   return (
     call.replay.logicalBudgetDebit === undefined &&
     call.replay.sourceResumeSafety === undefined &&
-    call.replay.checkpointHostDecision === true
+    (call.replay.checkpointInjected !== true || call.replay.checkpointHostDecision === true)
   );
 }
 
@@ -407,7 +373,7 @@ function validateBasicCall(value: unknown, sourceRunId: string): value is Workfl
 }
 
 function validateCallFacts(call: WorkflowCallRecord): boolean {
-  if (!isValidSafetyMarker(call) || !validateReplayForCall(call)) return false;
+  if (!validateReplayForCall(call)) return false;
   if (
     call.worktree === true &&
     (call.kind !== "agent" || call.origin !== "runner" || call.isolation !== "worktree")
@@ -421,7 +387,11 @@ function validateCallFacts(call: WorkflowCallRecord): boolean {
     return effectiveLogicalDebit(call) !== undefined;
   }
   if (call.budgetDebit !== undefined) return false;
-  return call.origin === "confirm" || call.origin === "headless" || isHostCheckpointDecision(call);
+  return (
+    call.origin === "confirm" ||
+    call.origin === "headless" ||
+    call.origin === "journal-replay"
+  );
 }
 
 function validateJournalEntry(value: unknown, sourceRunId: string): value is JournalEntry {
@@ -504,10 +474,10 @@ function validateCandidate(value: unknown): PersistedResumeCandidate | undefined
   }
   if (value.call.kind === "agent") {
     const debit = effectiveLogicalDebit(value.call);
-    if (value.call.resumeSafety === undefined || debit === undefined || value.logicalBudgetDebit !== debit) {
+    if (debit === undefined || value.logicalBudgetDebit !== debit) {
       return undefined;
     }
-  } else if (value.logicalBudgetDebit !== undefined || !isHostCheckpointDecision(value.call)) {
+  } else if (value.logicalBudgetDebit !== undefined) {
     return undefined;
   }
   return strictClone(value as unknown as PersistedResumeCandidate);
@@ -524,17 +494,6 @@ function validateCallBlocker(value: unknown): PersistedResumeCallBlocker | undef
     value.call.outcome === "result" ||
     !isPath(value.call.path) ||
     !isHash(value.call.inputsHash)
-  ) {
-    return undefined;
-  }
-  if (value.call.kind === "agent") {
-    if (value.call.resumeSafety === undefined) return undefined;
-  } else if (
-    value.call.origin !== "engine" ||
-    value.call.aborted !== true ||
-    !isRecord(value.call.error) ||
-    value.call.error.form !== "workflow-error" ||
-    value.call.error.code !== WorkflowErrorCode.WORKFLOW_ABORTED
   ) {
     return undefined;
   }
@@ -730,10 +689,9 @@ export function cloneResumeCandidate(
     return undefined;
   }
   const logicalBudgetDebit = call.kind === "agent" ? effectiveLogicalDebit(call) : undefined;
-  if (call.kind === "agent" && (call.resumeSafety === undefined || logicalBudgetDebit === undefined)) {
+  if (call.kind === "agent" && logicalBudgetDebit === undefined) {
     return undefined;
   }
-  if (call.kind === "checkpoint" && !isHostCheckpointDecision(call)) return undefined;
   return strictClone({
     sourceRunId,
     recordedIndex: call.index,
@@ -869,13 +827,10 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
     };
   }
 
-  const resume = source.resume as NonNullable<PersistedRunState["resume"]>;
   if (
     !isNonEmptyString(sourceRunId) ||
     typeof source.effectiveCwd !== "string" ||
     !isRecord(source.runtime) ||
-    typeof source.runtime.node !== "string" ||
-    typeof source.runtime.v8 !== "string" ||
     !Number.isSafeInteger(source.runtime.pathFormat) ||
     !Number.isSafeInteger(source.runtime.inputsFormat) ||
     !Number.isSafeInteger(source.runtime.checkpointInputsFormat) ||
@@ -904,21 +859,6 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
     return liveDecision(sourceRunId, requestedPolicy, "runtime-mismatch", undefined, checkpointReplyIndex);
   }
 
-  if (
-    resume.terminalEnvironment === undefined &&
-    source.status === "paused" &&
-    source.pauseReason === "interrupted"
-  ) {
-    return {
-      strategy: "positional-v1",
-      sourceRunId,
-      requestedPolicy,
-      fallbackReason: "crash-residue",
-      eligibility: "legacy",
-      ...(checkpointReplyIndex === undefined ? {} : { checkpointReplyIndex }),
-      ...(reply ? { legacyCheckpointReply: reply } : {}),
-    };
-  }
   if (inputsFormatLegacy) {
     return {
       strategy: "positional-v1",
@@ -954,7 +894,9 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
   }
 
   const promotedBlockers = manifest.calls
-    .filter((call) => call.outcome !== "result")
+    .filter((call) =>
+      call.outcome !== "result" &&
+      !(preparedInjection.injection && call.index === preparedInjection.injection.recordedIndex))
     .map((call) => cloneResumeCallBlocker(sourceRunId, call))
     .filter((blocker): blocker is PersistedResumeCallBlocker => blocker !== undefined);
   const blockerIndexes = new Set(promotedBlockers.map((blocker) => blocker.recordedIndex));
@@ -969,31 +911,17 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
     blockerIndexes.has(call.index) ||
     (pendingRepresented && call.index === pendingIndex),
   );
-  const filesystemStable = environmentsEqual(source.environment, resume.terminalEnvironment);
-  const allAgentsSafe =
-    manifest.calls.every((call) => call.kind !== "agent" || call.resumeSafety !== undefined) &&
-    retained.candidates.every((candidate) =>
-      candidate.call.kind !== "agent" || candidate.call.resumeSafety !== undefined,
-    );
-  const allCheckpointResultsHostDecisions = manifest.calls.every((call) =>
-    call.kind !== "checkpoint" || call.outcome !== "result" || isHostCheckpointDecision(call),
-  );
   const facts: ResumeAdmissionFacts = {
     pendingRepresented,
     allCallsRepresented,
-    filesystemStable,
-    allAgentsSafe,
-    allCheckpointResultsHostDecisions,
   };
 
   const fallbackReason: WorkflowResumeFallbackReason | undefined =
     requestedPolicy === "positional"
       ? "forced-positional"
-      : source.nestedWorkflows === true
-        ? "nested-workflows"
-        : !allAgentsSafe || !allCheckpointResultsHostDecisions || !allCallsRepresented
-          ? "unsafe-recording"
-          : undefined;
+      : !allCallsRepresented
+        ? "unsafe-recording"
+        : undefined;
   if (fallbackReason) {
     const checkpointSeed = preparedInjection.injection
       ? normalizeResumeSeed({ sourceRunId, pendingInjection: preparedInjection.injection })
@@ -1003,25 +931,15 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
       sourceRunId,
       requestedPolicy,
       fallbackReason,
-      eligibility: source.nestedWorkflows === true || !filesystemStable ? "all-live" : "safe-prefix",
+      eligibility: "safe-prefix",
       ...(checkpointReplyIndex === undefined ? {} : { checkpointReplyIndex }),
       ...(checkpointSeed ? { checkpointSeed } : {}),
       facts,
     };
   }
-  if (!filesystemStable) {
-    return liveDecision(
-      sourceRunId,
-      requestedPolicy,
-      "source-environment-drift",
-      facts,
-      checkpointReplyIndex,
-    );
-  }
   const promoted: PersistedResumeCandidate[] = [];
   for (const call of manifest.calls) {
     if (call.outcome !== "result") continue;
-    if (call.kind === "checkpoint" && !isHostCheckpointDecision(call)) continue;
     const candidate = cloneResumeCandidate(
       sourceRunId,
       manifest.journalByIndex.get(call.index) as JournalEntry,
@@ -1160,25 +1078,6 @@ function selectedSource(
   return { source, match: "unique-hash" };
 }
 
-function currentSafety(input: ResumeMatchInput): WorkflowResumeSafety | undefined {
-  if (input.kind !== "agent" || input.resumeDeclared !== true) return undefined;
-  if (input.resolvedIsolation === undefined) return "declared-read-only";
-  return input.hasAgentCwd === true ? undefined : "isolated-worktree";
-}
-
-function positionalCurrentSafety(input: PositionalResumeMatchInput): WorkflowResumeSafety | undefined {
-  return currentSafety({
-    kind: input.kind,
-    hash: input.hash,
-    inputsHash: input.inputsHash,
-    cacheOpen: true,
-    consumed: new Set(),
-    resumeDeclared: input.resumeDeclared,
-    resolvedIsolation: input.resolvedIsolation,
-    hasAgentCwd: input.hasAgentCwd,
-  });
-}
-
 export function initialPositionalFirstMiss(
   eligibility: PositionalResumeMatchInput["eligibility"],
 ): number {
@@ -1209,12 +1108,7 @@ export function selectPositionalResume(
       source.hash === input.hash &&
       source.outcome === "result" &&
       isHash(source.inputsHash) &&
-      source.inputsHash === input.inputsHash &&
-      (input.kind === "agent"
-        ? isValidSafetyMarker(source) &&
-          source.resumeSafety !== undefined &&
-          source.resumeSafety === positionalCurrentSafety(input)
-        : isHostCheckpointDecision(source));
+      source.inputsHash === input.inputsHash;
   }
   if (!hashMatches || emptyAgent || !safePrefixMatches) {
     return { action: "live", reason: "positional-miss", nextFirstMiss: input.index };
@@ -1235,19 +1129,16 @@ export function selectResumeCandidate(
   indexes: ResumeCandidateIndexes,
   input: ResumeMatchInput,
 ): ResumeMatchDecision {
-  if (!input.cacheOpen) return { action: "live", reason: "unsafe-suffix" };
   if (!isPath(input.path)) return { action: "live", reason: "path-missing" };
   if (!isHash(input.inputsHash)) return { action: "live", reason: "inputs-missing" };
   const selected = selectedSource(indexes, input);
   if (selected.reason) return selected.reason;
   const source = selected.source as IndexedResumeSource;
   if (source.type === "blocker") {
-    const closesSuffix = input.kind === "agent" && currentSafety(input) === undefined;
     return {
       action: "live",
       reason: "not-recorded",
       remove: source,
-      ...(closesSuffix ? { closesSuffix: true as const } : {}),
     };
   }
   if (
@@ -1258,17 +1149,6 @@ export function selectResumeCandidate(
     source.candidate.entry.result.trim().length === 0
   ) {
     return { action: "live", reason: "empty-output", remove: source };
-  }
-  if (
-    input.kind === "agent" &&
-    (source.type !== "candidate" || source.candidate.call.resumeSafety !== currentSafety(input))
-  ) {
-    return {
-      action: "live",
-      reason: "safety-changed",
-      remove: source,
-      ...(currentSafety(input) === undefined ? { closesSuffix: true as const } : {}),
-    };
   }
   return { action: "replay", source, match: selected.match as "path-hash" | "unique-hash" };
 }

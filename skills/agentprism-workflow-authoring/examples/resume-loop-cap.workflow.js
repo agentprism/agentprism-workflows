@@ -1,10 +1,8 @@
 // resume-loop-cap — demonstrate raising an orchestration-only cap on resume.
 // Run once with maxRounds=6 to journal six expensive rounds and halt; run again
-// with maxRounds=8 plus the first runId as resumeFromRunId. Each call carries the
-// resume: { filesystem: "read-only" } safety declaration, so identity matching can
-// serve the six unchanged rounds from the recording for zero tokens and only
-// rounds 7–8 run live. Without the declaration the recording is unsafe for
-// content-addressed replay and every round would run live on resume.
+// with maxRounds=8 plus the first runId as resumeFromRunId. Identity matching can
+// serve the six unchanged rounds from the journal for zero tokens and only rounds
+// 7–8 run live. Replay needs no filesystem-safety annotation.
 export const meta = {
   name: "resume-loop-cap",
   description: "Run expensive review rounds up to an args-controlled cap",
@@ -21,7 +19,7 @@ for (let i = 0; i < maxRounds; i += 1) {
   rounds.push(
     await agent(
       `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
-      { label: `review:${i + 1}`, phase: "Review", resume: { filesystem: "read-only" } },
+      { label: `review:${i + 1}`, phase: "Review" },
     ),
   );
 }

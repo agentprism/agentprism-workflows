@@ -14,6 +14,8 @@ export interface ContinuationCandidate {
   readonly callIndex: number;
   readonly hash: string;
   readonly inputsHash?: string;
+  /** Input fingerprint format used by the interrupted source call. Missing means current format. */
+  readonly inputsFormat?: number;
   readonly sessionRef: AgentSessionRecord;
   readonly recordedCwd: string;
 }
@@ -70,6 +72,8 @@ export const RESUME_CALL_FAILED_REASONS = Object.freeze([
   "resume-fatal-latch",
 ] as const satisfies readonly WorkflowResumeCallFailedReason[]);
 
+/** Validates legacy diagnostic provenance for recording tests and migration tooling.
+ * Never use this helper to decide whether a journal result may replay. */
 export function validateResumeSafetyMarker(
   record: WorkflowCallRecord,
   legacyResume: boolean,
@@ -84,13 +88,10 @@ export function validateResumeSafetyMarker(
   }
   if (record.origin === "journal-replay") {
     if (record.outcome !== "result" || legacyResume) return record.resumeSafety === undefined;
-    if (
-      record.resumeSafety === undefined ||
-      record.replay === undefined ||
-      record.replay.sourceResumeSafety !== record.resumeSafety
-    ) {
-      return false;
-    }
+    if (record.replay === undefined) return false;
+    const sourceSafety = record.replay.sourceResumeSafety;
+    if (sourceSafety === undefined) return record.resumeSafety === undefined;
+    if (sourceSafety !== record.resumeSafety) return false;
   }
   if (record.resumeSafety === undefined) return true;
   if (record.resumeSafety === "declared-read-only") {
@@ -122,11 +123,12 @@ export type PreparedResume =
       requestedPolicy: ResumePolicy;
       checkpointReplyIndex?: number;
       fallbackReason: WorkflowResumeFallbackReason;
-      /** "legacy" is the exact historical matcher. "safe-prefix" permits only
-       *  safety-marked new-format hits. "all-live" initializes firstMiss to 0. */
+      /** "legacy" is the exact historical matcher. "safe-prefix" permits
+       *  integrity-checked new-format prefix hits. "all-live" is retained for
+       *  compatibility and initializes firstMiss to 0. */
       eligibility: "legacy" | "safe-prefix" | "all-live";
       /** Root source manifest by source index when available; empty for pre-manifest legacy
-       *  sources. Used only to carry safety/provenance into fresh current rows. */
+       *  sources. Used to validate inputs and carry debit/diagnostic provenance. */
       sourceCalls: ReadonlyMap<number, WorkflowCallRecord>;
       /** Present only for a new-format shifted checkpoint injection. Its candidates
        *  array is empty; commitSeed has the same critical semantics as above. */

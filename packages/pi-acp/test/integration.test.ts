@@ -131,7 +131,7 @@ test("T21 real AgentSession with an injected Agent streamFn completes a credenti
     const agent = new Agent({
       initialState: { model, systemPrompt: "Hermetic test", tools: [] },
       getApiKey: () => "hermetic-key",
-      streamFunction: streamFn,
+      streamFn,
     });
     const session = new AgentSession({
       agent,
@@ -267,7 +267,7 @@ test("M5 actual Pi turn keeps a selected removed tool, then omits it and tombsto
     const agent = new Agent({
       initialState: { model, systemPrompt: "M5 turn boundary", tools: [] },
       getApiKey: () => "hermetic-key",
-      streamFunction: streamFn,
+      streamFn,
     });
     realSession = new AgentSession({
       agent,
