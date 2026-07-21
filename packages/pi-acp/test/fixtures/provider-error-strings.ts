@@ -1,4 +1,7 @@
-export const FIXTURE_PI_PIN = "0.80.10";
+export const FIXTURE_PI_PIN = "0.81.0";
+// 2026-07-21 bump 0.80.10 -> 0.81.0: every fixture string below was re-verified byte-identical
+// against the installed pi v0.81.0 dists (auth/guidance templates moved lines but did not change);
+// the per-string citations record where each originated in the pi monorepo at v0.80.10.
 
 const LOGIN_HELP = [
   "Use /login to log into a provider via OAuth or API key. See:",
