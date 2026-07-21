@@ -52,7 +52,7 @@ The quality helpers give you the machinery; these rules — each bought with a r
 
 ## Human gates: `checkpoint()`
 
-`checkpoint(promptText, options?)` is a zero-token, journaled human gate. With a live SDK `confirm` callback or MCP elicitation it waits for that reply; without a live channel, its default mode takes `default ?? true` immediately, so detached runs never hang.
+`checkpoint(promptText, options?)` is a zero-token, journaled human gate. With MCP elicitation (or a live SDK `confirm` callback) it waits for that reply; without a live channel, its default mode takes `default ?? true` immediately, so detached runs never hang.
 
 ```js
 const proceed = await checkpoint(`Apply this plan?\n${JSON.stringify(plan, null, 2)}`, {
@@ -64,4 +64,4 @@ const proceed = await checkpoint(`Apply this plan?\n${JSON.stringify(plan, null,
 if (!proceed) return { applied: false, plan };
 ```
 
-`kind: "input"` resolves to free text, `kind: "select"` to one of `choices`. How the question reaches a human is the host's job (`ExecOptions.confirm` in the SDK; elicitation in the MCP server). With no live channel, `headless: "default"` (the default) takes `default ?? true`, `"abort"` aborts, and `"pause"` returns a managed run with `reason: "checkpoint_required"` plus non-secret `checkpointContext`. Resume the last mode with `checkpointReplies: { [context.callIndex]: decision }` or a live confirm. For `resumeFromRunId`, that key is the source context index; an unambiguous identity match may journal the injected answer at a shifted current index. Put a checkpoint before anything hard to reverse — applying diffs, pushing, publishing — and treat the FIRST commit into a user-owned checkout as exactly that: a workflow that mutates a working copy it did not create carries at least one checkpoint before its first mutation (`default: true` keeps detached runs moving).
+`kind: "input"` resolves to free text, `kind: "select"` to one of `choices`. How the question reaches a human is the host's job (elicitation in the MCP server; `ExecOptions.confirm` in the SDK). With no live channel, `headless: "default"` (the default) takes `default ?? true`, `"abort"` aborts, and `"pause"` returns a managed run with `reason: "checkpoint_required"` plus non-secret `checkpointContext`. Resume the last mode with `checkpointReplies: { [context.callIndex]: decision }` or a live confirm. For `resumeFromRunId`, that key is the source context index; an unambiguous identity match may journal the injected answer at a shifted current index. Put a checkpoint before anything hard to reverse — applying diffs, pushing, publishing — and treat the FIRST commit into a user-owned checkout as exactly that: a workflow that mutates a working copy it did not create carries at least one checkpoint before its first mutation (`default: true` keeps detached runs moving).
