@@ -230,6 +230,118 @@ test(
 );
 
 test(
+  "a resumed start supersedes crash-dangling live observability state",
+  withPersistence(async ({ persistence }) => {
+    const runId = "crash-resumed-events";
+    persistence.save(state(runId));
+
+    persistence.appendEvent(runId, {
+      seq: 1,
+      timestamp: TIMESTAMP,
+      event: { type: "agentStart", runId, scope: runId, label: "worker", prompt: "work", callIndex: 0 },
+    });
+    persistence.appendEvent(runId, {
+      seq: 2,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "agentTranscript",
+        runId,
+        scope: runId,
+        label: "worker",
+        callIndex: 0,
+        executionStartSeq: 1,
+        entryIndex: 0,
+        revision: 0,
+        operation: "upsert",
+        entry: { role: "assistant", kind: "text", text: "before crash", timestamp: 1 },
+      },
+    });
+    persistence.appendEvent(runId, {
+      seq: 3,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "agentProgress",
+        runId,
+        scope: runId,
+        label: "worker",
+        callIndex: 0,
+        executionStartSeq: 1,
+        turnCount: 1,
+        observedEvents: 1,
+        coalescedEvents: 0,
+        cause: "activity",
+        latestText: "before crash",
+      },
+    });
+
+    // A hard crash leaves the first execution without agentEnd. Same-ID resume
+    // retains the stream and deterministically starts the logical call again.
+    persistence.appendEvent(runId, {
+      seq: 4,
+      timestamp: TIMESTAMP,
+      event: { type: "resumed", runId, scope: runId },
+    });
+    persistence.appendEvent(runId, {
+      seq: 5,
+      timestamp: TIMESTAMP,
+      event: { type: "agentStart", runId, scope: runId, label: "worker", prompt: "work", callIndex: 0 },
+    });
+    persistence.appendEvent(runId, {
+      seq: 6,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "agentTranscript",
+        runId,
+        scope: runId,
+        label: "worker",
+        callIndex: 0,
+        executionStartSeq: 5,
+        entryIndex: 0,
+        revision: 0,
+        operation: "upsert",
+        entry: { role: "assistant", kind: "text", text: "after resume", timestamp: 2 },
+      },
+    });
+    persistence.appendEvent(runId, {
+      seq: 7,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "agentProgress",
+        runId,
+        scope: runId,
+        label: "worker",
+        callIndex: 0,
+        executionStartSeq: 5,
+        turnCount: 1,
+        observedEvents: 1,
+        coalescedEvents: 0,
+        cause: "activity",
+        latestText: "after resume",
+      },
+    });
+
+    const page = persistence.readEvents(runId, { limit: 100 });
+    assert.deepEqual(page.events.map((record) => record.seq), [1, 2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(
+      page.events
+        .filter((record) => record.event.type === "agentProgress" || record.event.type === "agentTranscript")
+        .map((record) => record.event.type === "agentProgress" || record.event.type === "agentTranscript"
+          ? record.event.executionStartSeq
+          : 0),
+      [1, 1, 5, 5],
+    );
+
+    const stream = persistence.watchEvents(runId, { after: 5, streamId: page.streamId });
+    try {
+      assert.equal((await stream.next()).value?.event.type, "agentTranscript");
+      assert.equal((await stream.next()).value?.event.type, "agentProgress");
+    } finally {
+      stream.close();
+    }
+  }),
+);
+
+test(
   "read validation uses the exact option and snapshot classification precedence",
   withPersistence(({ persistence, eventPath }) => {
     expectCode(() => persistence.readEvents("missing", { after: -1, limit: 0, streamId: "bad" }), "INVALID_CURSOR");

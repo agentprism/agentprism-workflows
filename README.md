@@ -12,6 +12,17 @@
 
 Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, OpenCode, and pi), with deterministic journaling, resume, token budgets, and git-worktree isolation.
 
+Long-running journaling runs are observable while agents are still working: subscribe to
+`workflow://runs/{runId}/events` for redacted content-bearing progress and incrementally reducible
+assistant/tool transcript upserts, then catch up exactly with the durable stream cursor.
+
+```ts
+const uri = `workflow://runs/${runId}/events`;
+await client.subscribeResource({ uri });
+const first = JSON.parse(resourceText(await client.readResource({ uri })));
+const next = `${uri}?after=${first.cursor}&limit=1000&streamId=${first.streamId}`;
+```
+
 **Your agent authors** a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
 
 - **As a TypeScript SDK** — `@automatalabs/workflows` — embed the runner in your own program.

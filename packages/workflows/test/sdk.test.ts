@@ -53,6 +53,10 @@ import {
   RUN_EVENT_READ_LIMIT_MAX,
   RUN_EVENT_MAX_RECORD_BYTES,
   RUN_EVENT_LOG_VERSION,
+  AGENT_PROGRESS_HEARTBEAT_MS,
+  AGENT_PROGRESS_MIN_INTERVAL_MS,
+  projectWorkflowAgentActivity,
+  workflowAgentEventSource,
   CALL_PATH_FORMAT,
   CALL_INPUTS_FORMAT,
   CHECKPOINT_INPUTS_FORMAT,
@@ -123,6 +127,10 @@ import type {
   RunEventErrorProjection,
   RunEventCheckpointProjection,
   PersistedRunAgentEndPayload,
+  RunAgentProgressEvent,
+  RunAgentProgressPayload,
+  RunAgentTranscriptEvent,
+  RunAgentTranscriptPayload,
   RunEventPersistence,
   RunEventStream,
   AppendRunEventInput,
@@ -130,6 +138,10 @@ import type {
   ReadRunEventsResult,
   WatchRunEventsOptions,
   RunEventLogErrorCode,
+  WorkflowAgentActivity,
+  WorkflowAgentActivityBase,
+  WorkflowAgentEventSink,
+  WorkflowAgentEventSource,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -205,6 +217,10 @@ type RunEventSeamSurface = [
   RunEventErrorProjection,
   RunEventCheckpointProjection,
   PersistedRunAgentEndPayload,
+  RunAgentProgressEvent,
+  RunAgentProgressPayload,
+  RunAgentTranscriptEvent,
+  RunAgentTranscriptPayload,
   RunEventPersistence,
   RunEventStream,
   AppendRunEventInput,
@@ -212,6 +228,10 @@ type RunEventSeamSurface = [
   ReadRunEventsResult,
   WatchRunEventsOptions,
   RunEventLogErrorCode,
+  WorkflowAgentActivity,
+  WorkflowAgentActivityBase,
+  WorkflowAgentEventSink,
+  WorkflowAgentEventSource,
 ];
 void (undefined as unknown as RunEventSeamSurface);
 
@@ -681,6 +701,10 @@ test("facade re-exports the §2.10 durable event read/tail host seam", () => {
   assert.equal(RUN_EVENT_READ_LIMIT_MAX, 1_000);
   assert.equal(RUN_EVENT_MAX_RECORD_BYTES, 65_536);
   assert.equal(RUN_EVENT_LOG_VERSION, 1);
+  assert.equal(AGENT_PROGRESS_MIN_INTERVAL_MS, 1_000);
+  assert.equal(AGENT_PROGRESS_HEARTBEAT_MS, 15_000);
+  assert.equal(typeof projectWorkflowAgentActivity, "function");
+  assert.equal(typeof workflowAgentEventSource, "function");
   // The frozen error taxonomy is carried by the re-exported class; construct one through the facade.
   const code: RunEventLogErrorCode = "CORRUPT_LOG";
   const error = new RunEventLogError("boom", code, { runId: "r" });

@@ -10,7 +10,7 @@
 // vm-realm globals, NOT importable symbols; they are documented for author IntelliSense
 // in ./dsl.d.ts (referenced above), not exported here.
 
-import { ACP_CROSS_CUTTING_EVENT_NAMES, createAcpRunner } from "@automatalabs/acp-agents";
+import { createAcpRunner } from "@automatalabs/acp-agents";
 import {
   openWorkflowDir,
   parseWorkflowScript,
@@ -18,10 +18,20 @@ import {
   WorkflowErrorCode,
   WorkflowManager as EngineWorkflowManager,
 } from "@automatalabs/workflow-engine";
-import type { AcpEventListener, AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
+import type { AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
 import type { ExecOptions, WorkflowDir, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
 import type { AgentRunner, RunEvent, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 import { approveScriptBackends, type ScriptBackendApproval } from "./script-backends.js";
+import {
+  projectWorkflowAgentActivity,
+  workflowAgentEventSource,
+} from "./agent-event-source.js";
+export {
+  projectWorkflowAgentActivity,
+  workflowAgentEventSource,
+  type WorkflowAgentEventSink,
+  type WorkflowAgentEventSource,
+} from "./agent-event-source.js";
 
 type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 
@@ -35,6 +45,8 @@ export {
   resolveWorkflowRunLimits,
   redactText,
   truncateUtf8,
+  AGENT_PROGRESS_HEARTBEAT_MS,
+  AGENT_PROGRESS_MIN_INTERVAL_MS,
   CALL_PATH_FORMAT,
   CALL_INPUTS_FORMAT,
   CHECKPOINT_INPUTS_FORMAT,
@@ -154,6 +166,8 @@ export type {
   WorkflowReplayProvenanceChange,
   WorkflowReplayFirstNonReplay,
   WorkflowReplayEligibility,
+  WorkflowAgentActivity,
+  WorkflowAgentActivityBase,
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
@@ -391,28 +405,15 @@ export type {
   RunEventErrorProjection,
   RunEventCheckpointProjection,
   PersistedRunAgentEndPayload,
+  RunAgentProgressEvent,
+  RunAgentProgressPayload,
+  RunAgentTranscriptEvent,
+  RunAgentTranscriptPayload,
 } from "@automatalabs/shared-types";
-
-/** Cross-cutting runner events the manager forwards alongside ACP `session/update` traffic. */
-type ManagerAcpCrossCuttingEventName = Exclude<AcpEventName, AcpUpdateKind | "session_update">;
-const MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES =
-  ACP_CROSS_CUTTING_EVENT_NAMES satisfies readonly ManagerAcpCrossCuttingEventName[];
-type Assert<T extends true> = T;
-type IsNever<T> = [T] extends [never] ? true : false;
-type _ManagerAcpCrossCuttingEventNamesComplete = Assert<
-  IsNever<Exclude<ManagerAcpCrossCuttingEventName, (typeof MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES)[number]>>
->;
-type _ManagerAcpCrossCuttingEventNamesExact = Assert<
-  IsNever<Exclude<(typeof MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES)[number], ManagerAcpCrossCuttingEventName>>
->;
-
-type AcpEventBusRunner = AgentRunner & {
-  on<K extends AcpEventName>(name: K, listener: AcpEventListener<K>): () => void;
-};
 
 interface AcpBridgeEntry {
   refs: number;
-  unsubscribers: Array<() => void>;
+  detach: () => void;
 }
 
 type ContextProperty<T, Key extends PropertyKey> = Key extends keyof T ? T[Key] : never;
@@ -493,7 +494,7 @@ export interface WorkflowManager {
  * only the manager's runner subscriptions (runner process ownership stays with the caller).
  */
 export class WorkflowManager extends EngineWorkflowManager {
-  private readonly acpBridges = new Map<AcpEventBusRunner, AcpBridgeEntry>();
+  private readonly acpBridges = new Map<AgentRunner, AcpBridgeEntry>();
 
   constructor(options: WorkflowManagerOptions = {}) {
     super(options);
@@ -556,7 +557,7 @@ export class WorkflowManager extends EngineWorkflowManager {
    *  caller may share one runner across managers or own its process lifetime explicitly. */
   dispose(): void {
     for (const bridge of this.acpBridges.values()) {
-      for (const unsubscribe of bridge.unsubscribers) unsubscribe();
+      bridge.detach();
     }
     this.acpBridges.clear();
   }
@@ -567,21 +568,21 @@ export class WorkflowManager extends EngineWorkflowManager {
   }
 
   private acquireAcpRunnerBridge(agent: AgentRunner | undefined): () => void {
-    if (!isAcpEventBusRunner(agent)) return () => {};
+    if (!agent) return () => {};
     let bridge = this.acpBridges.get(agent);
     if (!bridge) {
       bridge = {
         refs: 0,
-        unsubscribers: [
-          agent.on("session_update", (event) => {
-            this.emit("agentEvent", toSessionUpdateAgentEventPayload(event));
-          }),
-          ...MANAGER_ACP_CROSS_CUTTING_EVENT_NAMES.map((name) =>
-            agent.on(name, (event) => {
-              this.emit("agentEvent", toAgentEventPayload(name, event));
-            }),
-          ),
-        ],
+        detach: workflowAgentEventSource(agent).attach({
+          observe: (event) => {
+            try {
+              const activity = projectWorkflowAgentActivity(event);
+              if (activity !== undefined) this.observeAgentActivity(activity);
+            } finally {
+              this.emit("agentEvent", event);
+            }
+          },
+        }),
       };
       this.acpBridges.set(agent, bridge);
     }
@@ -595,51 +596,10 @@ export class WorkflowManager extends EngineWorkflowManager {
       if (current !== bridge) return;
       current.refs--;
       if (current.refs > 0) return;
-      for (const unsubscribe of current.unsubscribers) unsubscribe();
+      current.detach();
       this.acpBridges.delete(agent);
     };
   }
-}
-
-function isAcpEventBusRunner(agent: AgentRunner | undefined): agent is AcpEventBusRunner {
-  return typeof (agent as Partial<Record<"on", unknown>> | undefined)?.on === "function";
-}
-
-function toSessionUpdateAgentEventPayload(
-  event: AcpRunnerEventMap["session_update"],
-): WorkflowAgentEventPayload<AcpUpdateKind> {
-  const name = event.update.sessionUpdate;
-  return toAgentEventPayload(name, {
-    ...event.update,
-    sessionId: event.sessionId,
-    backendId: event.backendId,
-    label: event.label,
-    runId: event.runId,
-    callIndex: event.callIndex,
-  } as AcpRunnerEventMap[typeof name]);
-}
-
-function toAgentEventPayload<Name extends WorkflowAgentEventName>(
-  name: Name,
-  event: AcpRunnerEventMap[Name],
-): WorkflowAgentEventPayload<Name> {
-  const context = event as Partial<{
-    backendId: string;
-    sessionId: string;
-    label: string;
-    runId: string;
-    callIndex: number;
-  }>;
-  return {
-    name,
-    event,
-    backendId: context.backendId,
-    ...(context.sessionId !== undefined ? { sessionId: context.sessionId } : {}),
-    ...(context.label !== undefined ? { label: context.label } : {}),
-    ...(context.runId !== undefined ? { runId: context.runId } : {}),
-    ...(context.runId !== undefined ? { scope: context.runId } : {}),
-    ...(context.callIndex !== undefined ? { callIndex: context.callIndex } : {}),
-  } as WorkflowAgentEventPayload<Name>;
 }
 
 /**

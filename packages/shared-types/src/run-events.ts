@@ -67,6 +67,35 @@ export interface RunAgentHistoryPayload extends RunEventOrigin {
   callIndex: number;
 }
 
+/** Coarse, content-bearing activity observed while an agent call is still running. */
+export interface RunAgentProgressPayload extends RunEventOrigin {
+  label: string;
+  phase?: string;
+  callIndex: number;
+  /** Sequence of the agentStart record that opened this execution. */
+  executionStartSeq: number;
+  turnCount: number;
+  observedEvents: number;
+  coalescedEvents: number;
+  cause: "activity" | "heartbeat";
+  latestText?: string;
+  lastToolName?: string;
+  tokensObserved?: number;
+}
+
+/** A durable, execution-partitioned in-flight transcript upsert. */
+export interface RunAgentTranscriptPayload extends RunEventOrigin {
+  label: string;
+  phase?: string;
+  callIndex: number;
+  /** Sequence of the agentStart record that opened this execution. */
+  executionStartSeq: number;
+  entryIndex: number;
+  revision: number;
+  operation: "upsert";
+  entry: AgentHistoryEntry;
+}
+
 export interface RunTokenUsagePayload extends RunEventOrigin {
   usage: TokenUsage;
 }
@@ -157,6 +186,8 @@ export type RunPhaseEvent = { type: "phase" } & RunPhasePayload;
 export type RunAgentStartEvent = { type: "agentStart" } & RunAgentStartPayload;
 export type RunAgentEndEvent = { type: "agentEnd" } & RunAgentEndPayload;
 export type RunAgentHistoryEvent = { type: "agentHistory" } & RunAgentHistoryPayload;
+export type RunAgentProgressEvent = { type: "agentProgress" } & RunAgentProgressPayload;
+export type RunAgentTranscriptEvent = { type: "agentTranscript" } & RunAgentTranscriptPayload;
 export type RunTokenUsageEvent = { type: "tokenUsage" } & RunTokenUsagePayload;
 export type RunCompleteEvent = { type: "complete" } & RunCompletePayload;
 export type RunJournalEvent = { type: "journal" } & RunJournalPayload;
@@ -175,6 +206,8 @@ export type EngineRunEvent =
   | RunAgentStartEvent
   | RunAgentEndEvent
   | RunAgentHistoryEvent
+  | RunAgentProgressEvent
+  | RunAgentTranscriptEvent
   | RunTokenUsageEvent
   | RunCompleteEvent
   | RunJournalEvent
@@ -303,6 +336,8 @@ export type PersistedRunEvent =
   | RunPhaseEvent
   | RunAgentStartEvent
   | ({ type: "agentEnd" } & PersistedRunAgentEndPayload)
+  | RunAgentProgressEvent
+  | RunAgentTranscriptEvent
   | RunTokenUsageEvent
   | ({ type: "complete" } & PersistedRunCompletePayload)
   | ({ type: "journal" } & PersistedRunJournalPayload)

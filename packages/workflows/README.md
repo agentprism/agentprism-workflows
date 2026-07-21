@@ -399,12 +399,29 @@ and compacts previews, and enforces the shared 24,576-byte structured cap. Non-c
 execution results carry an immediate redacted final-20 `logTail`; completed results omit it.
 
 Manager events are Node `EventEmitter` notifications: `agentStart`, `agentEnd`, `agentHistory`,
+`agentProgress`, `agentTranscript`,
 `journal`, `tokenUsage`, `log`, `phase`, `complete`, `paused`, `resumed`, `stopped`, `error`,
 and `agentEvent`. Their overloads infer exact payloads from `EngineRunEventPayloadMap` and
 `WorkflowAgentEventPayloadMap`; `WorkflowRunEvent` is the exhaustive union when a host wants one
 dispatcher. Every engine event carries the owning root `runId` and originating engine `scope`.
 `journal` emits `{ runId, scope, entry }` for each live journal append, even when file journaling is
 disabled via `journaling: false`.
+
+For journaling ACP runs, `agentProgress` provides redacted content while a call is still running
+(immediate first sample, one-second activity sampling, and content-bearing heartbeats), and
+`agentTranscript` provides execution-partitioned assistant/tool upserts before settlement. Both use
+the same durable JSONL cursor as lifecycle events; terminal run JSON and `agentHistory` keep their
+existing finalization semantics. The facade also exports `workflowAgentEventSource(runner)` so an
+eval or telemetry sink can share the one raw ACP subscription without reparsing provider traffic.
+
+An MCP client tails the same stream without holding the originating tool request:
+
+```ts
+const uri = `workflow://runs/${runId}/events`;
+await client.subscribeResource({ uri });
+const tail = JSON.parse(resourceText(await client.readResource({ uri })));
+const catchUp = `${uri}?after=${tail.cursor}&limit=1000&streamId=${tail.streamId}`;
+```
 
 ```ts
 import {

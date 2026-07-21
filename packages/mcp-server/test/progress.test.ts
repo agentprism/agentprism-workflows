@@ -167,3 +167,69 @@ test("await progress omits unknown totals and messages and stays silent without 
   assert.equal(Object.hasOwn(untitled[0] ?? {}, "message"), false);
   assert.deepEqual(silent, []);
 });
+
+test("await progress forwards content-bearing agent progress without changing call counters", async () => {
+  const notifications: ProgressParams[] = [];
+  const reporter = createAwaitProgressReporter(extra(notifications));
+  reporter.seed(snapshot({
+    currentPhase: "Execute",
+    agents: [
+      { id: 0, label: "worker", prompt: "work", status: "running", callIndex: 0 },
+    ],
+  }));
+
+  reporter.record(record({
+    type: "agentTranscript",
+    runId: "root-run",
+    scope: "root-run",
+    label: "worker",
+    callIndex: 0,
+    executionStartSeq: 1,
+    entryIndex: 0,
+    revision: 0,
+    operation: "upsert",
+    entry: { role: "assistant", kind: "text", text: "private transcript", timestamp: 0 },
+  }));
+  reporter.record(record({
+    type: "agentProgress",
+    runId: "root-run",
+    scope: "root-run",
+    label: "worker",
+    callIndex: 0,
+    executionStartSeq: 1,
+    turnCount: 1,
+    observedEvents: 2,
+    coalescedEvents: 1,
+    cause: "activity",
+    latestText: "checking the implementation",
+  }));
+  reporter.record(record({
+    type: "agentProgress",
+    runId: "root-run",
+    scope: "root-run",
+    label: "worker",
+    callIndex: 0,
+    executionStartSeq: 1,
+    turnCount: 1,
+    observedEvents: 3,
+    coalescedEvents: 2,
+    cause: "activity",
+    lastToolName: "typecheck",
+  }));
+  await Promise.resolve();
+
+  assert.deepEqual(notifications, [
+    {
+      progressToken: "await-token",
+      progress: 0,
+      total: 1,
+      message: "worker: checking the implementation",
+    },
+    {
+      progressToken: "await-token",
+      progress: 0,
+      total: 1,
+      message: "worker: tool typecheck",
+    },
+  ]);
+});

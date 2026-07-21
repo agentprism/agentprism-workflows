@@ -400,7 +400,7 @@ observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `ou
 
 ---
 
-## Script resources
+## Run resources
 
 Every admitted manager run has one immutable, persistence-backed resource:
 
@@ -424,6 +424,33 @@ URI this process knew existed. A malformed resource URI or a run ID that never e
 runs by `startedAt` descending**. Resource-template completion uses that same bounded set. Direct
 URI reads are the unbounded retrieval contract, so a known older run ID remains readable even when
 it is absent from the listing.
+
+Every journaling run also exposes its redacted append-only event stream:
+
+```text
+workflow://runs/{runId}/events
+workflow://runs/{runId}/events?after={seq}&limit={1..1000}&streamId={streamId}
+```
+
+Subscribe to the canonical URI with `resources/subscribe`. Each append produces an advisory
+`notifications/resources/updated` hint; read the JSON resource and page from your last cursor until
+`hasMore` is false. The canonical read is a newest-100 tail. The document carries
+`{ schemaVersion:1, runId, streamId, status, finalized, after, cursor, endCursor, hasMore, events }`.
+`agentProgress` gives bounded content while a call is in flight, and `agentTranscript` upserts let a
+client reduce assistant/tool history before settlement using
+`(scope, callIndex, executionStartSeq, entryIndex)` plus greatest `revision`.
+
+```ts
+await client.subscribeResource({ uri: `workflow://runs/${runId}/events` });
+const tail = JSON.parse(resourceText(await client.readResource({ uri: `workflow://runs/${runId}/events` })));
+const pageUri = `workflow://runs/${runId}/events?after=${tail.cursor}&limit=1000&streamId=${tail.streamId}`;
+```
+
+Notifications are deliberately coalesced to one in-flight promise plus one dirty bit. They are not
+the event queue: a slow/reconnected client catches up without gaps from the durable cursor. Only
+projected records are served; new content strings are credential-redacted and capped at 512 UTF-8
+bytes. Query URIs are readable but not subscribable. Integrity failures are explicit rather than
+serving a silently incomplete transcript. See the [API contract](../../docs/api.md#mcp-live-events-resource).
 
 Run/background results contain a `resource_link` for the newly admitted script. Inspect/await
 results contain available links for the full resume lineage, oldest to newest, and duplicate that

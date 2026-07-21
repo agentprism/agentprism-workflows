@@ -30,6 +30,8 @@ const EVENT_TYPES = new Set([
   "log",
   "phase",
   "agentStart",
+  "agentProgress",
+  "agentTranscript",
   "agentEnd",
   "tokenUsage",
   "complete",
@@ -205,6 +207,11 @@ function hasNone(value: Record<string, unknown>, keys: readonly string[]): boole
   return keys.every((key) => !hasOwn(value, key));
 }
 
+function hasOnly(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
 function isCanonicalTimestamp(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const parsed = Date.parse(value);
@@ -213,6 +220,52 @@ function isCanonicalTimestamp(value: unknown): value is string {
 
 function isProjectedText(value: unknown): value is string {
   return typeof value === "string" && Buffer.byteLength(value, "utf8") <= MAX_OBSERVABILITY_SCALAR_BYTES;
+}
+
+function isNonEmptyText(value: unknown, projected: boolean): value is string {
+  return (projected ? isProjectedText(value) : isString(value)) && (value as string).trim().length > 0;
+}
+
+function hasProgressContent(value: Record<string, unknown>, projected: boolean): boolean {
+  const latest = hasOwn(value, "latestText");
+  const tool = hasOwn(value, "lastToolName");
+  if (latest === tool) return false;
+  return isNonEmptyText(latest ? value.latestText : value.lastToolName, projected);
+}
+
+function isTranscriptEntry(value: unknown, projected: boolean): boolean {
+  if (!isObject(value) || !hasRequired(value, "text", (candidate) => isNonEmptyText(candidate, projected)) ||
+      !hasRequired(value, "timestamp", isNonNegativeSafeInteger) ||
+      !hasOnly(value, ["role", "kind", "text", "toolName", "timestamp"])) return false;
+  if (value.role === "assistant" && value.kind === "text") return !hasOwn(value, "toolName");
+  return value.role === "tool" && value.kind === "toolCall" &&
+    hasRequired(value, "toolName", (candidate) => isNonEmptyText(candidate, projected));
+}
+
+function isAgentProgress(value: Record<string, unknown>, projected: boolean): boolean {
+  const text = projected ? isProjectedText : isString;
+  return hasOnly(value, ["type", "runId", "scope", "label", "phase", "callIndex", "executionStartSeq",
+    "turnCount", "observedEvents", "coalescedEvents", "cause", "latestText", "lastToolName", "tokensObserved"]) &&
+    hasRequired(value, "label", text) && hasOptional(value, "phase", text) &&
+    hasRequired(value, "callIndex", isNonNegativeSafeInteger) &&
+    hasRequired(value, "executionStartSeq", isPositiveSafeInteger) &&
+    hasRequired(value, "turnCount", isNonNegativeSafeInteger) &&
+    hasRequired(value, "observedEvents", isNonNegativeSafeInteger) &&
+    hasRequired(value, "coalescedEvents", isNonNegativeSafeInteger) &&
+    (value.cause === "activity" || value.cause === "heartbeat") &&
+    hasOptional(value, "tokensObserved", isNonNegativeSafeInteger) && hasProgressContent(value, projected);
+}
+
+function isAgentTranscript(value: Record<string, unknown>, projected: boolean): boolean {
+  const text = projected ? isProjectedText : isString;
+  return hasOnly(value, ["type", "runId", "scope", "label", "phase", "callIndex", "executionStartSeq",
+    "entryIndex", "revision", "operation", "entry"]) &&
+    hasRequired(value, "label", text) && hasOptional(value, "phase", text) &&
+    hasRequired(value, "callIndex", isNonNegativeSafeInteger) &&
+    hasRequired(value, "executionStartSeq", isPositiveSafeInteger) &&
+    hasRequired(value, "entryIndex", isNonNegativeSafeInteger) &&
+    hasRequired(value, "revision", isNonNegativeSafeInteger) && value.operation === "upsert" &&
+    hasRequired(value, "entry", (candidate) => isTranscriptEntry(candidate, projected));
 }
 
 function isProjectionValue(value: unknown): boolean {
@@ -475,6 +528,10 @@ function isPersistableInputEvent(value: unknown): value is PersistableEngineRunE
         hasOptional(value, "timeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
         hasRequired(value, "callIndex", isNonNegativeSafeInteger)
       );
+    case "agentProgress":
+      return isAgentProgress(value, false);
+    case "agentTranscript":
+      return isAgentTranscript(value, false);
     case "agentEnd":
       return (
         hasRequired(value, "label", isString) &&
@@ -544,6 +601,10 @@ function isPersistedEvent(value: unknown): boolean {
         hasOptional(value, "timeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
         hasRequired(value, "callIndex", isNonNegativeSafeInteger)
       );
+    case "agentProgress":
+      return isAgentProgress(value, true);
+    case "agentTranscript":
+      return isAgentTranscript(value, true);
     case "agentEnd":
       return (
         hasRequired(value, "label", isProjectedText) &&
@@ -649,8 +710,119 @@ function eventError(
   });
 }
 
+interface ActiveExecutionValidation {
+  startSeq: number;
+  label: string;
+  phase?: string;
+  nextEntryIndex: number;
+  entries: Map<number, { revision: number; timestamp: number; tool: boolean }>;
+  lastActivityObserved: number;
+  lastActivityTurnCount: number;
+  lastProgress?: Extract<RunEventLogRecord["event"], { type: "agentProgress" }>;
+}
+
+function executionKey(scope: string, callIndex: number): string {
+  return JSON.stringify([scope, callIndex]);
+}
+
+function sameOptionalText(left: string | undefined, right: string | undefined): boolean {
+  return left === right;
+}
+
+function progressPayloadMatches(
+  left: Extract<RunEventLogRecord["event"], { type: "agentProgress" }>,
+  right: Extract<RunEventLogRecord["event"], { type: "agentProgress" }>,
+): boolean {
+  return left.runId === right.runId && left.scope === right.scope && left.label === right.label &&
+    sameOptionalText(left.phase, right.phase) && left.callIndex === right.callIndex &&
+    left.executionStartSeq === right.executionStartSeq && left.turnCount === right.turnCount &&
+    left.observedEvents === right.observedEvents &&
+    sameOptionalText(left.latestText, right.latestText) && sameOptionalText(left.lastToolName, right.lastToolName) &&
+    left.tokensObserved === right.tokensObserved;
+}
+
+function createSemanticValidator(): (record: RunEventLogRecord) => string | undefined {
+  const active = new Map<string, ActiveExecutionValidation>();
+  return (record) => {
+    const event = record.event;
+    if (event.type === "agentStart") {
+      const key = executionKey(event.scope, event.callIndex);
+      // A process can die after agentStart without ever appending agentEnd. Same-ID
+      // recovery re-executes that logical call in the same stream, so the new start
+      // supersedes the abandoned execution and opens a fresh validation partition.
+      active.set(key, {
+        startSeq: record.seq,
+        label: event.label,
+        ...(event.phase === undefined ? {} : { phase: event.phase }),
+        nextEntryIndex: 0,
+        entries: new Map(),
+        lastActivityObserved: 0,
+        lastActivityTurnCount: 0,
+      });
+      return undefined;
+    }
+    if (event.type === "agentEnd") {
+      active.delete(executionKey(event.scope, event.callIndex));
+      return undefined;
+    }
+    if (event.type === "complete" || event.type === "paused" || event.type === "error" || event.type === "stopped") {
+      active.clear();
+      return undefined;
+    }
+    if (event.type !== "agentProgress" && event.type !== "agentTranscript") return undefined;
+
+    const state = active.get(executionKey(event.scope, event.callIndex));
+    if (state === undefined) return `${event.type} has no active agent execution`;
+    if (event.executionStartSeq !== state.startSeq || event.label !== state.label ||
+        !sameOptionalText(event.phase, state.phase)) {
+      return `${event.type} does not match its active agentStart`;
+    }
+
+    if (event.type === "agentTranscript") {
+      const prior = state.entries.get(event.entryIndex);
+      const tool = event.entry.role === "tool";
+      if (prior === undefined) {
+        if (event.entryIndex !== state.nextEntryIndex || event.revision !== 0) {
+          return "agentTranscript indexes and initial revisions must be dense";
+        }
+        state.entries.set(event.entryIndex, {
+          revision: 0,
+          timestamp: event.entry.timestamp!,
+          tool,
+        });
+        state.nextEntryIndex += 1;
+        return undefined;
+      }
+      if (prior.tool || tool || event.revision !== prior.revision + 1 ||
+          event.entry.timestamp !== prior.timestamp) {
+        return "agentTranscript replacement revision is invalid";
+      }
+      prior.revision = event.revision;
+      return undefined;
+    }
+
+    if (event.cause === "heartbeat") {
+      if (state.lastProgress === undefined || event.coalescedEvents !== 0 ||
+          !progressPayloadMatches(event, state.lastProgress)) {
+        return "agentProgress heartbeat does not repeat the preceding progress payload";
+      }
+      state.lastProgress = event;
+      return undefined;
+    }
+    if (event.observedEvents <= state.lastActivityObserved || event.turnCount < state.lastActivityTurnCount ||
+        event.coalescedEvents !== event.observedEvents - state.lastActivityObserved - 1) {
+      return "agentProgress activity counters are not monotonic and dense";
+    }
+    state.lastActivityObserved = event.observedEvents;
+    state.lastActivityTurnCount = event.turnCount;
+    state.lastProgress = event;
+    return undefined;
+  };
+}
+
 function parseLog(buffer: Buffer, runId: string, path: string, expectedStreamId: string): ParsedLog {
   const records: RunEventLogRecord[] = [];
+  const validateSemanticRecord = createSemanticValidator();
   let offset = 0;
   let completeBytes = 0;
   while (offset < buffer.length) {
@@ -690,6 +862,10 @@ function parseLog(buffer: Buffer, runId: string, path: string, expectedStreamId:
     }
     if (value.streamId !== expectedStreamId) {
       throw eventError(`Event record ${expectedSeq} belongs to a different stream`, "STREAM_MISMATCH", runId, path, value.seq);
+    }
+    const semanticError = validateSemanticRecord(value);
+    if (semanticError !== undefined) {
+      throw eventError(`Event record ${expectedSeq} ${semanticError}`, "CORRUPT_LOG", runId, path, value.seq);
     }
     records.push(value);
     offset = lf + 1;

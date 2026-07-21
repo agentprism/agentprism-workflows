@@ -25,6 +25,51 @@ const secretForms = {
 };
 const allSecrets = Object.values(secretForms).join(" ");
 
+test("live progress and transcript content reuse the shared redaction and scalar bounds", () => {
+  const progress = projectRunEventForPersistence({
+    type: "agentProgress",
+    runId: "observe-run",
+    scope: "observe-run",
+    label: "observer",
+    callIndex: 0,
+    executionStartSeq: 1,
+    turnCount: 1,
+    observedEvents: 1,
+    coalescedEvents: 0,
+    cause: "activity",
+    latestText: `${"🙂".repeat(200)} password=hunter2`,
+  });
+  assert.equal(progress.event.type, "agentProgress");
+  assert.equal(JSON.stringify(progress).includes("hunter2"), false);
+  assert.deepEqual(progress.projection, { redacted: true, truncated: true });
+  if (progress.event.type === "agentProgress") {
+    assert.ok(Buffer.byteLength(progress.event.latestText ?? "", "utf8") <= MAX_OBSERVABILITY_SCALAR_BYTES);
+  }
+
+  const transcript = projectRunEventForPersistence({
+    type: "agentTranscript",
+    runId: "observe-run",
+    scope: "observe-run",
+    label: "observer",
+    callIndex: 0,
+    executionStartSeq: 1,
+    entryIndex: 0,
+    revision: 0,
+    operation: "upsert",
+    entry: {
+      role: "tool",
+      kind: "toolCall",
+      text: "password=hunter2",
+      toolName: "api_token=secret-value",
+      timestamp: 1,
+    },
+  });
+  assert.equal(transcript.event.type, "agentTranscript");
+  assert.equal(JSON.stringify(transcript).includes("hunter2"), false);
+  assert.equal(JSON.stringify(transcript).includes("secret-value"), false);
+  assert.equal(transcript.projection.redacted, true);
+});
+
 function recordedError(): WorkflowRecordedError {
   return {
     form: "workflow-error",

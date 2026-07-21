@@ -56,7 +56,7 @@ import type {
   WorkflowRunAwaitResult,
   WorkflowStopResult,
 } from "./workflow-tool-output.js";
-import { createAwaitProgressReporter, createProgressReporter } from "./progress.js";
+import { createAwaitProgressReporter, createProgressReporter, formatAgentProgressMessage } from "./progress.js";
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
@@ -1540,6 +1540,7 @@ export function createWorkflowServer(
         };
         if (!input.background) {
           const reporter = createProgressReporter(extra);
+          let lastActivitySeq = 0;
           exec.signal = extra.signal;
           // The engine drives progress with the live snapshot; project it onto the MCP wire
           // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
@@ -1547,7 +1548,13 @@ export function createWorkflowServer(
             const settled = snapshot.agents.filter(
               (a) => a.status === "done" || a.status === "error" || a.status === "skipped",
             ).length;
-            reporter(settled, snapshot.agents.length || undefined, snapshot.currentPhase);
+            const activity = snapshot.latestActivity;
+            if (activity && activity.seq > lastActivitySeq) {
+              lastActivitySeq = activity.seq;
+              reporter(settled, snapshot.agents.length || undefined, formatAgentProgressMessage(activity.progress));
+            } else {
+              reporter(settled, snapshot.agents.length || undefined, snapshot.currentPhase);
+            }
           };
           // A callback is a LIVE channel and therefore wins over headless:"pause". Do not
           // install a defaulting shim for non-elicitation clients; the authored headless mode

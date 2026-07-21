@@ -431,6 +431,13 @@ checkpoint default continues, abort fails with `WORKFLOW_ABORTED`, and pause ret
 daemon execution: process death can interrupt an in-flight call, and stale durable
 `pending`/`running` state reconciles under its lease to `paused` / `interrupted`.
 
+Background runs are nevertheless observable independently of the initiating tool request. Every
+journaling run has `workflow://runs/{runId}/events`: subscribe to the canonical URI for advisory
+`resources/updated` hints, then read/paginate with `after`, `limit`, and `streamId`. Progress is
+coarse and content-bearing (not token fidelity); `agentTranscript` rows are redacted assistant/tool
+upserts partitioned by `(scope, callIndex, executionStartSeq)` and reduced by greatest revision per
+entry index. The durable cursor is authoritative when hints coalesce or a subscriber falls behind.
+
 `action:"await"` and `action:"inspect"` never replay the script or spend tokens. Their cold
 preflight may briefly acquire a dead owner's stale lease solely to reconcile `pending`/`running` to
 `paused` / `interrupted`. `resumeFromRunId` executes a new run with the caller's current script or

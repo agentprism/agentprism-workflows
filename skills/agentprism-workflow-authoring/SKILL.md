@@ -33,6 +33,10 @@ Read the section your task needs — each is a separate document in this skill d
 - **The DSL primitives are realm globals, not imports.** There is nothing to `import` — `agent`, `parallel`, `pipeline`, `gate`, `checkpoint`, `args`, `budget`, … are injected. Top-level `await` and a top-level `return` are valid (the body runs inside an async wrapper). The script's return value becomes the run's `result`.
 - **Assume every agent is brilliant, amnesiac, overconfident, and racing a world that changed since its prompt was written.** Every load-bearing pattern in this guide — self-contained prompts, evidence-demanding schemas, pinned bases re-checked every round, refusal as a first-class outcome — follows from those four facts. The script, not the agents, is responsible for compensating for them.
 - **Scripts are plain JavaScript, not TypeScript.** Type annotations fail to parse. There are also no Node APIs in the realm (no `require`, `import`, `fs`, `fetch`, timers) — all side effects happen through agents.
+- **Live observability requires no script annotations.** Journaling ACP runs publish coarse,
+  redacted progress and execution-partitioned transcript upserts at
+  `workflow://runs/{runId}/events`; MCP clients subscribe for update hints and page the durable
+  cursor. Author labels for human correlation, not to enable this behavior.
 
 ## Minimal script
 

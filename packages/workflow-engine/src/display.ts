@@ -11,6 +11,7 @@ import type {
   AgentResultProvenance,
   AgentSessionRecord,
   AgentUsage,
+  RunAgentProgressPayload,
   WorkflowMeta,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
@@ -64,6 +65,11 @@ export interface WorkflowSnapshot {
     cacheWrite?: number;
   };
   runId?: string;
+  /** Latest successfully persisted progress sample; intentionally never serialized to run JSON. */
+  latestActivity?: {
+    seq: number;
+    progress: RunAgentProgressPayload;
+  };
 }
 
 export interface WorkflowDisplay {
