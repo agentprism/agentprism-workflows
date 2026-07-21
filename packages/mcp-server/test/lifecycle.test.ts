@@ -19,10 +19,11 @@ class FakeProcess extends EventEmitter {
   }
 }
 
-function disposableRunner(dispose: () => Promise<void>): AgentRunner {
+function disposableRunner(dispose: () => Promise<void>, forceKill?: () => void): AgentRunner {
   return {
     run: async () => "unused",
     dispose,
+    ...(forceKill ? { forceKill } : {}),
   } as AgentRunner;
 }
 
@@ -127,6 +128,22 @@ test("a stalled runner dispose reaches the hard exit deadline", async () => {
 
   await lifecycle.shutdown("stdin-close");
   assert.equal(stopCalls, 1);
+  assert.deepEqual(processHandle.exitCodes, [0]);
+});
+
+test("a stalled force-killable runner is force-killed before the hard exit deadline", async () => {
+  const processHandle = new FakeProcess();
+  let forceKills = 0;
+  const lifecycle = installMcpServerLifecycle({
+    runner: disposableRunner(async () => await new Promise<void>(() => {}), () => { forceKills++; }),
+    server: { stopAcceptingWork: () => {} },
+    transport: fakeTransport(),
+    process: processHandle,
+    deadlineMs: 1,
+  });
+
+  await lifecycle.shutdown("stdin-close");
+  assert.equal(forceKills, 1);
   assert.deepEqual(processHandle.exitCodes, [0]);
 });
 

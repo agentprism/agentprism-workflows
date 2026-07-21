@@ -15,6 +15,10 @@ interface DisposableRunner {
   dispose(): Promise<void>;
 }
 
+interface ForceKillableRunner {
+  forceKill(): void;
+}
+
 interface ShutdownProcess {
   stdin: {
     once(event: "close" | "end", listener: () => void): unknown;
@@ -40,6 +44,10 @@ export interface McpServerLifecycle {
 
 function isDisposableRunner(runner: AgentRunner): runner is AgentRunner & DisposableRunner {
   return "dispose" in runner && typeof runner.dispose === "function";
+}
+
+function isForceKillableRunner(runner: AgentRunner): runner is AgentRunner & ForceKillableRunner {
+  return "forceKill" in runner && typeof runner.forceKill === "function";
 }
 
 function exitCodeFor(reason: McpServerShutdownReason): number {
@@ -102,7 +110,19 @@ export function installMcpServerLifecycle(options: McpServerLifecycleOptions): M
         : Promise.resolve();
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<void>((resolve) => {
-        deadlineTimer = setTimeout(resolve, deadlineMs);
+        deadlineTimer = setTimeout(() => {
+          // AcpAgentRunner retains a synchronous path to every connection even after its
+          // asynchronous pool disposal has cleared normal admission state. Invoke it before the
+          // parent exits so a slow Pi shutdown cannot orphan its backend process tree.
+          if (isForceKillableRunner(runner)) {
+            try {
+              runner.forceKill();
+            } catch {
+              // The hard exit remains guaranteed even if force-kill itself is best-effort.
+            }
+          }
+          resolve();
+        }, deadlineMs);
       });
 
       shutdownPromise = Promise.race([dispose, deadline]).then(() => {

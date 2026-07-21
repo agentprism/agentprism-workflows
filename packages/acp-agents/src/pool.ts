@@ -72,6 +72,8 @@ export class AcpAgentPool {
   private readonly size: number;
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly byBackend = new Map<BackendId, PooledConnection[]>();
+  /** Connections removed from the admission registry but still awaiting async dispose(). */
+  private readonly disposingConnections = new Set<PooledConnection>();
   private readonly onProcessExit = () => this.killAllSync();
   private exitHookInstalled = false;
   private disposed = false;
@@ -263,15 +265,30 @@ export class AcpAgentPool {
     if (index >= 0) arr.splice(index, 1);
   }
 
-  /** Close every pooled process and clear the pool. Idempotent. */
+  /**
+   * Close every pooled process and clear the admission registry. Connections remain reachable
+   * through `disposingConnections` until their asynchronous graceful teardown settles so a host
+   * lifecycle deadline can still synchronously force-kill them.
+   */
   async dispose(): Promise<void> {
     this.disposed = true;
     this.removeExitHook();
     const all = this.allConnections();
+    for (const connection of all) this.disposingConnections.add(connection);
     this.byBackend.clear();
-    const results = await Promise.allSettled(all.map((c) => c.dispose()));
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (failure) throw failure.reason;
+    try {
+      const results = await Promise.allSettled(all.map((c) => c.dispose()));
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure) throw failure.reason;
+    } finally {
+      for (const connection of all) this.disposingConnections.delete(connection);
+    }
+  }
+
+  /** Synchronously kill live pooled and in-progress-disposal backend process trees. */
+  forceKill(): void {
+    this.killAllSync();
+    for (const connection of this.disposingConnections) connection.killNow();
   }
 
   private allConnections(): PooledConnection[] {

@@ -27,6 +27,7 @@ import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 interface LogEntry {
   method: string;
   pid?: number;
+  childPid?: number;
   reason?: string;
   params?: { sessionId?: string };
 }
@@ -38,6 +39,15 @@ const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
 
 const count = (entries: LogEntry[], method: string): number =>
   entries.filter((e) => e.method === method).length;
+
+function processIsGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
 
 // Track every runner so a failed assertion never leaks a pooled process.
 function makeRunner(size?: number): AcpAgentRunner {
@@ -290,4 +300,37 @@ test("Pi process disposal memoizes one promise and schedules SIGKILL at exactly 
   scheduled?.callback();
   await first;
   assert.equal(clears, 1);
+});
+
+test("forceKill reaches a stubborn detached Pi descendant after disposal clears the pool", { timeout: 15_000 }, async () => {
+  const { cwd, readLog } = harness.configure({
+    ignoreShutdown: true,
+    stubbornPiChild: true,
+  }, { backends: ["pi"] });
+  const pool = harness.track(new AcpAgentPool());
+  let childPid: number | undefined;
+  try {
+    const session = await pool.acquire(new PiBackend(), { cwd, schema: undefined, policy: {} });
+    await session.release();
+    await waitFor(() => readLog().some((entry) => entry.method === "__stubborn_pi_child"));
+    childPid = readLog().find((entry) => entry.method === "__stubborn_pi_child")?.childPid;
+    assert.ok(childPid, "fake Pi ACP process must report its stubborn descendant PID");
+
+    // dispose() has already removed this connection from `byBackend` before it awaits Pi's
+    // 67-second graceful envelope. forceKill() must retain and reach that connection anyway.
+    const disposing = pool.dispose();
+    pool.forceKill();
+    await disposing;
+    await waitFor(() => processIsGone(childPid!), 5_000);
+    assert.equal(processIsGone(childPid), true);
+  } finally {
+    pool.forceKill();
+    if (childPid !== undefined && !processIsGone(childPid)) {
+      try {
+        process.kill(childPid, "SIGKILL");
+      } catch {
+        // Test cleanup only: a concurrently exited child is already the intended state.
+      }
+    }
+  }
 });

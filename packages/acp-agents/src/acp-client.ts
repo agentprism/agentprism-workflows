@@ -20,7 +20,8 @@
 // (they only push into the routed session's arrays), so by the time the session/prompt request
 // resolves, every update for THAT session's turn has already been folded into its accumulator —
 // even while other sessions' updates interleave on the same wire.
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import {
   AGENT_METHODS,
@@ -192,6 +193,69 @@ const parseMessageMcpRequest = (params: unknown): MessageMcpRequest => params as
 const parseMessageMcpNotification = (params: unknown): MessageMcpNotification =>
   params as MessageMcpNotification;
 const parseDisconnectMcpRequest = (params: unknown): DisconnectMcpRequest => params as DisconnectMcpRequest;
+
+/**
+ * Snapshot an ACP server's descendants before terminating its group. Pi's terminal commands
+ * deliberately run in their own process groups, so group-killing the ACP server alone would not
+ * reach a command that has not yet been cleaned up by the graceful shutdown path. Linux reads
+ * procfs directly; other POSIX hosts use the portable `ps` parent map.
+ */
+function processDescendantPids(rootPid: number): number[] {
+  const descendants: number[] = [];
+  const childrenByParent = new Map<number, number[]>();
+  if (process.platform === "linux") {
+    const pending = [rootPid];
+    const visited = new Set<number>(pending);
+    while (pending.length > 0) {
+      const pid = pending.pop()!;
+      try {
+        const children = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
+          .trim()
+          .split(/\s+/)
+          .map(Number)
+          .filter((childPid) => Number.isSafeInteger(childPid) && childPid > 0);
+        for (const childPid of children) {
+          if (visited.has(childPid)) continue;
+          visited.add(childPid);
+          descendants.push(childPid);
+          pending.push(childPid);
+        }
+      } catch {
+        // The process can exit while its tree is being inspected; the group/direct kill below
+        // remains the best-effort fallback.
+      }
+    }
+    return descendants;
+  }
+  if (process.platform === "win32") return descendants;
+  try {
+    const rows = execFileSync("ps", ["-eo", "pid=,ppid="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 250,
+    });
+    for (const row of rows.split("\n")) {
+      const match = row.match(/^\s*(\d+)\s+(\d+)\s*$/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const parentPid = Number(match[2]);
+      const children = childrenByParent.get(parentPid) ?? [];
+      children.push(pid);
+      childrenByParent.set(parentPid, children);
+    }
+  } catch {
+    return descendants;
+  }
+  const pending = [rootPid];
+  while (pending.length > 0) {
+    const pid = pending.pop()!;
+    for (const childPid of childrenByParent.get(pid) ?? []) {
+      descendants.push(childPid);
+      pending.push(childPid);
+    }
+  }
+  return descendants;
+}
 
 /** Per-session accumulator: assistant text, tool history, usage, the Claude raw structured_output,
  *  and the permission policy/resolver used to answer permission requests for THIS session. */
@@ -1128,6 +1192,9 @@ export class PooledConnection {
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: authOverlay ? { ...env, ...authOverlay } : env,
+      // Give every backend its own process group. This lets force-kill tear down the normal
+      // backend subtree without ever signalling the host process group.
+      detached: process.platform !== "win32",
     });
     this.child = child;
 
@@ -1980,9 +2047,39 @@ export class PooledConnection {
     if (childCleanupError) throw childCleanupError;
   }
 
-  /** Synchronous best-effort kill for a process-exit hook (no time to await a graceful close). */
+  /**
+   * Synchronous best-effort force kill for process-exit and bounded shutdown paths. The parent
+   * ACP server gets an isolated process group; Linux additionally snapshots and signals detached
+   * descendants such as Pi terminal process groups before the parent can orphan them.
+   */
   killNow(): void {
     if (!this._alive) return;
+    const pid = this.child.pid;
+    const descendants = pid === undefined ? [] : processDescendantPids(pid);
+    if (pid !== undefined && process.platform === "win32") {
+      try {
+        execFileSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
+          stdio: "ignore",
+          windowsHide: true,
+          timeout: 1_000,
+        });
+      } catch {
+        // The direct kill below remains the best-effort fallback when taskkill races an exit.
+      }
+    } else if (pid !== undefined) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // The process group may already be gone; direct kills below cover any surviving child.
+      }
+    }
+    for (const descendantPid of descendants.reverse()) {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // A descendant can exit between the /proc snapshot and this synchronous escalation.
+      }
+    }
     try {
       this.child.kill("SIGKILL");
     } catch {
@@ -2014,11 +2111,7 @@ export class PooledConnection {
       // ignore
     }
     const sigkill = this.disposeTimer.set(() => {
-      try {
-        this.child.kill("SIGKILL");
-      } catch {
-        // ignore
-      }
+      this.killNow();
     }, this.backendId === "pi" ? PI_DISPOSE_SIGKILL_GRACE_MS : DISPOSE_SIGKILL_GRACE_MS);
     sigkill.unref?.();
     try {
