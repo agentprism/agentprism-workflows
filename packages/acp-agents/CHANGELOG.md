@@ -1,5 +1,17 @@
 # @automatalabs/acp-agents
 
+## 0.34.8
+
+### Patch Changes
+
+- d4c6e60: Refresh the release-gated ACP dependency train. Pi now ships the 0.81.1 runtime packages with
+  their compaction-retry, model-catalog, startup, and compatibility fixes; the Codex backend advances
+  to the newly upstream-synchronized Automata Labs fork release.
+- Updated dependencies [d4c6e60]
+- Updated dependencies [d4c6e60]
+  - @automatalabs/pi-acp@0.2.3
+  - @automatalabs/shared-types@0.27.1
+
 ## 0.34.7
 
 ### Patch Changes
