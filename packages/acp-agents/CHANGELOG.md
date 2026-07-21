@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.34.5
+
+### Patch Changes
+
+- 30fbeee: Dispose pooled ACP backend process trees when the stdio MCP server receives a signal or client disconnect, including stale connections already removed from pool admission.
+
 ## 0.34.4
 
 ### Patch Changes
