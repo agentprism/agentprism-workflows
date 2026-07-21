@@ -257,6 +257,49 @@ function processDescendantPids(rootPid: number): number[] {
   return descendants;
 }
 
+/** A descendant PID paired with Linux's process-creation tick when the platform exposes it. */
+interface ProcessIdentity {
+  readonly pid: number;
+  readonly startTime?: string;
+}
+
+/**
+ * Linux keeps a process's creation tick in field 22 of `/proc/<pid>/stat`. Pairing it with a PID
+ * lets delayed teardown distinguish the original detached descendant from a later PID reuse.
+ */
+function linuxProcessStartTime(pid: number): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // `comm` is parenthesized and can contain spaces or parentheses, so field splitting must begin
+    // after its final closing parenthesis. The remaining list begins at stat field 3 (state).
+    const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+    const startTime = fields[19]; // field 22 (starttime) minus the leading field 3.
+    return startTime && /^\d+$/.test(startTime) ? startTime : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotProcessIdentity(pid: number): ProcessIdentity | undefined {
+  if (process.platform !== "linux") return { pid };
+  const startTime = linuxProcessStartTime(pid);
+  // Do not retain an unverifiable Linux PID: a later direct signal could hit a reused PID.
+  return startTime === undefined ? undefined : { pid, startTime };
+}
+
+function isSameTrackedProcess(identity: ProcessIdentity): boolean {
+  if (process.platform === "linux") {
+    return identity.startTime !== undefined && linuxProcessStartTime(identity.pid) === identity.startTime;
+  }
+  try {
+    process.kill(identity.pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Per-session accumulator: assistant text, tool history, usage, the Claude raw structured_output,
  *  and the permission policy/resolver used to answer permission requests for THIS session. */
 class SessionState {
@@ -1159,6 +1202,11 @@ export class PooledConnection {
   private _alive = true;
   private _activeSessions = 0;
   private stderrTail = "";
+  /**
+   * Detached commands can outlive an ACP parent's graceful exit. Capture their identities before
+   * that exit so disposal retains a route to them until they have died or an escalation kills them.
+   */
+  private readonly retainedDescendants = new Map<number, ProcessIdentity>();
 
   private constructor(backend: Backend, deps: PooledConnectionDeps) {
     this.backend = backend;
@@ -2047,15 +2095,45 @@ export class PooledConnection {
     if (childCleanupError) throw childCleanupError;
   }
 
+  /** Snapshot descendants while the ACP parent can still prove their lineage. */
+  private retainDescendants(): void {
+    const pid = this.child.pid;
+    if (pid === undefined) return;
+    for (const descendantPid of processDescendantPids(pid)) {
+      if (this.retainedDescendants.has(descendantPid)) continue;
+      const identity = snapshotProcessIdentity(descendantPid);
+      if (identity) this.retainedDescendants.set(descendantPid, identity);
+    }
+  }
+
+  /** Synchronously signal retained descendants, verifying Linux PID identity before every kill. */
+  private killRetainedDescendants(): void {
+    for (const identity of [...this.retainedDescendants.values()].reverse()) {
+      if (!isSameTrackedProcess(identity)) continue;
+      try {
+        process.kill(identity.pid, "SIGKILL");
+      } catch {
+        // A descendant can exit between identity verification and this synchronous escalation.
+      }
+    }
+  }
+
+  /** Wait until all retained descendants have exited, so pool disposal cannot release them early. */
+  private async waitForRetainedDescendants(): Promise<void> {
+    while ([...this.retainedDescendants.values()].some(isSameTrackedProcess)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
   /**
    * Synchronous best-effort force kill for process-exit and bounded shutdown paths. The parent
-   * ACP server gets an isolated process group; Linux additionally snapshots and signals detached
-   * descendants such as Pi terminal process groups before the parent can orphan them.
+   * ACP server gets an isolated process group; retained detached descendants remain reachable
+   * after a graceful parent exit so the host deadline can still tear down their process groups.
    */
   killNow(): void {
-    if (!this._alive) return;
-    const pid = this.child.pid;
-    const descendants = pid === undefined ? [] : processDescendantPids(pid);
+    const parentAlive = this._alive;
+    const pid = parentAlive ? this.child.pid : undefined;
+    if (parentAlive) this.retainDescendants();
     if (pid !== undefined && process.platform === "win32") {
       try {
         execFileSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
@@ -2073,17 +2151,13 @@ export class PooledConnection {
         // The process group may already be gone; direct kills below cover any surviving child.
       }
     }
-    for (const descendantPid of descendants.reverse()) {
+    this.killRetainedDescendants();
+    if (parentAlive) {
       try {
-        process.kill(descendantPid, "SIGKILL");
+        this.child.kill("SIGKILL");
       } catch {
-        // A descendant can exit between the /proc snapshot and this synchronous escalation.
+        // ignore
       }
-    }
-    try {
-      this.child.kill("SIGKILL");
-    } catch {
-      // ignore
     }
   }
 
@@ -2097,6 +2171,9 @@ export class PooledConnection {
     if (!this._alive) return;
     // Mark graceful shutdown so the imminent process-exit `die()` does not emit `backend_error`.
     this.disposing = true;
+    // Capture detached descendants before stdin EOF or SIGTERM lets a cooperative ACP parent
+    // exit and orphan them. The retained identities keep this disposal pending until escalation.
+    this.retainDescendants();
     const exited = new Promise<void>((resolve) => {
       this.child.once("exit", () => resolve());
     });
@@ -2116,6 +2193,7 @@ export class PooledConnection {
     sigkill.unref?.();
     try {
       await exited;
+      await this.waitForRetainedDescendants();
     } finally {
       this.disposeTimer.clear(sigkill);
     }

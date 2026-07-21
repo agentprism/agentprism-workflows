@@ -336,6 +336,50 @@ test("forceKill reaches a stubborn detached Pi descendant after disposal clears 
   }
 });
 
+test("pool disposal retains and force-kills a detached Pi descendant after its parent exits promptly", { timeout: 15_000 }, async () => {
+  const { cwd, readLog } = harness.configure({
+    stubbornPiChild: true,
+  }, { backends: ["pi"] });
+  const pool = harness.track(new AcpAgentPool());
+  let parentPid: number | undefined;
+  let childPid: number | undefined;
+  try {
+    const session = await pool.acquire(new PiBackend(), { cwd, schema: undefined, policy: {} });
+    await session.release();
+    await waitFor(() => readLog().some((entry) => entry.method === "__stubborn_pi_child"));
+    parentPid = readLog().find((entry) => entry.method === "__start")?.pid;
+    childPid = readLog().find((entry) => entry.method === "__stubborn_pi_child")?.childPid;
+    assert.ok(parentPid, "fake Pi ACP process must report its parent PID");
+    assert.ok(childPid, "fake Pi ACP process must report its stubborn descendant PID");
+
+    // The parent honors stdin EOF/SIGTERM immediately, but its detached child cannot be reached
+    // through the parent's process group after that exit. dispose() must stay pending and retain
+    // the pre-exit child identity until the host's bounded-deadline forceKill() reaches it.
+    const disposing = pool.dispose();
+    await waitFor(() => processIsGone(parentPid!));
+    assert.equal(processIsGone(childPid), false, "the detached child outlives its cooperative parent");
+    let settled = false;
+    void disposing.then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(settled, false, "pool disposal waits for the retained detached descendant");
+
+    pool.forceKill();
+    await disposing;
+    await waitFor(() => processIsGone(childPid!), 5_000);
+    assert.equal(processIsGone(parentPid), true);
+    assert.equal(processIsGone(childPid), true);
+  } finally {
+    pool.forceKill();
+    if (childPid !== undefined && !processIsGone(childPid)) {
+      try {
+        process.kill(childPid, "SIGKILL");
+      } catch {
+        // Test cleanup only: a concurrently exited child is already the intended state.
+      }
+    }
+  }
+});
+
 test("forceKill reaches a stubborn detached Pi descendant recycled as stale", { timeout: 15_000 }, async () => {
   const { cwd, readLog } = harness.configure({
     ignoreShutdown: true,
