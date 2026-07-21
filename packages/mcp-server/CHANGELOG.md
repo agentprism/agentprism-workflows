@@ -1,5 +1,26 @@
 # @automatalabs/mcp-server
 
+## 0.17.0
+
+### Minor Changes
+
+- 0a56f82: Add default-on live observability for journaling workflow runs. The additive
+  `agentProgress` and `agentTranscript` events persist redacted, per-scalar-bounded content while an
+  agent is still running; consumers with exhaustive event switches must accept both new members.
+
+  Expose the append-only stream through the subscribable
+  `workflow://runs/{runId}/events` MCP resource with generation-pinned cursor paging,
+  constant-space notification coalescing, and explicit integrity-error mapping. Same-ID resume now
+  durably saves the running snapshot before publishing `resumed` or starting execution, and a
+  post-crash start opens a fresh validation partition without making the abandoned execution's
+  records unreadable.
+
+### Patch Changes
+
+- Updated dependencies [0a56f82]
+  - @automatalabs/shared-types@0.27.0
+  - @automatalabs/workflows@0.41.0
+
 ## 0.16.9
 
 ### Patch Changes
