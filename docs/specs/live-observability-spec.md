@@ -14,8 +14,10 @@ The design owner made the following statements. They are reproduced verbatim fro
 > "kimi k3, just to be specific so you dont choose a worse model." *(2026-07-20)*
 
 The tracking issue is [#261](https://github.com/VikashLoomba/agentprism-workflows/issues/261).
-The customer-originated Requests block is reproduced in the normative focus file and fixes the
-three product requirements used below:
+The customer's verbatim Requests block is in
+`.agentprism/design-observability/feedback-gist.md`; `focus.md` §1 normatively incorporates and
+interprets it. Together with tracking issue #261, those sources fix the three product requirements
+used below:
 
 - **R1 — progress:** persist a content-bearing signal while an agent call is in flight, not only
   when it settles. This is load-bearing, not permission to omit R2 or R3.
@@ -26,7 +28,9 @@ three product requirements used below:
 
 The first two owner quotations are the product authority for every normative requirement. The
 last two govern the author/review workflow and do not change the runtime API. Each normative
-section declares its R1/R2/R3 trace so no one request can disappear during implementation.
+section declares its R1/R2/R3 trace so no one request can disappear during implementation. All of
+`focus.md` §§1–4 is normative and incorporated here, including its verified-seam, shared-source,
+backpressure, default-on, additive-compatibility, documentation, and delivery directives.
 
 ## 1. Scope, outcome, and invariants
 
@@ -43,9 +47,11 @@ The following invariants are normative:
 1. **All three or none.** The release is not complete unless R1, R2, and R3 and their tests ship
    together. R2 over an unchanged lifecycle-only stream is not completion.
 2. **Default-on.** No feature flag, script option, tool input, environment variable, backend
-   allowlist, or client capability beyond the standard MCP resource-subscription capability turns
-   this behavior on. Every journaling run uses it. The existing explicit `journaling: false`
-   behavior still means no durable run artifact and therefore no durable events resource.
+   allowlist, or client-capability gate turns this behavior on. Every journaling run uses it. The
+   server advertises standard resource subscription support; clients use standard
+   `resources/subscribe`/`resources/unsubscribe` requests. The existing explicit
+   `journaling: false` behavior still means no durable run artifact and therefore no durable
+   events resource.
 3. **Content-bearing progress.** Every persisted `agentProgress` contains at least one of
    `latestText` or `lastToolName`. Counts-only records are forbidden. Heartbeats repeat the most
    recently projected content; the implementation never invents text for a backend that has not
@@ -54,12 +60,15 @@ The following invariants are normative:
    JSON fields, hashes, model routing, and backend selection do not change. New fields and the new
    event members are additive. `RUN_EVENT_LOG_VERSION` remains numeric `1`.
 5. **One root stream.** Nested engine scopes write to the root managed run's one event log. Every
-   new record retains both root `runId` and originating `scope`; `(scope, callIndex)` is the call
-   key.
-6. **Safety before durability.** No raw assistant text, tool name/title, label, phase, or transcript
-   string reaches JSONL or run JSON. It first passes the existing credential redactor and the
-   existing 512-byte UTF-8 scalar bound. The existing 65,536-byte JSONL record guard remains the
-   final check.
+   new record retains both root `runId` and originating `scope`; `(scope, callIndex)` is the logical
+   call key and `executionStartSeq` distinguishes repeated executions of that key after same-ID
+   resume.
+6. **Safety before new durability.** Every string newly written by this contract to JSONL, the
+   events resource, or `WorkflowSnapshot.latestActivity` first passes the existing credential
+   redactor and 512-byte UTF-8 scalar bound. The existing 65,536-byte JSONL record guard remains
+   the final check. This train does not route legacy run-JSON fields through that projector or
+   change their existing serialization/safety semantics: raw `label`, `phase`, and terminal
+   `history` continue through the established run-JSON path.
 7. **Observation cannot control execution.** Projection, sampling timers, transcript upserts,
    event-resource watchers, MCP notification delivery, and subscriber behavior never
    await, pause, fail, retry, or cancel an agent call. Existing synchronous file persistence can
@@ -93,19 +102,22 @@ The References section pins every statement in this section to base commit
    `agentEvent` event. It carries backend/session context and, when supplied by the engine, label,
    scope/run ID, and call index. The manager isolates throwing listeners from the run [L3, L4].
 4. ACP session state mutates its in-memory history as text chunks and tool calls arrive, and emits
-   the unchanged update after applying it [L5]. Contrary to the preliminary focus-file mechanism
-   note, the pinned runner invokes `RunOptions.onHistory` only from its `finally` block after the
-   attempt has settled; the engine manager therefore receives no mid-call history today [L6].
-5. When `onAgentHistory` fires during runner settlement, the engine replaces the matching in-memory agent
-   snapshot and publishes a live-only `agentHistory` event. That handler calls `progress()` but not
-   `persistRun`; `persistedState()` includes whatever snapshot history exists only when another
-   settlement/checkpoint save occurs [L7, L8].
+   the unchanged update after applying it [L5]. The pinned lifecycle is: ACP prompt processing
+   finishes; the runner enters `finally` and calls `RunOptions.onHistory`; it then awaits
+   `session.release()`; only then does `AcpAgentRunner.run()` fulfill or reject and the engine emit
+   `agentEnd` [L6, L7]. Thus `agentHistory` can precede `agentEnd`, but it is unavailable during
+   prompt processing and is not a durable mid-prompt stream.
+5. When `onAgentHistory` fires during runner finalization, the engine replaces the matching
+   in-memory agent snapshot and publishes a live-only `agentHistory` event. That handler calls
+   `progress()` but not `persistRun`; `persistedState()` includes whatever snapshot history exists
+   only when another settlement/checkpoint save occurs [L7, L8].
 6. `PersistedAgentState.history` is currently typed as `AgentHistoryEntry[]`. The safe `inspect`
    source type and outward call-status allowlist omit history entirely [L8, L9].
 7. The MCP server registers and subscribes only `workflow://runs/{runId}/script`. It already
-   advertises `{resources:{subscribe:true,listChanged:true}}` and handles standard
-   Subscribe/Unsubscribe requests, but has no per-run events resource and sends no per-append
-   resource update [L10, L11].
+   advertises the server capability `{resources:{subscribe:true,listChanged:true}}` and handles
+   standard Subscribe/Unsubscribe requests, but has no per-run events resource and sends no
+   per-append resource update [L10, L11]. MCP defines no corresponding client capability gate
+   [U1].
 8. The event tail is already consumed server-side by `await`: `readEvents` establishes a cursor,
    `watchEvents` drains subsequent records, and terminal event types settle the wait. Its progress
    projection counts starts/ends and phase only, so it carries no current agent content [L12,
@@ -130,10 +142,12 @@ export interface RunAgentProgressPayload extends RunEventOrigin {
   label: string;
   phase?: string;
   callIndex: number;
-  /** Completed assistant text segments observed for this logical call. The active
+  /** seq of the agentStart record that opened this execution of the logical call. */
+  executionStartSeq: number;
+  /** Completed assistant text segments observed for this execution. The active
    * segment counts as one from its first text chunk. */
   turnCount: number;
-  /** Recognized ACP activity items observed for this logical call, cumulative. */
+  /** Recognized ACP activity items observed for this execution, cumulative. */
   observedEvents: number;
   /** Recognized activity folded into this sample in addition to the triggering item. */
   coalescedEvents: number;
@@ -154,7 +168,9 @@ export interface RunAgentTranscriptPayload extends RunEventOrigin {
   label: string;
   phase?: string;
   callIndex: number;
-  /** Dense zero-based readable-entry index within this logical call. */
+  /** seq of the agentStart record that opened this execution of the logical call. */
+  executionStartSeq: number;
+  /** Dense zero-based readable-entry index within this execution. */
   entryIndex: number;
   /** Dense zero-based replacement revision within this entry. */
   revision: number;
@@ -172,11 +188,12 @@ with every string projected. `EngineRunEventName`, payload maps, manager overloa
 exports, JSONL `EVENT_TYPES`, input validation, persisted validation, and exhaustiveness switches
 must all acquire both members. Existing members are byte-for-byte unchanged.
 
-All numeric fields must be non-negative safe integers. `callIndex`, `turnCount`, and
-`observedEvents` are required. Exactly one own string field among `latestText` and `lastToolName`
-is required and its trimmed value must remain non-empty after projection. A value that becomes
-empty after redaction/truncation is omitted; if no content remains, that sample is not appended.
-Unknown raw activity never becomes an `agentProgress` record.
+All numeric fields must be non-negative safe integers; `executionStartSeq` must additionally be a
+positive safe integer. `callIndex`, `executionStartSeq`, `turnCount`, and `observedEvents` are
+required. Exactly one own string field among `latestText` and `lastToolName` is required and its
+trimmed value must remain non-empty after projection. A value that becomes empty after
+redaction/truncation is omitted; if no content remains, that attempt is not appended and is not a
+successful sample under §4.3. Unknown raw activity never becomes an `agentProgress` record.
 
 For `agentTranscript`, `entryIndex` and `revision` must be non-negative safe integers,
 `operation` must be exactly `"upsert"`, and `entry` must satisfy the existing
@@ -188,21 +205,41 @@ millisecond. An assistant entry forbids `toolName` and `isError`; a tool entry r
 redaction/truncation performed by the persistence projector on either persisted string. Selecting
 the defined rolling assistant window or bounded progress tool-name preview is sampling, not a
 projection truncation; transcript tool title/name still arrive raw and report projector truncation.
+If projection leaves a transcript candidate without its required non-empty `text` or `toolName`,
+omit that candidate before sequence/index/revision allocation. It is not a corrupt half-entry and
+does not create a dense-space gap.
 
-### 3.2 Attribution
+### 3.2 Attribution and execution cycles
 
-The raw ACP envelope's `runId` names the engine scope. The workflows facade resolves the root run
-by an active manager agent row matching `(scope = payload.runId, callIndex)`; it additionally
-checks `label` when the envelope supplies one. The row exists because `onAgentStart` runs before
-runner delegation. Zero or multiple matches are an unattributed observation: the raw public
-`agentEvent` is still delivered unchanged, but it is not persisted and does not mark the event log
-incomplete. Both new events copy `label`, optional `phase`, and `callIndex` from that sole active
-row. Their root `runId` is the managed run ID and `scope` is the raw engine scope.
+The raw ACP envelope's `runId` names the engine scope. The workflows facade only normalizes the raw
+event and calls the protected engine-manager observer; it does not search runs or choose an owner.
+The engine manager is the sole attribution authority. It indexes its active managed-agent rows by
+JSON-encoded `[scope, callIndex]`, where the scope is the raw `runId`. Correct engine execution has
+exactly one active row per key because call indexes are unique within a scope and nested workflows
+use distinct scopes [L17]. The set-valued bucket is defensive: a duplicate `onAgentStart` callback
+or two overlapping managed executions that violate that invariant can create multiple rows. An
+activity is admitted only when exactly one row remains after an optional envelope-label equality
+check; zero or multiple rows are unattributed rather than guessed.
 
-Retries share the logical `(scope, callIndex)` accumulator. A retry therefore keeps cumulative
-turn/activity counts and most-recent content until the one logical `agentEnd`. A nested workflow
-uses its nested scope and remains in the root log. Post-`agentEnd` or post-run-terminal raw traffic
-is delivered on the existing live `agentEvent` bus but ignored by durable progress/transcript.
+`session_open` and `session_close` are normalized as attribution-control activities and never
+increment counters or create records. A sole owner accepts a content/boundary/usage activity only
+while its ACP `sessionId` is in the set opened for that owner. This prevents a late update from an
+interrupted/retried session from attaching to a replacement execution with the same logical call
+key. Malformed context, an update before `session_open`, or an update after `session_close` remains
+on the raw public `agentEvent` bus but is omitted from persistence without marking the log
+incomplete.
+
+When `onAgentStart` publishes successfully, its new JSONL `seq` becomes
+`executionStartSeq`; the active owner copies that value into every progress/transcript record until
+the matching `agentEnd`. The append-success action registers this owner before live `agentStart`
+delivery and before runner delegation; if the start append fails, the incomplete generation admits
+no new content record. Retries inside one engine execution share that start record and therefore
+continue counters and entries. A pause/abort emits `agentEnd`; same-ID resume subsequently emits another
+`agentStart` at a different sequence [L17]. That second execution gets a fresh accumulator with
+`turnCount = observedEvents = entryIndex = revision = 0`; no durable-log reseeding is required.
+The public execution key is `(scope, callIndex, executionStartSeq)`. Both new events copy `label`,
+optional `phase`, and `callIndex` from their sole owner; root `runId` is the managed run ID and
+`scope` is the engine scope.
 
 ## 4. Shared firehose source and progress projection
 
@@ -255,9 +292,12 @@ export interface WorkflowAgentActivityBase {
   scope: string;
   callIndex: number;
   label?: string;
+  sessionId: string;
 }
 
 export type WorkflowAgentActivity = WorkflowAgentActivityBase & (
+  | { kind: "session-open" }
+  | { kind: "session-close" }
   | { kind: "assistant-text"; text: string; messageId?: string }
   | { kind: "tool-call"; title: string; toolName: string }
   | { kind: "content-boundary" }
@@ -266,12 +306,11 @@ export type WorkflowAgentActivity = WorkflowAgentActivityBase & (
 ```
 
 The SDK subclass calls the engine manager's protected, non-throwing
-`observeAgentActivity(activity): void` before raw event delivery. The engine manager maintains a
-map from JSON-encoded `[scope, callIndex]` to the set of active managed agent rows, populated at
-`onAgentStart` and removed at `agentEnd`/root finalization. Exactly one matching owner admits an
-activity. This index is bounded by active calls and avoids scanning all runs for every token.
-The adapter returns `undefined` unless the envelope has a non-empty scope and non-negative safe
-`callIndex`; malformed context never reaches that index.
+`observeAgentActivity(activity): void` before raw event delivery. The engine manager owns the
+attribution map and session-membership checks defined in §3.2. This index is bounded by active
+calls and avoids scanning all runs for every token. The adapter returns `undefined` unless the
+envelope has a non-empty scope and session ID plus a non-negative safe `callIndex`; malformed
+context never reaches that index.
 
 ### 4.2 Recognized activity and readable history
 
@@ -283,6 +322,7 @@ The provider-neutral projector recognizes these ACP update kinds:
 | `tool_call` | end text segment; set `lastToolName` | flush the assistant, then append one tool-call upsert immediately |
 | `user_message_chunk`, `agent_thought_chunk`, `tool_call_update`, `plan`, `plan_update`, `plan_removed` | end the current assistant segment; count activity | flush the assistant's newest changed revision |
 | `usage_update` | retain valid `used` as `tokensObserved`; count activity | no transcript row |
+| `session_open`, `session_close` | bind/unbind session attribution only | no transcript row |
 | every other update/cross-cutting event | no sampled progress mutation | no transcript row |
 
 The ACP adapter admits `agent_message_chunk` only when `content.type === "text"` and `text` is
@@ -301,31 +341,37 @@ window, so projection flags remain accurate when the event is persisted. Split c
 text that remains in the window is rechecked across chunk boundaries.
 Text activity makes `latestText` the sole progress content field and clears `lastToolName`; tool
 activity makes `lastToolName` the sole progress content field and clears `latestText`. Boundary and
-usage activity retain the last content. A heartbeat therefore repeats exactly the latest projected
-content kind rather than preferring an older tool over newer text.
+usage activity retain the last content. Activity samples therefore carry the latest projected
+content kind rather than preferring an older tool over newer text; heartbeats repeat the last
+successfully appended sample as §4.3 fixes.
 
-For `tool_call`, the adapter requires non-empty `title` and reuses the existing
-`toolNameFromMeta` lookup semantics: inspect `_meta` object values in insertion order and take the
-first nested object's non-empty string `toolName`; otherwise take non-empty `kind`, then `title`
-[L5]. It never copies `_meta`, raw input/output, content, locations, status, or tool-call ID. The
-tool transcript entry uses `text = title` and that derived `toolName`.
+For `tool_call`, the adapter requires non-empty `title` and applies a new, strengthened
+observability-only normalization: inspect `Object.values(_meta)` in ECMAScript property-enumeration
+order and take the first nested object's string `toolName` whose trimmed value is non-empty;
+otherwise take non-empty `kind`, then non-empty `title`. The chosen original string is projected;
+the existing `toolNameFromMeta` helper and terminal-history behavior remain unchanged because that
+helper accepts empty strings and falls back only to `kind` [L5]. The adapter never copies `_meta`,
+raw input/output, content, locations, status, or tool-call ID. The tool transcript entry uses
+`text = title` and the newly normalized `toolName`.
 The progress accumulator stores `lastToolName` through
 `truncateUtf8(..., MAX_OBSERVABILITY_SCALAR_BYTES)`; the immediate transcript entry still reaches
 the persistence projector as the raw scalar so its outer truncation flag is exact.
 
-An assistant entry takes the next `entryIndex` when its first text arrives and starts at revision
-`0`; each materially changed sampled preview increments `revision`. Its numeric millisecond
-`timestamp` is captured with `Date.now()` at that first chunk and remains stable across revisions.
-A tool call closes the text segment, takes the next entry index with revision `0`, captures its
-observation timestamp, and appends immediately. Generated entries omit `isError`; assistant entries
-omit `toolName`, while tool entries require it. Entry indexes are dense within one logical call and
-continue across retries. Reducers key entries by
-`(scope, callIndex, entryIndex)` and retain only the greatest revision; equal or decreasing
-revisions in a log are corrupt.
+An assistant segment captures its numeric millisecond `timestamp` with `Date.now()` at the first
+text chunk. Its first safely projectable preview takes the next `entryIndex` and revision `0`;
+projection-empty previews allocate neither. Each subsequent materially changed, safely projectable
+preview takes the next dense revision, while the timestamp remains stable. A tool call closes the
+text segment and, only when both required projected strings remain non-empty, takes the next entry
+index with revision `0`, captures its observation timestamp, and appends immediately. Generated
+entries omit `isError`; assistant entries omit `toolName`, while tool entries require it. Entry
+indexes are dense within one execution, continue across retries, and reset after a subsequent
+`agentStart` for same-ID resume. Reducers key entries by
+`(scope, callIndex, executionStartSeq, entryIndex)` and retain only the greatest revision; equal or
+decreasing revisions within that execution are corrupt.
 
-The existing live-only `onAgentHistory` event and settlement-time run JSON history remain exactly
-as they are. They are not the R3 persistence path, so this feature does not reinterpret or rewrite
-the established terminal run-file field.
+The existing live-only finalization-time `onAgentHistory` event and terminal run-JSON history
+remain exactly as they are. They are not the R3 persistence path, so this feature does not
+reinterpret or rewrite the established terminal run-file field.
 
 ### 4.3 Sampling constants and algorithm
 
@@ -336,28 +382,49 @@ export const AGENT_PROGRESS_MIN_INTERVAL_MS = 1_000 as const;
 export const AGENT_PROGRESS_HEARTBEAT_MS = 15_000 as const;
 ```
 
-Per active call, retain only the latest accumulator plus `dirty`, `coalescedEvents`, one sample
-timer, and one heartbeat timer. There is no array/queue of unpersisted raw events.
+Per active execution, retain only the latest accumulator, last successfully appended activity and
+progress snapshots, `dirty`, the observations-since-activity-sample counter, one sample timer, and
+one heartbeat timer. There is no array/queue of unpersisted raw events.
 
-`observedEvents` increments once for each admitted text, tool, boundary, or usage activity.
-Immediately before an activity sample, let `n` be the observations since the prior successful
-activity sample, or since call start for the first sample; the emitted `coalescedEvents` is
-`max(0, n - 1)`. Heartbeats emit numeric `0`. The counter resets only after a successful activity
-sample. An increment that would exceed a safe integer is a projection failure under §8, not a
-wrapped or saturated count.
+`observedEvents` increments once for each admitted text, tool, boundary, or usage activity. Every
+such activity updates count/token/content state first. `dirty` is true exactly when a raw text/tool
+content candidate has been observed and the current candidate differs from the last successfully
+appended activity sample in any of projected `latestText`/`lastToolName`, `turnCount`,
+`observedEvents`, or `tokensObserved`. `appendable` is the narrower condition that projection leaves
+one required non-empty content field. Boundary and usage activities therefore become dirty after a
+content candidate exists even when its projected bytes stay unchanged; before any content they
+increment/capture state but are neither dirty nor appendable.
 
-1. Opening any assistant segment appends transcript revision `0` immediately. A changed message ID
-   or recognized content boundary first flushes the prior segment's newest changed revision, then
-   closes it. A tool call performs that flush, appends its own revision `0`, and only then updates
-   progress. Thus rapid distinct turns remain readable without retaining a pending-entry queue.
-2. The first activity in a call that yields `latestText` or `lastToolName` appends
+Immediately before an activity sample, let `n` be the observations since the prior successfully
+appended activity sample, or since execution start for the first sample; emitted
+`coalescedEvents = max(0, n - 1)`. A **successfully appended activity sample** means a content-bearing
+`cause:"activity"` record passed input validation and projection, was appended to JSONL, and
+consumed a `seq`. A projection-empty attempt or failed append is not successful: it does not reset
+`n`, advance the 1,000 ms boundary, replace either last-success snapshot, or re-arm the heartbeat.
+Heartbeats never reset `n`. An increment that would exceed a safe integer is a projection failure
+under §8, not a wrapped or saturated count.
+
+1. Opening any assistant segment appends transcript revision `0` immediately when its projected
+   preview is non-empty; otherwise it remains provisional until a safe preview exists. A changed
+   message ID or recognized content boundary first flushes the prior segment's newest safely
+   projectable changed revision, then closes it. A tool call performs that flush, appends its own
+   revision `0` when both projected strings survive, and only then updates progress. Omitted
+   candidates consume no entry/revision index. Thus rapid distinct readable turns persist without
+   retaining a pending-entry queue.
+2. The first activity in an execution that yields `latestText` or `lastToolName` appends
    `agentProgress{cause:"activity"}` immediately. Thereafter, if at least 1,000 ms has elapsed since
    the last successful activity sample, the next dirty activity samples immediately. Otherwise it
    replaces the pending preview/tool/tokens and arms one timer for the remaining interval. At the
-   boundary, one sample carries the latest state.
-3. Each successful progress sample arms a 15,000 ms heartbeat. If no successful sample occurs before it
-   fires and the call still runs, append `cause:"heartbeat"` with the last content and cumulative
-   counts. No heartbeat is emitted before any content exists.
+   boundary, one sample carries the latest state. If projection removes its only content, leave
+   state dirty without a timer; the next admitted activity retries immediately because the minimum
+   interval has already elapsed.
+3. Each successfully appended progress record arms one 15,000 ms heartbeat. If no subsequent progress
+   record appends before it fires and the execution still runs, append `cause:"heartbeat"` by
+   copying every payload field from the immediately preceding successfully appended
+   `agentProgress` record except setting `cause:"heartbeat"` and `coalescedEvents:0`. In particular,
+   a heartbeat does **not** expose accumulator counts/tokens that have not reached an activity
+   sample. A successful heartbeat re-arms the timer, giving one repeat every 15,000 ms. No heartbeat
+   is emitted before an activity sample has persisted content.
 4. When an activity sample contains a changed assistant preview, append the next
    `agentTranscript` revision immediately before its matching `agentProgress`. If the bounded
    preview bytes did not change, do not append a redundant transcript revision.
@@ -371,18 +438,24 @@ need reducer state and R3 consumers do not infer turns from heartbeats.
 
 ### 4.4 Finalization and execution isolation
 
-Immediately before a call's `agentEnd` append, the manager flushes the newest changed assistant
-revision and one pending content-bearing activity sample, in that order, regardless of the 1,000 ms interval,
-cancels both timers, and deletes the accumulator. Therefore no valid pending transcript/progress
-state is silently ordered after `agentEnd`. If an engine path reaches a root terminal transition
-without `agentEnd`, it performs the same flush/cancel/delete sequence for every remaining
-accumulator before the terminal event.
+Immediately before an execution's `agentEnd` append, the manager flushes the newest changed
+assistant revision and one dirty content-bearing activity sample, in that order, regardless of the
+1,000 ms interval, cancels both timers, unbinds its sessions, and deletes the accumulator. A
+projection-empty pending state is intentionally not appendable and does not manufacture content.
+Therefore no valid pending transcript/progress state is silently ordered after `agentEnd`. If an
+engine path reaches a root terminal transition without `agentEnd`, it performs the same
+flush/cancel/delete sequence for every remaining accumulator before the terminal event.
+Owner/session indexes are removed before live delivery of `agentEnd` or the root terminal event, so
+synchronous or late raw traffic cannot append after the durable boundary.
 
-`publishRunEvent` retains its append-before-live-delivery order. A progress or transcript append failure follows
-the existing rule: latch `eventLogIncomplete`, best-effort persist the marker, deliver the live
-event, and stop further JSONL appends for that generation. Projection or persistence failure never
-propagates into the workflow promise. Raw listener/source failure is caught even earlier and cannot
-set `eventLogIncomplete` because no persistable event was admitted.
+`publishRunEvent` retains its append-before-live-delivery order. Its internal append-success action
+receives the already-projected record and is the only path that updates
+`WorkflowSnapshot.latestActivity`, the successful-sample clocks/snapshots, or `seq`-dependent
+execution state. A progress or transcript append failure follows the existing rule: latch
+`eventLogIncomplete`, best-effort persist the marker, deliver the live event, and stop further
+JSONL appends for that generation. Projection or persistence failure never propagates into the
+workflow promise. Raw listener/source failure is caught even earlier and cannot set
+`eventLogIncomplete` because no persistable event was admitted.
 
 ## 5. Redaction, bounds, and durable record semantics
 
@@ -394,7 +467,8 @@ Extend `projectRunEventForPersistence` rather than adding a second redactor. It 
 
 - `runId`, `scope`, `label`, `phase`, `latestText`, and `lastToolName` use the same internal
   `projectText` path as lifecycle fields;
-- numeric fields and `cause` are copied only after the input validator accepts them;
+- numeric fields, including `executionStartSeq`, and `cause` are copied only after the input
+  validator accepts them;
 - transcript `entry.text` and required tool-entry `entry.toolName` use `projectText`; role, kind,
   timestamp, index, revision, and operation are copied only after exact validation;
 - top-level `projection.redacted` and `projection.truncated` aggregate every projected string;
@@ -404,9 +478,19 @@ Extend `projectRunEventForPersistence` rather than adding a second redactor. It 
   one newline.
 
 The JSONL sequence remains gap-free. Sampling discards raw observations **before** sequence
-allocation; it does not reserve sequence numbers for them. Each successful transcript upsert and
-progress sample consumes exactly one next `seq`. `readEvents` and `watchEvents` require no special
-path and return both new members in order with lifecycle events.
+allocation; it does not reserve sequence numbers for them. Each successfully appended transcript
+upsert or progress record consumes exactly one next `seq`.
+
+Individual new-event shapes are checked by the existing input/persisted validators. Cross-record
+semantics from §6.2 are checked inside the existing `parseLog` whole-generation loop: initialize a
+fresh semantic validator before record `1`, feed every record through the physical shape/stream/seq
+checks and then the semantic validator in the same pass, and only after the complete terminated
+generation passes may `readEvents` slice the requested page. This is not page-local validation and
+not a second prefix scan. Consequently a read with `after > 0` and a `watchEvents` drain starting at
+the tail still validate against the preceding `agentStart`; they never treat the requested window
+as a standalone log. The base already parses the complete sidecar before every slice/watch drain
+[L2, L18], so this adds constant semantic work per parsed record without adding another scan or a
+new resource-only cursor cache. Both APIs return the new members in exact JSONL order.
 
 The log has no total-size retention limit and is never rewritten/compacted by this feature. A
 subscriber that falls behind recovers from JSONL with `(streamId, seq)`; it does not rely on a
@@ -426,10 +510,11 @@ choice preserves the established terminal run-file field byte/meaning contract, 
 an ever-growing run JSON on every streaming interval, reuses the one redaction/cursor/error path,
 and gives the subscribing MCP client the transcript directly.
 
-The ordinary run JSON and live-only `agentHistory` manager event keep their current settlement
-semantics. `inspect` remains bounded and unchanged; a client that needs the in-flight transcript
-reads the events resource it already subscribed to. R3 is not inferred from sampled progress:
-transcript upserts have their own exact reducer contract.
+The ordinary run JSON and live-only `agentHistory` manager event keep their current finalization
+semantics described in §2: `onHistory` can run before `agentEnd`, but only after ACP prompt
+processing and without causing a run save. `inspect` remains bounded and unchanged; a client that
+needs the in-flight transcript reads the events resource it already subscribed to. R3 is not
+inferred from sampled progress: transcript upserts have their own exact reducer contract.
 
 ### 6.2 Reducer and ordering
 
@@ -437,50 +522,78 @@ A client builds the current transcript with this deterministic algorithm:
 
 1. Deduplicate retried pages by exact `(streamId, seq)` before reducing; an already-applied sequence
    with the same canonical record is a no-op, while a different record at that sequence is corrupt.
-2. Partition `agentTranscript` records by `(scope, callIndex)`.
-3. Within a call, key by `entryIndex`; accept only a revision greater than the retained revision and
-   replace the retained entry. `entryIndex` and `revision` begin at zero and are dense as specified
-   in §4.2.
+2. Partition `agentTranscript` records by `(scope, callIndex, executionStartSeq)`. Order repeated
+   executions of one logical call by ascending `executionStartSeq`; do not merge their entry spaces.
+3. Within an execution, key by `entryIndex`; accept only a revision greater than the retained
+   revision and replace the retained entry. `entryIndex` and `revision` begin at zero and are dense
+   as specified in §4.2.
 4. Render retained entries in ascending `entryIndex`. A tool entry never receives a replacement;
    an assistant entry may receive one replacement per changed 1-second preview and one final flush.
-5. `agentEnd` finalizes the call after all transcript revisions in the same JSONL sequence. A root
-   terminal event finalizes any call that lacks `agentEnd` after the manager's forced flush.
+5. The `agentEnd` for the same `(scope, callIndex)` finalizes whichever execution is active after all
+   of its transcript revisions. A root terminal event finalizes any still-active execution after
+   the manager's forced flush. A subsequent `agentStart` for the same logical key opens a new partition;
+   its own record `seq` must be the new records' `executionStartSeq`.
 
-An equal/decreasing or skipped revision for the same entry, a nonzero initial revision, a skipped entry index,
-a transcript record after its call's `agentEnd`, or a transcript record without a preceding
-`agentStart` is a `CORRUPT_LOG` read failure. Retries do not create a second call partition; their
-entries continue the same dense index space.
+The whole-generation validator in §5 owns this state. On `agentStart` at sequence `s`, an empty
+slot for `(scope, callIndex)` opens one execution with start identity `s`, projected label/phase,
+zero transcript indexes/revisions, and zero progress observations. A second start before an end
+marks that slot ambiguous for new-event validation. `agentEnd` closes the slot when present; an
+unmatched legacy lifecycle record is not newly rejected. `complete`, `paused`, `error`, or
+`stopped` closes any remaining slots after the forced-flush ordering; `resumed` permits subsequent starts
+without changing generation. A subsequent start after an end/root terminal is legal. New events are
+legal only in one unambiguous active execution. Thus a new record after one `agentEnd` but before
+the next `agentStart` is corrupt, while post-resume records referencing the second start are valid.
+A generation containing no new event type is never rejected solely for legacy start/end balance.
 
-Cross-record validation applies the same active-call envelope to `agentProgress`. Both new event
-types must carry the matching start's label and phase. Activity progress has a strictly increasing
-`observedEvents` and nondecreasing `turnCount`; a heartbeat exactly repeats the preceding progress
-state except for `cause` and `coalescedEvents: 0`. Either event before start or after end, a tool
-entry revision other than `0`, or a mismatch in these invariants is `CORRUPT_LOG`. Old logs with no
-new event type pass unchanged.
+Within one execution, an equal/decreasing or skipped revision for the same entry, a nonzero initial
+revision, a skipped entry index, a changed timestamp across assistant revisions, or a tool entry
+revision other than `0` is `CORRUPT_LOG`. Both new event types must carry the active start's
+`executionStartSeq`, label, and exact optional phase. The first progress record must be activity.
+Each activity progress has strictly increasing `observedEvents`, nondecreasing `turnCount`, and
+exactly `coalescedEvents = observedEvents - priorActivityObservedEvents - 1`, using zero before the
+first activity sample. A heartbeat must copy every field of the immediately preceding progress
+payload except `cause:"heartbeat"` and `coalescedEvents:0`; it cannot reveal counts observed only in
+memory. Any violation is `CORRUPT_LOG`. Old logs with no new event type pass unchanged.
 
 The transcript has no entry-count or total-byte retention cap. Each revision is independently
 redacted and scalar/record bounded. A long assistant segment is therefore a readable current-window
 preview of the newest complete Unicode scalars, capped by the existing numeric 512-byte safety
 bound, not an unbounded verbatim capture. Its prior sampled windows remain in the append-only log.
 
-### 6.3 MCP progress convenience
+### 6.3 Existing MCP progress channel
 
-The MCP progress message uses the newest safely projected progress sample: `"<label>: tool
-<lastToolName>"` when a tool is latest, otherwise `"<label>: <latestText>"`. Background `await`
-handles the persisted `agentProgress` record in its existing event-log reporter.
+Add an optional root field to the additive live snapshot type:
 
-For a foreground invocation, the server installs a temporary manager `agentProgress` listener
-before `startInBackground`, assigns the returned run ID immediately, filters the listener to that
-ID, and removes it in the tool handler's `finally` block. The listener projects `label` and content
-again with the existing MCP redaction/512-byte helper before calling the request's progress
-reporter; it reads settled/total counts from the matching live snapshot. The existing snapshot
-callback continues to report lifecycle/phase changes. A progress event observed synchronously
-before run-ID assignment is held in one latest-event slot and either delivered after assignment if
-it matches or discarded; there is no queue.
+```ts
+export interface WorkflowSnapshot {
+  // existing fields unchanged
+  /** Latest successfully persisted, already-projected agentProgress record. Ephemeral run state. */
+  latestActivity?: {
+    seq: number;
+    progress: RunAgentProgressPayload;
+  };
+}
+```
 
-Both paths keep their existing request-correlated `notifications/progress` behavior; absent
-progress tokens remain a no-op, and notification promises are never awaited. These messages are a
-convenience only; transcript reconstruction always uses `agentTranscript` records.
+On each successful `agentProgress` append, the manager copies the returned record's positive `seq`
+and projected payload into `managed.snapshot.latestActivity`, then invokes the same `progress()`
+function that recomputes counts and calls `ExecOptions.onProgress` [L13]. `persistedState()`
+continues selecting its established fields and must not serialize `latestActivity`; agent rows are
+unchanged, preserving legacy run JSON [L8]. A foreground MCP invocation therefore receives content
+through its existing request-owned `exec.onProgress` callback, already correlated by construction.
+That closure remembers only the greatest activity `seq` it reported: on a newer one it formats
+`"<label>: tool <lastToolName>"` when a tool is latest or `"<label>: <latestText>"` otherwise; on
+ordinary lifecycle/phase callbacks with no newer activity it retains the existing phase message.
+Thus a subsequent lifecycle callback does not replay stale content, while every heartbeat has a new
+sequence and remains visible. Settled/total counts are unchanged. There is no manager-wide
+listener, run-ID filter, pre-assignment slot, or listener cleanup lifecycle.
+
+Background `await` handles the persisted `agentProgress` member inside the existing
+`createAwaitProgressReporter.record` switch and uses the same safe message while preserving its
+start/end/phase counters [L13]. Both paths keep existing request-correlated
+`notifications/progress` behavior; absent progress tokens remain a no-op and notification promises
+are never awaited. These messages are a convenience only; transcript reconstruction always uses
+`agentTranscript` records.
 
 ## 7. MCP events resource and subscription
 
@@ -526,6 +639,7 @@ export interface WorkflowRunEventsResourceDocument {
   cursor: number;
   /** Complete JSONL tail at the read snapshot. */
   endCursor: number;
+  /** True exactly when cursor < endCursor. */
   hasMore: boolean;
   events: RunEventLogRecord[];
 }
@@ -565,9 +679,17 @@ ordinary page loop.
 
 Only the canonical, query-free events URI is subscribable. A successful subscribe validates the
 run and current event generation with `readEvents`, adds the URI to protocol state, and starts one
-`watchEvents` pump at the current `endCursor`. A duplicate subscribe is idempotent and creates no
-second watcher. Unsubscribe is idempotent for a known/deleted/currently subscribed URI, removes the
-URI, closes its pump, and returns `{}`. Query-form subscription is rejected.
+`watchEvents` pump at the current `endCursor` before returning `{}`. A duplicate subscribe creates
+no second watcher; if the retained subscription currently has no watcher after an error, it
+revalidates and re-arms one at the new `endCursor` before returning. Query-form subscription is
+rejected.
+
+For unsubscribe, **known** means the canonical URI is currently subscribed, its run snapshot or
+lineage tombstone exists, or this server instance observed that run's deletion. A well-formed URI
+for an existing but never-subscribed run is therefore known and unsubscribe returns `{}`. A
+malformed/query URI or syntactically valid run ID that satisfies none of those conditions is
+never-known and returns **-32602**. Successful unsubscribe removes the URI, closes its pump, clears
+scheduler/recovery state, and returns `{}`.
 
 For every record drained by the pump, mark that URI dirty and schedule
 
@@ -590,10 +712,20 @@ affect the run.
 The pump remains attached while the protocol subscription exists, including across a paused/failed
 same-ID run that is explicitly resumed. `agentEnd` and each root terminal event are ordered after
 the final pending progress/transcript flush. The resource's `finalized` bit reflects the current run
-status; a `resumed` record changes it back to false without changing `streamId`. Unsubscribe,
-connection close, or run deletion closes all associated watchers and pending scheduler state. Run
-deletion also removes the subscription and sends list-changed; it does not send a final
-resource-updated notification for a resource that can no longer be read.
+status; a `resumed` record changes it back to false without changing `streamId`. Same-ID resumed
+progress/transcript records reference the second execution's new `agentStart` sequence under §6.2.
+
+If a watcher fails after subscribe, retain the protocol subscription, close the watcher, set
+`needsRearm`, and mark the URI dirty once. There is no polling restart and a subsequent append alone
+does not re-arm it. The next successful resource read of either the canonical or query URI for that
+subscribed run starts `watchEvents` at that read's complete `endCursor` and stream ID before
+returning the document, then clears `needsRearm`; backlog through `endCursor` is in the document and
+subsequent records are in the watcher. A duplicate subscribe performs the same recovery. If re-arm
+fails, that read/subscribe returns the mapped error and leaves `needsRearm` set.
+
+Unsubscribe, connection close, or run deletion closes all associated watchers and pending
+scheduler/recovery state. Run deletion also removes the subscription and sends list-changed; it
+does not send a final resource-updated notification for a resource that can no longer be read.
 
 ### 7.3 Existing surfaces
 
@@ -616,19 +748,22 @@ numeric **-32603** [U1]. Those exact wire codes are required:
 | read/subscribe malformed events URI or query; unknown run; known run without an event generation; query subscription | `McpError(ErrorCode.InvalidParams, safeMessage)`, code **-32602** |
 | query `after`/`limit`/`streamId` invalid; cursor ahead; stream generation mismatch | code **-32602** |
 | subscribe valid canonical URI | empty result `{}`; watcher is live before response |
-| unsubscribe valid known/deleted/subscribed canonical URI | empty result `{}` |
+| unsubscribe canonical URI for a current/tombstoned/this-process-deleted/subscribed run, including one never subscribed | empty result `{}` |
 | unsubscribe malformed or never-known URI | code **-32602** |
 | event log `EVENT_LOG_INCOMPLETE`, `CORRUPT_LOG`, `UNSUPPORTED_VERSION`, `SNAPSHOT_AHEAD`, `RECORD_TOO_LARGE`, `PROJECTION_ERROR`, `SEQUENCE_MISMATCH`, or `IO_ERROR` during resource read/start | `McpError(ErrorCode.InternalError, safeMessage)`, code **-32603** |
-| watcher hits one of those integrity/I/O errors after subscribe | mark URI dirty once so the client re-read receives **-32603**, close that watcher, retain protocol subscription; no automatic polling loop |
+| watcher hits one of those integrity/I/O errors after subscribe | mark URI dirty once, close watcher, retain protocol subscription with `needsRearm`; successful read/duplicate subscribe re-arms as §7.2, with no automatic polling |
 | `sendResourceUpdated` rejects or transport closes | swallow; clear bounded scheduler state; workflow and JSONL unchanged |
 | raw event unattributed/malformed/unsupported | omit durable progress/transcript mutation; raw live event still forwarded; workflow and JSONL completeness unchanged |
 | progress/transcript projection or append fails | existing `eventLogIncomplete` latch; raw live event still delivered; workflow result unchanged |
 | timer callback races finalization | observe finalized state and no-op |
 
-`safeMessage` includes the requested URI/run ID and the stable `RunEventLogError.code` when
-available. It never includes filesystem paths, raw record bytes, content previews, stack/cause,
-session IDs, or credentials. Protocol validation errors are request errors, not tool results and
-not `isError` tool content.
+After the parser has safely recognized a run ID, `safeMessage` includes that run ID and the
+normalized URI; when the cause is a `RunEventLogError`, it also includes the stable error code.
+Those inclusions are required, not optional diagnostics. A URI rejected before safe run-ID parsing
+is described only as a malformed workflow-events URI and is never echoed verbatim. Messages never
+include filesystem paths, raw record bytes, unknown query/userinfo text, content previews,
+stack/cause, session IDs, or credentials. Protocol validation errors are request errors, not tool
+results and not `isError` tool content.
 
 The complete engine-to-wire mapping is frozen. `RUN_NOT_FOUND`, `ORPHANED_LOG`,
 `EVENT_LOG_UNAVAILABLE`, `WATERMARK_MISSING`, `STREAM_ID_MISSING`, `INVALID_CURSOR`,
@@ -646,8 +781,8 @@ apparently complete transcript with a silent gap.
 **Source trace:** owner quotations 1–2; all R1/R2/R3 ship in one release without changing authored
 workflow behavior.
 
-- Run JSON and the live-only/settlement-time `agentHistory` field/event retain their exact existing
-  meaning and serialization.
+- Terminal run JSON and the live-only finalization-time `agentHistory` event retain their exact
+  existing meaning and serialization.
 - Old JSONL without `agentProgress` is unchanged and readable. New JSONL uses version `1`; all old
   event shapes and their serialization stay unchanged. Consumers with exhaustive event switches
   must accept the additive members before reading new logs.
@@ -663,7 +798,7 @@ One coordinated changeset set ships:
 | Package | Change | Bump |
 | --- | --- | --- |
 | `@automatalabs/shared-types` | additive progress/transcript resource-facing event types | minor |
-| `@automatalabs/workflow-engine` | accumulator, projection, sampling, transcript ordering, JSONL validation | minor |
+| `@automatalabs/workflow-engine` | accumulator, projection, sampling, execution-cycle transcript ordering, snapshot activity, JSONL validation | minor |
 | `@automatalabs/workflows` | shared `WorkflowAgentEventSource`, ACP projection, facade re-exports | minor |
 | `@automatalabs/mcp-server` | events resource, watcher/coalescer, content-bearing foreground/await progress | minor |
 | `@automatalabs/acp-agents` | no runtime/type change; its existing firehose is consumed | none |
@@ -680,13 +815,15 @@ saw the feedback.
 
 The implementation updates all of these in the same train:
 
-- `docs/api.md`: event schemas, sampling/finalization, transcript reduction, canonical and paging
-  URIs, cursor loop, notification advisory semantics, and the exact error matrix.
+- `docs/api.md`: event schemas, `executionStartSeq`/same-ID resume partitioning,
+  sampling/finalization, transcript reduction, canonical and paging URIs, cursor loop,
+  notification advisory/recovery semantics, and the exact error matrix.
 - root README plus `packages/workflows/README.md` and `packages/mcp-server/README.md`: one concise
   subscribe/read/catch-up example and link to the API contract.
 - `skills/agentprism-workflow-authoring/SKILL.md` and `reference.md`: explain that long-running
   journaling workflows are observable without author annotations, how clients use run ID/events,
-  and that progress is coarse while transcript upserts are reducible and cursor-backed.
+  and that progress is coarse while execution-partitioned transcript upserts are reducible and
+  cursor-backed.
 - MCP authoring prompt: both edited skill files are inputs to
   `scripts/generate-authoring-prompt.mjs`; run that generator and commit
   `packages/mcp-server/src/generated/authoring-prompt-content.ts`. The existing drift test must
@@ -747,6 +884,26 @@ The implementation updates all of these in the same train:
    incomplete markers/diagnostics are retained.
 11. **Put ACP types in workflow-engine.** Rejected because it breaks the backend-neutral runner
     seam. The workflows facade owns ACP decoding; the engine consumes normalized activity.
+12. **Use a temporary manager-wide `agentProgress` listener for foreground MCP progress.** Rejected
+    because the existing `ExecOptions.onProgress`/`WorkflowSnapshot` channel is already owned by and
+    correlated to that foreground request. `latestActivity` is an additive ephemeral snapshot field
+    and avoids listener lifetime, run-ID filtering, and pre-assignment races.
+13. **Continue transcript indexes/counters across same-ID resume by scanning and reseeding them.**
+    Rejected because `agentStart` already supplies a durable sequence identity for each execution.
+    `executionStartSeq` makes repeated cycles explicit, resets dense state safely, and requires no
+    extra resume scan or hidden run-JSON counter.
+14. **Validate new-event relationships only within each returned page.** Rejected because a page or
+    watcher beginning after `agentStart` lacks the required prefix and would falsely report
+    corruption. The existing persistence path already parses the whole generation before slicing;
+    semantic validation joins that one pass.
+15. **Poll automatically after a subscription watcher fails.** Rejected because hidden polling
+    survives without client demand and adds work per retained subscription. One dirty error hint
+    plus deterministic re-arm on the next successful read or duplicate subscribe restores delivery
+    without affecting the run.
+16. **Put current in-memory cumulative counts on heartbeats.** Rejected because activity may be
+    projection-empty or waiting for the sampling boundary, making a heartbeat disagree with the
+    last durable state. Heartbeats repeat the last appended payload; the next content-bearing
+    activity sample exposes all admitted counts through exact `coalescedEvents` arithmetic.
 
 ## 13. Test plan
 
@@ -755,8 +912,8 @@ compatibility invariant. All stated cases are release blockers.
 
 ### 13.1 Shared types and event persistence
 
-- Type fixtures cover `agentProgress`, `agentTranscript`, their required numeric/content fields,
-  reducer keys, and old event-union object literals.
+- Type fixtures cover `agentProgress`, `agentTranscript`, required `executionStartSeq` and other
+  numeric/content fields, execution-aware reducer keys, and old event-union object literals.
 - Existing JSONL fixtures remain byte-identical. New fixtures pin version `1`, exact projected
   progress JSON, dense sequence, top-level redacted/truncated flags, Unicode-safe 512-byte values,
   and 65,536-byte record rejection.
@@ -764,18 +921,23 @@ compatibility invariant. All stated cases are release blockers.
   fields absent, forbidden transcript roles/kinds, invalid entry/revision/operation, raw session/tool
   payload fields, invalid cause, malformed origin, and unknown event type.
 - Projection fixtures cover secrets in one chunk and split across chunks, sensitive tool names,
-  multibyte truncation, empty-after-projection omission, and a maximum-size valid record.
+  multibyte truncation, progress and transcript empty-after-projection omission, dense transcript
+  indexes/revisions after an omitted candidate, and a maximum-size valid record.
 - `readEvents` and `watchEvents` return progress/transcript in exact order and retain cursor/stream
-  behavior. Cross-record validation rejects skipped/decreasing revisions/indexes, tool revision,
-  label/phase mismatch, non-monotonic progress, changed heartbeat state, and pre-start/post-end
-  progress or transcript; all existing log error fixtures pass unchanged.
+  behavior. A fixture whose requested page and watcher both begin after `agentStart` passes because
+  the one whole-generation parse seeds semantic state before slicing. Cross-record validation
+  rejects skipped/decreasing revisions/indexes, changed revision timestamp, tool revision,
+  start-sequence/label/phase mismatch, non-monotonic progress, wrong exact `coalescedEvents`, changed
+  heartbeat state, and new events outside an active execution; lifecycle-only legacy fixtures,
+  including their historical start/end balance, pass unchanged.
 
 ### 13.2 Shared firehose and manager progress (R1)
 
 - One runner shared across managers/overlapping runs gets one source subscription and exact
   per-sink delivery; detach/dispose/ref-count/throwing-sink tests prove isolation and cleanup.
 - Every ACP update discriminant is covered by an exhaustive type guard. Provider IDs are varied to
-  prove identical behavior. Cross-cutting events remain raw-only.
+  prove identical behavior. `session_open`/`session_close` are attribution-control-only; every other
+  cross-cutting event remains raw-only.
 - A controlled in-flight agent emits text, remains unresolved, and the test reads a persisted
   `agentProgress` containing `{callIndex,label,turnCount,latestText}` **before** resolving the
   runner and before any `agentEnd`. This is the load-bearing acceptance test.
@@ -783,10 +945,20 @@ compatibility invariant. All stated cases are release blockers.
   `tokensObserved`; invalid values are ignored. Counts-only pre-content heartbeat never appears.
 - Same/different/absent ACP message IDs, non-text content, tool/content boundaries, retries, nested
   scopes, same-label concurrency, and unattributed/ambiguous/post-terminal events follow §§3–4
-  exactly. Tool-name precedence covers nested `_meta` tool names, kind, title, and empty candidates.
-- Fake timers pin immediate first sample/upsert, one activity sample per 1,000 ms, latest-state
-  replacement, changed-preview-only revisions, `coalescedEvents`, 15,000 ms heartbeat, dirty flush
-  before `agentEnd`, terminal cleanup, `unref`, and stale callback no-op.
+  exactly. Session-open binding rejects pre-open, post-close, and late old-execution updates; a
+  deliberately duplicated active owner proves multiple matches are omitted. Tool-name precedence
+  covers the new non-empty nested `_meta` name → kind → title rule, empty candidates, and a
+  non-regression fixture for the existing `toolNameFromMeta`/terminal-history semantics.
+- Fake timers pin immediate first sample/upsert, the exact dirty predicate (content, boundary counts,
+  usage tokens), one activity sample per 1,000 ms, latest-state replacement,
+  changed-preview-only revisions, exact `coalescedEvents`, and a 15,000 ms heartbeat that repeats
+  the immediately preceding appended payload. Projection-empty attempts do not reset counters,
+  clocks, or timers; the next safe sample includes their observations. Dirty flush before
+  `agentEnd`, terminal cleanup, `unref`, and stale callback no-op are pinned.
+- Pause/abort followed by same-ID resume produces two `agentStart`/`agentEnd` cycles with distinct
+  `executionStartSeq` values. The second execution resets entry/revision/turn/observation state,
+  retries within either execution do not reset it, and both the whole-log validator and client
+  reducer accept the result without collisions.
 - A high-volume burst (at least 100,000 text chunks) produces constant-size pending state, no raw
   queue, bounded persisted sample count, correct final preview/counts, and no workflow latency tied
   to a fake slow subscriber.
@@ -799,8 +971,8 @@ compatibility invariant. All stated cases are release blockers.
   entry and a tool-call entry; neither assertion resolves the runner or observes `agentEnd`.
 - Consecutive same-message chunks retain one entry index and increasing revisions; message-ID
   changes and tool/content boundaries split segments; tool calls take the next index. Retries,
-  stable first-observation timestamps, exact allowed keys/roles/kinds, and forced final revisions
-  are pinned.
+  execution-local resets on resume, stable first-observation timestamps, exact allowed
+  keys/roles/kinds, and forced final revisions are pinned.
 - A reducer fed one record at a time and one fed arbitrary resource pages produce the identical
   transcript. Duplicate page reads are idempotent at the client reducer while duplicate/decreasing
   revisions inside the log are corrupt.
@@ -816,38 +988,48 @@ compatibility invariant. All stated cases are release blockers.
 - Resource list/template/direct-read tests cover discovery eligibility, the existing newest-50
   discovery rule, exact registration/list metadata and completion, canonical/query content URI
   normalization, MIME/compact JSON/schema version, status/finalized derivation, empty logs,
-  latest-100 tail, concurrent canonical appends, and direct reads outside discovery.
+  latest-100 tail, exact `hasMore === (cursor < endCursor)`, concurrent canonical appends, and
+  direct reads outside discovery.
 - Query parser table covers every accepted default/bound and every forbidden duplicate, unknown,
   fragment, authority, numeric, stream, cursor, and path form. Paging 2,501 records with limit
   1,000 yields all records exactly once.
-- Subscribe starts one watcher before `{}`; duplicate subscribe is idempotent; query subscribe and
-  unknown/unavailable runs return numeric -32602. Unsubscribe/deletion/connection-close release
-  watchers and timers.
+- Subscribe starts one watcher before `{}`; duplicate subscribe is idempotent while healthy and
+  re-arms a failed watcher. Query subscribe and unknown/unavailable runs return numeric -32602.
+  Unsubscribe of an existing but never-subscribed canonical URI returns `{}`; malformed and
+  syntactically valid never-known URIs return -32602. Deletion/connection-close release watchers,
+  scheduler, and recovery state.
 - Append mid-flight `agentTranscript` and `agentProgress` records and assert a subscribed client
   receives `notifications/resources/updated`, reads the resource, and sees readable content before
   `agentEnd`.
 - The **subscriber-falls-behind acceptance test** holds the first notification promise unresolved,
   appends more than one page, proves only one promise plus `dirty` exists, releases it, receives at
   most one subsequent hint, then pages from its old cursor with no gaps or duplicates.
-- Notification rejection, connection close, absent subscriber, watcher integrity error, external
-  process append, coalesced filesystem changes, paused/resumed same stream, final flush ordering,
-  and run deletion follow §7.
-- Exact numeric error assertions pin -32602/-32603 for every §8 row and verify safe messages omit
-  paths/content/causes.
-- Script-resource tests pass unchanged. Foreground and `await` progress tests now assert the safe
-  content message; the foreground test covers a synchronous pre-run-ID event slot, run filtering,
-  listener cleanup, and no queue. No-progress-token remains a no-op.
+- Notification rejection, connection close, absent subscriber, external process append, coalesced
+  filesystem changes, paused/resumed same stream, final flush ordering, and run deletion follow §7.
+  For watcher errors, one test proves no append/poller silently re-arms it and a subsequent successful
+  page read restores the watcher at `endCursor` without a gap; failed re-arm leaves `needsRearm`.
+- Exact numeric error assertions pin -32602/-32603 for every §8 row. For safely parsed requests,
+  safe-message assertions require normalized URI/run ID and stable `RunEventLogError.code`; a
+  malicious malformed URI is not echoed. Both groups prove paths/content/causes/credentials are
+  absent.
+- Script-resource tests pass unchanged. Foreground and `await` progress tests assert the safe
+  content message. The foreground test proves the content arrives through the existing
+  request-owned snapshot callback, `latestActivity` is already projected and absent from persisted
+  run JSON, and no manager listener/filter/holding slot exists. No-progress-token remains a no-op.
 
 ### 13.5 Compatibility, docs, and release
 
 - Full package typecheck/build/test suites pass; existing journal hash, model-routing, resume,
   isolation, auth, cancellation, event-persistence, script-resource, and authoring-prompt drift
   suites remain green.
-- Export-surface tests pin old import paths and the new constants/types/source helper from public
-  package roots.
-- Old run/event fixtures load without rewrite. Default journaling needs no new option and creates
-  the resource whether or not the run ever emits progress; explicit `journaling: false` creates no
-  durable resource. Tool/script/environment schemas contain no observability switch.
+- Export-surface tests pin old import paths and the new constants/event/snapshot types/source helper
+  from public package roots.
+- Old run/event fixtures load without rewrite. Legacy run-JSON label/phase/history serialization is
+  byte-identical and does not pass through the event projector. Default journaling needs no new
+  option and creates the resource whether or not the run ever emits progress; explicit
+  `journaling: false` creates no durable resource. Tool/script/environment schemas contain no
+  observability switch. Initialize capability fixtures prove subscription is advertised by the
+  server and that no client-capability gate exists.
 - Golden call/input hashes, raw authored model/config/mode values, backend routing, results,
   budgets, retries, and resume matching are identical with the observer present or absent. A custom
   `RunPersistence` wrapped by `withRunEvents` receives the new records through its existing seam.
@@ -881,7 +1063,7 @@ mechanism differs from this contract, they must **stop before building and repor
 the new pin and affected claim. Silent adaptation is forbidden; the spec owner decides whether the
 contract needs amendment.
 
-Author-round verification on 2026-07-20 found:
+Author-round verification on 2026-07-20 found the GitHub latest release and npm `latest` agree:
 
 - `@modelcontextprotocol/sdk` npm `latest` = `1.29.0`, tag `v1.29.0`, commit
   `e12cbd7078db388152f6e839abdbe09ba01f3f32`.
@@ -906,14 +1088,14 @@ to omit any work in this contract.
 
 **Source trace:** owner quotations 1–2; the sequence reaches one atomic R1/R2/R3 release.
 
-1. Add shared progress/transcript types, projectors, validators, constants, and public re-exports with
-   byte/error fixtures.
+1. Add shared progress/transcript types with `executionStartSeq`, projectors, shape/whole-generation
+   semantic validators, constants, and public re-exports with byte/error fixtures.
 2. Extract `WorkflowAgentEventSource`, add provider-neutral activity normalization, and integrate
    manager attribution/accumulators with sampling and failure isolation.
-3. Add projected transcript upserts, reducer validation, final ordering, and terminal-history
-   compatibility fixtures.
-4. Add the MCP event document/parser/template, subscription watcher/coalescer, exact error mapping,
-   and content-bearing foreground/await progress.
+3. Add projected transcript upserts, execution-partitioned reducer validation, final ordering,
+   pause/resume cycles, and terminal-history compatibility fixtures.
+4. Add the MCP event document/parser/template, subscription watcher/coalescer/re-arm state, exact
+   error mapping, and content-bearing foreground snapshot/await progress.
 5. Complete cross-package integration/backpressure tests, documentation, generated artifacts, and
    coordinated changesets. Publish only after all five stages are green together.
 
@@ -933,12 +1115,12 @@ All local file/line citations were verified at base commit
   `packages/workflow-engine/src/workflow-manager.ts:493-499`, `:535-594`, `:1525-1565`.
 - **[L5] Mid-stream session accumulator and emit-after-apply:**
   `packages/acp-agents/src/acp-client.ts:196-312`, `:709-715`, `:956-965`;
-  `packages/acp-agents/src/events.ts:1-46`, `:157-225`.
-- **[L6] Current history callback occurs in runner finalization:**
-  `packages/acp-agents/src/runner.ts:1030-1052`;
+  `packages/acp-agents/src/events.ts:1-46`, `:102-140`, `:157-225`.
+- **[L6] Current history callback precedes awaited session release and runner settlement:**
+  `packages/acp-agents/src/runner.ts:1018-1056`;
   `packages/shared-types/src/agent-run.ts:137-153`.
 - **[L7] Engine-to-manager history callback and manager mutation:**
-  `packages/workflow-engine/src/workflow.ts:1470-1525`;
+  `packages/workflow-engine/src/workflow.ts:1294-1355`, `:1470-1525`, `:1566-1637`;
   `packages/workflow-engine/src/workflow-manager.ts:1789-1867`.
 - **[L8] Persisted history field and snapshot-save path:**
   `packages/workflow-engine/src/run-persistence.ts:44-72`, `:132-223`;
@@ -953,7 +1135,8 @@ All local file/line citations were verified at base commit
   `packages/mcp-server/src/server.ts:1149-1163`.
 - **[L12] Await's durable event tail and terminal detection:**
   `packages/mcp-server/src/server.ts:960-1086`.
-- **[L13] Existing count/phase-only progress projection:**
+- **[L13] Existing snapshot type and request-owned foreground/background progress projections:**
+  `packages/workflow-engine/src/display.ts:20-67`;
   `packages/mcp-server/src/progress.ts:1-26`, `:60-118`;
   `packages/mcp-server/src/server.ts:1527-1536`.
 - **[L14] Existing redaction, scalar/structured bounds, and event projector:**
@@ -965,17 +1148,26 @@ All local file/line citations were verified at base commit
 - **[L16] Authoring prompt source inputs, generator, and byte-for-byte drift test:**
   `scripts/generate-authoring-prompt.mjs:13-46`, `:158-168`;
   `packages/mcp-server/test/authoring-prompt.test.ts:1-18`.
+- **[L17] One start per engine execution, interrupt end, and same-stream resume:**
+  `packages/shared-types/src/agent-run.ts:231-240`;
+  `packages/workflow-engine/src/workflow.ts:1151-1206`, `:1457-1464`;
+  `packages/workflow-engine/src/workflow-manager.ts:1486-1522`, `:2667-2753`.
+- **[L18] Whole-generation parse before page slicing and watch drain:**
+  `packages/workflow-engine/src/run-event-persistence.ts:652-699`, `:807-852`,
+  `:924-1072`.
 
 External sources were verified from fresh clones created during this author round, at the current
 npm `latest` release pins above:
 
-- **[I1] Scope issue:** [GitHub issue #261](https://github.com/VikashLoomba/agentprism-workflows/issues/261),
-  whose customer-originated Requests block is reproduced verbatim in the normative focus file.
-- **[U1] MCP stable resource subscription, update notification, sender, client methods, and numeric
-  errors:** `modelcontextprotocol/typescript-sdk` tag `v1.29.0`, commit
+- **[I1] Scope issue:** [GitHub issue #261](https://github.com/VikashLoomba/agentprism-workflows/issues/261)
+  is the tracking/scope issue. The customer's verbatim Requests block is in
+  `.agentprism/design-observability/feedback-gist.md` and is normatively incorporated and
+  interpreted by `focus.md` §1.
+- **[U1] MCP stable client/server capability schemas, resource subscription, update notification,
+  sender, client methods, and numeric errors:** `modelcontextprotocol/typescript-sdk` tag `v1.29.0`, commit
   `e12cbd7078db388152f6e839abdbe09ba01f3f32`:
-  `src/types.ts:191-205`, `:1030-1064`; `src/server/index.ts:322-335`, `:649-660`;
-  `src/client/index.ts:708-725`.
+  `src/types.ts:191-205`, `:475-519`, `:542-581`, `:1030-1064`;
+  `src/server/index.ts:322-335`, `:649-660`; `src/client/index.ts:708-725`.
 - **[U2] ACP stable real-time session update and content/tool/usage discriminants:**
   `agentclientprotocol/typescript-sdk` tag `v1.2.1`, commit
   `26da1ae7ab66fae0f5e77272dee3e5d562d24aee`:
