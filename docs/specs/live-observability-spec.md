@@ -75,8 +75,9 @@ The following invariants are normative:
    consume local I/O time; no subscriber or transport promise is on that path.
 8. **No event or transcript retention quota.** This contract adds no event-count, run-duration,
    transcript-entry-count, log-size, subscriber-count, or per-run byte quota. Safety bounds apply per
-   scalar, per record, per MCP response, and to constant-space in-memory coalescing only. Run
-   deletion retains its existing cleanup semantics.
+   scalar, per record, and per MCP response through the existing `1..1000` record page bound; only
+   constant-space in-memory coalescing is allowed. Run deletion retains its existing cleanup
+   semantics.
 9. **Backend symmetry.** The ACP projection switches on protocol update kinds, not provider IDs.
    Claude, Codex, OpenCode, pi, and custom ACP backends follow identical rules. Any third-party
    `AgentRunner` with no ACP event bus remains source-compatible, but no fake transcript/progress is
@@ -155,7 +156,8 @@ export interface RunAgentProgressPayload extends RunEventOrigin {
   /** Most recent assistant segment preview. Raw on the live manager event; redacted
    * and <=512 UTF-8 bytes in PersistedRunEvent. */
   latestText?: string;
-  /** Most recent tool kind, falling back to title. Raw live; projected when persisted. */
+  /** Normalized tool preview: first non-empty nested `_meta.toolName`, then kind, then title.
+   * Unredacted but already <=512 UTF-8 bytes on the raw live event; projected for persistence. */
   lastToolName?: string;
   /** Latest non-negative safe-integer ACP usage_update.used value, when supplied. */
   tokensObserved?: number;
@@ -233,9 +235,12 @@ When `onAgentStart` publishes successfully, its new JSONL `seq` becomes
 `executionStartSeq`; the active owner copies that value into every progress/transcript record until
 the matching `agentEnd`. The append-success action registers this owner before live `agentStart`
 delivery and before runner delegation; if the start append fails, the incomplete generation admits
-no new content record. Retries inside one engine execution share that start record and therefore
-continue counters and entries. A pause/abort emits `agentEnd`; same-ID resume subsequently emits another
-`agentStart` at a different sequence [L17]. That second execution gets a fresh accumulator with
+no new content record. A non-journaling run, a run without a persistence lease, or a generation
+already marked `eventLogIncomplete` has no successfully appended start sequence, so it allocates no
+live-observability owner, accumulator, timer, `agentProgress`, or `agentTranscript`; the existing raw
+`agentEvent` bus remains available. Retries inside one engine execution share that start record and
+therefore continue counters and entries. A pause/abort emits `agentEnd`; same-ID resume subsequently
+emits another `agentStart` at a different sequence [L17]. That second execution gets a fresh accumulator with
 `turnCount = observedEvents = entryIndex = revision = 0`; no durable-log reseeding is required.
 The public execution key is `(scope, callIndex, executionStartSeq)`. Both new events copy `label`,
 optional `phase`, and `callIndex` from their sole owner; root `runId` is the managed run ID and
@@ -326,10 +331,23 @@ The provider-neutral projector recognizes these ACP update kinds:
 | every other update/cross-cutting event | no sampled progress mutation | no transcript row |
 
 The ACP adapter admits `agent_message_chunk` only when `content.type === "text"` and `text` is
-non-empty. It copies a non-empty `messageId` when present. A change from one present `messageId` to
-another closes the prior assistant segment; consecutive chunks with the same ID, or consecutive
-chunks for which the ID is absent, extend it. A recognized content-boundary update also closes the
-segment. `turnCount` increments exactly when the first text chunk opens a segment, never per token.
+non-empty. It trims no identifier, but treats `undefined`, `null`, and the empty string as absent;
+every other string is a present `messageId`. The active assistant segment retains either an
+anonymous anchor or the present ID that opened it. Transitions are exact:
+
+| Current segment anchor | Incoming chunk ID | Result |
+| --- | --- | --- |
+| none (no open segment) | absent or present `X` | open a segment; its anchor is anonymous or `X` respectively |
+| anonymous | absent | extend the anonymous segment |
+| anonymous | present `X` | flush/close the anonymous segment, then open a new segment anchored by `X` |
+| present `X` | absent | extend the segment and retain anchor `X` |
+| present `X` | present `X` | extend the segment |
+| present `X` | present `Y`, `Y !== X` | flush/close the `X` segment, then open a segment anchored by `Y` |
+
+This deliberately does not retroactively assign earlier ID-less bytes to a later explicitly
+identified message, while an omitted ID after an identified chunk is treated as lack of contrary
+evidence rather than a boundary. A recognized content-boundary update also closes the segment.
+`turnCount` increments exactly when the first text chunk opens a segment, never per token.
 
 The active segment keeps a rolling raw UTF-8 suffix bounded to
 `MAX_OBSERVABILITY_SCALAR_BYTES`; it does not retain an array of chunks or a whole message. On every
@@ -382,9 +400,11 @@ export const AGENT_PROGRESS_MIN_INTERVAL_MS = 1_000 as const;
 export const AGENT_PROGRESS_HEARTBEAT_MS = 15_000 as const;
 ```
 
-Per active execution, retain only the latest accumulator, last successfully appended activity and
-progress snapshots, `dirty`, the observations-since-activity-sample counter, one sample timer, and
-one heartbeat timer. There is no array/queue of unpersisted raw events.
+Per active execution with a successfully appended `agentStart`, retain only the latest accumulator,
+last successfully appended activity and progress snapshots, `dirty`, the
+observations-since-activity-sample counter, one sample timer, and one heartbeat timer. There is no
+array/queue of unpersisted raw events. No accumulator or timer exists while durable publication is
+ineligible under §3.2.
 
 `observedEvents` increments once for each admitted text, tool, boundary, or usage activity. Every
 such activity updates count/token/content state first. `dirty` is true exactly when a raw text/tool
@@ -401,8 +421,11 @@ appended activity sample, or since execution start for the first sample; emitted
 `cause:"activity"` record passed input validation and projection, was appended to JSONL, and
 consumed a `seq`. A projection-empty attempt or failed append is not successful: it does not reset
 `n`, advance the 1,000 ms boundary, replace either last-success snapshot, or re-arm the heartbeat.
-Heartbeats never reset `n`. An increment that would exceed a safe integer is a projection failure
-under §8, not a wrapped or saturated count.
+Heartbeats never reset `n`. A publish skipped because journaling is off, the lease is absent, or the
+generation is already incomplete is also not successful, but it cannot create a degenerate live
+sample loop: those states disable the live-observability accumulator and timers, so no such publish
+is attempted. An increment that would exceed a safe integer is a projection failure under §8, not a
+wrapped or saturated count.
 
 1. Opening any assistant segment appends transcript revision `0` immediately when its projected
    preview is non-empty; otherwise it remains provisional until a safe preview exists. A changed
@@ -453,9 +476,14 @@ receives the already-projected record and is the only path that updates
 `WorkflowSnapshot.latestActivity`, the successful-sample clocks/snapshots, or `seq`-dependent
 execution state. A progress or transcript append failure follows the existing rule: latch
 `eventLogIncomplete`, best-effort persist the marker, deliver the live event, and stop further
-JSONL appends for that generation. Projection or persistence failure never propagates into the
-workflow promise. Raw listener/source failure is caught even earlier and cannot set
-`eventLogIncomplete` because no persistable event was admitted.
+JSONL appends for that generation. The failing event is the final live `agentProgress` or
+`agentTranscript` event for that generation: after `publishRunEvent` returns, the bridge observes
+the latch, clears every execution accumulator/session index and timer, and ignores subsequent raw
+activity for the new typed surfaces. It does not advance sampling clocks for the failed or later
+skipped appends, and terminal flushing becomes a no-op. The raw `agentEvent` bus continues.
+Projection or persistence failure never propagates into the workflow promise. Raw listener/source
+failure is caught even earlier and cannot set `eventLogIncomplete` because no persistable event was
+admitted.
 
 ## 5. Redaction, bounds, and durable record semantics
 
@@ -590,7 +618,9 @@ listener, run-ID filter, pre-assignment slot, or listener cleanup lifecycle.
 
 Background `await` handles the persisted `agentProgress` member inside the existing
 `createAwaitProgressReporter.record` switch and uses the same safe message while preserving its
-start/end/phase counters [L13]. Both paths keep existing request-correlated
+start/end/phase counters [L13]. That switch explicitly ignores `agentTranscript`: transcript rows
+neither change counters nor emit `notifications/progress`; the following `agentProgress` record is
+the one progress-reporting surface. Both paths keep existing request-correlated
 `notifications/progress` behavior; absent progress tokens remain a no-op and notification promises
 are never awaited. These messages are a convenience only; transcript reconstruction always uses
 `agentTranscript` records.
@@ -630,8 +660,8 @@ export interface WorkflowRunEventsResourceDocument {
   runId: string;
   streamId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
-  /** True exactly when status is neither pending nor running. A subsequent explicit resumed
-   * event can make the same stream non-final again. */
+  /** True exactly when status is neither pending nor running. Same-ID resume durably saves
+   * running before publishing resumed; event records are not the status authority. */
   finalized: boolean;
   /** Greatest sequence excluded from this page. */
   after: number;
@@ -661,7 +691,11 @@ workflow://runs/{runId}/events?after={seq}&limit={n}&streamId={streamId}
 known key may occur once. Unknown/duplicate keys, fragments, credentials, ports, non-decimal
 numbers, leading signs, unsafe integers, and noncanonical run paths are invalid. Clients paginate
 while `hasMore`, then retain `cursor` for the next update. Thus the response cap is a paging safety
-bound, not a retention cap.
+bound, not a retention cap. `limit` is the complete aggregate per-response safety bound and
+`events.length` never exceeds it; there is intentionally no second serialized-document byte cap.
+Every member has already passed the 65,536-byte record guard, so preserving whole records and a
+predictable next cursor is preferable to partial-record or post-serialization truncation. Clients
+that need smaller responses request a smaller `limit`.
 
 The URI parser applies the existing tool run-ID grammar exactly: 1–128 characters matching
 `^[a-z0-9]+-[a-z0-9]+$`. Percent-encoded path delimiters or run IDs, an empty path segment, trailing
@@ -670,19 +704,39 @@ slash, or any path other than the exact two-segment `/RUN_ID/events` form is non
 For either form, load the persisted run status first and then take the event-log page; a run deleted
 between those operations is `RUN_NOT_FOUND`. This order makes `finalized` conservative during a
 concurrent terminal transition. `finalized` is exactly
-`status !== "pending" && status !== "running"`. The canonical tail uses a first bounded read to
-obtain its generation/end cursor and a second same-generation read after
-`max(0, endCursor - 100)`; concurrent appends can make `hasMore` true and are recovered through the
-ordinary page loop.
+`status !== "pending" && status !== "running"`. Persisted run state is the sole status authority;
+neither the process-local `manager.getRun()` value nor a `resumed` event changes document status
+[L8, L17]. The canonical tail uses a first bounded read to obtain its generation/end cursor and a
+second same-generation read after `max(0, endCursor - 100)`; concurrent appends can make `hasMore`
+true and are recovered through the ordinary page loop.
+
+An accepted same-ID resume has one new critical ordering rule. Construct the `ManagedRun` with
+`status:"running"`, its current event watermark/incomplete marker, and any validated synthetic
+checkpoint reply; then call the existing throwing `persistRunOrThrow` path **before** adding the run
+to `this.runs`, publishing `resumed`, delegating to `executeRun`, or returning the accepted result
+[L17]. Only after that durable save succeeds may those four actions occur. This moves the current
+checkpoint-reply save into the same critical write. If the write throws, release the lease, leave
+any prior paused/failed managed row untouched, do not register the new running row, publish/deliver
+no `resumed` event, start no execution, and propagate the existing non-recoverable
+`PERSISTENCE_ERROR`; no event append was attempted, so this failure does not itself set
+`eventLogIncomplete`. After success, persistence-backed and external-process reads
+observe `running` before any resumed-generation event can be readable. If the later `resumed`
+append fails, the ordinary incomplete-log latch applies and the events resource returns -32603;
+if the generation was already incomplete, the running save does not heal it. The `resumed` record
+preserves event chronology and stream identity but is never used to infer `finalized`.
 
 ### 7.2 Subscribe/unsubscribe and push
 
 Only the canonical, query-free events URI is subscribable. A successful subscribe validates the
-run and current event generation with `readEvents`, adds the URI to protocol state, and starts one
-`watchEvents` pump at the current `endCursor` before returning `{}`. A duplicate subscribe creates
-no second watcher; if the retained subscription currently has no watcher after an error, it
-revalidates and re-arms one at the new `endCursor` before returning. Query-form subscription is
-rejected.
+run and current event generation with `readEvents`, constructs one `watchEvents` stream at the
+current `endCursor`, commits the URI to protocol state, starts its drain loop, and only then returns
+`{}`. The stream must be constructed before subscription state is committed, so a synchronous
+initial `watchEvents` failure rolls the operation back completely: close any partially constructed
+stream, retain no subscription/scheduler/`needsRearm` state, and return the mapped error. A later
+resource read cannot re-arm that URI; the client must send a new subscribe request. A duplicate
+subscribe creates no second watcher; if the retained subscription currently has no watcher after
+an error, it revalidates and re-arms one at the new `endCursor` before returning. Query-form
+subscription is rejected.
 
 For unsubscribe, **known** means the canonical URI is currently subscribed, its run snapshot or
 lineage tombstone exists, or this server instance observed that run's deletion. A well-formed URI
@@ -712,15 +766,19 @@ affect the run.
 The pump remains attached while the protocol subscription exists, including across a paused/failed
 same-ID run that is explicitly resumed. `agentEnd` and each root terminal event are ordered after
 the final pending progress/transcript flush. The resource's `finalized` bit reflects the current run
-status; a `resumed` record changes it back to false without changing `streamId`. Same-ID resumed
-progress/transcript records reference the second execution's new `agentStart` sequence under §6.2.
+status; the critical running-status save in §7.1 changes it back to false without changing
+`streamId`, and `resumed` only records that chronology. Same-ID resumed progress/transcript records
+reference the second execution's new `agentStart` sequence under §6.2.
 
 If a watcher fails after subscribe, retain the protocol subscription, close the watcher, set
 `needsRearm`, and mark the URI dirty once. There is no polling restart and a subsequent append alone
 does not re-arm it. The next successful resource read of either the canonical or query URI for that
 subscribed run starts `watchEvents` at that read's complete `endCursor` and stream ID before
-returning the document, then clears `needsRearm`; backlog through `endCursor` is in the document and
-subsequent records are in the watcher. A duplicate subscribe performs the same recovery. If re-arm
+returning the document, then clears `needsRearm`. The returned page contains records only through
+its `cursor`; when `hasMore` is true, records in `(cursor, endCursor]` are not in that document.
+Instead, the document's exact `cursor`/`hasMore` page chain makes the complete backlog through that
+snapshot `endCursor` durably recoverable, while the watcher begins strictly after `endCursor` and
+delivers subsequent append hints. A duplicate subscribe performs the same recovery. If re-arm
 fails, that read/subscribe returns the mapped error and leaves `needsRearm` set.
 
 Unsubscribe, connection close, or run deletion closes all associated watchers and pending
@@ -731,9 +789,9 @@ does not send a final resource-updated notification for a resource that can no l
 
 Script resource URI/read/subscription/lineage behavior remains unchanged. `await` continues to use
 the same event log and terminal detection, but its progress reporter adds the `agentProgress`
-content message from §6.3. Tool input/output schemas gain no field. Run/tool results and existing
-script resource links remain compatible; documentation adds the events URI rather than replacing
-script links.
+content message from §6.3 and explicitly ignores `agentTranscript` records. Tool input/output
+schemas gain no field. Run/tool results and existing script resource links remain compatible;
+documentation adds the events URI rather than replacing script links.
 
 ## 8. Error and failure contract
 
@@ -748,6 +806,7 @@ numeric **-32603** [U1]. Those exact wire codes are required:
 | read/subscribe malformed events URI or query; unknown run; known run without an event generation; query subscription | `McpError(ErrorCode.InvalidParams, safeMessage)`, code **-32602** |
 | query `after`/`limit`/`streamId` invalid; cursor ahead; stream generation mismatch | code **-32602** |
 | subscribe valid canonical URI | empty result `{}`; watcher is live before response |
+| initial canonical subscribe validation/watcher construction fails | mapped **-32602** or **-32603** from this table; transaction rolls back with no subscription, scheduler, or `needsRearm` state |
 | unsubscribe canonical URI for a current/tombstoned/this-process-deleted/subscribed run, including one never subscribed | empty result `{}` |
 | unsubscribe malformed or never-known URI | code **-32602** |
 | event log `EVENT_LOG_INCOMPLETE`, `CORRUPT_LOG`, `UNSUPPORTED_VERSION`, `SNAPSHOT_AHEAD`, `RECORD_TOO_LARGE`, `PROJECTION_ERROR`, `SEQUENCE_MISMATCH`, or `IO_ERROR` during resource read/start | `McpError(ErrorCode.InternalError, safeMessage)`, code **-32603** |
@@ -756,6 +815,7 @@ numeric **-32603** [U1]. Those exact wire codes are required:
 | raw event unattributed/malformed/unsupported | omit durable progress/transcript mutation; raw live event still forwarded; workflow and JSONL completeness unchanged |
 | progress/transcript projection or append fails | existing `eventLogIncomplete` latch; raw live event still delivered; workflow result unchanged |
 | timer callback races finalization | observe finalized state and no-op |
+| critical same-ID running-status save fails before `resumed` | non-recoverable `PERSISTENCE_ERROR`; release lease, do not register the new running row/delegate/publish, preserve any prior paused/failed row, and do not change event-log completeness |
 
 After the parser has safely recognized a run ID, `safeMessage` includes that run ID and the
 normalized URI; when the cause is a `RunEventLogError`, it also includes the stable error code.
@@ -798,7 +858,7 @@ One coordinated changeset set ships:
 | Package | Change | Bump |
 | --- | --- | --- |
 | `@automatalabs/shared-types` | additive progress/transcript resource-facing event types | minor |
-| `@automatalabs/workflow-engine` | accumulator, projection, sampling, execution-cycle transcript ordering, snapshot activity, JSONL validation | minor |
+| `@automatalabs/workflow-engine` | accumulator, projection, sampling, execution-cycle transcript ordering, critical resumed-status save, snapshot activity, JSONL validation | minor |
 | `@automatalabs/workflows` | shared `WorkflowAgentEventSource`, ACP projection, facade re-exports | minor |
 | `@automatalabs/mcp-server` | events resource, watcher/coalescer, content-bearing foreground/await progress | minor |
 | `@automatalabs/acp-agents` | no runtime/type change; its existing firehose is consumed | none |
@@ -806,7 +866,8 @@ One coordinated changeset set ships:
 The changesets explicitly call out: default-on progress/transcript for journaling runs; additive
 `agentProgress`/`agentTranscript`; transcript text is redacted and per-scalar bounded on disk; the new resource
 and paging contract; notification coalescing; integrity-error mapping; and old-reader exhaustive
-switch impact.
+switch impact. The workflow-engine changeset also names the new critical same-ID running-status
+save and its fail-before-resume behavior.
 
 ## 10. Documentation and generated artifacts
 
@@ -817,7 +878,8 @@ The implementation updates all of these in the same train:
 
 - `docs/api.md`: event schemas, `executionStartSeq`/same-ID resume partitioning,
   sampling/finalization, transcript reduction, canonical and paging URIs, cursor loop,
-  notification advisory/recovery semantics, and the exact error matrix.
+  notification advisory/recovery semantics, persisted-status authority and critical same-ID resume
+  ordering, and the exact error matrix.
 - root README plus `packages/workflows/README.md` and `packages/mcp-server/README.md`: one concise
   subscribe/read/catch-up example and link to the API contract.
 - `skills/agentprism-workflow-authoring/SKILL.md` and `reference.md`: explain that long-running
@@ -904,6 +966,22 @@ The implementation updates all of these in the same train:
     projection-empty or waiting for the sampling boundary, making a heartbeat disagree with the
     last durable state. Heartbeats repeat the last appended payload; the next content-bearing
     activity sample exposes all admitted counts through exact `coalescedEvents` arithmetic.
+17. **Retroactively bind an anonymous assistant segment when a later chunk first supplies a
+    `messageId`.** Rejected because earlier ID-less bytes cannot be proven to belong to that newly
+    identified message. Anonymous-to-present closes; present-to-absent retains the known anchor so
+    intermittent omission does not fragment an identified message.
+18. **Keep producing typed live samples after journaling is disabled or the event log becomes
+    incomplete.** Rejected because no durable R1/R3 state can result and a never-advancing success
+    clock degenerates into per-token live events. Those states disable accumulators/timers while
+    leaving the existing raw `agentEvent` bus intact.
+19. **Retain a protocol subscription after its initial watcher start returns an error.** Rejected
+    because a failed `resources/subscribe` response must not create surprise later notifications or
+    make ordinary reads mutate hidden subscription state. Initial failure rolls back; recovery
+    state exists only after a previously successful subscribe.
+20. **Infer resource `finalized` from the `resumed` event tail or process-local manager state.**
+    Rejected because persistence-backed reads can occur in another process and the existing resumed
+    append did not durably save `running`. A critical pre-event running-status save makes persisted
+    state the one document authority.
 
 ## 13. Test plan
 
@@ -943,18 +1021,29 @@ compatibility invariant. All stated cases are release blockers.
   runner and before any `agentEnd`. This is the load-bearing acceptance test.
 - Tool-first activity persists `lastToolName` before settlement. Usage updates add valid
   `tokensObserved`; invalid values are ignored. Counts-only pre-content heartbeat never appears.
-- Same/different/absent ACP message IDs, non-text content, tool/content boundaries, retries, nested
-  scopes, same-label concurrency, and unattributed/ambiguous/post-terminal events follow §§3–4
-  exactly. Session-open binding rejects pre-open, post-close, and late old-execution updates; a
+- The full §4.2 message-ID table is tested with `undefined`, `null`, and empty-string absence:
+  first absent/present, anonymous→absent,
+  anonymous→present, present→absent→same-present, present→absent→different-present, same-present,
+  and different-present transitions pin exact turn counts, transcript indexes/revisions, and flush
+  order. Non-text content,
+  tool/content boundaries, retries, nested scopes, same-label concurrency, and
+  unattributed/ambiguous/post-terminal events follow §§3–4 exactly. Session-open binding rejects
+  pre-open, post-close, and late old-execution updates; a
   deliberately duplicated active owner proves multiple matches are omitted. Tool-name precedence
   covers the new non-empty nested `_meta` name → kind → title rule, empty candidates, and a
-  non-regression fixture for the existing `toolNameFromMeta`/terminal-history semantics.
+  pre-bounded raw live preview plus projected persisted value; a non-regression fixture covers the
+  existing `toolNameFromMeta`/terminal-history semantics.
 - Fake timers pin immediate first sample/upsert, the exact dirty predicate (content, boundary counts,
   usage tokens), one activity sample per 1,000 ms, latest-state replacement,
   changed-preview-only revisions, exact `coalescedEvents`, and a 15,000 ms heartbeat that repeats
   the immediately preceding appended payload. Projection-empty attempts do not reset counters,
   clocks, or timers; the next safe sample includes their observations. Dirty flush before
   `agentEnd`, terminal cleanup, `unref`, and stale callback no-op are pinned.
+- With `journaling:false`, absent lease, or an initially incomplete generation, 100,000 raw chunks
+  produce raw `agentEvent` delivery but no accumulator, timer, `agentProgress`, or
+  `agentTranscript`. A forced first progress and first transcript append failure each delivers only
+  that failing live typed event, latches incompleteness, clears all execution state/timers, and
+  suppresses typed events for all later raw chunks without advancing either sampling clock.
 - Pause/abort followed by same-ID resume produces two `agentStart`/`agentEnd` cycles with distinct
   `executionStartSeq` values. The second execution resets entry/revision/turn/observation state,
   retries within either execution do not reset it, and both the whole-log validator and client
@@ -992,9 +1081,13 @@ compatibility invariant. All stated cases are release blockers.
   direct reads outside discovery.
 - Query parser table covers every accepted default/bound and every forbidden duplicate, unknown,
   fragment, authority, numeric, stream, cursor, and path form. Paging 2,501 records with limit
-  1,000 yields all records exactly once.
+  1,000 yields all records exactly once; every document has `events.length <= limit`, an exact
+  1,000-record page is accepted, and 1,001 is rejected rather than invoking an unstated byte cap.
 - Subscribe starts one watcher before `{}`; duplicate subscribe is idempotent while healthy and
   re-arms a failed watcher. Query subscribe and unknown/unavailable runs return numeric -32602.
+  Synchronous initial `readEvents` and `watchEvents` failures both leave no subscription,
+  scheduler, or `needsRearm`; a later read does not re-arm and only a fresh successful subscribe
+  starts delivery. This is distinct from failed recovery of a previously successful subscription.
   Unsubscribe of an existing but never-subscribed canonical URI returns `{}`; malformed and
   syntactically valid never-known URIs return -32602. Deletion/connection-close release watchers,
   scheduler, and recovery state.
@@ -1007,7 +1100,15 @@ compatibility invariant. All stated cases are release blockers.
 - Notification rejection, connection close, absent subscriber, external process append, coalesced
   filesystem changes, paused/resumed same stream, final flush ordering, and run deletion follow §7.
   For watcher errors, one test proves no append/poller silently re-arms it and a subsequent successful
-  page read restores the watcher at `endCursor` without a gap; failed re-arm leaves `needsRearm`.
+  page read whose document has `hasMore === true` restores the watcher at `endCursor`: that page
+  contains only through `cursor`, its page chain recovers `(cursor,endCursor]`, and the watcher
+  covers later appends without a gap. Failed re-arm leaves `needsRearm`.
+- Same-ID resume fault injection proves the running snapshot (including a synthetic checkpoint
+  reply when present) is durably saved before `resumed`, manager registration, execution, and
+  acceptance. An external persistence-backed reader sees `finalized:false` during the unresolved
+  resumed call. Critical-save failure releases the lease, preserves any prior paused/failed manager
+  row, and performs none of those later actions; a later resumed-append failure instead leaves the
+  running status durable and serves -32603 via the incomplete-log contract.
 - Exact numeric error assertions pin -32602/-32603 for every §8 row. For safely parsed requests,
   safe-message assertions require normalized URI/run ID and stable `RunEventLogError.code`; a
   malicious malformed URI is not echoed. Both groups prove paths/content/causes/credentials are
@@ -1015,7 +1116,9 @@ compatibility invariant. All stated cases are release blockers.
 - Script-resource tests pass unchanged. Foreground and `await` progress tests assert the safe
   content message. The foreground test proves the content arrives through the existing
   request-owned snapshot callback, `latestActivity` is already projected and absent from persisted
-  run JSON, and no manager listener/filter/holding slot exists. No-progress-token remains a no-op.
+  run JSON, and no manager listener/filter/holding slot exists. The `await` reporter receives an
+  `agentTranscript` followed by `agentProgress`, proves the transcript emits nothing and changes no
+  counters, then emits only the safe progress message. No-progress-token remains a no-op.
 
 ### 13.5 Compatibility, docs, and release
 
@@ -1074,15 +1177,17 @@ The repository lock resolves those same versions [L15].
 
 **Forward-compatibility risks found by diffing each pin to upstream main.** MCP upstream main was
 `f4137630c05dc9a4fb14d4d3777f5cb167bd6313`; it contains an unreleased-for-this-package major
-reorganization and a 2026-07-28 protocol path where generic subscription filters replace the
-legacy `resources/subscribe` request, while retaining legacy-era compatibility surfaces. Adoption
-of that package family requires re-verifying handler registration and notification routing; this
-contract targets the current stable package. ACP upstream main was
-`26cdeb48dc389335830fdb51d61dbfa88d644e96`; it adds an experimental major-revision API and changes
-router implementation files, while the stable generated `SessionUpdate` union cited here remains
-unchanged and the experimental union retains the text/tool/usage discriminants. Adoption of that
-API requires re-verifying the envelope type and source adapter. These are risk notes, not permission
-to omit any work in this contract.
+reorganization: the stable client/server paths are deleted and the types path is renamed into the
+new package layout; the reorganized core retains the legacy request schema, and a 2026-07-28
+protocol path replaces it with generic subscription filters.
+Adoption of that package family requires re-verifying handler registration and notification
+routing; this contract targets the current stable package [U1, U3]. ACP upstream main was
+`26cdeb48dc389335830fdb51d61dbfa88d644e96`; its stable generated `SessionUpdate` union cited here
+is unchanged, but it adds an experimental major-revision API. Experimental v2 retains
+`agent_message_chunk` and `usage_update` but has no stable
+`sessionUpdate:"tool_call"`; it instead exposes `tool_call_content_chunk` and `tool_call_update`.
+Adopting v2 therefore requires adapting the load-bearing tool-event projection, not merely checking
+an envelope type [U4]. These are risk notes, not permission to omit any work in this contract.
 
 ## 15. Implementation sequence
 
@@ -1095,7 +1200,8 @@ to omit any work in this contract.
 3. Add projected transcript upserts, execution-partitioned reducer validation, final ordering,
    pause/resume cycles, and terminal-history compatibility fixtures.
 4. Add the MCP event document/parser/template, subscription watcher/coalescer/re-arm state, exact
-   error mapping, and content-bearing foreground snapshot/await progress.
+   error mapping, critical same-ID running-status save, and content-bearing foreground
+   snapshot/await progress.
 5. Complete cross-package integration/backpressure tests, documentation, generated artifacts, and
    coordinated changesets. Publish only after all five stages are green together.
 
@@ -1148,10 +1254,11 @@ All local file/line citations were verified at base commit
 - **[L16] Authoring prompt source inputs, generator, and byte-for-byte drift test:**
   `scripts/generate-authoring-prompt.mjs:13-46`, `:158-168`;
   `packages/mcp-server/test/authoring-prompt.test.ts:1-18`.
-- **[L17] One start per engine execution, interrupt end, and same-stream resume:**
+- **[L17] One start per engine execution, nested child scope, throwing save, and same-stream resume:**
   `packages/shared-types/src/agent-run.ts:231-240`;
-  `packages/workflow-engine/src/workflow.ts:1151-1206`, `:1457-1464`;
-  `packages/workflow-engine/src/workflow-manager.ts:1486-1522`, `:2667-2753`.
+  `packages/workflow-engine/src/workflow.ts:1151-1206`, `:1457-1464`, `:2139-2166`;
+  `packages/workflow-engine/src/workflow-manager.ts:1486-1522`, `:2430-2456`,
+  `:2495-2550`, `:2667-2753`.
 - **[L18] Whole-generation parse before page slicing and watch drain:**
   `packages/workflow-engine/src/run-event-persistence.ts:652-699`, `:807-852`,
   `:924-1072`.
@@ -1174,3 +1281,14 @@ npm `latest` release pins above:
   `src/schema/types.gen.ts:281-296`, `:334-342`, `:3664-3770`, `:3772-3825`,
   `:4250-4276`;
   `src/acp.ts:1691-1718`, `:2658-2675`.
+- **[U3] MCP unreleased main subscription migration risk:**
+  `modelcontextprotocol/typescript-sdk` commit
+  `f4137630c05dc9a4fb14d4d3777f5cb167bd6313`:
+  `packages/core/src/schemas.ts:904-963`;
+  `packages/core-internal/src/types/spec.types.2026-07-28.ts:1264-1301`, `:1384-1412`;
+  `packages/server/src/server/listenRouter.ts:286-303`, `:394-407`.
+- **[U4] ACP unreleased experimental-v2 update discriminants:**
+  `agentclientprotocol/typescript-sdk` commit
+  `26cdeb48dc389335830fdb51d61dbfa88d644e96`:
+  `src/schema/types.gen.ts:3699-3738`;
+  `src/v2/schema/types.gen.ts:3698-3749`.
