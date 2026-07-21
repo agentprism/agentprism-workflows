@@ -1,0 +1,5 @@
+---
+"@automatalabs/mcp-server": minor
+---
+
+Harden the workflow-authoring skill (and the served `author-workflow` prompt) with rules distilled from observed authoring failures: an explicit execution-environment contract for mutating workflows (verify an args-supplied workroot or create a persistent workspace idempotently — never treat the run cwd as disposable), a checkpoint required before the first commit into a user-owned checkout, per-model/per-provider-variant catalog probing via validate's per-pair echo, the corrected `"fast-mode"` config-option id (previously mis-documented as `fast_mode`), a generalized every-referenced-path-has-a-writer rule, values-not-attestations SHA discipline (`headSha`/`reviewedHeadSha` compared in script code), an explicit `status` enum for STOP-and-report, shared-tree fan-out guidance (serialize or isolate run-things reviewers; `git ls-remote` over `git fetch`), spec snapshotting for mutable external contracts, source-lean handling for open decisions, plan gating with a schema-carried source diff, and shipping mock-answer fixtures beside the script. The `implementation-train` example demonstrates all of it.

@@ -61,20 +61,21 @@ Running scripts happens through the MCP server's `workflow` tool — server setu
 - [ ] `export const meta = { name, description }` is the first statement, a pure literal.
 - [ ] No `Date.now()` / `Math.random()` / no-arg `new Date()` / `Date()`; no imports, no Node APIs — timestamps and randomness come in through `args`.
 - [ ] Every `parallel` element is a **thunk**; results are `.filter(Boolean)`-ed or null-checked.
-- [ ] Every agent prompt is self-contained — prior results interpolated in, no "as discussed above".
+- [ ] Every agent prompt is self-contained — prior results interpolated in, no "as discussed above" — and every file path a prompt references is traceable to a writer (an earlier call, an `args` input, or that prompt's own instructions).
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, `description` on every field; load-bearing fields checked for placeholders in script code.
 - [ ] Model specs only where a specific backend earns its keep; use a registered prefix plus a live-catalog-verified id (or backend-only form), and expect harness rejection rather than client fallback.
-- [ ] Model ids and effort values were read from `npx @automatalabs/workflows config` (or a validator report), not recalled from memory.
+- [ ] Model ids and effort values were read from `npx @automatalabs/workflows config` (or a validator report), not recalled from memory — and every pinned model was confirmed against its own per-pair validator echo (options are model-specific; provider variants of the same model advertise different domains).
 - [ ] Every `configOptions` id/value comes from the selected model's advertised-options table; `"model"` stays in the dedicated field, and any ordered thought-level clamp warning is intentional.
 - [ ] `mode` only on calls with a pinned `model`; worktree-isolated agents return their work as data.
-- [ ] Every `resume: { filesystem: "read-only" }` assertion is true for all persistent/ambient effects; unordered parallel siblings do not communicate through files, and worktree calls do not commit or mutate outside the throwaway checkout.
-- [ ] `checkpoint()` before irreversible actions, with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
+- [ ] Every `resume: { filesystem: "read-only" }` assertion is true for all persistent/ambient effects; unordered parallel siblings do not communicate through files, run-things reviewers are worktree-isolated or serialized (no concurrent builds or fetches in a shared tree), and worktree calls do not commit or mutate outside the throwaway checkout.
+- [ ] The run cwd is never assumed disposable: a committing workflow verifies an args-supplied workroot in a preflight step or creates its own persistent workspace idempotently (refuse, never force).
+- [ ] `checkpoint()` before irreversible actions — including the first commit into a user-owned checkout — with a sane headless `default` or an intentional `headless: "pause"` durable hand-off.
 - [ ] New-run `checkpointReplies` use source `checkpointContext.callIndex` keys; changed checkpoint defaults/headless modes/timeouts are expected to run fresh.
 - [ ] Budget loops guard on `budget.total`; caps and drops are `log()`-ed, not silent.
 - [ ] `return` a compact, structured result — it is the run's `result`, not a transcript.
-- [ ] Boolean-controlled convergence branches are scripted with mock answers (including reject-then-approve), not left to the all-true default.
-- [ ] The user's verbatim request sentences travel with the run (`args.sourceRequest` / a focus file), your prompts were diffed against them, and every genuine ambiguity became a question to the user — not a silent scope decision.
-- [ ] Producer reports have a refusal shape (STOP-and-report) and the checker recognizes it; report-shape validation runs in script code before any reviewer is spawned.
+- [ ] Boolean-controlled convergence branches are scripted with mock answers (including reject-then-approve), not left to the all-true default — and the fixtures ship beside the script as `<name>.mock.json`.
+- [ ] The user's verbatim request sentences travel with the run (`args.sourceRequest` / a focus file), your prompts were diffed against them, and every genuine ambiguity became a question to the user — not a silent scope decision; a mutable external spec is snapshotted verbatim by the first call, and open decisions carry the source's stated lean.
+- [ ] Producer reports have an explicit refusal shape (a STOP-and-report `status` enum, not an implicit empty-array convention) and the checker recognizes it; report-shape validation runs in script code before any reviewer is spawned, and producer/reviewer SHA fields are compared in script code (values, not attested booleans).
 - [ ] Every reviewer charge is one falsifiable question with an evidence field capped in size; full detail goes to design-dir files outside the worktree.
 - [ ] Gates are bounded, a terminal adjudicator is designed in, and its findings feed a panel-free fix round — no unaddressed final-round blockers, no unbounded convergence hopes.
 - [ ] `npx @automatalabs/workflows validate <file> --args '<json>'` exits 0 with no surprising warnings.

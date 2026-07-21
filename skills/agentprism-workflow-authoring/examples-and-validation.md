@@ -130,6 +130,13 @@ that a convergence loop works: script its control labels with `--mock-answers` o
 the revision branch and proves the loop stops; the report identifies every consumed and unused
 fixture without printing answer bodies.
 
+Ship the fixtures with the script. Save the mock-answers JSON beside the workflow file
+(`<name>.mock.json`) and treat the pair as the deliverable: the deep paths it proves — fix rounds,
+STOP branches, post-adjudication repairs — are exactly the paths a later edit (or a
+kill-patch-resume) breaks silently, and an unmocked dry run stops at the first guard. When a
+default-fabrication dry run leaves declared phases unexecuted, that usually means your guard
+branches fired — script the mocks that reach past them instead of shrugging at the warnings.
+
 Exit codes: `0` valid · `1` parse failure · `2` dry-run or config-option failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
 
 The third pass's table is also available standalone — before any script exists — as validate's sibling command: `npx @automatalabs/workflows config [harness ...]` (default: every routable harness; `--json`; exit `1` when a probe fails). Use `config` while authoring to pick values; validate's copy then confirms the script you wrote against the same live catalog.

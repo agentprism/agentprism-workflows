@@ -3,10 +3,15 @@
 Hard-won rules for workflows whose implement/review rounds span hours against a repository that
 keeps moving. Each of these prevented — or would have prevented — a real terminal-verdict blocker:
 
+- **Fix where the train lives before round one.** Verify an args-supplied workroot in a preflight
+  step (expected branch, recorded base, clean tree — refuse on mismatch) or have a setup call create
+  a persistent sibling worktree idempotently; never commit onto whatever the run cwd happens to have
+  checked out. The execution-environment section spells out both patterns.
 - **Pin a base and check it every round.** A brief that says "based on origin/main" names a moving
   target. Have the implementer record the exact base SHA it built against (e.g. into a gitignored
-  `base-sha.txt`), and make every reviewer run `git fetch` + compare `git rev-parse origin/<default>`
-  against it as a structured verdict field. Reviewers grounded in a stale worktree will confidently
+  `base-sha.txt`), and make every reviewer compare `git ls-remote origin refs/heads/<default>`
+  against it as a structured verdict field (`ls-remote` reads the remote without mutating the shared
+  checkout; reserve `git fetch` for throwaway worktrees). Reviewers grounded in a stale worktree will confidently
   "verify" claims against the wrong tree — in one run, fourteen of fifteen agents (including the
   final adjudicator's first pass) validated against a base nine commits behind, and the decisive
   blocker was visible only to the single reviewer that fetched. At least one gate lens should
@@ -28,7 +33,11 @@ keeps moving. Each of these prevented — or would have prevented — a real ter
 - **The report and HEAD must be the same commit.** An implementer that keeps committing after filing
   its structured report makes the review target a moving object — reviewers certify a branch state
   that no longer exists. Require the report's SHAs to be the branch tip, and treat post-report
-  commits as a blocking process violation.
+  commits as a blocking process violation. Enforce it with values, not prose: the producer schema
+  carries a full 40-character `headSha` that script code checks equals the last reported commit,
+  each reviewer schema carries the `reviewedHeadSha` it actually inspected, and script code compares
+  the two — an attested boolean ("I reviewed the right commit") is worthless next to an SHA equality
+  check that costs nothing.
 - **Verify the brief's own premises against the live tree.** A brief assertion about engine behavior
   ("seeds persist on every resumed run") that is false at HEAD forces the implementer into
   ungrounded redesigns mid-flight. Cited behaviors deserve the same file:line grounding the spec

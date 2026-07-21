@@ -75,7 +75,7 @@ Whatever the harness returns is the outcome. A rejection follows the existing ag
 await agent("Implement the approved change.", {
   label: "implement",
   model: "codex",
-  configOptions: { fast_mode: true, reasoning_effort: "high" },
+  configOptions: { "fast-mode": true, reasoning_effort: "high" },
 });
 ```
 
@@ -85,7 +85,12 @@ option-id order after model selection and before the prompt. A harness rejection
 ordinary agent-error path. Never put `"model"` in this bag; the engine rejects it before opening a
 session. The catalog varies by harness version, login, and machine, so read a live advertised
 config-options table — `agentprism-workflows config <harness>`, or any validate report — before
-picking an id or select value, and run the validator every time after authoring.
+picking an id or select value, and run the validator every time after authoring. Ids are copied
+character-for-character, punctuation included (`"fast-mode"`, not `fast_mode`). The bare `config`
+probe reads each harness with its default model selected; option ids, domains, and ceilings are
+model-specific, and provider-served variants of the same model can advertise different domains —
+validate's per-pair echo, which selects your authored model first, is the authoritative per-model
+probe.
 
 For Pi, use `thinkingLevel` only with an explicit Pi model when the level matters. Validation
 selects that call's model before reading the option: listed values pass unchanged, recognized but
