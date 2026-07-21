@@ -237,7 +237,7 @@ The full event map (`AcpRunnerEventMap`) and helpers (`TypedEventEmitter`) are e
 From [`src/index.ts`](./src/index.ts):
 
 - **`createAcpRunner(options?)`** — factory returning an `AcpAgentRunner` (this is what `@automatalabs/workflows` injects into the engine).
-- **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `probeConfigOptions(spec?, options?)`, `openSession(options)`, `dispose()`, and `[Symbol.asyncDispose]()` for `await using`. The caller that constructs a runner owns its lifecycle.
+- **`AcpAgentRunner`** — the `AgentRunner` implementation; `run(prompt, options)`, `probeConfigOptions(spec?, options?)`, `openSession(options)`, `dispose()`, and `[Symbol.asyncDispose]()` for `await using`. `forceKill()` is a synchronous, best-effort emergency teardown for hosts only after a bounded graceful `dispose()` deadline; normal owners must await `dispose()`. The caller that constructs a runner owns its lifecycle.
 - **Auth/provider lifecycle methods** — `describeAuthMethods()`, `completeAuth()`, `runner.auth`, `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support. A successful `setProvider()` records a durable routing intent (`ProviderStore`) replayed on every fresh connection's `initialize` — provider config is in-process agent state for e.g. codex-acp, so record → recycle → replay is what makes it stick across the pool.
 - **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, `resumeSession()`, and `forkSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn`** — the held-open multi-turn session surface returned by `openSession()`.
@@ -254,7 +254,7 @@ From [`src/index.ts`](./src/index.ts):
 - **`AGENT_METHOD_COVERAGE` / `CLIENT_METHOD_COVERAGE`** — manifests classifying the installed ACP SDK method surface; enforced by tests so SDK bumps cannot silently drift.
 - **`toJsonSchema(schema)` / `toStrictJsonSchema(schema)`** — turn a typebox schema into on-the-wire shapes: plain JSON Schema for Claude and the Pi/OpenCode injected HTTP MCP tool, and an OpenAI-strict-normalized schema for Codex `outputSchema`. Pi retains the common prompt/validated-last-text fallback.
 
-Also exported: `AcpAgentPool` / `resolvePoolSize`, `PooledConnection` / `SessionHandle`, `decidePermission`, `UsageAccumulator`, `resolveStructuredOutput` / `extractValidated` / `findJsonBlock` / `validateValue`, `errorText` / `mapThrownError`, and the event surface `TypedEventEmitter` / `AcpRunnerEventMap` / `AcpEventName` / `AcpEventListener` / `AcpEventContext` / `AcpSessionUpdate` (+ the per-event payload types, including `AcpPermissionPendingEvent`), plus their associated types.
+Also exported: `AcpAgentPool` / `resolvePoolSize` (including the same deadline-only `forceKill()` emergency path), `PooledConnection` / `SessionHandle`, `decidePermission`, `UsageAccumulator`, `resolveStructuredOutput` / `extractValidated` / `findJsonBlock` / `validateValue`, `errorText` / `mapThrownError`, and the event surface `TypedEventEmitter` / `AcpRunnerEventMap` / `AcpEventName` / `AcpEventListener` / `AcpEventContext` / `AcpSessionUpdate` (+ the per-event payload types, including `AcpPermissionPendingEvent`), plus their associated types.
 
 ## Environment overrides
 

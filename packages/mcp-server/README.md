@@ -590,12 +590,15 @@ console.log(run.status, run.result);
 This MCP-server package does export its own building blocks, for hosts that want to mount the same `workflow` tool on a transport they control rather than the default stdio one:
 
 ```ts
-import { createWorkflowServer } from "@automatalabs/mcp-server";
+import { createWorkflowServer, installMcpServerLifecycle } from "@automatalabs/mcp-server";
 import { createAcpRunner } from "@automatalabs/workflows";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-const server = createWorkflowServer(createAcpRunner());
-await server.connect(new StdioServerTransport());
+const runner = createAcpRunner();
+const server = createWorkflowServer(runner);
+const transport = new StdioServerTransport();
+await server.connect(transport);
+installMcpServerLifecycle({ runner, server, transport });
 ```
 
 Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
@@ -606,7 +609,9 @@ Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `WorkflowInspectionToolResult`, `WorkflowRunAwaitResult`, `WorkflowStopResult`,
 `WorkflowScriptLineageEntry`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
 `workflowToolOutputShape` / `toWorkflowToolResult`,
-`createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond
+`createProgressReporter`, `installMcpServerLifecycle` / `SHUTDOWN_DEADLINE_MS`, and lifecycle
+types `McpServerLifecycle`, `McpServerLifecycleOptions`, `McpServerShutdownReason`, and
+`WorkflowServerControl`, plus a `main()` that runs the default stdio server. For anything beyond
 hosting this tool, prefer `@automatalabs/workflows`.
 
 ---

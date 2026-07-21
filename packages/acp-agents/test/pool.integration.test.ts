@@ -15,6 +15,7 @@ import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import {
   AcpAgentPool,
   AcpAgentRunner,
+  AuthStore,
   CANCEL_NOT_HONORED_GRACE_MS,
   PI_DISPOSE_SIGKILL_GRACE_MS,
   PI_PROCESS_EXIT_MARGIN_MS,
@@ -321,6 +322,62 @@ test("forceKill reaches a stubborn detached Pi descendant after disposal clears 
     const disposing = pool.dispose();
     pool.forceKill();
     await disposing;
+    await waitFor(() => processIsGone(childPid!), 5_000);
+    assert.equal(processIsGone(childPid), true);
+  } finally {
+    pool.forceKill();
+    if (childPid !== undefined && !processIsGone(childPid)) {
+      try {
+        process.kill(childPid, "SIGKILL");
+      } catch {
+        // Test cleanup only: a concurrently exited child is already the intended state.
+      }
+    }
+  }
+});
+
+test("forceKill reaches a stubborn detached Pi descendant recycled as stale", { timeout: 15_000 }, async () => {
+  const { cwd, readLog } = harness.configure({
+    ignoreShutdown: true,
+    stubbornPiChild: true,
+  }, { backends: ["pi"] });
+  const authStore = new AuthStore();
+  const pool = harness.track(new AcpAgentPool({}, { authStore }));
+  const backend = new PiBackend();
+  let childPid: number | undefined;
+  try {
+    const session = await pool.acquire(backend, { cwd, schema: undefined, policy: {} });
+    await session.release();
+    await waitFor(() => readLog().some((entry) => entry.method === "__stubborn_pi_child"));
+    childPid = readLog().find((entry) => entry.method === "__stubborn_pi_child")?.childPid;
+    assert.ok(childPid, "fake Pi ACP process must report its stubborn descendant PID");
+
+    const machine = authStore.existing("pi");
+    assert.ok(machine, "the pooled Pi connection must initialize an auth machine");
+    machine.send({
+      t: "host_authenticate",
+      intent: {
+        backendId: "pi",
+        poolKey: "pi",
+        methodId: "native-login",
+        methodType: "terminal",
+        klass: "disk",
+        diskBacked: true,
+      },
+    });
+    pool.recycle("pi");
+    await waitFor(() => readLog().some((entry) => entry.method === "__sigterm"));
+
+    // Reconciliation has removed the stale connection from normal admission, but its Pi
+    // graceful teardown is still pending. Shutdown must wait for it rather than cancelling the
+    // host deadline early, and that deadline's force-kill must retain and reach it.
+    const shutdown = pool.dispose();
+    let shutdownComplete = false;
+    void shutdown.then(() => { shutdownComplete = true; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(shutdownComplete, false, "pool shutdown must await stale connection disposal");
+    pool.forceKill();
+    await shutdown;
     await waitFor(() => processIsGone(childPid!), 5_000);
     assert.equal(processIsGone(childPid), true);
   } finally {
