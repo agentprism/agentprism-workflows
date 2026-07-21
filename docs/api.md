@@ -671,6 +671,9 @@ Every record contains real projected content; counts-only heartbeats are forbidd
 state is flushed before `agentEnd`. `agentTranscript` uses upserts partitioned by
 `(scope, callIndex, executionStartSeq)`: retain the greatest revision for each `entryIndex`, render
 indexes ascending, and start a fresh partition when same-ID resume opens a new `agentStart` sequence.
+If a process dies before the prior `agentEnd`, that later start supersedes the dangling active
+execution for validation; the abandoned partition stays readable, while every resumed upsert and
+progress sample references the later start's `seq`.
 Assistant text is a rolling newest-512-byte Unicode-safe window; tool rows retain projected title
 and normalized tool name. Terminal run-JSON `history` and live-only `agentHistory` are unchanged.
 

@@ -714,7 +714,6 @@ interface ActiveExecutionValidation {
   startSeq: number;
   label: string;
   phase?: string;
-  ambiguous: boolean;
   nextEntryIndex: number;
   entries: Map<number, { revision: number; timestamp: number; tool: boolean }>;
   lastActivityObserved: number;
@@ -748,19 +747,18 @@ function createSemanticValidator(): (record: RunEventLogRecord) => string | unde
     const event = record.event;
     if (event.type === "agentStart") {
       const key = executionKey(event.scope, event.callIndex);
-      const prior = active.get(key);
-      active.set(key, prior === undefined
-        ? {
-            startSeq: record.seq,
-            label: event.label,
-            ...(event.phase === undefined ? {} : { phase: event.phase }),
-            ambiguous: false,
-            nextEntryIndex: 0,
-            entries: new Map(),
-            lastActivityObserved: 0,
-            lastActivityTurnCount: 0,
-          }
-        : { ...prior, ambiguous: true });
+      // A process can die after agentStart without ever appending agentEnd. Same-ID
+      // recovery re-executes that logical call in the same stream, so the new start
+      // supersedes the abandoned execution and opens a fresh validation partition.
+      active.set(key, {
+        startSeq: record.seq,
+        label: event.label,
+        ...(event.phase === undefined ? {} : { phase: event.phase }),
+        nextEntryIndex: 0,
+        entries: new Map(),
+        lastActivityObserved: 0,
+        lastActivityTurnCount: 0,
+      });
       return undefined;
     }
     if (event.type === "agentEnd") {
@@ -774,7 +772,7 @@ function createSemanticValidator(): (record: RunEventLogRecord) => string | unde
     if (event.type !== "agentProgress" && event.type !== "agentTranscript") return undefined;
 
     const state = active.get(executionKey(event.scope, event.callIndex));
-    if (state === undefined || state.ambiguous) return `${event.type} has no unambiguous active agent execution`;
+    if (state === undefined) return `${event.type} has no active agent execution`;
     if (event.executionStartSeq !== state.startSeq || event.label !== state.label ||
         !sameOptionalText(event.phase, state.phase)) {
       return `${event.type} does not match its active agentStart`;
