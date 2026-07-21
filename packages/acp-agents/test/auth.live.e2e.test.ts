@@ -109,7 +109,10 @@ test(
   { skip: gate("set a supported Pi provider API key to run the pi auth e2e", Boolean(PI_PROVIDER_KEY)) },
   async () => {
     const runner = makeRunner();
-    const model = process.env.AGENTPRISM_PI_E2E_MODEL ?? "pi";
+    const configuredModel = process.env.AGENTPRISM_PI_E2E_MODEL;
+    const model = configuredModel === undefined || configuredModel.startsWith("pi/")
+      ? configuredModel ?? "pi"
+      : `pi/${configuredModel}`;
     const methods = await runner.describeAuthMethods({ model });
     assert.deepEqual(methods.map(({ id }) => id), [
       "anthropic-api-key",
@@ -162,6 +165,11 @@ test(
     });
     assert.equal(outcome.status, "authenticated");
     assert.equal(outcome.recycled, true);
+
+    // completeAuth records the new intent as credentials_held and recycles the stale
+    // connection. Force a fresh real-adapter connection so initialize replays the gateway
+    // credential and the machine observes apply_ok before asserting authenticated state.
+    await runner.describeAuthMethods({ model: "claude" });
     const status = runner.auth.status({ backend: "claude" })[0];
     assert.equal(status.backendId, "claude");
     assert.equal(status.authenticated, true);

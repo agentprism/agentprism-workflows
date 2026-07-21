@@ -887,7 +887,7 @@ test("a long-lived server lazily reconciles crash residue for await, inspect, an
     sourceCalls++;
     return "cached";
   }));
-  const script = 'export const meta = { name: "stale", description: "stale" }; return await agent("cached", { resume: { filesystem: "read-only" } });';
+  const script = 'export const meta = { name: "stale", description: "stale" }; return await agent("cached");';
   const source = await first.client.callTool({ name: "workflow", arguments: { script } });
   const sourceId = runIdOf(source);
   await first.dispose();
@@ -936,7 +936,8 @@ test("a long-lived server lazily reconciles crash residue for await, inspect, an
       name: "workflow",
       arguments: { script, background: true, resumeFromRunId: staleId },
     });
-    assert.equal(field(structured(resumed)?.replayEligibility, "fallbackReason"), "crash-residue");
+    assert.equal(field(structured(resumed)?.replayEligibility, "strategy"), "identity-v1");
+    assert.equal(field(structured(resumed)?.replayEligibility, "fallbackReason"), undefined);
     assert.equal(field(structured(resumed)?.replayEligibility, "predictedReplayablePrefix"), 1);
     const completed = await cold.client.callTool({
       name: "workflow",
@@ -944,8 +945,8 @@ test("a long-lived server lazily reconciles crash residue for await, inspect, an
     });
     assert.equal(structured(completed)?.status, "completed");
     assert.equal(resumedCalls, 0, "the recovered journal remains resumable");
-    assert.equal(field(field(structured(completed)?.outcome, "resumeReport"), "fallbackReason"), "crash-residue");
-    assert.match(textOf(completed), /resume: positional-v1\/legacy \(crash-residue\)/);
+    assert.equal(field(field(structured(completed)?.outcome, "resumeReport"), "strategy"), "identity-v1");
+    assert.match(textOf(completed), /resume: identity-v1/);
   } finally {
     await cold.dispose();
   }

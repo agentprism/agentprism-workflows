@@ -124,7 +124,7 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. Every retry re-arms the clock. |
 | `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
-| `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input/safety checks. Requires `resumeFromRunId`. |
+| `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
 | `runId` | engine run ID | inspect/await/stop only | — | Required for inspect/await/stop; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
@@ -152,23 +152,23 @@ Example call arguments:
 }
 ```
 
-Compact replay-safe read-only/worktree fan-out for `script`:
+Compact reader/worktree fan-out for `script`:
 
 ```js
 export const meta = { name: "fan-out", description: "Audit and experiment independently" };
 return await parallel([
   () => agent("Audit src/api without changing files.", {
-    label: "audit:api", resume: { filesystem: "read-only" },
+    label: "audit:api",
   }),
   () => agent("Try the worker fix in isolation; return a unified diff.", {
-    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+    label: "try:worker", isolation: "worktree",
   }),
 ]);
 ```
 
-The worktree edits are discarded. See the
-[incremental resume API](../../docs/api.md#content-addressed-incremental-resume) for the safety
-contract, admission gates, reports, and legacy fallback.
+The worktree edits are discarded. Both completed calls use the same journal correspondence rule.
+See the [incremental resume API](../../docs/api.md#content-addressed-incremental-resume) for
+admission, reports, and legacy fallback.
 
 The same run delivered from disk:
 
@@ -499,7 +499,7 @@ client `resources` capability to gate these server-offered primitives.
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Safe calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed/content-dependent calls run live. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix, first non-replay, runtime/environment provenance changes, and operational changes. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Normally settled sources below input format 2 use the named `inputs-format-legacy` positional bridge. A crash snapshot reconciled to `paused` / `interrupted` without terminal environment proof uses `crash-residue` with legacy hash-only prefix eligibility. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Journals resume across workflow-engine, Node, V8, and current-environment changes; `replayEligibility` surfaces those differences as diagnostics, never gates. Unsupported call-path/input/checkpoint formats remain named runtime mismatches.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Completed calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed or ambiguous calls run live. Filesystem/world state, read/write behavior, safety annotations, nested workflows, and earlier live calls do not gate a match or clear later candidates. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix, first non-replay, runtime/environment provenance changes, and operational changes. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; current-format crash snapshots use identity even without terminal-environment capture. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Workflow-engine, Node, V8, filesystem, and environment differences are diagnostics, never gates. Unsupported call-path/input/checkpoint formats remain named runtime mismatches.
 - **Authoritative stop.** `action:"stop"` without `callIndex` acts on `running` and `paused` runs live in this server
   process, cancels their agent/checkpoint work, persists `aborted`, appends the durable `stopped`
   event, releases the lease, and returns the final inspection projection inline. Resume is safe
@@ -509,9 +509,8 @@ client `resources` capability to gate these server-offered primitives.
   dead-owner `pending`/`running` record is first reconciled to `paused` / `interrupted`, and any cold
   paused record has nothing live to stop in this process and should be resumed.
   Stop retains the journal, record, and script resource, so the kill-patch-resume loop is: stop,
-  edit the file, then call run with `scriptPath` plus `resumeFromRunId`. Because an in-flight stop
-  cannot capture a quiescent terminal environment, the manager may conservatively run that resumed
-  script live; the `resumeReport` is authoritative about any calls it could safely replay.
+  edit the file, then call run with `scriptPath` plus `resumeFromRunId`. Missing terminal-environment
+  capture does not veto replay; the `resumeReport` shows which completed calls corresponded.
 - **Targeted agent cancellation.** Adding `callIndex` to `action:"stop"` selects one uniquely
   matching in-flight agent, settles it to `null` with `AGENT_CANCELLED`, and returns a live status.
   Siblings and the run continue, retries are bypassed, and `labelGlob` remains only an output filter.
@@ -525,7 +524,7 @@ client `resources` capability to gate these server-offered primitives.
   `checkpointReplies`; no particular `resumePolicy` is required, and the decision value becomes the
   checkpoint result verbatim. The engine guarantees journal/script replay integrity and reply
   targeting only—never that the filesystem, external state, agent semantics, or any other part of
-  the world stayed fresh. After an unsafe prefix runs live, injection requires the exact recorded
+  the world stayed fresh. After a prior correspondence miss runs live, injection requires the exact recorded
   checkpoint call site, identity, and inputs; a content-only match is not enough. An unapplied reply
   is explicit in `resumeReport` and the terminal text. To bind approval to changing content,
   interpolate that content into the checkpoint prompt so it participates in the hashed checkpoint

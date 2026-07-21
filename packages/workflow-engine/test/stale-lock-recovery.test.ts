@@ -11,8 +11,8 @@ import { workflowProjectPaths } from "../src/workflow-paths.js";
 
 const SCRIPT = [
   'export const meta = { name: "crash-recovery", description: "crash recovery" };',
-  'const first = await agent("first", { label: "first", resume: { filesystem: "read-only" } });',
-  'const second = await agent("second", { label: "second", resume: { filesystem: "read-only" } });',
+  'const first = await agent("first", { label: "first" });',
+  'const second = await agent("second", { label: "second" });',
   "return { first, second };",
 ].join("\n");
 
@@ -94,11 +94,7 @@ test("SIGKILL crash residue is lazily paused and reports environment drift witho
     const result = resumed.result as Record<string, unknown>;
     assert.equal(result.first, "child:first");
     assert.equal(result.second, "parent:second");
-    assert.equal(resumed.resumeReport?.strategy, "positional-v1");
-    if (resumed.resumeReport?.strategy === "positional-v1") {
-      assert.equal(resumed.resumeReport.fallbackReason, "crash-residue");
-      assert.equal(resumed.resumeReport.eligibility, "legacy");
-    }
+    assert.equal(resumed.resumeReport?.strategy, "identity-v1");
     assert.equal(resumed.resumeReport?.replayed, 1);
     assert.equal(resumed.resumeReport?.live, 1);
     assert.deepEqual(livePrompts, ["second"]);
@@ -114,14 +110,10 @@ test("SIGKILL crash residue is lazily paused and reports environment drift witho
       environmentKey: "drifted-environment",
     });
     assert.equal(drifted.status, "completed");
-    assert.equal(drifted.resumeReport?.strategy, "positional-v1");
-    if (drifted.resumeReport?.strategy === "positional-v1") {
-      assert.equal(drifted.resumeReport.fallbackReason, "crash-residue");
-      assert.equal(drifted.resumeReport.eligibility, "legacy");
-    }
+    assert.equal(drifted.resumeReport?.strategy, "identity-v1");
     assert.equal(drifted.resumeReport?.replayed, 1);
     assert.equal(drifted.resumeReport?.live, 1);
-    assert.equal(drifted.replayEligibility?.firstNonReplay?.reason, "positional-miss");
+    assert.equal(drifted.replayEligibility?.firstNonReplay?.reason, "not-recorded");
     assert.deepEqual(drifted.replayEligibility?.provenanceChanges, [{
       field: "environment.key",
       source: "crash-environment",

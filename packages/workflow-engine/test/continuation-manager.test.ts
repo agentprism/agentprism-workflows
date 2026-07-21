@@ -9,7 +9,7 @@ import type { PersistedRunState, RunLease, RunPersistence } from "../src/run-per
 import { WorkflowManager } from "../src/workflow-manager.js";
 
 const script = `export const meta = { name: "managed-continuation", description: "manager continuation" }
-return await agent("finish the task", { label: "worker", resume: { filesystem: "read-only" } })`;
+return await agent("finish the task", { label: "worker" })`;
 
 function fixture(): {
   cwd: string;
@@ -136,7 +136,7 @@ describe("WorkflowManager continuation wiring", () => {
     }
   });
 
-  it("reattaches on positional new-run resume and permits sequential multi-consumer fan-out", async () => {
+  it("reattaches on identity new-run resume and permits sequential multi-consumer fan-out", async () => {
     const test = fixture();
     try {
       const runner = new ContinuationRunner();
@@ -166,6 +166,74 @@ describe("WorkflowManager continuation wiring", () => {
         "usage-pause-session",
       ]);
       assert.equal(test.states.get("fanout-source")?.status, "paused", "targets never claim or mutate the source");
+    } finally {
+      test.cleanup();
+    }
+  });
+
+  it("replays an ordinary completed prefix before reattaching the interrupted call", async () => {
+    const test = fixture();
+    try {
+      const calls: string[] = [];
+      const directives: Array<RunOptions["continueFromSession"]> = [];
+      let continuing = false;
+      const runner: AgentRunner = {
+        async run(prompt, options) {
+          calls.push(prompt);
+          if (prompt === "completed prefix") {
+            assert.equal(continuing, false, "the completed prefix must replay on resume");
+            return "recorded prefix";
+          }
+          if (!continuing) {
+            options.onSessionOpen?.({
+              sessionId: "interrupted-session",
+              backendId: "test-backend",
+              poolKey: "test-backend",
+              cwd: options.cwd ?? "",
+              reopen: { load: true, resume: true, list: true },
+            });
+            throw new WorkflowError("quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+              recoverable: false,
+            });
+          }
+          directives.push(options.continueFromSession);
+          return options.continueFromSession ? "continued tail" : "fresh tail";
+        },
+      };
+      const manager = new WorkflowManager({
+        cwd: test.cwd,
+        persistence: test.persistence,
+        agent: runner,
+        environmentKey: "continuation-v1",
+      });
+      const prefixScript = `export const meta = { name: "prefix-continuation", description: "prefix continuation" }
+const prefix = await agent("completed prefix", { label: "prefix" })
+const tail = await agent("interrupted tail", { label: "tail" })
+return { prefix, tail }`;
+      const paused = await manager.runSync(prefixScript, undefined, { runId: "prefix-source" });
+      assert.equal(paused.status, "paused");
+      assert.deepEqual(calls, ["completed prefix", "interrupted tail"]);
+      const persistedSource = test.states.get("prefix-source");
+      assert.ok(persistedSource);
+      test.states.set("prefix-source", JSON.parse(JSON.stringify(persistedSource)) as PersistedRunState);
+
+      continuing = true;
+      const completed = await manager.runSync(prefixScript, undefined, {
+        runId: "prefix-target",
+        resumeFromRunId: "prefix-source",
+      });
+      assert.equal(completed.status, "completed");
+      assert.deepEqual(JSON.parse(JSON.stringify(completed.result)), {
+        prefix: "recorded prefix",
+        tail: "continued tail",
+      });
+      assert.deepEqual(calls, ["completed prefix", "interrupted tail", "interrupted tail"]);
+      assert.equal(directives[0]?.sessionId, "interrupted-session");
+      assert.equal(completed.resumeReport?.strategy, "identity-v1");
+      assert.deepEqual(completed.resumeReport?.calls.map((decision) => decision.action), [
+        "replayed",
+        "live",
+      ]);
     } finally {
       test.cleanup();
     }

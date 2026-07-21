@@ -271,6 +271,8 @@ export type WorkflowCheckpointReplyReport =
     }
   | WorkflowCheckpointReplyNotApplied;
 
+/** Legacy source-world classifications retained for journal compatibility and diagnostics.
+ * They never determine replay eligibility. */
 export type WorkflowResumeSafety =
   | "declared-read-only"
   | "isolated-worktree";
@@ -282,11 +284,11 @@ export interface WorkflowCallReplayProvenance {
   /** Preserved source cost. Applied to script-visible spent only by identity-v1;
    *  absent for checkpoints and legacy rows without a source manifest. */
   logicalBudgetDebit?: number;
-  /** Agents only: source row's admitted safety class. Required on every non-legacy
-   *  journal replay and equal to the current row's resumeSafety. */
+  /** Agents only: legacy source-world classification retained as diagnostic
+   *  provenance. It never determines whether a call is replayable. */
   sourceResumeSafety?: WorkflowResumeSafety;
-  /** Checkpoints only: the selected source outcome was produced by a host confirm or
-   *  inherited from one. Required to carry that eligibility across resume hops. */
+  /** Checkpoints only: diagnostic origin marker for a host-confirmed or injected
+   *  decision. It never determines whether a completed checkpoint can replay. */
   checkpointHostDecision?: true;
   checkpointInjected?: true;
 }
@@ -408,8 +410,8 @@ export interface WorkflowReplayFirstNonReplay {
 
 interface WorkflowReplayEligibilityBase {
   sourceRunId: string;
-  /** Admission-time upper bound from the durable source prefix. Actual call identity,
-   *  inputs, and current safety are still checked before any result is replayed. */
+  /** Admission-time upper bound from the durable source prefix. Actual call identity
+   *  and inputs are still checked before any result is replayed. */
   predictedReplayablePrefix: number;
   /** Contiguous replayed prefix observed so far in the new run. */
   replayedPrefix: number;
@@ -500,10 +502,9 @@ export interface WorkflowCallRecord {
   /** What this logical call added to the run's script-visible spent value. Zero on
    *  journal-replayed rows; absent on checkpoint rows. */
   budgetDebit?: number;
-  /** Why this agent occurrence is safe for content-addressed mainline resume.
-   *  "declared-read-only" reflects the authored assertion at allocation.
-   *  "isolated-worktree" is written only after createWorktree() returned
-   *  isolated:true. Absent for checkpoints and every unproved agent call. */
+  /** Legacy source-world classification retained for diagnostics and old journal
+   *  compatibility. Replay eligibility is based on recorded call correspondence,
+   *  not this marker. */
   resumeSafety?: WorkflowResumeSafety;
   /** Manager-owned provenance for a resumeFromRunId journal replay. */
   replay?: WorkflowCallReplayProvenance;

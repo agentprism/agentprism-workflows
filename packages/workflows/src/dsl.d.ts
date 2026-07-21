@@ -13,8 +13,8 @@
 // mirror workflow.ts exactly (verified against the injected vm context).
 
 type AgentPrismAgentOptions = import("@automatalabs/workflow-engine").AgentOptions & {
-  /** Contractual opt-in for content-addressed mainline replay. The call may read the
-   * admitted workspace but must not create, modify, or delete persistent shared state. */
+  /** Legacy diagnostic annotation. New workflows should omit it.
+   * @deprecated Replay is determined by recorded call correspondence, not world state. */
   resume?: { filesystem: "read-only" };
 };
 

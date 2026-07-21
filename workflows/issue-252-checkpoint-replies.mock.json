@@ -1,0 +1,84 @@
+{
+  "implement:*": {
+    "status": "implemented",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "commitShas": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+    "summary": "Relaxed the positional checkpoint injection gate to exact path-hash matches; added unapplied-reply reporting, honest prediction, docs.",
+    "deviations": "",
+    "testsRun": [
+      { "command": "pnpm build", "exitCode": 0 },
+      { "command": "pnpm --filter @automatalabs/workflow-engine test", "exitCode": 0 }
+    ]
+  },
+  "review:acceptance:*": {
+    "ok": true,
+    "baseDrifted": false,
+    "headMatchesReport": true,
+    "commandsRun": [{ "command": "pnpm --filter @automatalabs/workflow-engine test", "exitCode": 0 }],
+    "findings": [],
+    "feedback": ""
+  },
+  "review:acceptance:1": {
+    "ok": false,
+    "baseDrifted": false,
+    "headMatchesReport": true,
+    "commandsRun": [{ "command": "npx tsx --test packages/workflow-engine/test/incremental-manager-resume.test.ts", "exitCode": 1 }],
+    "findings": [
+      {
+        "severity": "blocker",
+        "file": "packages/workflow-engine/src/workflow.ts",
+        "line": 2531,
+        "summary": "The unique-hash content match is still honored after firstMiss, allowing a content-only injection after a live prefix.",
+        "evidence": "mock: regression test injection-unique-hash-gated fails with exit 1"
+      }
+    ],
+    "feedback": "Gate the unique-hash branch behind firstMiss as prescribed; add the missing regression test."
+  },
+  "review:adversarial:*": {
+    "ok": true,
+    "baseDrifted": false,
+    "headMatchesReport": true,
+    "commandsRun": [{ "command": "git diff aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..HEAD --stat", "exitCode": 0 }],
+    "findings": [],
+    "feedback": ""
+  },
+  "fix:*": {
+    "status": "implemented",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+    "commitShas": [
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "cccccccccccccccccccccccccccccccccccccccc"
+    ],
+    "summary": "Addressed the round-1 blocker: unique-hash matches are now gated behind firstMiss; regression test added.",
+    "deviations": "",
+    "testsRun": [{ "command": "pnpm --filter @automatalabs/workflow-engine test", "exitCode": 0 }]
+  },
+  "adjudicate:verify": {
+    "allAddressed": true,
+    "perFinding": [
+      { "id": "F1", "addressed": true, "evidence": "mock: suite green, diff shows the reporting branch" }
+    ],
+    "commandsRun": [{ "command": "pnpm --filter @automatalabs/workflow-engine test", "exitCode": 0 }],
+    "feedback": ""
+  },
+  "adjudicate": {
+    "verdict": "fix",
+    "closedFindings": [
+      {
+        "id": "F1",
+        "severity": "major",
+        "file": "packages/mcp-server/src/server.ts",
+        "line": 560,
+        "summary": "The paused-run summary does not mention the unapplied checkpointReplies, violating issue section 3.2.",
+        "evidence": "mock: formatTerminalSummary checkpoint arm lacks the not-applied note"
+      }
+    ],
+    "spotChecks": [
+      { "claim": "acceptance lens ok on round 2", "command": "pnpm --filter @automatalabs/workflow-engine test", "exitCode": 0, "upheld": true }
+    ],
+    "ownerDecisions": [],
+    "rationale": "One real 3.2 surface gap survived my own re-verification; everything else checked out."
+  }
+}

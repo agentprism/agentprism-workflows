@@ -29,17 +29,18 @@ test("generated authoring-prompt distinguishes background start from awaited pro
 test("generated authoring-prompt teaches fail-to-live identity resume semantics", () => {
   assert.ok(
     AUTHORING_PROMPT_CONTENT.includes(
-      "**Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.",
+      "**Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.",
     ),
   );
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("resolved agent definition"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('resume: { filesystem: "read-only" }'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("has no effect on replay"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('replay as `"unique-hash"`'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Source headless decisions always execute fresh."));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Completed checkpoint results replay"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("keys always name the checkpoint index in the source run"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('resumePolicy: "positional"'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('source-wide `"manifest-invalid"`'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Node/V8 drift is reported provenance"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Node/V8, and producing engine version are diagnostics only"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 6'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 8'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("only rounds 7–8 run live"));
@@ -59,10 +60,9 @@ test("generated authoring-prompt teaches resume compatibility and eligibility di
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("the identity hash covers prompt, resolved model"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("The separate input fingerprint covers resolved label"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "inputs-format-legacy"'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "crash-residue"'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("with `legacy` prefix eligibility"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("current-format crash snapshot uses identity matching"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("ancestor-scoped rows from ≤0.23 resume chains"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume across workflow-engine, Node, V8, and current-environment changes"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume across filesystem/environment, workflow-engine, Node, and V8 changes"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`replayEligibility.provenanceChanges`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("MCP background admission, foreground completion, both await shapes, and inspect"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("seed-persistence-error"));

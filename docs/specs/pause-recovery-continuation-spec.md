@@ -1,5 +1,12 @@
 # Pause-recovery Session Continuation
 
+> **Replay-strategy update (2026-07-21):** This document remains the frozen design record for ACP
+> session continuation, but its claims that interrupted runs force `unsafe-recording` positional
+> replay are superseded. Current-format interrupted calls are identity blockers: completed matching
+> calls replay independently, while the interrupted call runs at the live boundary and may reattach
+> through the continuation channel described here. See the current
+> [journal replay contract](journal-replay-contract.md).
+
 **Date:** 2026-07-15
 
 **Status:** Frozen implementation contract for issue #183. Verified against base commit
@@ -80,16 +87,12 @@ load-bearing:
    manager→engine channel** (`preparedContinuation`, §2.7), distinct from the seed and from
    `PreparedResume`.
 
-2. **A pause-class resume runs the positional (not identity) correspondence strategy.** The
-   interrupted `outcome: "error"` call makes `allCallsRepresented` false
-   (`resume-matcher.ts:827-829`; the pending-representation exception covers only
-   `checkpoint_required`), which selects `fallbackReason: "unsafe-recording"` and a
-   `positional-v1` strategy at `safe-prefix` eligibility (`resume-matcher.ts:847-868`). This is
-   **orthogonal to continuation**: both `identity-v1` and `positional-v1` resolve a journal-miss to
-   the same live executor, `runLive()` (`workflow.ts:1684` and `workflow.ts:1759`), where the call
-   re-runs live with its unchanged hash. Continuation is served at that live boundary and does not
-   depend on which correspondence strategy the resume chose — nor on whether a `PreparedResume`
-   exists at all (§2.7, §2.8).
+2. **Continuation is independent of the correspondence strategy.** At this document's frozen base,
+   an interrupted `outcome: "error"` call forced `fallbackReason: "unsafe-recording"` and
+   `positional-v1`. The current matcher instead retains that non-result occurrence as an identity
+   blocker: it runs live without invalidating completed matching calls around it. In both designs,
+   continuation is served at the live boundary and does not depend on the replay strategy—or on
+   whether a `PreparedResume` exists at all (§2.7, §2.8).
 
 3. **Session refs reach disk only through the `PersistedRunState` snapshot.** The append-only
    event-log projections deliberately drop `session` from both the agent-end and journal events
@@ -1654,8 +1657,8 @@ the reopen RPC method constants used are `AGENT_METHODS.session_new` / `session_
 - `PreparedResume` union (identity-v1 `:95` / positional-v1 `:104` / live `:122` arms) — `:93-126`
 
 **`packages/workflow-engine/src/resume-matcher.ts`**
-- `allCallsRepresented` (interrupted error call ⇒ false; pending covers only checkpoint) — `:827-829`
-- `fallbackReason: "unsafe-recording"` selection + `positional-v1`/`safe-prefix` — `:847-868`
+- Historical frozen-base `allCallsRepresented` behavior (interrupted error call ⇒ false) — `:827-829`
+- Historical frozen-base `fallbackReason: "unsafe-recording"` positional selection — `:847-868`
 - seed promotion filters non-`result` rows (`if (call.outcome !== "result") continue;` `:874`) —
   `:872-882`
 

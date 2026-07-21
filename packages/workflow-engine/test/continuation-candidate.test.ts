@@ -86,6 +86,20 @@ function candidate(persisted: PersistedRunState, index = 0) {
 }
 
 describe("PreparedContinuation snapshot projection", () => {
+  it("carries the source input format for cross-version matching", () => {
+    const formatOne = candidate(state({
+      runtime: {
+        node: process.version,
+        v8: process.versions.v8,
+        pathFormat: 1,
+        inputsFormat: 1,
+        checkpointInputsFormat: 1,
+      },
+    }));
+    assert.equal(formatOne?.inputsFormat, 1);
+    assert.equal(candidate(state())?.inputsFormat, undefined);
+  });
+
   it("requires a pause-class source, an error outcome, an authoritative pause-class agent error, and reopen support", () => {
     assert.ok(candidate(state()));
     assert.ok(candidate(state({ pauseReason: "auth_required", agents: [{

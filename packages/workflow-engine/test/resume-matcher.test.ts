@@ -130,7 +130,6 @@ function admission(
     current: {
       effectiveCwd: CWD,
       runtime: { ...RUNTIME },
-      environment: { ...ENVIRONMENT },
     },
     ...overrides,
   });
@@ -208,15 +207,13 @@ function matchInput(overrides: Partial<ResumeMatchInput> = {}): ResumeMatchInput
     hash: HASH_A,
     path: "workflow.js:1:1",
     inputsHash: INPUT_A,
-    cacheOpen: true,
     consumed: new Set(),
-    resumeDeclared: true,
     ...overrides,
   };
 }
 
 describe("incremental resume admission", () => {
-  it("selects legacy positional, identity, and every valid new-format fallback", () => {
+  it("selects legacy positional and world-neutral identity admission", () => {
     const legacy = sourceState();
     delete legacy.resume;
     assert.deepEqual(admission(legacy), {
@@ -233,21 +230,25 @@ describe("incremental resume admission", () => {
     assert.deepEqual(safe.facts, {
       pendingRepresented: false,
       allCallsRepresented: true,
-      filesystemStable: true,
-      allAgentsSafe: true,
-      allCheckpointResultsHostDecisions: true,
     });
 
     const unsafeRow = agentRow();
     delete unsafeRow.resumeSafety;
     const unsafe = admission(sourceState([unsafeRow]));
-    assert.equal(unsafe.strategy, "positional-v1");
-    assert.equal(unsafe.strategy === "positional-v1" && unsafe.fallbackReason, "unsafe-recording");
-    assert.equal(unsafe.strategy === "positional-v1" && unsafe.eligibility, "safe-prefix");
+    assert.equal(unsafe.strategy, "identity-v1");
+    assert.equal(unsafe.strategy === "identity-v1" && unsafe.seed.candidates.length, 1);
+
+    const inconsistentLegacyMarker = agentRow(0, {
+      isolation: "worktree",
+      resumeSafety: "declared-read-only",
+    });
+    const inconsistent = admission(sourceState([inconsistentLegacyMarker]));
+    assert.equal(inconsistent.strategy, "identity-v1");
+    assert.equal(inconsistent.strategy === "identity-v1" && inconsistent.seed.candidates.length, 1);
 
     const headless = admission(sourceState([checkpointRow(0, { origin: "headless" })]));
-    assert.equal(headless.strategy, "positional-v1");
-    assert.equal(headless.strategy === "positional-v1" && headless.fallbackReason, "unsafe-recording");
+    assert.equal(headless.strategy, "identity-v1");
+    assert.equal(headless.strategy === "identity-v1" && headless.seed.candidates.length, 1);
 
     const failedCall = checkpointRow(0, {
       outcome: "error",
@@ -255,8 +256,9 @@ describe("incremental resume admission", () => {
       error: { form: "workflow-error", message: "stopped", code: WorkflowErrorCode.UNKNOWN },
     });
     const failed = admission(sourceState([failedCall]));
-    assert.equal(failed.strategy, "positional-v1");
-    assert.equal(failed.strategy === "positional-v1" && failed.fallbackReason, "unsafe-recording");
+    assert.equal(failed.strategy, "identity-v1");
+    assert.equal(failed.strategy === "identity-v1" && failed.seed.candidates.length, 0);
+    assert.equal(failed.strategy === "identity-v1" && failed.seed.callBlockers?.length, 1);
 
     const interrupted = blocker().call;
     const interruptedDecision = admission(sourceState([interrupted]));
@@ -264,10 +266,33 @@ describe("incremental resume admission", () => {
     assert.equal(interruptedDecision.strategy === "identity-v1" && interruptedDecision.seed.candidates.length, 0);
     assert.equal(interruptedDecision.strategy === "identity-v1" && interruptedDecision.seed.callBlockers?.length, 1);
 
+    const usageLimited = agentRow(1, {
+      path: "workflow.js:2:1",
+      outcome: "error",
+      origin: "runner",
+      error: {
+        form: "workflow-error",
+        message: "quota exhausted",
+        code: WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+        recoverable: false,
+      },
+      backendId: "test-backend",
+    });
+    delete usageLimited.resumeSafety;
+    const ordinaryCompleted = agentRow(0);
+    delete ordinaryCompleted.resumeSafety;
+    const usageDecision = admission(sourceState([ordinaryCompleted, usageLimited], {
+      status: "paused",
+      pauseReason: "usage_limit",
+      resume: { format: "identity-v1" },
+    }));
+    assert.equal(usageDecision.strategy, "identity-v1");
+    assert.equal(usageDecision.strategy === "identity-v1" && usageDecision.seed.candidates.length, 1);
+    assert.equal(usageDecision.strategy === "identity-v1" && usageDecision.seed.callBlockers?.length, 1);
+
     const nested = admission(sourceState(undefined, { nestedWorkflows: true }));
-    assert.equal(nested.strategy, "positional-v1");
-    assert.equal(nested.strategy === "positional-v1" && nested.fallbackReason, "nested-workflows");
-    assert.equal(nested.strategy === "positional-v1" && nested.eligibility, "all-live");
+    assert.equal(nested.strategy, "identity-v1");
+    assert.equal(nested.strategy === "identity-v1" && nested.seed.candidates.length, 1);
 
     const legacyResume = admission(sourceState(undefined, { legacyResume: true }));
     assert.equal(legacyResume.strategy, "positional-v1");
@@ -309,53 +334,38 @@ describe("incremental resume admission", () => {
     assert.equal(future.strategy === "live" && future.disabledReason, "runtime-mismatch");
   });
 
-  it("admits crash residue before the input-format bridge without consulting the current environment", () => {
-    for (const inputsFormat of [1, CALL_INPUTS_FORMAT]) {
-      const crashed = sourceState(undefined, {
-        status: "paused",
-        pauseReason: "interrupted",
-        runtime: { ...RUNTIME, inputsFormat },
-        resume: { format: "identity-v1" },
-      });
-      assert.deepEqual(admission(crashed), {
-        strategy: "positional-v1",
-        sourceRunId: SOURCE_RUN_ID,
-        requestedPolicy: "auto",
-        fallbackReason: "crash-residue",
-        eligibility: "legacy",
-      });
-    }
+  it("uses manifest identity for crash residue without consulting world state", () => {
+    const legacyCrashed = sourceState(undefined, {
+      status: "paused",
+      pauseReason: "interrupted",
+      runtime: { ...RUNTIME, inputsFormat: 1 },
+      resume: { format: "identity-v1" },
+    });
+    assert.deepEqual(admission(legacyCrashed), {
+      strategy: "positional-v1",
+      sourceRunId: SOURCE_RUN_ID,
+      requestedPolicy: "auto",
+      fallbackReason: "inputs-format-legacy",
+      eligibility: "legacy",
+    });
+
+    const currentCrashed = sourceState(undefined, {
+      status: "paused",
+      pauseReason: "interrupted",
+      resume: { format: "identity-v1" },
+    });
+    const currentDecision = admission(currentCrashed);
+    assert.equal(currentDecision.strategy, "identity-v1");
 
     const drifted = sourceState(undefined, {
       status: "paused",
       pauseReason: "interrupted",
       resume: { format: "identity-v1" },
     });
-    const driftDecision = admission(drifted, {
-      current: {
-        effectiveCwd: CWD,
-        runtime: RUNTIME,
-        environment: { key: "workspace-v2" },
-      },
-    });
-    assert.deepEqual(driftDecision, {
-      strategy: "positional-v1",
-      sourceRunId: SOURCE_RUN_ID,
-      requestedPolicy: "auto",
-      fallbackReason: "crash-residue",
-      eligibility: "legacy",
-    });
+    const driftDecision = admission(drifted);
+    assert.equal(driftDecision.strategy, "identity-v1");
 
-    const unknownEnvironment = admission(drifted, {
-      current: { effectiveCwd: CWD, runtime: RUNTIME },
-    });
-    assert.equal(unknownEnvironment.strategy, "positional-v1");
-    assert.equal(
-      unknownEnvironment.strategy === "positional-v1" && unknownEnvironment.eligibility,
-      "legacy",
-    );
-
-    const markerless = drifted;
+    const markerless = structuredClone(drifted);
     delete markerless.resume;
     const markerlessDecision = admission(markerless);
     assert.equal(markerlessDecision.strategy, "positional-v1");
@@ -367,7 +377,7 @@ describe("incremental resume admission", () => {
       resume: { format: "identity-v1", terminalEnvironment: {} },
     });
     const malformed = admission(malformedTerminal);
-    assert.equal(malformed.strategy === "live" && malformed.disabledReason, "source-environment-drift");
+    assert.equal(malformed.strategy, "identity-v1");
   });
 
   it("replays across every operational-knob change and migrates format 1 positionally", async () => {
@@ -457,21 +467,19 @@ return { first, second };`;
     }
   });
 
-  it("pins the remaining format, status, metadata, runtime-format, and intra-run safety outcomes", () => {
+  it("pins the remaining structural, status, metadata, and runtime-format outcomes", () => {
     const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>, string]> = [
       ["unsupported", sourceState(undefined, { resume: { format: "future" } as never }), {}, "unsupported-format"],
       ["aborted", sourceState(undefined, { status: "aborted" }), {}, "abort-residue"],
       ["abort signal", sourceState(undefined, { abortSignaled: true }), {}, "abort-residue"],
       ["running", sourceState(undefined, { status: "running" }), {}, "source-not-terminal"],
       ["isolation", sourceState(undefined, { executionMode: { kind: "isolation", baselineRunId: "base" } }), {}, "isolation-recording"],
-      ["terminal environment", sourceState(undefined, { resume: { format: "identity-v1" } }), {}, "source-environment-drift"],
-      ["source environment", sourceState(undefined, { environment: undefined }), {}, "source-environment-drift"],
       ["cwd metadata", sourceState(undefined, { effectiveCwd: undefined }), {}, "resume-metadata-missing"],
       ["runtime metadata", sourceState(undefined, { runtime: undefined }), {}, "resume-metadata-missing"],
       ["journal metadata", sourceState(undefined, { journal: undefined }), {}, "resume-metadata-missing"],
       ["manifest metadata", sourceState(undefined, { calls: undefined }), {}, "resume-metadata-missing"],
       ["allocation metadata", sourceState(undefined, { callsAllocated: undefined }), {}, "resume-metadata-missing"],
-      ["cwd", sourceState(), { current: { effectiveCwd: "/other", runtime: RUNTIME, environment: ENVIRONMENT } }, "cwd-mismatch"],
+      ["cwd", sourceState(), { current: { effectiveCwd: "/other", runtime: RUNTIME } }, "cwd-mismatch"],
       ["path format", sourceState(undefined, { runtime: { ...RUNTIME, pathFormat: 0 } }), {}, "runtime-mismatch"],
       ["input format", sourceState(undefined, { runtime: { ...RUNTIME, inputsFormat: 3 } }), {}, "runtime-mismatch"],
       ["checkpoint format", sourceState(undefined, { runtime: { ...RUNTIME, checkpointInputsFormat: 0 } }), {}, "runtime-mismatch"],
@@ -481,53 +489,39 @@ return { first, second };`;
       assert.equal(decision.strategy, "live", name);
       assert.equal(decision.strategy === "live" && decision.disabledReason, reason, name);
     }
+
+    const missingTerminal = admission(sourceState(undefined, {
+      resume: { format: "identity-v1" },
+    }));
+    assert.equal(missingTerminal.strategy, "identity-v1");
+
+    const missingSource = admission(sourceState(undefined, { environment: undefined }));
+    assert.equal(missingSource.strategy, "identity-v1");
   });
 
-  it("admits Node, V8, and current-environment drift as provenance instead of vetoes", () => {
+  it("admits missing or changed Node and V8 provenance because only formats gate", () => {
     const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>]> = [
       ["node", sourceState(undefined, { runtime: { ...RUNTIME, node: "v0" } }), {}],
       ["v8", sourceState(undefined, { runtime: { ...RUNTIME, v8: "v0" } }), {}],
-      ["current environment missing", sourceState(), { current: { effectiveCwd: CWD, runtime: RUNTIME } }],
-      [
-        "environment identity kind",
-        sourceState(),
-        {
-          current: {
-            effectiveCwd: CWD,
-            runtime: RUNTIME,
-            environment: { git: { head: HASH_A, dirtyDigest: HASH_B } },
-          },
-        },
-      ],
-      [
-        "environment identity value",
-        sourceState(),
-        { current: { effectiveCwd: CWD, runtime: RUNTIME, environment: { key: "other" } } },
-      ],
+      ["node missing", sourceState(undefined, { runtime: { ...RUNTIME, node: undefined } as never }), {}],
+      ["v8 missing", sourceState(undefined, { runtime: { ...RUNTIME, v8: undefined } as never }), {}],
     ];
     for (const [name, source, overrides] of cases) {
       assert.equal(admission(source, overrides).strategy, "identity-v1", name);
     }
   });
 
-  it("computes source drift after fallback precedence and positional eligibility", () => {
+  it("ignores source drift when choosing identity or positional correspondence", () => {
     const drifted = sourceState(undefined, {
       environment: { key: "source-start" },
       resume: { format: "identity-v1", terminalEnvironment: { key: "source-terminal" } },
     });
-    const current = {
-      effectiveCwd: CWD,
-      runtime: RUNTIME,
-      environment: { key: "source-terminal" },
-    };
-    const automatic = admission(drifted, { current });
-    assert.equal(automatic.strategy, "live");
-    assert.equal(automatic.strategy === "live" && automatic.disabledReason, "source-environment-drift");
-    assert.equal(automatic.facts?.filesystemStable, false);
+    const automatic = admission(drifted);
+    assert.equal(automatic.strategy, "identity-v1");
 
-    const positional = admission(drifted, { requestedPolicy: "positional", current });
+    const positional = admission(drifted, { requestedPolicy: "positional" });
     assert.equal(positional.strategy, "positional-v1");
-    assert.equal(positional.strategy === "positional-v1" && positional.eligibility, "all-live");
+    assert.equal(positional.strategy === "positional-v1" && positional.eligibility, "safe-prefix");
 
     const unsafeRow = agentRow();
     delete unsafeRow.resumeSafety;
@@ -535,9 +529,8 @@ return { first, second };`;
       environment: { key: "source-start" },
       resume: { format: "identity-v1", terminalEnvironment: { key: "source-terminal" } },
     });
-    const unsafeDecision = admission(unsafe, { current });
-    assert.equal(unsafeDecision.strategy, "positional-v1");
-    assert.equal(unsafeDecision.strategy === "positional-v1" && unsafeDecision.eligibility, "all-live");
+    const unsafeDecision = admission(unsafe);
+    assert.equal(unsafeDecision.strategy, "identity-v1");
   });
 
   it("requires a dense bijective manifest and every result identity fact", () => {
@@ -725,8 +718,9 @@ return { first, second };`;
     );
 
     const withoutReply = admission(paused);
-    assert.equal(withoutReply.strategy, "positional-v1");
+    assert.equal(withoutReply.strategy, "identity-v1");
     assert.equal(withoutReply.facts?.pendingRepresented, false);
+    assert.equal(withoutReply.strategy === "identity-v1" && withoutReply.seed.callBlockers?.length, 1);
 
     const duplicateRow = checkpointRow(2, { hash: HASH_B, inputsHash: INPUT_B });
     const duplicateSource = sourceState([prior, pending, duplicateRow], {
@@ -735,7 +729,7 @@ return { first, second };`;
       checkpointContext: context,
     });
     const duplicateDecision = admission(duplicateSource, { checkpointReplies: { 1: true } });
-    assert.equal(duplicateDecision.strategy, "positional-v1");
+    assert.equal(duplicateDecision.strategy, "identity-v1");
     assert.equal(duplicateDecision.facts?.pendingRepresented, false);
 
     const retainedCheckpoint = candidate(4, {
@@ -765,7 +759,7 @@ return { first, second };`;
       },
     });
     const retainedBlocked = admission(retainedBlocker, { checkpointReplies: { 1: true } });
-    assert.equal(retainedBlocked.strategy, "positional-v1");
+    assert.equal(retainedBlocked.strategy, "identity-v1");
     assert.equal(retainedBlocked.facts?.pendingRepresented, false);
 
     const corrupt = sourceState([prior, { ...pending, hash: HASH_C }], {
@@ -843,12 +837,8 @@ describe("identity candidate indexes and selection", () => {
     });
   });
 
-  it("orders cache, path, inputs, mismatch, and consumption decisions", () => {
+  it("orders correspondence and consumption decisions from journal identity alone", () => {
     const indexes = buildResumeCandidateIndexes(seed());
-    assert.deepEqual(selectResumeCandidate(indexes, matchInput({ cacheOpen: false, path: undefined, inputsHash: undefined })), {
-      action: "live",
-      reason: "unsafe-suffix",
-    });
     assert.deepEqual(selectResumeCandidate(indexes, matchInput({ path: undefined })), {
       action: "live",
       reason: "path-missing",
@@ -897,7 +887,7 @@ describe("identity candidate indexes and selection", () => {
     });
   });
 
-  it("applies the empty-output guard and source/current safety agreement", () => {
+  it("applies the empty-output guard while ignoring source-world classifications", () => {
     const empty = candidate(0, { entry: { result: "  \n" } });
     const emptyIndexes = buildResumeCandidateIndexes(seed([empty]));
     const emptyDecision = selectResumeCandidate(emptyIndexes, matchInput());
@@ -906,13 +896,10 @@ describe("identity candidate indexes and selection", () => {
     assert.equal(emptyDecision.action === "live" && emptyDecision.remove?.type, "candidate");
     assert.equal(selectResumeCandidate(emptyIndexes, matchInput({ hasSchema: true })).action, "replay");
 
-    const ordinary = buildResumeCandidateIndexes(seed());
-    const undeclared = selectResumeCandidate(ordinary, matchInput({ resumeDeclared: false }));
-    assert.equal(undeclared.action === "live" && undeclared.reason, "safety-changed");
-    assert.equal(undeclared.action === "live" && undeclared.closesSuffix, true);
-    const changedMode = selectResumeCandidate(ordinary, matchInput({ resolvedIsolation: "worktree" }));
-    assert.equal(changedMode.action === "live" && changedMode.reason, "safety-changed");
-    assert.equal(changedMode.action === "live" && changedMode.closesSuffix, undefined);
+    const unannotated = candidate();
+    delete unannotated.call.resumeSafety;
+    const ordinary = buildResumeCandidateIndexes(seed([unannotated]));
+    assert.equal(selectResumeCandidate(ordinary, matchInput()).action, "replay");
 
     const worktree = candidate(0, {
       call: {
@@ -922,12 +909,7 @@ describe("identity candidate indexes and selection", () => {
       },
     });
     const worktreeIndexes = buildResumeCandidateIndexes(seed([worktree]));
-    assert.equal(selectResumeCandidate(worktreeIndexes, matchInput({ resolvedIsolation: "worktree" })).action, "replay");
-    const externalBase = selectResumeCandidate(worktreeIndexes, matchInput({
-      resolvedIsolation: "worktree",
-      hasAgentCwd: true,
-    }));
-    assert.equal(externalBase.action === "live" && externalBase.closesSuffix, true);
+    assert.equal(selectResumeCandidate(worktreeIndexes, matchInput()).action, "replay");
   });
 
   it("partitions primitive kinds and includes checkpoint injections in multiplicity", () => {
@@ -951,7 +933,6 @@ describe("identity candidate indexes and selection", () => {
       hash: HASH_B,
       path: "checkpoint-path",
       inputsHash: INPUT_C,
-      resumeDeclared: undefined,
     })), {
       action: "live",
       reason: "inputs-changed",
@@ -961,7 +942,6 @@ describe("identity candidate indexes and selection", () => {
       hash: HASH_B,
       path: "new-path",
       inputsHash: INPUT_B,
-      resumeDeclared: undefined,
     });
     assert.deepEqual(selectResumeCandidate(indexes, checkpointInput), {
       action: "live",
@@ -1036,7 +1016,7 @@ describe("positional resume selection", () => {
     });
   });
 
-  it("requires new-format input and safety agreement while preserving duplicate occurrences", () => {
+  it("requires new-format input agreement while ignoring world classifications", () => {
     const first = agentRow(0);
     const second = agentRow(1, { path: first.path, budgetDebit: 2 });
     for (const call of [first, second]) {
@@ -1049,7 +1029,6 @@ describe("positional resume selection", () => {
         firstMiss: Number.POSITIVE_INFINITY,
         cached: entryFor(call),
         sourceCall: call,
-        resumeDeclared: true,
       });
       assert.equal(decision.action, "replay");
       assert.equal(decision.action === "replay" && decision.logicalBudgetDebit, call.budgetDebit);
@@ -1064,7 +1043,6 @@ describe("positional resume selection", () => {
       firstMiss: Number.POSITIVE_INFINITY,
       cached: entryFor(first),
       sourceCall: first,
-      resumeDeclared: true,
     });
     assert.equal(changedInputs.action === "live" && changedInputs.reason, "positional-miss");
 
@@ -1079,12 +1057,11 @@ describe("positional resume selection", () => {
       firstMiss: Number.POSITIVE_INFINITY,
       cached: entryFor(unsafe),
       sourceCall: unsafe,
-      resumeDeclared: true,
     });
-    assert.equal(unsafeDecision.action === "live" && unsafeDecision.reason, "positional-miss");
+    assert.equal(unsafeDecision.action, "replay");
   });
 
-  it("rejects changed checkpoint inputs and unproved headless checkpoint results", () => {
+  it("rejects changed checkpoint inputs and replays completed headless results", () => {
     const confirmed = checkpointRow();
     const cached = entryFor(confirmed, true);
     assert.equal(selectPositionalResume({
@@ -1119,7 +1096,7 @@ describe("positional resume selection", () => {
       cached: entryFor(headless),
       sourceCall: headless,
     });
-    assert.equal(unproved.action === "live" && unproved.reason, "positional-miss");
+    assert.equal(unproved.action, "replay");
   });
 });
 

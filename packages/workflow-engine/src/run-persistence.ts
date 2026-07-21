@@ -74,8 +74,9 @@ export interface PersistedAgentState {
 export interface PersistedResumeFormat {
   format: "identity-v1";
   /** Captured only after the script has settled AND resume activity is zero, immediately
-   *  before the terminal save. Absent from a crash snapshot, a non-quiescent terminal
-   *  run, and an unsafe non-git execution whose static host key cannot recapture state. */
+   *  before the terminal save. It may be absent from a crash snapshot, a non-quiescent
+   *  terminal run, or a non-git run without meaningful terminal provenance. Presence,
+   *  absence, and value are diagnostic only and never affect journal replay. */
   terminalEnvironment?: RunEnvironmentIdentity;
 }
 

@@ -68,7 +68,8 @@ function contentDigest(path: Buffer): string {
   return createHash("sha256").update("<missing>").digest("hex");
 }
 
-/** Capture the exact run-creation environment identity without making execution fail. */
+/** Capture bounded run-environment provenance without making execution fail.
+ * This snapshot is diagnostic only and must never gate journal replay. */
 export function captureRunEnvironment(
   effectiveCwd: string,
   environmentKey?: string,

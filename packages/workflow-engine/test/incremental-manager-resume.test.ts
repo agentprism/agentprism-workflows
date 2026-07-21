@@ -603,7 +603,7 @@ throw new Error("stop after one")`, "failed-hop"), undefined, {
     }
   });
 
-  it("persists an empty seed at the unsafe barrier and never resurrects its suffix", async () => {
+  it("replays both a completed live call and an inherited suffix after failure", async () => {
     const dirs = tempDirs();
     try {
       const store = memoryStore(dirs.root);
@@ -621,7 +621,7 @@ throw new Error("stop after unsafe work")`, "unsafe-barrier"), undefined, {
         resumeFromRunId: sourceRunId,
       });
       assert.equal(failed.status, "failed");
-      assert.equal(store.persistence.load("unsafe-barrier")?.resumeSeed?.candidates.length, 0);
+      assert.equal(store.persistence.load("unsafe-barrier")?.resumeSeed?.candidates.length, 2);
 
       const live: string[] = [];
       const resumed = await new WorkflowManager({
@@ -635,9 +635,9 @@ return await agent("two", { label: "two", resume: { filesystem: "read-only" } })
         runId: "after-unsafe",
         resumeFromRunId: "unsafe-barrier",
       });
-      assert.deepEqual(live, ["changed", "two"]);
-      assert.equal(resumed.resumeReport?.replayed, 0);
-      assert.equal(resumed.resumeReport?.live, 2);
+      assert.deepEqual(live, []);
+      assert.equal(resumed.resumeReport?.replayed, 2);
+      assert.equal(resumed.resumeReport?.live, 0);
     } finally {
       dirs.cleanup();
     }
@@ -774,7 +774,7 @@ return codes`, "commit-failure"), undefined, {
   });
 });
 
-describe("WorkflowManager positional safety counterexamples", () => {
+describe("WorkflowManager world-neutral journal replay", () => {
   function gitDirs(): { cwd: string; root: string; cleanup: () => void } {
     const dirs = tempDirs("incremental-manager-git-");
     execFileSync("git", ["-C", dirs.cwd, "init", "-q"]);
@@ -807,7 +807,7 @@ return await agent(${JSON.stringify(reader)}, {
   resume: { filesystem: "read-only" },
 })`, "writer-counterexample");
 
-  it("runs an edited unsafe writer and its unchanged reader live", async () => {
+  it("runs an edited writer but replays its unchanged reader", async () => {
     const dirs = gitDirs();
     try {
       const sourceCalls: string[] = [];
@@ -822,24 +822,20 @@ return await agent(${JSON.stringify(reader)}, {
         persistenceRoot: dirs.root,
         agent: artifactRunner(dirs.cwd, targetCalls),
       }).runSync(writerScript("write:v2", "read"), undefined, { resumeFromRunId: source.runId });
-      assert.deepEqual(targetCalls, ["write:v2", "read"]);
-      assert.equal(target.result, "v2");
-      assert.equal(target.resumeReport?.strategy, "positional-v1");
-      if (target.resumeReport?.strategy === "positional-v1") {
-        assert.equal(target.resumeReport.fallbackReason, "unsafe-recording");
-        assert.equal(target.resumeReport.eligibility, "all-live");
-      }
+      assert.deepEqual(targetCalls, ["write:v2"]);
+      assert.equal(target.result, "v1");
+      assert.equal(target.resumeReport?.strategy, "identity-v1");
       assert.deepEqual(target.resumeReport?.calls.map((decision) =>
         decision.action === "live" ? decision.reason : decision.action), [
-        "positional-suffix",
-        "positional-suffix",
+        "not-recorded",
+        "replayed",
       ]);
     } finally {
       dirs.cleanup();
     }
   });
 
-  it("reruns an unchanged unsafe writer before a changed downstream reader", async () => {
+  it("replays an unchanged writer before running a changed downstream reader", async () => {
     const dirs = gitDirs();
     try {
       const source = await new WorkflowManager({
@@ -853,10 +849,10 @@ return await agent(${JSON.stringify(reader)}, {
         persistenceRoot: dirs.root,
         agent: artifactRunner(dirs.cwd, targetCalls),
       }).runSync(writerScript("write:v1", "read:changed"), undefined, { resumeFromRunId: source.runId });
-      assert.deepEqual(targetCalls, ["write:v1", "read:changed"]);
+      assert.deepEqual(targetCalls, ["read:changed"]);
       assert.equal(target.result, "v1");
-      assert.equal(target.resumeReport?.replayed, 0);
-      assert.equal(target.resumeReport?.live, 2);
+      assert.equal(target.resumeReport?.replayed, 1);
+      assert.equal(target.resumeReport?.live, 1);
     } finally {
       dirs.cleanup();
     }

@@ -244,7 +244,7 @@ export interface ExecOptions {
   runId?: string;
   /** Marks this run as an isolation execution from its initial save onward. */
   executionMode?: PersistedRunState["executionMode"];
-  /** Non-git environment identity for replay comparability. */
+  /** Non-git environment label reported in replay provenance diagnostics only. */
   environmentKey?: string;
   /**
    * The agent backend for THIS run. Overrides the manager's constructor-injected
@@ -351,7 +351,7 @@ export interface WorkflowManagerOptions {
   persistence?: RunPersistence;
   /** Default journaling policy for runs created by this manager. Default true. */
   journaling?: boolean;
-  /** Default non-git environment identity. */
+  /** Default non-git environment label for replay provenance diagnostics. */
   environmentKey?: string;
 }
 
@@ -415,13 +415,7 @@ function predictedPositionalReplayablePrefix(
       entry === undefined ||
       call === undefined ||
       call.outcome !== "result" ||
-      call.hash !== entry.hash ||
-      (call.kind === "agent"
-        ? call.resumeSafety === undefined
-        : !(
-            call.origin === "confirm" ||
-            (call.origin === "journal-replay" && call.replay?.checkpointHostDecision === true)
-          ))
+      call.hash !== entry.hash
     ) {
       return prefix;
     }
@@ -887,12 +881,9 @@ export class WorkflowManager extends EventEmitter {
     append("runtime.v8", source.runtime?.v8 ?? null, managed.runtime.v8, "runtime.v8");
 
     const recordedTerminal = source.resume?.terminalEnvironment;
-    const recordedEnvironment =
-      admission.strategy === "positional-v1" && admission.fallbackReason === "crash-residue"
-        ? source.environment
-        : isRunEnvironmentIdentity(recordedTerminal)
-          ? recordedTerminal
-          : source.environment;
+    const recordedEnvironment = isRunEnvironmentIdentity(recordedTerminal)
+      ? recordedTerminal
+      : source.environment;
     const sourceEnvironment = isRunEnvironmentIdentity(recordedEnvironment)
       ? recordedEnvironment
       : undefined;
@@ -1141,6 +1132,10 @@ export class WorkflowManager extends EventEmitter {
     }
 
     const calls = Array.isArray(persisted.calls) ? persisted.calls : [];
+    const inputsFormat = isRecord(persisted.runtime) &&
+        isNonNegativeSafeInteger(persisted.runtime.inputsFormat)
+      ? persisted.runtime.inputsFormat
+      : undefined;
     const rootCalls = new Map<number, Record<string, unknown>>();
     for (const value of calls) {
       if (!isRecord(value) || !isNonNegativeSafeInteger(value.index)) continue;
@@ -1171,6 +1166,7 @@ export class WorkflowManager extends EventEmitter {
         callIndex: index,
         hash: record.hash,
         ...(typeof record.inputsHash === "string" ? { inputsHash: record.inputsHash } : {}),
+        ...(inputsFormat === undefined ? {} : { inputsFormat }),
         sessionRef: joined,
         recordedCwd,
       });
@@ -1191,14 +1187,10 @@ export class WorkflowManager extends EventEmitter {
       current: {
         effectiveCwd: managed.effectiveCwd,
         runtime: {
-          engineVersion: managed.runtime.engineVersion,
-          node: managed.runtime.node,
-          v8: managed.runtime.v8,
           pathFormat: managed.runtime.pathFormat,
           inputsFormat: managed.runtime.inputsFormat,
           checkpointInputsFormat: managed.runtime.checkpointInputsFormat as number,
         },
-        environment: managed.environment,
       },
       checkpointReplies: exec.checkpointReplies as Record<string, unknown> | undefined,
     });
@@ -1275,12 +1267,11 @@ export class WorkflowManager extends EventEmitter {
       predictedPositionalReplayablePrefix(admission.eligibility, sourceJournal, managed.calls),
     );
     if (admission.checkpointSeed) managed.resumeSeed = admission.checkpointSeed;
-    // Marked format-1 rows can republish matching safety/debit provenance under format 2;
+    // Marked format-1 rows can republish matching debit/diagnostic provenance under format 2;
     // markerless legacy rows have no trustworthy source-call facts to promote.
     const retainSourceCallFacts =
       admission.eligibility !== "legacy" ||
-      admission.fallbackReason === "inputs-format-legacy" ||
-      admission.fallbackReason === "crash-residue";
+      admission.fallbackReason === "inputs-format-legacy";
     const sourceCalls = retainSourceCallFacts
       ? new Map(managed.calls.map((call) => [call.index, call] as const))
       : new Map<number, WorkflowCallRecord>();

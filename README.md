@@ -62,27 +62,27 @@ From an ask like that, the agent picks the primitives — `gate()` fix-loops wit
 
 ### Durable runs — resume without re-spending tokens
 
-Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution can replay unchanged, explicitly safe calls even after insertions or reordering; ambiguous or unsafe calls run live. Current-environment and Node/V8 drift are reported as provenance instead of vetoing replay. Provider quota and authentication walls don't fail the run either: the run **pauses**, keeps the interrupted ACP session reopenable, and on resume reattaches to continue that exact turn when its call index, identity, execution inputs, backend, cwd, and reopen capability still match. Any correspondence uncertainty fails to a fresh live call, while completed prefix calls retain the ordinary journal replay rules.
+Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution replays unchanged completed calls even after insertions or reordering; ambiguous or mismatched calls run live. Filesystem/environment drift is reported as provenance instead of vetoing replay. Provider quota and authentication walls don't fail the run either: the run **pauses**, keeps the interrupted ACP session reopenable, and on resume reattaches to continue that exact turn when its call index, identity, execution inputs, backend, cwd, and reopen capability still match. Any correspondence uncertainty fails to a fresh live call, while completed calls retain ordinary journal replay.
 
-> **Resume rule:** replay is content-addressed and fail-to-live: an admitted safe call replays only when its identity and input fingerprint match uniquely.
+> **Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.
 >
-> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls and their content-dependent descendants miss. New-format reuse also requires exact cwd, compatible format/metadata/manifest admission, recorded start-to-terminal filesystem stability, and `resume: { filesystem: "read-only" }` safety on source and current agents. Identity hits preserve logical budget debit but spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, checkpoints, and filesystem boundaries.
+> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls miss. New-format reuse requires exact cwd, compatible format/metadata/manifest admission, and unambiguous identity/input correspondence—not a purity annotation. Identity hits preserve logical budget debit but spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, and checkpoints.
 
-Compact read-only/worktree fan-out:
+Compact reader/experiment fan-out:
 
 ```js
 const [audit, experiment] = await parallel([
   () => agent("Audit src/api without changing files.", {
-    label: "audit:api", resume: { filesystem: "read-only" },
+    label: "audit:api",
   }),
   () => agent("Try the worker fix in isolation; return a unified diff.", {
-    label: "try:worker", isolation: "worktree", resume: { filesystem: "read-only" },
+    label: "try:worker", isolation: "worktree",
   }),
 ]);
 ```
 
-The worktree's edits are discarded; return them as data. Worktree isolation without the explicit
-declaration is not replay-safe.
+The worktree's edits are discarded; return them as data. Both completed calls replay from their
+journal identity without a filesystem-safety annotation.
 
 ### Structured output as validated objects
 
@@ -337,7 +337,7 @@ for (let i = 0; i < maxRounds; i += 1) {
   rounds.push(
     await agent(
       `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
-      { label: `review:${i + 1}`, phase: "Review", resume: { filesystem: "read-only" } },
+      { label: `review:${i + 1}`, phase: "Review" },
     ),
   );
 }
@@ -346,7 +346,7 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `workflow` again with the same script, `args: { "maxRounds": 8 }`, and that ID as `resumeFromRunId`. Rounds 1–6 rebuild the same safe identities and replay with zero current provider tokens; only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` into every prompt would change all eight identities and make all eight calls live.
+Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `workflow` again with the same script, `args: { "maxRounds": 8 }`, and that ID as `resumeFromRunId`. Rounds 1–6 rebuild the same identities and replay with zero current provider tokens; only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` into every prompt would change all eight identities and make all eight calls live.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, inspect its safe log and
 call tail:
@@ -367,7 +367,7 @@ The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts a
 
 A script is plain JavaScript whose **first statement** is the `meta` literal. Inside it, these globals are available (injected into the run's realm — they are not importable functions; `@automatalabs/workflows` ships an ambient `.d.ts` so your editor knows them):
 
-- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `resume`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`. (`resume: { filesystem: "read-only" }` is the explicit content-addressed replay safety contract; `configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
+- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`, plus the deprecated replay-neutral `resume` annotation. (`configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
 - `parallel([fn, …])` — run thunks concurrently; **barrier** (awaits all).
 - `pipeline(items, stage1, stage2, …)` — stream each item through stages independently (no inter-stage barrier).
 - `phase(title)`, `log(msg)` — progress grouping + narration.
