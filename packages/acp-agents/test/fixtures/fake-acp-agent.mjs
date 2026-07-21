@@ -18,6 +18,7 @@
 // sessionId each time and the process logs a `__start`/`__exit` lifecycle marker so the test can
 // prove the process was spawned once and only closed on pool dispose.
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
@@ -107,6 +108,19 @@ process.stdin.on("end", () => {
   recordExit("stdin-end");
   process.exit(0);
 });
+
+// Lifecycle teardown regressions use this intentionally detached Pi-like command process. It
+// ignores SIGTERM and sits in a separate process group, so killing only the ACP server would
+// orphan it unless the parent snapshots and force-kills the whole descendant tree.
+if (scenario.stubbornPiChild === true) {
+  const stubbornChild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1 << 30);"], {
+    detached: process.platform !== "win32",
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  stubbornChild.unref();
+  record({ method: "__stubborn_pi_child", childPid: stubbornChild.pid });
+}
 
 const defaultConfigOptions = [
   {

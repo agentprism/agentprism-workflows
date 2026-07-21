@@ -1118,6 +1118,14 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     await this.dispose();
   }
 
+  /**
+   * Synchronously force-kill every backend process tree. Hosts use this only after a bounded
+   * graceful dispose deadline; it is additive to the normal asynchronous dispose() contract.
+   */
+  forceKill(): void {
+    this.killAllSync();
+  }
+
   private async createInteractiveSession(
     opts: InteractiveAssemblyOptions,
     methodName: "openSession" | "loadSession" | "forkSession" | "resumeSession",
@@ -1411,6 +1419,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
   /** Synchronous best-effort child kill for the process-exit hook (no async work is possible). */
   private killAllSync(): void {
+    this.pool.forceKill();
     for (const connection of this.interactiveSessions.values()) connection.killNow();
   }
 }

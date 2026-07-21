@@ -60,6 +60,8 @@ The package ships one executable:
 
 Running it starts the MCP server on stdio: it builds an ACP-backed `AgentRunner`, injects it into a `WorkflowManager`, registers the `workflow` tool, and connects a `StdioServerTransport`. It speaks the MCP protocol — it is not an interactive CLI. Launch it from an MCP host, or pipe JSON-RPC to it yourself for testing.
 
+On stdin EOF, transport close, `SIGINT`, or `SIGTERM`, the server stops accepting new tool calls and disposes the ACP runner before exiting. That closes every pooled backend process with its existing graceful `SIGTERM`/`SIGKILL` teardown. Cleanup has a five-second hard deadline; if graceful disposal stalls, the server synchronously force-kills the tracked backend process trees before it exits. Client disconnects exit with code `0`; signal shutdowns use conventional `SIGINT`/`SIGTERM` exit codes `130`/`143`.
+
 ---
 
 ## Register it in an MCP host
@@ -506,12 +508,14 @@ client `resources` capability to gate these server-offered primitives.
   `resumeFromRunId`; no MCP credential channel is added.
 - **Retention and process lifetime.** Terminal results are reconstructed from project-scoped
   persistence and have no MCP TTL; repeated/cold await works until deletion, corruption, or store
-  loss. Background means detached from one request, not from this stdio child. Disconnect does not
-  itself abort work while Node stays alive, but host process exit, SIGTERM/SIGKILL, crash, shutdown,
-  or machine loss can stop it. Construction and cold inspect/list/await/stop/resume preflights
-  reconcile a dead owner's durable `pending`/`running` state under its lease to `paused` with
-  `pauseReason: "interrupted"`; completed journal entries remain resumable, while an in-flight
-  unjournaled call can run again. Later persistence after admission is best effort.
+  loss. Background means detached from one request, not from this stdio child. A client disconnect
+  tears down this child: it stops new admissions, disposes the ACP runner, force-kills a stalled
+  backend tree at the shutdown deadline, then exits. Therefore in-flight and background work does
+  not survive a disconnect, signal shutdown, host exit, crash, or machine loss. Construction and
+  cold inspect/list/await/stop/resume preflights reconcile a dead owner's durable
+  `pending`/`running` state under its lease to `paused` with `pauseReason: "interrupted"`; completed
+  journal entries remain resumable, while an in-flight unjournaled call can run again. Later
+  persistence after admission is best effort.
 
 ---
 
@@ -586,12 +590,15 @@ console.log(run.status, run.result);
 This MCP-server package does export its own building blocks, for hosts that want to mount the same `workflow` tool on a transport they control rather than the default stdio one:
 
 ```ts
-import { createWorkflowServer } from "@automatalabs/mcp-server";
+import { createWorkflowServer, installMcpServerLifecycle } from "@automatalabs/mcp-server";
 import { createAcpRunner } from "@automatalabs/workflows";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-const server = createWorkflowServer(createAcpRunner());
-await server.connect(new StdioServerTransport());
+const runner = createAcpRunner();
+const server = createWorkflowServer(runner);
+const transport = new StdioServerTransport();
+await server.connect(transport);
+installMcpServerLifecycle({ runner, server, transport });
 ```
 
 Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
@@ -602,7 +609,9 @@ Other exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `WorkflowInspectionToolResult`, `WorkflowRunAwaitResult`, `WorkflowStopResult`,
 `WorkflowScriptLineageEntry`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
 `workflowToolOutputShape` / `toWorkflowToolResult`,
-`createProgressReporter`, and a `main()` that runs the default stdio server. For anything beyond
+`createProgressReporter`, `installMcpServerLifecycle` / `SHUTDOWN_DEADLINE_MS`, and lifecycle
+types `McpServerLifecycle`, `McpServerLifecycleOptions`, `McpServerShutdownReason`, and
+`WorkflowServerControl`, plus a `main()` that runs the default stdio server. For anything beyond
 hosting this tool, prefer `@automatalabs/workflows`.
 
 ---

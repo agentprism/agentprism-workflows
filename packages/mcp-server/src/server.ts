@@ -59,6 +59,7 @@ import type {
 import { createAwaitProgressReporter, createProgressReporter } from "./progress.js";
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
+import type { WorkflowServerControl } from "./lifecycle.js";
 import {
   WorkflowScriptResources,
   workflowScriptUri,
@@ -1146,11 +1147,19 @@ export interface CreateWorkflowServerOptions {
   manager?: WorkflowManager;
 }
 
+export interface WorkflowServer extends McpServer, WorkflowServerControl {}
+
 export function createWorkflowServer(
   runner: AgentRunner,
   options: CreateWorkflowServerOptions = {},
-): McpServer {
+): WorkflowServer {
   const mcp = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
+  let acceptingWork = true;
+  const server = Object.assign(mcp, {
+    stopAcceptingWork() {
+      acceptingWork = false;
+    },
+  });
 
   // registerCapabilities is illegal after a transport attaches. Merge the complete resources
   // capability before resource/handler registration and before createWorkflowServer returns.
@@ -1188,6 +1197,12 @@ export function createWorkflowServer(
       outputSchema: workflowToolOutputShape,
     },
     async (args, extra) => {
+      if (!acceptingWork) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          "Workflow server is shutting down and is no longer accepting tool calls.",
+        );
+      }
       const parsedInput = parseWorkflowToolInput(args);
       if (parsedInput.action === "inspect") {
         const status = manager.inspectRun(parsedInput.runId, {
@@ -1639,5 +1654,5 @@ export function createWorkflowServer(
     },
   );
 
-  return mcp;
+  return server;
 }

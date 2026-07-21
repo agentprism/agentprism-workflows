@@ -72,6 +72,8 @@ export class AcpAgentPool {
   private readonly size: number;
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly byBackend = new Map<BackendId, PooledConnection[]>();
+  /** Connections whose async disposal is still in progress, including ones already removed from admission. */
+  private readonly disposingConnections = new Set<PooledConnection>();
   private readonly onProcessExit = () => this.killAllSync();
   private exitHookInstalled = false;
   private disposed = false;
@@ -192,8 +194,7 @@ export class AcpAgentPool {
       if (c.canLiveReapply(machine) && c.activeSessions === 0) {
         c.scheduleReapply(machine); // in-process: re-auth the idle connection live
       } else if (c.activeSessions === 0) {
-        void c.dispose(); // disk/spawn-env: recycle the idle process now
-        this.drop(key, c);
+        this.disposeAndDrop(key, c); // disk/spawn-env: recycle the idle process now
       } else {
         c.markForRecycleWhenIdle(machine); // BUSY: drain, then recycle on release
       }
@@ -210,8 +211,7 @@ export class AcpAgentPool {
     for (const c of this.connectionsFor(key).filter((c) => c.alive)) {
       if (!store.isStale(key, c.providerStamp)) continue;
       if (c.activeSessions === 0) {
-        void c.dispose();
-        this.drop(key, c);
+        this.disposeAndDrop(key, c);
       } else {
         c.recyclePending = true; // BUSY: drain, then dispose-and-drop on release
       }
@@ -263,15 +263,53 @@ export class AcpAgentPool {
     if (index >= 0) arr.splice(index, 1);
   }
 
-  /** Close every pooled process and clear the pool. Idempotent. */
+  /**
+   * Remove a stale connection from admission while retaining its disposal promise. A later pool
+   * shutdown must await this graceful teardown, and its deadline must still be able to force-kill
+   * the process tree if it has not settled yet.
+   */
+  private disposeAndDrop(key: string, connection: PooledConnection): void {
+    this.drop(key, connection);
+    void this.trackDisposal(connection);
+  }
+
+  /** Retain one memoized connection disposal until it settles, without leaking a rejection. */
+  private trackDisposal(connection: PooledConnection): Promise<void> {
+    this.disposingConnections.add(connection);
+    const disposal = connection.dispose();
+    void disposal.then(
+      () => this.disposingConnections.delete(connection),
+      () => this.disposingConnections.delete(connection),
+    );
+    return disposal;
+  }
+
+  /**
+   * Close every pooled process and clear the admission registry. Connections remain reachable
+   * through `disposingConnections` until their asynchronous graceful teardown settles so a host
+   * lifecycle deadline can still synchronously force-kill them.
+   */
   async dispose(): Promise<void> {
     this.disposed = true;
     this.removeExitHook();
-    const all = this.allConnections();
+    // Include stale connections that were removed from admission by reconciliation but whose
+    // graceful disposal has not settled. Otherwise a host lifecycle could see dispose() resolve,
+    // cancel its deadline, and exit while such a backend process tree is still alive.
+    const all = [...new Set([...this.allConnections(), ...this.disposingConnections])];
     this.byBackend.clear();
-    const results = await Promise.allSettled(all.map((c) => c.dispose()));
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (failure) throw failure.reason;
+    try {
+      const results = await Promise.allSettled(all.map((connection) => this.trackDisposal(connection)));
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure) throw failure.reason;
+    } finally {
+      for (const connection of all) this.disposingConnections.delete(connection);
+    }
+  }
+
+  /** Synchronously kill live pooled and in-progress-disposal backend process trees. */
+  forceKill(): void {
+    this.killAllSync();
+    for (const connection of this.disposingConnections) connection.killNow();
   }
 
   private allConnections(): PooledConnection[] {
