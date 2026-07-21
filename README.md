@@ -254,12 +254,17 @@ Register the stdio server in your MCP host's config:
 {
   "mcpServers": {
     "agentprism-workflow": {
-      "command": "agentprism-workflow",
+      "command": "npx",
+      "args": ["-y", "@automatalabs/workflows", "mcp"],
       "env": { "AGENTPRISM_DEFAULT_BACKEND": "claude" }
     }
   }
 }
 ```
+
+The server is bundled in the `@automatalabs/workflows` tarball, so this needs no separate
+server installation. The independently published `@automatalabs/mcp-server` package and its
+`agentprism-workflow` bin remain available as an alternative.
 
 From a source checkout, point at the built entry instead:
 

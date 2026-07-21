@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// The @automatalabs/workflows bin (`agentprism-workflows`). Two subcommands:
+// The @automatalabs/workflows bin (`agentprism-workflows`). Three subcommands:
 //
 //   agentprism-workflows validate <workflow-file> [options]
 //   agentprism-workflows config [harness ...] [options]
+//   agentprism-workflows mcp
 //
 // validate checks a workflow script without spending tokens: static parse (meta literal,
 // syntax, direct nondeterministic call expressions), then a dry run over an in-process
@@ -13,8 +14,13 @@
 // config runs that same no-prompt probe standalone — no script needed — and prints each
 // requested harness's advertised config-option catalog (model ids, effort levels, modes,
 // …). See ./config.ts for the programmatic API (`probeHarnessConfig`).
+//
+// mcp delegates stdio unchanged to the MCP server embedded at build time. In a source
+// checkout without that bundle, it falls back to the separately built mcp-server entry.
 
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { resolve } from "node:path";
 import { openWorkflowDir } from "@automatalabs/workflow-engine";
 import { validateWorkflowScript, formatValidateReport } from "./validate.js";
@@ -31,6 +37,7 @@ Commands:
                                     catalog (model ids, effort levels, modes, …) so
                                     model/configOptions values come from the live
                                     catalog, not guesswork
+  mcp                               launch the embedded AgentPrism stdio MCP server
 
 Run \`agentprism-workflows <command> --help\` for that command's options.`;
 
@@ -97,6 +104,14 @@ Options:
 
 Exit codes: 0 all probed · 1 at least one probe failed · 3 usage error`;
 
+const MCP_USAGE = `Usage: agentprism-workflows mcp
+
+Launches the embedded AgentPrism MCP server over stdio. stdin and stdout are reserved
+for JSON-RPC framing and are inherited unchanged by the server process.
+
+Options:
+  -h, --help          show this help`;
+
 let activeCommand = "";
 
 function fail(message: string): never {
@@ -155,6 +170,93 @@ async function mainConfig(rest: string[]): Promise<void> {
   process.exitCode = report.exitCode;
 }
 
+async function mainMcp(rest: string[]): Promise<void> {
+  if (rest.length === 1 && (rest[0] === "-h" || rest[0] === "--help")) {
+    process.stdout.write(`${MCP_USAGE}\n`);
+    process.exit(0);
+  }
+  if (rest.length > 0) fail(`mcp does not accept arguments (received: ${rest.join(" ")})`);
+
+  const bundlePath = resolve(import.meta.dirname, "mcp-server.js");
+  const monorepoFallbackPath = resolve(import.meta.dirname, "../../mcp-server/dist/cli.js");
+  const serverPath = existsSync(bundlePath)
+    ? bundlePath
+    : existsSync(monorepoFallbackPath)
+      ? monorepoFallbackPath
+      : undefined;
+
+  if (serverPath === undefined) {
+    fail(
+      `MCP server bundle not found at ${bundlePath}, and the monorepo fallback is not built. ` +
+        "Run `pnpm --filter @automatalabs/workflows build` to create the bundle, or run `pnpm build` at the repository root.",
+    );
+  }
+
+  await new Promise<void>((resolvePromise) => {
+    const child = spawn(process.execPath, [serverPath], { stdio: "inherit" });
+    const forwardedSignals = ["SIGINT", "SIGTERM"] as const;
+    let settled = false;
+    let cleaned = false;
+
+    const forwarders = new Map<(typeof forwardedSignals)[number], () => void>();
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      for (const [signal, forward] of forwarders) process.off(signal, forward);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const finish = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+      resolvePromise();
+    };
+    const onError = (error: Error) => {
+      finish(() => {
+        process.stderr.write(`mcp server failed to start: ${error.message}\n`);
+        process.exitCode = 1;
+      });
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      finish(() => {
+        if (signal === null) {
+          process.exitCode = code ?? 1;
+          return;
+        }
+
+        // Preserve signal termination for callers (shells, npx, and MCP hosts). Set a
+        // conventional nonzero fallback first in case re-raising is unsupported here.
+        process.exitCode = 128 + (osConstants.signals[signal] ?? 1);
+        try {
+          process.kill(process.pid, signal);
+        } catch (error) {
+          process.stderr.write(
+            `mcp server exited on ${signal}, but the parent could not re-raise it: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      });
+    };
+
+    for (const signal of forwardedSignals) {
+      const forward = () => {
+        try {
+          child.kill(signal);
+        } catch (error) {
+          process.stderr.write(
+            `could not forward ${signal} to the mcp server: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      };
+      forwarders.set(signal, forward);
+      process.on(signal, forward);
+    }
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
 async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === undefined || command === "-h" || command === "--help") {
@@ -165,7 +267,11 @@ async function main(argv: string[]): Promise<void> {
     activeCommand = "config";
     return mainConfig(rest);
   }
-  if (command !== "validate") fail(`unknown command "${command}" — the commands are: validate, config`);
+  if (command === "mcp") {
+    activeCommand = "mcp";
+    return mainMcp(rest);
+  }
+  if (command !== "validate") fail(`unknown command "${command}" — the commands are: validate, config, mcp`);
   activeCommand = "validate";
 
   let file: string | undefined;

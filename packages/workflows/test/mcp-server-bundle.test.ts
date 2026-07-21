@@ -1,0 +1,177 @@
+import test, { before } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { build } from "esbuild";
+
+const REPOSITORY_ROOT = resolve(import.meta.dirname, "../../..");
+const WORKFLOWS_ROOT = resolve(import.meta.dirname, "..");
+const WORKFLOWS_DIST_ENTRY = resolve(WORKFLOWS_ROOT, "dist/index.js");
+const MCP_SOURCE_ENTRY = resolve(REPOSITORY_ROOT, "packages/mcp-server/src/index.ts");
+const MCP_BUNDLE = resolve(WORKFLOWS_ROOT, "dist/mcp-server.js");
+const WORKFLOWS_PACKAGE = (await import("../package.json", { with: { type: "json" } })).default;
+
+interface JsonRpcFrame {
+  jsonrpc?: unknown;
+  id?: unknown;
+  result?: unknown;
+}
+
+before(async () => {
+  assert.ok(
+    existsSync(WORKFLOWS_DIST_ENTRY),
+    "workflows dist/index.js must be built before the MCP bundle smoke test",
+  );
+  await build({
+    entryPoints: [MCP_SOURCE_ENTRY],
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    target: "node22",
+    external: ["@automatalabs/*"],
+    outfile: MCP_BUNDLE,
+    logLevel: "silent",
+  });
+});
+
+function request(id: number, method: string, params?: unknown): string {
+  return `${JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) })}\n`;
+}
+
+test("the bundled stdio server initializes once and advertises the workflow tool", { timeout: 30_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "automatalabs-workflows-mcp-bundle-"));
+  const child = spawn(process.execPath, [MCP_BUNDLE], {
+    cwd: REPOSITORY_ROOT,
+    env: { ...process.env, HOME: home },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const childDone = new Promise<void>((resolvePromise) => {
+    child.once("close", () => resolvePromise());
+    child.once("error", () => resolvePromise());
+  });
+
+  const frames: JsonRpcFrame[] = [];
+  const waiters = new Set<() => void>();
+  let stdoutBuffer = "";
+  let stderr = "";
+  let failure: Error | undefined;
+
+  const notifyWaiters = () => {
+    for (const waiter of [...waiters]) waiter();
+  };
+  const setFailure = (error: Error) => {
+    if (failure !== undefined) return;
+    failure = error;
+    notifyWaiters();
+  };
+  const waitForResponse = (id: number): Promise<JsonRpcFrame> =>
+    new Promise((resolvePromise, rejectPromise) => {
+      const inspect = () => {
+        if (failure !== undefined) {
+          waiters.delete(inspect);
+          rejectPromise(failure);
+          return;
+        }
+        const frame = frames.find((candidate) => candidate.id === id);
+        if (frame !== undefined) {
+          waiters.delete(inspect);
+          resolvePromise(frame);
+        }
+      };
+      waiters.add(inspect);
+      inspect();
+    });
+
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdoutBuffer += chunk.toString("utf8");
+    for (;;) {
+      const newline = stdoutBuffer.indexOf("\n");
+      if (newline === -1) break;
+      const line = stdoutBuffer.slice(0, newline);
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      if (line.length === 0) {
+        setFailure(new Error("the MCP server wrote a blank stdout frame"));
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(line) as JsonRpcFrame;
+        if (parsed === null || typeof parsed !== "object") {
+          throw new Error("frame is not a JSON object");
+        }
+        frames.push(parsed);
+      } catch (error) {
+        setFailure(
+          new Error(
+            `the MCP server wrote a non-JSON stdout frame: ${error instanceof Error ? error.message : String(error)}; line=${JSON.stringify(line)}`,
+          ),
+        );
+      }
+      notifyWaiters();
+    }
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8");
+  });
+  child.once("error", (error) => setFailure(error));
+  child.once("exit", (code, signal) => {
+    if (failure === undefined) {
+      setFailure(new Error(`the MCP server exited early (code=${code}, signal=${signal ?? "none"})`));
+    }
+  });
+
+  const watchdog = setTimeout(() => {
+    setFailure(new Error("timed out waiting for the MCP stdio handshake"));
+  }, 20_000);
+
+  try {
+    child.stdin.write(
+      request(1, "initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "workflows-bundle-smoke", version: "0.0.0" },
+      }),
+    );
+    const initialize = await waitForResponse(1);
+
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    child.stdin.write(request(2, "tools/list", {}));
+    const toolsList = await waitForResponse(2);
+
+    // Keep collecting briefly: a cli.ts bundle starts the server twice and can otherwise
+    // pass if the test stops at the first matching response.
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 300));
+    if (failure !== undefined) throw failure;
+
+    const initializeResult = initialize.result as {
+      serverInfo?: { name?: unknown; version?: unknown };
+    };
+    assert.equal(initializeResult.serverInfo?.name, "agentprism-workflow");
+    assert.equal(initializeResult.serverInfo?.version, WORKFLOWS_PACKAGE.version);
+
+    const toolsResult = toolsList.result as { tools?: Array<{ name?: unknown }> };
+    assert.ok(toolsResult.tools?.some((tool) => tool.name === "workflow"), "workflow tool was not advertised");
+    assert.deepEqual(
+      frames.map((frame) => frame.id),
+      [1, 2],
+      `expected exactly one initialize and one tools/list response; frames=${JSON.stringify(frames)}`,
+    );
+    assert.equal(stdoutBuffer, "", `incomplete stdout frame: ${JSON.stringify(stdoutBuffer)}`);
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\nMCP stderr:\n${stderr || "(empty)"}`,
+      { cause: error },
+    );
+  } finally {
+    clearTimeout(watchdog);
+    child.stdin.end();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    const forceKill = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, 5_000);
+    await childDone;
+    clearTimeout(forceKill);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
