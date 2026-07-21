@@ -42,6 +42,18 @@ function resourceText(result: Awaited<ReturnType<Client["readResource"]>>): stri
   return String(content.text);
 }
 
+interface EventDocument {
+  streamId: string;
+  cursor: number;
+  endCursor: number;
+  hasMore: boolean;
+  events: Array<{ seq: number; event: { type: string; message?: string } }>;
+}
+
+function eventDocument(result: Awaited<ReturnType<Client["readResource"]>>): EventDocument {
+  return JSON.parse(resourceText(result)) as EventDocument;
+}
+
 async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) {
     if (predicate()) return;
@@ -544,13 +556,19 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
     await waitUntil(() => listChanged >= 55, "every admission should emit resources/list_changed");
 
     const listed = await client.listResources();
-    assert.equal(listed.resources.length, 50);
+    assert.equal(listed.resources.length, 100);
     const expectedNewest = runIds.slice(5).reverse();
+    const listedScripts = listed.resources.filter((resource) => resource.uri.endsWith("/script"));
+    const listedEvents = listed.resources.filter((resource) => resource.uri.endsWith("/events"));
     assert.deepEqual(
-      listed.resources.map((resource) => resource.uri),
+      listedScripts.map((resource) => resource.uri),
       expectedNewest.map((runId) => `workflow://runs/${runId}/script`),
     );
-    assert.match(String(listed.resources[0]?.description), /^completed · started /);
+    assert.deepEqual(
+      listedEvents.map((resource) => resource.uri),
+      expectedNewest.map((runId) => `workflow://runs/${runId}/events`),
+    );
+    assert.match(String(listedScripts[0]?.description), /^completed · started /);
     assert.equal(
       resourceText(await client.readResource({ uri: `workflow://runs/${runIds[0]}/script` })),
       NO_AGENT_SCRIPT.replace("no-agent", "resource-0"),
@@ -1094,5 +1112,126 @@ test("cold await does not infer an admission-only script source", async () => {
     assert.equal((structured(awaited)?.outcome as Record<string, unknown>).scriptSource, undefined);
   } finally {
     await second.dispose();
+  }
+});
+
+test("events resources push append hints and page exact durable catch-up", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-events-resource-"));
+  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const mcp = new McpServer({ name: "events-test", version: "0.0.0" }, { capabilities: {} });
+  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+  const resources = new WorkflowScriptResources(mcp, manager);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "events-client", version: "0.0.0" }, { capabilities: {} });
+  let updated = 0;
+  client.setNotificationHandler(ResourceUpdatedNotificationSchema, () => { updated += 1; });
+  await Promise.all([mcp.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "events-resource"));
+    resources.notifyRunAdmitted(run.runId);
+    const uri = `workflow://runs/${run.runId}/events`;
+    const initial = eventDocument(await client.readResource({ uri }));
+    assert.ok(initial.streamId);
+    assert.equal(initial.hasMore, false);
+    await client.subscribeResource({ uri });
+
+    const persistence = manager.getPersistence();
+    const state = persistence.load(run.runId);
+    assert.ok(state?.eventSeq !== undefined);
+    const record = persistence.appendEvent(run.runId, {
+      seq: state.eventSeq + 1,
+      timestamp: new Date().toISOString(),
+      event: { type: "log", runId: run.runId, scope: run.runId, message: "external append" },
+    });
+    state.eventSeq = record.seq;
+    persistence.save(state);
+    await waitUntil(() => updated >= 1, "subscribed event append should push resources/updated");
+
+    const page = eventDocument(await client.readResource({
+      uri: `${uri}?limit=100&streamId=${initial.streamId}&after=${initial.cursor}`,
+    }));
+    assert.equal(page.events.length, 1);
+    assert.equal(page.events[0]?.event.message, "external append");
+    assert.equal(page.cursor, record.seq);
+    assert.equal(page.hasMore, false);
+    await client.unsubscribeResource({ uri });
+
+    const updatesBeforeUnsubscribedAppend = updated;
+    const afterUnsubscribe = persistence.appendEvent(run.runId, {
+      seq: record.seq + 1,
+      timestamp: new Date().toISOString(),
+      event: { type: "log", runId: run.runId, scope: run.runId, message: "after unsubscribe" },
+    });
+    state.eventSeq = afterUnsubscribe.seq;
+    persistence.save(state);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(updated, updatesBeforeUnsubscribedAppend, "unsubscribe must close the event watcher");
+  } finally {
+    await client.close();
+    await mcp.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a slow events subscriber holds one promise plus one dirty bit while durable pages keep every record", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-events-backpressure-"));
+  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const mcp = new McpServer({ name: "events-backpressure", version: "0.0.0" }, { capabilities: {} });
+  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+  const resources = new WorkflowScriptResources(mcp, manager);
+  let notificationCalls = 0;
+  let releaseFirst!: () => void;
+  const sender = mcp.server as unknown as { sendResourceUpdated(params: { uri: string }): Promise<void> };
+  sender.sendResourceUpdated = () => {
+    notificationCalls += 1;
+    if (notificationCalls !== 1) return Promise.resolve();
+    return new Promise<void>((resolve) => { releaseFirst = resolve; });
+  };
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "slow-events-client", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([mcp.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "events-backpressure"));
+    const uri = `workflow://runs/${run.runId}/events`;
+    const initial = eventDocument(await client.readResource({ uri }));
+    await client.subscribeResource({ uri });
+    const persistence = manager.getPersistence();
+    const state = persistence.load(run.runId);
+    assert.ok(state?.eventSeq !== undefined);
+    for (let index = 0; index < 1_005; index++) {
+      const record = persistence.appendEvent(run.runId, {
+        seq: state.eventSeq + 1,
+        timestamp: new Date().toISOString(),
+        event: { type: "log", runId: run.runId, scope: run.runId, message: `burst-${index}` },
+      });
+      state.eventSeq = record.seq;
+    }
+    persistence.save(state);
+    const internals = resources as unknown as {
+      eventSubscriptions: Map<string, { dirty: boolean; inFlight: boolean }>;
+    };
+    await waitUntil(() => notificationCalls === 1 && internals.eventSubscriptions.get(uri)?.dirty === true,
+      "the slow subscriber should coalesce its backlog into one dirty bit");
+    assert.equal(internals.eventSubscriptions.get(uri)?.inFlight, true);
+    releaseFirst();
+    await waitUntil(() => notificationCalls >= 2, "one coalesced follow-up hint should be sent");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(notificationCalls, 2);
+
+    const first = eventDocument(await client.readResource({
+      uri: `${uri}?after=${initial.cursor}&limit=1000&streamId=${initial.streamId}`,
+    }));
+    const second = eventDocument(await client.readResource({
+      uri: `${uri}?after=${first.cursor}&limit=1000&streamId=${initial.streamId}`,
+    }));
+    const recovered = [...first.events, ...second.events];
+    assert.equal(recovered.length, 1_005);
+    assert.deepEqual(recovered.map((record) => record.seq),
+      Array.from({ length: 1_005 }, (_, index) => initial.cursor + index + 1));
+    await client.unsubscribeResource({ uri });
+  } finally {
+    await client.close();
+    await mcp.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });

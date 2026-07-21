@@ -52,6 +52,20 @@ export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js"
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
 export { installMcpServerLifecycle, SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 export type { McpServerLifecycle, McpServerLifecycleOptions, McpServerShutdownReason, WorkflowServerControl } from "./lifecycle.js";
+export {
+  EVENTS_RESOURCE_MIME_TYPE,
+  SCRIPT_RESOURCE_LIST_LIMIT,
+  SCRIPT_RESOURCE_MIME_TYPE,
+  WORKFLOW_RUN_EVENTS_SCHEMA_VERSION,
+  parseWorkflowRunEventsUri,
+  workflowRunEventsUri,
+  workflowRunIdFromScriptUri,
+  workflowScriptUri,
+} from "./workflow-resources.js";
+export type {
+  ParsedWorkflowRunEventsUri,
+  WorkflowRunEventsResourceDocument,
+} from "./workflow-resources.js";
 
 /**
  * Bootstrap the MCP `workflow` server over stdio. Composition root: build the ACP-backed

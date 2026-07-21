@@ -620,6 +620,8 @@ affects the run.
 | `agentStart` | `label`, `phase?`, `prompt`, `model?`, `configOptions?`, `callIndex` |
 | `agentEnd` | `label`, `phase?`, `result`, `callIndex`, usage/model/backend/provenance fields, optional error fields |
 | `agentHistory` | `label`, `phase?`, `history`, `callIndex` |
+| `agentProgress` | `label`, `phase?`, `callIndex`, `executionStartSeq`, `turnCount`, `observedEvents`, `coalescedEvents`, `cause`, exactly one of `latestText` / `lastToolName`, optional `tokensObserved` |
+| `agentTranscript` | `label`, `phase?`, `callIndex`, `executionStartSeq`, dense `entryIndex` / `revision`, `operation: "upsert"`, assistant-text or tool-call `entry` |
 | `journal` | `entry` (`JournalEntry`) — live journal append observations, including when file journaling is disabled |
 | `callRecord` | `record` (`WorkflowCallRecord`), including terminal non-journal exits |
 | `tokenUsage` | `usage` (cumulative input/output/total/cost/cache) |
@@ -645,6 +647,8 @@ additive `RunEventPersistence` subtype. The live and persisted policies are fixe
 | `agentStart` | yes | yes | Lifecycle/progress boundary |
 | `agentEnd` | yes | yes | Lifecycle/progress boundary and terminal call summary |
 | `agentHistory` | yes | no | Transcript-like, content-heavy duplicate |
+| `agentProgress` | yes | yes | Redacted, bounded, content-bearing in-flight sample or heartbeat |
+| `agentTranscript` | yes | yes | Redacted, bounded in-flight assistant/tool upsert |
 | `tokenUsage` | yes | yes | Bounded cumulative usage/cost snapshot |
 | `complete` | yes | yes | Root terminal lifecycle |
 | `journal` | listener-gated | yes | Deterministic call-result lifecycle |
@@ -655,9 +659,20 @@ additive `RunEventPersistence` subtype. The live and persisted policies are fixe
 | `resumed` | yes | yes | Same-run lifecycle transition |
 | `agentEvent` | yes, on the SDK manager | no | Verbatim high-frequency ACP stream; host-owned transcript concern |
 
-`journaling: false` disables the snapshot, watermark, and sidecar but leaves the live named events
-unchanged. There is no transcript-persistence opt-in: subscribe to `agentHistory`/`agentEvent` and
-apply a host-owned consent and retention policy when transcript storage is required.
+`journaling: false` disables the snapshot, watermark, sidecar, progress sampler, and transcript
+upserts but leaves the raw `agentEvent` and established lifecycle events unchanged. Journaling runs
+enable progress and transcript persistence by default; there is no observability flag or backend
+allowlist. ACP-capable runners supply real content, while custom runners without a live event bus do
+not receive fabricated activity.
+
+`agentProgress` is emitted immediately on the first projectable assistant/tool activity, at most
+once per 1,000 ms for later activity, and every 15,000 ms as a heartbeat after content has appeared.
+Every record contains real projected content; counts-only heartbeats are forbidden. Final pending
+state is flushed before `agentEnd`. `agentTranscript` uses upserts partitioned by
+`(scope, callIndex, executionStartSeq)`: retain the greatest revision for each `entryIndex`, render
+indexes ascending, and start a fresh partition when same-ID resume opens a new `agentStart` sequence.
+Assistant text is a rolling newest-512-byte Unicode-safe window; tool rows retain projected title
+and normalized tool name. Terminal run-JSON `history` and live-only `agentHistory` are unchanged.
 
 The default layout is one generation-pinned sidecar beside the existing files:
 
@@ -707,6 +722,44 @@ backlog first, then follows appends as a pull-based `RunEventStream`; abort/`clo
 normally. Watchers stay open across lifecycle events because the same run may resume. They fail
 closed on deletion, generation replacement, corruption, or inconsistency instead of following a
 different stream.
+
+#### MCP live events resource
+
+The MCP server exposes the same projected log at `workflow://runs/{runId}/events` with MIME type
+`application/json`. Subscribe to the canonical URI, treat `notifications/resources/updated` as an
+advisory hint, then read cursor pages until `hasMore` is false:
+
+```ts
+const canonical = `workflow://runs/${runId}/events`;
+await client.subscribeResource({ uri: canonical });
+const tail = JSON.parse(resourceText(await client.readResource({ uri: canonical })));
+let cursor = tail.cursor;
+const streamId = tail.streamId;
+
+client.setNotificationHandler(ResourceUpdatedNotificationSchema, async ({ params }) => {
+  if (params.uri !== canonical) return;
+  do {
+    const uri = `${canonical}?after=${cursor}&limit=1000&streamId=${streamId}`;
+    const page = JSON.parse(resourceText(await client.readResource({ uri })));
+    for (const record of page.events) reduceTranscriptOrProgress(record);
+    cursor = page.cursor;
+    if (!page.hasMore) break;
+  } while (true);
+});
+```
+
+The document is `{ schemaVersion:1, runId, streamId, status, finalized, after, cursor,
+endCursor, hasMore, events }`. A canonical read returns the latest 100 records. Query reads require
+the current 32-hex `streamId`; `after` defaults to 0, `limit` defaults to 100 and accepts 1–1000.
+Only the canonical URI is subscribable. At most one notification promise per URI is in flight;
+additional appends collapse into one dirty bit, so a slow or absent client cannot queue events or
+delay execution. Recovery always pages the durable JSONL stream from the client's last cursor.
+
+Malformed/unknown/unavailable/cursor/generation request errors are MCP `-32602`. Corrupt,
+incomplete, unsupported, oversized, projection, sequence, snapshot-ahead, and I/O failures are
+`-32603`; error messages contain only the normalized URI/run ID and stable event-log error code.
+Watcher failure sends one advisory hint and re-arms only after a successful subscribed-resource read
+or duplicate subscribe. Run deletion and connection close remove watchers and scheduler state.
 
 #### Event-log errors and remedies
 
@@ -784,6 +837,13 @@ including its type-only `session_update` branch. The emitted envelope is
   connection-scoped and carries no session/run/call context.
 
 Bridge lifecycle: ref-counted per runner. A constructor-injected runner is bridged for the manager's lifetime; a per-run `ExecOptions.agent` runner is bridged only while its run is active. `manager.dispose()` (alias `close()`) detaches the manager's subscriptions — it does **not** dispose the runner, whose process lifetime stays with the caller. Forwarding is observability-only: a throwing `agentEvent` listener is isolated and never affects the run.
+
+`workflowAgentEventSource(runner)` exposes that process-shared, ref-counted multicast as
+`WorkflowAgentEventSource.attach({ observe })`. It owns one underlying ACP catch-all/cross-cutting
+subscription set per runner, snapshots and isolates sinks, and detaches on the last reference. The
+manager feeds the pure `projectWorkflowAgentActivity(event)` adapter into its durable sampler before
+forwarding the unchanged raw event. This is the supported seam for a later eval/trajectory sink;
+projection and persistence remain manager-owned.
 
 Alternative: subscribe on the runner's bus directly — see [Runner events](#runner-events); same
 underlying stream and optional `runId`/`label`/`callIndex` attribution, no manager involved.

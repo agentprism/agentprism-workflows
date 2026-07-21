@@ -728,6 +728,50 @@ export function projectRunEventForPersistence(
         callIndex: event.callIndex,
       };
       break;
+    case "agentProgress":
+      projected = {
+        type: "agentProgress",
+        ...origin(),
+        label: projectText(event.label, state),
+        ...(event.phase === undefined ? {} : { phase: projectText(event.phase, state) }),
+        callIndex: event.callIndex,
+        executionStartSeq: event.executionStartSeq,
+        turnCount: event.turnCount,
+        observedEvents: event.observedEvents,
+        coalescedEvents: event.coalescedEvents,
+        cause: event.cause,
+        ...(event.latestText === undefined ? {} : { latestText: projectText(event.latestText, state) }),
+        ...(event.lastToolName === undefined ? {} : { lastToolName: projectText(event.lastToolName, state) }),
+        ...(event.tokensObserved === undefined ? {} : { tokensObserved: event.tokensObserved }),
+      };
+      break;
+    case "agentTranscript":
+      projected = {
+        type: "agentTranscript",
+        ...origin(),
+        label: projectText(event.label, state),
+        ...(event.phase === undefined ? {} : { phase: projectText(event.phase, state) }),
+        callIndex: event.callIndex,
+        executionStartSeq: event.executionStartSeq,
+        entryIndex: event.entryIndex,
+        revision: event.revision,
+        operation: "upsert",
+        entry: event.entry.role === "assistant"
+          ? {
+              role: "assistant",
+              kind: "text",
+              text: projectText(event.entry.text, state),
+              timestamp: event.entry.timestamp,
+            }
+          : {
+              role: "tool",
+              kind: "toolCall",
+              text: projectText(event.entry.text, state),
+              toolName: projectText(event.entry.toolName!, state),
+              timestamp: event.entry.timestamp,
+            },
+      };
+      break;
     case "agentEnd": {
       const modelFallbacks = event.modelFallbacks
         ?.slice(0, MAX_OBJECT_KEYS)

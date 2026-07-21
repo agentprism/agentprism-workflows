@@ -14,7 +14,9 @@ import type {
   RunAgentEventEvent,
   RunAgentEventPayload,
   RunAgentHistoryPayload,
+  RunAgentProgressPayload,
   RunAgentStartPayload,
+  RunAgentTranscriptPayload,
   RunCallRecordPayload,
   RunCompletePayload,
   RunErrorPayload,
@@ -44,6 +46,8 @@ type ExpectedEngineEventName =
   | "agentStart"
   | "agentEnd"
   | "agentHistory"
+  | "agentProgress"
+  | "agentTranscript"
   | "tokenUsage"
   | "complete"
   | "journal"
@@ -61,6 +65,8 @@ type ExpectedPayloadMap = {
   agentStart: RunAgentStartPayload;
   agentEnd: RunAgentEndPayload;
   agentHistory: RunAgentHistoryPayload;
+  agentProgress: RunAgentProgressPayload;
+  agentTranscript: RunAgentTranscriptPayload;
   tokenUsage: RunTokenUsagePayload;
   complete: RunCompletePayload;
   journal: RunJournalPayload;
@@ -90,6 +96,8 @@ function exhaustiveEngineName(event: EngineRunEvent): EngineRunEventName {
     case "agentStart":
     case "agentEnd":
     case "agentHistory":
+    case "agentProgress":
+    case "agentTranscript":
     case "tokenUsage":
     case "complete":
     case "journal":
@@ -111,6 +119,8 @@ function exhaustiveRunEventName(event: RunEvent): RunEventName {
     case "agentStart":
     case "agentEnd":
     case "agentHistory":
+    case "agentProgress":
+    case "agentTranscript":
     case "tokenUsage":
     case "complete":
     case "journal":

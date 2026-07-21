@@ -8,6 +8,7 @@ import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sd
 import { redactText, truncateUtf8 } from "@automatalabs/workflows";
 import type { PersistedRunState } from "@automatalabs/workflows";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
+import type { RunAgentProgressPayload } from "@automatalabs/shared-types";
 
 const EVENT_TEXT_LIMIT_BYTES = 512;
 
@@ -24,6 +25,12 @@ export type WorkflowToolExtra = RequestHandlerExtra<ServerRequest, ServerNotific
 export interface AwaitProgressReporter {
   seed(snapshot: PersistedRunState): void;
   record(record: RunEventLogRecord): void;
+}
+
+export function formatAgentProgressMessage(progress: RunAgentProgressPayload): string {
+  return progress.lastToolName !== undefined
+    ? `${progress.label}: tool ${progress.lastToolName}`
+    : `${progress.label}: ${progress.latestText ?? ""}`;
 }
 
 /**
@@ -82,6 +89,11 @@ export function createAwaitProgressReporter(extra: WorkflowToolExtra): AwaitProg
     },
     record(record) {
       const event = record.event;
+      if (event.type === "agentTranscript") return;
+      if (event.type === "agentProgress") {
+        report(ended.size, started.size || undefined, formatAgentProgressMessage(event));
+        return;
+      }
       if (event.type === "phase") {
         latestTitle = event.title;
         emit();

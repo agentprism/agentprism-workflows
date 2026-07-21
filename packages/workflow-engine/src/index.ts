@@ -199,6 +199,12 @@ export {
   truncateUtf8,
   type RunObservabilitySource,
 } from "./run-observability.js";
+export {
+  AGENT_PROGRESS_HEARTBEAT_MS,
+  AGENT_PROGRESS_MIN_INTERVAL_MS,
+  type WorkflowAgentActivity,
+  type WorkflowAgentActivityBase,
+} from "./agent-live-observability.js";
 
 // ── Structured run-event contract ──
 export {
@@ -226,8 +232,12 @@ export {
   type RunAgentEventPayload,
   type RunAgentHistoryEvent,
   type RunAgentHistoryPayload,
+  type RunAgentProgressEvent,
+  type RunAgentProgressPayload,
   type RunAgentStartEvent,
   type RunAgentStartPayload,
+  type RunAgentTranscriptEvent,
+  type RunAgentTranscriptPayload,
   type RunAuthPausedPayload,
   type RunCallRecordEvent,
   type RunCallRecordPayload,
