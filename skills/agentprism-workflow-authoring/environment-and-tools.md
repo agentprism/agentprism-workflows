@@ -6,6 +6,15 @@
 - `mode` requests an agent-advertised ACP session mode and is **strict** — an unsupported mode fails the call rather than running unconfined. Mode ids are backend-specific (Claude-family: `plan`, `acceptEdits`, `bypassPermissions`; Codex-family: `read-only`, `agent`, `agent-full-access`; OpenCode via its mode option; Pi advertises thinking-level config rather than modes), so only set `mode` on calls whose `model` you also pin. Use read-only/plan modes for reviewers and auditors that must not write.
 - `agentType: "<name>"` binds a reusable subagent definition — a Markdown file at `<cwd>/.agentprism/agents/<name>.md` (project) or `~/.agentprism/agents/<name>.md` (user; project wins) whose frontmatter sets tool allow/deny lists, a model, and isolation, and whose body is the role prompt. An unknown name logs a warning and degrades to defaults.
 
+## Where a mutating workflow runs
+
+The run's base `cwd` is the USER'S checkout — the working copy they launched the host from. Treat it as borrowed, never disposable: committing onto whatever branch happens to be checked out, switching its branches, or resetting it are defects unless the user explicitly asked for exactly that. The most expensive environment failures are silent assumptions ("cwd will be a prepared worktree", "the current branch is mine to commit on") that hold only in the author's head; scripts that commit must make their environment contract explicit, one of two ways:
+
+1. **Require a prepared workroot via `args` and verify it before any edit.** A preflight step confirms the expected branch, the recorded base, and a clean tree — and refuses (STOP-and-report) on any mismatch instead of adapting to it.
+2. **Create a persistent workspace in a setup call.** E.g. `git worktree add <sibling-path> -b <branch> origin/<default>`, idempotently: reuse the workspace when it already matches, refuse when the path or branch exists in any other state. Never force-delete or overwrite anything the workflow did not create.
+
+`isolation: "worktree"` is NOT this workspace: it is per-call and throwaway — the checkout and its branch are deleted when the call ends. Use it for experiments, builds, and verification; use a setup-created persistent worktree (or a verified args-supplied one) as the train's home. Note also that the throwaway worktree branches from the run cwd's repository: an isolated reviewer sees a producer's commits only when they are reachable there — in a shared object store (the workroot is a worktree of the same repo) it can `git checkout --detach <reported SHA>` to inspect them; when the commits live in an unrelated clone, isolation reviews the wrong tree.
+
 ## Wiring tools and inputs into a call
 
 - `mcpServers: [{ name, command, args: [], env: [] }]` attaches MCP servers to that agent's session — the portable way to hand any backend a capability (image generation, a browser, a ticket system). The agent sees the server's tools natively. Note `env` is a list of `{ name, value }` pairs (ACP shape), not an object map; HTTP/SSE servers use `{ type: "http", name, url, headers: [] }`.

@@ -20,7 +20,7 @@ npx @automatalabs/workflows config                # every routable harness (clau
 npx @automatalabs/workflows config codex --json   # one harness, machine-readable
 ```
 
-One no-prompt session per harness, zero tokens: the table lists every negotiable session option — model ids (including bracket variants like `opus[1m]`), effort levels, modes — exactly as the installed harness advertises them. This is the same probe the validator runs, available before a script exists; do NOT write a throwaway probe workflow (or read package internals) to discover options.
+One no-prompt session per harness, zero tokens: the table lists every negotiable session option — model ids (including bracket variants like `opus[1m]`), effort levels, modes — exactly as the installed harness advertises them. But the bare `config` probe reads each harness with its **default model** selected, and option domains are **model-specific**: an option can appear only once a particular model is selected (an `effort` select surfacing for one model and not another), ceilings differ per model, and provider-served variants of the *same* model can advertise different domains (one provider's build may expose a level another lacks). The authoritative per-model probe is the validator run on your real script — it selects each authored `{ backend, model }` pair first and echoes that pair's advertised table. Authoring-then-validating IS the per-model probe; confirm every pinned model against its own echoed table, and do not read package internals to discover options.
 
 ```js
 const plan   = await agent(PLAN_PROMPT,          { label: "plan",      model: "opencode/zai/glm-5.2", schema: PLAN });
@@ -37,14 +37,16 @@ harness version, login, and machine.
 const impl = await agent(implPrompt(plan), {
   label: "implement",
   model: "codex",
-  configOptions: { fast_mode: true, reasoning_effort: "high" },
+  configOptions: { "fast-mode": true, reasoning_effort: "high" },
 });
 ```
 
 Ids and string/boolean values pass through verbatim in ascending id order, after model selection
 and before the prompt. There are no aliases, coercion, client-side vocabulary, defaults, or cached
-catalogs. Never put `"model"` in `configOptions`; use the dedicated `model` field. A harness
-rejection follows the ordinary agent-error path.
+catalogs. Copy option ids character-for-character from the catalog, punctuation included —
+`"fast-mode"`, not `fast_mode` — and quote ids that are not valid identifiers. Never put `"model"`
+in `configOptions`; use the dedicated `model` field. A harness rejection follows the ordinary
+agent-error path.
 
 Pi's thought-level option is named `thinkingLevel`, and its choices depend on the exact model in
 the same call:
