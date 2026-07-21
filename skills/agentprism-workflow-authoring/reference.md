@@ -163,7 +163,7 @@ reach the host; keep evidence concise and never put credentials or other secrets
 | `headless` | `"default" \| "abort" \| "pause"` | No live channel: `"default"` takes `default ?? true`, `"abort"` aborts, and `"pause"` creates a persisted `checkpoint_required` pause. Default `"default"`. |
 | `timeoutMs` | `number` | Deadline for the interactive prompt. |
 
-The host supplies the live human channel (`ExecOptions.confirm` in the SDK; elicitation in the MCP server), and that channel wins even when `headless: "pause"` is declared. A durable pause carries non-secret `checkpointContext`; resume with `ExecOptions.checkpointReplies: { [context.callIndex]: decision }` or attach a live channel. On a new `resumeFromRunId` execution, reply keys always name indexes in the **source** recording; identity matching may inject that decision at a shifted current index. Identity replay is restricted to host decisions and requires equality of the checkpoint-options fingerprint over `default`, `headless`, and `timeoutMs`; a changed option, ambiguous match, or source headless decision runs fresh. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
+The host supplies the live human channel (elicitation in the MCP server; `ExecOptions.confirm` in the SDK), and that channel wins even when `headless: "pause"` is declared. A durable pause carries non-secret `checkpointContext`; resume with `ExecOptions.checkpointReplies: { [context.callIndex]: decision }` or attach a live channel. On a new `resumeFromRunId` execution, reply keys always name indexes in the **source** recording; identity matching may inject that decision at a shifted current index. Identity replay is restricted to host decisions and requires equality of the checkpoint-options fingerprint over `default`, `headless`, and `timeoutMs`; a changed option, ambiguous match, or source headless decision runs fresh. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
 
 ## Error codes (`WorkflowError.code`)
 
@@ -265,7 +265,7 @@ export const meta = {
 };
 ```
 
-Script-declared backends are **trust-gated**: they spawn commands on the host machine, so they stay inert until the composition root approves them — `allowScriptBackends: true` (or a per-backend callback) on `runDynamicWorkflow`, `ExecOptions.scriptBackends` on a manager, elicitation approval in the MCP server, or `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`. A *declined* backend aborts the run rather than silently rerouting its calls to the default backend. Host-registered names always win over script declarations. Prefer host registration (`createAcpRunner({ backends })` / `AGENTPRISM_BACKENDS` env JSON) when you control the host.
+Script-declared backends are **trust-gated**: they spawn commands on the host machine, so they stay inert until the composition root approves them — elicitation approval in the MCP server, `allowScriptBackends: true` (or a per-backend callback) on `runDynamicWorkflow`, `ExecOptions.scriptBackends` on a manager, or `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`. A *declined* backend aborts the run rather than silently rerouting its calls to the default backend. Host-registered names always win over script declarations. Prefer host registration (`createAcpRunner({ backends })` / `AGENTPRISM_BACKENDS` env JSON) when you control the host.
 
 ## <a name="agenttype-definitions"></a>`agentType` definitions
 
@@ -285,6 +285,30 @@ You are a security auditor. Report findings; never modify files.
 The body is prepended to the agent's task as role guidance. An unknown `agentType` logs a warning and runs with default tools/model (the name degrades to a prose hint).
 
 ## How hosts run scripts (what authors can assume)
+
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) — the canonical way an agent
+runs an authored script — accepts exactly one of raw
+`script` source or an absolute server-filesystem `scriptPath`, plus `args`. A path is read once and
+snapshotted at admission. Foreground is the default and streams progress/resolves checkpoints live;
+long work uses `background:true` plus bounded `action:"await"`. It supports explicit
+`resumeFromRunId` with content supplied again by either mechanism; non-elicitation clients resume
+`headless: "pause"` checkpoints with `checkpointReplies` from terminal
+`outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a
+saved workflow name. The `workflow` tool is the server's whole tool surface —
+run/resume/inspect/await/stop are action branches, not separate tools. Stop without `callIndex`
+aborts the whole run; stop with `callIndex` cancels only that in-flight agent and returns a live
+inspection snapshot. `labelGlob` filters that snapshot and never selects cancellation. A run that pauses with
+`reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band
+(see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also
+get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional
+`task` argument. Environment knobs shared by both routes (MCP server and the SDK below): `AGENTPRISM_DEFAULT_BACKEND`,
+`AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool,
+one injected-tool registry per process), `AGENTPRISM_BACKENDS`,
+`AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend spawn
+overrides. Pi uses `AGENTPRISM_PI_ACP_CMD` with optional `AGENTPRISM_PI_ACP_ARGS`; otherwise the
+installed exact-pinned package bin is used before the `npx -y @automatalabs/pi-acp` fallback.
+
+Embedding hosts can instead drive the same contract directly through the SDK:
 
 ```ts
 import { runDynamicWorkflow } from "@automatalabs/workflows";
@@ -311,27 +335,6 @@ const run = await runDynamicWorkflow(script, {
 For edited-script/current-args resume, call the same entry point with
 `exec: { resumeFromRunId: previous.runId, resumePolicy: "auto", checkpointReplies }`. Reply keys
 name source indexes. The manager prepares and durably persists correspondence before execution.
-
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) accepts exactly one of raw
-`script` source or an absolute server-filesystem `scriptPath`, plus `args`. A path is read once and
-snapshotted at admission. Foreground is the default and streams progress/resolves checkpoints live;
-long work uses `background:true` plus bounded `action:"await"`. It supports explicit
-`resumeFromRunId` with content supplied again by either mechanism; non-elicitation clients resume
-`headless: "pause"` checkpoints with `checkpointReplies` from terminal
-`outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a
-saved workflow name. The `workflow` tool is the server's whole tool surface —
-run/resume/inspect/await/stop are action branches, not separate tools. Stop without `callIndex`
-aborts the whole run; stop with `callIndex` cancels only that in-flight agent and returns a live
-inspection snapshot. `labelGlob` filters that snapshot and never selects cancellation. A run that pauses with
-`reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band
-(see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also
-get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional
-`task` argument. Environment knobs shared by both: `AGENTPRISM_DEFAULT_BACKEND`,
-`AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool,
-one injected-tool registry per process), `AGENTPRISM_BACKENDS`,
-`AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend spawn
-overrides. Pi uses `AGENTPRISM_PI_ACP_CMD` with optional `AGENTPRISM_PI_ACP_ARGS`; otherwise the
-installed exact-pinned package bin is used before the `npx -y @automatalabs/pi-acp` fallback.
 
 Exact detached host types:
 
