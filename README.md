@@ -6,22 +6,11 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@automatalabs/workflows"><img src="https://img.shields.io/npm/v/@automatalabs/workflows?logo=npm&color=cb3837" alt="npm version" /></a>
-  <a href="https://www.npmjs.com/package/@automatalabs/workflows"><img src="https://img.shields.io/npm/dm/@automatalabs/workflows?color=cb3837" alt="npm downloads" /></a>
+  <a href="https://vikashloomba.github.io/agentprism-workflows/npm-downloads-details.json"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fvikashloomba.github.io%2Fagentprism-workflows%2Fnpm-downloads.json&amp;cacheSeconds=3600" alt="npm downloads across AgentPrism packages" /></a>
   <a href="https://deepwiki.com/VikashLoomba/agentprism-workflows"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
 </p>
 
 Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, OpenCode, and pi), with deterministic journaling, resume, token budgets, and git-worktree isolation.
-
-Long-running journaling runs are observable while agents are still working: subscribe to
-`workflow://runs/{runId}/events` for redacted content-bearing progress and incrementally reducible
-assistant/tool transcript upserts, then catch up exactly with the durable stream cursor.
-
-```ts
-const uri = `workflow://runs/${runId}/events`;
-await client.subscribeResource({ uri });
-const first = JSON.parse(resourceText(await client.readResource({ uri })));
-const next = `${uri}?after=${first.cursor}&limit=1000&streamId=${first.streamId}`;
-```
 
 **Your agent authors** a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
 
@@ -320,6 +309,39 @@ not from the stdio server process: process exit can stop in-flight work, while t
 prefix remains resumable. Background runs send no request progress and use authored headless
 checkpoint behavior. Resume after a pause/crash by starting a new run with `resumeFromRunId`; each
 new background run durably inherits the replay prefix under its new run ID before acknowledgement.
+
+#### Follow a background run live
+
+`await` returns bounded status snapshots. To consume redacted progress and assistant/tool transcript
+upserts while agents are still working, subscribe to the run's durable MCP events resource. Subscribe
+before the first read so an append cannot race the handoff, then page from the last reduced cursor:
+
+```ts
+const canonical = `workflow://runs/${runId}/events`;
+await client.subscribeResource({ uri: canonical });
+
+const initial = JSON.parse(resourceText(await client.readResource({ uri: canonical })));
+const streamId = initial.streamId;
+let cursor = 0;
+
+async function catchUp() {
+  let page;
+  do {
+    const uri = `${canonical}?after=${cursor}&limit=1000&streamId=${streamId}`;
+    page = JSON.parse(resourceText(await client.readResource({ uri })));
+    for (const event of page.events) reduceRunEvent(event);
+    cursor = page.cursor;
+  } while (page.hasMore);
+}
+
+await catchUp();
+// Call catchUp() after each notifications/resources/updated hint.
+```
+
+Update notifications are coalesced wake-up hints, not the event queue; replaying from `cursor` is
+what makes reconnects gap-free. See the
+[`@automatalabs/mcp-server` run-resource contract](packages/mcp-server/README.md#run-resources) for
+event shapes, redaction limits, and stream-replacement errors.
 
 #### Raise a loop cap without paying for completed rounds twice
 
