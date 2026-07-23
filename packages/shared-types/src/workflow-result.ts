@@ -547,6 +547,8 @@ export interface WorkflowRunCallStatus {
   timeoutMs?: number | null;
   /** Terminal agent error, including recoverable failures that settled the call to null. */
   errorCode?: WorkflowErrorCode;
+  /** Present only while the call is in flight on a live run; settled calls omit it. */
+  status?: "queued" | "running";
   /** Compact JSON text after structural compaction and redaction; never the raw result. */
   resultPreview: string;
   resultRedacted: boolean;

@@ -272,7 +272,15 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
     assert.equal(structured(cancelled)?.stopped, undefined);
     assert.equal(structured(cancelled)?.alreadyTerminal, undefined);
     assert.equal((structured(cancelled)?.filter as Record<string, unknown>).labelGlob, "peer");
-    assert.deepEqual(structured(cancelled)?.calls, [], "the output glob filters, but does not select, cancellation");
+    assert.deepEqual(
+      (structured(cancelled)?.calls as Array<Record<string, unknown>>).map((call) => ({
+        index: call.index,
+        label: call.label,
+        status: call.status,
+      })),
+      [{ index: 0, label: "peer", status: "running" }],
+      "the output glob filters, but does not select, cancellation: the matching peer is live and visible, the cancelled call is filtered out",
+    );
     assert.match(textOf(cancelled), /Agent call 1 \("cancel"\) settled with AGENT_CANCELLED/i);
     assert.match(textOf(cancelled), /run remains live/i);
     assert.equal(controlled.calls[0].options.signal?.aborted, false, "the peer remains untouched");
