@@ -1,5 +1,24 @@
 # @automatalabs/workflows
 
+## 0.44.0
+
+### Minor Changes
+
+- 3d80c62: Persist per-tool results in agent transcripts. Terminal ACP `tool_call_update` notifications
+  carrying displayable content now map to a new `tool-result` observability activity
+  (`@automatalabs/workflows` adapter) and are published as durable `toolResult` transcript
+  entries — redacted and byte-capped like every other transcript record — instead of being
+  collapsed into a bare content boundary. Non-terminal and content-less updates keep the
+  previous boundary behavior. The run event persistence schema accepts the new entry shape
+  (`kind: "toolResult"`, optional `toolName`, optional `isError: true`).
+
+### Patch Changes
+
+- Updated dependencies [3d80c62]
+- Updated dependencies [3d80c62]
+  - @automatalabs/acp-agents@0.34.9
+  - @automatalabs/workflow-engine@0.32.0
+
 ## 0.43.0
 
 ### Minor Changes
