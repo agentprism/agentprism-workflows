@@ -474,6 +474,24 @@ export const workflowToolOutputShape = z
     ],
   });
 
+/**
+ * Output shape for the app-only `workflow-events` tool: the same document served by the
+ * `workflow://runs/{runId}/events` resource (cursor-paged, redacted, append-only records).
+ */
+export const workflowEventsOutputShape = {
+  schemaVersion: z.literal(1),
+  runId: z.string(),
+  streamId: z.string(),
+  workflowName: z.string(),
+  status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
+  finalized: z.boolean(),
+  after: z.number().int().nonnegative(),
+  cursor: z.number().int().nonnegative(),
+  endCursor: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  events: z.array(z.unknown()),
+} as const;
+
 export type WorkflowScriptSource = z.infer<typeof scriptSourceSchema>;
 
 export interface WorkflowScriptLineageEntry {

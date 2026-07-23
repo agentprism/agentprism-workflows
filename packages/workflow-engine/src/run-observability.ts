@@ -763,13 +763,24 @@ export function projectRunEventForPersistence(
               text: projectText(event.entry.text, state),
               timestamp: event.entry.timestamp,
             }
-          : {
-              role: "tool",
-              kind: "toolCall",
-              text: projectText(event.entry.text, state),
-              toolName: projectText(event.entry.toolName!, state),
-              timestamp: event.entry.timestamp,
-            },
+          : event.entry.kind === "toolResult"
+            ? {
+                role: "tool",
+                kind: "toolResult",
+                text: projectText(event.entry.text, state),
+                ...(event.entry.toolName === undefined
+                  ? {}
+                  : { toolName: projectText(event.entry.toolName, state) }),
+                ...(event.entry.isError === true ? { isError: true } : {}),
+                timestamp: event.entry.timestamp,
+              }
+            : {
+                role: "tool",
+                kind: "toolCall",
+                text: projectText(event.entry.text, state),
+                toolName: projectText(event.entry.toolName!, state),
+                timestamp: event.entry.timestamp,
+              },
       };
       break;
     case "agentEnd": {

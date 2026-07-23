@@ -43,14 +43,25 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc --noEmit",
+    "build:ui": "vite build ui && node ../../scripts/generate-run-monitor-html.mjs",
+    "typecheck": "tsc --noEmit && tsc -p ui --noEmit",
     "test": "tsc -p tsconfig.type-tests.json && tsx --test \"test/**/*.test.ts\"",
     "prepublishOnly": "tsc -b"
   },
   "dependencies": {
-    "@automatalabs/workflows": "workspace:*",
     "@automatalabs/shared-types": "workspace:*",
+    "@automatalabs/workflows": "workspace:*",
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
     "@modelcontextprotocol/sdk": "^1.29",
     "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "vite": "^8.1.5",
+    "vite-plugin-singlefile": "^2.3.3"
   }
 }

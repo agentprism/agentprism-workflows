@@ -336,7 +336,11 @@ test("persistent foreground admission failure never starts the runner and leaves
     const uri = `workflow://runs/${runId}/script`;
     assert.equal(manager.getRun(runId), undefined);
     assert.equal(fault.durable.load(runId), null);
-    assert.deepEqual((await client.listResources()).resources, []);
+    assert.deepEqual(
+      (await client.listResources()).resources.filter((resource) => resource.uri.startsWith("workflow://")),
+      [],
+      "no run resources are listed (the static ui:// panel resource is always present)",
+    );
     await assert.rejects(client.readResource({ uri }), /resource not found/i);
 
     const lease = fault.durable.acquireRunLease(runId);
@@ -382,7 +386,11 @@ test("persistent admission save failure returns no URI and cleans the run, resou
     const uri = `workflow://runs/${runId}/script`;
     assert.equal(manager.getRun(runId), undefined);
     assert.equal(fault.durable.load(runId), null);
-    assert.deepEqual((await client.listResources()).resources, []);
+    assert.deepEqual(
+      (await client.listResources()).resources.filter((resource) => resource.uri.startsWith("workflow://")),
+      [],
+      "no run resources are listed (the static ui:// panel resource is always present)",
+    );
     await assert.rejects(client.readResource({ uri }), /resource not found/i);
     assert.equal(listChanged, 0);
 

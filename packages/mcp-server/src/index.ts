@@ -50,6 +50,12 @@ export type {
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
+export {
+  RUN_MONITOR_RESOURCE_URI,
+  WORKFLOW_EVENTS_TOOL_NAME,
+  registerWorkflowAppUi,
+} from "./app-ui.js";
+export type { WorkflowAppUiDeps } from "./app-ui.js";
 export { installMcpServerLifecycle, SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 export type { McpServerLifecycle, McpServerLifecycleOptions, McpServerShutdownReason, WorkflowServerControl } from "./lifecycle.js";
 export {

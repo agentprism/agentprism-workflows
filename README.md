@@ -268,6 +268,24 @@ From a source checkout, point at the built entry instead:
 }
 ```
 
+**MCP Apps run monitor.** The `workflow` tool declares a UI resource
+(`_meta.ui.resourceUri`) per the [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview),
+and the server advertises `io.modelcontextprotocol/ui` in its capabilities. Hosts that render
+MCP Apps (Claude, Claude Desktop, VS Code Copilot, Goose, …) show a live run-monitor panel
+for `workflow` calls: a phase/agent graph with per-node log drill-in, live token/cost totals,
+and a Stop control. The panel derives the runId from the call's arguments (inspect/await/stop)
+or from the execute result (immediately for `background: true` admissions), then keeps itself
+current by polling the app-only `workflow-events` tool (`visibility: ["app"]`, outside the
+model's tool loop) — no model tokens are spent while it is visible. Hosts without MCP Apps
+support ignore the UI metadata and get the same text/structured output as before. To try it
+locally against the ext-apps reference host, run
+`node packages/mcp-server/scripts/dev-app-host.mjs`.
+
+<p align="center">
+  <img src="docs/assets/run-monitor-graph.png" alt="Run monitor: live phase/agent graph of a workflow run" />
+  <img src="docs/assets/run-monitor-log.png" alt="Run monitor: per-agent log drill-in with an expanded tool result" />
+</p>
+
 **Tool: `workflow`** — input parameters:
 
 | Param | Type | Notes |
