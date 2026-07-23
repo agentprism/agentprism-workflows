@@ -360,6 +360,61 @@ test("run and inspect both validate after listTools caching; inspect is read-onl
   }
 });
 
+test("inspecting a live run surfaces its in-flight agent calls", async () => {
+  let release!: (value: string) => void;
+  const gate = new Promise<string>((resolve) => {
+    release = resolve;
+  });
+  const runner = makeRunner((prompt) => (prompt === "hold" ? gate : `done:${prompt}`));
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const script = [
+      'export const meta = { name: "live-inspect", description: "live inspect", phases: [{ title: "Work" }] };',
+      'phase("Work");',
+      'await agent("first", { label: "settled-agent" });',
+      'await agent("hold", { label: "held-agent" });',
+      'return true;',
+    ].join("\n");
+    const accepted = await client.callTool({ name: "workflow", arguments: { script, background: true } });
+    const runId = String(structured(accepted)?.runId);
+
+    // Wait until the held agent is actually in flight (its start is durable in the event log).
+    let liveStatus: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const inspected = await client.callTool({ name: "workflow", arguments: { action: "inspect", runId } });
+      assert.equal(inspected.isError, false);
+      liveStatus = structured(inspected);
+      const calls = (liveStatus?.calls as Array<Record<string, unknown>>) ?? [];
+      if (calls.some((call) => call.label === "held-agent")) {
+        assert.equal(liveStatus?.status, "running");
+        const held = calls.find((call) => call.label === "held-agent");
+        assert.equal(held?.status, "running");
+        assert.equal(textOf(inspected).includes('[1] agent "held-agent" in Work: (running)'), true);
+        break;
+      }
+      liveStatus = undefined;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(liveStatus, "a live inspection surfaced the in-flight agent call");
+
+    release("held-done");
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 10_000 },
+    });
+    assert.equal(structured(awaited)?.status, "completed");
+    const settled = await client.callTool({ name: "workflow", arguments: { action: "inspect", runId } });
+    const settledCalls = (structured(settled)?.calls as Array<Record<string, unknown>>) ?? [];
+    assert.equal(settledCalls.length, 2);
+    assert.ok(
+      settledCalls.every((call) => call.status === undefined),
+      "settled calls carry no in-flight status",
+    );
+  } finally {
+    await dispose();
+  }
+});
+
 test("unknown inspection is an exact tool error; inspecting a failed run is a successful read", async () => {
   const runner = throwingRunner(
     () => new WorkflowError("FAIL-CLOSED", WorkflowErrorCode.SCRIPT_ERROR, { recoverable: false }),

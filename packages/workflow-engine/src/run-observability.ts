@@ -327,6 +327,7 @@ function agentCallStatus(agent: RunObservabilityAgent): WorkflowRunCallStatus {
     ...(agent.model === undefined ? {} : { model: scalar(agent.model) }),
     ...(agent.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
     ...(agent.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
+    ...(agent.status === "queued" || agent.status === "running" ? { status: agent.status } : {}),
     ...resultPreview(null),
   };
 }
@@ -379,10 +380,16 @@ export function projectWorkflowRunStatus(
       agentsByCall.get(scopedCallKey(entry.scope ?? source.runId, entry.index)),
     ),
   }));
+  // In-flight rows are only projected while the run itself is live: a persisted "running"
+  // agent row on a dead/failed/paused run is stale, not an active call.
+  const runIsLive = source.status === "pending" || source.status === "running";
   for (const [key, agent] of agentsByCall) {
     // Successful calls already have journal rows. Failed calls intentionally do not, so project
     // their terminal agent row to keep recoverable failures such as AGENT_TIMEOUT inspectable.
-    if (!journalCalls.has(key) && agent.status === "error") {
+    // Queued/running calls have no journal row yet either — project them on live runs so
+    // inspection reflects the agents actually in flight instead of reporting zero calls.
+    if (journalCalls.has(key)) continue;
+    if (agent.status === "error" || (runIsLive && (agent.status === "queued" || agent.status === "running"))) {
       callRows.push({ label: agent.label, status: agentCallStatus(agent) });
     }
   }

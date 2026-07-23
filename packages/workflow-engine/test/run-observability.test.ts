@@ -130,6 +130,11 @@ test("inspection is live-first, cold-readable, ordered, missing-safe, and read-o
   assert.equal(live?.calls[0]?.label, "plan-agent");
   assert.equal(live?.calls[0]?.model, "resolved/model");
   assert.equal(live?.calls[0]?.backendId, "actual-backend");
+  assert.equal(live?.calls[0]?.status, undefined, "settled calls carry no in-flight status");
+  // The held agent has no journal row yet — it must still be visible as an in-flight call.
+  assert.equal(live?.calls.length, 2);
+  assert.equal(live?.calls[1]?.label, "review-agent");
+  assert.equal(live?.calls[1]?.status, "running");
   assert.equal(store.saves.length, beforeSaves, "inspection does not save");
   assert.equal(store.acquired.length, beforeAcquires, "inspection does not acquire a lease");
   assert.equal(manager.inspectRun("missing-run"), undefined);
@@ -137,6 +142,9 @@ test("inspection is live-first, cold-readable, ordered, missing-safe, and read-o
   held.resolve({ answer: "done" });
   const completed = await started.promise;
   assert.equal(completed.status, "completed");
+  const settled = manager.inspectRun(started.runId);
+  assert.equal(settled?.calls.length, 2);
+  assert.ok(settled?.calls.every((call) => call.status === undefined), "no in-flight rows after completion");
   assert.equal(completed.logTail, undefined);
   assert.equal("logTail" in completed, false);
   const cold = new WorkflowManager({ persistence: store.persistence, agent: runner }).inspectRun(started.runId);
@@ -153,6 +161,35 @@ test("inspection is live-first, cold-readable, ordered, missing-safe, and read-o
   assert.equal(fresh.inspectRun("cold-completed")?.status, "completed");
   assert.equal(fresh.inspectRun("cold-paused")?.reason, "paused reason");
   assert.equal(fresh.inspectRun("cold-failed")?.errorCode, WorkflowErrorCode.SCRIPT_ERROR);
+});
+
+test("in-flight agent calls are projected only while the run is live", () => {
+  const base = {
+    runId: "run-inflight",
+    workflowName: "wf",
+    phases: ["Plan"],
+    logs: [],
+    journal: [],
+  };
+  const agents = [
+    { label: "active", phase: "Plan", status: "running" as const, callIndex: 0 },
+    { label: "waiting", status: "queued" as const, callIndex: 1 },
+  ];
+  const live = projectWorkflowRunStatus({ ...base, status: "running", agents });
+  assert.deepEqual(
+    live.calls.map((call) => ({ index: call.index, label: call.label, status: call.status })),
+    [
+      { index: 0, label: "active", status: "running" },
+      { index: 1, label: "waiting", status: "queued" },
+    ],
+  );
+  assert.equal(live.truncation.calls.total, 2);
+
+  // A dead run's persisted agent rows can still say "running"; those are stale, not in flight.
+  for (const status of ["paused", "completed", "failed", "aborted"] as const) {
+    const stale = projectWorkflowRunStatus({ ...base, status, agents });
+    assert.deepEqual(stale.calls, [], `${status} run projects no phantom in-flight calls`);
+  }
 });
 
 test("journal attribution covers agents, checkpoints, synthetic replies, and replay without changing identity", async () => {

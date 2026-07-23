@@ -484,6 +484,11 @@ points, `?` one, and backslash escapes the next character; a trailing backslash 
 Checkpoints and unknown legacy entries do not match a label glob. Filtering precedes latest-N
 selection and selected calls return in ascending deterministic index order.
 
+While a run is pending/running, agents currently in flight are projected as calls with
+`status: "queued" | "running"` and a `null` result preview; once a call settles its row comes from
+the journal and omits `status`. Terminal and paused runs never project in-flight rows — persisted
+agent rows that still read "running" on a dead run are stale, not active calls.
+
 ```ts
 interface WorkflowLogTail {
   lines: string[];
@@ -502,6 +507,8 @@ interface WorkflowRunCallStatus {
   backendId?: string;
   timeoutMs?: number | null;
   errorCode?: WorkflowErrorCode;
+  /** Present only while the call is in flight on a live run; settled calls omit it. */
+  status?: "queued" | "running";
   resultPreview: string;
   resultRedacted: boolean;
   resultTruncated: boolean;

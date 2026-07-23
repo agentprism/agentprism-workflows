@@ -267,6 +267,7 @@ const runStatusShape = {
       backendId: z.string().optional(),
       timeoutMs: z.number().nonnegative().nullable().optional(),
       errorCode: z.string().optional(),
+      status: z.enum(["queued", "running"]).optional(),
       resultPreview: z.string(),
       resultRedacted: z.boolean(),
       resultTruncated: z.boolean(),

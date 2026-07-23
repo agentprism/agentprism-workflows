@@ -618,7 +618,9 @@ function inspectionSummaryLines(
   for (const call of status.calls) {
     const attribution = call.label ? `${call.kind} "${call.label}"` : call.kind;
     const phase = call.phase ? ` in ${call.phase}` : "";
-    lines.push(`  [${call.index}] ${attribution}${phase}: ${call.resultPreview}`);
+    // In-flight calls have no result yet; show their live state instead of the null preview.
+    const outcome = call.status !== undefined ? `(${call.status})` : call.resultPreview;
+    lines.push(`  [${call.index}] ${attribution}${phase}: ${outcome}`);
   }
   return lines;
 }
