@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-A **stdio [MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Its whole tool surface is the single **`workflow`** tool, with run/resume/inspect/await/stop branches. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+A **stdio [MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Its model-facing tool surface is the single **`workflow`** tool, with run/resume/inspect/await/stop branches (plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop). Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. All of the real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool, and serves it over stdin/stdout.
 
@@ -31,6 +31,28 @@ This package is a **thin MCP adapter**. All of the real work — parsing the wor
 Foreground is the default; `background:true` durably admits work and returns its run ID without
 awaiting agent completion. `action:"await"` collects it in bounded calls (see [Run model](#run-model)).
 `stdout` is reserved for JSON-RPC framing — every diagnostic the server emits goes to `stderr`.
+
+---
+
+## Run monitor (MCP Apps)
+
+The `workflow` tool declares a UI resource per the
+[MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview), and the server
+advertises `io.modelcontextprotocol/ui` in its capabilities. Hosts that render MCP Apps show a
+live run-monitor panel for `workflow` calls — a phase/agent graph with per-node log drill-in
+(including expandable per-tool results), live token/cost totals, and a Stop control. The panel
+keeps itself current by polling the app-only `workflow-events` tool, so no model tokens are
+spent while it is visible; hosts without MCP Apps support ignore the UI metadata and get the
+same text/structured output as always.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/VikashLoomba/agentprism-workflows/main/docs/assets/run-monitor-graph.png" alt="Run monitor: live phase/agent graph of a workflow run" />
+  <img src="https://raw.githubusercontent.com/VikashLoomba/agentprism-workflows/main/docs/assets/run-monitor-log.png" alt="Run monitor: per-agent log drill-in with an expanded tool result" />
+</p>
+
+To try it locally against the [ext-apps](https://github.com/modelcontextprotocol/ext-apps)
+reference host, run `node scripts/dev-app-host.mjs` from this package (see the script header
+for the basic-host setup; `AGENTPRISM_DEV_CWD=<project dir>` serves an existing run store).
 
 ---
 

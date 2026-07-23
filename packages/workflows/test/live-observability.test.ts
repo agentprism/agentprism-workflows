@@ -56,6 +56,14 @@ class ControlledEventRunner {
       _meta: { adapter: { toolName: "read_file" } },
     } as AcpRunnerEventMap["session_update"]["update"];
     this.bus.emit("session_update", { ...context, update: tool });
+    const toolResult = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool-1",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "implementation body password=hunter2" } }],
+      _meta: { adapter: { toolName: "read_file" } },
+    } as AcpRunnerEventMap["session_update"]["update"];
+    this.bus.emit("session_update", { ...context, update: toolResult });
     this.markStarted();
     await this.blocked;
     this.bus.emit("session_close", context);
@@ -117,7 +125,7 @@ test("content-bearing progress and transcript records are durable before agent s
     await waitUntil(() => {
       records = manager.getPersistence().readEvents(started.runId, { limit: 100 }).events;
       return records.some((record) => record.event.type === "agentProgress") &&
-        records.filter((record) => record.event.type === "agentTranscript").length >= 2;
+        records.filter((record) => record.event.type === "agentTranscript").length >= 3;
     });
 
     assert.equal(records.some((record) => record.event.type === "agentEnd"), false);
@@ -131,8 +139,14 @@ test("content-bearing progress and transcript records are durable before agent s
     assert.ok(Buffer.byteLength(progress.event.latestText ?? "", "utf8") <= 512);
 
     const transcript = records.filter((record) => record.event.type === "agentTranscript");
-    assert.deepEqual(transcript.map((record) => record.event.type === "agentTranscript" ? record.event.entry.kind : ""), ["text", "toolCall"]);
+    assert.deepEqual(transcript.map((record) => record.event.type === "agentTranscript" ? record.event.entry.kind : ""), ["text", "toolCall", "toolResult"]);
     assert.equal(JSON.stringify(transcript).includes("hunter2"), false);
+    const toolResultRecord = transcript.at(-1);
+    assert.ok(toolResultRecord && toolResultRecord.event.type === "agentTranscript");
+    assert.equal(toolResultRecord.event.entry.kind, "toolResult");
+    assert.equal(toolResultRecord.event.entry.toolName, "read_file");
+    assert.ok(toolResultRecord.event.entry.text.includes("[REDACTED]"));
+    assert.equal(toolResultRecord.event.entry.isError, undefined);
   } finally {
     runner.finish();
     await started.promise;

@@ -24,6 +24,7 @@ export type WorkflowAgentActivity = WorkflowAgentActivityBase & (
   | { kind: "session-close" }
   | { kind: "assistant-text"; text: string; messageId?: string }
   | { kind: "tool-call"; title: string; toolName: string }
+  | { kind: "tool-result"; text: string; toolName?: string; isError?: boolean }
   | { kind: "content-boundary" }
   | { kind: "usage"; tokensObserved?: number }
 );
@@ -148,6 +149,7 @@ export class LiveAgentObservability<Run extends object> {
 
       if (activity.kind === "assistant-text") this.observeText(owner, activity.text, activity.messageId);
       else if (activity.kind === "tool-call") this.observeTool(owner, activity.title, activity.toolName);
+      else if (activity.kind === "tool-result") this.observeToolResult(owner, activity.text, activity.toolName, activity.isError);
       else if (activity.kind === "content-boundary") this.closeSegment(owner);
       else if (activity.tokensObserved !== undefined) owner.tokensObserved = activity.tokensObserved;
 
@@ -228,6 +230,17 @@ export class LiveAgentObservability<Run extends object> {
     this.publishToolEntry(owner, title, toolName);
     owner.lastToolName = truncateUtf8(toolName, MAX_OBSERVABILITY_SCALAR_BYTES);
     owner.latestText = undefined;
+  }
+
+  /** A terminal tool result is a content boundary AND a durable transcript entry of its own. */
+  private observeToolResult(
+    owner: LiveOwner<Run>,
+    text: string,
+    toolName: string | undefined,
+    isError: boolean | undefined,
+  ): void {
+    this.closeSegment(owner);
+    this.publishToolResultEntry(owner, text, toolName, isError);
   }
 
   private closeSegment(owner: LiveOwner<Run>): void {
@@ -317,6 +330,33 @@ export class LiveAgentObservability<Run extends object> {
     const projected = projectRunEventForPersistence(event).event;
     if (projected.type !== "agentTranscript" || projected.entry.text.trim().length === 0 ||
         !projected.entry.toolName?.trim()) return;
+    this.publish(owner, event, () => { owner.nextEntryIndex += 1; });
+  }
+
+  private publishToolResultEntry(
+    owner: LiveOwner<Run>,
+    text: string,
+    toolName: string | undefined,
+    isError: boolean | undefined,
+  ): void {
+    const entryIndex = owner.nextEntryIndex;
+    const event: Extract<EngineRunEvent, { type: "agentTranscript" }> = {
+      type: "agentTranscript",
+      ...this.base(owner),
+      entryIndex,
+      revision: 0,
+      operation: "upsert",
+      entry: {
+        role: "tool",
+        kind: "toolResult",
+        text,
+        ...(toolName === undefined ? {} : { toolName }),
+        ...(isError === true ? { isError: true } : {}),
+        timestamp: Date.now(),
+      },
+    };
+    const projected = projectRunEventForPersistence(event).event;
+    if (projected.type !== "agentTranscript" || projected.entry.text.trim().length === 0) return;
     this.publish(owner, event, () => { owner.nextEntryIndex += 1; });
   }
 

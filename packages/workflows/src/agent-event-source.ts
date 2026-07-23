@@ -179,8 +179,43 @@ export function projectWorkflowAgentActivity(
       ...(Number.isSafeInteger(used) && (used as number) >= 0 ? { tokensObserved: used as number } : {}),
     };
   }
+  if (event.name === "tool_call_update") {
+    // A TERMINAL update carrying displayable content becomes a durable tool-result transcript
+    // entry; every other update keeps today's behavior (a bare content boundary).
+    const status = update.status;
+    if (status === "completed" || status === "failed") {
+      const text = toolCallContentText(update.content);
+      if (text !== undefined) {
+        const name = nestedToolName(update._meta) ??
+          (typeof update.kind === "string" && update.kind.trim().length > 0 ? update.kind : undefined);
+        return {
+          ...base,
+          kind: "tool-result",
+          text,
+          ...(name === undefined ? {} : { toolName: name }),
+          ...(status === "failed" ? { isError: true } : {}),
+        };
+      }
+    }
+    return { ...base, kind: "content-boundary" };
+  }
   if (event.name === "user_message_chunk" || event.name === "agent_thought_chunk" ||
-      event.name === "tool_call_update" || event.name === "plan" || event.name === "plan_update" ||
+      event.name === "plan" || event.name === "plan_update" ||
       event.name === "plan_removed") return { ...base, kind: "content-boundary" };
   return undefined;
+}
+
+/** Joined text of the update's `content` blocks (type "content" with nested text blocks). */
+function toolCallContentText(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!isObject(block) || block.type !== "content") continue;
+    const nested = block.content;
+    if (isObject(nested) && nested.type === "text" && typeof nested.text === "string" && nested.text.length > 0) {
+      parts.push(nested.text);
+    }
+  }
+  const joined = parts.join("\n").trim();
+  return joined.length > 0 ? joined : undefined;
 }

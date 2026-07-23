@@ -52,6 +52,7 @@ export interface WorkflowRunEventsResourceDocument {
   schemaVersion: typeof WORKFLOW_RUN_EVENTS_SCHEMA_VERSION;
   runId: string;
   streamId: string;
+  workflowName: string;
   status: PersistedRunState["status"];
   finalized: boolean;
   after: number;
@@ -148,6 +149,10 @@ function lineageSourceRunId(state: PersistedRunState): string | undefined {
 export class WorkflowScriptResources {
   private readonly persistence: ReturnType<WorkflowManager["getPersistence"]>;
   private readonly subscriptions = new Set<string>();
+  private readonly externalReaders = new Map<
+    string,
+    () => { contents: Array<{ uri: string; mimeType: string; text: string }> }
+  >();
   private readonly eventSubscriptions = new Map<string, EventSubscription>();
   private readonly deletedRunIds = new Set<string>();
   private readonly silentDeletionRunIds = new Set<string>();
@@ -178,6 +183,17 @@ export class WorkflowScriptResources {
       previousOnClose?.();
     };
     this.registerProtocolSurface();
+  }
+
+  /**
+   * Serve a fixed, non-run resource (exact URI match) through this class's resources/read
+   * router. Needed because registerProtocolSurface replaces the SDK's default read dispatch.
+   */
+  registerExternalResourceReader(
+    uri: string,
+    read: () => { contents: Array<{ uri: string; mimeType: string; text: string }> },
+  ): void {
+    this.externalReaders.set(uri, read);
   }
 
   /** Announce a resource only after the server has read its admitted record back successfully. */
@@ -315,8 +331,13 @@ export class WorkflowScriptResources {
 
     // The SDK's registerResource handler constructs URL before invoking the template callback.
     // Validate the raw wire string here so malformed input stays an InvalidParams client error.
+    // This handler REPLACES the SDK's default resources/read dispatch, so any fixed resource
+    // registered outside this class (e.g. the MCP Apps ui:// panel) must also register a
+    // reader here via registerExternalResourceReader.
     this.mcp.server.setRequestHandler(ReadResourceRequestSchema, (request) => {
       const uri = request.params.uri;
+      const external = this.externalReaders.get(uri);
+      if (external) return external();
       return uri.includes("/events") ? this.readEventsResource(uri) : this.readResource(uri);
     });
 
@@ -433,53 +454,94 @@ export class WorkflowScriptResources {
     subscription.watcher = undefined;
   }
 
+  /**
+   * Shared events-page builder used by both the `workflow://runs/{runId}/events` resource and
+   * the app-only `workflow-events` tool. `streamId` defaults to the run's current stream and
+   * `after` to 0, so a UI consumer can bootstrap the full log without a prior head read.
+   * Throws McpError (unavailable) or RunEventLogError (cursor/stream faults) — callers map.
+   */
+  readEventsPage(request: {
+    runId: string;
+    after?: number;
+    limit?: number;
+    streamId?: string;
+  }): WorkflowRunEventsResourceDocument {
+    const state = this.persistence.load(request.runId);
+    if (!state?.eventStreamId || state.eventSeq === undefined) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Workflow events for ${request.runId} are unavailable.`,
+      );
+    }
+    const after = request.after ?? 0;
+    const page = this.persistence.readEvents(request.runId, {
+      after,
+      limit: request.limit ?? RUN_EVENT_READ_LIMIT_DEFAULT,
+      streamId: request.streamId ?? state.eventStreamId,
+    });
+    return this.buildEventsDocument(request.runId, state, after, page);
+  }
+
+  /** Canonical (query-less) resource read: the tail window of the current stream. */
+  private readEventsTail(runId: string): WorkflowRunEventsResourceDocument {
+    const state = this.persistence.load(runId);
+    if (!state?.eventStreamId || state.eventSeq === undefined) {
+      throw new McpError(ErrorCode.InvalidParams, `Workflow events for ${runId} are unavailable.`);
+    }
+    const head = this.persistence.readEvents(runId, { limit: 1, streamId: state.eventStreamId });
+    const effectiveAfter = Math.max(0, head.endCursor - RUN_EVENT_READ_LIMIT_DEFAULT);
+    const page = this.persistence.readEvents(runId, {
+      after: effectiveAfter,
+      limit: RUN_EVENT_READ_LIMIT_DEFAULT,
+      streamId: head.streamId,
+    });
+    return this.buildEventsDocument(runId, state, effectiveAfter, page);
+  }
+
+  private buildEventsDocument(
+    runId: string,
+    state: PersistedRunState,
+    after: number,
+    page: ReturnType<ReturnType<WorkflowManager["getPersistence"]>["readEvents"]>,
+  ): WorkflowRunEventsResourceDocument {
+    const subscription = this.eventSubscriptions.get(workflowRunEventsUri(runId));
+    if (subscription?.needsRearm) {
+      const watcher = this.persistence.watchEvents(runId, { after: page.endCursor, streamId: page.streamId });
+      subscription.watcher?.close();
+      subscription.watcher = watcher;
+      subscription.streamId = page.streamId;
+      subscription.needsRearm = false;
+      this.drainEventWatcher(subscription, watcher);
+    }
+    return {
+      schemaVersion: WORKFLOW_RUN_EVENTS_SCHEMA_VERSION,
+      runId,
+      streamId: page.streamId,
+      workflowName: state.workflowName,
+      status: state.status,
+      finalized: state.status !== "pending" && state.status !== "running",
+      after,
+      cursor: page.cursor,
+      endCursor: page.endCursor,
+      hasMore: page.cursor < page.endCursor,
+      events: page.events,
+    };
+  }
+
   private readEventsResource(uri: string): {
     contents: Array<{ uri: string; mimeType: string; text: string }>;
   } {
     const parsed = parseWorkflowRunEventsUri(uri);
     if (!parsed) malformedEventsUri();
     try {
-      const state = this.persistence.load(parsed.runId);
-      if (!state?.eventStreamId || state.eventSeq === undefined) {
-        throw new McpError(ErrorCode.InvalidParams, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} are unavailable.`);
-      }
-      let effectiveAfter = parsed.after ?? 0;
-      const page = parsed.canonical
-        ? (() => {
-            const head = this.persistence.readEvents(parsed.runId, { limit: 1, streamId: state.eventStreamId });
-            effectiveAfter = Math.max(0, head.endCursor - RUN_EVENT_READ_LIMIT_DEFAULT);
-            return this.persistence.readEvents(parsed.runId, {
-              after: effectiveAfter,
-              limit: RUN_EVENT_READ_LIMIT_DEFAULT,
-              streamId: head.streamId,
-            });
-          })()
-        : this.persistence.readEvents(parsed.runId, {
+      const document = parsed.canonical
+        ? this.readEventsTail(parsed.runId)
+        : this.readEventsPage({
+            runId: parsed.runId,
             after: parsed.after,
             limit: parsed.limit,
             streamId: parsed.streamId,
           });
-      const subscription = this.eventSubscriptions.get(workflowRunEventsUri(parsed.runId));
-      if (subscription?.needsRearm) {
-        const watcher = this.persistence.watchEvents(parsed.runId, { after: page.endCursor, streamId: page.streamId });
-        subscription.watcher?.close();
-        subscription.watcher = watcher;
-        subscription.streamId = page.streamId;
-        subscription.needsRearm = false;
-        this.drainEventWatcher(subscription, watcher);
-      }
-      const document: WorkflowRunEventsResourceDocument = {
-        schemaVersion: WORKFLOW_RUN_EVENTS_SCHEMA_VERSION,
-        runId: parsed.runId,
-        streamId: page.streamId,
-        status: state.status,
-        finalized: state.status !== "pending" && state.status !== "running",
-        after: effectiveAfter,
-        cursor: page.cursor,
-        endCursor: page.endCursor,
-        hasMore: page.cursor < page.endCursor,
-        events: page.events,
-      };
       return { contents: [{ uri: parsed.normalizedUri, mimeType: EVENTS_RESOURCE_MIME_TYPE, text: JSON.stringify(document) }] };
     } catch (error) {
       mapEventError(error, parsed);

@@ -236,10 +236,17 @@ function hasProgressContent(value: Record<string, unknown>, projected: boolean):
 function isTranscriptEntry(value: unknown, projected: boolean): boolean {
   if (!isObject(value) || !hasRequired(value, "text", (candidate) => isNonEmptyText(candidate, projected)) ||
       !hasRequired(value, "timestamp", isNonNegativeSafeInteger) ||
-      !hasOnly(value, ["role", "kind", "text", "toolName", "timestamp"])) return false;
-  if (value.role === "assistant" && value.kind === "text") return !hasOwn(value, "toolName");
-  return value.role === "tool" && value.kind === "toolCall" &&
-    hasRequired(value, "toolName", (candidate) => isNonEmptyText(candidate, projected));
+      !hasOnly(value, ["role", "kind", "text", "toolName", "isError", "timestamp"])) return false;
+  if (value.role === "assistant" && value.kind === "text") {
+    return !hasOwn(value, "toolName") && !hasOwn(value, "isError");
+  }
+  if (value.role === "tool" && value.kind === "toolCall") {
+    return hasRequired(value, "toolName", (candidate) => isNonEmptyText(candidate, projected)) &&
+      !hasOwn(value, "isError");
+  }
+  return value.role === "tool" && value.kind === "toolResult" &&
+    hasOptional(value, "toolName", (candidate) => isNonEmptyText(candidate, projected)) &&
+    (!hasOwn(value, "isError") || value.isError === true);
 }
 
 function isAgentProgress(value: Record<string, unknown>, projected: boolean): boolean {

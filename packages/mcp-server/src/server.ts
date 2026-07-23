@@ -45,7 +45,10 @@ import type {
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
 
+import { EXTENSION_ID, registerAppTool } from "@modelcontextprotocol/ext-apps/server";
+
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
+import { RUN_MONITOR_RESOURCE_URI, registerWorkflowAppUi } from "./app-ui.js";
 import {
   toWorkflowExecutionOutcome,
   toWorkflowToolResult,
@@ -1162,8 +1165,13 @@ export function createWorkflowServer(
   });
 
   // registerCapabilities is illegal after a transport attaches. Merge the complete resources
-  // capability before resource/handler registration and before createWorkflowServer returns.
-  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+  // capability — and the MCP Apps extension declaration required by the extensions
+  // negotiation spec (servers advertise `capabilities.extensions` in the initialize
+  // response) — before handler registration and before createWorkflowServer returns.
+  mcp.server.registerCapabilities({
+    resources: { subscribe: true, listChanged: true },
+    extensions: { [EXTENSION_ID]: {} },
+  });
 
   // Composition root: the ACP-backed AgentRunner is injected into the engine here. The
   // manager owns run lifecycle, status stamping, and the persisted journal used by resume.
@@ -1175,9 +1183,20 @@ export function createWorkflowServer(
 
   registerAuthoringPrompt(mcp);
 
-  mcp.registerTool(
+  // MCP Apps surface, per the extension's graceful-degradation model: registered for every
+  // client. Apps-capable hosts render the panel from the `workflow` tool's `_meta.ui`;
+  // everyone else ignores the meta (and the app-only events tool) and keeps the tool's
+  // text/structured output unchanged.
+  registerWorkflowAppUi(mcp, {
+    readEventsPage: (request) => scriptResources.readEventsPage(request),
+    registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
+  });
+
+  registerAppTool(
+    mcp,
     "workflow",
     {
+      _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI } },
       title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
       description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +

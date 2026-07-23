@@ -108,9 +108,14 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 1, "exactly one tool is registered");
-    const tool = tools[0];
-    assert.equal(tool.name, "workflow");
+    // The model-facing surface is `workflow` plus the app-only `workflow-events` poller
+    // (visibility ["app"] — Apps hosts keep it out of the model's tool loop; see app-ui.ts).
+    assert.deepEqual(
+      tools.map((candidate) => candidate.name).sort(),
+      ["workflow", "workflow-events"],
+    );
+    const tool = tools.find((candidate) => candidate.name === "workflow");
+    assert.ok(tool, "the workflow tool is registered");
     assert.match(tool.description ?? "", /registry built-ins—currently Claude, Codex, OpenCode, and pi/);
 
     assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
