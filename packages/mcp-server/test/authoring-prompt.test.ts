@@ -18,9 +18,9 @@ test("generated authoring-prompt content is in sync with the skill sources", () 
 });
 
 test("generated authoring-prompt distinguishes background start from awaited progress", () => {
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("background start has no enduring request channel"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("has no enduring request signal, progress channel, or live checkpoint channel"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("emits no progress after returning"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("when that await carries a progress token"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("carries a progress token, it can stream coarse phase"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("distinct started/ended-call progress"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("polling fallback emits no progress notifications"));
   assert.ok(!AUTHORING_PROMPT_CONTENT.includes("It has no progress token or live checkpoint elicitation"));
@@ -39,7 +39,7 @@ test("generated authoring-prompt teaches fail-to-live identity resume semantics"
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Completed checkpoint results replay"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("keys always name the checkpoint index in the source run"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('resumePolicy: "positional"'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes('source-wide `"manifest-invalid"`'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('the whole source is `"manifest-invalid"`'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Node/V8, and producing engine version are diagnostics only"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 6'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('maxRounds": 8'));
@@ -47,34 +47,31 @@ test("generated authoring-prompt teaches fail-to-live identity resume semantics"
 });
 
 test("generated authoring-prompt teaches bounded attempts and targeted cancellation", () => {
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("total wall-clock ceiling per attempt, not an idle timer"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("caps the wall-clock time of each attempt; it is not an idle timer"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("(resolved retries + 1) × resolved timeout"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("per-call `timeoutMs` may tighten it but cannot escape it"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("does not inherit host bounds from its source"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("can tighten that ceiling but cannot escape it"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("does not inherit them from its source run"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('{ action: "stop", runId, callIndex }'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`AGENT_CANCELLED`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("releases its concurrency slot"));
 });
 
 test("generated authoring-prompt teaches resume compatibility and eligibility diagnostics", () => {
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("the identity hash covers prompt, resolved model"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("The separate input fingerprint covers resolved label"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("The identity hash covers the prompt, the resolved model"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("The input fingerprint covers the resolved label"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes('fallbackReason: "inputs-format-legacy"'));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("current-format crash snapshot uses identity matching"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("ancestor-scoped rows from ≤0.23 resume chains"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume across filesystem/environment, workflow-engine, Node, and V8 changes"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Ancestor-scoped rows carried from ≤0.23 resume chains"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Journals resume across filesystem, environment, engine, Node, and V8 changes"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`replayEligibility.provenanceChanges`"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("MCP background admission, foreground completion, both await shapes, and inspect"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Background admission, foreground completion, both await shapes, and inspect"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("seed-persistence-error"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("resume-fatal-latch"));
 });
 
-test("implementation-train example does not author a timeout escape", () => {
+test("implementation-train pattern does not author a timeout escape", () => {
   const example = readFileSync(
-    new URL(
-      "../../../skills/agentprism-workflow-authoring/examples/implementation-train.workflow.js",
-      import.meta.url,
-    ),
+    new URL("../../../docs/patterns/implementation-train.workflow.js", import.meta.url),
     "utf8",
   );
   assert.doesNotMatch(example, /timeoutMs\s*:\s*null/);
@@ -85,9 +82,9 @@ test("generated authoring-prompt teaches scriptPath, resources, and stop-patch-r
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("workflow://runs/{runId}/script"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("a bare `resumeFromRunId`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("never silently reuses the old script"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes('{ action: "stop", runId, lastN?, labelGlob?, logLines? }'));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("authoritative durable acknowledgement"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("absolute `scriptPath` plus"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('Stop the live run with `{ action: "stop", runId }`.'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("durable acknowledgement: resume is safe immediately"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("absolute `scriptPath` and `resumeFromRunId`"));
 });
 
 test("generated authoring-prompt teaches registered-prefix routing and verbatim selection", () => {
@@ -118,13 +115,13 @@ test("generated authoring-prompt teaches configOptions and validate-time probe s
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("| `configOptions` |"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Ids and string/boolean values pass through verbatim"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("advertised-options table"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("marks it `probed:false`"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`probed:false`, skips only that pair's checks"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi's thought-level option is named `thinkingLevel`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("warning that names the effective clamp target"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Claude and Codex are also ordered"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("OpenCode and custom/unknown backends use exact-set validation"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Enumeration is bounded at 32 advertised models"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Claude effort absence remains model-specific"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("so validation is exact-set"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("Enumeration stops at 32 advertised models"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("A Claude model without an `effort` option does not support effort"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("`default` never becomes a ceiling target"));
 });
 

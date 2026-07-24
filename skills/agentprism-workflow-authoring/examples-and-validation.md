@@ -38,7 +38,7 @@ const outcome = await gate(
   async (report) => {
     if (!report) return { ok: false, feedback: "implementation agent produced no result" };
     phase("Review");
-    const reviews = (await parallel([   // two vendors, two lenses — independent eyes
+    const reviews = (await parallel([   // two reviewers on different vendors
       () => agent(`Review the working-tree diff for correctness. Implementer's report:\n${report}`,
                   { label: "review:correctness", model: "claude/opus[1m]", schema: VERDICT }),
       () => agent(`Review the working-tree diff for regressions and missing tests. Report:\n${report}`,
@@ -108,9 +108,9 @@ return { confirmed, missing: gaps.missing ?? [] };
 
 When the inline examples above aren't enough, study the complete, validated scripts in [`examples/`](examples/) (same directory as this file):
 
-- [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous, unattended cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor adversarial verification panel, `gate()` where writer and reviewer are always different vendors, nesting a saved workflow by name, `completenessCheck()`, budget headroom reservation, string-form `args` hardening, placeholder/path guards on schema outputs, and pause-class error rethrow.
-- [`examples/implementation-train.workflow.js`](examples/implementation-train.workflow.js) — the battle pattern for shipping real work against a frozen contract: a lens-gated implement loop (produce → four falsifiable-question reviewers → self-contained combined feedback) with STOP-and-report recognized in the checker, script-side report validation before any reviewer spends tokens, base-freshness re-anchoring every round, and a terminal adjudicator whose closed finding list feeds a panel-free fix round.
+- [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor verification panel, `gate()` where writer and reviewer are different vendors, nesting a saved workflow by name, `completenessCheck()`, budget headroom reservation, string-form `args` hardening, path guards on schema outputs, and pause-class error rethrow.
 - [`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js) — a small hunter that runs standalone *or* nested: `loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an in-round budget floor (nested runs share the parent's budget).
+- [`examples/resume-loop-cap.workflow.js`](examples/resume-loop-cap.workflow.js) — content-addressed replay: run with a low `maxRounds`, resume with a higher one; unchanged rounds replay for zero tokens (worked through in Determinism and resume).
 
 [`examples/README.md`](examples/README.md) maps each script to what it teaches.
 
@@ -122,22 +122,29 @@ The SDK ships a validator that costs **zero tokens** — always run it on a scri
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'
 ```
 
-It does three passes: a **static parse** (the `meta` literal, syntax, and direct nondeterministic call expressions), a **dry run** — the script executes for real in the engine's realm, but every `agent()` call is served by a mock backend that fabricates schema-conforming results — then one no-prompt session for each distinct routed `{ backend, model }` pair. The last pass spends no tokens, selects each authored call model, and surfaces the echoed model-specific config-options table in the human and JSON reports every time. Read that table before picking `configOptions` values. Unknown ids, bad select values, non-boolean boolean values, and the reserved `"model"` key fail validation with the call label, authored value, and alternatives. Self-advertised recognized domains win; otherwise Claude and Codex enumerate at most 32 picker-visible models and merge consistent effort orders for ordered clamping. Pi already advertises its domain. OpenCode and custom/unknown backends are exact-set, and enumeration that is too large or inconsistent warns and exact-rejects unadvertised values. Claude effort absence remains model-specific and `default` is not an ordered ceiling. If a routed pair cannot spawn, authenticate, select its model, or open a session, validation emits one warning, marks it `probed:false`, skips only its checks, and stays valid; this is the offline degradation behavior. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` still warns because a truly unattended run would abort. Script-declared `meta.backends` are treated as approved, and the report lists every call with its backend attribution plus warnings (undeclared phases, `headless: "abort"` checkpoints, zero agent calls).
+It does three passes. First, a **static parse**: the `meta` literal, syntax, and direct
+nondeterministic call expressions. Second, a **dry run**: the engine runs the script's control flow
+in its realm, with every `agent()` call served by a mock backend that fabricates
+schema-conforming results — no real agent runs, and validation is not an execution of the
+workflow. Third, one no-prompt session for each distinct routed `{ backend, model
+}` pair. The third pass spends no tokens, selects each authored call model, and echoes that pair's
+model-specific config-options table in the report. Read that table before picking `configOptions`
+values; unknown ids, bad select values, wrong value types, and the reserved `"model"` key fail
+validation with the call label, authored value, and alternatives. If a routed pair cannot spawn,
+authenticate, select its model, or open a session, validation emits one warning, marks it
+`probed:false`, skips only that pair's checks, and stays valid — the offline degradation behavior. A
+mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs
+cleanly; `headless: "abort"` warns because a truly unattended run would abort. Script-declared
+`meta.backends` are treated as approved. The report lists every call with its backend attribution,
+plus warnings for undeclared phases, `headless: "abort"` checkpoints, and zero agent calls.
+(Option-domain clamping rules are in Backends and structured output; the full flag table and
+mock-answer grammar are in `reference.md`.)
 
-The default fabricator returns `true` for every boolean. Do not accept that all-true path as proof
-that a convergence loop works: script its control labels with `--mock-answers` or a reusable
-`--mock-answers-file`. Use a finite `$sequence` such as reject-then-approve so validation executes
-the revision branch and proves the loop stops; the report identifies every consumed and unused
-fixture without printing answer bodies.
+The default fabricator returns `true` for every boolean. Do not accept that all-true path as proof that a convergence loop works: script its control labels with `--mock-answers` or a reusable `--mock-answers-file`. Use a finite `$sequence` such as reject-then-approve so validation executes the revision branch and proves the loop stops; the report identifies every consumed and unused fixture without printing answer bodies.
 
-Ship the fixtures with the script. Save the mock-answers JSON beside the workflow file
-(`<name>.mock.json`) and treat the pair as the deliverable: the deep paths it proves — fix rounds,
-STOP branches, post-adjudication repairs — are exactly the paths a later edit (or a
-kill-patch-resume) breaks silently, and an unmocked dry run stops at the first guard. When a
-default-fabrication dry run leaves declared phases unexecuted, that usually means your guard
-branches fired — script the mocks that reach past them instead of shrugging at the warnings.
+Save reusable mock answers beside the workflow file (`<name>.mock.json`). When a default-fabrication dry run leaves declared phases unexecuted, your guard branches fired — script the mocks that reach past them instead of shrugging at the warnings.
 
-Exit codes: `0` valid · `1` parse failure · `2` dry-run or config-option failure. Useful flags: `--parse-only`, `--token-budget <n>` (exercises `budget`-guarded paths; the mock reports 1000 tokens per call), `--args-file <path>`, `--json` (machine-readable report). Hosts can do the same programmatically via `validateWorkflowScript(script, opts)` from `@automatalabs/workflows`.
+Exit codes: `0` valid · `1` parse failure · `2` dry-run or config-option failure. The full flag table, mock-answers grammar, and limits are in `reference.md`.
 
 The third pass's table is also available standalone — before any script exists — as validate's sibling command: `npx @automatalabs/workflows config [harness ...]` (default: every routable harness; `--json`; exit `1` when a probe fails). Use `config` while authoring to pick values; validate's copy then confirms the script you wrote against the same live catalog.
 

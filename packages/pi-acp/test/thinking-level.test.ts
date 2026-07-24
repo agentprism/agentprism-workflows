@@ -51,7 +51,11 @@ function runtimeWith(selected: Model<Api>): ModelRuntime {
   return { async getAvailable() { return [selected]; } } as unknown as ModelRuntime;
 }
 
-const cappedAtHigh = getBuiltinModel("opencode-go", "kimi-k3");
+// pi 0.82.0 reshaped builtin kimi thinking domains (opencode-go/kimi-k3 is max-only now),
+// so the capped fixture is synthetic: reasoning with no explicit xhigh/max support yields
+// the ladder through "high" regardless of catalog drift.
+const cappedAtHigh = model("capped-at-high", true);
+const sparseKimi = getBuiltinModel("moonshotai", "kimi-k3");
 const fullLadder = getBuiltinModel("amazon-bedrock", "anthropic.claude-opus-4-7");
 const nonReasoning = getBuiltinModel("amazon-bedrock", "amazon.nova-lite-v1:0");
 const interiorGap = model("interior-gap", true, { low: null, xhigh: null, max: null });
@@ -69,6 +73,9 @@ test("thinking-level advertisement is the ordered subset for the selected model"
   const fullSession = fakeSession({ model: fullLadder });
   assert.equal(RECOGNIZED_THINKING_LEVELS.length, 7);
   assert.deepEqual(advertisedValues(fullSession.session), RECOGNIZED_THINKING_LEVELS);
+
+  const sparseSession = fakeSession({ model: sparseKimi });
+  assert.deepEqual(advertisedValues(sparseSession.session), ["low", "high", "max"]);
 
   const offSession = fakeSession({ model: nonReasoning });
   assert.deepEqual(advertisedValues(offSession.session), ["off"]);
@@ -148,6 +155,17 @@ test("applyConfig clamps only unsupported recognized levels and echoes the effec
   );
   assert.equal(gapSession.session.thinkingLevel, "medium");
   assert.equal(gap.configOptions[0]?.currentValue, "medium");
+
+  const sparseSession = fakeSession({ model: sparseKimi });
+  const sparse = await applyConfig(
+    sparseSession.session,
+    runtimeWith(sparseKimi),
+    [sparseKimi],
+    "thinkingLevel",
+    "xhigh",
+  );
+  assert.equal(sparseSession.session.thinkingLevel, "max");
+  assert.equal(sparse.configOptions[0]?.currentValue, "max");
 
   const supportedSession = fakeSession({ model: cappedAtHigh });
   const supported = await applyConfig(

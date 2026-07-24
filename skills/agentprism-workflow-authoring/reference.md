@@ -2,20 +2,6 @@
 
 Exhaustive tables for the AgentPrism workflow script DSL. `SKILL.md` (same directory) is the authoring guide; this file is the lookup companion. Everything here is verified against `@automatalabs/workflow-engine` / `@automatalabs/acp-agents` as shipped with `@automatalabs/workflows`.
 
-## The `meta` header
-
-`export const meta = {...}` must be the script's first statement and a pure object literal (it is parsed from source text before execution).
-
-| field | required | meaning |
-|---|---|---|
-| `name` | yes | Stable identifier for the workflow (journals, logs, traces). |
-| `description` | yes | One line: what the workflow does. |
-| `phases` | no | `[{ title, detail?, model? }]` — declare one entry per `phase()` call (matched by exact title). A phase `model` is the default for agents assigned to that phase. |
-| `model` | no | Run-wide default model for agents with no `model`/`tier` whose phase has no `model`. |
-| `backends` | no | Script-declared custom ACP backends, keyed by routing name — see [Custom backends](#custom-backends-metabackends). Inert until the host approves them. |
-
-Per-agent model precedence: `agent({ model })` > `agent({ tier })` > current phase `model` > `meta.model` > host session default.
-
 ## `agent(prompt, options?)` — full option table
 
 Returns the agent's final assistant text, or the schema-validated object when `schema` is set. Resolves to `null` when a *recoverable* failure survives all retries.
@@ -27,7 +13,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
-| `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Claude-family: `default`, `plan`, `acceptEdits`, `bypassPermissions`. Codex-family: `read-only`, `agent`, `agent-full-access`. OpenCode: its mode config option. Part of the resume hash when set. |
+| `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Ids are backend-specific and drift with harness versions — read the advertised `mode` select from the config probe or a validator report (Codex-family examples: `read-only`, `agent`, `agent-full-access`; Claude-family advertises permission modes such as `plan`, `acceptEdits`, and `dontAsk`). Part of the resume hash when set. |
 | `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. Read the advertised-options table first (`agentprism-workflows config <harness>`, or any validate report) before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
@@ -63,43 +49,9 @@ A `model` string is resolved solely from its first segment, then delegated to th
 | `claude/<id>`, `codex/<id>`, `opencode/<id>`, `pi/<id>`, or `<custom-name>/<id>` | that registered harness | Match the first segment ASCII-case-insensitively and strip exactly one segment. Custom names take priority on collision. The remaining `<id>` is sent verbatim, including further `/` characters. For Pi, that remainder is its `<provider>/<model-id>` and Pi preserves any further slashes in the model id. |
 | any other string, including `anthropic/…`, `openai/…`, bare `opus`, or bare `gpt-…` | host default backend | The **entire** authored string is sent verbatim; these are not routing aliases. |
 
-Selection is a single `session/set_config_option` with `configId: "model"` and the exact remaining string. There is no catalog matching, case folding, normalization, bracket parsing, nearest-neighbor selection, sibling effort/Fast option driving, retry, or echo verification. Brackets, dots, and provider-style prefixes are ordinary model-id characters. Live-catalog-verified examples are `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`; prefer backend-only forms for harness-configured models.
+Selection is a single `session/set_config_option` with `configId: "model"` and the exact remaining string. There is no catalog matching, case folding, normalization, bracket parsing, nearest-neighbor selection, sibling effort/Fast option driving, retry, or echo verification. Brackets, dots, and provider-style prefixes are ordinary model-id characters.
 
 Whatever the harness returns is the outcome. A rejection follows the existing agent-error path with no resolution-specific code or model fallback event. `onModelFallback` and `WorkflowRunResult.fallbacks` remain public compatibility surfaces; model resolution does not emit entries, while pause recovery emits `kind: "continuation"` reattach/skip notices.
-
-### Session config options
-
-`configOptions` extends the model rule to any other ACP session knob the routed harness advertises:
-
-```js
-await agent("Implement the approved change.", {
-  label: "implement",
-  model: "codex",
-  configOptions: { "fast-mode": true, reasoning_effort: "high" },
-});
-```
-
-Ids and values are verbatim: strings stay strings, booleans stay booleans, and the client has no
-aliases, vocabulary, defaults, coercion, or catalog fallback. Entries are sent in ascending
-option-id order after model selection and before the prompt. A harness rejection follows the
-ordinary agent-error path. Never put `"model"` in this bag; the engine rejects it before opening a
-session. The catalog varies by harness version, login, and machine, so read a live advertised
-config-options table — `agentprism-workflows config <harness>`, or any validate report — before
-picking an id or select value, and run the validator every time after authoring. Ids are copied
-character-for-character, punctuation included (`"fast-mode"`, not `fast_mode`). The bare `config`
-probe reads each harness with its default model selected; option ids, domains, and ceilings are
-model-specific, and provider-served variants of the same model can advertise different domains —
-validate's per-pair echo, which selects your authored model first, is the authoritative per-model
-probe.
-
-For Pi, use `thinkingLevel` only with an explicit Pi model when the level matters. Validation
-selects that call's model before reading the option: listed values pass unchanged, recognized but
-unsupported ordered values warn with the effective clamp, and unrecognized values fail with exit
-`2`. Pi advertises its domain directly. Claude and Codex derive missing domains by enumerating up to
-32 advertised models and consistently merging their effort orders; Claude does not borrow `effort`
-for a model that omits the option, and its `default` sentinel is outside clamp ordering. OpenCode and
-custom/unknown backends are exact-set, so every unadvertised thought-level value fails instead of
-clamping. A too-large or inconsistent ordered catalog warns and takes that same exact path.
 
 ## Structured output channels
 
@@ -189,59 +141,23 @@ The host supplies the live human channel (elicitation in the MCP server; `ExecOp
 
 > **Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.
 
-- Direct calls that break deterministic replay fail static validation: `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()`. The realm also blocks aliased or computed forms at runtime. `new Date(value)` works. There is no `require`, `import`, Node API, or network API in the realm.
+The guide section **Determinism and resume** carries the full semantics: what each hash contains, matching, admission, continuation of interrupted calls, and checkpoint replay. Wire-level specifics for lookup:
+
 - Each `agent()` result is journaled under a monotonic call index and a SHA-256 identity hash. The canonical identity fields, in order, are `prompt`, resolved `model`, `mode` only when set, `configOptions` only when non-empty, `tier`, `phase`, `agentType`, resolved `agentDef`, and `schema`. Config-option keys are sorted before serialization. Missing fields other than `mode` and `configOptions` serialize as `null`; an unset `mode` and an unset/empty `configOptions` key are omitted for compatibility with older journals.
 - `agentDef` is the resolved definition's tools, disallowed tools, model, isolation, and body prompt. Changing a named definition therefore invalidates its call even when the `agentType` name is unchanged.
-- The separate input fingerprint contains resolved label, per-call `cwd`, resolved isolation, `keepSession`, `images`, `mcpServers`, `meta`, `promptMeta`, and the approved script-backend digest. Host `agentTimeoutMs`, `agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, are operational bounds in neither hash; a resume may change them without invalidating completed work or interrupted-turn continuation.
-- `args` is exposed to the script but is not directly included in the call hash. An args change misses only when evaluating the script produces a changed hashed field, changed call order, new call, or changed runner-visible input fingerprint.
 - The legacy `resume: { filesystem: "read-only" }` annotation has no effect on admission or matching. Writers, readers, worktree calls, and unannotated calls follow the same journal rule.
-- Automatic new-format matching first tries one exact `(kind, call path, identity hash)` candidate (`"path-hash"`), then one unique `(kind, identity hash, input fingerprint)` candidate so an unchanged call may replay as `"unique-hash"` across inserted/deleted siblings. The source and current input fingerprints must be equal. Duplicate exact identities, duplicate content, consumed candidates, missing facts, or an empty schema-less result run live; no occurrence or source-order guess is made.
-- A source is admitted only after exact cwd, compatible call-path/input/checkpoint formats, complete call/journal/allocation metadata, and valid manifest/seed checks. Git HEAD/dirty digest, `environmentKey`, captured start/terminal environment values, current Node/V8, and engine version are diagnostics only. Provenance compares the recorded terminal environment (or start environment when no terminal capture exists) with the current environment; reported differences never gate replay.
-- Live agents, nested workflows, host checkpoint callbacks, and worktree degradation do not close the identity cache. Nested child calls are not in the parent journal and therefore run live, while matching parent calls around them remain replayable. Replayed calls do not recreate file writes; a later live agent navigates the world it actually finds.
-- Identity hits add their preserved logical budget debit to `budget.spent()`/`remaining()` so budget-driven control flow stays stable, while current `tokenUsage` and provider cost remain zero. Replayed session records are rebound to the current call index/label/phase without opening a session.
-- A root call interrupted by `PROVIDER_USAGE_LIMIT` / `AUTH_REQUIRED` may continue its recorded session on either resume API. Continuation is index-local and independent of replay strategy. It requires matching identity and input fingerprints, a non-worktree call, equal existing cwd, a coherent reopenable session row, and matching runner backend/`poolKey`; current capabilities choose resume before load. Every rejection fails to a fresh call and appears in `fallbacks`, while successful continuation journals its reopen method and charges only continuation-turn usage.
-- Completed `checkpoint()` results require equal fingerprints of `default`, `headless`, and `timeoutMs` and replay whether they came from a host or headless default. `checkpointReplies` keys refer to source indexes; a moved reply follows intact prior correspondence, while a different same-text branch after a live divergence cannot consume it.
-- `resumePolicy: "positional"` is the migration escape hatch: it requests index/prefix correspondence but cannot bypass new-format format, metadata, manifest, cwd, or input checks. It requires no safety annotation. Marker-less journals and permanently marked manual/same-run legacy resumes retain historical hash-only positional behavior. Current-format reconciled `paused` / `interrupted` snapshots with valid manifests use identity matching even without terminal-environment capture; sources below input format 2 use `inputs-format-legacy`. Ancestor-scoped rows carried by a ≤0.23 resume hop replay only while that ancestor is still persisted, and nested/deleted scopes stay live.
-- The additive options `label`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`, and `keepSession` are not identity-hashed. A changed value does not invalidate an ordinary replayed result, but it changes the input fingerprint and therefore rejects continuation of an interrupted turn.
+- `resumePolicy: "positional"` requests index/prefix correspondence but cannot bypass new-format format, metadata, manifest, cwd, or input checks. Marker-less journals and permanently marked manual/same-run legacy resumes retain historical hash-only positional behavior. Sources below input format 2 use `inputs-format-legacy`. Ancestor-scoped rows carried by a ≤0.23 resume hop replay only while that ancestor is still persisted; engine-minted nested scopes and deleted ancestor scopes stay live.
+- There is no `require`, `import`, Node API, or network API in the realm. `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()` fail static validation; aliased or computed forms are blocked at runtime; `new Date(value)` works.
 
 Every new-run resume exposes `replayEligibility` on admission, polling, inspection, and the terminal result. It reports strategy, predicted/observed replayable prefix and counts, first non-replay/reason/detail, engine/input-format diagnostics, non-gating runtime/environment `provenanceChanges`, and non-gating operational changes; `resumeReport` retains the complete terminal per-call correspondence.
 
 An all-live outcome is expected when correspondence cannot be established, not when the world changed. Missing resume metadata, incompatible format literals, or an invalid manifest/seed can disable reuse. A new-format source containing any result row without a captured call path/input fact—possible with a call stack deeper than the raw-frame cap or a non-strict-JSON `meta` value—is source-wide `"manifest-invalid"`; excluding the row could make an ambiguous sibling look unique. Format-1 bytes are never reinterpreted; they enter the positional bridge and replayed rows are recorded under format 2.
 
-An args-controlled cap is the useful case. In this complete script, `maxRounds` changes how many calls are reachable but does not appear in an earlier call's prompt:
-
-```js
-export const meta = {
-  name: "resume-loop-cap",
-  description: "Run expensive review rounds up to an args-controlled cap",
-  phases: [{ title: "Review" }],
-};
-
-const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-const numericCap = Number(input.maxRounds);
-const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 8;
-
-phase("Review");
-const rounds = [];
-for (let i = 0; i < maxRounds; i += 1) {
-  rounds.push(
-    await agent(
-      `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
-      { label: `review:${i + 1}`, phase: "Review" },
-    ),
-  );
-}
-
-if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rounds`);
-return { rounds };
-```
-
-The first MCP request uses `{ "args": { "maxRounds": 6 } }` and returns a failed run with a
-persisted six-entry journal. The next request sends the same content via `script` (or the same
-absolute `scriptPath`), `{ "args": { "maxRounds": 8 } }`, and the returned run ID as
-`resumeFromRunId`. Calls 0–5 match uniquely and replay for zero current provider tokens; calls 6–7
-are new and run live. This changed-args pattern is specific to new-run entry points that accept
-current args with `resumeFromRunId`. The MCP `workflow` tool does, as does
+An args-controlled cap is the useful case: a cap that changes how many calls are reachable, but
+does not appear in an earlier call's prompt, lets those calls replay on resume. The worked example
+lives in the determinism-and-resume guide document and ships as
+`examples/resume-loop-cap.workflow.js`. This changed-args pattern is specific to new-run entry
+points that accept current args with `resumeFromRunId`. The MCP `workflow` tool does, as does
 `WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`. MCP resume always requires
 explicit content; a bare `resumeFromRunId` is invalid. `WorkflowManager.resume(runId)` is a
 different same-ID recovery API: it reloads the persisted original script/args and permanently uses
@@ -286,57 +202,29 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 ## How hosts run scripts (what authors can assume)
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) — the canonical way an agent
-runs an authored script — accepts exactly one of raw
-`script` source or an absolute server-filesystem `scriptPath`, plus `args`. A path is read once and
-snapshotted at admission. Foreground is the default and streams progress/resolves checkpoints live;
-long work uses `background:true` plus bounded `action:"await"`. It supports explicit
-`resumeFromRunId` with content supplied again by either mechanism; non-elicitation clients resume
-`headless: "pause"` checkpoints with `checkpointReplies` from terminal
-`outcome.checkpointContext`. Unlike the SDK's `openWorkflowDir` path, this input does not resolve a
-saved workflow name. The `workflow` tool is the server's whole tool surface —
-run/resume/inspect/await/stop are action branches, not separate tools. Stop without `callIndex`
-aborts the whole run; stop with `callIndex` cancels only that in-flight agent and returns a live
-inspection snapshot. `labelGlob` filters that snapshot and never selects cancellation. A run that pauses with
-`reason: "auth_required"` resumes via a new run after the backend's own CLI is logged in out-of-band
-(see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as a slash command) also
-get this entire guide from the server itself as the **`author-workflow`** prompt, with an optional
-`task` argument. Environment knobs shared by both routes (MCP server and the SDK below): `AGENTPRISM_DEFAULT_BACKEND`,
-`AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the pool,
-one injected-tool registry per process), `AGENTPRISM_BACKENDS`,
+The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) is the canonical way an agent
+runs an authored script; registration and the per-action contracts are in the Running workflows
+guide section. The `workflow` tool is the server's whole tool surface: run/resume/inspect/await/stop
+are action branches, not separate tools, and this input does not resolve a saved workflow name. A
+run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
+logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as
+a slash command) also get this entire guide from the server itself as the **`author-workflow`**
+prompt, with an optional `task` argument.
+
+Environment knobs shared by the MCP server and the SDK: `AGENTPRISM_DEFAULT_BACKEND`,
+`AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the
+pool; one injected-tool registry per process), `AGENTPRISM_BACKENDS`,
 `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_PERSISTENCE_ROOT`, plus per-backend spawn
 overrides. Pi uses `AGENTPRISM_PI_ACP_CMD` with optional `AGENTPRISM_PI_ACP_ARGS`; otherwise the
 installed exact-pinned package bin is used before the `npx -y @automatalabs/pi-acp` fallback.
 
-Embedding hosts can instead drive the same contract directly through the SDK:
+Embedding hosts drive the same contract directly through the SDK — `runDynamicWorkflow` /
+`WorkflowManager` from `@automatalabs/workflows`, with `exec` limits (`tokenBudget`, `maxAgents`,
+`concurrency`, `agentTimeoutMs`, `agentRetries`), a live `confirm` checkpoint channel, and
+`exec.resumeFromRunId` for edited-script resume. See `docs/api.md` in the repository. The shapes
+below are the MCP tool surface, which is what script authors interact with.
 
-```ts
-import { runDynamicWorkflow } from "@automatalabs/workflows";
-
-const run = await runDynamicWorkflow(script, {
-  cwd: "/abs/project",              // the script's `cwd` global; every session's base dir
-  args: { target: "src/" },         // the script's `args` global, verbatim
-  allowScriptBackends: true,        // approve meta.backends (or a per-backend callback)
-  exec: {
-    tokenBudget: 500_000,           // hard cap → budget.total in-script
-    maxAgents: 200,
-    concurrency: 8,                 // concurrent agents (default 8)
-    agentTimeoutMs: 600_000,         // total wall-clock ceiling for every attempt
-    agentRetries: 1,                // default retries for recoverable failures
-    confirm: async (text, opts) => true,   // live checkpoint channel; omit = authored headless mode
-    onProgress: (snapshot) => {},
-  },
-});
-// run.status: "completed" | "paused" | "failed" | "aborted"
-// run.result · run.runId (resume handle) · run.tokenUsage · run.logs · run.phases · run.effectiveLimits
-// run.replayEligibility? · run.resumeReport? · run.fallbacks? · run.checkpointsTaken? (absent when empty)
-```
-
-For edited-script/current-args resume, call the same entry point with
-`exec: { resumeFromRunId: previous.runId, resumePolicy: "auto", checkpointReplies }`. Reply keys
-name source indexes. The manager prepares and durably persists correspondence before execution.
-
-Exact detached host types:
+Exact MCP tool input/output types:
 
 ```ts
 interface WorkflowExecuteToolInputBase {
@@ -437,43 +325,34 @@ The background start has no enduring request signal, progress channel, or live c
 It returns immediately and emits no progress after returning, even if the initiating request
 supplied a progress token. A later bounded `action:"await"` is a separate request; when that await
 carries a progress token, it can stream coarse phase and distinct started/ended-call progress while
-pending. The legacy/inconsistent-log polling fallback emits no progress notifications. Headless
-checkpoint default continues, abort fails with `WORKFLOW_ABORTED`, and pause returns
+pending. The legacy/inconsistent-log polling fallback emits no progress notifications. A headless
+checkpoint default continues; abort fails with `WORKFLOW_ABORTED`; pause returns
 `checkpoint_required` plus `outcome.checkpointContext`. Auth pauses return non-secret
-`outcome.authContext`; log the backend CLI in before resume. Background is process-lifetime, not
-daemon execution: process death can interrupt an in-flight call, and stale durable
-`pending`/`running` state reconciles under its lease to `paused` / `interrupted`.
+`outcome.authContext`; log the backend CLI in before resume. Background execution lives in the
+serving process (the daemon, or the single process under `--in-process`): that process's death can
+interrupt an in-flight call, and stale durable `pending`/`running` state reconciles under its lease
+to `paused` / `interrupted`.
 
-Background runs are nevertheless observable independently of the initiating tool request. Every
-journaling run has `workflow://runs/{runId}/events`: subscribe to the canonical URI for advisory
-`resources/updated` hints, then read/paginate with `after`, `limit`, and `streamId`. Progress is
-coarse and content-bearing (not token fidelity); `agentTranscript` rows are redacted assistant/tool
-upserts partitioned by `(scope, callIndex, executionStartSeq)` and reduced by greatest revision per
-entry index. The durable cursor is authoritative when hints coalesce or a subscriber falls behind.
-
-`action:"await"` and `action:"inspect"` never replay the script or spend tokens. Their cold
-preflight may briefly acquire a dead owner's stale lease solely to reconcile `pending`/`running` to
-`paused` / `interrupted`. `resumeFromRunId` executes a new run with the caller's current script or
-path snapshot and args, and a new run ID. Every resumed background run durably seeds its inherited prefix (including a
-manager-owned checkpoint injection) beneath that new ID before acknowledgement, so later resume
-hops remain self-contained. The MCP layer never rewrites that seed.
+Every resumed background run durably seeds its inherited prefix (including a manager-owned
+checkpoint injection) beneath its new run ID before acknowledgement, so later resume hops remain
+self-contained. The MCP layer never rewrites that seed. Await and inspect never execute or resume
+the script; their cold preflight may only reconcile a dead owner's stale `pending`/`running` state
+to `paused` / `interrupted`.
 
 Every admitted script is an immutable persistence-backed MCP resource at
-`workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the full resume
-lineage oldest-to-newest and expose structured `{ runId, uri, available }` entries. A fresh session
-can read a lost inline script and explicitly send that text back with `resumeFromRunId`; a path is
-never persisted or implicitly re-read. Listing/completion include only the 50 newest runs, but a
-direct URI read works for any retained project run.
-The MCP layer retains no scripts, args, or synthetic lineage metadata in process memory.
+`workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the full
+resume lineage oldest-to-newest as structured `{ runId, uri, available }` entries. Listing and
+completion include only the 50 newest runs, but a direct URI read works for any retained project
+run. A path is never persisted or implicitly re-read, and the MCP layer retains no scripts, args,
+or synthetic lineage metadata in process memory.
 
-`action:"stop"` durably aborts a `running` or `paused` run live in the serving process, cancels any
-pending agent/checkpoint request, appends `stopped`, releases the lease, and returns the final
-inspection projection with `stopped:true`. Resume is safe immediately; await adds nothing. Only
-backend session wind-down can remain, observable through inspect's agent states. A repeated stop on
-a terminal run succeeds with `stopped:false, alreadyTerminal:true`. For the kill-patch-resume loop:
-stop, edit the file, then submit its `scriptPath` with `resumeFromRunId`. An in-flight stop may lack
-a quiescent terminal-environment proof, so the manager can conservatively run that resume live;
-inspect `replayEligibility` and `resumeReport` rather than assuming a prefix replay.
+`action:"stop"` durably aborts a `running` or `paused` run live in the serving process: it cancels
+any pending agent/checkpoint request, appends `stopped`, releases the lease, and returns the final
+inspection projection with `stopped:true`. Only backend session wind-down can remain, observable
+through inspect's agent states. A repeated stop on a terminal run succeeds with `stopped:false,
+alreadyTerminal:true`. An in-flight stop may lack a quiescent terminal-environment proof, so the
+manager can conservatively run the following resume live; inspect `replayEligibility` and
+`resumeReport` rather than assuming a prefix replay.
 
 Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
 
@@ -572,7 +451,9 @@ Backend auth comes from the machine the host runs on: Claude via a logged-in Cla
 npx @automatalabs/workflows validate <workflow-file> [options]
 ```
 
-Zero tokens: a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run in the real engine realm against a mock `AgentRunner` that fabricates deterministic results (`enum[0]`, `true` booleans, `mock-<field>` strings, one to three array items). Afterward, validation opens each distinct routed `{ backend, model }` pair once without a prompt, selects the authored call model verbatim, and surfaces its echoed model-specific config-options table in both human and JSON reports, even when the script authors none. It checks exact authored ids, select values, boolean types, and the reserved `"model"` key; errors name the call label, authored value, and alternatives and exit `2`. Self-advertised recognized domains win. Otherwise, Claude/Codex enumerate up to 32 picker-visible models and merge consistent effort orders before using the same ordered clamp path. Pi already advertises its domain. OpenCode, custom/unknown backends, too-large catalogs, and inconsistent orders use exact advertised-value validation. Claude effort omission is model-specific and its `default` sentinel is excluded from ceiling ordering. A pair's spawn/auth/model-selection/session failure adds one warning, reports `probed:false`, and skips only that pair's checks—it never fails validation by itself. Catalogs are read afresh on every validation. Script boolean-controlled branches explicitly instead of treating the all-true default as convergence coverage.
+Zero tokens; three passes — static parse, mocked dry run, then one no-prompt config probe per
+routed `{ backend, model }` pair — described in the guide's Validate before you run section. The
+tables and grammar below are the exhaustive contract.
 
 | flag | meaning |
 |---|---|
@@ -649,16 +530,9 @@ Exit codes: `0` all probed · `1` at least one probe failed · `3` usage error.
 
 Programmatic: `probeHarnessConfig({ harnesses, backends, cwd, timeoutMs })` from `@automatalabs/workflows` returns the same report (`backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`); `formatHarnessConfigReport(report)` renders the human table.
 
-## Workflow folders — `openWorkflowDir`
+## Workflow folders
 
-Hosts that keep versioned folders of workflow scripts serve them by name with:
-
-```ts
-import { openWorkflowDir, runDynamicWorkflow } from "@automatalabs/workflows";
-
-const flows = openWorkflowDir("./workflows");   // or [projectDir, teamDir] — first hit wins; no I/O here
-flows.list();                                    // [{ name, file, meta }] — fresh scan per call
-const run = await runDynamicWorkflow("review-pr", { workflows: flows, args });
-```
-
-The filename stem is the name (`review-pr.workflow.js` ⇒ `review-pr`; `.workflow.js` beats `.js`). With the `workflows` option set, the first argument may be a name AND nested `workflow("<name>")` calls resolve from the same view (`flows.resolve` is a ready-made `loadSavedWorkflow` for hand-built `WorkflowManager`s). Every method reads the filesystem at call time — a git checkout/pull is picked up immediately — while each admitted run persists the exact script content used for journal correspondence. For script AUTHORS the takeaway is simply: `workflow("<name>")` works when the host serves a folder; keep names equal to filename stems.
+Hosts that keep versioned folders of workflow scripts serve them by name (the SDK's
+`openWorkflowDir` — see `docs/api.md`). The filename stem is the name (`review-pr.workflow.js` ⇒
+`review-pr`; `.workflow.js` beats `.js`). For script AUTHORS the takeaway is simply:
+`workflow("<name>")` works when the host serves a folder; keep names equal to filename stems.

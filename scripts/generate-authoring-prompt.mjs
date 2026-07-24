@@ -30,13 +30,11 @@ function replaceOnce(text, marker, replacement, file) {
 // The guide's sub-documents, inlined into the self-contained prompt in index reading order.
 const GUIDE_PARTS = [
   "mcp-server-setup.md",
-  "source-contract.md",
   "models-and-output.md",
   "composition-and-failure.md",
   "gates-and-lenses.md",
   "environment-and-tools.md",
   "determinism-and-resume.md",
-  "long-running-trains.md",
   "examples-and-validation.md",
 ];
 
@@ -67,7 +65,7 @@ export function buildAuthoringPromptContent() {
   const inlined = GUIDE_PARTS.map((f) => readFileSync(join(skillDir, f), "utf8").trimEnd()).join("\n\n");
   skill =
     skill.slice(0, begin) +
-    "Every section of the guide is inlined below, after the core: MCP Server Setup, the source contract, models and structured output, composition and failure design, gates and lenses, the execution environment, determinism and resume, long-running trains, and worked examples with validation." +
+    "Every section of the guide is inlined below, after the core: Running workflows (the MCP server and `workflow` tool), backends and structured output, composition and failure, quality helpers and checkpoints, the execution environment, determinism and resume, and worked examples with validation." +
     skill.slice(end + INDEX_END.length) +
     "\n\n" +
     inlined;
@@ -75,9 +73,15 @@ export function buildAuthoringPromptContent() {
   // Same-directory pointers → in-document sections / absolute URLs (applied to the STITCHED text).
   skill = replaceOnce(
     skill,
-    "covered in **MCP Server Setup** ([mcp-server-setup.md](mcp-server-setup.md)).",
-    "covered in the **MCP Server Setup** section below.",
+    "the `args`/`cwd` globals are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)).",
+    "the `args`/`cwd` globals are covered in the **Running workflows** section below.",
     "SKILL.md",
+  );
+  skill = replaceOnce(
+    skill,
+    "background collection, and the events resource are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)).",
+    "background collection, and the events resource are covered in the **Running workflows** section above.",
+    "determinism-and-resume.md",
   );
   skill = replaceOnce(
     skill,
@@ -87,9 +91,9 @@ export function buildAuthoringPromptContent() {
   );
   skill = replaceOnce(
     skill,
-    "(`openWorkflowDir` / the `workflows` run option — see `reference.md`)",
-    "(`openWorkflowDir` / the `workflows` run option — see the reference section below)",
-    "SKILL.md",
+    "saved names resolve when the host serves a workflows folder (see `reference.md`).",
+    "saved names resolve when the host serves a workflows folder (see the reference section below).",
+    "composition-and-failure.md",
   );
   skill = replaceOnce(
     skill,
@@ -111,15 +115,15 @@ export function buildAuthoringPromptContent() {
   );
   skill = replaceOnce(
     skill,
-    "[`examples/implementation-train.workflow.js`](examples/implementation-train.workflow.js)",
-    `[\`implementation-train.workflow.js\`](${EXAMPLES_URL}/implementation-train.workflow.js)`,
+    "[`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js)",
+    "`quick-wins.workflow.js` (included in full at the end of this document)",
     "SKILL.md",
   );
   skill = replaceOnce(
     skill,
-    "[`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js)",
-    "`quick-wins.workflow.js` (included in full at the end of this document)",
-    "SKILL.md",
+    "[`examples/resume-loop-cap.workflow.js`](examples/resume-loop-cap.workflow.js)",
+    `[\`resume-loop-cap.workflow.js\`](${EXAMPLES_URL}/resume-loop-cap.workflow.js)`,
+    "examples-and-validation.md",
   );
   skill = replaceOnce(
     skill,
@@ -129,8 +133,8 @@ export function buildAuthoringPromptContent() {
   );
   skill = replaceOnce(
     skill,
-    "For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and how hosts run scripts, read [`reference.md`](reference.md).",
-    "For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and how hosts run scripts, see the **Workflow script reference** section below.",
+    "For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and the MCP tool input shapes, read [`reference.md`](reference.md).",
+    "For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and the MCP tool input shapes, see the **Workflow script reference** section below.",
     "SKILL.md",
   );
 
