@@ -48,6 +48,7 @@ test("input shape: one tool advertises the exact run, inspect, await, and stop f
       "lastN",
       "logLines",
       "maxAgents",
+      "projectDir",
       "resumeFromRunId",
       "resumePolicy",
       "runId",

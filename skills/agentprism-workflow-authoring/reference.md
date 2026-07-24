@@ -357,6 +357,11 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
   | { script: string; scriptPath?: never }
   | { script?: never; scriptPath: string } // absolute path on the server
 );
+// WorkflowExecuteToolInputBase also carries projectDir?: string — the absolute project
+// directory selecting the project-scoped run store and default execution cwd. REQUIRED for
+// run on the shared workflow daemon (one registration serves every project); optional on a
+// single-project (--in-process) server. inspect/await/stop never take it: a runId locates
+// its project store automatically.
 
 interface WorkflowAwaitToolInput {
   action: "await";
@@ -461,7 +466,7 @@ never persisted or implicitly re-read. Listing/completion include only the 50 ne
 direct URI read works for any retained project run.
 The MCP layer retains no scripts, args, or synthetic lineage metadata in process memory.
 
-`action:"stop"` durably aborts a `running` or `paused` run live in this server process, cancels any
+`action:"stop"` durably aborts a `running` or `paused` run live in the serving process, cancels any
 pending agent/checkpoint request, appends `stopped`, releases the lease, and returns the final
 inspection projection with `stopped:true`. Resume is safe immediately; await adds nothing. Only
 backend session wind-down can remain, observable through inspect's agent states. A repeated stop on

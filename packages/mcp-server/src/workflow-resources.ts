@@ -11,15 +11,17 @@ import type {
   PersistedRunLineageTombstone,
   PersistedRunState,
   RunEventLogErrorCode,
+  RunEventPersistence,
   RunEventStream,
-  WorkflowManager,
 } from "@automatalabs/workflows";
 import {
   RUN_EVENT_READ_LIMIT_DEFAULT,
   RUN_EVENT_READ_LIMIT_MAX,
   RunEventLogError,
+  WorkflowManager,
 } from "@automatalabs/workflows";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
+import { singleStoreRouter, type RunStoreRouter } from "./project-registry.js";
 
 import type { WorkflowScriptLineageEntry } from "./workflow-tool-output.js";
 
@@ -147,7 +149,8 @@ function lineageSourceRunId(state: PersistedRunState): string | undefined {
  * transient controller for a live foreground checkpoint elicitation.
  */
 export class WorkflowScriptResources {
-  private readonly persistence: ReturnType<WorkflowManager["getPersistence"]>;
+  private readonly router: RunStoreRouter;
+  private readonly detachRunDeleted: () => void;
   private readonly subscriptions = new Set<string>();
   private readonly externalReaders = new Map<
     string,
@@ -170,19 +173,38 @@ export class WorkflowScriptResources {
 
   constructor(
     private readonly mcp: McpServer,
-    private readonly manager: WorkflowManager,
+    source: WorkflowManager | { router: RunStoreRouter },
   ) {
-    this.persistence = manager.getPersistence();
-    this.manager.on("runDeleted", this.onRunDeleted);
+    this.router = source instanceof WorkflowManager ? singleStoreRouter(source) : source.router;
+    this.detachRunDeleted = this.router.onRunDeleted(this.onRunDeleted);
     const previousOnClose = this.mcp.server.onclose;
     this.mcp.server.onclose = () => {
       for (const controller of this.elicitationControllers.values()) controller.abort();
       this.elicitationControllers.clear();
       for (const uri of [...this.eventSubscriptions.keys()]) this.closeEventSubscription(uri);
-      this.manager.off("runDeleted", this.onRunDeleted);
+      this.detachRunDeleted();
       previousOnClose?.();
     };
     this.registerProtocolSurface();
+  }
+
+  /** The persistence store containing runId, if any known project store holds it. */
+  private persistenceFor(runId: string): RunEventPersistence | undefined {
+    return this.router.storeFor(runId)?.manager.getPersistence();
+  }
+
+  /** Load a persisted run from whichever project store holds it. */
+  private loadState(runId: string): PersistedRunState | null {
+    return this.persistenceFor(runId)?.load(runId) ?? null;
+  }
+
+  /** Tombstones outlive their run file, so consult every live store. */
+  private loadTombstone(runId: string): PersistedRunLineageTombstone | null | undefined {
+    for (const context of this.router.stores()) {
+      const tombstone = context.manager.getPersistence().loadLineageTombstone?.(runId);
+      if (tombstone) return tombstone;
+    }
+    return undefined;
   }
 
   /**
@@ -218,7 +240,7 @@ export class WorkflowScriptResources {
    */
   deleteRun(runId: string, notify = true): boolean {
     if (!notify) this.silentDeletionRunIds.add(runId);
-    const deleted = this.manager.deleteRun(runId);
+    const deleted = this.router.storeFor(runId)?.manager.deleteRun(runId) ?? false;
     if (!deleted) this.silentDeletionRunIds.delete(runId);
     return deleted;
   }
@@ -231,15 +253,14 @@ export class WorkflowScriptResources {
 
     while (currentRunId && !visited.has(currentRunId)) {
       visited.add(currentRunId);
-      const state = this.persistence.load(currentRunId);
+      const state = this.loadState(currentRunId);
       newestToOldest.push({
         runId: currentRunId,
         uri: workflowScriptUri(currentRunId),
         available: state !== null,
       });
       if (!state) {
-        const tombstone: PersistedRunLineageTombstone | null | undefined =
-          this.persistence.loadLineageTombstone?.(currentRunId);
+        const tombstone = this.loadTombstone(currentRunId);
         currentRunId = tombstone?.sourceRunId;
         continue;
       }
@@ -253,7 +274,7 @@ export class WorkflowScriptResources {
     const links: ResourceLink[] = [];
     for (const entry of lineage) {
       if (!entry.available) continue;
-      const state = this.persistence.load(entry.runId);
+      const state = this.loadState(entry.runId);
       if (!state) continue;
       links.push({
         type: "resource_link",
@@ -267,8 +288,9 @@ export class WorkflowScriptResources {
   }
 
   private recentRuns(): PersistedRunState[] {
-    return this.persistence
-      .list()
+    return this.router
+      .stores()
+      .flatMap((context) => context.manager.getPersistence().list())
       .sort((left, right) => startedAtMillis(right) - startedAtMillis(left) || right.runId.localeCompare(left.runId))
       .slice(0, SCRIPT_RESOURCE_LIST_LIMIT);
   }
@@ -345,7 +367,7 @@ export class WorkflowScriptResources {
       const uri = request.params.uri;
       const runId = workflowRunIdFromScriptUri(uri);
       if (runId) {
-        if (!this.persistence.load(runId)) resourceNotFound(uri);
+        if (!this.loadState(runId)) resourceNotFound(uri);
         this.subscriptions.add(uri);
         return {};
       }
@@ -360,8 +382,8 @@ export class WorkflowScriptResources {
       const runId = workflowRunIdFromScriptUri(uri);
       if (runId) {
         if (
-          !this.persistence.load(runId) &&
-          !this.persistence.loadLineageTombstone?.(runId) &&
+          !this.loadState(runId) &&
+          !this.loadTombstone(runId) &&
           !this.deletedRunIds.has(runId) &&
           !this.subscriptions.has(uri)
         ) resourceNotFound(uri);
@@ -371,7 +393,7 @@ export class WorkflowScriptResources {
       if (!uri.includes("/events")) resourceNotFound(uri);
       const parsed = parseWorkflowRunEventsUri(uri);
       if (!parsed || !parsed.canonical) malformedEventsUri();
-      if (!this.persistence.load(parsed.runId) && !this.persistence.loadLineageTombstone?.(parsed.runId) &&
+      if (!this.loadState(parsed.runId) && !this.loadTombstone(parsed.runId) &&
           !this.deletedRunIds.has(parsed.runId) && !this.eventSubscriptions.has(parsed.normalizedUri)) {
         throw new McpError(ErrorCode.InvalidParams, `Workflow events resource ${parsed.normalizedUri} is not known.`);
       }
@@ -384,12 +406,13 @@ export class WorkflowScriptResources {
     const existing = this.eventSubscriptions.get(parsed.normalizedUri);
     if (existing && !existing.needsRearm && existing.watcher) return {};
     try {
-      const state = this.persistence.load(parsed.runId);
-      if (!state?.eventStreamId || state.eventSeq === undefined) {
+      const persistence = this.persistenceFor(parsed.runId);
+      const state = persistence?.load(parsed.runId);
+      if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
         throw new McpError(ErrorCode.InvalidParams, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} are unavailable.`);
       }
-      const page = this.persistence.readEvents(parsed.runId, { limit: 1, streamId: state.eventStreamId });
-      const watcher = this.persistence.watchEvents(parsed.runId, { after: page.endCursor, streamId: page.streamId });
+      const page = persistence.readEvents(parsed.runId, { limit: 1, streamId: state.eventStreamId });
+      const watcher = persistence.watchEvents(parsed.runId, { after: page.endCursor, streamId: page.streamId });
       const subscription = existing ?? {
         runId: parsed.runId,
         uri: parsed.normalizedUri,
@@ -466,15 +489,16 @@ export class WorkflowScriptResources {
     limit?: number;
     streamId?: string;
   }): WorkflowRunEventsResourceDocument {
-    const state = this.persistence.load(request.runId);
-    if (!state?.eventStreamId || state.eventSeq === undefined) {
+    const persistence = this.persistenceFor(request.runId);
+    const state = persistence?.load(request.runId);
+    if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
       throw new McpError(
         ErrorCode.InvalidParams,
         `Workflow events for ${request.runId} are unavailable.`,
       );
     }
     const after = request.after ?? 0;
-    const page = this.persistence.readEvents(request.runId, {
+    const page = persistence.readEvents(request.runId, {
       after,
       limit: request.limit ?? RUN_EVENT_READ_LIMIT_DEFAULT,
       streamId: request.streamId ?? state.eventStreamId,
@@ -484,13 +508,14 @@ export class WorkflowScriptResources {
 
   /** Canonical (query-less) resource read: the tail window of the current stream. */
   private readEventsTail(runId: string): WorkflowRunEventsResourceDocument {
-    const state = this.persistence.load(runId);
-    if (!state?.eventStreamId || state.eventSeq === undefined) {
+    const persistence = this.persistenceFor(runId);
+    const state = persistence?.load(runId);
+    if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
       throw new McpError(ErrorCode.InvalidParams, `Workflow events for ${runId} are unavailable.`);
     }
-    const head = this.persistence.readEvents(runId, { limit: 1, streamId: state.eventStreamId });
+    const head = persistence.readEvents(runId, { limit: 1, streamId: state.eventStreamId });
     const effectiveAfter = Math.max(0, head.endCursor - RUN_EVENT_READ_LIMIT_DEFAULT);
-    const page = this.persistence.readEvents(runId, {
+    const page = persistence.readEvents(runId, {
       after: effectiveAfter,
       limit: RUN_EVENT_READ_LIMIT_DEFAULT,
       streamId: head.streamId,
@@ -506,12 +531,15 @@ export class WorkflowScriptResources {
   ): WorkflowRunEventsResourceDocument {
     const subscription = this.eventSubscriptions.get(workflowRunEventsUri(runId));
     if (subscription?.needsRearm) {
-      const watcher = this.persistence.watchEvents(runId, { after: page.endCursor, streamId: page.streamId });
-      subscription.watcher?.close();
-      subscription.watcher = watcher;
-      subscription.streamId = page.streamId;
-      subscription.needsRearm = false;
-      this.drainEventWatcher(subscription, watcher);
+      // The store just answered a read, so it is present; skip the re-arm if it vanished since.
+      const watcher = this.persistenceFor(runId)?.watchEvents(runId, { after: page.endCursor, streamId: page.streamId });
+      if (watcher !== undefined) {
+        subscription.watcher?.close();
+        subscription.watcher = watcher;
+        subscription.streamId = page.streamId;
+        subscription.needsRearm = false;
+        this.drainEventWatcher(subscription, watcher);
+      }
     }
     return {
       schemaVersion: WORKFLOW_RUN_EVENTS_SCHEMA_VERSION,
@@ -553,7 +581,7 @@ export class WorkflowScriptResources {
   } {
     const runId = workflowRunIdFromScriptUri(uri);
     if (!runId) resourceNotFound(uri);
-    const state = this.persistence.load(runId);
+    const state = this.loadState(runId);
     if (!state) resourceNotFound(uri);
     return {
       contents: [

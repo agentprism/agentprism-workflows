@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-A **stdio [MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Its model-facing tool surface is the single **`workflow`** tool, with run/resume/inspect/await/stop branches (plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop). Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+An **[MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tool surface is the single **`workflow`** tool, with run/resume/inspect/await/stop branches (plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop). Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. All of the real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool, and serves it over stdin/stdout.
 
@@ -80,9 +80,43 @@ The package ships one executable:
 | --- | --- |
 | `agentprism-workflow` | `dist/cli.js` |
 
-Running it starts the MCP server on stdio: it builds an ACP-backed `AgentRunner`, injects it into a `WorkflowManager`, registers the `workflow` tool, and connects a `StdioServerTransport`. It speaks the MCP protocol — it is not an interactive CLI. Launch it from an MCP host, or pipe JSON-RPC to it yourself for testing.
+Running it starts the MCP stdio entry. **By default this is a thin shim** that proxies stdio to the shared local **workflow daemon** — a per-user process serving spec-compliant Streamable HTTP on loopback — auto-starting the daemon when none is running. Workflow execution lives in the daemon, so runs survive the MCP client killing the stdio process (session end, restarts, tool timeouts). It speaks the MCP protocol — it is not an interactive CLI. Launch it from an MCP host, or pipe JSON-RPC to it yourself for testing.
 
-On stdin EOF, transport close, `SIGINT`, or `SIGTERM`, the server stops accepting new tool calls and disposes the ACP runner before exiting. That closes every pooled backend process with its existing graceful `SIGTERM`/`SIGKILL` teardown. Cleanup has a five-second hard deadline; if graceful disposal stalls, the server synchronously force-kills the tracked backend process trees before it exits. Client disconnects exit with code `0`; signal shutdowns use conventional `SIGINT`/`SIGTERM` exit codes `130`/`143`.
+```
+agentprism-workflow                     # stdio shim → daemon (default)
+agentprism-workflow --in-process        # the pre-daemon single-process stdio server
+agentprism-workflow daemon <start|stop|status|url|run|logs>
+```
+
+With `--in-process`, the old lifecycle applies: on stdin EOF, transport close, `SIGINT`, or `SIGTERM`, the server stops accepting new tool calls and disposes the ACP runner before exiting (five-second hard deadline, then force-kill of tracked backend process trees). The shim itself is disposable — killing it never touches the daemon or its runs.
+
+### The workflow daemon
+
+- **Discovery**: the daemon records `{pid, port, url, version}` in `~/.agentprism/workflows/daemon.json` (mode 0600); shims verify liveness via pid + `/healthz` and never dial a port blind. Concurrent shims race a spawn lock, so a cold start produces exactly one daemon. Logs land in `~/.agentprism/workflows/logs/daemon.log`.
+- **Port**: default `29888` (`AGENTPRISM_DAEMON_PORT` / `--port`). If a foreign process holds the port, the daemon falls back to an ephemeral port — discovery still works, only hardcoded client URLs need the actual port from `daemon status`.
+- **Sessions and projects**: sessions are project-agnostic — every `run` call names its project via the **required `projectDir` argument** (absolute path), so one registration serves any number of projects concurrently. `inspect`/`await`/`stop` take only a runId and locate its project store automatically (live contexts first, then the on-disk store manifests). Each project gets its own `WorkflowManager` — same per-project run stores as before — while all projects share one ACP backend pool. Background runs are visible from every session, and `MAX_BACKGROUND_RUNS` caps runs **per project** rather than per client process.
+- **Lifetime**: only signals, `daemon stop`, or sustained idleness end the daemon (default: 15 min with zero sessions and zero active runs, `AGENTPRISM_DAEMON_IDLE_TTL_MS`, `0` disables). Client disconnects never cancel runs — per the Streamable HTTP spec, cancellation is only an explicit MCP cancellation. Dead-client sessions (no open connections, no traffic for `AGENTPRISM_SESSION_TTL_MS`, default 2 h) are evicted without touching their runs; the shim transparently re-initializes on the spec's 404, so eviction and daemon restarts are invisible to live clients.
+- **Security**: the daemon binds `127.0.0.1` only, validates the `Host` header, and enforces the spec's `Origin` validation (403 for non-loopback origins; extend with `AGENTPRISM_DAEMON_ALLOWED_ORIGINS`). There is no authentication: any local process/user on the machine can reach it — the standard localhost-dev-server trade-off.
+- **Env is captured at daemon start**: the ACP backend registry (`AGENTPRISM_BACKENDS`, `AGENTPRISM_DEFAULT_BACKEND`, …) is resolved once by the daemon. A shim whose env fingerprint differs restarts an **idle** daemon automatically and warns (but still connects) when the daemon is busy; `--in-process` is the escape hatch when you need per-client env.
+
+### Connecting over HTTP directly
+
+HTTP-capable hosts can skip the shim and register the daemon's MCP endpoint straight from `agentprism-workflow daemon url`, which prints ready-to-paste snippets:
+
+```bash
+# Claude Code
+claude mcp add --transport http agentprism-workflows http://127.0.0.1:29888/mcp
+```
+
+```toml
+# Codex (~/.codex/config.toml)
+[mcp_servers.agentprism-workflows]
+url = "http://127.0.0.1:29888/mcp"
+```
+
+One registration — global or per-project — serves every project: each run names its project via the required `projectDir` tool argument, and runId actions need no project at all.
+
+The daemon must be running before an HTTP-only host connects (`daemon start`); any stdio shim usage also keeps it alive. The transport implements the full 2025-11-25 Streamable HTTP contract: per-session `Mcp-Session-Id`, SSE with priming events and `Last-Event-ID` resumability (dropped connections replay missed messages, including tool responses), `DELETE` session termination, and 404-driven re-initialize.
 
 ---
 
@@ -138,6 +172,7 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `action` | `"run" \| "inspect" \| "await" \| "stop"` | no | run | Omit for execution. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state; `"stop"` aborts the run unless `callIndex` selects one in-flight agent. |
 | `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
 | `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/stop. |
+| `projectDir` | absolute path string | run (daemon) | in-process: the server's own project | Absolute project directory: selects the project-scoped run store (where the runId, journal, and resume state live) and the run's default execution cwd. **Required for run on the shared workflow daemon** — one registration serves every project. Forbidden for inspect/await/stop: a runId locates its project store automatically. |
 | `background` | boolean | run only | `false` | Acknowledge after admission and execute in this server process. |
 | `args` | any JSON value | no | — | Optional value exposed to the script as the global `args`. |
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
@@ -556,10 +591,13 @@ client `resources` capability to gate these server-offered primitives.
   `resumeFromRunId`; no MCP credential channel is added.
 - **Retention and process lifetime.** Terminal results are reconstructed from project-scoped
   persistence and have no MCP TTL; repeated/cold await works until deletion, corruption, or store
-  loss. Background means detached from one request, not from this stdio child. A client disconnect
-  tears down this child: it stops new admissions, disposes the ACP runner, force-kills a stalled
-  backend tree at the shutdown deadline, then exits. Therefore in-flight and background work does
-  not survive a disconnect, signal shutdown, host exit, crash, or machine loss. Construction and
+  loss. Runs execute in the shared daemon, so a client disconnect, shim kill, host exit, or session
+  eviction does **not** touch in-flight or background work — the daemon and its runs continue, and
+  any later session of the same project can await/inspect/stop them. Work is lost only when the
+  daemon itself dies (signals, `daemon stop`, crash, machine loss) — or, under `--in-process`,
+  whenever that single client-owned process exits: there a client disconnect stops new admissions,
+  disposes the ACP runner, force-kills a stalled backend tree at the deadline, and exits.
+  Construction and
   cold inspect/list/await/stop/resume preflights reconcile a dead owner's durable
   `pending`/`running` state under its lease to `paused` with `pauseReason: "interrupted"`; completed
   journal entries remain resumable, while an in-flight unjournaled call can run again. Later

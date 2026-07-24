@@ -59,6 +59,33 @@ function exitCodeFor(reason: McpServerShutdownReason): number {
 }
 
 /**
+ * Dispose the concrete ACP runner (and therefore every pooled backend process), racing a hard
+ * deadline. At the deadline the runner's synchronous force-kill path is invoked so a slow
+ * backend shutdown cannot orphan its process tree. Disposal errors are contained: the returned
+ * promise always resolves.
+ */
+export async function disposeRunnerWithDeadline(runner: AgentRunner, deadlineMs = SHUTDOWN_DEADLINE_MS): Promise<void> {
+  const dispose = isDisposableRunner(runner)
+    ? Promise.resolve().then(() => runner.dispose()).catch(() => undefined)
+    : Promise.resolve();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    deadlineTimer = setTimeout(() => {
+      if (isForceKillableRunner(runner)) {
+        try {
+          runner.forceKill();
+        } catch {
+          // The exit path remains guaranteed even if force-kill itself is best-effort.
+        }
+      }
+      resolve();
+    }, deadlineMs);
+  });
+  await Promise.race([dispose, deadline]);
+  if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+}
+
+/**
  * Own the stdio server's process lifetime. The first termination trigger closes the workflow
  * admission gate, disposes the concrete ACP runner (and therefore every pooled backend process),
  * then exits. Disposal errors are intentionally contained: process exit remains guaranteed.
@@ -104,29 +131,7 @@ export function installMcpServerLifecycle(options: McpServerLifecycleOptions): M
       shuttingDown = true;
       options.server.stopAcceptingWork();
 
-      const runner = options.runner;
-      const dispose = isDisposableRunner(runner)
-        ? Promise.resolve().then(() => runner.dispose()).catch(() => undefined)
-        : Promise.resolve();
-      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-      const deadline = new Promise<void>((resolve) => {
-        deadlineTimer = setTimeout(() => {
-          // AcpAgentRunner retains a synchronous path to every connection even after its
-          // asynchronous pool disposal has cleared normal admission state. Invoke it before the
-          // parent exits so a slow Pi shutdown cannot orphan its backend process tree.
-          if (isForceKillableRunner(runner)) {
-            try {
-              runner.forceKill();
-            } catch {
-              // The hard exit remains guaranteed even if force-kill itself is best-effort.
-            }
-          }
-          resolve();
-        }, deadlineMs);
-      });
-
-      shutdownPromise = Promise.race([dispose, deadline]).then(() => {
-        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      shutdownPromise = disposeRunnerWithDeadline(options.runner, deadlineMs).then(() => {
         removeListeners();
         processHandle.exit(exitCodeFor(reason));
       });

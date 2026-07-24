@@ -543,7 +543,8 @@ export class WorkflowManager extends EventEmitter {
   private runs = new Map<string, ManagedRun>();
   private agentAttempts = new Map<string, Set<RegisteredAgentAttempt>>();
   private persistence: RunEventPersistence;
-  private cwd: string;
+  /** The manager's project directory — keys the persistence store and is the default run cwd. */
+  readonly cwd: string;
   private concurrency: number;
   private loadSavedWorkflow?: (name: string) => string | undefined;
   private agent?: AgentRunner;
