@@ -21,6 +21,7 @@ const PI_AUTH_METHODS = [
 
 interface LogEntry {
   method: string;
+  pid?: number;
   params?: {
     configId?: string;
     value?: string | boolean;
@@ -125,6 +126,39 @@ test("Pi schema path injects HTTP MCP, embeds the common fallback, and sends no 
   const text = prompted?.params?.prompt?.map((block) => block.text ?? "").join("") ?? "";
   assert.match(text, /The required output schema \(JSON Schema\)/);
   assert.match(text, /single JSON object/);
+});
+
+test("Pi parallel schema runs overlap on distinct processes and return their own captures", async () => {
+  const { cwd, readLog } = configure([
+    {
+      delayMs: 200,
+      structuredToolCall: { label: "pi-capture", argumentsFromPromptJson: true },
+    },
+  ]);
+  const runner = harness.makeRunner();
+  const payloads = [
+    { city: "Oslo", hot: false },
+    { city: "Lima", hot: true },
+    { city: "Kyiv", hot: false },
+  ];
+
+  const outputs = await Promise.all(payloads.map((payload, index) =>
+    runner.run(`classify ${index}\nSTRUCTURED_OUTPUT_PAYLOAD:${JSON.stringify(payload)}`, {
+      model: "pi",
+      cwd,
+      schema: SCHEMA,
+    }),
+  ));
+
+  assert.deepEqual(outputs, payloads);
+  const log = readLog();
+  const promptPids = log.filter((entry) => entry.method === "prompt").map((entry) => entry.pid);
+  assert.equal(new Set(promptPids).size, 3, "each Pi schema run uses a distinct process");
+  const firstCapture = log.findIndex((entry) => entry.method === "structuredToolCall");
+  const overlapping = new Set(
+    log.slice(0, firstCapture).filter((entry) => entry.method === "prompt").map((entry) => entry.pid),
+  );
+  assert.ok(overlapping.size >= 2, "at least two Pi prompts were in flight before the first capture");
 });
 
 test("Pi categorical provider errors map through the built-in backend", async () => {

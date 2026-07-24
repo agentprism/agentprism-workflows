@@ -1,5 +1,5 @@
 // AcpAgentPool — POOL-manages the ACP server PROCESS lifecycle so it is decoupled from the
-// per-agent SESSION lifecycle. Per backend (claude / codex) it holds a small set of long-lived
+// per-agent SESSION lifecycle. Per backend it holds a small steady-state set of long-lived
 // PooledConnections (default 1, configurable via option/env). Each connection is initialized ONCE
 // and multiplexes many concurrent sessions; the engine limiter already caps concurrency, so the
 // pinned servers run prompts on different sessions concurrently.
@@ -8,8 +8,10 @@
 //   - reuse an idle live connection if one exists (sequential calls reuse ONE process);
 //   - else grow up to `size` (spread concurrent load across processes);
 //   - else pile onto the least-loaded live connection (multiplex past `size`).
-// A crashed process is evicted (drop) and the next acquire spawns a fresh one. dispose() closes
-// every process. A process-exit safety net kills children if the host exits without disposing.
+// Injected StructuredOutput runs instead reserve one process exclusively from other injected runs,
+// growing elastically past `size` when necessary. Surplus idle processes are reaped after a warm
+// keep-alive. A crashed process is evicted (drop) and the next acquire spawns a fresh one. dispose()
+// closes every process. A process-exit safety net kills children if the host exits without disposing.
 import type { Backend, BackendId } from "./backend.js";
 import {
   PooledConnection,
@@ -26,9 +28,21 @@ import type { ProviderStore } from "./provider-store.js";
 
 const DEFAULT_POOL_SIZE = 1;
 const POOL_SIZE_ENV = "AGENTPRISM_ACP_POOL_SIZE";
+const ELASTIC_POOL_IDLE_KEEP_ALIVE_MS = 30_000;
+
+interface PoolSelection {
+  key: string;
+  connection: PooledConnection;
+  injected: boolean;
+}
+
+interface IdleTimer {
+  set(callback: () => void, ms: number): { unref?(): void };
+  clear(timer: { unref?(): void }): void;
+}
 
 export interface AcpPoolOptions {
-  /** Long-lived processes to keep PER backend. Default 1; falls back to AGENTPRISM_ACP_POOL_SIZE. */
+  /** Steady-state processes to keep PER backend. Default 1; falls back to AGENTPRISM_ACP_POOL_SIZE. */
   size?: number;
   /** Client-side ACP fs/terminal handlers advertised at initialize and routed per session. */
   clientHandlers?: ClientHandlers;
@@ -53,6 +67,8 @@ export interface AcpPoolDeps {
    *  under stale (or missing) client-configured provider routing. Undefined or never-recorded =>
    *  no gating, byte-identical baseline. */
   providerStore?: ProviderStore;
+  /** Deterministic elastic-idle clock seam. Production uses the platform timers. */
+  idleTimer?: IdleTimer;
 }
 
 /** Resolve the per-backend pool size: explicit option wins, else env, else 1. Clamped to >= 1. */
@@ -74,6 +90,9 @@ export class AcpAgentPool {
   private readonly byBackend = new Map<BackendId, PooledConnection[]>();
   /** Connections whose async disposal is still in progress, including ones already removed from admission. */
   private readonly disposingConnections = new Set<PooledConnection>();
+  /** Warm keep-alive timers for currently idle connections above the steady-state pool size. */
+  private readonly elasticIdleTimers = new Map<PooledConnection, { unref?(): void }>();
+  private readonly idleTimer: IdleTimer;
   private readonly onProcessExit = () => this.killAllSync();
   private exitHookInstalled = false;
   private disposed = false;
@@ -85,14 +104,19 @@ export class AcpAgentPool {
     validateClientHandlers(options.clientHandlers);
     this.size = resolvePoolSize(options.size);
     this.clientHandlers = options.clientHandlers;
+    this.idleTimer = deps.idleTimer ?? {
+      set: (callback, ms) => setTimeout(callback, ms),
+      clear: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    };
   }
 
   /** Acquire a session for one agent() run: get/grow a pooled connection and open a session. */
   async acquire(backend: Backend, opts: AcpSessionOptions): Promise<SessionHandle> {
     if (this.disposed) throw new Error("ACP agent pool is disposed");
-    const connection = this.selectConnection(backend);
+    const selection = this.selectConnection(backend, false);
+    const { connection } = selection;
     try {
-      return await connection.openSession(opts);
+      return await connection.openSession(opts, () => this.releaseSelection(selection));
     } catch (error) {
       if (opts.signal?.aborted) throw error;
       throw mapThrownError(error, {
@@ -108,12 +132,13 @@ export class AcpAgentPool {
   async acquirePrepared(
     backend: Backend,
     prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
-    context: { signal?: AbortSignal; label?: string } = {},
+    context: { signal?: AbortSignal; label?: string; injected?: boolean } = {},
   ): Promise<SessionHandle> {
     if (this.disposed) throw new Error("ACP agent pool is disposed");
-    const connection = this.selectConnection(backend);
+    const selection = this.selectConnection(backend, context.injected === true);
+    const { connection } = selection;
     try {
-      return await connection.openPreparedSession(prepare);
+      return await connection.openPreparedSession(prepare, () => this.releaseSelection(selection));
     } catch (error) {
       if (context.signal?.aborted) throw error;
       throw mapThrownError(error, {
@@ -130,12 +155,17 @@ export class AcpAgentPool {
     backend: Backend,
     sessionId: string,
     prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
-    context: { signal?: AbortSignal; label?: string } = {},
+    context: { signal?: AbortSignal; label?: string; injected?: boolean } = {},
   ): Promise<{ handle: SessionHandle; method: "resume" | "load" }> {
     if (this.disposed) throw new Error("ACP agent pool is disposed");
-    const connection = this.selectConnection(backend);
+    const selection = this.selectConnection(backend, context.injected === true);
+    const { connection } = selection;
     try {
-      return await connection.openPreparedReattachedSession(sessionId, prepare);
+      return await connection.openPreparedReattachedSession(
+        sessionId,
+        prepare,
+        () => this.releaseSelection(selection),
+      );
     } catch (error) {
       if (context.signal?.aborted) throw error;
       if (error instanceof ReattachCapabilityUnavailable) throw error;
@@ -149,11 +179,11 @@ export class AcpAgentPool {
   }
 
   /**
-   * Pick the connection to host the next session. Runs SYNCHRONOUSLY (no await) through to the
-   * synchronous load-reservation in openSession(), so concurrent acquires never over-spawn or
-   * double-book a connection.
+   * Pick the connection to host the next session. Runs SYNCHRONOUSLY (no await) through both the
+   * injected-process reservation here and the load reservation in openSession(), so concurrent
+   * acquires never over-spawn or double-book a connection.
    */
-  private selectConnection(backend: Backend): PooledConnection {
+  private selectConnection(backend: Backend, injected: boolean): PoolSelection {
     // Pool identity: poolKey (id + spawn-config hash for custom backends) over bare id, so two
     // runs declaring the same NAME with different COMMANDS never share a process.
     const key = backend.poolKey ?? backend.id;
@@ -174,15 +204,46 @@ export class AcpAgentPool {
         !machine?.isStale(c.authStamp) &&
         !this.deps.providerStore?.isStale(key, c.providerStamp),
     );
-    const idle = usable.find((c) => c.activeSessions === 0);
-    if (idle) return idle;
 
-    if (usable.length < this.size) return this.spawn(key, backend);
+    if (injected) {
+      // Space-based isolation for every injecting backend: one live injected run per process.
+      // The reservation is taken in this no-await selection path, so a concurrent acquire sees it
+      // immediately and can never choose the same process. Existing non-injected sessions do not
+      // disqualify a process, matching the previous FIFO's risk profile.
+      const available = usable.filter((c) => !c.injectedRunReserved);
+      const connection = available.length > 0
+        ? available.reduce((least, c) => (c.activeSessions < least.activeSessions ? c : least))
+        : this.spawn(key, backend);
+      if (!connection.tryReserveInjectedRun()) {
+        throw new Error(`ACP pool invariant violated: injected process ${connection.id} was double-booked`);
+      }
+      this.cancelElasticReap(connection);
+      return { key, connection, injected: true };
+    }
+
+    const idle = usable.find((c) => c.activeSessions === 0);
+    if (idle) {
+      this.cancelElasticReap(idle);
+      return { key, connection: idle, injected: false };
+    }
+
+    if (usable.length < this.size) {
+      return { key, connection: this.spawn(key, backend), injected: false };
+    }
 
     // At capacity with every usable connection busy: multiplex onto the least-loaded one.
-    return usable.length > 0
+    const connection = usable.length > 0
       ? usable.reduce((least, c) => (c.activeSessions < least.activeSessions ? c : least))
       : this.spawn(key, backend);
+    this.cancelElasticReap(connection);
+    return { key, connection, injected: false };
+  }
+
+  /** Release the selection-owned reservation only after SessionHandle.release() has completed,
+   *  then retain surplus processes warm for one idle keep-alive before shrinking. */
+  private releaseSelection(selection: PoolSelection): void {
+    if (selection.injected) selection.connection.releaseInjectedRun();
+    this.scheduleElasticReap(selection.key, selection.connection);
   }
 
   /** Reconcile every live connection for a key to the current generation (§2.6). Stale-but-busy
@@ -257,6 +318,7 @@ export class AcpAgentPool {
 
   /** Evict a dead connection so it is never handed out again. */
   private drop(key: string, connection: PooledConnection): void {
+    this.cancelElasticReap(connection);
     const arr = this.byBackend.get(key);
     if (!arr) return;
     const index = arr.indexOf(connection);
@@ -284,6 +346,54 @@ export class AcpAgentPool {
     return disposal;
   }
 
+  /** Schedule one warm-idle reap for a surplus connection. Floor connections stay pinned. */
+  private scheduleElasticReap(key: string, connection: PooledConnection): void {
+    if (
+      this.disposed ||
+      !connection.alive ||
+      connection.recyclePending ||
+      connection.activeSessions !== 0 ||
+      connection.injectedRunReserved ||
+      this.elasticIdleTimers.has(connection)
+    ) {
+      return;
+    }
+    const connections = this.byBackend.get(key);
+    if (!connections?.includes(connection) || connections.length <= this.size) return;
+
+    const timer = this.idleTimer.set(() => {
+      this.elasticIdleTimers.delete(connection);
+      if (this.disposed) return;
+      const current = this.byBackend.get(key);
+      if (
+        !current?.includes(connection) ||
+        current.length <= this.size ||
+        !connection.alive ||
+        connection.recyclePending ||
+        connection.activeSessions !== 0 ||
+        connection.injectedRunReserved
+      ) {
+        return;
+      }
+      this.disposeAndDrop(key, connection);
+    }, ELASTIC_POOL_IDLE_KEEP_ALIVE_MS);
+    timer.unref?.();
+    this.elasticIdleTimers.set(connection, timer);
+  }
+
+  /** A synchronous admission cancels the idle countdown before any await can let it fire. */
+  private cancelElasticReap(connection: PooledConnection): void {
+    const timer = this.elasticIdleTimers.get(connection);
+    if (!timer) return;
+    this.elasticIdleTimers.delete(connection);
+    this.idleTimer.clear(timer);
+  }
+
+  private clearElasticReaps(): void {
+    for (const timer of this.elasticIdleTimers.values()) this.idleTimer.clear(timer);
+    this.elasticIdleTimers.clear();
+  }
+
   /**
    * Close every pooled process and clear the admission registry. Connections remain reachable
    * through `disposingConnections` until their asynchronous graceful teardown settles so a host
@@ -292,6 +402,7 @@ export class AcpAgentPool {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.removeExitHook();
+    this.clearElasticReaps();
     // Include stale connections that were removed from admission by reconciliation but whose
     // graceful disposal has not settled. Otherwise a host lifecycle could see dispose() resolve,
     // cancel its deadline, and exit while such a backend process tree is still alive.

@@ -112,11 +112,12 @@ const OPENCODE_AGENT_PROMPT =
 const SMOKE_PROMPT = "Reply with exactly LIVE_SMOKE_OK and no other text. Do not call tools.";
 
 /** A meta + 3-schema'd-agent parallel() workflow plus one schema-less smoke call (concurrency 3
- *  => 3 simultaneous live sessions, followed by one ordinary text session, all on
- *  ONE pooled process). For injected-tool backends (OpenCode) the runner SERIALIZES the three
- *  schema runs internally — instance-global name-keyed MCP registries expose every registered
- *  tool to every live session, so overlapping injected sessions would leak captures across
- *  sessions. parallel() here deliberately exercises that serialization end to end. */
+ *  => 3 simultaneous live sessions, followed by one ordinary text session). Native-channel
+ *  backends (Claude/Codex) multiplex all four sessions on ONE pooled process. Injected-tool
+ *  backends (OpenCode/Pi) instead reserve one process per concurrent injected run — process
+ *  isolation replaces the old per-connection serialization (#292) — so the three schema runs
+ *  overlap on THREE elastic processes and the schema-less smoke reuses the steady-state one.
+ *  parallel() here deliberately exercises that process-exclusive overlap end to end. */
 function buildScript(backend: Backend, modelSpec?: string): string {
   const prompt = backend === "opencode" ? OPENCODE_AGENT_PROMPT : AGENT_PROMPT;
   const modelEntry = modelSpec ? `, model: ${JSON.stringify(modelSpec)}` : "";
@@ -389,13 +390,19 @@ function assertBackend(backend: Backend, out: LiveOutcome): void {
   // Progress fired.
   assert.ok(out.progressEvents > 0, `live ${backend} emitted at least one progress event${d()}`);
 
-  // Crux 2: pooling reuse — EXACTLY ONE long-lived backend subprocess (a DIRECT child of the
-  // server) served all four sessions. >1 distinct child PID would mean a per-session spawn.
+  // Crux 2: pooling shape. Native-channel backends (Claude/Codex) multiplex all four sessions
+  // on EXACTLY ONE long-lived subprocess; >1 distinct child PID would mean a per-session spawn.
+  // Injected-tool backends (OpenCode/Pi) reserve one process per concurrent injected run (#292):
+  // the 3-wide parallel() must show EXACTLY THREE distinct subprocesses (the schema-less smoke
+  // reuses a steady-state one); 1 would mean the old serialization, 4 a per-session spawn.
   assert.ok(out.samplesWithBackend > 0, `live ${backend} never observed the backend subprocess via ps${d()}`);
+  const injected = backend === "opencode" || backend === "pi";
   assert.equal(
     out.backendProcCount,
-    1,
-    `live ${backend} pooling reuse: exactly ONE backend subprocess must serve all 4 sessions${d()}`,
+    injected ? 3 : 1,
+    injected
+      ? `live ${backend} process-exclusive overlap: the 3 injected runs must land on 3 distinct subprocesses${d()}`
+      : `live ${backend} pooling reuse: exactly ONE backend subprocess must serve all 4 sessions${d()}`,
   );
   // The single process is long-lived (seen across multiple polls + still alive after the run).
   assert.ok(out.maxSamplesForOnePid >= 2, `live ${backend} the one backend process must be long-lived${d()}`);
@@ -420,7 +427,7 @@ test("live-backend e2e: codex npm package drives schema'd structured output with
   assertBackend("codex", out);
 });
 
-test("live-backend e2e: opencode drives schema'd structured output through the injected StructuredOutput tool", {
+test("live-backend e2e: opencode drives injected StructuredOutput with process-exclusive overlap", {
   skip: SKIP,
   timeout: 300_000,
 }, async () => {
@@ -429,7 +436,7 @@ test("live-backend e2e: opencode drives schema'd structured output through the i
   assertBackend("opencode", out);
 });
 
-test("live-backend e2e: pi drives native schema output with single-process pooling reuse", {
+test("live-backend e2e: pi drives injected StructuredOutput with process-exclusive overlap", {
   skip: SKIP,
   timeout: 300_000,
 }, async () => {

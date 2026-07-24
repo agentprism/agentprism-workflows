@@ -388,9 +388,6 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
   /** The auth verbs as one addressable object (§2.10). */
   readonly auth: AuthController;
   private readonly structuredOutputTools = new StructuredOutputToolHost();
-  /** FIFO turn queue per pooled connection for injected-tool schema runs (see the injection
-   *  site for why concurrent injected sessions on one process cannot be isolated). */
-  private readonly structuredToolTurns = new WeakMap<object, Promise<void>>();
   /** Held-open interactive sessions own dedicated ACP processes outside the pool. The runner
    *  tracks their connections so dispose() can release them and the process-exit hook can
    *  synchronously kill any dedicated children if the host exits without release(). */
@@ -801,7 +798,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     let session: SessionHandle | undefined;
     let structuredTool: StructuredOutputToolRegistration | undefined;
     let structuredToolActive = false;
-    let releaseStructuredToolTurn: (() => void) | undefined;
+    const reservesInjectedProcess = schema !== undefined && prepared.backend.injectStructuredOutputTool === true;
     let continuationUsageBaseline: UsageBaseline | undefined;
     let continuationMethod: "resume" | "load" | undefined;
     let keepOpenOnRelease = opts.keepSession === true;
@@ -819,12 +816,6 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     };
 
     const cleanupFailedAcquisition = async (): Promise<void> => {
-      try {
-        releaseStructuredToolTurn?.();
-      } catch {
-        // best-effort cleanup before another acquire.
-      }
-      releaseStructuredToolTurn = undefined;
       try {
         structuredTool?.release();
       } catch {
@@ -845,16 +836,10 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       const prepare = async (connection: PooledConnection): Promise<AcpSessionOptions> => {
         let sessionOptions = prepared.sessionOptions;
         if (shouldInjectStructuredOutputTool(schema, prepared.backend, connection.capabilities)) {
-          // Injected runs are SERIALIZED per connection, and the server name stays CONSTANT.
-          // Agents with instance-global, name-keyed MCP registries (OpenCode) expose every
-          // registered tool to EVERY session on the process, so concurrent same-named
-          // registrations collide and concurrent unique-named ones are cross-visible — either
-          // way one session's model can call another session's tool and leak its capture.
-          // Same-name registration REPLACES the previous entry; holding this per-connection
-          // turn for the whole run guarantees the single live registration belongs to the
-          // active session. Scale schema-run parallelism with pool size (one registry per
-          // process), not sessions.
-          releaseStructuredToolTurn = await this.acquireStructuredToolTurn(connection);
+          // The pool synchronously reserved this process before any acquisition await. Injecting
+          // backends with instance-global MCP registries (OpenCode) therefore expose at most this
+          // run's registration to an active injected session, while Pi and custom backends receive
+          // the same uniform process-exclusive behavior without a backend-specific scope knob.
           structuredTool = await this.structuredOutputTools.register(schema);
           structuredToolActive = true;
           sessionOptions = {
@@ -888,7 +873,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
               prepared.backend,
               recorded.sessionId,
               prepare,
-              { signal: opts.signal, label: opts.label },
+              { signal: opts.signal, label: opts.label, injected: reservesInjectedProcess },
             );
             session = reattached.handle;
             continuationMethod = reattached.method;
@@ -924,6 +909,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
             session = await this.pool.acquirePrepared(prepared.backend, prepare, {
               signal: opts.signal,
               label: opts.label,
+              injected: reservesInjectedProcess,
             });
             break;
           } catch (error) {
@@ -1029,48 +1015,38 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       throw mapped;
     } finally {
       try {
+        structuredTool?.release();
+      } catch {
+        // best-effort tool cleanup; never mask the run result, error, or caller cancellation.
+      }
+      if (session) {
+        // Read real usage on BOTH success and error so partial usage is never lost.
         try {
-          structuredTool?.release();
+          opts.onUsage?.(
+            continuationUsageBaseline
+              ? session.usage.delta(continuationUsageBaseline)
+              : session.usage.toAgentUsage(),
+          );
         } catch {
-          // best-effort tool cleanup; never mask the run result, error, or caller cancellation.
+          // usage is best-effort; never let it mask the real result/error.
         }
-        if (session) {
-          // Read real usage on BOTH success and error so partial usage is never lost.
-          try {
-            opts.onUsage?.(
-              continuationUsageBaseline
-                ? session.usage.delta(continuationUsageBaseline)
-                : session.usage.toAgentUsage(),
-            );
-          } catch {
-            // usage is best-effort; never let it mask the real result/error.
-          }
-          try {
-            opts.onHistory?.(session.history);
-          } catch {
-            // history is diagnostic only.
-          }
-          // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
-          // keepSession skips the close so the agent-persisted session stays re-openable.
-          try {
-            await session.release({ keepOpen: keepOpenOnRelease });
-          } catch (error) {
-            if (isChildCleanupError(error)) {
-              throw mapThrownError(error, {
-                label: opts.label,
-                backendId: prepared.backend.id,
-                backend: prepared.backend,
-              });
-            }
-          }
-        }
-      } finally {
-        // The injected-tool turn spans the WHOLE run incl. session close, so the next queued
-        // schema run's session/new (same-name registry replacement) never overlaps this one.
         try {
-          releaseStructuredToolTurn?.();
+          opts.onHistory?.(session.history);
         } catch {
-          // best-effort turn release; never mask the run outcome.
+          // history is diagnostic only.
+        }
+        // Release the SESSION (best-effort session/close) WITHOUT killing the pooled process.
+        // keepSession skips the close so the agent-persisted session stays re-openable.
+        try {
+          await session.release({ keepOpen: keepOpenOnRelease });
+        } catch (error) {
+          if (isChildCleanupError(error)) {
+            throw mapThrownError(error, {
+              label: opts.label,
+              backendId: prepared.backend.id,
+              backend: prepared.backend,
+            });
+          }
         }
       }
     }
@@ -1078,19 +1054,6 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
   /** Tear down the whole pool (close every long-lived process). Call when the run ends / the
    *  runner is disposed. Beyond the AgentRunner seam (additive) — never enters the resume hash. */
-  /** Await the connection's current injected-run chain and append this run's turn. The
-   *  returned release MUST be called (run finally) or the connection's schema runs starve. */
-  private async acquireStructuredToolTurn(connection: object): Promise<() => void> {
-    const previous = this.structuredToolTurns.get(connection) ?? Promise.resolve();
-    let release!: () => void;
-    const turn = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.structuredToolTurns.set(connection, previous.then(() => turn));
-    await previous;
-    return release;
-  }
-
   async dispose(): Promise<void> {
     this.disposed = true;
     this.removeExitHook();
