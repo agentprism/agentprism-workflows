@@ -1,6 +1,7 @@
-export const FIXTURE_PI_PIN = "0.81.1";
-// 2026-07-21 bump 0.81.0 -> 0.81.1: every fixture string below was re-verified byte-identical
-// against the installed pi v0.81.1 dists and its release-tagged source tests;
+export const FIXTURE_PI_PIN = "0.82.0";
+// 2026-07-24 bump 0.81.1 -> 0.82.0: every fixture string below was re-verified byte-identical
+// against the installed pi v0.82.0 dists (auth strings span concatenated template literals in
+// dist/core/agent-session.js:186,852) and the v0.82.0-tagged source tests;
 // the per-string citations record where each originated in the pi monorepo at v0.80.10.
 
 const LOGIN_HELP = [

@@ -131,6 +131,7 @@ export function translateEvent(event: AgentSessionEvent, failedResult?: PiResult
     case "summarization_retry_scheduled":
     case "summarization_retry_attempt_start":
     case "summarization_retry_finished":
+    case "bash_execution_update":
       return [];
     default: {
       const exhaustive: never = event;
