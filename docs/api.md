@@ -1331,12 +1331,15 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface. Its input is this union:
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface. By default the stdio process is a thin shim proxying to the shared per-user workflow daemon (Streamable HTTP on loopback, auto-started, spec 2025-11-25 session management and resumability); `--in-process` serves everything in the one stdio process instead, and HTTP-capable hosts can register the daemon URL directly (`agentprism-workflow daemon url`). The tool contract is identical on every path except one knob: the daemon **requires** `projectDir` on run inputs, while an in-process server defaults it to its own project. Its input is this union:
 
 ```ts
 interface WorkflowExecuteToolInput {
   action?: "run";
   script: string;
+  projectDir?: string; // absolute project directory: selects the project-scoped run store and
+                       // default execution cwd. REQUIRED on the shared workflow daemon; optional
+                       // on a single-project (--in-process) server, defaulting to its own project.
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -1452,11 +1455,14 @@ loss. The inherited status portion retains its 24,576-byte/redaction budget and 
 8,192-byte cap; raw terminal `outcome` intentionally has no new envelope cap and is never duplicated
 into text.
 
-Background means detached from one request, not from the server process. Stdio-host exit, SIGTERM,
-crash, or machine shutdown can stop in-flight work; there is no daemon/worker handoff. The initial
-record and completed call prefix remain durable, later writes are best effort, and construction or
-a cold await/inspect/stop/resume preflight reconciles an orphaned `pending`/`running` record to
-`paused` / `interrupted` for an explicit new `resumeFromRunId` execution.
+Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that
+proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not
+stop in-flight work. Daemon exit (signals, `daemon stop`, crash, machine shutdown) — or, under
+`--in-process`, the single client-owned process exiting — can; there is no cross-machine handoff.
+The initial record and completed call prefix remain durable, later writes are best effort, and
+construction or a cold await/inspect/stop/resume preflight reconciles an orphaned
+`pending`/`running` record to `paused` / `interrupted` for an explicit new `resumeFromRunId`
+execution.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 

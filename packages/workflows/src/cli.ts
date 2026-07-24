@@ -37,7 +37,11 @@ Commands:
                                     catalog (model ids, effort levels, modes, …) so
                                     model/configOptions values come from the live
                                     catalog, not guesswork
-  mcp                               launch the embedded AgentPrism stdio MCP server
+  mcp                               launch the AgentPrism MCP stdio entry (a thin proxy
+                                    to the shared local workflow daemon, auto-started;
+                                    --in-process restores the old single-process server)
+  daemon <start|stop|status|url|run|logs>
+                                    manage the shared local workflow daemon
 
 Run \`agentprism-workflows <command> --help\` for that command's options.`;
 
@@ -104,13 +108,35 @@ Options:
 
 Exit codes: 0 all probed · 1 at least one probe failed · 3 usage error`;
 
-const MCP_USAGE = `Usage: agentprism-workflows mcp
+const MCP_USAGE = `Usage: agentprism-workflows mcp [options]
 
-Launches the embedded AgentPrism MCP server over stdio. stdin and stdout are reserved
-for JSON-RPC framing and are inherited unchanged by the server process.
+Launches the AgentPrism MCP stdio entry. By default this is a thin shim that proxies
+stdio to the shared local workflow daemon (Streamable HTTP on loopback), auto-starting
+the daemon when none is running — so workflow runs survive this process being killed by
+the MCP client. stdin and stdout are reserved for JSON-RPC framing.
 
 Options:
-  -h, --help          show this help`;
+  --in-process         serve MCP over stdio in this process tree (the pre-daemon
+                       behavior: runs die with the process)
+  --port <n>           daemon port to use/spawn (default: 29888, or
+                       AGENTPRISM_DAEMON_PORT)
+  -h, --help           show this help
+
+Each workflow run names its project via the required \`projectDir\` tool argument, so one
+registration serves every project.`;
+
+const DAEMON_USAGE = `Usage: agentprism-workflows daemon <command>
+
+Manage the shared local workflow daemon (the process that actually executes workflow
+runs; MCP clients reach it via the stdio shim or directly over Streamable HTTP).
+
+Commands:
+  start            start the daemon in the background (no-op when already running)
+  stop             stop the running daemon (SIGTERM, waits for exit)
+  status           show pid, port, version, uptime, sessions, and active runs
+  url              print the MCP endpoint URL and client registration snippets
+  run              run the daemon in the foreground (logs to stderr)
+  logs [-n LINES]  print the tail of the daemon log`;
 
 let activeCommand = "";
 
@@ -170,13 +196,7 @@ async function mainConfig(rest: string[]): Promise<void> {
   process.exitCode = report.exitCode;
 }
 
-async function mainMcp(rest: string[]): Promise<void> {
-  if (rest.length === 1 && (rest[0] === "-h" || rest[0] === "--help")) {
-    process.stdout.write(`${MCP_USAGE}\n`);
-    process.exit(0);
-  }
-  if (rest.length > 0) fail(`mcp does not accept arguments (received: ${rest.join(" ")})`);
-
+function resolveServerPath(): string {
   const bundlePath = resolve(import.meta.dirname, "mcp-server.js");
   const monorepoFallbackPath = resolve(import.meta.dirname, "../../mcp-server/dist/cli.js");
   const serverPath = existsSync(bundlePath)
@@ -191,9 +211,47 @@ async function mainMcp(rest: string[]): Promise<void> {
         "Run `pnpm --filter @automatalabs/workflows build` to create the bundle, or run `pnpm build` at the repository root.",
     );
   }
+  return serverPath;
+}
 
+async function mainMcp(rest: string[]): Promise<void> {
+  const forwarded: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    switch (arg) {
+      case "-h":
+      case "--help":
+        process.stdout.write(`${MCP_USAGE}\n`);
+        process.exit(0);
+        break;
+      case "--in-process":
+        forwarded.push(arg);
+        break;
+      case "--port": {
+        const value = rest[++i];
+        if (value === undefined) fail(`${arg} expects a value`);
+        forwarded.push(arg, value);
+        break;
+      }
+      default:
+        fail(`unknown option "${arg}"`);
+    }
+  }
+
+  await spawnServer(resolveServerPath(), forwarded);
+}
+
+async function mainDaemon(rest: string[]): Promise<void> {
+  if (rest.length === 0 || rest[0] === "-h" || rest[0] === "--help") {
+    process.stdout.write(`${DAEMON_USAGE}\n`);
+    process.exit(rest.length === 0 ? 3 : 0);
+  }
+  await spawnServer(resolveServerPath(), ["daemon", ...rest]);
+}
+
+async function spawnServer(serverPath: string, args: string[]): Promise<void> {
   await new Promise<void>((resolvePromise) => {
-    const child = spawn(process.execPath, [serverPath], { stdio: "inherit" });
+    const child = spawn(process.execPath, [serverPath, ...args], { stdio: "inherit" });
     const forwardedSignals = ["SIGINT", "SIGTERM"] as const;
     let settled = false;
     let cleaned = false;
@@ -271,7 +329,11 @@ async function main(argv: string[]): Promise<void> {
     activeCommand = "mcp";
     return mainMcp(rest);
   }
-  if (command !== "validate") fail(`unknown command "${command}" — the commands are: validate, config, mcp`);
+  if (command === "daemon") {
+    activeCommand = "daemon";
+    return mainDaemon(rest);
+  }
+  if (command !== "validate") fail(`unknown command "${command}" — the commands are: validate, config, mcp, daemon`);
   activeCommand = "validate";
 
   let file: string | undefined;

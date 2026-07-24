@@ -20,12 +20,17 @@ const initializeRequest =
     },
   }) + "\n";
 
-/** Spawn `node <entryPath>`, send an initialize request over stdio, and return the first
- *  JSON-RPC response line (or reject if the process exits without answering). */
-function initializeViaStdio(entryPath: string): Promise<{ id: number; result?: unknown }> {
+// The in-process server touches ~/.agentprism at run time; keep spawned children away from
+// the developer's real home.
+const isolatedHome = mkdtempSync(join(tmpdir(), "agentprism-entrypoint-home-"));
+
+/** Spawn `node <entryPath> [...args]`, send an initialize request over stdio, and return the
+ *  first JSON-RPC response line (or reject if the process exits without answering). */
+function initializeViaStdio(entryPath: string, args: string[] = []): Promise<{ id: number; result?: unknown }> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [entryPath], {
+    const child = spawn(process.execPath, [entryPath, ...args], {
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, HOME: isolatedHome },
     });
     let stdout = "";
     let stderr = "";
@@ -59,16 +64,20 @@ function initializeViaStdio(entryPath: string): Promise<{ id: number; result?: u
   });
 }
 
-// The `bin` entry (dist/cli.js) starts unconditionally; dist/index.js stays runnable for the
-// documented direct-path registration. Both must also answer when invoked THROUGH A SYMLINK:
-// npm/pnpm expose bins as node_modules/.bin symlinks, and Node realpath-resolves the ESM entry
-// module while argv[1] stays the shim path — an entry guard comparing raw paths skips main()
-// and MCP clients report "connection closed: initialize response".
-for (const entry of ["cli.js", "index.js"]) {
+// The `bin` entry (dist/cli.js) dispatches unconditionally — exercised here with
+// --in-process (the daemon shim path has its own e2e suite); dist/index.js stays runnable
+// for the documented direct-path registration. Both must also answer when invoked THROUGH A
+// SYMLINK: npm/pnpm expose bins as node_modules/.bin symlinks, and Node realpath-resolves
+// the ESM entry module while argv[1] stays the shim path — an entry guard comparing raw
+// paths skips main() and MCP clients report "connection closed: initialize response".
+for (const { entry, args } of [
+  { entry: "cli.js", args: ["--in-process"] },
+  { entry: "index.js", args: [] as string[] },
+]) {
   const entryPath = join(distDir, entry);
 
   test(`dist/${entry} answers initialize when invoked directly`, async () => {
-    const response = await initializeViaStdio(entryPath);
+    const response = await initializeViaStdio(entryPath, args);
     assert.equal(response.id, 1);
     assert.ok(response.result, "expected an initialize result");
   });
@@ -78,7 +87,7 @@ for (const entry of ["cli.js", "index.js"]) {
     const shimPath = join(shimDir, "agentprism-workflow");
     symlinkSync(entryPath, shimPath);
     try {
-      const response = await initializeViaStdio(shimPath);
+      const response = await initializeViaStdio(shimPath, args);
       assert.equal(response.id, 1);
       assert.ok(response.result, "expected an initialize result");
     } finally {

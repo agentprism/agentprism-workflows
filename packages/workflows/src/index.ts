@@ -171,6 +171,10 @@ export type {
 } from "@automatalabs/workflow-engine";
 export {
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
+  WORKFLOW_PROJECTS_SUBDIR,
+  workflowHomeDir,
+  workflowProjectKey,
+  workflowProjectPaths,
   WorkflowError,
   WorkflowErrorCode,
   isWorkflowError,

@@ -48,6 +48,13 @@ import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
 import { EXTENSION_ID, registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
+import {
+  BackgroundRunRegistry,
+  MAX_BACKGROUND_RUNS,
+  WorkflowProjectRegistry,
+  resolveProjectDir,
+  type ProjectContext,
+} from "./project-registry.js";
 import { RUN_MONITOR_RESOURCE_URI, registerWorkflowAppUi } from "./app-ui.js";
 import {
   toWorkflowExecutionOutcome,
@@ -70,9 +77,9 @@ import {
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
-const SERVER_VERSION = (require("../package.json") as { version: string }).version;
+export const SERVER_VERSION = (require("../package.json") as { version: string }).version;
 
-export const MAX_BACKGROUND_RUNS = 4;
+export { BackgroundRunRegistry, MAX_BACKGROUND_RUNS } from "./project-registry.js";
 
 const TERMINAL_STATUSES = new Set(["paused", "completed", "failed", "aborted"]);
 
@@ -106,38 +113,6 @@ function isTerminalStatus(status: WorkflowRunStatus["status"]): boolean {
 
 function isAlreadyTerminalForStop(status: WorkflowRunStatus["status"]): boolean {
   return status === "completed" || status === "failed" || status === "aborted";
-}
-
-class BackgroundRunRegistry {
-  private starting = 0;
-  private readonly active = new Map<string, Promise<WorkflowRunResult>>();
-
-  reserve(): boolean {
-    if (this.starting + this.active.size >= MAX_BACKGROUND_RUNS) return false;
-    this.starting++;
-    return true;
-  }
-
-  releaseReservation(): void {
-    if (this.starting > 0) this.starting--;
-  }
-
-  track(runId: string, promise: Promise<WorkflowRunResult>): void {
-    this.releaseReservation();
-    this.active.set(runId, promise);
-    void promise.then(
-      () => this.active.delete(runId),
-      () => this.active.delete(runId),
-    );
-  }
-
-  get(runId: string): Promise<WorkflowRunResult> | undefined {
-    return this.active.get(runId);
-  }
-
-  evict(runId: string): void {
-    this.active.delete(runId);
-  }
 }
 
 /**
@@ -1149,7 +1124,20 @@ function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
  * transport (see index.ts).
  */
 export interface CreateWorkflowServerOptions {
+  /** Pin a pre-built manager as this server's own project (composition/back-compat seam). */
   manager?: WorkflowManager;
+  /** Background-run registry for the pinned manager's project. Defaults to a fresh one. */
+  backgroundRuns?: BackgroundRunRegistry;
+  /**
+   * Share one project registry across servers (the daemon passes its own, shared by every
+   * session, so all sessions see all projects' runs). Defaults to a private registry.
+   */
+  projects?: WorkflowProjectRegistry;
+  /**
+   * Require `projectDir` on run inputs instead of defaulting to this server's own project.
+   * The daemon sets this: it serves every project from one process and has no ambient cwd.
+   */
+  requireProjectDir?: boolean;
 }
 
 export interface WorkflowServer extends McpServer, WorkflowServerControl {}
@@ -1175,13 +1163,33 @@ export function createWorkflowServer(
     extensions: { [EXTENSION_ID]: {} },
   });
 
-  // Composition root: the ACP-backed AgentRunner is injected into the engine here. The
-  // manager owns run lifecycle, status stamping, and the persisted journal used by resume.
-  const manager = options.manager ?? new WorkflowManager({ agent: runner });
-  const scriptResources = new WorkflowScriptResources(mcp, manager);
-  const backgroundRuns = new BackgroundRunRegistry();
+  // Composition root: the ACP-backed AgentRunner is injected into the engine here. Each
+  // project's manager owns run lifecycle, status stamping, and the persisted journal used by
+  // resume; the registry routes calls to the right project (run: the projectDir argument;
+  // inspect/await/stop: locating the runId's store).
+  const requireProjectDir = options.requireProjectDir === true;
+  const projects = options.projects ?? new WorkflowProjectRegistry(runner);
+  const defaultContext: ProjectContext | undefined = requireProjectDir
+    ? undefined
+    : projects.adopt(options.manager ?? new WorkflowManager({ agent: runner }), options.backgroundRuns);
+  const scriptResources = new WorkflowScriptResources(mcp, { router: projects });
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
+
+  /** Route a parsed input to its project context; undefined = runId found in no known store. */
+  const resolveContext = (input: ReturnType<typeof parseWorkflowToolInput>): ProjectContext | undefined => {
+    if (input.action === "inspect" || input.action === "await" || input.action === "stop") {
+      return projects.storeFor(input.runId) ?? defaultContext;
+    }
+    if (input.projectDir !== undefined) {
+      const resolution = resolveProjectDir(input.projectDir);
+      if (!resolution.ok) {
+        throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${resolution.message}`);
+      }
+      return projects.getOrCreate(resolution.projectDir);
+    }
+    return defaultContext;
+  };
 
   registerAuthoringPrompt(mcp);
 
@@ -1204,7 +1212,12 @@ export function createWorkflowServer(
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
         "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
-        "read once and snapshotted at admission. Foreground is the default and streams progress; background:true returns " +
+        "read once and snapshotted at admission. " +
+        (requireProjectDir
+          ? "run REQUIRES projectDir (absolute): it selects the project-scoped run store and the run's default execution cwd. "
+          : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
+        "inspect/await/stop take only a runId — it locates its project store automatically. " +
+        "Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +
         "run from a prior journal prefix. " +
         'Use action:"inspect" with a runId for a safe bounded status, log tail, and attributed call previews. ' +
@@ -1212,7 +1225,7 @@ export function createWorkflowServer(
         "and keep the run live. labelGlob remains an output filter in both forms. A whole-run stop returns " +
         "the final run fate; resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
-        "Background is tied to this server process, capped at four active/starting runs, and uses " +
+        "Background runs are tracked per project, capped at four active/starting runs, and use " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
       inputSchema: workflowToolInputShape,
       outputSchema: workflowToolOutputShape,
@@ -1224,7 +1237,41 @@ export function createWorkflowServer(
           "Workflow server is shutting down and is no longer accepting tool calls.",
         );
       }
-      const parsedInput = parseWorkflowToolInput(args);
+      const parsedInput = parseWorkflowToolInput(args, { requireProjectDir });
+      const context = resolveContext(parsedInput);
+      if (context === undefined) {
+        // Only reachable for runId actions whose run exists in no known project store.
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No workflow run found for runId "${(parsedInput as { runId: string }).runId}" in any project-scoped run store known to this server.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const manager = context.manager;
+      const backgroundRuns = context.backgroundRuns;
+      if ((parsedInput.action === undefined || parsedInput.action === "run") && parsedInput.resumeFromRunId !== undefined) {
+        // Cross-project resume is an explicit redirect, never a silent miss in the wrong store.
+        if (!manager.getPersistence().load(parsedInput.resumeFromRunId)) {
+          const elsewhere = projects.storeFor(parsedInput.resumeFromRunId);
+          if (elsewhere !== undefined && elsewhere !== context) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `resumeFromRunId "${parsedInput.resumeFromRunId}" belongs to project "${elsewhere.projectDir}". ` +
+                    `Re-send the run with projectDir: "${elsewhere.projectDir}" to resume it there.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
+      }
       if (parsedInput.action === "inspect") {
         const status = manager.inspectRun(parsedInput.runId, {
           lastN: parsedInput.lastN,

@@ -49,6 +49,17 @@ export const workflowToolInputShape = {
         "Exactly one of script or scriptPath is required for run; both are forbidden for inspect/await/stop. " +
         "Relative paths are rejected.",
     ),
+  projectDir: z
+    .string()
+    .min(1)
+    .refine((value) => isAbsolute(value), "projectDir must be an absolute path")
+    .optional()
+    .describe(
+      "Absolute project directory the run belongs to: it selects the project-scoped run store " +
+        "(where the runId, journal, and resume state live) and is the run's default execution cwd. " +
+        "Required for run on the shared workflow daemon; on a single-project (in-process) server it " +
+        "defaults to that server's own project. Forbidden for inspect/await/stop — a runId locates its project.",
+    ),
   args: z.unknown().optional().describe("Optional JSON value exposed to the script as the global `args`."),
   maxAgents: z
     .number()
@@ -135,6 +146,8 @@ export const workflowToolInputShape = {
 
 interface WorkflowExecuteToolInputBase {
   action?: "run";
+  /** Absolute project directory selecting the run store and default execution cwd. */
+  projectDir?: string;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -166,6 +179,7 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   callIndex?: never;
   script?: never;
   scriptPath?: never;
+  projectDir?: never;
   background?: never;
   waitMs?: never;
   resumeFromRunId?: never;
@@ -181,6 +195,7 @@ export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   waitMs?: number;
   script?: never;
   scriptPath?: never;
+  projectDir?: never;
   background?: never;
   resumeFromRunId?: never;
   resumePolicy?: never;
@@ -194,6 +209,7 @@ export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
   callIndex?: number;
   script?: never;
   scriptPath?: never;
+  projectDir?: never;
   background?: never;
   waitMs?: never;
   resumeFromRunId?: never;
@@ -211,6 +227,7 @@ interface RawWorkflowToolInput {
   action?: "run" | "inspect" | "await" | "stop";
   script?: string;
   scriptPath?: string;
+  projectDir?: string;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -233,6 +250,7 @@ function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
   return (
     raw.script !== undefined ||
     raw.scriptPath !== undefined ||
+    raw.projectDir !== undefined ||
     raw.args !== undefined ||
     raw.maxAgents !== undefined ||
     raw.concurrency !== undefined ||
@@ -250,8 +268,20 @@ function invalid(message: string): never {
   throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
 }
 
+export interface ParseWorkflowToolInputOptions {
+  /**
+   * Enforce projectDir on run inputs. The shared workflow daemon serves every project from
+   * one process and has no ambient cwd, so a run must name its project; a single-project
+   * (in-process) server leaves this off and defaults to its own project.
+   */
+  requireProjectDir?: boolean;
+}
+
 /** Apply the action discriminator after the MCP SDK has validated primitive fields. */
-export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolInput {
+export function parseWorkflowToolInput(
+  raw: RawWorkflowToolInput,
+  options: ParseWorkflowToolInputOptions = {},
+): WorkflowToolInput {
   if (raw.action === "inspect") {
     if (!raw.runId) invalid('action="inspect" requires runId');
     if (hasExecutionFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined) {
@@ -309,6 +339,11 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
   const hasScript = raw.script !== undefined;
   const hasScriptPath = raw.scriptPath !== undefined;
   if (hasScript === hasScriptPath) invalid("exactly one of script or scriptPath is required");
+  if (options.requireProjectDir === true && raw.projectDir === undefined) {
+    invalid(
+      "run requires projectDir (the absolute project directory) on this server — it selects the project-scoped run store and default execution cwd",
+    );
+  }
   if (raw.resumePolicy !== undefined && raw.resumeFromRunId === undefined) {
     invalid("resumePolicy requires resumeFromRunId");
   }
@@ -317,6 +352,7 @@ export function parseWorkflowToolInput(raw: RawWorkflowToolInput): WorkflowToolI
   }
   const common = {
     action: raw.action,
+    projectDir: raw.projectDir,
     args: raw.args,
     maxAgents: raw.maxAgents,
     concurrency: raw.concurrency,

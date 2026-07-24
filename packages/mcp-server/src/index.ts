@@ -13,7 +13,7 @@ import { createAcpRunner } from "@automatalabs/workflows";
 import { installMcpServerLifecycle } from "./lifecycle.js";
 import { createWorkflowServer } from "./server.js";
 
-export { createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
+export { BackgroundRunRegistry, createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
 export type {
   CreateWorkflowServerOptions,
   WorkflowConfirmCallback,
@@ -56,7 +56,7 @@ export {
   registerWorkflowAppUi,
 } from "./app-ui.js";
 export type { WorkflowAppUiDeps } from "./app-ui.js";
-export { installMcpServerLifecycle, SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
+export { disposeRunnerWithDeadline, installMcpServerLifecycle, SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 export type { McpServerLifecycle, McpServerLifecycleOptions, McpServerShutdownReason, WorkflowServerControl } from "./lifecycle.js";
 export {
   EVENTS_RESOURCE_MIME_TYPE,
@@ -93,7 +93,10 @@ export async function main(): Promise<void> {
 // library. npm/pnpm bin shims are symlinks and Node realpath-resolves the ESM entry module, so
 // argv[1] must be realpath'd before comparing — matching the raw shim path would silently skip
 // main() and the MCP client would see the connection close before the initialize response.
+// Inside the esbuild bundle every module shares one import.meta.url, so when entry.ts's argv
+// dispatcher owns startup it raises this global (see entry-mode.ts) to keep main() dormant.
 function isProcessEntryPoint(): boolean {
+  if ((globalThis as Record<string, unknown>).__agentprismEntryDispatch === true) return false;
   const invokedPath = process.argv[1];
   if (invokedPath === undefined) return false;
   try {

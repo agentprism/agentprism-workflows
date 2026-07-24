@@ -106,9 +106,10 @@ status intentionally do not. It carries `scriptUri` but not the admission-only, 
 `scriptSource`. `checkpointsTaken` identifies resolved live, headless-default,
 journal-replay, and injected `checkpointReplies` decisions without repeating prompt text.
 
-Background is detached from the initiating request, not from the MCP server process; a stdio child
-exit can stop in-flight work. The start request has no live checkpoint elicitation, so authored
-headless checkpoint modes apply. Resume only a paused durable journal: submit a new run with the
+Background is detached from the client entirely: runs execute in the shared workflow daemon, so a
+client disconnect or shim exit does not stop in-flight work — only daemon exit (or, under
+`--in-process`, that single process exiting) can. The start request has no live checkpoint
+elicitation, so authored headless checkpoint modes apply. Resume only a paused durable journal: submit a new run with the
 script, `resumeFromRunId`, and any `checkpointReplies`. That execution gets a new run ID and
 durably inherits the complete replay prefix. Await and inspect never execute or resume the script;
 their cold preflight may only reconcile dead-owner status.

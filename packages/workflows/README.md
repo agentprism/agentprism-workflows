@@ -781,7 +781,7 @@ formatHarnessConfigReport(report); // the CLI's human table
 
 ## Launching the MCP server — `agentprism-workflows mcp`
 
-Register the bundled stdio server directly from the workflows package; no separate
+Register the bundled MCP entry directly from the workflows package; no separate
 `@automatalabs/mcp-server` installation is required:
 
 ```json
@@ -794,6 +794,18 @@ Register the bundled stdio server directly from the workflows package; no separa
   }
 }
 ```
+
+By default `mcp` runs a thin **stdio shim** that proxies to the shared local **workflow
+daemon** (Streamable HTTP on loopback, auto-started on first use), so workflow runs survive
+the MCP client killing the stdio process. Every `run` call names its project via the required
+`projectDir` tool argument, so one registration — even in global MCP settings — serves every
+project; `inspect`/`await`/`stop` locate a runId's project automatically. `--in-process`
+restores the pre-daemon single-process stdio server (there `projectDir` is optional and
+defaults to that server's own cwd). Manage the daemon with `agentprism-workflows daemon
+<start|stop|status|url|run|logs>` — `daemon url` prints registration snippets for HTTP-capable
+hosts (Claude Code `--transport http`, Codex `config.toml` `url`), which can skip the shim
+entirely. See the [`@automatalabs/mcp-server` README](../mcp-server#the-workflow-daemon) for
+the daemon's full contract (discovery, project routing, idle shutdown, security posture).
 
 For the source inner loop, build workflows before launching its compiled CLI:
 

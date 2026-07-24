@@ -237,7 +237,9 @@ The single `workflow` tool runs in the foreground by default, can acknowledge lo
 project-scoped run by ID. Foreground execution streams `notifications/progress` and returns the
 terminal structured result.
 
-Register the stdio server in your MCP host's config:
+Register the MCP entry in your host's config (the same command as before — it is now a thin
+stdio shim that auto-starts a shared local **workflow daemon**, so runs survive the host
+killing the process; add `--in-process` to the args for the old single-process behavior):
 
 ```json
 {
@@ -322,9 +324,11 @@ Then long-poll in ordinary bounded tool calls until `outcome` appears:
 
 A timeout returns the freshest bounded status and partial cumulative token usage; terminal await
 adds the same raw result/log projection a foreground call returns. At most four background runs may
-be active or starting per server process. Background means detached from the initiating MCP request,
-not from the stdio server process: process exit can stop in-flight work, while the durable journal
-prefix remains resumable. Background runs send no request progress and use authored headless
+be active or starting per project. Runs execute in the shared local daemon, so MCP clients
+disconnecting or killing the stdio shim never stops in-flight work — any later session of the same
+project can await/inspect/stop it. Only daemon exit (signals, `daemon stop`, crash, machine loss) —
+or, under `--in-process`, the client-owned process exiting — stops in-flight work, while the durable
+journal prefix remains resumable. Background runs send no request progress and use authored headless
 checkpoint behavior. Resume after a pause/crash by starting a new run with `resumeFromRunId`; each
 new background run durably inherits the replay prefix under its new run ID before acknowledgement.
 

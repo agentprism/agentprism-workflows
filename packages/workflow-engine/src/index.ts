@@ -183,6 +183,7 @@ export {
   workflowUserSavedDir,
   workflowProjectKey,
   AGENTPRISM_PERSISTENCE_ROOT_ENV,
+  WORKFLOW_PROJECTS_SUBDIR,
   type WorkflowProjectPaths,
   type WorkflowPathOptions,
 } from "./workflow-paths.js";
