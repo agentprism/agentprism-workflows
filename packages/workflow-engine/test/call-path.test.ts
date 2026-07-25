@@ -79,6 +79,32 @@ return await parallel([1, 2, 3].map((value) => () => agent('map-' + value)))`);
     assert.equal(mappedPaths.length, 3);
   });
 
+  it("emits the runner's callPath on the agentStart event", async () => {
+    const runnerPaths: Array<string | undefined> = [];
+    const startPaths: Array<string | undefined> = [];
+    const runner: AgentRunner = {
+      async run<S extends TSchema | undefined = undefined>(
+        _prompt: string,
+        options?: RunOptions<S>,
+      ): Promise<AgentResult<S>> {
+        runnerPaths.push(options?.callPath);
+        return "ok" as AgentResult<S>;
+      },
+    };
+    await runWorkflow(
+      `export const meta = { name: 'path', description: 'call path' }\nreturn await agent('direct')`,
+      {
+        agent: runner,
+        persistLogs: false,
+        onAgentStart: (event) => startPaths.push(event.path),
+      },
+    );
+
+    assert.equal(startPaths.length, 1);
+    assert.equal(startPaths[0], runnerPaths[0]);
+    assert.notEqual(startPaths[0], undefined);
+  });
+
   it("records aliased agent invocations by call site", async () => {
     const paths = await pathsFor(`await Promise.resolve()
 const invoke = agent

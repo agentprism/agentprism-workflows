@@ -32,6 +32,11 @@ export interface NodeModel {
   /** The backend-resolved model id, when the run reported one. */
   modelResolved?: string;
   backendId?: string;
+  /** Engine structural call path (agentStart.path) — joins the node to a skeleton site. */
+  path?: string;
+  /** Originating engine run; the skeleton join only applies when scope === RunModel.runId
+   *  (workflow() children share the stream but execute a different script). */
+  scope?: string;
   status: NodeStatus;
   startSeq: number;
   startTs?: number;
@@ -47,6 +52,13 @@ export interface NodeModel {
   progress: DetailRow[];
 }
 
+export interface CheckpointModel {
+  callIndex: number;
+  path?: string;
+  scope?: string;
+  outcome: "result" | "null" | "error";
+}
+
 export interface RunModel {
   runId: string;
   streamId?: string;
@@ -60,6 +72,8 @@ export interface RunModel {
   /** Every phase() transition in stream order, for slicing run logs per phase. */
   phaseMarks: Array<{ title: string; seq: number; ts?: number }>;
   nodes: Map<number, NodeModel>;
+  /** Settled checkpoint() calls (from callRecord events) — checkpoints emit no agentStart. */
+  checkpoints: Map<number, CheckpointModel>;
   logs: DetailRow[];
   usage?: TokenUsage;
   agentCountFinal?: number;
@@ -76,6 +90,7 @@ export function createRunModel(runId: string): RunModel {
     phases: [],
     phaseMarks: [],
     nodes: new Map(),
+    checkpoints: new Map(),
     logs: [],
   };
 }
@@ -183,6 +198,8 @@ export function foldRecord(model: RunModel, record: RunEventLogRecord): void {
       };
       if (event.phase !== undefined) node.phase = event.phase;
       if (event.model !== undefined) node.model = event.model;
+      if (event.path !== undefined) node.path = event.path;
+      node.scope = event.scope;
       if (at !== undefined) node.startTs = at;
       model.nodes.set(event.callIndex, node);
       return;
@@ -232,6 +249,22 @@ export function foldRecord(model: RunModel, record: RunEventLogRecord): void {
         // Order by execution partition first, then entry index within it.
         row: rowFromHistoryEntry(event.entry, event.executionStartSeq * 100_000 + event.entryIndex, at),
       });
+      return;
+    }
+    case "callRecord": {
+      const call = event.record;
+      if (call.kind === "checkpoint") {
+        const checkpoint: CheckpointModel = { callIndex: call.index, outcome: call.outcome };
+        if (call.path !== undefined) checkpoint.path = call.path;
+        checkpoint.scope = event.scope;
+        model.checkpoints.set(call.index, checkpoint);
+        return;
+      }
+      // Agents: backfill the call path for streams recorded before agentStart carried it.
+      const node = model.nodes.get(call.index);
+      if (node !== undefined && node.path === undefined && call.path !== undefined) {
+        node.path = call.path;
+      }
       return;
     }
     case "log": {

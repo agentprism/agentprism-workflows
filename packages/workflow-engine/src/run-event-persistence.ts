@@ -533,7 +533,8 @@ function isPersistableInputEvent(value: unknown): value is PersistableEngineRunE
         hasOptional(value, "model", isString) &&
         hasOptional(value, "configOptions", (candidate) => isConfigOptions(candidate, false)) &&
         hasOptional(value, "timeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
-        hasRequired(value, "callIndex", isNonNegativeSafeInteger)
+        hasRequired(value, "callIndex", isNonNegativeSafeInteger) &&
+        hasOptional(value, "path", isString)
       );
     case "agentProgress":
       return isAgentProgress(value, false);
@@ -606,7 +607,8 @@ function isPersistedEvent(value: unknown): boolean {
         hasOptional(value, "model", isProjectedText) &&
         hasOptional(value, "configOptions", (candidate) => isConfigOptions(candidate, true)) &&
         hasOptional(value, "timeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
-        hasRequired(value, "callIndex", isNonNegativeSafeInteger)
+        hasRequired(value, "callIndex", isNonNegativeSafeInteger) &&
+        hasOptional(value, "path", isProjectedText)
       );
     case "agentProgress":
       return isAgentProgress(value, true);

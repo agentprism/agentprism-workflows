@@ -20,6 +20,8 @@ import { DetailView } from "./DetailView.js";
 import { fmtCost, fmtDuration, fmtTokens, shortRunId } from "./format.js";
 import { GraphView } from "./GraphView.js";
 import type { NodeSelection } from "./GraphView.js";
+import { extractSkeleton } from "./skeleton.js";
+import type { Skeleton } from "./skeleton.js";
 import { agentCount, createRunModel, foldRecord } from "./state.js";
 import type { RunModel, RunStatus } from "./state.js";
 import "./style.css";
@@ -178,6 +180,36 @@ function useRunModel(app: App | null, runId: string | undefined): MonitorState {
   return { model: runId === undefined ? null : modelRef.current, connectionLost, fatal };
 }
 
+/**
+ * Fetch the run's admitted script and extract its structural skeleton. Any failure — the
+ * host not supporting resource reads, the resource missing, an unparseable script — yields
+ * undefined and the graph falls back to the timing-based wave layout.
+ */
+function useSkeleton(app: App | null, runId: string | undefined): Skeleton | undefined {
+  const [skeleton, setSkeleton] = useState<Skeleton | undefined>(undefined);
+  useEffect(() => {
+    if (!app || runId === undefined) return;
+    let cancelled = false;
+    setSkeleton(undefined);
+    void (async () => {
+      try {
+        const result = await app.readServerResource({ uri: `workflow://runs/${runId}/script` });
+        if (cancelled) return;
+        const text = (result.contents as Array<{ text?: unknown }>).find(
+          (content) => typeof content.text === "string",
+        )?.text as string | undefined;
+        if (text !== undefined) setSkeleton(extractSkeleton(text));
+      } catch {
+        // Fall back silently; the wave view needs nothing beyond the event stream.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [app, runId]);
+  return runId === undefined ? undefined : skeleton;
+}
+
 function ElapsedClock({ model }: { model: RunModel }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -251,12 +283,14 @@ function StopButton({ app, runId }: { app: App; runId: string }) {
 function MonitorBody({
   app,
   model,
+  skeleton,
   connectionLost,
   fatal,
   budget,
 }: {
   app: App;
   model: RunModel;
+  skeleton: Skeleton | undefined;
   connectionLost: boolean;
   fatal: string | undefined;
   budget: number | null | undefined;
@@ -265,6 +299,7 @@ function MonitorBody({
     kind: "graph",
   });
   const [expandedWaves, setExpandedWaves] = useState<ReadonlySet<string>>(new Set());
+  const [loopSelections, setLoopSelections] = useState<ReadonlyMap<string, number>>(new Map());
 
   const live = !model.finalized && model.status !== "completed";
   const bannerMessage = fatal ?? model.banner;
@@ -290,9 +325,14 @@ function MonitorBody({
       {view.kind === "graph" ? (
         <GraphView
           model={model}
+          skeleton={skeleton}
           expandedWaves={expandedWaves}
           onExpandWave={(waveKey) =>
             setExpandedWaves((current) => new Set([...current, waveKey]))
+          }
+          loopSelections={loopSelections}
+          onSelectLoopIteration={(loopId, iteration) =>
+            setLoopSelections((current) => new Map([...current, [loopId, iteration]]))
           }
           onSelect={(target) => setView({ kind: "detail", target })}
         />
@@ -340,6 +380,7 @@ function RunMonitor() {
 
   const runId = runIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
   const { model, connectionLost, fatal } = useRunModel(app, runId);
+  const skeleton = useSkeleton(app, runId);
   const budget = budgetFromResult(toolResult);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
@@ -354,6 +395,7 @@ function RunMonitor() {
       key={runId}
       app={app}
       model={model}
+      skeleton={skeleton}
       connectionLost={connectionLost}
       fatal={fatal}
       budget={budget}
