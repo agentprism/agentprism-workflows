@@ -1218,9 +1218,13 @@ export function createWorkflowServer(
           : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
         "inspect/await/stop take only a runId — it locates its project store automatically. " +
         "Foreground is the default and streams progress; background:true returns " +
-        "a durable runId for bounded action:\"await\" calls. Pass resumeFromRunId to execute a new " +
+        "a durable runId for bounded action:\"await\" calls. run and await honor _meta.progressToken " +
+        "with notifications/progress while they block. Pass resumeFromRunId to execute a new " +
         "run from a prior journal prefix. " +
-        'Use action:"inspect" with a runId for a safe bounded status, log tail, and attributed call previews. ' +
+        "In hosts that render MCP Apps, every call of this tool shows a live self-updating run-monitor " +
+        "panel and the panel pushes current run status into your context on its own — do NOT poll " +
+        'action:"inspect" to check on a run there; prefer a single bounded action:"await". ' +
+        'Use action:"inspect" with a runId when you need machine-readable status data: a safe bounded status, log tail, and attributed call previews. ' +
         'Use action:"stop" to durably abort a live run; add callIndex to cancel only that in-flight agent ' +
         "and keep the run live. labelGlob remains an output filter in both forms. A whole-run stop returns " +
         "the final run fate; resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
@@ -1301,7 +1305,13 @@ export function createWorkflowServer(
         return {
           structuredContent: { ...projected },
           content: [
-            { type: "text", text: formatInspectionSummary(projected) },
+            // Status summaries are model input, not user-facing chat content (the run-monitor
+            // panel is the user's live view) — the audience annotation says so per MCP core.
+            {
+              type: "text",
+              text: formatInspectionSummary(projected),
+              annotations: { audience: ["assistant"] },
+            },
             ...scriptResources.links(lineage),
           ],
           isError: false,
@@ -1552,7 +1562,12 @@ export function createWorkflowServer(
         return {
           structuredContent: { ...result },
           content: [
-            { type: "text", text: formatAwaitSummary(result) },
+            // Same audience hint as inspect: the await summary is for the model.
+            {
+              type: "text",
+              text: formatAwaitSummary(result),
+              annotations: { audience: ["assistant"] },
+            },
             ...scriptResources.links(lineage),
           ],
           isError: false,
@@ -1678,7 +1693,9 @@ export function createWorkflowServer(
                     ? `${formatResumeSummary(admittedRun.replayEligibility)}\n`
                     : "") +
                   `Call workflow with action="await" and this runId to wait for its result, or ` +
-                  `action="inspect" for an immediate status snapshot.`,
+                  `action="inspect" for an immediate status snapshot. If a live run-monitor panel ` +
+                  `is shown for this run, it self-updates and pushes status into your context — ` +
+                  `do not poll inspect for status.`,
               },
               ...links,
             ],

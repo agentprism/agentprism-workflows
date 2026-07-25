@@ -112,7 +112,9 @@ test("background acceptance is immediate and await reports immediate, timeout, c
       `Workflow "detached-review" started in the background.\n` +
         `runId: ${acceptedRunId}\n` +
         `Call workflow with action="await" and this runId to wait for its result, or ` +
-        `action="inspect" for an immediate status snapshot.`,
+        `action="inspect" for an immediate status snapshot. If a live run-monitor panel ` +
+        `is shown for this run, it self-updates and pushes status into your context — ` +
+        `do not poll inspect for status.`,
     );
     assert.equal(controlled.calls.length, 1);
     initiating.abort();
