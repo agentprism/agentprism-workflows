@@ -22,6 +22,7 @@ const SCHEMA = Type.Object(
 
 interface LogEntry {
   method: string;
+  pid?: number;
   label?: string;
   serverName?: string;
   response?: {
@@ -203,36 +204,50 @@ test("injected server is appended after user MCP servers and avoids structured_o
   assert.match(injected.url, /^http:\/\/127\.0\.0\.1:\d+\//);
 });
 
-test("concurrent schema runs on one connection SERIALIZE and keep captures isolated", async () => {
+test("concurrent injected schema runs overlap on distinct processes and keep captures isolated", async () => {
   const { config, cwd, readLog } = fakeBackend({
     mcpHttpSupport: true,
     turns: [
-      { structuredToolCall: { label: "first", arguments: { city: "Oslo", hot: false } } },
-      { structuredToolCall: { label: "second", arguments: { city: "Lima", hot: true } } },
+      {
+        delayMs: 200,
+        structuredToolCall: { label: "capture", argumentsFromPromptJson: true },
+      },
     ],
   });
   const runner = makeRunner({ fake: config });
-
-  const [a, b] = await Promise.all([
-    runner.run("classify one", { model: "fake", cwd, schema: SCHEMA, label: "one" }),
-    runner.run("classify two", { model: "fake", cwd, schema: SCHEMA, label: "two" }),
-  ]);
-
-  // Isolation: each run resolves to its own turn's capture — never a blend or a duplicate.
-  assert.deepEqual([a, b].toSorted((x, y) => JSON.stringify(x).localeCompare(JSON.stringify(y))), [
-    { city: "Lima", hot: true },
+  const payloads = [
     { city: "Oslo", hot: false },
-  ]);
+    { city: "Lima", hot: true },
+    { city: "Kyiv", hot: false },
+  ];
 
-  // Serialization: agents with instance-global name-keyed MCP registries (OpenCode) expose
-  // every registered tool to every live session, so the runner must never overlap two
-  // injected sessions on one connection — the second session/new comes only after the first
-  // run fully releases (same constant server name = replacement, single live registration).
-  const wire = readLog().map((entry) => entry.method);
-  const firstClose = wire.indexOf("closeSession");
-  const secondNew = wire.indexOf("newSession", wire.indexOf("newSession") + 1);
-  assert.ok(firstClose !== -1 && secondNew !== -1, `expected two sessions on the wire: ${wire.join(",")}`);
-  assert.ok(secondNew > firstClose, `second newSession must follow first closeSession: ${wire.join(",")}`);
+  const outputs = await Promise.all(payloads.map((payload, index) =>
+    runner.run(`classify ${index}\nSTRUCTURED_OUTPUT_PAYLOAD:${JSON.stringify(payload)}`, {
+      model: "fake",
+      cwd,
+      schema: SCHEMA,
+      label: `capture-${index}`,
+    }),
+  ));
+
+  // Every run receives its own token-scoped capture.
+  assert.deepEqual(outputs, payloads);
+
+  const log = readLog();
+  const prompts = log.filter((entry) => entry.method === "prompt");
+  assert.equal(prompts.length, 3);
+  assert.equal(new Set(prompts.map((entry) => entry.pid)).size, 3, "no two injected runs share a process");
+  const firstCapture = log.findIndex((entry) => entry.method === "structuredToolCall");
+  const overlapping = new Set(
+    log.slice(0, firstCapture).filter((entry) => entry.method === "prompt").map((entry) => entry.pid),
+  );
+  assert.ok(overlapping.size >= 2, `expected overlapping prompts before the first capture: ${JSON.stringify(log)}`);
+  const urls = log
+    .filter((entry) => entry.method === "newSession")
+    .flatMap((entry) => entry.params?.mcpServers ?? [])
+    .filter((server) => server.name.startsWith("structured_output"))
+    .map((server) => ("url" in server ? server.url : undefined));
+  assert.equal(new Set(urls).size, 3, "each process receives a distinct tokenized capture endpoint");
 });
 
 test("structuredOutputTool false in the registry disables injection even with HTTP MCP support", async () => {

@@ -204,7 +204,13 @@ function structuredToolCallsFor(turn) {
   return [];
 }
 
-function structuredToolArgumentsFor(flow) {
+function structuredToolArgumentsFor(flow, prompt) {
+  if (flow?.argumentsFromPromptJson === true) {
+    const marker = flow.promptMarker ?? "STRUCTURED_OUTPUT_PAYLOAD:";
+    const line = prompt.split("\n").find((entry) => entry.startsWith(marker));
+    if (!line) throw new Error(`structured output payload marker not found: ${marker}`);
+    return JSON.parse(line.slice(marker.length));
+  }
   return flow && Object.prototype.hasOwnProperty.call(flow, "arguments") ? flow.arguments : flow;
 }
 
@@ -565,6 +571,9 @@ class FakeAgent {
       }
       return { stopReason: "cancelled" };
     }
+    if (typeof turn.delayMs === "number" && turn.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, turn.delayMs));
+    }
 
     // 1) optional permission round-trip (agent -> client request)
     if (turn.toolCall) {
@@ -606,7 +615,7 @@ class FakeAgent {
 
     const structuredToolCalls = structuredToolCallsFor(turn);
     for (const call of structuredToolCalls) {
-      await this.callStructuredOutputTool(call, params.sessionId);
+      await this.callStructuredOutputTool(call, params.sessionId, promptText(params));
     }
 
     // 2) optional client-side fs/terminal calls (agent -> client request) with responses/errors
@@ -773,7 +782,7 @@ class FakeAgent {
     }
   }
 
-  async callStructuredOutputTool(flow, sessionId) {
+  async callStructuredOutputTool(flow, sessionId, prompt) {
     const servers = this.mcpServersBySession.get(sessionId) ?? [];
     const server = structuredOutputServerFor(servers, flow);
     if (!server) {
@@ -795,7 +804,7 @@ class FakeAgent {
       }
       const response = await client.callTool({
         name: flow?.toolName ?? "StructuredOutput",
-        arguments: structuredToolArgumentsFor(flow),
+        arguments: structuredToolArgumentsFor(flow, prompt),
       });
       record({ method: "structuredToolCall", label: flow?.label, serverName: server.name, response });
     } catch (error) {

@@ -1201,6 +1201,8 @@ export class PooledConnection {
   private negotiated: NegotiatedCapabilities | undefined;
   private _alive = true;
   private _activeSessions = 0;
+  /** Synchronous process-exclusive reservation for one injected StructuredOutput run. */
+  private _injectedRunReserved = false;
   private stderrTail = "";
   /**
    * Detached commands can outlive an ACP parent's graceful exit. Capture their identities before
@@ -1342,6 +1344,22 @@ export class PooledConnection {
 
   get activeSessions(): number {
     return this._activeSessions;
+  }
+
+  get injectedRunReserved(): boolean {
+    return this._injectedRunReserved;
+  }
+
+  /** Reserve this process for one injected run. Selection calls this without awaiting. */
+  tryReserveInjectedRun(): boolean {
+    if (this._injectedRunReserved) return false;
+    this._injectedRunReserved = true;
+    return true;
+  }
+
+  /** Release the injected reservation after the owning session release has settled. */
+  releaseInjectedRun(): void {
+    this._injectedRunReserved = false;
   }
 
   /** The capabilities negotiated on this connection's one-time initialize handshake, or undefined
@@ -1666,13 +1684,14 @@ export class PooledConnection {
    * accumulator for routing, and return a SessionHandle. `activeSessions` is reserved
    * synchronously (before the first await) so the pool's load accounting is race-free.
    */
-  async openSession(opts: AcpSessionOptions): Promise<SessionHandle> {
+  async openSession(opts: AcpSessionOptions, onReleased?: () => void): Promise<SessionHandle> {
     this._activeSessions += 1;
     try {
       await this.ready;
-      return await this.openReadySession(opts);
+      return await this.openReadySession(opts, onReleased);
     } catch (error) {
       this._activeSessions -= 1;
+      onReleased?.();
       throw error;
     }
   }
@@ -1681,14 +1700,16 @@ export class PooledConnection {
    *  negotiated capabilities in hand. */
   async openPreparedSession(
     prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
+    onReleased?: () => void,
   ): Promise<SessionHandle> {
     this._activeSessions += 1;
     try {
       await this.ready;
       const opts = await prepare(this);
-      return await this.openReadySession(opts);
+      return await this.openReadySession(opts, onReleased);
     } catch (error) {
       this._activeSessions -= 1;
+      onReleased?.();
       throw error;
     }
   }
@@ -1698,6 +1719,7 @@ export class PooledConnection {
   async openPreparedReattachedSession(
     sessionId: string,
     prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
+    onReleased?: () => void,
   ): Promise<{ handle: SessionHandle; method: "resume" | "load" }> {
     this._activeSessions += 1;
     try {
@@ -1714,15 +1736,17 @@ export class PooledConnection {
         method === "resume" ? AGENT_METHODS.session_resume : AGENT_METHODS.session_load,
         sessionId,
         opts,
+        onReleased,
       );
       return { handle, method };
     } catch (error) {
       this._activeSessions -= 1;
+      onReleased?.();
       throw error;
     }
   }
 
-  private async openReadySession(opts: AcpSessionOptions): Promise<SessionHandle> {
+  private async openReadySession(opts: AcpSessionOptions, onReleased?: () => void): Promise<SessionHandle> {
     // Capability gate: reject a client-provided MCP server whose transport the connected agent
     // does not advertise (http/sse gated on mcpCapabilities; stdio is always serviceable).
     // Fail-fast and non-recoverable — re-running the same incompatible transport can never
@@ -1757,7 +1781,7 @@ export class PooledConnection {
       opts.retainSessionLog ?? true,
     );
     this.client.register(response.sessionId, state);
-    return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts);
+    return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts, onReleased);
   }
 
   /** Reopen an existing session and replay its transcript through the router before resolving. */
@@ -1847,6 +1871,7 @@ export class PooledConnection {
     method: typeof AGENT_METHODS.session_load | typeof AGENT_METHODS.session_resume,
     sessionId: string,
     opts: AcpSessionOptions,
+    onReleased?: () => void,
   ): Promise<SessionHandle> {
     let registered = false;
     try {
@@ -1894,7 +1919,7 @@ export class PooledConnection {
         );
       }
       state.modes = response.modes;
-      return new SessionHandle(this, sessionId, state, response.configOptions ?? [], opts);
+      return new SessionHandle(this, sessionId, state, response.configOptions ?? [], opts, onReleased);
     } catch (error) {
       if (registered) this.client.unregister(sessionId);
       throw error;
@@ -2237,6 +2262,7 @@ export class SessionHandle implements StructuredSource {
     private readonly state: SessionState,
     configOptions: SessionConfigOption[],
     private readonly opts: AcpSessionOptions,
+    private readonly onReleased?: () => void,
   ) {
     this.configOptions = configOptions;
     if (opts.signal) {
@@ -2441,7 +2467,11 @@ export class SessionHandle implements StructuredSource {
     this.resolveReleaseStarted();
     this.removeAbort?.();
     this.removeAbort = undefined;
-    await this.pooled.releaseSession(this.sessionId, keepOpen);
+    try {
+      await this.pooled.releaseSession(this.sessionId, keepOpen);
+    } finally {
+      this.onReleased?.();
+    }
   }
 }
 

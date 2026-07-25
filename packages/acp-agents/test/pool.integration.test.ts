@@ -17,6 +17,7 @@ import {
   AcpAgentRunner,
   AuthStore,
   CANCEL_NOT_HONORED_GRACE_MS,
+  ClaudeBackend,
   PI_DISPOSE_SIGKILL_GRACE_MS,
   PI_PROCESS_EXIT_MARGIN_MS,
   PI_PROCESS_SHUTDOWN_ENVELOPE_MS,
@@ -225,6 +226,150 @@ test("dispose() closes every pooled process (multi-process pool)", async () => {
 
   const afterDispose = readLog();
   assert.equal(count(afterDispose, "__exit"), spawned, "dispose() closed every pooled process");
+});
+
+test("an injected reservation spans session release, then the released process is reused", async () => {
+  const { cwd, readLog } = configure({
+    turns: [{ text: "ok", close: { delayMs: 150 } }],
+  });
+  const pool = harness.track(new AcpAgentPool({ size: 1 }));
+  const backend = new ClaudeBackend();
+  const options = { cwd, schema: undefined, policy: {} };
+  const acquireInjected = () =>
+    pool.acquirePrepared(backend, () => options, { injected: true });
+
+  const first = await acquireInjected();
+  await first.prompt("first");
+  const releasingFirst = first.release();
+  await waitFor(() => count(readLog(), "closeSession") === 1);
+
+  const second = await acquireInjected();
+  const firstTwo = readLog().filter((entry) => entry.method === "newSession");
+  assert.equal(firstTwo.length, 2);
+  assert.notEqual(
+    firstTwo[0]?.pid,
+    firstTwo[1]?.pid,
+    "a connection remains reserved until its delayed session/close completes",
+  );
+
+  await releasingFirst;
+  await second.prompt("second");
+  await second.release();
+
+  const third = await acquireInjected();
+  assert.equal(count(readLog(), "__start"), 2, "a released injected connection is reused");
+  const thirdPid = readLog().filter((entry) => entry.method === "newSession").at(-1)?.pid;
+  assert.ok(firstTwo.some((entry) => entry.pid === thirdPid));
+  await third.release({ keepOpen: true });
+});
+
+test("surplus injected connections stay warm, then shrink back to the configured size", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  const timers: Array<{ active: boolean; fire(): void }> = [];
+  const pool = harness.track(new AcpAgentPool({ size: 1 }, {
+    idleTimer: {
+      set(callback) {
+        const handle = {
+          active: true,
+          fire() {
+            if (!handle.active) return;
+            handle.active = false;
+            callback();
+          },
+        };
+        timers.push(handle);
+        return handle;
+      },
+      clear(timer) {
+        (timer as { active: boolean }).active = false;
+      },
+    },
+  }));
+  const backend = new ClaudeBackend();
+  const options = { cwd, schema: undefined, policy: {} };
+  const sessions = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      pool.acquirePrepared(backend, () => options, { injected: true })),
+  );
+  assert.equal(count(readLog(), "__start"), 3, "injected demand grows past the configured size");
+
+  await Promise.all(sessions.map((session) => session.release({ keepOpen: true })));
+  assert.equal(count(readLog(), "__exit"), 0, "surplus processes remain warm during keep-alive");
+  for (const timer of timers) timer.fire();
+  await waitFor(() => count(readLog(), "__exit") === 2);
+
+  const reused = await pool.acquire(backend, options);
+  assert.equal(count(readLog(), "__start"), 3, "ordinary work reuses the steady-state process");
+  await reused.release({ keepOpen: true });
+  await pool.dispose();
+  assert.equal(count(readLog(), "__exit"), 3);
+});
+
+test("dispose() closes elastically spawned connections before their idle reap", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  const pool = harness.track(new AcpAgentPool({ size: 1 }, {
+    idleTimer: {
+      set() {
+        return {};
+      },
+      clear() {},
+    },
+  }));
+  const backend = new ClaudeBackend();
+  const options = { cwd, schema: undefined, policy: {} };
+  const sessions = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      pool.acquirePrepared(backend, () => options, { injected: true })),
+  );
+  await Promise.all(sessions.map((session) => session.release({ keepOpen: true })));
+  assert.equal(count(readLog(), "__start"), 3);
+
+  await pool.dispose();
+  assert.equal(count(readLog(), "__exit"), 3, "pool disposal covers every elastic process");
+});
+
+test("forceKill reaches an elastic connection whose idle reap is disposing it", { timeout: 15_000 }, async () => {
+  const { cwd, readLog } = configure({ ignoreShutdown: true, turns: [{ text: "ok" }] });
+  const timers: Array<{ active: boolean; fire(): void }> = [];
+  const pool = harness.track(new AcpAgentPool({ size: 1 }, {
+    idleTimer: {
+      set(callback) {
+        const handle = {
+          active: true,
+          fire() {
+            if (!handle.active) return;
+            handle.active = false;
+            callback();
+          },
+        };
+        timers.push(handle);
+        return handle;
+      },
+      clear(timer) {
+        (timer as { active: boolean }).active = false;
+      },
+    },
+  }));
+  const backend = new ClaudeBackend();
+  const options = { cwd, schema: undefined, policy: {} };
+  const sessions = await Promise.all([
+    pool.acquirePrepared(backend, () => options, { injected: true }),
+    pool.acquirePrepared(backend, () => options, { injected: true }),
+  ]);
+  await Promise.all(sessions.map((session) => session.release({ keepOpen: true })));
+  const pids = readLog().filter((entry) => entry.method === "__start").map((entry) => entry.pid);
+  assert.equal(pids.length, 2);
+  timers.find((timer) => timer.active)?.fire();
+  await waitFor(() => count(readLog(), "__sigterm") >= 1);
+
+  pool.forceKill();
+  await pool.dispose();
+  await waitFor(() => pids.every((pid) => pid !== undefined && processIsGone(pid)));
+  assert.equal(
+    pids.every((pid) => pid !== undefined && processIsGone(pid)),
+    true,
+    "forceKill covers admitted and mid-reap elastic processes",
+  );
 });
 
 test("Pi child cleanup quarantine prevents reuse and disposes only after the last active close", async () => {

@@ -62,6 +62,7 @@ const OPENCODE_CONFIG_OPTIONS = [
 
 interface LogEntry {
   method: string;
+  pid?: number;
   label?: string;
   params?: {
     configId?: string;
@@ -212,6 +213,41 @@ test("OpenCode schema run injects StructuredOutput MCP and resolves captured too
   const injected = servers.find((server) => server.name?.startsWith("structured_output"));
   assert.ok(injected && "type" in injected && injected.type === "http");
   assert.match(injected.url, /^http:\/\/127\.0\.0\.1:\d+\//);
+});
+
+test("OpenCode parallel schema runs overlap on distinct processes and return their own captures", async () => {
+  const { cwd, readLog } = configure({
+    turns: [
+      {
+        delayMs: 200,
+        structuredToolCall: { label: "opencode-capture", argumentsFromPromptJson: true },
+      },
+    ],
+  });
+  const runner = makeRunner();
+  const payloads = [
+    { city: "Oslo", hot: false },
+    { city: "Lima", hot: true },
+    { city: "Kyiv", hot: false },
+  ];
+
+  const outputs = await Promise.all(payloads.map((payload, index) =>
+    runner.run(`classify ${index}\nSTRUCTURED_OUTPUT_PAYLOAD:${JSON.stringify(payload)}`, {
+      model: "opencode/zai/glm-5.2",
+      cwd,
+      schema: SCHEMA,
+    }),
+  ));
+
+  assert.deepEqual(outputs, payloads);
+  const log = readLog();
+  const promptPids = log.filter((entry) => entry.method === "prompt").map((entry) => entry.pid);
+  assert.equal(new Set(promptPids).size, 3, "no two injected OpenCode runs share a process");
+  const firstCapture = log.findIndex((entry) => entry.method === "structuredToolCall");
+  const overlapping = new Set(
+    log.slice(0, firstCapture).filter((entry) => entry.method === "prompt").map((entry) => entry.pid),
+  );
+  assert.ok(overlapping.size >= 2, "at least two OpenCode prompts were in flight before the first capture");
 });
 
 test("OpenCode usage combines PromptResponse tokens with latest cumulative usage_update cost", async () => {

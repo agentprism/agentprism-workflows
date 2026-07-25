@@ -109,7 +109,7 @@ host-facing event, auth, and interactive/reattach APIs. Its runtime deps are
 `@automatalabs/pi-acp`, `@modelcontextprotocol/sdk`, `typebox`, and
 `@automatalabs/shared-types`; OpenCode is resolved from the host and deliberately is not bundled.
 
-The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.6.11` — a
+The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.6.12` — a
 published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `outputSchema` forward
 (§6.3) into its shipped dist. It's an exact-pinned dependency, so Codex ships on a clean
 `git clone && pnpm install && pnpm build` — no pnpm patch, no `patches/` file, no vendored tree.
@@ -211,13 +211,13 @@ All versions below were re-verified from the installed workspace dependency grap
   client/connection helpers). This is what your orchestrator uses to *speak ACP as a client*.
   Ref: https://agentclientprotocol.com · https://github.com/agentclientprotocol
 
-- **`@agentclientprotocol/claude-agent-acp@0.61.0`** — ACP server wrapping Claude.
+- **`@agentclientprotocol/claude-agent-acp@0.62.0`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
-  Wraps **`@anthropic-ai/claude-agent-sdk@0.3.215`**.
+  Wraps **`@anthropic-ai/claude-agent-sdk@0.3.219`**.
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
 
-- **`@automatalabs/codex-acp@1.6.11`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
+- **`@automatalabs/codex-acp@1.6.12`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
   the **Codex App Server**). Bin: `codex-acp`. This is a **published fork** of
   `@agentclientprotocol/codex-acp` that bakes the `outputSchema` forward (§6.3) into its shipped
   dist; it is the package `acp-agents` exact-pins and consumes.
@@ -329,7 +329,9 @@ Both servers implement a real `sessionId → session` map:
 
 **Efficient fan-out:** run one (or a few) long-lived server processes and open **N sessions**;
 the engine's `createLimiter` caps real concurrency. You're bound by API rate limits and
-per-session memory, not by the protocol.
+per-session memory, not by the protocol. The one deliberate exception is the client-hosted
+StructuredOutput lane: concurrent injected runs reserve separate processes to isolate agents with
+process-global MCP registries, while non-injected sessions continue to multiplex (§6.6).
 Ref: https://agentclientprotocol.com/protocol/v1/session-setup
 
 ### 5.3 Working directory / worktree isolation — supported, clean
@@ -484,7 +486,7 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.61.0` → `@anthropic-ai/claude-agent-sdk@0.3.215`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.62.0` → `@anthropic-ai/claude-agent-sdk@0.3.219`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
@@ -628,10 +630,10 @@ never sets `outputSchema`. The fork forwards it from the prompt's `_meta` (the a
 `runTurn → turnStart → sendRequest({ method: "turn/start", params })` passes it through verbatim;
 `TurnStartParams.outputSchema` already exists, so it's type-clean.
 
-**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.6.11` — its
+**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.6.12` — its
 build compiles the change into the shipped `dist/index.js`, so npm consumers get it directly (unlike
 a pnpm `patchedDependencies` transform, which is a workspace-root install step that never travels in
-a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.6.11`, so the forward is
+a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.6.12`, so the forward is
 present on a clean checkout with no vendoring and no postinstall hook. `CodexBackend` spawns the
 resolved package main (`require.resolve("@automatalabs/codex-acp")`) under the current node.
 
@@ -691,6 +693,16 @@ Invalid calls return a tool error with TypeBox validation details and do not clo
 capture. The resolution ladder is captured tool args → native/final-text parse → prose JSON
 extraction → repair prompt.
 
+Injected runs use process-exclusive elastic pooling rather than a per-connection FIFO. Selection
+synchronously reserves a process with no other injected run; if every usable process is reserved,
+the pool starts another process even past its configured `size`. The reservation remains held until
+the owning `session.release()` completes, which prevents process-global MCP registries such as
+OpenCode's from exposing a sibling injected registration while allowing Pi, OpenCode, and custom
+injecting backends to overlap uniformly. Non-injected sessions keep the normal multiplexing policy
+and may share a process with an injected run. Released surplus processes remain warm for an idle
+keep-alive and are then reaped back to `size`; pool disposal and force-kill retain them throughout
+that lifecycle.
+
 ### 6.7 What this means for us
 
 - **Keep native channels primary where they exist.** Claude constrains out-of-the-box via `_meta`;
@@ -719,27 +731,32 @@ into its dist, §2, §6.3), `opencode acp`, and `pi-acp` as ACP server subproces
 ```
 run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
   1. pick backend (Claude vs Codex vs OpenCode vs Pi/custom) by agentType/model
-  2. if continueFromSession is eligible:
+  2. acquire a pooled process:
+       injected schema lane → synchronously reserve one process exclusively from injected peers,
+                              elastically spawning past size when all are reserved
+       non-injected lane    → idle → grow to size → multiplex least-loaded
+  3. if continueFromSession is eligible:
        session/resume({ sessionId }) else session/load({ sessionId })
        on reopen failure → clean up and session/new({ cwd }) with the ORIGINAL prompt
      otherwise session/new({ cwd: worktree?.cwd }) // §5.3 worktree isolation
-  3. select model via session config option         // §5.4
-  4. apply schema:
+  4. select model via session config option         // §5.4
+  5. apply schema:
        Claude → already set in session/new _meta.claudeCode.options.outputFormat (+ emitRawSDKMessages)
        Codex  → outputSchema on the turn params
        Pi/OpenCode → append a client-hosted HTTP StructuredOutput MCP tool and embed the schema
        custom → generic outputSchema plus optional StructuredOutput MCP tool
-  5. session/prompt(continued ? CONTINUATION_INSTRUCTION : prompt); drain session/update:
+  6. session/prompt(continued ? CONTINUATION_INSTRUCTION : prompt); drain session/update:
        • agent_message_chunk → assistant text
        • tool_call / request_permission → enforce allow/deny (§5.5)
        • usage_update → token accounting (§5.6)
-  6. on stopReason:
+  7. on stopReason:
        schema set → extract structured result
                      (Claude: structured_output off _claude/sdkMessage; Codex: final text;
                       Pi/OpenCode/custom: HTTP tool capture, then the common final-text fallback),
                      then VALIDATE; re-prompt on failure (guard)
        no schema   → final assistant text (empty ⇒ recoverable retry)
-  7. signal.aborted → session/cancel (§5.7)
+  8. release the session; only after release completes, return any injected reservation
+  9. signal.aborted → session/cancel (§5.7)
 ```
 
 `onSessionOpen` fires exactly once for the acquisition that wins. Usage/auth pause failures release
@@ -875,7 +892,7 @@ resurrect a snapshot or sidecar after the run was removed.
 - **Codex structured output needs a codex-acp forward:** the shipped binary (`@openai/codex@0.142.5`;
   the field was source-verified at `rust-v0.142.4`) honors `turn/start.outputSchema`, but the stock adapter never forwards
   it — the ~1-line `_meta` → `runTurn` forward (§6.3) is **baked into the published fork
-  `@automatalabs/codex-acp@1.6.11`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
+  `@automatalabs/codex-acp@1.6.12`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
   consumers, unlike a pnpm `patchedDependencies` transform). `CodexBackend` also normalizes schemas
   to OpenAI **strict** rules. Output rides the normal message stream (no `emitRawSDKMessages` needed).
 - **MCP turn semantics:** no "deliver result into a later turn" — run the `workflow` tool
@@ -908,8 +925,8 @@ resurrect a snapshot or sidecar after the run was removed.
 **Packages (verified versions, 2026-07-09):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.3.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.61.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.215`) — https://github.com/agentclientprotocol/claude-agent-acp
-- `@automatalabs/codex-acp@1.6.11` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
+- `@agentclientprotocol/claude-agent-acp@0.62.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.219`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@automatalabs/codex-acp@1.6.12` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
 - `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai
 
