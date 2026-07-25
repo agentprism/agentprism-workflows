@@ -1,12 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";
 import { OpenCodeBackend } from "../src/index.js";
 import type { StructuredSource } from "../src/index.js";
 
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
-const ENV_KEYS = ["AGENTPRISM_OPENCODE_ACP_CMD", "AGENTPRISM_OPENCODE_ACP_ARGS", "OPENCODE_DB"] as const;
+const ENV_KEYS = [
+  "AGENTPRISM_OPENCODE_ACP_CMD",
+  "AGENTPRISM_OPENCODE_ACP_ARGS",
+  "OPENCODE_DB",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "XDG_CACHE_HOME",
+  "OPENCODE_DISABLE_AUTOUPDATE",
+] as const;
 
 function source(text: string, finalText = text): StructuredSource {
   return { currentTurnText: () => text, finalMessageText: () => finalText, rawStructuredOutput: () => undefined };
@@ -46,18 +57,39 @@ test("OpenCodeBackend.spawnConfig: CMD override wins and argv comes only from _A
   });
 });
 
-test("OpenCodeBackend.spawnConfig: every spawn isolates its own OPENCODE_DB (anomalyco/opencode#31307)", () => {
-  withEnv({ OPENCODE_DB: undefined }, () => {
+test("OpenCodeBackend.spawnConfig: every spawn isolates its own XDG data/state/cache trees (anomalyco/opencode#31307)", () => {
+  withEnv({ XDG_DATA_HOME: undefined }, () => {
     const backend = new OpenCodeBackend();
-    const first = backend.spawnConfig().env.OPENCODE_DB;
-    const second = backend.spawnConfig().env.OPENCODE_DB;
-    assert.ok(first && second, "each spawn env carries an OPENCODE_DB");
-    assert.notEqual(first, second, "concurrent spawns must never share a database");
-    assert.match(first!, /agentprism-opencode-.+\.db$/);
+    const first = backend.spawnConfig().env;
+    const second = backend.spawnConfig().env;
+    assert.ok(first.XDG_DATA_HOME && second.XDG_DATA_HOME, "each spawn env carries an isolated XDG_DATA_HOME");
+    assert.notEqual(first.XDG_DATA_HOME, second.XDG_DATA_HOME, "concurrent spawns must never share state");
+    assert.match(first.XDG_DATA_HOME!, /agentprism-opencode-[^/]+[/\\]data$/);
+    assert.match(first.XDG_STATE_HOME ?? "", /[/\\]state$/);
+    assert.match(first.XDG_CACHE_HOME ?? "", /[/\\]cache$/);
+    assert.equal(first.OPENCODE_DISABLE_AUTOUPDATE, "1");
+    assert.equal(first.XDG_CONFIG_HOME, process.env.XDG_CONFIG_HOME, "user config stays shared");
+    assert.ok(existsSync(join(first.XDG_DATA_HOME!, "opencode")), "isolated data dir is pre-created");
   });
 });
 
-test("OpenCodeBackend.spawnConfig: an explicitly exported OPENCODE_DB wins over isolation", () => {
+test("OpenCodeBackend.spawnConfig: seeds credentials from the real data dir into the isolated tree", () => {
+  const fixtureData = mkdtempSync(join(tmpdir(), "oc-auth-fixture-"));
+  mkdirSync(join(fixtureData, "opencode"), { recursive: true });
+  writeFileSync(join(fixtureData, "opencode", "auth.json"), '{"fixture":true}');
+  try {
+    withEnv({ XDG_DATA_HOME: fixtureData }, () => {
+      const env = new OpenCodeBackend().spawnConfig().env;
+      const seeded = join(env.XDG_DATA_HOME!, "opencode", "auth.json");
+      assert.ok(existsSync(seeded), "auth.json is seeded into the isolated data dir");
+      assert.equal(readFileSync(seeded, "utf8"), '{"fixture":true}');
+    });
+  } finally {
+    rmSync(fixtureData, { recursive: true, force: true });
+  }
+});
+
+test("OpenCodeBackend.spawnConfig: an explicitly exported OPENCODE_DB passes through untouched", () => {
   withEnv({ OPENCODE_DB: "/explicit/opencode.db" }, () => {
     const cfg = new OpenCodeBackend().spawnConfig();
     assert.equal(cfg.env.OPENCODE_DB, "/explicit/opencode.db");
