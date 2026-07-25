@@ -264,6 +264,7 @@ body {
   font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .node-sub {
@@ -271,6 +272,7 @@ body {
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .node.status-running .node-side::after,
@@ -302,6 +304,76 @@ body {
 .node.more-node {
   border-style: dashed;
   color: var(--text-dim);
+}
+
+/* ---------- skeleton view ---------- */
+/* A site that has not executed yet: visible structure, muted presence. */
+.node.status-pending {
+  opacity: 0.45;
+  border-style: dashed;
+  cursor: default;
+}
+
+.node.status-pending:hover {
+  border-color: var(--border);
+}
+
+.node.phase-node.status-pending {
+  opacity: 0.45;
+  border-style: dashed;
+}
+
+.loop-box {
+  position: absolute;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-raised) 45%, transparent);
+}
+
+.loop-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  border-bottom: 1px dashed var(--border-dim);
+}
+
+.loop-glyph {
+  font-size: 14px;
+  color: var(--text-faint);
+}
+
+.loop-iter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.iter-btn {
+  font: inherit;
+  line-height: 1;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.iter-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.iter-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 /* ---------- detail view ---------- */

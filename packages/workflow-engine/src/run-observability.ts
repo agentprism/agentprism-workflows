@@ -733,6 +733,11 @@ export function projectRunEventForPersistence(
           : { configOptions: projectConfigOptions(event.configOptions, state) }),
         ...(event.timeoutMs === undefined ? {} : { timeoutMs: event.timeoutMs }),
         callIndex: event.callIndex,
+        // Never truncated: a partial call-path key is worse than none for consumers that
+        // join on it, so an oversized capture is dropped instead of projected.
+        ...(event.path === undefined || Buffer.byteLength(event.path, "utf8") > MAX_OBSERVABILITY_SCALAR_BYTES
+          ? {}
+          : { path: event.path }),
       };
       break;
     case "agentProgress":

@@ -169,6 +169,27 @@ test("projectRunEventForPersistence redacts every retained string surface withou
   }
 });
 
+test("agentStart path passes through verbatim and an oversized path is dropped, never truncated", () => {
+  const base = {
+    type: "agentStart" as const,
+    runId: "run-projection",
+    scope: "scope-projection",
+    label: "label",
+    prompt: "prompt",
+    callIndex: 0,
+  };
+  const kept = projectRunEventForPersistence({ ...base, path: "3:14<7:9" });
+  assert.equal(kept.event.type, "agentStart");
+  if (kept.event.type === "agentStart") assert.equal(kept.event.path, "3:14<7:9");
+
+  const oversized = projectRunEventForPersistence({
+    ...base,
+    path: "1:1<".repeat(MAX_OBSERVABILITY_SCALAR_BYTES),
+  });
+  assert.equal(oversized.event.type, "agentStart");
+  if (oversized.event.type === "agentStart") assert.equal("path" in oversized.event, false);
+});
+
 test("config, journal metadata, and call-record provenance follow the nested projection rules", () => {
   const collidingPrefix = "x".repeat(MAX_OBSERVABILITY_SCALAR_BYTES);
   const start = projectRunEventForPersistence({
