@@ -62,7 +62,10 @@ const BACKEND_SCOPE: Record<Exclude<Backend, "opencode">, string> = {
   pi: "@automatalabs/",
 };
 
-const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/openrouter/moonshotai/kimi-k3";
+// Kimi K3 rate-buckets concurrent bursts: with process-exclusive injected pooling (#292) the
+// three schema runs fire simultaneously and Kimi reliably drops one of the three. DeepSeek v4
+// Flash tolerates the 3-wide burst on the same OpenCode/OpenRouter routing.
+const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencode/openrouter/deepseek/deepseek-v4-flash";
 // Kimi K3 can exceed the MCP request deadline under provider load. Gemini Flash exercises the
 // same Pi/OpenRouter routing and native schema path with enough latency headroom for all four calls.
 const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL ?? "openrouter/google/gemini-2.5-flash";
