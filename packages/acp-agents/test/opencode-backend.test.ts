@@ -6,7 +6,7 @@ import { OpenCodeBackend } from "../src/index.js";
 import type { StructuredSource } from "../src/index.js";
 
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
-const ENV_KEYS = ["AGENTPRISM_OPENCODE_ACP_CMD", "AGENTPRISM_OPENCODE_ACP_ARGS"] as const;
+const ENV_KEYS = ["AGENTPRISM_OPENCODE_ACP_CMD", "AGENTPRISM_OPENCODE_ACP_ARGS", "OPENCODE_DB"] as const;
 
 function source(text: string, finalText = text): StructuredSource {
   return { currentTurnText: () => text, finalMessageText: () => finalText, rawStructuredOutput: () => undefined };
@@ -42,7 +42,25 @@ test("OpenCodeBackend.spawnConfig: CMD override wins and argv comes only from _A
     const cfg = new OpenCodeBackend().spawnConfig();
     assert.equal(cfg.command, "/custom/opencode");
     assert.deepEqual(cfg.args, ["--stdio", "--x", "y"]);
-    assert.equal(cfg.env, process.env);
+    assert.equal(cfg.env.AGENTPRISM_OPENCODE_ACP_CMD, "/custom/opencode");
+  });
+});
+
+test("OpenCodeBackend.spawnConfig: every spawn isolates its own OPENCODE_DB (anomalyco/opencode#31307)", () => {
+  withEnv({ OPENCODE_DB: undefined }, () => {
+    const backend = new OpenCodeBackend();
+    const first = backend.spawnConfig().env.OPENCODE_DB;
+    const second = backend.spawnConfig().env.OPENCODE_DB;
+    assert.ok(first && second, "each spawn env carries an OPENCODE_DB");
+    assert.notEqual(first, second, "concurrent spawns must never share a database");
+    assert.match(first!, /agentprism-opencode-.+\.db$/);
+  });
+});
+
+test("OpenCodeBackend.spawnConfig: an explicitly exported OPENCODE_DB wins over isolation", () => {
+  withEnv({ OPENCODE_DB: "/explicit/opencode.db" }, () => {
+    const cfg = new OpenCodeBackend().spawnConfig();
+    assert.equal(cfg.env.OPENCODE_DB, "/explicit/opencode.db");
   });
 });
 
@@ -59,7 +77,7 @@ test("OpenCodeBackend.spawnConfig: default falls back to opencode acp on PATH", 
     const cfg = new OpenCodeBackend().spawnConfig();
     assert.equal(cfg.command, "opencode");
     assert.deepEqual(cfg.args, ["acp"]);
-    assert.equal(cfg.env, process.env);
+    assert.equal(cfg.env.PATH, process.env.PATH);
   });
 });
 

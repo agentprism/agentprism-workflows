@@ -2,6 +2,8 @@
 // a native structured-output result channel and ignores request._meta today, so the backend uses
 // the repo's generic schema dialect plus prompt embedding. When OpenCode advertises HTTP MCP, the
 // runner can also inject the client-hosted StructuredOutput MCP tool.
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
@@ -52,7 +54,18 @@ export class OpenCodeBackend implements Backend {
   }
 
   spawnConfig(): SpawnConfig {
-    const env = process.env;
+    // Concurrent OpenCode instances in one project share the cwd-keyed sqlite database
+    // (~/.local/share/opencode/opencode.db, WAL) and interfere across sessions — observed as a
+    // mid-run "ACP connection closed" once process-exclusive injected pooling (#292) started
+    // overlapping opencode processes (upstream: anomalyco/opencode#31307). Give every spawned
+    // server its own database; auth is unaffected (separate auth.json). An explicitly exported
+    // OPENCODE_DB still wins. Tradeoff: agent-persisted sessions live in the spawned process's
+    // db, so cross-process session/load|resume falls back to the runner's fresh-session path.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      OPENCODE_DB: process.env.OPENCODE_DB
+        ?? join(tmpdir(), `agentprism-opencode-${randomUUID()}.db`),
+    };
     const override = env.AGENTPRISM_OPENCODE_ACP_CMD;
     if (override) {
       return { command: override, args: splitArgs(env.AGENTPRISM_OPENCODE_ACP_ARGS), env };
