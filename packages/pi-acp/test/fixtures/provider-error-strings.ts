@@ -1,7 +1,10 @@
-export const FIXTURE_PI_PIN = "0.82.0";
-// 2026-07-24 bump 0.81.1 -> 0.82.0: every fixture string below was re-verified byte-identical
-// against the installed pi v0.82.0 dists (auth strings span concatenated template literals in
-// dist/core/agent-session.js:186,852) and the v0.82.0-tagged source tests;
+export const FIXTURE_PI_PIN = "0.82.1";
+// 2026-07-25 bump 0.82.0 -> 0.82.1: every fixture string below was re-verified byte-identical
+// against the installed pi v0.82.1 dists — the guidance templates reconstructed from
+// dist/core/auth-guidance.js, the auth strings still spanning concatenated template literals
+// at dist/core/agent-session.js:186,852, and the provider-error values unchanged because
+// pi-ai's dist/utils/retry.js and dist/utils/overflow.js are byte-identical to 0.82.0
+// (its only 0.82.1 error change guards unread response streams in dist/utils/error-body.js);
 // the per-string citations record where each originated in the pi monorepo at v0.80.10.
 
 const LOGIN_HELP = [
