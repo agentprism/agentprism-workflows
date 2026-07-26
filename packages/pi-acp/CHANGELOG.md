@@ -1,5 +1,21 @@
 # @automatalabs/pi-acp
 
+## 0.2.5
+
+### Patch Changes
+
+- 3a55679: ACP dependency maintenance (2026-07-25). Bump the Pi SDK lockstep family
+  (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`)
+  to 0.82.1 — a patch release (Claude Opus 5 catalog entries, `ANTHROPIC_AUTH_TOKEN` gateway
+  bearer auth, `If-None-Match` catalog revalidation) that changes no surface pi-acp integrates
+  against; the provider-error fixture strings are re-verified byte-identical against the
+  installed 0.82.1 dists.
+
+  Also lifts the wrapped Claude runtime to npm `latest` with a root `pnpm.overrides` pin of
+  `@anthropic-ai/claude-agent-sdk` to 0.3.220, because `@agentclientprotocol/claude-agent-acp@0.62.0`
+  still exact-pins 0.3.219. That override is repository-local — it changes no published
+  manifest — and goes away once the adapter catches up.
+
 ## 0.2.4
 
 ### Patch Changes
