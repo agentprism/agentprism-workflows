@@ -25,6 +25,7 @@ import {
   formatModelContextText,
   isUrgentStatus,
   modelContextSignature,
+  nextPushDelayMs,
 } from "./model-context.js";
 import { extractSkeleton } from "./skeleton.js";
 import type { Skeleton } from "./skeleton.js";
@@ -48,8 +49,6 @@ interface EventsDoc {
 
 const POLL_MS = 1000;
 const MAX_BACKOFF_MS = 15_000;
-/** Minimum spacing between routine ui/update-model-context pushes (urgent ones skip it). */
-const MODEL_CONTEXT_MIN_INTERVAL_MS = 2000;
 
 function runIdFromArgs(args: Record<string, unknown> | null): string | undefined {
   const runId = args?.["runId"];
@@ -207,10 +206,7 @@ function useModelContextSync(app: App | null, model: RunModel | null): void {
     if (!app || signature === undefined || disabledRef.current) return;
     const current = modelRef.current;
     if (!current) return;
-    const urgent = isUrgentStatus(current);
-    const wait = urgent
-      ? 0
-      : Math.max(0, MODEL_CONTEXT_MIN_INTERVAL_MS - (Date.now() - lastPushRef.current));
+    const wait = nextPushDelayMs(isUrgentStatus(current), lastPushRef.current, Date.now());
     // Trailing-edge timer: superseded signatures cancel, so only the latest state lands.
     const timer = setTimeout(() => {
       const latest = modelRef.current;

@@ -13,7 +13,9 @@ import {
   buildModelContextSnapshot,
   formatModelContextText,
   isUrgentStatus,
+  MODEL_CONTEXT_MIN_INTERVAL_MS,
   modelContextSignature,
+  nextPushDelayMs,
 } from "../ui/src/model-context.js";
 import { createRunModel, foldRecord } from "../ui/src/state.js";
 
@@ -123,6 +125,24 @@ test("live pushes tell the agent not to poll inspect", () => {
   model.status = "running";
   fold(model, { type: "agentStart", callIndex: 0, label: "a", scope: "run-5" });
   assert.match(formatModelContextText(model), /do not call workflow action:"inspect"/);
+});
+
+test("routine pushes are throttled on the trailing edge; urgent ones are not", () => {
+  const now = 1_700_000_000_000;
+  // Urgent (paused/terminal) always goes out on this tick, however recent the last push.
+  assert.equal(nextPushDelayMs(true, now, now), 0);
+  assert.equal(nextPushDelayMs(true, now - 1, now), 0);
+
+  // Routine waits out only the REMAINDER of the interval, so a burst collapses into one push.
+  assert.equal(nextPushDelayMs(false, now, now), MODEL_CONTEXT_MIN_INTERVAL_MS);
+  assert.equal(nextPushDelayMs(false, now - 500, now), MODEL_CONTEXT_MIN_INTERVAL_MS - 500);
+  assert.equal(nextPushDelayMs(false, now - MODEL_CONTEXT_MIN_INTERVAL_MS, now), 0);
+  assert.equal(nextPushDelayMs(false, now - 10 * MODEL_CONTEXT_MIN_INTERVAL_MS, now), 0);
+
+  // First push of a panel's life (no prior push recorded) is not delayed.
+  assert.equal(nextPushDelayMs(false, 0, now), 0);
+  // A clock that jumped backwards cannot stretch the wait past one interval.
+  assert.equal(nextPushDelayMs(false, now + 60_000, now), MODEL_CONTEXT_MIN_INTERVAL_MS);
 });
 
 // The signature joins fields with NUL so no phase title or banner can forge a boundary.

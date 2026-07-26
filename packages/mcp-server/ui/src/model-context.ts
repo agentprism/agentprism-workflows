@@ -50,6 +50,19 @@ export function isUrgentStatus(model: RunModel): boolean {
   return model.finalized || model.status === "paused";
 }
 
+/** Minimum spacing between routine pushes; urgent transitions ignore it. */
+export const MODEL_CONTEXT_MIN_INTERVAL_MS = 2000;
+
+/**
+ * Trailing-edge delay before the next push. Urgent transitions (paused/terminal) go out
+ * immediately; routine ones wait out the remainder of the interval since the last push, so a
+ * burst of transitions collapses into one push carrying the latest state.
+ */
+export function nextPushDelayMs(urgent: boolean, lastPushAt: number, now: number): number {
+  if (urgent) return 0;
+  return Math.max(0, Math.min(MODEL_CONTEXT_MIN_INTERVAL_MS, MODEL_CONTEXT_MIN_INTERVAL_MS - (now - lastPushAt)));
+}
+
 export function buildModelContextSnapshot(model: RunModel): ModelContextSnapshot {
   const { settled, failed } = settleCounts(model);
   const snapshot: ModelContextSnapshot = {
