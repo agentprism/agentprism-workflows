@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# Pre-push gate, two checks before code leaves this machine. NO BYPASSES — if a check
+# Pre-push gate, three checks before code leaves this machine. NO BYPASSES — if a check
 # fails, do the maintenance it demands (owner policy, 2026-07-16).
 #
-# 1. ACP dependency gate (scripts/check-acp-deps.mjs), three sub-checks:
+# 1. Attribution gate (scripts/check-attribution.mjs) over the commits actually being
+#    pushed: no agent attribution in the message, AND no agent author/committer identity —
+#    GitHub manufactures a co-author trailer out of that identity when the PR is
+#    squash-merged, which is how one slipped onto main past the message-only commit-msg
+#    hook (#297). Cheap and offline-ish, so it runs first and fails fast. The same gate is
+#    a step of the required CI job, where it runs over the PR's base..head — the only
+#    enforcement point that sits BEFORE the squash button.
+#
+# 2. ACP dependency gate (scripts/check-acp-deps.mjs), three sub-checks:
 #      a. freshness — the ACP client/agent libraries (@agentclientprotocol/*,
 #         @automatalabs/codex-acp, @earendil-works/pi-coding-agent) must be at npm
 #         `latest`; policy is to bump them at every release.
@@ -17,7 +25,7 @@
 #    release.yml (blocks publishing) — bypassing it locally only moves the failure there.
 #    Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 #
-# 2. LIVE backend e2e (packages/mcp-server/test/live-backend.e2e.test.ts) against the REAL
+# 3. LIVE backend e2e (packages/mcp-server/test/live-backend.e2e.test.ts) against the REAL
 #    Claude + Codex + OpenCode + pi agents. CI cannot run these (no agent auth —
 #    AGENTPRISM_LIVE_E2E stays unset there), so this hook is the only place the
 #    structured-output cruxes get exercised against real backends pre-merge. If a leg
@@ -29,6 +37,42 @@ set -euo pipefail
 if [ -n "${CI:-}" ]; then exit 0; fi
 
 cd "$(git rev-parse --show-toplevel)"
+
+# Attribution gate. git feeds "<local ref> <local sha> <remote ref> <remote sha>" per pushed
+# ref on stdin; the remote sha it reports is the remote's CURRENT tip, so for an existing
+# branch the range is exact and never over-blocks on already-pushed history. For a NEW branch
+# (remote sha all-zeros) there is no such anchor: fall back to excluding everything already on
+# origin, refreshed first so stale remote-tracking refs don't drag old pre-hook commits into
+# the range. A failed fetch is not fatal — it can only make the exclusion set smaller, i.e.
+# over-block, which still fails closed.
+ZERO_SHA="0000000000000000000000000000000000000000"
+push_tips=()
+push_bounds=()
+scan_all_remotes=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  [ "$local_sha" = "$ZERO_SHA" ] && continue # ref deletion — nothing is being pushed
+  push_tips+=("$local_sha")
+  if [ "${remote_sha:-$ZERO_SHA}" = "$ZERO_SHA" ]; then
+    scan_all_remotes=1
+  else
+    push_bounds+=("^$remote_sha")
+  fi
+done
+
+if [ ${#push_tips[@]} -gt 0 ]; then
+  if [ "$scan_all_remotes" = 1 ]; then
+    git fetch --quiet origin 2>/dev/null || true
+    push_bounds+=("--not" "--remotes=origin")
+  fi
+  if ! node scripts/check-attribution.mjs "${push_tips[@]}" ${push_bounds[@]+"${push_bounds[@]}"}; then
+    echo "" >&2
+    echo "pre-push: attribution check FAILED — push blocked." >&2
+    echo "  Rewrite the commits listed above, then push again." >&2
+    echo "  There is no bypass: the same gate is a step of the required CI job." >&2
+    exit 1
+  fi
+fi
 
 if ! node scripts/check-acp-deps.mjs; then
   echo "" >&2
