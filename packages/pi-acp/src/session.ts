@@ -10,6 +10,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { adapterError, classifyPreflight, isRequestError, unexpectedError } from "./errors.js";
 import type { PiAcpDeps } from "./deps.js";
 import { applyConfig, modelOption, thinkingLevelOption } from "./config.js";
+import { shutdownPiSession } from "./pi-shutdown.js";
 import { convertPromptContent } from "./prompt-content.js";
 import { replayEntry } from "./replay.js";
 import { stopReasonFor } from "./stop-reason.js";
@@ -580,7 +581,7 @@ export class PiSession {
         console.error("pi-acp MCP refresh drain error:", error);
       });
       const results = await Promise.allSettled([
-        Promise.resolve().then(() => this.pi.dispose()),
+        shutdownPiSession(this.pi),
         this.bridgeClosePromise ?? Promise.resolve(),
       ]);
       if (results[0]?.status === "rejected") {

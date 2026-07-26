@@ -10,6 +10,12 @@ Run the server with `npx @automatalabs/pi-acp` or an installed `pi-acp` binary. 
 
 The package entry exports the value APIs `runAcp(options?)`, `PiAcpAgent`, and `resolveDeps`, plus the TypeScript-only `PiAcpDeps` type. Importing it starts no server, opens no stdio connection, and does not mutate `console` or stdio. Call and await `runAcp()` explicitly to connect; pass a partial `PiAcpDeps` and/or an ACP stream for embedding and tests.
 
+### Pi configuration and teardown
+
+Sessions load the operator's real pi configuration — settings, extensions, and pi's own MCP servers — from `PiAcpDeps.agentDir`, which defaults to pi's `getAgentDir()` (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`). Override it to point pi at an isolated directory; embedders and tests that stub `createAgentSession` should, because the resource loader reads this path and starts the extensions it finds *before* the session factory is called.
+
+Closing a session emits pi's `session_shutdown` event to those extensions before disposing the session, matching `AgentSessionRuntime.dispose()`. That event is pi's only extension-cleanup contract, so an extension that spawned a process releases it there. This matters more here than for out-of-process ACP backends: pi runs **in-process**, so anything it leaves behind is a live handle on the host's event loop rather than something the OS reaps with a child process tree.
+
 ## AgentPrism built-in backend
 
 `@automatalabs/acp-agents` ships pi-acp as the built-in `pi` backend. Route a call with the backend-only id to keep pi's configured default model, or include pi's exact `provider/model-id` after the routing prefix:

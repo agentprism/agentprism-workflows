@@ -924,8 +924,10 @@ test("M6 only the MCP extension moves first; configured order and control-last s
   setup.deps.connectMcpClient = async () => fakeMcpHandle({
     async listTools() { return { tools: [{ name: "remote", inputSchema: { type: "object" } }] }; },
   });
-  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
+  // Injected as a dependency, not by mutating process.env: the agent dir is what newSession()
+  // builds its settings manager and resource loader from, so a test that needs specific
+  // extensions loaded says so directly instead of reaching through a global.
+  setup.deps.agentDir = agentDir;
   const agent = new (await import("../src/agent.js")).PiAcpAgent(setup.deps);
   try {
     await agent.newSession(context({
@@ -945,8 +947,6 @@ test("M6 only the MCP extension moves first; configured order and control-last s
       "the core fallback must not compete with an already-configured bash owner");
   } finally {
     await agent.dispose();
-    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
   }
 });
 

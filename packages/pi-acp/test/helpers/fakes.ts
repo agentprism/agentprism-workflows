@@ -220,11 +220,20 @@ export interface FakeDepsResult {
   createOptions: CreateAgentSessionOptions[];
   cwd: string;
   sessionDir: string;
+  agentDir: string;
 }
 
 export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
   const cwd = mkdtempSync(`${tmpdir()}/pi-acp-cwd-`);
   const sessionDir = mkdtempSync(`${tmpdir()}/pi-acp-sessions-`);
+  // An EMPTY agent dir, never the developer's. newSession() builds the settings manager and the
+  // resource loader from this path and the loader then loads — and starts — whatever extensions it
+  // finds, before `createAgentSession` is reached. Because these fakes stub the session, there is
+  // no ExtensionRunner afterwards and so no `session_shutdown` can ever be emitted: any process a
+  // real extension started here would outlive the suite and, embedded in-process, keep the test
+  // runner's event loop open forever. Pointing this at a temp dir keeps the fakes hermetic; it is
+  // not a workaround for the runtime leak, which pi-shutdown.ts fixes on the real-session path.
+  const agentDir = mkdtempSync(`${tmpdir()}/pi-acp-agentdir-`);
   const controls: FakeSessionControl[] = [];
   const createOptions: CreateAgentSessionOptions[] = [];
   const model = { provider: "test", id: "model", name: "Test model", contextWindow: 100, reasoning: true };
@@ -252,13 +261,14 @@ export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
       listAll: (dir) => SessionManager.listAll(dir),
     },
     modelRuntime,
+    agentDir,
     sessionDir,
     async connectMcpClient() { throw new Error("unexpected MCP connect"); },
     sleep: realSleep,
     graceMs: 20,
     mcpTimeoutMs: 20,
   };
-  return { deps, controls, createOptions, cwd, sessionDir };
+  return { deps, controls, createOptions, cwd, sessionDir, agentDir };
 }
 
 export function context<T>(params: T, client?: Partial<AgentContext>, signal = new AbortController().signal): AgentRequestContext<T> {
