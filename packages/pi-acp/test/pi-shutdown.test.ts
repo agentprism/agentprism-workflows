@@ -83,3 +83,33 @@ test("a session with no extension runtime at all is handled", async () => {
   assert.equal(await emitPiSessionShutdown(session), false);
   await assert.doesNotReject(shutdownPiSession(session));
 });
+
+// The failed-open branch: pi exists but the session never became publishable, so
+// FailedOpenCleanup — not PiSession — owns teardown. It routes through the same helper, but
+// "routes through the same helper" stays an assumption until the branch is actually driven.
+test("failed-open cleanup also emits session_shutdown", async () => {
+  const { fakeDeps, context } = await import("./helpers/fakes.js");
+  const { PiAcpAgent } = await import("../src/agent.js");
+  const setup = fakeDeps();
+  const emitted: Array<{ type: string; reason?: string }> = [];
+  const inner = setup.deps.createAgentSession;
+  setup.deps.createAgentSession = async (options) => {
+    const created = await inner(options);
+    const session = created.session as unknown as Record<string, unknown>;
+    session["extensionRunner"] = {
+      hasHandlers: () => true,
+      emit: async (event: { type: string; reason?: string }) => { emitted.push(event); },
+    };
+    // Throwing here strands the open after pi exists — exactly the failed-open shape.
+    session["bindExtensions"] = async () => { throw new Error("bindExtensions failed"); };
+    return created;
+  };
+  const agent = new PiAcpAgent(setup.deps);
+  await assert.rejects(agent.newSession(context({ cwd: setup.cwd, mcpServers: [] })));
+  assert.deepEqual(
+    emitted,
+    [{ type: "session_shutdown", reason: "quit" }],
+    "a session that failed open still owns whatever its extensions started",
+  );
+  await agent.dispose().catch(() => undefined);
+});
