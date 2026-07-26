@@ -3,7 +3,10 @@
 // agent settlement, failures, pauses, and terminal states change it (and pauses/terminals
 // are urgent). The text push is a complete snapshot because updates overwrite each other.
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 
 import {
@@ -120,4 +123,18 @@ test("live pushes tell the agent not to poll inspect", () => {
   model.status = "running";
   fold(model, { type: "agentStart", callIndex: 0, label: "a", scope: "run-5" });
   assert.match(formatModelContextText(model), /do not call workflow action:"inspect"/);
+});
+
+// The signature joins fields with NUL so no phase title or banner can forge a boundary.
+// Write it as an ESCAPE (\u0000) — a literal NUL byte makes git classify the source as
+// binary, which silently drops the file from every diff and review.
+test("panel sources are text: control bytes only ever appear as escapes", () => {
+  const uiSrc = fileURLToPath(new URL("../ui/src/", import.meta.url));
+  const sources = readdirSync(uiSrc).filter((name) => name.endsWith(".ts") || name.endsWith(".tsx"));
+  assert.ok(sources.includes("model-context.ts"));
+  for (const name of sources) {
+    const bytes = readFileSync(join(uiSrc, name));
+    const offending = bytes.findIndex((byte) => byte < 9 || (byte > 13 && byte < 32));
+    assert.equal(offending, -1, `${name} holds a raw control byte at offset ${offending}`);
+  }
 });
