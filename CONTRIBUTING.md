@@ -60,16 +60,17 @@ AGENTPRISM_LIVE_E2E=1 pnpm --filter @automatalabs/mcp-server test
 
 CI must leave `AGENTPRISM_LIVE_E2E` unset.
 
-Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) gates every `git push` from a dev machine with two checks:
+Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired by the root `prepare` script via `core.hooksPath`) gates every `git push` from a dev machine with three checks:
 
-1. **ACP dependency gate** (`node scripts/check-acp-deps.mjs`, also runnable standalone), three sub-checks:
+1. **Attribution gate** (`node scripts/check-attribution.mjs`, also runnable standalone) over the commits actually being pushed — see "No agent attribution in the history" below.
+2. **ACP dependency gate** (`node scripts/check-acp-deps.mjs`, also runnable standalone), three sub-checks:
    - *npm freshness*: the ACP client/agent libraries (`@agentclientprotocol/*`, `@automatalabs/codex-acp`, `@earendil-works/pi-coding-agent`) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
      On a pi runtime bump, re-capture `packages/pi-acp/test/fixtures/provider-error-strings.ts` and re-run the classifier suite so provider prose cannot silently change pause/retry classification.
    - *fork git sync*: our codex-acp fork's published `main` must contain its upstream (`agentclientprotocol/codex-acp`) `main` — versions can't be compared because the fork's version line has diverged, so the check counts unmerged upstream commits. It always works against a **real clone** (no API summary): the working clone (`~/codex-acp`, override with `AGENTPRISM_CODEX_ACP_DIR`) when present, otherwise a managed temp clone the gate creates at `<tmpdir>/codex-acp` and reuses (this is the CI path — public repos, no token). Either way the clone is verified and prepared first: `origin` must be the fork (`VikashLoomba/codex-acp`, matched by owner/repo so https/ssh forms both pass — read-only check, the gate never mutates a repo that isn't provably the fork); the `upstream` remote is added or re-pointed to the true upstream when wrong; both remotes are fetched; the checkout is put on `main` and pulled current (a working clone must be clean and must have no unpushed commits — releases are cut from the *pushed* fork main, so a locally-merged-but-unpushed sync still blocks). Only then are upstream commits counted against the local checkout. On failure it prints the merge → push → `release-fork.yml` → bump sequence.
    - *wrapped runtime freshness*: an adapter can be at npm `latest` while exact-pinning a stale agent runtime inside it (e.g. `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` — the runtime that actually answers prompts), which the freshness check can't see. The gate compares the lockfile's *transitive* resolution of each wrapped runtime against the runtime's npm `latest`. Fix when behind: bump the adapter if its latest already wraps a current runtime, else add a root `pnpm.overrides` pin (then `pnpm install` + run the acp-agents live e2e before pushing). The check warns once an override becomes redundant so versions drift back to upstream-managed.
 
    The gate **fails closed**: if the registry or GitHub API is unreachable after retries, staleness cannot be ruled out and the push is blocked. **There is no bypass.** The same gate also runs as a step of the required **Build & test** CI job — while any tracked dependency is stale, *every* PR merge is blocked — and at the top of `release.yml`, where a failure blocks versioning/publishing, leaves any open Version PR open, and files/updates a "Release blocked: ACP dependency gate failed" issue with the gate output.
-2. **MCP live suite**: builds the workspace and drives Claude, Codex, OpenCode, and pi (~60–120s, spends real tokens). The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. There is no skip: if a leg fails on authentication (stalling turns usually mean an expired OAuth login), re-authenticate and push again. Legs whose default model rides limited credentials can be rerouted — not skipped — via `AGENTPRISM_OPENCODE_E2E_MODEL` / `AGENTPRISM_PI_E2E_MODEL`. On failure the hook re-prints the failing-test section (assertion + per-leg diagnostics) as the last output and keeps the full runner log at `.git/pre-push-live-e2e.log`.
+3. **MCP live suite**: builds the workspace and drives Claude, Codex, OpenCode, and pi (~60–120s, spends real tokens). The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. There is no skip: if a leg fails on authentication (stalling turns usually mean an expired OAuth login), re-authenticate and push again. Legs whose default model rides limited credentials can be rerouted — not skipped — via `AGENTPRISM_OPENCODE_E2E_MODEL` / `AGENTPRISM_PI_E2E_MODEL`. On failure the hook re-prints the failing-test section (assertion + per-leg diagnostics) as the last output and keeps the full runner log at `.git/pre-push-live-e2e.log`.
 
 CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI enforces the dependency gate itself in the required job and the release workflow.
 
@@ -99,6 +100,34 @@ instead of editing the JSON by hand.
    - *Upstream broke or changed our integration surface*: adapt the agentprism packages to the new API as part of the same PR — the bump and the adaptation land together, never a pin held back to avoid the work.
    - *Upstream added capability we should exploit*: land the mechanical bump first to unblock the gate, and file an issue for the capability work so it is tracked, not lost.
 3. **Land the maintenance PR** — its own CI passes because its tree carries the fixed pins, which is exactly why a stale gate never wedges the repo: the fix PR is always mergeable. Once it merges, every blocked PR unblocks on rebase/re-run, and the next push to `main` versions and publishes normally.
+
+## No agent attribution in the history
+
+Commits in this repo carry **no Claude attribution**, on either of two axes, and there is no bypass:
+
+- **Message** — no `Claude-Session:` trailers, no `claude.ai/code` links, no Claude co-author trailers, no "Generated with Claude Code" banners.
+- **Identity** — no commit whose *author* or *committer* is an agent identity (an `@anthropic.com` address, or a name beginning `Claude`).
+
+The identity axis is not cosmetic, and it is the one that is easy to miss. GitHub composes a squash-merge message from the branch's commit messages **and synthesizes a `Co-authored-by:` trailer for every distinct author identity among them** (this repo uses `squash_merge_commit_message=COMMIT_MESSAGES`). So a single branch commit authored under an agent identity — a cloud-session commit, say, where the committer is you but the author is not — puts a co-author trailer on `main` even though no branch commit message ever contained one, generated server-side where no local hook can reach it. That is exactly how it happened once (`fc50fae`, #297): the message-only `commit-msg` hook was already in place and had nothing to catch.
+
+`scripts/check-attribution.mjs` owns both axes and the pattern list, and runs in **three** places:
+
+| Where | Scope | Blocks |
+|---|---|---|
+| `.githooks/commit-msg` | the pending message + the identity git is about to stamp | the commit |
+| `.githooks/pre-push` | the commits actually being pushed (exact range from git's stdin; a new branch falls back to "not already on origin", after a refresh) | the push |
+| **Build & test** CI job | the PR's `base..head` | the **merge** — the only enforcement point that runs *before* the squash button |
+
+Run it standalone over any range: `node scripts/check-attribution.mjs origin/main..HEAD`.
+
+**Fixing a flagged commit** — rewrite it, then force-push the branch:
+
+```bash
+git rebase origin/main --exec 'git commit --amend --no-edit --reset-author'  # re-stamp identity
+git rebase -i origin/main                                                    # reword a message
+```
+
+`--reset-author` re-stamps the commit with your configured `user.name` / `user.email`. If a *cloud or agent session* produced the commit, fix the identity it commits under rather than rewriting after the fact each time. On a push to `main` the CI gate still runs (over the newly-pushed commits) — too late to block, but a loud tripwire that clears itself on the next merge.
 
 ## Workflow launches carry the user's verbatim request (source gate)
 

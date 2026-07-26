@@ -36,6 +36,36 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # Attribution gate — a step of the REQUIRED check on purpose, and the ONLY
+      # enforcement point that runs before the squash button. GitHub builds a squash
+      # message from the branch's commit messages AND synthesizes a "Co-authored-by:"
+      # trailer for every distinct author identity among them, so an agent-authored
+      # branch commit puts agent attribution on main even when no branch commit message
+      # ever contained it — exactly how it happened in #297, past the message-only
+      # commit-msg hook. Checking base..head here catches the identity before the merge.
+      # Zero-dep script, so it runs before the install. On a push to main the range is
+      # the newly-pushed commits: too late to block, but a loud, self-clearing tripwire.
+      - name: Attribution gate
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE:-}" ]; then
+            node scripts/check-attribution.mjs "$PR_BASE..$PR_HEAD"
+          elif [ -n "${PUSH_AFTER:-}" ]; then
+            # A first push / force-push leaves no usable "before" anchor — check the tip alone.
+            if git cat-file -e "${PUSH_BEFORE:-}^{commit}" 2>/dev/null; then
+              node scripts/check-attribution.mjs "$PUSH_BEFORE..$PUSH_AFTER"
+            else
+              node scripts/check-attribution.mjs --no-walk "$PUSH_AFTER"
+            fi
+          else
+            echo "attribution: no commit range for this event (workflow_dispatch) — nothing to check"
+          fi
+
       # ACP dependency freshness gate — a step of the REQUIRED check on purpose:
       # while any tracked ACP dependency (@agentclientprotocol/*, the codex-acp
       # fork vs its upstream, the wrapped claude-agent-sdk runtime, or

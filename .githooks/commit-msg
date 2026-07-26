@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
-# Commit-message gate: REJECT Claude-generated attribution in commit messages. NO BYPASSES
-# (owner policy, 2026-07-23). No Claude session links, no Claude co-author trailers, no
-# "Generated with Claude Code" banners. Claude: do NOT re-add these, and do NOT amend or
-# alter this hook to get a commit through.
+# Commit-message gate: REJECT Claude-generated attribution. NO BYPASSES (owner policy,
+# 2026-07-23). No Claude session links, no Claude co-author trailers, no "Generated with
+# Claude Code" banners — and, since 2026-07-25, no commit stamped with an agent AUTHOR or
+# COMMITTER identity either (GitHub manufactures a co-author trailer out of that identity at
+# squash-merge time; see scripts/check-attribution.mjs). Claude: do NOT re-add attribution,
+# and do NOT amend or alter this hook, or the script it calls, to get a commit through.
+#
+# The patterns and both axes live in scripts/check-attribution.mjs so this hook, the pre-push
+# gate, and the required CI job enforce ONE rule. Fails closed: if the checker cannot run, the
+# commit is rejected rather than waved through.
 set -euo pipefail
 
-MSG_FILE="$1"
+MSG_FILE="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+cd "$(git rev-parse --show-toplevel)"
 
-PATTERNS=(
-  'Claude-Session:'
-  'claude\.ai/code'
-  'Co-Authored-By:.*[Cc]laude'
-  'noreply@anthropic\.com'
-  'Generated with.*Claude'
-)
-
-for pattern in "${PATTERNS[@]}"; do
-  if grep -Eq "$pattern" "$MSG_FILE"; then
-    echo "commit-msg hook: REJECTED — commit message contains Claude attribution matching: $pattern" >&2
-    echo "Remove the Claude attribution (session link, co-author trailer, banner) and retry." >&2
-    exit 1
-  fi
-done
+if ! node scripts/check-attribution.mjs --message-file "$MSG_FILE"; then
+  echo "commit-msg hook: commit REJECTED." >&2
+  exit 1
+fi
 
 exit 0
