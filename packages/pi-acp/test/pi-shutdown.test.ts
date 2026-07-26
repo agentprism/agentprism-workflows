@@ -1,0 +1,72 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+
+import { emitPiSessionShutdown, shutdownPiSession } from "../src/pi-shutdown.js";
+
+// Pi tears a session down in two steps (AgentSessionRuntime.dispose): emit `session_shutdown` so
+// extensions release what they own, THEN AgentSession.dispose(). pi-acp used to call only the
+// second, so an extension that had spawned a process never got its cleanup hook and the child
+// outlived the session. Embedded in-process, that unreaped grandchild holds a ChildProcess handle
+// on OUR event loop and the process can never exit — which is what wedged every pi-acp suite that
+// opened a session on a machine with real pi extensions configured.
+
+type Emitted = { type: string; reason?: string };
+
+function fakeSession(options: { handlers?: boolean; emit?: () => Promise<unknown> } = {}) {
+  const order: string[] = [];
+  const emitted: Emitted[] = [];
+  const session = {
+    extensionRunner: {
+      hasHandlers: (eventType: string) => {
+        assert.equal(eventType, "session_shutdown");
+        return options.handlers ?? true;
+      },
+      emit: async (event: Emitted) => {
+        order.push(`emit:${event.type}`);
+        emitted.push(event);
+        if (options.emit) return options.emit();
+        return undefined;
+      },
+    },
+    dispose: () => { order.push("dispose"); },
+  } as unknown as AgentSession;
+  return { session, order, emitted };
+}
+
+test("session_shutdown reaches extensions before the session is disposed", async () => {
+  const { session, order, emitted } = fakeSession();
+  await shutdownPiSession(session);
+  // Order is the whole point: dispose() marks the extension context stale, so an event emitted
+  // after it would reach handlers that can no longer act.
+  assert.deepEqual(order, ["emit:session_shutdown", "dispose"]);
+  assert.deepEqual(emitted, [{ type: "session_shutdown", reason: "quit" }]);
+});
+
+test("reason is 'quit' — the terminal reason, not a session-replacement one", async () => {
+  const { session, emitted } = fakeSession();
+  await emitPiSessionShutdown(session);
+  // "reload"/"new"/"resume"/"fork" tell an extension the session is being REPLACED and it should
+  // hand resources to the successor. pi-acp is closing for good; extensions must fully release.
+  assert.equal(emitted[0]?.reason, "quit");
+});
+
+test("no registered handlers means no emit and no error", async () => {
+  const { session, order } = fakeSession({ handlers: false });
+  assert.equal(await emitPiSessionShutdown(session), false);
+  assert.deepEqual(order, []);
+});
+
+// The disposal path must be unstrandable: a broken extension cannot be allowed to prevent
+// dispose() from running, or one bad handler leaks the whole session's resources.
+test("a throwing extension handler still lets disposal proceed", async () => {
+  const { session, order } = fakeSession({ emit: () => Promise.reject(new Error("bad extension")) });
+  await assert.doesNotReject(shutdownPiSession(session));
+  assert.deepEqual(order, ["emit:session_shutdown", "dispose"]);
+});
+
+test("a session with no extension runtime at all is handled", async () => {
+  const session = { dispose: () => {} } as unknown as AgentSession;
+  assert.equal(await emitPiSessionShutdown(session), false);
+  await assert.doesNotReject(shutdownPiSession(session));
+});

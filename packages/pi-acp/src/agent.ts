@@ -20,7 +20,6 @@ import {
   DefaultResourceLoader,
   SettingsManager,
   createBashToolDefinition,
-  getAgentDir,
   type AgentSession,
   type InlineExtension,
   type SessionManager,
@@ -32,6 +31,7 @@ import {
   bridgeMcpServers,
   type McpBridge,
 } from "./mcp-bridge.js";
+import { shutdownPiSession } from "./pi-shutdown.js";
 import { PiSession } from "./session.js";
 import { ChildProcessRegistrySlot, createTrackedBashOperations } from "./child-process-registry.js";
 import { PKG_VERSION } from "./version.js";
@@ -85,7 +85,7 @@ class FailedOpenCleanup implements CleanupOwner {
         console.error("pi-acp failed-open refresh drain error:", error);
       });
       const results = await Promise.allSettled([
-        Promise.resolve().then(() => this.pi.dispose()),
+        shutdownPiSession(this.pi),
         bridgeClose,
       ]);
       for (const result of results) {
@@ -302,7 +302,7 @@ export class PiAcpAgent {
       lifecycle = prepared.lifecycle;
       bindingState = prepared.state;
       this.gate(opening);
-      const settingsManager = SettingsManager.create(cwd, getAgentDir());
+      const settingsManager = SettingsManager.create(cwd, this.deps.agentDir);
       const instructionFactory = bridge.instructionsExtension;
       const controlExtension: InlineExtension = {
         name: "agentprism-pi-acp-control",
@@ -322,7 +322,7 @@ export class PiAcpAgent {
       };
       const resourceLoader = new DefaultResourceLoader({
         cwd,
-        agentDir: getAgentDir(),
+        agentDir: this.deps.agentDir,
         settingsManager,
         extensionFactories: [bridge.inlineExtension, controlExtension],
         extensionsOverride: (base) => {

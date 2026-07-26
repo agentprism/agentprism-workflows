@@ -2,6 +2,7 @@ import {
   ModelRuntime,
   SessionManager,
   createAgentSession,
+  getAgentDir,
   type CreateAgentSessionOptions,
   type CreateAgentSessionResult,
   type NewSessionOptions,
@@ -25,6 +26,18 @@ export interface PiAcpDeps {
     listAll(sessionDir?: string): Promise<SessionInfo[]>;
   };
   modelRuntime: ModelRuntime;
+  /**
+   * Pi's agent directory — the source of the user's settings, extensions, and MCP servers.
+   *
+   * Defaults to pi's own `getAgentDir()` (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`), so running
+   * the server picks up the operator's real pi configuration exactly as before. It is injectable
+   * because `newSession()` reads it BEFORE `createAgentSession`: the settings manager and the
+   * resource loader are built from it and the loader then loads (and starts) the user's
+   * extensions. A caller that stubs `createAgentSession` alone therefore still gets the ambient
+   * configuration and everything it spawns, with no session runtime left to shut any of it down.
+   * Tests point this at an isolated directory; production leaves it unset.
+   */
+  agentDir: string;
   sessionDir?: string;
   connectMcpClient(
     server: McpServer,
@@ -69,6 +82,7 @@ export async function resolveDeps(partial: Partial<PiAcpDeps> = {}): Promise<PiA
     createAgentSession: partial.createAgentSession ?? createAgentSession,
     sessions,
     modelRuntime,
+    agentDir: partial.agentDir ?? getAgentDir(),
     sessionDir: partial.sessionDir,
     sleep,
     graceMs: partial.graceMs ?? 5_000,
