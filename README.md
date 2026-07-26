@@ -278,10 +278,22 @@ for `workflow` calls: a phase/agent graph with per-node log drill-in, live token
 and a Stop control. The panel derives the runId from the call's arguments (inspect/await/stop)
 or from the execute result (immediately for `background: true` admissions), then keeps itself
 current by polling the app-only `workflow-events` tool (`visibility: ["app"]`, outside the
-model's tool loop) — no model tokens are spent while it is visible. Hosts without MCP Apps
+model's tool loop) — no model tokens are spent while it is visible. The panel also mirrors
+run status into the host's model context (`ui/update-model-context`, last push wins) on
+phase transitions, agent failures, pauses, and the terminal state, so the agent learns how a
+run is doing without re-calling the tool; `inspect`/`await` text summaries carry
+`annotations.audience: ["assistant"]`, and blocking `run`/`await` calls report
+`notifications/progress` when the client sends `_meta.progressToken`. Hosts without MCP Apps
 support ignore the UI metadata and get the same text/structured output as before. To try it
 locally against the ext-apps reference host, run
 `node packages/mcp-server/scripts/dev-app-host.mjs`.
+
+> **Known limitation (upstream):** MCP Apps currently renders a **new** panel instance for
+> every model-initiated `workflow` call — the spec has no way to re-attach a call to an
+> already-rendered view yet. Reusable views (`viewSessionId`) are tracked upstream in
+> [ext-apps#430](https://github.com/modelcontextprotocol/ext-apps/issues/430); until that
+> lands, the mitigations above (context pushes + tool-description guidance) keep the agent
+> from re-calling the tool just to check status.
 
 <p align="center">
   <img src="docs/assets/run-monitor-graph.png" alt="Run monitor: live phase/agent graph of a workflow run" />

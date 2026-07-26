@@ -20,6 +20,13 @@ import { DetailView } from "./DetailView.js";
 import { fmtCost, fmtDuration, fmtTokens, shortRunId } from "./format.js";
 import { GraphView } from "./GraphView.js";
 import type { NodeSelection } from "./GraphView.js";
+import {
+  buildModelContextSnapshot,
+  formatModelContextText,
+  isUrgentStatus,
+  modelContextSignature,
+  nextPushDelayMs,
+} from "./model-context.js";
 import { extractSkeleton } from "./skeleton.js";
 import type { Skeleton } from "./skeleton.js";
 import { agentCount, createRunModel, foldRecord } from "./state.js";
@@ -178,6 +185,44 @@ function useRunModel(app: App | null, runId: string | undefined): MonitorState {
   }, [app, runId]);
 
   return { model: runId === undefined ? null : modelRef.current, connectionLost, fatal };
+}
+
+/**
+ * Mirror run status into the host's model context (`ui/update-model-context`) so the agent
+ * learns of phase transitions, failures, pauses, and the terminal state without re-calling
+ * the `workflow` tool — every model-initiated call renders another panel instance. Pushes
+ * overwrite each other, fire only when the run's signature changes, are throttled on the
+ * trailing edge for routine transitions, and go out immediately for paused/terminal ones.
+ * A host that rejects the request (feature unsupported) disables the channel for good.
+ */
+function useModelContextSync(app: App | null, model: RunModel | null): void {
+  const signature = model === null ? undefined : modelContextSignature(model);
+  const modelRef = useRef<RunModel | null>(model);
+  modelRef.current = model;
+  const disabledRef = useRef(false);
+  const lastPushRef = useRef(0);
+
+  useEffect(() => {
+    if (!app || signature === undefined || disabledRef.current) return;
+    const current = modelRef.current;
+    if (!current) return;
+    const wait = nextPushDelayMs(isUrgentStatus(current), lastPushRef.current, Date.now());
+    // Trailing-edge timer: superseded signatures cancel, so only the latest state lands.
+    const timer = setTimeout(() => {
+      const latest = modelRef.current;
+      if (!latest || disabledRef.current) return;
+      lastPushRef.current = Date.now();
+      void app
+        .updateModelContext({
+          content: [{ type: "text", text: formatModelContextText(latest) }],
+          structuredContent: { ...buildModelContextSnapshot(latest) },
+        })
+        .catch(() => {
+          disabledRef.current = true;
+        });
+    }, wait);
+    return () => clearTimeout(timer);
+  }, [app, signature]);
 }
 
 /**
@@ -382,6 +427,7 @@ function RunMonitor() {
   const { model, connectionLost, fatal } = useRunModel(app, runId);
   const skeleton = useSkeleton(app, runId);
   const budget = budgetFromResult(toolResult);
+  useModelContextSync(app, model);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
   if (!app) return <div className="log-empty">Connecting…</div>;
