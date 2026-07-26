@@ -36,8 +36,12 @@ export interface PiAcpDeps {
    * extensions. A caller that stubs `createAgentSession` alone therefore still gets the ambient
    * configuration and everything it spawns, with no session runtime left to shut any of it down.
    * Tests point this at an isolated directory; production leaves it unset.
+   *
+   * Optional so the frozen `new PiAcpAgent(deps)` contract (pi-acp spec §4.1) stays source
+   * compatible: a hand-built deps object that omits it keeps the previous ambient behaviour.
+   * `resolveDeps` always populates it.
    */
-  agentDir: string;
+  agentDir?: string;
   sessionDir?: string;
   connectMcpClient(
     server: McpServer,

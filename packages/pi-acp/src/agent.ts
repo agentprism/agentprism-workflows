@@ -20,6 +20,7 @@ import {
   DefaultResourceLoader,
   SettingsManager,
   createBashToolDefinition,
+  getAgentDir,
   type AgentSession,
   type InlineExtension,
   type SessionManager,
@@ -302,7 +303,8 @@ export class PiAcpAgent {
       lifecycle = prepared.lifecycle;
       bindingState = prepared.state;
       this.gate(opening);
-      const settingsManager = SettingsManager.create(cwd, this.deps.agentDir);
+      const agentDir = this.deps.agentDir ?? getAgentDir();
+      const settingsManager = SettingsManager.create(cwd, agentDir);
       const instructionFactory = bridge.instructionsExtension;
       const controlExtension: InlineExtension = {
         name: "agentprism-pi-acp-control",
@@ -322,7 +324,7 @@ export class PiAcpAgent {
       };
       const resourceLoader = new DefaultResourceLoader({
         cwd,
-        agentDir: this.deps.agentDir,
+        agentDir,
         settingsManager,
         extensionFactories: [bridge.inlineExtension, controlExtension],
         extensionsOverride: (base) => {

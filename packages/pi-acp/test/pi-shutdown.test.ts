@@ -65,6 +65,19 @@ test("a throwing extension handler still lets disposal proceed", async () => {
   assert.deepEqual(order, ["emit:session_shutdown", "dispose"]);
 });
 
+// `agentDir` is OPTIONAL on PiAcpDeps so the frozen `new PiAcpAgent(deps)` contract stays source
+// compatible — which means a suite could omit it and silently fall back to the developer's real
+// ~/.pi, reloading their extensions and re-wedging the runner at exit. The shared harness must
+// always pin an isolated one; this guard is what makes the optionality safe.
+test("the fake deps harness always supplies an isolated agentDir", async () => {
+  const { fakeDeps } = await import("./helpers/fakes.js");
+  const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
+  const { deps, agentDir } = fakeDeps();
+  assert.equal(typeof deps.agentDir, "string");
+  assert.equal(deps.agentDir, agentDir);
+  assert.notEqual(deps.agentDir, getAgentDir(), "the suite must never load the developer's pi config");
+});
+
 test("a session with no extension runtime at all is handled", async () => {
   const session = { dispose: () => {} } as unknown as AgentSession;
   assert.equal(await emitPiSessionShutdown(session), false);
