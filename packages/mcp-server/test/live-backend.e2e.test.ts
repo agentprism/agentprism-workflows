@@ -293,7 +293,12 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
     const result = asObject(sc.result) ?? {};
     const arr = Array.isArray(result.structured) ? result.structured : [];
     out.smokeValue = result.smoke;
-    out.smokePass = result.smoke === "LIVE_SMOKE_OK";
+    // The model must reply with exactly LIVE_SMOKE_OK, but agent CLIs may
+    // prepend their own banners to the message text (Codex injects a skills
+    // context-budget warning when local skills are installed) — judge the
+    // last non-empty line, not the whole string.
+    const smokeLines = typeof result.smoke === "string" ? result.smoke.trim().split("\n") : [];
+    out.smokePass = smokeLines.at(-1)?.trim() === "LIVE_SMOKE_OK";
     out.resultCount = arr.length;
     let allOk = arr.length === 3;
     for (const r of arr) {
