@@ -67,7 +67,7 @@ extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (co
 source) and write the rest fresh. The engine imports no Pi code; `acp-agents` reaches Pi only by
 spawning the exact-pinned `@automatalabs/pi-acp` package as an ACP server.
 
-The code is published as **seven packages** with a one-way dependency direction. The three lower
+The code is published as **eight packages** with a one-way dependency direction. The three lower
 layers remain independently usable — in particular, the ACP agent logic and workflow engine both
 work **with no MCP server at all** — while the facade and integration leaves stay thin.
 
@@ -109,9 +109,10 @@ host-facing event, auth, and interactive/reattach APIs. Its runtime deps are
 `@automatalabs/pi-acp`, `@modelcontextprotocol/sdk`, `typebox`, and
 `@automatalabs/shared-types`; OpenCode is resolved from the host and deliberately is not bundled.
 
-The Codex backend drives the **installed npm dependency** `@automatalabs/codex-acp@1.6.12` — a
-published fork of `@agentclientprotocol/codex-acp` that bakes the turn-level `outputSchema` forward
-(§6.3) into its shipped dist. It's an exact-pinned dependency, so Codex ships on a clean
+The Codex backend drives the **workspace package** `@automatalabs/codex-acp` (`packages/codex-acp`)
+— our fork of `@agentclientprotocol/codex-acp`, imported with its full history as a non-squashed
+subtree (#282), which bakes the turn-level `outputSchema` forward (§6.3) into its built dist. It is
+consumed as `workspace:*` (pnpm materializes an exact version at publish), so Codex ships on a clean
 `git clone && pnpm install && pnpm build` — no pnpm patch, no `patches/` file, no vendored tree.
 
 The Pi backend depends on the workspace **`@automatalabs/pi-acp`** (`workspace:*`, rewritten to the exact lockstep version at publish) and resolves its `dist/index.js` bin
@@ -162,7 +163,7 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **seven** published packages —
+> Packaging (as implemented): a pnpm monorepo of **eight** published packages —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
 > `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade), and
 > `@automatalabs/agentprism-otel` (the optional telemetry bridge), and `@automatalabs/pi-acp`
@@ -219,11 +220,11 @@ All versions below were re-verified from the installed workspace dependency grap
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
 
-- **`@automatalabs/codex-acp@1.6.12`** — ACP server wrapping OpenAI Codex (TypeScript rewrite over
+- **`@automatalabs/codex-acp`** (workspace, `packages/codex-acp`) — ACP server wrapping OpenAI Codex (TypeScript rewrite over
   the **Codex App Server**). Bin: `codex-acp`. This is a **published fork** of
   `@agentclientprotocol/codex-acp` that bakes the `outputSchema` forward (§6.3) into its shipped
   dist; it is the package `acp-agents` exact-pins and consumes.
-  Ref: https://github.com/VikashLoomba/codex-acp (fork) · https://github.com/agentclientprotocol/codex-acp (upstream)
+  Ref: `packages/codex-acp` (workspace fork, full imported history) · https://github.com/agentclientprotocol/codex-acp (upstream)
   > The Rust `zed-industries/codex-acp` is the deprecated predecessor; development moved to the
   > `agentclientprotocol/codex-acp` TypeScript package (which this fork tracks).
 
@@ -624,7 +625,7 @@ turn/start.output_schema            app-server-protocol/.../v2/turn.rs:143
 
 **The gap + the forward.** The stock adapter's `sendPrompt()` builds the `runTurn({…})` call but
 never sets `outputSchema`. The fork forwards it from the prompt's `_meta` (the adapter already reads
-`request._meta` nearby) — a ~1-line change in [`src/CodexAcpClient.ts`](https://github.com/VikashLoomba/codex-acp/blob/main/src/CodexAcpClient.ts):
+`request._meta` nearby) — a ~1-line change in [`packages/codex-acp/src/CodexAcpClient.ts`](../packages/codex-acp/src/CodexAcpClient.ts):
 
     // inside sendPrompt() → the runTurn({ ... }) call
     outputSchema: (request._meta as any)?.["outputSchema"] ?? null,
@@ -632,11 +633,11 @@ never sets `outputSchema`. The fork forwards it from the prompt's `_meta` (the a
 `runTurn → turnStart → sendRequest({ method: "turn/start", params })` passes it through verbatim;
 `TurnStartParams.outputSchema` already exists, so it's type-clean.
 
-**Delivery.** The forward is baked into the published fork `@automatalabs/codex-acp@1.6.12` — its
-build compiles the change into the shipped `dist/index.js`, so npm consumers get it directly (unlike
-a pnpm `patchedDependencies` transform, which is a workspace-root install step that never travels in
-a published tarball). `acp-agents` **exact-pins** `@automatalabs/codex-acp@1.6.12`, so the forward is
-present on a clean checkout with no vendoring and no postinstall hook. `CodexBackend` spawns the
+**Delivery.** The forward is baked into the workspace package `@automatalabs/codex-acp` — its
+build compiles the change into `dist/index.js`, so npm consumers get it directly (unlike a pnpm
+`patchedDependencies` transform, which is a workspace-root install step that never travels in a
+published tarball). `acp-agents` consumes it as `workspace:*` (published as an exact version by
+pnpm), so the forward is present on a clean checkout with no vendoring and no postinstall hook. `CodexBackend` spawns the
 resolved package main (`require.resolve("@automatalabs/codex-acp")`) under the current node.
 
 **Output needs no patch.** `outputSchema` constrains the FINAL assistant message, which already
@@ -893,9 +894,10 @@ resurrect a snapshot or sidecar after the run was removed.
   per distinct schema). The engine already does one session per call.
 - **Codex structured output needs a codex-acp forward:** the shipped binary (`@openai/codex@0.142.5`;
   the field was source-verified at `rust-v0.142.4`) honors `turn/start.outputSchema`, but the stock adapter never forwards
-  it — the ~1-line `_meta` → `runTurn` forward (§6.3) is **baked into the published fork
-  `@automatalabs/codex-acp@1.6.12`'s dist**, which `acp-agents` **exact-pins** (so it travels to npm
-  consumers, unlike a pnpm `patchedDependencies` transform). `CodexBackend` also normalizes schemas
+  it — the ~1-line `_meta` → `runTurn` forward (§6.3) is **baked into the workspace
+  package `@automatalabs/codex-acp`'s dist**, which `acp-agents` consumes as `workspace:*` —
+  published as an exact version, so it travels to npm consumers (unlike a pnpm
+  `patchedDependencies` transform). `CodexBackend` also normalizes schemas
   to OpenAI **strict** rules. Output rides the normal message stream (no `emitRawSDKMessages` needed).
 - **MCP turn semantics:** no "deliver result into a later turn" — run the `workflow` tool
   synchronously with progress notifications; expose `resumeFromRunId` for continuation.
@@ -928,7 +930,7 @@ resurrect a snapshot or sidecar after the run was removed.
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.3.0` — https://github.com/agentclientprotocol
 - `@agentclientprotocol/claude-agent-acp@0.63.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.220`) — https://github.com/agentclientprotocol/claude-agent-acp
-- `@automatalabs/codex-acp@1.6.12` (published fork of `@agentclientprotocol/codex-acp`, patch baked into dist) — https://github.com/VikashLoomba/codex-acp
+- `@automatalabs/codex-acp` (workspace fork of `@agentclientprotocol/codex-acp` at `packages/codex-acp`, patch baked into dist) — upstream: https://github.com/agentclientprotocol/codex-acp
 - `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai
 

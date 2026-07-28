@@ -65,9 +65,25 @@ function validateDefinition(
   if (release.server.kind === "npm-package" && !npm.has(release.server.package)) {
     fail(`backend ${id} server.package must appear in freshness.npm`);
   }
-  for (const fork of release.freshness.forks) {
-    if (!npm.has(fork.package)) {
-      fail(`backend ${id} freshness.forks package ${fork.package} must appear in freshness.npm`);
+  for (const upstream of release.freshness.sourceUpstreams) {
+    if (release.server.kind !== "workspace-package") {
+      fail(`backend ${id} freshness.sourceUpstreams requires a workspace-package server`);
+    } else {
+      if (upstream.package !== release.server.package) {
+        fail(
+          `backend ${id} sourceUpstreams package ${upstream.package} must be the workspace server package ${release.server.package}`,
+        );
+      }
+      if (upstream.path !== release.server.path) {
+        fail(
+          `backend ${id} sourceUpstreams path ${upstream.path} must be the workspace server path ${release.server.path}`,
+        );
+      }
+    }
+    for (const [field, value] of Object.entries(upstream)) {
+      if (typeof value !== "string" || value.length === 0) {
+        fail(`backend ${id} sourceUpstreams.${field} must be a non-empty string`);
+      }
     }
   }
   for (const wrapped of release.freshness.wrappedRuntimes) {

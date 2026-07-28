@@ -44,7 +44,7 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.63.0",
     "@agentclientprotocol/sdk": "^1.3.0",
-    "@automatalabs/codex-acp": "1.6.12",
+    "@automatalabs/codex-acp": "workspace:*",
     "@automatalabs/pi-acp": "workspace:*",
     "@automatalabs/shared-types": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29",

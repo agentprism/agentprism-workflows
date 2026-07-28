@@ -57,7 +57,7 @@ function makeFixtureRoot(opts: {
         server: { kind: "system-command", command: "fixture" },
         freshness: {
           npm: [ADAPTER],
-          forks: [],
+          sourceUpstreams: [],
           wrappedRuntimes: [{ adapterPackage: ADAPTER, runtimePackage: SDK }],
         },
       }],

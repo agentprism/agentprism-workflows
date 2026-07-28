@@ -15,7 +15,7 @@
           "@agentclientprotocol/sdk",
           "@agentclientprotocol/claude-agent-acp"
         ],
-        "forks": [],
+        "sourceUpstreams": [],
         "wrappedRuntimes": [
           {
             "adapterPackage": "@agentclientprotocol/claude-agent-acp",
@@ -30,27 +30,21 @@
         "node": ">=22"
       },
       "server": {
-        "kind": "npm-package",
-        "package": "@automatalabs/codex-acp"
+        "kind": "workspace-package",
+        "package": "@automatalabs/codex-acp",
+        "path": "packages/codex-acp"
       },
       "freshness": {
         "npm": [
-          "@agentclientprotocol/sdk",
-          "@automatalabs/codex-acp"
+          "@agentclientprotocol/sdk"
         ],
-        "forks": [
+        "sourceUpstreams": [
           {
             "package": "@automatalabs/codex-acp",
-            "envDir": "AGENTPRISM_CODEX_ACP_DIR",
-            "defaultDirs": [
-              "$HOME/codex-acp"
-            ],
-            "tempCloneName": "codex-acp",
-            "originUrl": "https://github.com/VikashLoomba/codex-acp.git",
-            "originUrlEnv": "AGENTPRISM_CODEX_ACP_ORIGIN_URL",
+            "path": "packages/codex-acp",
             "upstreamUrl": "https://github.com/agentclientprotocol/codex-acp.git",
             "upstreamUrlEnv": "AGENTPRISM_CODEX_ACP_UPSTREAM_URL",
-            "upstreamRemote": "upstream"
+            "upstreamRef": "main"
           }
         ],
         "wrappedRuntimes": []
@@ -70,7 +64,7 @@
         "npm": [
           "@agentclientprotocol/sdk"
         ],
-        "forks": [],
+        "sourceUpstreams": [],
         "wrappedRuntimes": []
       }
     },
@@ -90,7 +84,7 @@
           "@earendil-works/pi-ai",
           "@earendil-works/pi-coding-agent"
         ],
-        "forks": [],
+        "sourceUpstreams": [],
         "wrappedRuntimes": []
       }
     }

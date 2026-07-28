@@ -4,7 +4,7 @@
     "access": "public"
   },
   "version": "1.6.12",
-  "description": "ACP server wrapping OpenAI Codex — Automata Labs fork of @agentclientprotocol/codex-acp adding turn-level outputSchema forwarding for structured output.",
+  "description": "ACP server wrapping OpenAI Codex \u2014 Automata Labs fork of @agentclientprotocol/codex-acp adding turn-level outputSchema forwarding for structured output.",
   "main": "dist/index.js",
   "bin": {
     "codex-acp": "dist/index.js"
@@ -43,13 +43,14 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p examples/tsconfig.json",
     "codex-test": "tsx .claude/skills/run-codex/scripts/run-codex-test.ts"
   },
-  "homepage": "https://github.com/VikashLoomba/codex-acp#readme",
+  "homepage": "https://github.com/agentprism/agentprism-workflows/tree/main/packages/codex-acp#readme",
   "bugs": {
-    "url": "https://github.com/VikashLoomba/codex-acp/issues"
+    "url": "https://github.com/agentprism/agentprism-workflows/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/VikashLoomba/codex-acp.git"
+    "url": "git+https://github.com/agentprism/agentprism-workflows.git",
+    "directory": "packages/codex-acp"
   },
   "keywords": [],
   "author": "Automata Labs",
@@ -70,5 +71,8 @@
     "open": "^11.0.0",
     "vscode-jsonrpc": "^9.0.1",
     "zod": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

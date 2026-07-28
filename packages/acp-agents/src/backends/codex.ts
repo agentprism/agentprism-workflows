@@ -1,5 +1,6 @@
-// CodexBackend — drives the installed npm dep @automatalabs/codex-acp, a published fork of
-// @agentclientprotocol/codex-acp that bakes in the outputSchema patch. The patch forwards
+// CodexBackend — drives the workspace package @automatalabs/codex-acp (packages/codex-acp), our
+// maintained fork of @agentclientprotocol/codex-acp imported as a non-squashed subtree (#282),
+// which bakes in the outputSchema patch. The patch forwards
 // request._meta["outputSchema"] into the Codex App Server's turn/start.outputSchema,
 // which the shipped @openai/codex binary honors as an OpenAI Responses-API STRICT constraint —
 // applied to EVERY sampled assistant message in the turn (field-verified), not only the last:
@@ -76,10 +77,10 @@ export class CodexBackend implements Backend {
     if (override) {
       return { command: override, args: splitArgs(env.AGENTPRISM_CODEX_ACP_ARGS), env };
     }
-    // Run the installed codex-acp under the current node. AGENTPRISM_CODEX_ACP_BIN overrides the
-    // resolved path; otherwise resolve the package's main (dist/index.js) from node_modules so it
-    // ships on a clean `git clone && pnpm install` (the @automatalabs/codex-acp fork already bakes
-    // in the outputSchema patch). Works from both src/ and the compiled dist/.
+    // Run codex-acp under the current node. AGENTPRISM_CODEX_ACP_BIN overrides the resolved
+    // path; otherwise resolve the package's main (dist/index.js) — the workspace symlink for a
+    // monorepo checkout (built by `pnpm build`), node_modules for a published install. Works
+    // from both src/ and the compiled dist/.
     const bin =
       env.AGENTPRISM_CODEX_ACP_BIN ?? require.resolve("@automatalabs/codex-acp");
     return { command: process.execPath, args: [bin], env };
@@ -117,20 +118,16 @@ export const codexBackendDefinition = defineBuiltinBackend({
   create: (authProfile) => new CodexBackend(authProfile),
   release: {
     engine: { node: ">=22" },
-    server: { kind: "npm-package", package: "@automatalabs/codex-acp" },
+    server: { kind: "workspace-package", package: "@automatalabs/codex-acp", path: "packages/codex-acp" },
     freshness: {
-      npm: ["@agentclientprotocol/sdk", "@automatalabs/codex-acp"],
-      forks: [
+      npm: ["@agentclientprotocol/sdk"],
+      sourceUpstreams: [
         {
           package: "@automatalabs/codex-acp",
-          envDir: "AGENTPRISM_CODEX_ACP_DIR",
-          defaultDirs: ["$HOME/codex-acp"],
-          tempCloneName: "codex-acp",
-          originUrl: "https://github.com/VikashLoomba/codex-acp.git",
-          originUrlEnv: "AGENTPRISM_CODEX_ACP_ORIGIN_URL",
+          path: "packages/codex-acp",
           upstreamUrl: "https://github.com/agentclientprotocol/codex-acp.git",
           upstreamUrlEnv: "AGENTPRISM_CODEX_ACP_UPSTREAM_URL",
-          upstreamRemote: "upstream",
+          upstreamRef: "main",
         },
       ],
       wrappedRuntimes: [],

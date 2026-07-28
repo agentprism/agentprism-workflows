@@ -112,7 +112,7 @@ export const claudeBackendDefinition = defineBuiltinBackend({
         "@agentclientprotocol/sdk",
         "@agentclientprotocol/claude-agent-acp",
       ],
-      forks: [],
+      sourceUpstreams: [],
       wrappedRuntimes: [
         {
           adapterPackage: "@agentclientprotocol/claude-agent-acp",

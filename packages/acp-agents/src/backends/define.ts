@@ -2,16 +2,17 @@ import type { AuthProfile } from "../auth/auth-profile.js";
 import type { Backend } from "../backend.js";
 import type { BuiltinProtocolCoverageRow } from "../protocol-coverage.js";
 
-export interface BuiltinBackendForkMetadata {
+/** A workspace package whose source history must CONTAIN its canonical upstream's history.
+ *  Replaces the retired external-fork model (#282): the fork now lives in this repository as a
+ *  non-squashed subtree, so the dependency gate checks git ancestry against the monorepo HEAD —
+ *  `merge-base --is-ancestor <fetched upstream ref> HEAD` — instead of inspecting an external
+ *  clone. Sync is merge-based, never rebase/squash: a squash import cannot satisfy the check. */
+export interface BuiltinBackendSourceUpstreamMetadata {
   readonly package: string;
-  readonly envDir: string;
-  readonly defaultDirs: readonly string[];
-  readonly tempCloneName: string;
-  readonly originUrl: string;
-  readonly originUrlEnv: string;
+  readonly path: string;
   readonly upstreamUrl: string;
   readonly upstreamUrlEnv: string;
-  readonly upstreamRemote: string;
+  readonly upstreamRef: string;
 }
 
 export interface BuiltinBackendWrappedRuntimeMetadata {
@@ -33,7 +34,7 @@ export interface BuiltinBackendReleaseMetadata {
   readonly server: BuiltinBackendServerMetadata;
   readonly freshness: {
     readonly npm: readonly string[];
-    readonly forks: readonly BuiltinBackendForkMetadata[];
+    readonly sourceUpstreams: readonly BuiltinBackendSourceUpstreamMetadata[];
     readonly wrappedRuntimes: readonly BuiltinBackendWrappedRuntimeMetadata[];
   };
 }

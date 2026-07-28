@@ -140,7 +140,7 @@ export const opencodeBackendDefinition = defineBuiltinBackend({
     },
     freshness: {
       npm: ["@agentclientprotocol/sdk"],
-      forks: [],
+      sourceUpstreams: [],
       wrappedRuntimes: [],
     },
   },
