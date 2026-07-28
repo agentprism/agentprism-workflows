@@ -3,8 +3,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "1.6.12",
-  "description": "ACP server wrapping OpenAI Codex \u2014 Automata Labs fork of @agentclientprotocol/codex-acp adding turn-level outputSchema forwarding for structured output.",
+  "version": "1.6.13",
+  "description": "ACP server wrapping OpenAI Codex — Automata Labs fork of @agentclientprotocol/codex-acp adding turn-level outputSchema forwarding for structured output.",
   "main": "dist/index.js",
   "bin": {
     "codex-acp": "dist/index.js"

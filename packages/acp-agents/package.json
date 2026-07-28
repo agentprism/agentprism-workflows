@@ -1,6 +1,6 @@
 {
   "name": "@automatalabs/acp-agents",
-  "version": "0.34.17",
+  "version": "0.34.18",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
