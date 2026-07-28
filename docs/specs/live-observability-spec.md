@@ -13,7 +13,7 @@ The design owner made the following statements. They are reproduced verbatim fro
 
 > "kimi k3, just to be specific so you dont choose a worse model." *(2026-07-20)*
 
-The tracking issue is [#261](https://github.com/VikashLoomba/agentprism-workflows/issues/261).
+The tracking issue is [#261](https://github.com/agentprism/agentprism-workflows/issues/261).
 The customer's verbatim Requests block is in
 `.agentprism/design-observability/feedback-gist.md`; `focus.md` §1 normatively incorporates and
 interprets it. Together with tracking issue #261, those sources fix the three product requirements
@@ -1266,7 +1266,7 @@ All local file/line citations were verified at base commit
 External sources were verified from fresh clones created during this author round, at the current
 npm `latest` release pins above:
 
-- **[I1] Scope issue:** [GitHub issue #261](https://github.com/VikashLoomba/agentprism-workflows/issues/261)
+- **[I1] Scope issue:** [GitHub issue #261](https://github.com/agentprism/agentprism-workflows/issues/261)
   is the tracking/scope issue. The customer's verbatim Requests block is in
   `.agentprism/design-observability/feedback-gist.md` and is normatively incorporated and
   interpreted by `focus.md` §1.

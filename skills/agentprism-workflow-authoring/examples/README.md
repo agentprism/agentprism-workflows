@@ -2,7 +2,7 @@
 
 Full-scale workflow scripts to study alongside `SKILL.md` — read them when the inline
 worked examples aren't enough. The first two are **verbatim copies** of the runnable
-[`repo-triage` example project](https://github.com/VikashLoomba/agentprism-workflows/tree/main/packages/workflows/examples/repo-triage)
+[`repo-triage` example project](https://github.com/agentprism/agentprism-workflows/tree/main/packages/workflows/examples/repo-triage)
 (canonical source in the monorepo; kept byte-identical so a plain `diff` catches drift).
 
 | script | what it teaches |

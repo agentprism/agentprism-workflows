@@ -7,7 +7,7 @@ reshaped, or dropped as the ecosystem (especially the [Agent Client
 Protocol](https://agentclientprotocol.com)) evolves. Feedback and discussion via issues are
 welcome.
 
-Shipped work is *not* tracked here — see the [CHANGELOG](https://github.com/VikashLoomba/agentprism-workflows/releases)
+Shipped work is *not* tracked here — see the [CHANGELOG](https://github.com/agentprism/agentprism-workflows/releases)
 and [`docs/design-notes.md`](docs/design-notes.md) for what already exists.
 
 ## Status legend

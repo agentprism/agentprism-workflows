@@ -46,8 +46,8 @@ spent while it is visible; hosts without MCP Apps support ignore the UI metadata
 same text/structured output as always.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/VikashLoomba/agentprism-workflows/main/docs/assets/run-monitor-graph.png" alt="Run monitor: live phase/agent graph of a workflow run" />
-  <img src="https://raw.githubusercontent.com/VikashLoomba/agentprism-workflows/main/docs/assets/run-monitor-log.png" alt="Run monitor: per-agent log drill-in with an expanded tool result" />
+  <img src="https://raw.githubusercontent.com/agentprism/agentprism-workflows/main/docs/assets/run-monitor-graph.png" alt="Run monitor: live phase/agent graph of a workflow run" />
+  <img src="https://raw.githubusercontent.com/agentprism/agentprism-workflows/main/docs/assets/run-monitor-log.png" alt="Run monitor: per-agent log drill-in with an expanded tool result" />
 </p>
 
 To try it locally against the [ext-apps](https://github.com/modelcontextprotocol/ext-apps)
@@ -611,7 +611,7 @@ The server also exposes one [MCP prompt](https://modelcontextprotocol.io/docs/co
 
 Invoking it injects the complete, self-contained workflow-authoring guide (the same content as the published `agentprism-workflow-authoring` skill: the authoring guide, the exhaustive DSL reference tables, and a complete validated example script), always version-matched to the engine this server runs. Pass the optional **`task`** argument to have the guide close with "author a workflow that accomplishes: …, then run it with the `workflow` tool".
 
-Hosts without prompt support (Codex CLI, at the time of writing) simply never see it — install the [authoring skill](https://github.com/VikashLoomba/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring) there instead.
+Hosts without prompt support (Codex CLI, at the time of writing) simply never see it — install the [authoring skill](https://github.com/agentprism/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring) there instead.
 
 ---
 

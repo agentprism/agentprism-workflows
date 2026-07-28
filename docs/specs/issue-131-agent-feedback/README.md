@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-14
 
-**Issue:** [#131](https://github.com/VikashLoomba/agentprism-workflows/issues/131)
+**Issue:** [#131](https://github.com/agentprism/agentprism-workflows/issues/131)
 
 This pack turns the operational feedback from a five-run, roughly 200-agent-call workflow into one
 coordinated design: safe run inspection and failure context, request-detached execution with bounded

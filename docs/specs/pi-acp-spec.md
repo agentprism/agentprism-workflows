@@ -238,7 +238,7 @@ Mirrors the `main→lib / bin→index` split of `packages/mcp-server/package.jso
   "version": "0.0.0",
   "license": "Apache-2.0",
   "engines": { "node": ">=22.19.0" },
-  "repository": { "type": "git", "url": "git+https://github.com/VikashLoomba/agentprism-workflows.git", "directory": "packages/pi-acp" },
+  "repository": { "type": "git", "url": "git+https://github.com/agentprism/agentprism-workflows.git", "directory": "packages/pi-acp" },
   "type": "module",
   "bin": { "pi-acp": "./dist/index.js" },
   "main": "./dist/lib.js",

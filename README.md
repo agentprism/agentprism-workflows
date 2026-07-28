@@ -6,8 +6,8 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@automatalabs/workflows"><img src="https://img.shields.io/npm/v/@automatalabs/workflows?logo=npm&color=cb3837" alt="npm version" /></a>
-  <a href="https://vikashloomba.github.io/agentprism-workflows/npm-downloads-details.json"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fvikashloomba.github.io%2Fagentprism-workflows%2Fnpm-downloads.json&amp;cacheSeconds=3600" alt="npm downloads across AgentPrism packages" /></a>
-  <a href="https://deepwiki.com/VikashLoomba/agentprism-workflows"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
+  <a href="https://agentprism.github.io/agentprism-workflows/npm-downloads-details.json"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fagentprism.github.io%2Fagentprism-workflows%2Fnpm-downloads.json&amp;cacheSeconds=3600" alt="npm downloads across AgentPrism packages" /></a>
+  <a href="https://deepwiki.com/agentprism/agentprism-workflows"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
 </p>
 
 Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, OpenCode, and pi), with deterministic journaling, resume, token budgets, and git-worktree isolation.
@@ -38,7 +38,7 @@ You describe the workflow in plain language; your agent designs it with the righ
 - **Agent skill** — install the bundled authoring skill into any skills-capable agent CLI:
 
   ```bash
-  npx skills add VikashLoomba/agentprism-workflows
+  npx skills add agentprism/agentprism-workflows
   ```
 
 - **MCP prompt** — on prompt-capable MCP hosts, invoke the **`author-workflow`** prompt served by `@automatalabs/mcp-server` (in Claude Code it surfaces as a slash command, with an optional `task` argument). It injects the same authoring guide, so the agent targets the DSL that will actually execute the script.
@@ -444,7 +444,7 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 > [skills.sh](https://skills.sh) CLI:
 >
 > ```bash
-> npx skills add VikashLoomba/agentprism-workflows
+> npx skills add agentprism/agentprism-workflows
 > ```
 >
 > It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, budgets, isolation,
@@ -576,7 +576,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 - [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes three selected backends in one autonomous multi-stage run.
 - [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, MCP auth tools, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
-- [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add VikashLoomba/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
+- [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add agentprism/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
 - [Agent Client Protocol](https://agentclientprotocol.com) · [Model Context Protocol](https://modelcontextprotocol.io)
 

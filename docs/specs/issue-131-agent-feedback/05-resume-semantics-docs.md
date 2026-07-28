@@ -1,7 +1,7 @@
 # Prominent Resume and Journal Identity Semantics
 
 **Date:** 2026-07-14
-**Reference:** [Issue #131](https://github.com/VikashLoomba/agentprism-workflows/issues/131), section 5
+**Reference:** [Issue #131](https://github.com/agentprism/agentprism-workflows/issues/131), section 5
 
 ## 1. Problem
 

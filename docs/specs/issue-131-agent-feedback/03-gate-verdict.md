@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-14
 
-**Issue:** [#131](https://github.com/VikashLoomba/agentprism-workflows/issues/131), item 3
+**Issue:** [#131](https://github.com/agentprism/agentprism-workflows/issues/131), item 3
 
 ## 1. Problem
 

@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 
-**References:** [issue #147](https://github.com/VikashLoomba/agentprism-workflows/issues/147) (resolved by removal under this contract)
+**References:** [issue #147](https://github.com/agentprism/agentprism-workflows/issues/147) (resolved by removal under this contract)
 
 ## 1. Problem
 

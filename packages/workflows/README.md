@@ -980,12 +980,12 @@ globals documented by the ambient `dsl.d.ts`.)
 
 The repository publishes an **agent skill** — a self-contained, backend-agnostic authoring guide
 in the standard `SKILL.md` format — at
-[`skills/agentprism-workflow-authoring/`](https://github.com/VikashLoomba/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring).
+[`skills/agentprism-workflow-authoring/`](https://github.com/agentprism/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring).
 Install it into whatever coding agent you use (Claude Code, Codex, Cursor, OpenCode, …) with the
 [skills](https://skills.sh) CLI:
 
 ```bash
-npx skills add VikashLoomba/agentprism-workflows
+npx skills add agentprism/agentprism-workflows
 ```
 
 It teaches the full script DSL: routing each `agent()` call to a different ACP backend inside one
