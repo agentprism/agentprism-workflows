@@ -1,0 +1,11 @@
+@automatalabs/codex-acp
+Copyright 2026 Automata Labs
+
+This product is a fork of "codex-acp" by Agent Client Protocol
+(https://github.com/agentclientprotocol/codex-acp), used under the
+Apache License, Version 2.0 (see LICENSE).
+
+Changes made by Automata Labs in this fork:
+- Forward a per-turn JSON Schema from the ACP prompt's
+  _meta["agentprism/outputSchema"] into the Codex App Server's
+  turn/start.outputSchema, enabling native structured output for ACP clients.
