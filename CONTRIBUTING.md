@@ -103,10 +103,12 @@ instead of editing the JSON by hand.
 
 ## No agent attribution in the history
 
-Commits in this repo carry **no Claude attribution**, on either of two axes, and there is no bypass:
+Commits in this repo carry **no Claude attribution**, on either of two axes, and there is no bypass for first-party commits:
 
 - **Message** — no `Claude-Session:` trailers, no `claude.ai/code` links, no Claude co-author trailers, no "Generated with Claude Code" banners.
 - **Identity** — no commit whose *author* or *committer* is an agent identity (an `@anthropic.com` address, or a name beginning `Claude`).
+
+**Imported third-party history is the one recorded exception** (owner decision, 2026-07-28, for the #282 codex-acp fold-in). Non-squashed subtree imports carry upstream contributors' and pre-policy fork commits whose messages we neither wrote nor may rewrite — rewriting upstream commits would break the upstream-ancestry containment invariant the import exists to preserve. `scripts/attribution-foreign-heads.json` records the tip SHA of each imported history; the gate exempts only commits *reachable from a recorded head*. The import and sync merge commits themselves are first-party and stay fully gated, and the allowlist grows only via a reviewed PR that merges that exact history. Identity cannot express this exemption: GitHub's web-flow committer (`noreply@github.com`) appears on both our squash merges and upstream's, so only ancestry separates their history from ours.
 
 The identity axis is not cosmetic, and it is the one that is easy to miss. GitHub composes a squash-merge message from the branch's commit messages **and synthesizes a `Co-authored-by:` trailer for every distinct author identity among them** (this repo uses `squash_merge_commit_message=COMMIT_MESSAGES`). So a single branch commit authored under an agent identity — a cloud-session commit, say, where the committer is you but the author is not — puts a co-author trailer on `main` even though no branch commit message ever contained one, generated server-side where no local hook can reach it. That is exactly how it happened once (`fc50fae`, #297): the message-only `commit-msg` hook was already in place and had nothing to catch.
 
