@@ -7,7 +7,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/VikashLoomba/agentprism-workflows.git",
+    "url": "git+https://github.com/agentprism/agentprism-workflows.git",
     "directory": "packages/acp-agents"
   },
   "type": "module",
@@ -42,7 +42,7 @@
     "prepublishOnly": "tsc -b"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.62.0",
+    "@agentclientprotocol/claude-agent-acp": "0.63.0",
     "@agentclientprotocol/sdk": "^1.3.0",
     "@automatalabs/codex-acp": "1.6.12",
     "@automatalabs/pi-acp": "workspace:*",

@@ -15,7 +15,7 @@ const skillDir = join(repoRoot, "skills", "agentprism-workflow-authoring");
 const outFile = join(repoRoot, "packages", "mcp-server", "src", "generated", "authoring-prompt-content.ts");
 
 const EXAMPLES_URL =
-  "https://github.com/VikashLoomba/agentprism-workflows/blob/main/skills/agentprism-workflow-authoring/examples";
+  "https://github.com/agentprism/agentprism-workflows/blob/main/skills/agentprism-workflow-authoring/examples";
 
 function replaceOnce(text, marker, replacement, file) {
   const parts = text.split(marker);

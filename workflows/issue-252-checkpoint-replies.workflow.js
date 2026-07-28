@@ -31,7 +31,7 @@ const DESIGN_DIR = typeof input.designDir === "string"
   ? input.designDir
   : "/home/vikash/agentprism-252-design"; // OUTSIDE the worktree — survives a worktree reset
 const ISSUE = Number.isInteger(input.issue) ? input.issue : 252;
-const REPO = "VikashLoomba/agentprism-workflows";
+const REPO = "agentprism/agentprism-workflows";
 const MAX_ROUNDS = Number.isInteger(input.maxRounds) && input.maxRounds > 0
   ? Math.min(input.maxRounds, 5)
   : 3;
