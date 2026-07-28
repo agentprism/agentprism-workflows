@@ -1,0 +1,172 @@
+# Upstream sync for packages/codex-acp (#282): keep our fork's history CONTAINING canonical
+# upstream (agentclientprotocol/codex-acp). When upstream advances, this workflow opens/refreshes
+# ONE rolling DRAFT PR whose package change is a NON-SQUASHED subtree merge — never a rebase,
+# never --squash, never a push to main, never auto-resolved conflicts. The dependency gate
+# (scripts/check-acp-deps.mjs) fails closed repo-wide while upstream is uncontained; the sync PR
+# itself is what unblocks it.
+#
+# The PR stays DRAFT until a maintainer reviews the upstream changes and adds an explicit
+# @automatalabs/codex-acp changeset — automation must not guess major/minor/patch. The merged
+# upstream tip is recorded in scripts/attribution-foreign-heads.json in the same PR, which is what
+# lets the imported third-party commits through the attribution gate (first-party commits,
+# including the merge commit itself, stay fully gated).
+#
+# On a merge conflict with fork-owned behavior the workflow opens/updates a blocking issue naming
+# the upstream SHA and conflict paths, and touches nothing.
+#
+# The PR rides the release app token when configured (so CI runs on it natively — same pattern as
+# release.yml); with no app secrets it falls back to GITHUB_TOKEN and a maintainer re-runs the
+# pull_request checks if needed.
+name: codex-acp upstream sync
+
+on:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: codex-acp-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/agentclientprotocol/codex-acp.git
+  UPSTREAM_REF: main
+  PREFIX: packages/codex-acp
+  SYNC_BRANCH: codex-acp-upstream-sync
+  ISSUE_TITLE: "codex-acp upstream sync blocked: subtree merge conflict"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+    steps:
+      - name: Mint the release app token
+        id: app-token
+        if: env.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream and decide
+        id: decide
+        run: |
+          set -euo pipefail
+          git fetch --quiet "$UPSTREAM_URL" "$UPSTREAM_REF"
+          UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Upstream $UPSTREAM_SHA already contained in main — nothing to sync."
+            exit 0
+          fi
+          # An existing sync branch that already contains this exact upstream tip needs no refresh.
+          if git ls-remote --exit-code --heads origin "refs/heads/$SYNC_BRANCH" >/dev/null 2>&1; then
+            git fetch --quiet origin "$SYNC_BRANCH"
+            if git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/$SYNC_BRANCH"; then
+              echo "Sync branch already carries upstream $UPSTREAM_SHA — leaving the open PR as is."
+              exit 0
+            fi
+          fi
+          echo "should_sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Subtree-merge upstream (no squash)
+        id: merge
+        if: steps.decide.outputs.should_sync == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.decide.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH" origin/main
+          if ! git subtree pull --prefix="$PREFIX" "$UPSTREAM_URL" "$UPSTREAM_REF" \
+              -m "sync($PREFIX): merge upstream codex-acp $UPSTREAM_SHA"; then
+            {
+              echo "conflict=true"
+              echo "conflict_paths<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            exit 0
+          fi
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const path = "scripts/attribution-foreign-heads.json";
+            const record = JSON.parse(readFileSync(path, "utf8"));
+            const sha = process.env.UPSTREAM_SHA;
+            if (!record.heads.some((head) => head.sha === sha)) {
+              record.heads.push({
+                sha,
+                imported: new Date().toISOString().slice(0, 10),
+                what: "codex-acp upstream sync: agentclientprotocol/codex-acp main",
+              });
+              writeFileSync(path, JSON.stringify(record, null, 2) + "\n");
+            }
+          '
+          git add scripts/attribution-foreign-heads.json
+          git commit -m "chore(attribution): record imported upstream head $UPSTREAM_SHA"
+          git push --force-with-lease origin "$SYNC_BRANCH"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh the draft sync PR
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.decide.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          body="Non-squashed subtree merge of upstream \`agentclientprotocol/codex-acp@${UPSTREAM_SHA}\` into \`${PREFIX}\`.
+
+          Before marking ready for review:
+          - [ ] review the upstream changes (\`git log main..${SYNC_BRANCH} -- ${PREFIX}\`)
+          - [ ] run \`pnpm --filter @automatalabs/codex-acp test\` and the acp-agents live e2e
+          - [ ] add an explicit \`@automatalabs/codex-acp\` changeset (automation never guesses the bump)
+
+          The merged upstream tip is recorded in \`scripts/attribution-foreign-heads.json\` in this PR. Never squash-merge this PR — the dependency gate verifies real ancestry."
+          existing=$(gh pr list --state open --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body "$body"
+            gh pr comment "$existing" --body "Refreshed to upstream \`$UPSTREAM_SHA\`."
+          else
+            gh pr create --draft --base main --head "$SYNC_BRANCH" \
+              --title "sync(codex-acp): merge upstream $UPSTREAM_SHA" --body "$body"
+          fi
+          open_issue=$(gh issue list --state open --search "$ISSUE_TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$open_issue" ]; then
+            gh issue close "$open_issue" --comment "A conflict-free sync PR now covers upstream \`$UPSTREAM_SHA\`."
+          fi
+
+      - name: Report the conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.decide.outputs.upstream_sha }}
+          CONFLICT_PATHS: ${{ steps.merge.outputs.conflict_paths }}
+        run: |
+          set -euo pipefail
+          body="Merging upstream \`agentclientprotocol/codex-acp@${UPSTREAM_SHA}\` into \`${PREFIX}\` conflicts with fork-owned behavior. Resolve manually on the \`${SYNC_BRANCH}\` branch (non-squashed merge, fork's \`package.json\` version line wins), then re-run this workflow.
+
+          Conflicting paths:
+          \`\`\`
+          ${CONFLICT_PATHS}
+          \`\`\`"
+          existing=$(gh issue list --state open --search "$ISSUE_TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body "$body"
+          fi
