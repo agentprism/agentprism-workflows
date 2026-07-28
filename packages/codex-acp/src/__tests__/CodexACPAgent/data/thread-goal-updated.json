@@ -1,0 +1,23 @@
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "test-session-id",
+      "update": {
+        "sessionUpdate": "session_info_update",
+        "_meta": {
+          "codex": {
+            "goal": {
+              "objective": "Ship the goal update",
+              "status": "active",
+              "tokenBudget": null,
+              "timeUsedSeconds": 12,
+              "createdAt": 1710000000,
+              "controlMethod": "_codex/session/goal_control"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

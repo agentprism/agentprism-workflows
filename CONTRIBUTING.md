@@ -1,6 +1,6 @@
 # Contributing
 
-This is a **pnpm workspace** (monorepo) of seven packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the protocol-level design is in [`docs/design-notes.md`](docs/design-notes.md).
+This is a **pnpm workspace** (monorepo) of eight packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the protocol-level design is in [`docs/design-notes.md`](docs/design-notes.md).
 
 ## Prerequisites
 
@@ -11,7 +11,7 @@ This is a **pnpm workspace** (monorepo) of seven packages under the `@automatala
 
 ```bash
 pnpm install        # installs deps, fetches backend binaries
-pnpm build          # tsc -b across all packages (topological)
+pnpm build          # per-package builds, topological (tsc -b; esbuild for codex-acp)
 pnpm test           # pnpm build && pnpm -r test
 pnpm typecheck      # pnpm -r exec tsc --noEmit
 ```
@@ -20,7 +20,7 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 1. **Fetches native binaries.** Both backends pull an os/cpu-gated native binary (`@openai/codex`, `@anthropic-ai/claude-agent-sdk`). Stay on a glibc x64 runner in CI and do **not** pass `--no-optional`.
 
-> The Codex backend's turn-level `outputSchema` forward is baked into the published `@automatalabs/codex-acp` fork (exact-pinned by `acp-agents`), so there is nothing to patch locally. See [`docs/design-notes.md` §6.3](docs/design-notes.md).
+> The Codex backend's turn-level `outputSchema` forward is baked into the workspace `@automatalabs/codex-acp` package (`packages/codex-acp`, consumed by `acp-agents` as `workspace:*`), so there is nothing to patch locally. See [`docs/design-notes.md` §6.3](docs/design-notes.md).
 
 ## Package layout
 
@@ -33,6 +33,7 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 | `packages/workflows` | The importable SDK facade. |
 | `packages/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` events. |
 | `packages/pi-acp` | Standalone in-process ACP server and library adapter for the pi coding agent. |
+| `packages/codex-acp` | Our codex-acp fork (full upstream history, non-squashed subtree): the ACP server the Codex backend spawns. |
 
 `workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`. So the primary dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }`. `agentprism-otel` is an independent leaf with an `@opentelemetry/api` peer dependency; it observes the manager structurally and is not in that runtime chain.
 
@@ -64,9 +65,9 @@ Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired b
 
 1. **Attribution gate** (`node scripts/check-attribution.mjs`, also runnable standalone) over the commits actually being pushed — see "No agent attribution in the history" below.
 2. **ACP dependency gate** (`node scripts/check-acp-deps.mjs`, also runnable standalone), three sub-checks:
-   - *npm freshness*: the ACP client/agent libraries (`@agentclientprotocol/*`, `@automatalabs/codex-acp`, `@earendil-works/pi-coding-agent`) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
+   - *npm freshness*: the ACP client/agent libraries (`@agentclientprotocol/*`, `@earendil-works/pi-coding-agent`) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
      On a pi runtime bump, re-capture `packages/pi-acp/test/fixtures/provider-error-strings.ts` and re-run the classifier suite so provider prose cannot silently change pause/retry classification.
-   - *fork git sync*: our codex-acp fork's published `main` must contain its upstream (`agentclientprotocol/codex-acp`) `main` — versions can't be compared because the fork's version line has diverged, so the check counts unmerged upstream commits. It always works against a **real clone** (no API summary): the working clone (`~/codex-acp`, override with `AGENTPRISM_CODEX_ACP_DIR`) when present, otherwise a managed temp clone the gate creates at `<tmpdir>/codex-acp` and reuses (this is the CI path — public repos, no token). Either way the clone is verified and prepared first: `origin` must be the fork (`VikashLoomba/codex-acp`, matched by owner/repo so https/ssh forms both pass — read-only check, the gate never mutates a repo that isn't provably the fork); the `upstream` remote is added or re-pointed to the true upstream when wrong; both remotes are fetched; the checkout is put on `main` and pulled current (a working clone must be clean and must have no unpushed commits — releases are cut from the *pushed* fork main, so a locally-merged-but-unpushed sync still blocks). Only then are upstream commits counted against the local checkout. On failure it prints the merge → push → `release-fork.yml` → bump sequence.
+   - *source-upstream containment*: the workspace fork `packages/codex-acp` must CONTAIN its upstream (`agentclientprotocol/codex-acp`) `main` — versions can't be compared because the fork's version line has diverged, so the gate fetches the canonical upstream ref into THIS repository and requires `git merge-base --is-ancestor <upstream tip> HEAD`. Sync policy is merge, never rebase or squash, so ancestry is the exact invariant: a non-squashed subtree merge satisfies it, and a squash or rewritten import can never fake it (new SHAs make the true upstream tip unreachable from HEAD). On failure it names the remediation: open/refresh the upstream-sync PR — `git subtree merge` (NO `--squash`) of upstream `main` into `packages/codex-acp` — review the upstream changes, add a `@automatalabs/codex-acp` changeset, and merge.
    - *wrapped runtime freshness*: an adapter can be at npm `latest` while exact-pinning a stale agent runtime inside it (e.g. `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` — the runtime that actually answers prompts), which the freshness check can't see. The gate compares the lockfile's *transitive* resolution of each wrapped runtime against the runtime's npm `latest`. Fix when behind: bump the adapter if its latest already wraps a current runtime, else add a root `pnpm.overrides` pin (then `pnpm install` + run the acp-agents live e2e before pushing). The check warns once an override becomes redundant so versions drift back to upstream-managed.
 
    The gate **fails closed**: if the registry or GitHub API is unreachable after retries, staleness cannot be ruled out and the push is blocked. **There is no bypass.** The same gate also runs as a step of the required **Build & test** CI job — while any tracked dependency is stale, *every* PR merge is blocked — and at the top of `release.yml`, where a failure blocks versioning/publishing, leaves any open Version PR open, and files/updates a "Release blocked: ACP dependency gate failed" issue with the gate output.
@@ -103,10 +104,12 @@ instead of editing the JSON by hand.
 
 ## No agent attribution in the history
 
-Commits in this repo carry **no Claude attribution**, on either of two axes, and there is no bypass:
+Commits in this repo carry **no Claude attribution**, on either of two axes, and there is no bypass for first-party commits:
 
 - **Message** — no `Claude-Session:` trailers, no `claude.ai/code` links, no Claude co-author trailers, no "Generated with Claude Code" banners.
 - **Identity** — no commit whose *author* or *committer* is an agent identity (an `@anthropic.com` address, or a name beginning `Claude`).
+
+**Imported third-party history is the one recorded exception** (owner decision, 2026-07-28, for the #282 codex-acp fold-in). Non-squashed subtree imports carry upstream contributors' and pre-policy fork commits whose messages we neither wrote nor may rewrite — rewriting upstream commits would break the upstream-ancestry containment invariant the import exists to preserve. `scripts/attribution-foreign-heads.json` records the tip SHA of each imported history; the gate exempts only commits *reachable from a recorded head*. The import and sync merge commits themselves are first-party and stay fully gated, and the allowlist grows only via a reviewed PR that merges that exact history. Identity cannot express this exemption: GitHub's web-flow committer (`noreply@github.com`) appears on both our squash merges and upstream's, so only ancestry separates their history from ours.
 
 The identity axis is not cosmetic, and it is the one that is easy to miss. GitHub composes a squash-merge message from the branch's commit messages **and synthesizes a `Co-authored-by:` trailer for every distinct author identity among them** (this repo uses `squash_merge_commit_message=COMMIT_MESSAGES`). So a single branch commit authored under an agent identity — a cloud-session commit, say, where the committer is you but the author is not — puts a co-author trailer on `main` even though no branch commit message ever contained one, generated server-side where no local hook can reach it. That is exactly how it happened once (`fc50fae`, #297): the message-only `commit-msg` hook was already in place and had nothing to catch.
 
@@ -197,14 +200,14 @@ pnpm release          # pnpm build && changeset publish (runs in release.yml's p
 
    Registry propagation can lag a minute or two — retry before concluding failure. A Version PR sitting OPEN with green checks and no auto-merge queued means the app secrets are absent or broken → merge it manually (step 6's fallback). A failed release run with a red gate → the "Release blocked" issue carries the gate output; follow the runbook above. For a release touching the pi-acp ↔ mcp-server wiring, additionally run the post-publish smoke: `node scripts/smoke-pi-mcp-release.mjs` (doc-sync map above).
 
-### The codex-acp fork leg (when the dependency gate demands it)
+### The codex-acp upstream-sync leg (when the dependency gate demands it)
 
-`@automatalabs/codex-acp` releases from its own repo (`VikashLoomba/codex-acp`), **automatically**: pushing fork `main` with green CI fires its `release-fork.yml` (bump size inferred from commit subjects since the last tag; its `workflow_dispatch` exists only for explicit bump overrides and dry runs), which tags, creates the GitHub release, and chain-dispatches `publish-oidc.yml` to publish to npm. There is no manual trigger to pull on the happy path. The full sequence:
+`@automatalabs/codex-acp` lives in this monorepo at `packages/codex-acp` — our fork of `agentclientprotocol/codex-acp`, imported with its full history as a **non-squashed subtree** (#282) — and releases through the ordinary Changesets train like every other package. When the gate reports the package behind its upstream, the fix is one sync PR:
 
-1. In `~/codex-acp`: `git fetch upstream main && git merge upstream/main` — resolve the recurring `package.json`/`package-lock.json` version+description conflict in the **fork's** favor (its version line is independent of upstream's), sanity-build, and `git push origin main`. The gate requires the clone to be clean **and pushed** — a locally-merged-but-unpushed sync still blocks.
-2. Watch `gh run list --repo VikashLoomba/codex-acp` until CI → `Release (fork)` → `Publish (OIDC)` are all green, then confirm `npm view @automatalabs/codex-acp version` advanced.
-3. Bump the exact pin in `packages/acp-agents/package.json` to that new version as part of the same maintenance PR here (never a separate later PR — the gate compares the pin against npm `latest`).
+1. `git fetch https://github.com/agentclientprotocol/codex-acp.git main`, then merge it into `packages/codex-acp` with `git subtree merge --prefix=packages/codex-acp` (or `git merge -X subtree=packages/codex-acp`) — **never `--squash`, never a rebase**: the gate verifies real ancestry, and a squashed or rewritten import can never satisfy it. Resolve the recurring `package.json` version/metadata conflict in the **fork's** favor (its version line is independent of upstream's).
+2. Review the upstream changes, run the codex-acp suite (`pnpm --filter @automatalabs/codex-acp test`) and the acp-agents live e2e, and add an explicit `@automatalabs/codex-acp` changeset — automation must not guess the bump size.
+3. Merge the sync PR; the normal release train versions and publishes the package with everything else. Imported upstream commits are exempt from the attribution gate via `scripts/attribution-foreign-heads.json` — record the merged upstream tip there in the same PR.
 
-The Codex `outputSchema` forward lives in that fork (exact-pinned by `acp-agents`), so any change to that wire key is a **coordinated release**: publish the fork first, then bump the pinned dep. The repo is licensed Apache-2.0 (`LICENSE`).
+The Codex `outputSchema` forward lives in `packages/codex-acp` (consumed by `acp-agents` as `workspace:*`, published as an exact version), so any change to that wire key ships atomically with the adapter in one release. The package is licensed Apache-2.0 (`packages/codex-acp/LICENSE`).
 
-CI (`.github/workflows/ci.yml`) runs on every PR and push: frozen install → `tsc -b` → `tsc --noEmit` → `pnpm -r test` on Node 24 / pnpm 10. `main` has an active ruleset requiring the `Build & test` check on every merge.
+CI (`.github/workflows/ci.yml`) runs on every PR and push: frozen install → `pnpm build` (per-package builds — `tsc -b` for the TypeScript project references, esbuild for `packages/codex-acp`) → `tsc --noEmit` → `pnpm -r test` on Node 24 / pnpm 10. `main` has an active ruleset requiring the `Build & test` check on every merge.

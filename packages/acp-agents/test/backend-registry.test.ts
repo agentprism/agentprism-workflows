@@ -127,15 +127,15 @@ test("definitions and every release descendant are frozen against strict-mode mu
     assert.throws(() => ((definition.release.engine as any).node = ">=999"), TypeError);
     assert.throws(() => ((definition.release.server as any).kind = "system-command"), TypeError);
     assert.throws(() => (definition.release.freshness.npm as any[]).push("extra"), TypeError);
-    assert.throws(() => (definition.release.freshness.forks as any[]).push({}), TypeError);
+    assert.throws(() => (definition.release.freshness.sourceUpstreams as any[]).push({}), TypeError);
     assert.throws(
       () => (definition.release.freshness.wrappedRuntimes as any[]).push({}),
       TypeError,
     );
-    const fork = definition.release.freshness.forks[0];
-    if (fork) {
-      assert.throws(() => ((fork as any).package = "changed"), TypeError);
-      assert.throws(() => (fork.defaultDirs as any[]).push("$HOME/other"), TypeError);
+    const upstream = definition.release.freshness.sourceUpstreams[0];
+    if (upstream) {
+      assert.throws(() => ((upstream as any).package = "changed"), TypeError);
+      assert.throws(() => ((upstream as any).upstreamRef = "other"), TypeError);
     }
     assert.equal(JSON.stringify(definition.release), before);
   }

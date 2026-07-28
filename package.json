@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "pnpm@10.34.4",
   "scripts": {
-    "build": "pnpm -r exec tsc -b",
+    "build": "pnpm -r run build",
     "typecheck": "pnpm -r exec tsc --noEmit",
     "test": "pnpm build && pnpm -r test",
     "generate:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts",

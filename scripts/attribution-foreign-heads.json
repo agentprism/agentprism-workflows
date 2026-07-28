@@ -1,0 +1,10 @@
+{
+  "$comment": "Imported third-party history the attribution gate exempts (check-attribution.mjs). Commits REACHABLE from a recorded head are skipped on the message axis and identity axis; every commit not reachable from a head — including the import/sync merge commits themselves — is gated normally. Add a head only via a reviewed PR that merges that exact history (owner policy, 2026-07-28).",
+  "heads": [
+    {
+      "sha": "0c53f0c2ceed6fa7181664a8d85ee6f868713c40",
+      "imported": "2026-07-28",
+      "what": "codex-acp fork history: VikashLoomba/codex-acp main at the packages/codex-acp subtree import (contains upstream agentclientprotocol/codex-acp main ba5bef59cfcea4229841fe9438d816696621307b)"
+    }
+  ]
+}

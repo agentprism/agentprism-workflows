@@ -215,14 +215,14 @@ Cross-field validation is mandatory:
 
 The initial generated rows encode the current real topology:
 
-| id | Node floor | server | npm freshness packages | fork sync | wrapped runtime |
+| id | Node floor | server | npm freshness packages | source-upstream containment | wrapped runtime |
 |---|---|---|---|---|---|
 | `claude` | `>=22` | npm package `@agentclientprotocol/claude-agent-acp` | `@agentclientprotocol/sdk`, `@agentclientprotocol/claude-agent-acp` | none | adapter `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` |
-| `codex` | `>=22` | npm package `@automatalabs/codex-acp` | `@agentclientprotocol/sdk`, `@automatalabs/codex-acp` | the exact existing `AGENTPRISM_CODEX_ACP_DIR`/fork/upstream/temporary-clone configuration | none |
+| `codex` | `>=22` | workspace package `@automatalabs/codex-acp` at `packages/codex-acp` | `@agentclientprotocol/sdk` | source upstream `agentclientprotocol/codex-acp#main` contained in HEAD (override `AGENTPRISM_CODEX_ACP_UPSTREAM_URL`) | none |
 | `opencode` | `>=22` | system command `opencode`, optional package probe `opencode-ai` | `@agentclientprotocol/sdk` | none | none |
 | `pi` | `>=22.19.0` | workspace package `@automatalabs/pi-acp` at `packages/pi-acp` | `@agentclientprotocol/sdk`, `@earendil-works/pi-coding-agent` | none | none |
 
-The Codex fork object must preserve: `$HOME/codex-acp`; temporary clone name `codex-acp`; origin `https://github.com/VikashLoomba/codex-acp.git`; upstream `https://github.com/agentclientprotocol/codex-acp.git`; override variables `AGENTPRISM_CODEX_ACP_ORIGIN_URL` and `AGENTPRISM_CODEX_ACP_UPSTREAM_URL`; and remote name `upstream`.
+The Codex source-upstream object must preserve: package `@automatalabs/codex-acp`; path `packages/codex-acp`; upstream `https://github.com/agentclientprotocol/codex-acp.git`; override variable `AGENTPRISM_CODEX_ACP_UPSTREAM_URL`; and ref `main`. (Amended for #282: the external-fork clone model — `$HOME/codex-acp`, temp clones, origin verification — is retired; the gate checks upstream containment as git ancestry against this repository's HEAD.)
 
 The table records engine floors as release/deployment metadata. It does not add a runtime router rejection. Provenance and divergence detection are frozen per server kind:
 

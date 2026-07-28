@@ -1,8 +1,19 @@
 #!/usr/bin/env node
 // Attribution gate: no agent attribution enters this history — not in commit MESSAGES, and not in
-// commit IDENTITIES (author/committer name + email). NO BYPASSES (owner policy, 2026-07-23;
-// identity axis added 2026-07-25 after a squash merge manufactured a co-author trailer out of an
-// agent-authored branch commit).
+// commit IDENTITIES (author/committer name + email). NO BYPASSES for first-party commits (owner
+// policy, 2026-07-23; identity axis added 2026-07-25 after a squash merge manufactured a co-author
+// trailer out of an agent-authored branch commit).
+//
+// IMPORTED THIRD-PARTY HISTORY is the one recorded exception (owner decision, 2026-07-28, for the
+// #282 codex-acp fold-in): non-squashed subtree imports carry foreign commits — upstream
+// contributors' and pre-policy fork commits — whose messages we neither wrote nor may rewrite
+// (rewriting upstream commits would break the upstream-ancestry containment invariant the import
+// exists to preserve). scripts/attribution-foreign-heads.json records the tip SHA of each imported
+// history; commits REACHABLE from a recorded head are exempt. Everything else — including the
+// import and sync MERGE commits themselves, which are first-party — is gated normally. Identity
+// alone cannot express this exemption: GitHub's web-flow committer (noreply@github.com) appears on
+// both our squash merges and upstream's, so only ancestry separates their history from ours. The
+// allowlist grows only via a reviewed PR that merges that exact history.
 //
 // WHY THE IDENTITY AXIS EXISTS. Commit fc50fae ("stop agent-driven run-monitor re-renders", #297)
 // landed on main carrying a Claude co-author trailer while the message-only commit-msg hook was
@@ -28,6 +39,10 @@
 
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
+
+const FOREIGN_HEADS_FILE = join(dirname(fileURLToPath(import.meta.url)), "attribution-foreign-heads.json");
 
 // Field/record separators for the git log format below. Written as escapes on BOTH sides (the
 // `%x1f` git placeholder here, `\x1f` in the split) so no raw control byte ever lands in a source
@@ -118,8 +133,40 @@ function checkMessageFile(path) {
   return 1;
 }
 
+// Commits reachable from a recorded imported-history head are exempt (foreign history; see the
+// header). A head that is not present in this clone exempts nothing — absence fails CLOSED, never
+// open. The env override exists solely so the hermetic tests can point at a fixture file.
+function foreignExemptSet() {
+  const file = process.env.ATTRIBUTION_FOREIGN_HEADS_FILE ?? FOREIGN_HEADS_FILE;
+  let heads;
+  try {
+    heads = JSON.parse(readFileSync(file, "utf8")).heads ?? [];
+  } catch {
+    return new Set();
+  }
+  const exempt = new Set();
+  for (const { sha } of heads) {
+    if (!/^[0-9a-f]{40}$/.test(sha ?? "")) continue;
+    try {
+      git(["cat-file", "-e", `${sha}^{commit}`], { stdio: ["ignore", "ignore", "ignore"] });
+    } catch {
+      continue;
+    }
+    for (const rev of git(["rev-list", sha]).split("\n").filter(Boolean)) exempt.add(rev);
+  }
+  return exempt;
+}
+
 function checkRange(revListArgs) {
-  const revs = git(["rev-list", ...revListArgs]).split("\n").filter(Boolean);
+  const allRevs = git(["rev-list", ...revListArgs]).split("\n").filter(Boolean);
+  const exempt = foreignExemptSet();
+  const revs = allRevs.filter((rev) => !exempt.has(rev));
+  const skipped = allRevs.length - revs.length;
+  if (skipped > 0) {
+    console.log(
+      `attribution: ${skipped} imported foreign-history commit(s) exempt (scripts/attribution-foreign-heads.json)`,
+    );
+  }
   if (revs.length === 0) {
     console.log("attribution: no commits in range — nothing to check");
     return 0;

@@ -27,14 +27,15 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
   }
 }
 
-test("CodexBackend.spawnConfig: default resolves the installed npm dep dist under the current node", () => {
+test("CodexBackend.spawnConfig: default resolves the workspace package dist under the current node", () => {
   withEnv({}, () => {
     const cfg = new CodexBackend().spawnConfig();
     assert.equal(cfg.command, process.execPath); // run under the current node, not a shell/npx
     assert.equal(cfg.args.length, 1);
     const bin = cfg.args[0];
-    // resolved from node_modules (the installed package), not a vendored tree
-    assert.match(bin, /node_modules[/\\].*@automatalabs[/\\]codex-acp[/\\]dist[/\\]index\.js$/);
+    // In this monorepo require.resolve follows the workspace symlink to packages/codex-acp;
+    // a published install resolves the same package under node_modules.
+    assert.match(bin, /(packages|node_modules[/\\].*@automatalabs)[/\\]codex-acp[/\\]dist[/\\]index\.js$/);
     assert.equal(bin.includes("vendor"), false);
     assert.equal(cfg.env, process.env);
   });

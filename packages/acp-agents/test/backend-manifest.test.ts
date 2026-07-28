@@ -59,12 +59,36 @@ function baseBackend(): JsonObject {
     id: "fixture",
     engine: { node: ">=22" },
     server: { kind: "system-command", command: "fixture" },
-    freshness: { npm: [SDK], forks: [], wrappedRuntimes: [] },
+    freshness: { npm: [SDK], sourceUpstreams: [], wrappedRuntimes: [] },
   };
 }
 
 function baseManifest(): JsonObject {
   return { schemaVersion: 1, backends: [baseBackend()] };
+}
+
+// sourceUpstreams are only legal on a workspace-package server, so relation fixtures use one.
+function workspaceBackend(): JsonObject {
+  return {
+    id: "fixture",
+    engine: { node: ">=22" },
+    server: { kind: "workspace-package", package: "@fixture/server", path: "packages/server" },
+    freshness: { npm: [SDK], sourceUpstreams: [], wrappedRuntimes: [] },
+  };
+}
+
+const workspaceServerFiles = {
+  "packages/server": { name: "@fixture/server", engines: { node: ">=22" } },
+};
+
+function validSourceUpstream(): JsonObject {
+  return {
+    package: "@fixture/server",
+    path: "packages/server",
+    upstreamUrl: "https://example.test/upstream.git",
+    upstreamUrlEnv: "FIXTURE_UPSTREAM",
+    upstreamRef: "main",
+  };
 }
 
 function clone<T>(value: T): T {
@@ -188,8 +212,9 @@ function generatorFixture(installedClaudeEngine?: string): string {
       ...(installedClaudeEngine === undefined ? {} : { engines: { node: installedClaudeEngine } }),
     },
   );
-  writePackage("packages/acp-agents/node_modules/@automatalabs/codex-acp/package.json", {
+  writePackage("packages/codex-acp/package.json", {
     name: "@automatalabs/codex-acp",
+    engines: { node: ">=22" },
   });
   mkdirSync(join(root, "scripts"), { recursive: true });
   return root;
@@ -328,20 +353,9 @@ test("schema version, engine grammar, malformed JSON, missing file, and unknown 
 
 test("strict manifest schema rejects every missing, mistyped, unknown, and empty field before network", async () => {
   const server = await registry({});
-  const validFork = {
-    package: SDK,
-    envDir: "FIXTURE_DIR",
-    defaultDirs: ["$HOME/fixture"],
-    tempCloneName: "fixture",
-    originUrl: "https://example.test/fork.git",
-    originUrlEnv: "FIXTURE_ORIGIN",
-    upstreamUrl: "https://example.test/upstream.git",
-    upstreamUrlEnv: "FIXTURE_UPSTREAM",
-    upstreamRemote: "upstream",
-  };
   const manifestWithRelations = () => {
-    const manifest = baseManifest();
-    manifest.backends[0].freshness.forks = [clone(validFork)];
+    const manifest = { schemaVersion: 1, backends: [workspaceBackend()] };
+    manifest.backends[0].freshness.sourceUpstreams = [validSourceUpstream()];
     manifest.backends[0].freshness.wrappedRuntimes = [{
       adapterPackage: SDK,
       runtimePackage: "runtime-fixture",
@@ -367,13 +381,13 @@ test("strict manifest schema rejects every missing, mistyped, unknown, and empty
     ["backends", "0", "server", "kind"],
     ["backends", "0", "server", "command"],
     ["backends", "0", "freshness", "npm"],
-    ["backends", "0", "freshness", "forks"],
+    ["backends", "0", "freshness", "sourceUpstreams"],
     ["backends", "0", "freshness", "wrappedRuntimes"],
   ]) cases.push([missing(path), /required/]);
 
-  for (const field of ["package", "envDir", "defaultDirs", "tempCloneName", "originUrl", "originUrlEnv", "upstreamUrl", "upstreamUrlEnv", "upstreamRemote"]) {
+  for (const field of ["package", "path", "upstreamUrl", "upstreamUrlEnv", "upstreamRef"]) {
     const manifest = manifestWithRelations();
-    delete manifest.backends[0].freshness.forks[0][field];
+    delete manifest.backends[0].freshness.sourceUpstreams[0][field];
     cases.push([manifest, /required/]);
   }
   for (const field of ["adapterPackage", "runtimePackage"]) {
@@ -395,7 +409,7 @@ test("strict manifest schema rejects every missing, mistyped, unknown, and empty
     owner[field] = true;
     cases.push([manifest, /unrecognized field/]);
   }
-  for (const relation of ["forks", "wrappedRuntimes"] as const) {
+  for (const relation of ["sourceUpstreams", "wrappedRuntimes"] as const) {
     const manifest = manifestWithRelations();
     manifest.backends[0].freshness[relation][0].unexpected = true;
     cases.push([manifest, /unrecognized field/]);
@@ -406,7 +420,7 @@ test("strict manifest schema rejects every missing, mistyped, unknown, and empty
     manifest.backends = value;
     cases.push([manifest, /backends must be an array/]);
   }
-  for (const field of ["npm", "forks", "wrappedRuntimes"]) {
+  for (const field of ["npm", "sourceUpstreams", "wrappedRuntimes"]) {
     const manifest = baseManifest();
     manifest.backends[0].freshness[field] = null;
     cases.push([manifest, /must be an array/]);
@@ -446,14 +460,9 @@ test("strict manifest schema rejects every missing, mistyped, unknown, and empty
     };
     cases.push([manifest, new RegExp(`server\\.${field} must be a non-empty string`)]);
   }
-  for (const field of ["package", "envDir", "tempCloneName", "originUrl", "originUrlEnv", "upstreamUrl", "upstreamUrlEnv", "upstreamRemote"]) {
+  for (const field of ["package", "path", "upstreamUrl", "upstreamUrlEnv", "upstreamRef"]) {
     const manifest = manifestWithRelations();
-    manifest.backends[0].freshness.forks[0][field] = "";
-    cases.push([manifest, /non-empty string/]);
-  }
-  {
-    const manifest = manifestWithRelations();
-    manifest.backends[0].freshness.forks[0].defaultDirs = [""];
+    manifest.backends[0].freshness.sourceUpstreams[0][field] = "";
     cases.push([manifest, /non-empty string/]);
   }
   for (const field of ["adapterPackage", "runtimePackage"]) {
@@ -515,24 +524,9 @@ test("empty work sets and every row-array duplicate class fail closed before net
     duplicateNpm.backends[0].freshness.npm.push(SDK);
     await earlyFailure(server, { manifest: duplicateNpm }, /freshness\.npm must be duplicate-free/);
 
-    const duplicateFork = baseManifest();
-    const fork = {
-      package: SDK,
-      envDir: "FIXTURE_DIR",
-      defaultDirs: ["$HOME/fixture"],
-      tempCloneName: "fixture",
-      originUrl: "https://example.test/fork.git",
-      originUrlEnv: "FIXTURE_ORIGIN",
-      upstreamUrl: "https://example.test/upstream.git",
-      upstreamUrlEnv: "FIXTURE_UPSTREAM",
-      upstreamRemote: "upstream",
-    };
-    duplicateFork.backends[0].freshness.forks = [fork, clone(fork)];
-    await earlyFailure(server, { manifest: duplicateFork }, /freshness\.forks must be duplicate-free/);
-
-    const duplicateDirs = baseManifest();
-    duplicateDirs.backends[0].freshness.forks = [{ ...fork, defaultDirs: ["$HOME/fixture", "$HOME/fixture"] }];
-    await earlyFailure(server, { manifest: duplicateDirs }, /defaultDirs must be duplicate-free/);
+    const duplicateUpstream = { schemaVersion: 1, backends: [workspaceBackend()] };
+    duplicateUpstream.backends[0].freshness.sourceUpstreams = [validSourceUpstream(), validSourceUpstream()];
+    await earlyFailure(server, { manifest: duplicateUpstream }, /freshness\.sourceUpstreams must be duplicate-free/);
 
     const duplicateWrapped = baseManifest();
     const wrapped = { adapterPackage: SDK, runtimePackage: "runtime-fixture" };
@@ -543,33 +537,28 @@ test("empty work sets and every row-array duplicate class fail closed before net
   }
 });
 
-test("portable home tokens and server/fork/wrapper cross-fields fail deterministically", async () => {
+test("server/source-upstream/wrapper cross-fields fail deterministically", async () => {
   const server = await registry({});
   try {
-    const fork = {
-      package: SDK,
-      envDir: "FIXTURE_DIR",
-      defaultDirs: ["$HOME/fixture"],
-      tempCloneName: "fixture",
-      originUrl: "https://example.test/fork.git",
-      originUrlEnv: "FIXTURE_ORIGIN",
-      upstreamUrl: "https://example.test/upstream.git",
-      upstreamUrlEnv: "FIXTURE_UPSTREAM",
-      upstreamRemote: "upstream",
-    };
-    for (const token of ["/absolute/path", "$HOME/../escape", "$HOME/name*", "$OTHER/name"]) {
-      const manifest = baseManifest();
-      manifest.backends[0].freshness.forks = [{ ...fork, defaultDirs: [token] }];
-      await earlyFailure(server, { manifest }, /invalid \$HOME/);
-    }
-
     const npmRelation = baseManifest();
     npmRelation.backends[0].server = { kind: "npm-package", package: "npm-server" };
     await earlyFailure(server, { manifest: npmRelation }, /server\.package must appear/);
 
-    const forkRelation = baseManifest();
-    forkRelation.backends[0].freshness.forks = [{ ...fork, package: "fork-package" }];
-    await earlyFailure(server, { manifest: forkRelation }, /forks\[0\]\.package must appear/);
+    // sourceUpstreams demand a workspace-package server...
+    const nonWorkspace = baseManifest();
+    nonWorkspace.backends[0].freshness.sourceUpstreams = [validSourceUpstream()];
+    await earlyFailure(server, { manifest: nonWorkspace }, /requires a workspace-package server/);
+
+    // ...and must reference exactly that server's package and path.
+    for (const drift of [{ package: "@fixture/other" }, { path: "packages/other" }]) {
+      const mismatch = { schemaVersion: 1, backends: [workspaceBackend()] };
+      mismatch.backends[0].freshness.sourceUpstreams = [{ ...validSourceUpstream(), ...drift }];
+      await earlyFailure(
+        server,
+        { manifest: mismatch },
+        /must reference the backend's workspace server package and path/,
+      );
+    }
 
     const wrapperRelation = baseManifest();
     wrapperRelation.backends[0].freshness.wrappedRuntimes = [{
@@ -723,65 +712,53 @@ test("manifest-declared npm and wrapped-runtime work activate without gate sourc
   }
 });
 
-test("a supplied fifth-backend fork relationship activates without gate source edits", async () => {
+test("a supplied fifth-backend source-upstream relationship activates without gate source edits", async () => {
   const FIFTH = "@agentclientprotocol/fifth-backend";
-  const originUrl = "https://git.invalid/runtime-owner/fifth-backend.git";
   const upstreamUrl = "https://git.invalid/runtime-upstream/fifth-backend.git";
-  const fifth = baseBackend();
-  fifth.id = "fifth";
-  fifth.server.command = "fifth";
-  fifth.freshness.npm = [FIFTH];
-  fifth.freshness.forks = [{
-    package: FIFTH,
-    envDir: "AGENTPRISM_FIFTH_BACKEND_DIR",
-    defaultDirs: ["$HOME/fifth-backend"],
-    tempCloneName: "fifth-backend",
-    originUrl: "https://git.invalid/declared-owner/fifth-backend.git",
-    originUrlEnv: "AGENTPRISM_FIFTH_BACKEND_ORIGIN_URL",
-    upstreamUrl: "https://git.invalid/declared-upstream/fifth-backend.git",
-    upstreamUrlEnv: "AGENTPRISM_FIFTH_BACKEND_UPSTREAM_URL",
-    upstreamRemote: "source",
-  }];
+  const fifth = {
+    id: "fifth",
+    engine: { node: ">=22" },
+    server: { kind: "workspace-package", package: FIFTH, path: "packages/fifth-backend" },
+    freshness: {
+      npm: [SDK],
+      sourceUpstreams: [{
+        package: FIFTH,
+        path: "packages/fifth-backend",
+        upstreamUrl: "https://git.invalid/declared-upstream/fifth-backend.git",
+        upstreamUrlEnv: "AGENTPRISM_FIFTH_BACKEND_UPSTREAM_URL",
+        upstreamRef: "main",
+      }],
+      wrappedRuntimes: [],
+    },
+  };
   const manifest = baseManifest();
   manifest.backends.push(fifth);
   const root = fixtureRoot({
     manifest,
-    packageManifest: {
-      name: "@automatalabs/acp-agents",
-      engines: { node: ">=22" },
-      dependencies: { [SDK]: "^1.2.1", [FIFTH]: "^5.0.0" },
+    workspaces: {
+      "packages/fifth-backend": { name: FIFTH, engines: { node: ">=22" } },
     },
-    lock: lockfile({ [SDK]: "1.2.1", [FIFTH]: "5.0.0" }),
   });
-  const workingClone = join(root, "fifth-working-clone");
-  mkdirSync(join(workingClone, ".git"), { recursive: true });
   const gitFixture = installManifestGitFixture(root);
   const server = await registry({
     [`/${SDK}/latest`]: { body: { version: "1.2.1" } },
-    [`/${FIFTH}/latest`]: { body: { version: "5.0.0" } },
   });
   try {
     const result = await runGate(root, server.url, {
       PATH: `${gitFixture.bin}${delimiter}${process.env.PATH ?? ""}`,
       FIXTURE_GIT_LOG: gitFixture.log,
-      FIXTURE_GIT_ORIGIN: originUrl,
-      FIXTURE_GIT_UPSTREAM: upstreamUrl,
-      AGENTPRISM_FIFTH_BACKEND_DIR: workingClone,
-      AGENTPRISM_FIFTH_BACKEND_ORIGIN_URL: originUrl,
       AGENTPRISM_FIFTH_BACKEND_UPSTREAM_URL: upstreamUrl,
     });
     assert.equal(result.status, 0, result.out);
-    assert.ok(server.requests.includes(`/${FIFTH}/latest`));
-    assert.match(result.out, new RegExp(`fork ${workingClone.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-    assert.match(result.out, /runtime-upstream\/fifth-backend#main/);
+    // the env override wins over the declared upstream URL, and the result names the ref
+    assert.match(result.out, /runtime-upstream\/fifth-backend#main — in sync/);
 
     const calls = readFileSync(gitFixture.log, "utf8")
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    assert.ok(calls.some((args) => args.includes("source") && args.includes("fetch")));
-    assert.ok(calls.some((args) => args.includes("source") && args.includes("ls-remote")));
-    assert.ok(calls.some((args) => args.includes("pull") && args.includes("--ff-only")));
+    assert.ok(calls.some((args) => args.includes("fetch") && args.includes(upstreamUrl) && args.includes("main")));
+    assert.ok(calls.some((args) => args.includes("merge-base") && args.includes("--is-ancestor")));
     assert.equal(calls.some((args) => args.includes("clone")), false);
     assert.equal(
       readFileSync(join(root, "scripts", "check-acp-deps.mjs"), "utf8"),

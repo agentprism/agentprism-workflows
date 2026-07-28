@@ -125,7 +125,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build (project references)
-        run: pnpm -r exec tsc -b
+        run: pnpm build
 
       # changesets/action opens/updates a "Version Packages" PR (running the
       # root `version` script = `changeset version`); when that PR is merged it

@@ -63,8 +63,12 @@ test("adapter versions cited in docs match the installed acp-agents dependencies
   };
   const expected = new Map([
     ["@agentclientprotocol/claude-agent-acp", packageJson.dependencies["@agentclientprotocol/claude-agent-acp"]],
-    ["@automatalabs/codex-acp", packageJson.dependencies["@automatalabs/codex-acp"]],
   ]);
+  assert.equal(
+    packageJson.dependencies["@automatalabs/codex-acp"],
+    "workspace:*",
+    "codex-acp is consumed as a workspace package",
+  );
 
   for (const path of ["docs/api.md", "docs/design-notes.md"]) {
     const text = readRepoFile(path);
@@ -75,6 +79,13 @@ test("adapter versions cited in docs match the installed acp-agents dependencies
       assert.ok(cited.length > 0, `${path} must cite ${packageName}@${version}`);
       assert.deepEqual([...new Set(cited)], [version], `${path} ${packageName} version citations drifted`);
     }
+    // A version-pinned codex-acp citation would break the automated Version PR (Changesets bumps
+    // the workspace version without touching docs) — the workspace package is cited unversioned.
+    assert.equal(
+      /@automatalabs\/codex-acp@\d/.test(text),
+      false,
+      `${path} must not version-pin the workspace package @automatalabs/codex-acp`,
+    );
   }
 });
 
@@ -160,7 +171,7 @@ test("public package inventories cover every workspace package", () => {
       manifest: JSON.parse(readRepoFile(`packages/${entry.name}/package.json`)) as { name: string },
     }));
 
-  assert.equal(manifests.length, 7, "update the documented package-count contract when the workspace changes");
+  assert.equal(manifests.length, 8, "update the documented package-count contract when the workspace changes");
   for (const path of ["README.md", "docs/api.md", "docs/design-notes.md"]) {
     const text = readRepoFile(path);
     for (const { manifest } of manifests) {
@@ -172,18 +183,17 @@ test("public package inventories cover every workspace package", () => {
   for (const { dir } of manifests) {
     assert.ok(contributing.includes(`packages/${dir}`), `CONTRIBUTING.md must inventory packages/${dir}`);
   }
-  assert.match(contributing, /\(monorepo\) of seven packages/);
-  assert.match(readRepoFile("docs/design-notes.md"), /monorepo of \*\*seven\*\* published packages/);
+  assert.match(contributing, /\(monorepo\) of eight packages/);
+  assert.match(readRepoFile("docs/design-notes.md"), /monorepo of \*\*eight\*\* published packages/);
 });
 
 test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   const packageJson = JSON.parse(readRepoFile("packages/acp-agents/package.json")) as {
     dependencies: Record<string, string>;
   };
-  const codexVersion = packageJson.dependencies["@automatalabs/codex-acp"];
   const authSpec = readRepoFile("docs/specs/acp-auth-spec.md");
   assert.ok(authSpec.startsWith("# ACP Authentication — Implemented End-to-End Design Record"));
-  assert.ok(authSpec.includes(`### 3.3 Codex — \`@automatalabs/codex-acp\` ${codexVersion}`));
+  assert.ok(authSpec.includes("### 3.3 Codex — `@automatalabs/codex-acp` (workspace)"));
   assert.ok(authSpec.includes("### 4.6 Implemented test matrix (historical plan)"));
   assert.ok(authSpec.includes("### 4.7 Completed PR sequencing (historical)"));
 

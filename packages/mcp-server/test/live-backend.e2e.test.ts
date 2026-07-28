@@ -46,7 +46,10 @@ const SERVER_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url))
 // a workspace:* sibling, so in-repo it resolves to packages/pi-acp/dist (the exact artifact
 // npm publishes) instead of node_modules.
 const requireAcp = createRequire(new URL("../../acp-agents/package.json", import.meta.url));
-const PI_WORKSPACE_DIST = fileURLToPath(new URL("../../pi-acp/dist/", import.meta.url));
+const WORKSPACE_DIST: Partial<Record<Backend, string>> = {
+  pi: fileURLToPath(new URL("../../pi-acp/dist/", import.meta.url)),
+  codex: fileURLToPath(new URL("../../codex-acp/dist/", import.meta.url)),
+};
 const BACKEND_BIN: Record<Backend, string> = {
   claude: requireAcp.resolve("@agentclientprotocol/claude-agent-acp/dist/index.js"),
   codex: requireAcp.resolve("@automatalabs/codex-acp"),
@@ -361,10 +364,11 @@ function assertBackend(backend: Backend, out: LiveOutcome): void {
   // or a host-installed opencode-ai package.
   if (backend !== "opencode") {
     const scope = BACKEND_SCOPE[backend];
-    if (backend === "pi" && !bin.includes("/node_modules/")) {
-      // workspace:* topology — acp-agents links the repo's own pi-acp package, the exact
-      // artifact npm publishes; consumer installs resolve it under node_modules instead.
-      assert.ok(bin.startsWith(PI_WORKSPACE_DIST), `pi bin must be the workspace @automatalabs/pi-acp dist: ${bin}`);
+    const workspaceDist = WORKSPACE_DIST[backend];
+    if (workspaceDist !== undefined && !bin.includes("/node_modules/")) {
+      // workspace:* topology — acp-agents links the repo's own package (pi-acp, codex-acp), the
+      // exact artifact npm publishes; consumer installs resolve it under node_modules instead.
+      assert.ok(bin.startsWith(workspaceDist), `${backend} bin must be the workspace ${scope} dist: ${bin}`);
     } else {
       assert.ok(bin.includes("/node_modules/"), `${backend} bin must resolve under node_modules: ${bin}`);
       assert.ok(bin.includes(scope), `${backend} bin must be the ${scope} npm package: ${bin}`);

@@ -3,16 +3,14 @@
 // Three checks, exit 1 if any fails:
 //   1. npm freshness: the pnpm-lock.yaml-resolved versions of the ACP client/agent libraries must
 //      match the npm registry's `latest` dist-tag (prints the exact bump command per dep).
-//   2. Fork git sync (FORK_SYNC): fork version lines diverge from upstream's, so versions can't be
-//      compared — instead check git ancestry: does the upstream repo have commits the fork's
-//      published default branch hasn't merged? Policy is merge (not rebase), so ancestry is the
-//      right signal. Always checked against a REAL clone (no API shortcut): the working clone
-//      (~/codex-acp, override AGENTPRISM_CODEX_ACP_DIR) when present, else a managed temp clone
-//      (<tmpdir>/codex-acp) created on demand. Either way the clone's remotes are VERIFIED first
-//      (origin must be our fork; upstream is added/corrected to the true upstream), both remotes
-//      are fetched, the checkout is put on origin's default branch and pulled current (working
-//      clones must be clean and fully pushed — releases are cut from the PUSHED fork main), and
-//      only then is upstream containment counted against the local checkout.
+//   2. Source-upstream containment (SOURCE_UPSTREAMS): a workspace package that is our maintained
+//      fork of an external repo (codex-acp at packages/codex-acp, imported as a non-squashed
+//      subtree — #282) must CONTAIN its upstream's history. Version lines diverge, so versions
+//      can't be compared — instead fetch the canonical upstream ref into THIS repository and
+//      check git ancestry: `merge-base --is-ancestor <upstream tip> HEAD`. Sync policy is merge
+//      (never rebase or squash), so ancestry is the right signal, and a squash/rebase import can
+//      never satisfy it. When upstream has advanced, the fix is the upstream-sync PR: a
+//      non-squashed subtree merge into the package path.
 //   3. Wrapped runtime freshness (WRAPPED_RUNTIMES): an adapter can be at npm latest while
 //      exact-pinning a stale agent runtime inside it (the runtime is what actually answers
 //      prompts), so check 1 is structurally blind to this axis. Compare the lockfile's
@@ -27,9 +25,8 @@
 // a blocker, not a warning — staleness we cannot rule out blocks the same as staleness we can see.
 // Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 
-import { readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname, isAbsolute, resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
@@ -37,7 +34,6 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestPath = join(repoRoot, "scripts", "acp-backends.manifest.json");
 const MANIFEST_COVERAGE_PREFIXES = Object.freeze(["@agentclientprotocol/"]);
 const NODE_FLOOR = /^>=(0|[1-9]\d*)(?:\.(0|[1-9]\d*)\.(0|[1-9]\d*))?$/;
-const HOME_TOKEN = /^\$HOME\/(.+)$/;
 
 const backendManifest = loadBackendManifest();
 const manifestNpm = new Set(
@@ -48,14 +44,11 @@ if (manifestNpm.size === 0) {
 }
 
 // These three work sets are projections of the committed manifest, never authored gate lists.
-const FORK_SYNC = Object.freeze(
+const SOURCE_UPSTREAMS = Object.freeze(
   backendManifest.backends.flatMap((backend) =>
-    backend.freshness.forks.map((fork) => ({
-      dep: fork.package,
-      config: {
-        ...fork,
-        defaultDirs: fork.defaultDirs.map(expandHomeToken),
-      },
+    backend.freshness.sourceUpstreams.map((upstream) => ({
+      dep: upstream.package,
+      config: upstream,
     })),
   ),
 );
@@ -248,23 +241,19 @@ function validateBackendRow(backend, index) {
     manifestFailure(`${path}.server.kind is unrecognized`);
   }
 
-  exactObject(backend.freshness, ["npm", "forks", "wrappedRuntimes"], [], `${path}.freshness`);
+  exactObject(backend.freshness, ["npm", "sourceUpstreams", "wrappedRuntimes"], [], `${path}.freshness`);
   stringArray(backend.freshness.npm, `${path}.freshness.npm`);
-  objectArray(backend.freshness.forks, `${path}.freshness.forks`);
+  objectArray(backend.freshness.sourceUpstreams, `${path}.freshness.sourceUpstreams`);
   objectArray(backend.freshness.wrappedRuntimes, `${path}.freshness.wrappedRuntimes`);
   duplicateFree(
-    backend.freshness.forks.map((fork) => [
-      fork?.package,
-      fork?.envDir,
-      ...(Array.isArray(fork?.defaultDirs) ? fork.defaultDirs : []),
-      fork?.tempCloneName,
-      fork?.originUrl,
-      fork?.originUrlEnv,
-      fork?.upstreamUrl,
-      fork?.upstreamUrlEnv,
-      fork?.upstreamRemote,
+    backend.freshness.sourceUpstreams.map((upstream) => [
+      upstream?.package,
+      upstream?.path,
+      upstream?.upstreamUrl,
+      upstream?.upstreamUrlEnv,
+      upstream?.upstreamRef,
     ].join("\u0000")),
-    `${path}.freshness.forks`,
+    `${path}.freshness.sourceUpstreams`,
   );
   duplicateFree(
     backend.freshness.wrappedRuntimes.map((wrapped) =>
@@ -278,19 +267,19 @@ function validateBackendRow(backend, index) {
     manifestFailure(`${path}.server.package must appear in ${path}.freshness.npm`);
   }
 
-  backend.freshness.forks.forEach((fork, forkIndex) => {
-    const forkPath = `${path}.freshness.forks[${forkIndex}]`;
-    exactObject(fork, [
-      "package", "envDir", "defaultDirs", "tempCloneName", "originUrl", "originUrlEnv",
-      "upstreamUrl", "upstreamUrlEnv", "upstreamRemote",
-    ], [], forkPath);
+  backend.freshness.sourceUpstreams.forEach((upstream, upstreamIndex) => {
+    const upstreamPath = `${path}.freshness.sourceUpstreams[${upstreamIndex}]`;
+    exactObject(upstream, [
+      "package", "path", "upstreamUrl", "upstreamUrlEnv", "upstreamRef",
+    ], [], upstreamPath);
     for (const field of [
-      "package", "envDir", "tempCloneName", "originUrl", "originUrlEnv", "upstreamUrl",
-      "upstreamUrlEnv", "upstreamRemote",
-    ]) nonemptyString(fork[field], `${forkPath}.${field}`);
-    stringArray(fork.defaultDirs, `${forkPath}.defaultDirs`);
-    for (const token of fork.defaultDirs) validateHomeToken(token, `${forkPath}.defaultDirs`);
-    if (!npm.has(fork.package)) manifestFailure(`${forkPath}.package must appear in ${path}.freshness.npm`);
+      "package", "path", "upstreamUrl", "upstreamUrlEnv", "upstreamRef",
+    ]) nonemptyString(upstream[field], `${upstreamPath}.${field}`);
+    if (backend.server.kind !== "workspace-package") {
+      manifestFailure(`${upstreamPath} requires a workspace-package server`);
+    } else if (upstream.package !== backend.server.package || upstream.path !== backend.server.path) {
+      manifestFailure(`${upstreamPath} must reference the backend's workspace server package and path`);
+    }
   });
 
   backend.freshness.wrappedRuntimes.forEach((wrapped, wrappedIndex) => {
@@ -335,22 +324,6 @@ function objectArray(value, path) {
 
 function duplicateFree(value, path) {
   if (new Set(value).size !== value.length) manifestFailure(`${path} must be duplicate-free`);
-}
-
-function validateHomeToken(token, path) {
-  const match = HOME_TOKEN.exec(token);
-  if (!match) manifestFailure(`${path} contains an invalid $HOME token`);
-  const segments = match[1].split("/");
-  if (
-    segments.some((segment) =>
-      segment.length === 0 || segment === "." || segment === ".." || /[\\*?\[\]{}$]/.test(segment)
-    )
-  ) manifestFailure(`${path} contains an invalid $HOME relative path`);
-}
-
-function expandHomeToken(token) {
-  validateHomeToken(token, "manifest freshness.forks.defaultDirs");
-  return join(homedir(), token.slice("$HOME/".length));
 }
 
 function manifestFailure(message) {
@@ -453,13 +426,13 @@ const freshness = Promise.all(
   }),
 );
 
-// ---- check 2: fork git sync with upstream --------------------------------------------------------
-const forkIssues = []; // { dep, where, branch, upstreamRef, missing, fix }
+// ---- check 2: source-upstream containment --------------------------------------------------------
+const upstreamIssues = []; // { dep, upstreamRef, missing, fix }
 
 // Git-location env vars that git exports into hook child processes (e.g. GIT_DIR in a pre-push
-// hook, pointing at THIS repo's .git). GIT_DIR overrides `-C <dir>` repo discovery, so a hook
-// caller's inherited GIT_DIR would silently redirect every `git -C <cloneDir>` below to the wrong
-// repo. Strip them from the child env so `-C <dir>` always wins (also protects future hook callers).
+// hook, pointing at THIS repo's .git *for a different worktree*). GIT_DIR overrides `-C <dir>`
+// repo discovery, so a hook caller's inherited GIT_DIR could silently redirect every `git -C`
+// below. Strip them from the child env so `-C <dir>` always wins.
 const GIT_LOCATION_ENV = [
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -476,140 +449,55 @@ function git(dir, ...args) {
   for (const key of GIT_LOCATION_ENV) delete env[key];
   return execFileSync("git", ["-C", dir, ...args], {
     encoding: "utf8",
-    timeout: 120_000, // covers fetches and the on-demand temp clone
+    timeout: 120_000, // covers the upstream fetch
     stdio: ["ignore", "pipe", "pipe"],
     env,
   }).trim();
 }
 
-// Default branch of a remote as the remote reports it (ls-remote --symref HEAD → refs/heads/<branch>).
-function remoteDefaultBranch(dir, remote) {
-  const out = git(dir, "ls-remote", "--symref", remote, "HEAD");
-  const m = /^ref: refs\/heads\/(\S+)\s+HEAD/m.exec(out);
-  if (!m) throw new Error(`cannot determine default branch of remote '${remote}'`);
-  return m[1];
-}
+// The repository whose HEAD must contain each source upstream. The env override exists solely so
+// the hermetic tests can point the check at fixture repositories; every real invocation checks
+// the repository this script lives in.
+const SOURCE_SYNC_REPO = process.env.AGENTPRISM_SOURCE_SYNC_REPO_DIR || repoRoot;
 
-// Repo identity as owner/repo, normalized across https/ssh/local-path remote forms — URL-string
-// equality would false-fail an ssh-configured origin (and hermetic tests use path remotes).
-function repoSlug(url) {
-  const segments = String(url).replace(/\.git$/, "").replace(/\\/g, "/").replaceAll(":", "/").split("/").filter(Boolean);
-  return segments.length >= 2 ? segments.slice(-2).join("/").toLowerCase() : null;
-}
-
-// Verify + prepare one fork clone, then count upstream containment against its local checkout.
-//
-// Order matters: origin identity is verified FIRST and read-only — this gate must never mutate a
-// repo that isn't provably the fork (it also self-diagnoses a GIT_DIR leak past the env scrub:
-// the "wrong" repo's origin won't be the fork). Only then is the upstream remote added when
-// missing or re-pointed when it names the wrong repo. After fetching both remotes the checkout is
-// put on origin's default branch and brought current: a managed temp clone is hard-reset to
-// origin; a working clone must be CLEAN (we never touch uncommitted work), is switched to the
-// branch if needed, fast-forward pulled, and must have NO unpushed commits — releases are cut
-// from the PUSHED fork main, so "merged upstream locally but never pushed" must stay a blocker
-// even though the local diff would look in-sync.
-function checkForkAt(dir, { originUrl, upstreamUrl, upstreamRemote, disposable }) {
-  const actualOrigin = git(dir, "remote", "get-url", "origin");
-  if (repoSlug(actualOrigin) !== repoSlug(originUrl)) {
-    const resolved = git(dir, "rev-parse", "--absolute-git-dir");
-    throw new Error(`clone at ${dir} has origin ${actualOrigin} — expected the fork ${originUrl} (git resolved dir: ${resolved})`);
-  }
-
-  let actualUpstream = null;
+// Fetch the canonical upstream ref into this repository's object store and require it to be an
+// ancestor of HEAD. Merge-based sync makes ancestry the exact invariant: a non-squashed subtree
+// merge satisfies it, and a squash or rebase import cannot (those manufacture new SHAs, so the
+// true upstream tip is never reachable from HEAD).
+function checkSourceUpstream(cfg) {
+  const upstreamUrl = process.env[cfg.upstreamUrlEnv] || cfg.upstreamUrl;
+  const dir = SOURCE_SYNC_REPO;
+  git(dir, "fetch", "--quiet", upstreamUrl, cfg.upstreamRef);
+  const upstreamSha = git(dir, "rev-parse", "FETCH_HEAD");
+  const upstreamRef = `${upstreamUrl.replace(/\.git$/, "")}#${cfg.upstreamRef}`;
   try {
-    actualUpstream = git(dir, "remote", "get-url", upstreamRemote);
+    git(dir, "merge-base", "--is-ancestor", upstreamSha, "HEAD");
+    return { upstreamRef, missing: 0 };
   } catch {
-    // remote not configured yet
+    const missing = parseInt(git(dir, "rev-list", "--count", `HEAD..${upstreamSha}`), 10);
+    return {
+      upstreamRef,
+      missing,
+      fix: `open/refresh the upstream-sync PR: git subtree merge (NO --squash) of ${upstreamRef} into ${cfg.path}`,
+    };
   }
-  if (actualUpstream === null) {
-    git(dir, "remote", "add", upstreamRemote, upstreamUrl);
-    console.error(`acp-deps: added missing '${upstreamRemote}' remote (${upstreamUrl}) to ${dir}`);
-  } else if (repoSlug(actualUpstream) !== repoSlug(upstreamUrl)) {
-    git(dir, "remote", "set-url", upstreamRemote, upstreamUrl);
-    console.error(`acp-deps: re-pointed '${upstreamRemote}' remote of ${dir} (${actualUpstream} → ${upstreamUrl})`);
-  }
+}
 
-  git(dir, "fetch", "--quiet", upstreamRemote);
-  git(dir, "fetch", "--quiet", "origin");
-  const originBranch = remoteDefaultBranch(dir, "origin");
-  const upstreamBranch = remoteDefaultBranch(dir, upstreamRemote);
-
-  if (disposable) {
-    git(dir, "checkout", "--quiet", "-B", originBranch, `origin/${originBranch}`);
-  } else {
-    if (git(dir, "status", "--porcelain") !== "") {
-      throw new Error(`clone at ${dir} has uncommitted changes — commit or stash them so the gate can pull ${originBranch}`);
-    }
-    const current = git(dir, "rev-parse", "--abbrev-ref", "HEAD");
-    if (current !== originBranch) {
-      git(dir, "switch", "--quiet", originBranch);
-      console.error(`acp-deps: switched ${dir} from '${current}' to '${originBranch}'`);
-    }
-    git(dir, "pull", "--ff-only", "--quiet", "origin", originBranch);
-    const unpushed = parseInt(git(dir, "rev-list", "--count", `origin/${originBranch}..HEAD`), 10);
-    if (unpushed > 0) {
-      throw new Error(
-        `${dir} ${originBranch} has ${unpushed} commit(s) not pushed to origin — releases are cut from the pushed fork ${originBranch}; push first`,
+const sourceUpstreamSync = Promise.all(
+  SOURCE_UPSTREAMS.map(async ({ dep, config: cfg }) => {
+    try {
+      const result = checkSourceUpstream(cfg);
+      if (result.missing > 0) {
+        upstreamIssues.push({ dep, ...result });
+      } else {
+        console.error(`acp-deps: ${dep} (${cfg.path}) contains upstream ${result.upstreamRef} — in sync`);
+      }
+    } catch (err) {
+      blockers.push(
+        `acp-deps: could not verify upstream containment for ${dep} (${err.message}) — upstream ${cfg.upstreamUrl} must be reachable; the gate fails closed`,
       );
     }
-  }
-
-  const missing = parseInt(git(dir, "rev-list", "--count", `HEAD..${upstreamRemote}/${upstreamBranch}`), 10);
-  return {
-    where: dir,
-    branch: originBranch,
-    upstreamRef: `${upstreamUrl.replace(/\.git$/, "")}#${upstreamBranch}`,
-    missing,
-    fix: `cd ${dir} && git merge ${upstreamRemote}/${upstreamBranch} && git push origin ${originBranch}`,
-  };
-}
-
-// Resolve which clone to check: an explicit envDir wins outright, then the default working-clone
-// locations; with none on disk the gate clones the fork itself into <tmpdir>/<tempCloneName>
-// (blob-filtered — full commit graph for the containment count, no blob download) and reuses that
-// clone on later runs. A broken/hijacked temp clone is disposable: delete and re-clone once.
-function checkFork(cfg) {
-  const originUrl = process.env[cfg.originUrlEnv] || cfg.originUrl;
-  const upstreamUrl = process.env[cfg.upstreamUrlEnv] || cfg.upstreamUrl;
-  const opts = { originUrl, upstreamUrl, upstreamRemote: cfg.upstreamRemote };
-
-  const envDir = process.env[cfg.envDir];
-  const candidates = envDir ? [envDir] : cfg.defaultDirs;
-  const workingClone = candidates.find((d) => existsSync(join(d, ".git")));
-  if (workingClone) return checkForkAt(workingClone, { ...opts, disposable: false });
-
-  const tempClone = join(tmpdir(), cfg.tempCloneName);
-  const cloneFresh = () => {
-    console.error(`acp-deps: no local fork clone found — cloning ${originUrl} to ${tempClone}`);
-    git(tmpdir(), "clone", "--quiet", "--filter=blob:none", originUrl, tempClone);
-  };
-  try {
-    if (!existsSync(join(tempClone, ".git"))) cloneFresh();
-    return checkForkAt(tempClone, { ...opts, disposable: true });
-  } catch {
-    rmSync(tempClone, { recursive: true, force: true });
-    cloneFresh();
-    return checkForkAt(tempClone, { ...opts, disposable: true });
-  }
-}
-
-const forkSync = Promise.all(
-  FORK_SYNC
-    .filter(({ dep }) => tracked.some((t) => t.dep === dep))
-    .map(async ({ dep, config: cfg }) => {
-      try {
-        const result = checkFork(cfg);
-        if (result.missing > 0) {
-          forkIssues.push({ dep, ...result });
-        } else {
-          console.error(`acp-deps: fork ${result.where} (${result.branch}) contains upstream ${result.upstreamRef} — in sync`);
-        }
-      } catch (err) {
-        blockers.push(
-          `acp-deps: could not verify fork sync for ${dep} (${err.message}) — working clone via ${cfg.envDir} or ~/${cfg.tempCloneName}; otherwise the gate clones ${cfg.originUrl} itself`,
-        );
-      }
-    }),
+  }),
 );
 
 // ---- check 3: wrapped runtime freshness ----------------------------------------------------------
@@ -674,7 +562,7 @@ const wrappedRuntimes = Promise.all(
     }),
 );
 
-await Promise.all([freshness, forkSync, wrappedRuntimes]);
+await Promise.all([freshness, sourceUpstreamSync, wrappedRuntimes]);
 
 for (const w of warnings) console.error(w);
 
@@ -690,13 +578,13 @@ if (outdated.length > 0) {
   console.error("  Then add a changeset for the bump: pnpm changeset");
 }
 
-if (forkIssues.length > 0) {
+if (upstreamIssues.length > 0) {
   console.error("");
-  console.error("acp-deps: fork(s) OUT OF SYNC with git upstream — merge upstream before pushing:");
-  for (const { dep, where, branch, upstreamRef, missing, fix } of forkIssues) {
-    console.error(`  ${dep}: upstream ${upstreamRef} has ${missing} commit(s) not in ${where} (${branch})`);
-    console.error(`    → ${fix}  # resolve conflicts`);
-    console.error(`    → then cut a fork release (release-fork.yml) and bump ${dep} here`);
+  console.error("acp-deps: workspace package(s) BEHIND their source upstream — sync before pushing:");
+  for (const { dep, upstreamRef, missing, fix } of upstreamIssues) {
+    console.error(`  ${dep}: upstream ${upstreamRef} has ${missing} commit(s) not contained in HEAD`);
+    console.error(`    → ${fix}`);
+    console.error(`    → review the upstream changes, add a ${dep} changeset, and merge the sync PR`);
   }
 }
 
@@ -721,7 +609,7 @@ if (blockers.length > 0) {
   for (const b of blockers) console.error(`  ${b}`);
 }
 
-const failed = outdated.length > 0 || forkIssues.length > 0 || wrappedIssues.length > 0 || blockers.length > 0;
+const failed = outdated.length > 0 || upstreamIssues.length > 0 || wrappedIssues.length > 0 || blockers.length > 0;
 if (failed) {
   console.error("");
   console.error('acp-deps: triage runbook: CONTRIBUTING.md "When the dependency gate blocks"');

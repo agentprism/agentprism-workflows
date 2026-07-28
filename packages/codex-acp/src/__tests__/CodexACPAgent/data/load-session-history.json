@@ -1,0 +1,432 @@
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "available_commands_update",
+        "availableCommands": [
+          {
+            "name": "plan",
+            "description": "Turn plan mode on.",
+            "input": null,
+            "_meta": {
+              "commandAction": {
+                "kind": "setConfigOption",
+                "configId": "collaboration_mode",
+                "value": "plan",
+                "resetValue": "default",
+                "presentation": "state"
+              }
+            }
+          },
+          {
+            "name": "mcp",
+            "description": "List configured Model Context Protocol (MCP) tools.",
+            "input": null
+          },
+          {
+            "name": "skills",
+            "description": "List available skills.",
+            "input": null
+          },
+          {
+            "name": "status",
+            "description": "Display session configuration and token usage.",
+            "input": null
+          },
+          {
+            "name": "review",
+            "description": "Review uncommitted changes, or review with custom instructions.",
+            "input": {
+              "hint": "optional review instructions"
+            }
+          },
+          {
+            "name": "review-branch",
+            "description": "Review changes relative to a base branch.",
+            "input": {
+              "hint": "branch name"
+            }
+          },
+          {
+            "name": "review-commit",
+            "description": "Review a specific commit.",
+            "input": {
+              "hint": "commit sha"
+            }
+          },
+          {
+            "name": "compact",
+            "description": "Summarize conversation to avoid hitting the context limit.",
+            "input": null
+          },
+          {
+            "name": "goal",
+            "description": "Set a goal to keep pursuing.",
+            "input": {
+              "hint": "[<objective>|clear|pause|resume]"
+            },
+            "_meta": {
+              "commandAction": {
+                "kind": "prefixPrompt",
+                "presentation": "state"
+              }
+            }
+          },
+          {
+            "name": "logout",
+            "description": "Sign out of Codex. This option is available when you are logged in via ChatGPT.",
+            "input": null
+          }
+        ]
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "session_info_update",
+        "_meta": {
+          "codex": {
+            "goal": {
+              "objective": "Keep the restored migration green",
+              "status": "paused",
+              "tokenBudget": null,
+              "timeUsedSeconds": 46,
+              "createdAt": 1710000000,
+              "controlMethod": "_codex/session/goal_control"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "session_info_update",
+        "title": "Saved title"
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "user_message_chunk",
+        "messageId": "item-user-1",
+        "content": {
+          "type": "text",
+          "text": "Hi"
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "user_message_chunk",
+        "messageId": "item-user-1",
+        "content": {
+          "type": "text",
+          "text": "[@image](https://example.com/image.png)"
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "agent_message_chunk",
+        "messageId": "item-agent-1",
+        "content": {
+          "type": "text",
+          "text": "Hello!"
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "agent_thought_chunk",
+        "messageId": "item-reason-1",
+        "content": {
+          "type": "text",
+          "text": "Thinking..."
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-cmd-1",
+        "kind": "execute",
+        "title": "ls",
+        "status": "completed",
+        "content": [
+          {
+            "type": "terminal",
+            "terminalId": "item-cmd-1"
+          }
+        ],
+        "rawInput": {
+          "command": "ls",
+          "cwd": "/test/project"
+        },
+        "_meta": {
+          "terminal_info": {
+            "cwd": "/test/project",
+            "terminal_id": "item-cmd-1"
+          }
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "item-cmd-1",
+        "status": "completed",
+        "rawOutput": {
+          "formatted_output": "Added.txt\nREADME.md\n",
+          "exit_code": 0
+        },
+        "_meta": {
+          "terminal_output_delta": {
+            "data": "Added.txt\nREADME.md\n",
+            "terminal_id": "item-cmd-1"
+          },
+          "terminal_exit": {
+            "exit_code": 0,
+            "signal": null,
+            "terminal_id": "item-cmd-1"
+          }
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-file-1",
+        "title": "Editing files",
+        "kind": "edit",
+        "status": "completed",
+        "content": [
+          {
+            "type": "diff",
+            "oldText": null,
+            "newText": "Hello\nWorld\n",
+            "path": "/test/project/Added.txt",
+            "_meta": {
+              "kind": "add"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-mcp-1",
+        "kind": "execute",
+        "title": "mcp.github.search",
+        "status": "completed",
+        "rawInput": {
+          "server": "github",
+          "tool": "search",
+          "arguments": {}
+        },
+        "_meta": {
+          "is_mcp_tool_call": true
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-dyn-1",
+        "kind": "execute",
+        "title": "list_apps",
+        "status": "completed",
+        "rawInput": {
+          "arguments": {
+            "includeDisabled": false
+          }
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-image-view-1",
+        "kind": "read",
+        "title": "View Image /test/project/input.png",
+        "status": "completed",
+        "content": [
+          {
+            "type": "content",
+            "content": {
+              "type": "resource_link",
+              "name": "/test/project/input.png",
+              "uri": "/test/project/input.png"
+            }
+          }
+        ],
+        "locations": [
+          {
+            "path": "/test/project/input.png"
+          }
+        ],
+        "rawInput": {
+          "path": "/test/project/input.png"
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-image-generation-1",
+        "kind": "other",
+        "title": "Image generation",
+        "status": "completed",
+        "content": [
+          {
+            "type": "content",
+            "content": {
+              "type": "text",
+              "text": "Revised prompt: A tiny blue square"
+            }
+          },
+          {
+            "type": "content",
+            "content": {
+              "type": "image",
+              "data": "iVBORw0KGgo=",
+              "mimeType": "image/png",
+              "uri": "/test/project/generated-blue-square.png"
+            }
+          }
+        ],
+        "rawOutput": {
+          "status": "completed",
+          "revisedPrompt": "A tiny blue square",
+          "result": "iVBORw0KGgo=",
+          "savedPath": "/test/project/generated-blue-square.png"
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "item-context-compaction-1",
+        "kind": "other",
+        "title": "Context compacted",
+        "status": "completed",
+        "_meta": {
+          "contextCompaction": true
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "session-1",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "title": "Start subagent test_audit",
+        "kind": "other",
+        "toolCallId": "item-subagent-1",
+        "status": "completed",
+        "rawInput": {
+          "agentThreadId": "thread-child-1",
+          "agentPath": "/root/test_audit",
+          "activityKind": "started"
+        },
+        "_meta": {
+          "codex": {
+            "subagent": {
+              "threadId": "thread-child-1",
+              "path": "/root/test_audit",
+              "activity": "started"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
