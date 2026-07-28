@@ -1,5 +1,11 @@
 # @automatalabs/shared-types
 
+## 0.29.1
+
+### Patch Changes
+
+- f150805: Repository metadata now points at `agentprism/agentprism-workflows` — the monorepo transferred from `VikashLoomba` to the `agentprism` GitHub organization. No runtime changes.
+
 ## 0.29.0
 
 ### Minor Changes

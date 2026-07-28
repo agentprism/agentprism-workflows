@@ -1,5 +1,15 @@
 # @automatalabs/acp-agents
 
+## 0.34.17
+
+### Patch Changes
+
+- f150805: Update `@agentclientprotocol/claude-agent-acp` to 0.63.0 (ACP dependency freshness gate).
+- f150805: Repository metadata now points at `agentprism/agentprism-workflows` — the monorepo transferred from `VikashLoomba` to the `agentprism` GitHub organization. No runtime changes.
+- Updated dependencies [f150805]
+  - @automatalabs/pi-acp@0.2.8
+  - @automatalabs/shared-types@0.29.1
+
 ## 0.34.16
 
 ### Patch Changes

@@ -1,5 +1,11 @@
 # @automatalabs/pi-acp
 
+## 0.2.8
+
+### Patch Changes
+
+- f150805: Repository metadata now points at `agentprism/agentprism-workflows` — the monorepo transferred from `VikashLoomba` to the `agentprism` GitHub organization. No runtime changes.
+
 ## 0.2.7
 
 ### Patch Changes
