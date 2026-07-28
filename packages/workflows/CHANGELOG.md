@@ -1,5 +1,16 @@
 # @automatalabs/workflows
 
+## 0.45.7
+
+### Patch Changes
+
+- f150805: Repository metadata now points at `agentprism/agentprism-workflows` — the monorepo transferred from `VikashLoomba` to the `agentprism` GitHub organization. No runtime changes.
+- Updated dependencies [f150805]
+- Updated dependencies [f150805]
+  - @automatalabs/acp-agents@0.34.17
+  - @automatalabs/shared-types@0.29.1
+  - @automatalabs/workflow-engine@0.35.1
+
 ## 0.45.6
 
 ### Patch Changes
