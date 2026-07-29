@@ -16,7 +16,12 @@ import type { AgentHistoryEntry, AgentSessionRef, McpServerConfig, PromptImage }
 import type { RunOptions } from "@automatalabs/shared-types";
 import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
-import { isChildCleanupError, type PooledConnection, type SessionHandle } from "./acp-client.js";
+import {
+  isChildCleanupError,
+  type PooledConnection,
+  type SessionHandle,
+  type SteeringOutcome,
+} from "./acp-client.js";
 import type { AcpEventListener, AcpEventName } from "./events.js";
 import { mapThrownError } from "./errors-map.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
@@ -207,6 +212,38 @@ export class InteractiveSession {
       });
     } finally {
       this.promptInFlight = false;
+    }
+  }
+
+  /** Inject a follow-up into the prompt currently in flight. Idle callers must use prompt():
+   *  steering has no client-owned turn, output, usage, or retry path. Concurrent steer calls are
+   *  sent independently and left to the backend's ordering semantics. */
+  async steer(
+    content: string | ContentBlock[],
+    opts: { images?: readonly PromptImage[]; promptMeta?: Record<string, unknown> } = {},
+  ): Promise<SteeringOutcome> {
+    if (this.releasePromise) throw new Error("InteractiveSession has been released");
+    this.signal?.throwIfAborted();
+    if (!this.promptInFlight) {
+      throw new Error(
+        "InteractiveSession.steer() requires prompt() to be in flight; use prompt() when the session is idle",
+      );
+    }
+    validatePromptImages(opts.images, this.label);
+
+    try {
+      const steeringContent = appendPromptImages(content, opts.images);
+      const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(undefined));
+      return await this.session.steer(steeringContent, promptMeta);
+    } catch (error) {
+      if (this.signal?.aborted) throw error;
+      throw mapThrownError(error, {
+        label: this.label,
+        backendId: this.backendId,
+        backend: this.backend,
+        providerErrorMetadata: this.session.providerErrorMetadata,
+        authMethods: this.capabilities?.authMethods,
+      });
     }
   }
 

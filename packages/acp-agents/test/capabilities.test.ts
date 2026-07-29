@@ -45,7 +45,7 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { name: "codex-acp", title: "Codex", version: "1.2.0" },
       authMethods: [{ id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "OPENAI_API_KEY" }] }],
-      _meta: { source: "test" },
+      _meta: { source: "test", steering: { supported: true } },
       agentCapabilities: {
         auth: { logout: {} },
         providers: {},
@@ -63,7 +63,8 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
   assert.deepEqual(negotiated.authMethods, [
     { id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "OPENAI_API_KEY" }] },
   ]);
-  assert.deepEqual(negotiated.initializeMeta, { source: "test" });
+  assert.deepEqual(negotiated.initializeMeta, { source: "test", steering: { supported: true } });
+  assert.equal(negotiated.supportsSteering, true);
   assert.equal(negotiated.supportsClose, true);
   assert.equal(negotiated.supportsForkSession, true);
   assert.equal(negotiated.supportsLogout, true);
@@ -82,12 +83,56 @@ test("negotiateCapabilities: a minimal response yields no close support and no c
   assert.equal(negotiated.agentInfo, undefined);
   assert.deepEqual(negotiated.authMethods, []);
   assert.equal(negotiated.initializeMeta, undefined);
+  assert.equal(negotiated.supportsSteering, false);
   assert.equal(negotiated.supportsClose, false);
   assert.equal(negotiated.supportsForkSession, false);
   assert.equal(negotiated.supportsLogout, false);
   assert.equal(negotiated.supportsProviders, false);
   assert.equal(negotiated.customMetaSupport, undefined, "no namespace advertised => legacy passthrough");
   assert.deepEqual(negotiated.gatedKeys, GATED_CUSTOM_META_KEYS);
+});
+
+test("negotiateCapabilities derives steering strictly from top-level response _meta", () => {
+  const supported = negotiateCapabilities({
+    protocolVersion: PROTOCOL_VERSION,
+    _meta: { steering: { supported: true } },
+    agentCapabilities: {
+      _meta: { steering: { supported: false } },
+    },
+  });
+  assert.equal(supported.supportsSteering, true, "top-level exact true wins");
+
+  const malformedAdvertisements: unknown[] = [
+    undefined,
+    null,
+    false,
+    true,
+    1,
+    "true",
+    [],
+    {},
+    { steering: null },
+    { steering: true },
+    { steering: [] },
+    { steering: {} },
+    { steering: { supported: false } },
+    { steering: { supported: 1 } },
+    { steering: { supported: "true" } },
+  ];
+  for (const meta of malformedAdvertisements) {
+    const negotiated = negotiateCapabilities({
+      protocolVersion: PROTOCOL_VERSION,
+      _meta: meta as InitializeResponse["_meta"],
+      agentCapabilities: {
+        _meta: { steering: { supported: true } },
+      },
+    });
+    assert.equal(
+      negotiated.supportsSteering,
+      false,
+      `unsupported top-level advertisement: ${JSON.stringify(meta)}`,
+    );
+  }
 });
 
 test("negotiateCapabilities: no backend declaration ignores even a known custom namespace", () => {

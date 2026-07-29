@@ -4,7 +4,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import type { Backend } from "../src/backend.js";
-import type { PooledConnection, SessionHandle } from "../src/acp-client.js";
+import type {
+  PooledConnection,
+  SessionHandle,
+  SteeringOutcome,
+} from "../src/acp-client.js";
 import { AcpAgentRunner, InteractiveSession } from "../src/index.js";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -21,6 +25,7 @@ function fakeInteractive(session: Partial<SessionHandle>): InteractiveSession {
       sessionId: "unit-session",
       currentTurnText: () => "",
       prompt: async () => ({ stopReason: "end_turn" }),
+      steer: async () => "injected",
       cancel: async () => undefined,
       release: async () => undefined,
       ...session,
@@ -103,4 +108,88 @@ test("InteractiveSession.prompt validates per-turn images before sending", async
     },
   );
   assert.equal(sent, false);
+});
+
+test("InteractiveSession.steer rejects idle callers and directs them to prompt()", async () => {
+  let sent = false;
+  const session = fakeInteractive({
+    steer: async () => {
+      sent = true;
+      return "injected";
+    },
+  });
+
+  await assert.rejects(
+    () => session.steer("follow up"),
+    /steer\(\) requires prompt\(\) to be in flight; use prompt\(\) when the session is idle/,
+  );
+  assert.equal(sent, false);
+});
+
+test("InteractiveSession.steer adapts images/meta and surfaces every outcome unchanged", async () => {
+  const promptGate = deferred<void>();
+  const outcomes: SteeringOutcome[] = ["injected", "startedNewTurn", "failed"];
+  const calls: Array<{
+    content: Parameters<SessionHandle["steer"]>[0];
+    meta: Record<string, unknown> | undefined;
+  }> = [];
+  const session = fakeInteractive({
+    prompt: async () => {
+      await promptGate.promise;
+      return { stopReason: "end_turn" };
+    },
+    steer: async (content, meta) => {
+      calls.push({ content, meta });
+      return outcomes[calls.length - 1]!;
+    },
+  });
+  const prompt = session.prompt("original");
+
+  const image = { data: "ZmFrZQ==", mimeType: "image/png", uri: "file:///tmp/fake.png" };
+  assert.equal(
+    await session.steer("redirect", { images: [image], promptMeta: { private: "request-only" } }),
+    "injected",
+  );
+  assert.equal(await session.steer("late"), "startedNewTurn");
+  assert.equal(await session.steer("declined"), "failed");
+  assert.deepEqual(calls[0], {
+    content: [
+      { type: "text", text: "redirect" },
+      { type: "image", ...image },
+    ],
+    meta: { private: "request-only" },
+  });
+
+  promptGate.resolve();
+  await prompt;
+});
+
+test("InteractiveSession does not serialize concurrent steer calls", async () => {
+  const promptGate = deferred<void>();
+  const firstGate = deferred<SteeringOutcome>();
+  const secondGate = deferred<SteeringOutcome>();
+  const seen: string[] = [];
+  const session = fakeInteractive({
+    prompt: async () => {
+      await promptGate.promise;
+      return { stopReason: "end_turn" };
+    },
+    steer: async (content) => {
+      const text = typeof content === "string" ? content : "";
+      seen.push(text);
+      return text === "first" ? firstGate.promise : secondGate.promise;
+    },
+  });
+  const prompt = session.prompt("original");
+
+  const first = session.steer("first");
+  const second = session.steer("second");
+  assert.deepEqual(seen, ["first", "second"], "both requests reached the backend without a client queue");
+  secondGate.resolve("failed");
+  assert.equal(await second, "failed", "the second request may settle before the first");
+  firstGate.resolve("injected");
+  assert.equal(await first, "injected");
+
+  promptGate.resolve();
+  await prompt;
 });

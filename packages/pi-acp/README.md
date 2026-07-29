@@ -69,7 +69,24 @@ pi-acp owns the `mcp__` prefix for injected MCP tools. Pi extensions must not re
 
 ## Version 1 limitations
 
-Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. ACP prompt audio is degraded to a text note. Mid-turn steering and terminal-login authentication are not exposed.
+Load replay is the active linear branch and excludes branch topology and compaction summaries. `additionalDirectories` is accepted but ignored because pi is not root-confined. ACP prompt audio is degraded to a text note. Terminal-login authentication is not exposed.
+
+### Native session steering
+
+Pi advertises the `_session/steering` extension at top-level initialize metadata as
+`_meta: { steering: { supported: true } }`, with codex-shaped semantics. While a Pi prompt turn is
+live, the server converts the supplied ACP content with the same text/image conversion as
+`session/prompt` and calls native `AgentSession.steer(text, images)`, returning
+`{ outcome: "injected" }`; the original `session/prompt` still owns all output, usage, and
+settlement. When the session is idle — or a steer arrives just as the turn settles, before pi could
+consume it — the content runs as a fire-and-forget turn instead and the call returns
+`{ outcome: "startedNewTurn" }`: never an error, never dropped, never silently prepended to the next
+prompt. That turn occupies the single turn slot (a concurrent `session/prompt` is `session_busy`)
+and streams through normal `session/update`s with no owned `PromptResponse`. A steer racing an
+in-progress cancel returns `{ outcome: "failed" }` — cancellation wins, and pi's queued steering is
+cleared synchronously before aborting so queued content never restarts generation after
+cancellation. Unexpected internal failures also resolve as `{ outcome: "failed" }` rather than a
+JSON-RPC error.
 
 ## Development
 

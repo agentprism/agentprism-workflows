@@ -7,6 +7,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { PiAcpAgent } from "./agent.js";
 import { resolveDeps, type PiAcpDeps } from "./deps.js";
+import { SESSION_STEERING_METHOD, steeringRequestParser } from "./steering.js";
 
 export { PiAcpAgent } from "./agent.js";
 
@@ -28,6 +29,7 @@ export async function runAcp(options: RunAcpOptions = {}) {
     .onRequest(methods.agent.session.close, (context) => impl.closeSession(context))
     .onRequest(methods.agent.session.setConfigOption, (context) => impl.setConfigOption(context))
     .onRequest(methods.agent.session.prompt, (context) => impl.prompt(context))
+    .onRequest(SESSION_STEERING_METHOD, steeringRequestParser, (context) => impl.steer(context))
     .onNotification(methods.agent.session.cancel, (context) => impl.cancel(context));
   const stream = options.stream ?? ndJsonStream(
     Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,

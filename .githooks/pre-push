@@ -25,8 +25,9 @@
 #    release.yml (blocks publishing) — bypassing it locally only moves the failure there.
 #    Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 #
-# 3. LIVE backend e2e (packages/mcp-server/test/live-backend.e2e.test.ts) against the REAL
-#    Claude + Codex + OpenCode + pi agents. CI cannot run these (no agent auth —
+# 3. LIVE backend e2e (packages/mcp-server/test/live-backend.e2e.test.ts) plus native steering
+#    smoke (packages/acp-agents/test/steering.live.e2e.test.ts) against the REAL Claude + Codex +
+#    OpenCode + pi agents. CI cannot run these (no agent auth —
 #    AGENTPRISM_LIVE_E2E stays unset there), so this hook is the only place the
 #    structured-output cruxes get exercised against real backends pre-merge. If a leg
 #    fails on auth (e.g. an expired login), re-authenticate and push again — never skip.
@@ -82,7 +83,7 @@ if ! node scripts/check-acp-deps.mjs; then
   exit 1
 fi
 
-echo "pre-push: building workspace, then LIVE backend e2e (real Claude/Codex/OpenCode/pi, real tokens; ~60-120s)..." >&2
+echo "pre-push: building workspace, then LIVE backend + Claude/Codex steering e2e (real agents, real tokens; ~60-120s)..." >&2
 pnpm build >/dev/null 2>&1
 
 # The full runner output is tee'd to a log, and on failure the failing-test section is
@@ -91,7 +92,7 @@ pnpm build >/dev/null 2>&1
 # for inspection after the run.
 E2E_LOG="$(git rev-parse --git-dir)/pre-push-live-e2e.log"
 # timeout: an expired agent login must fail the push loudly, not hang it forever.
-if ! AGENTPRISM_LIVE_E2E=1 timeout 420 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts 2>&1 | tee "$E2E_LOG" >&2; then
+if ! AGENTPRISM_LIVE_E2E=1 timeout 420 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts packages/acp-agents/test/steering.live.e2e.test.ts 2>&1 | tee "$E2E_LOG" >&2; then
   echo "" >&2
   echo "pre-push: LIVE backend e2e FAILED — push blocked. Exact failure:" >&2
   if grep -q "failing tests:" "$E2E_LOG"; then

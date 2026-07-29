@@ -62,6 +62,10 @@ export interface NegotiatedCapabilities {
   authMethods: AuthMethod[];
   /** Initialize-response `_meta`, when the agent sent it. */
   initializeMeta: InitializeResponse["_meta"] | undefined;
+  /** Whether the agent advertises the `_session/steering` vendor extension through the
+   *  top-level initialize-response `_meta.steering.supported === true` contract. This is
+   *  intentionally independent of agentCapabilities._meta, which gates outgoing custom metadata. */
+  supportsSteering: boolean;
   /** Whether session/close is advertised (gates the best-effort release-time close). */
   supportsClose: boolean;
   /** Whether session/load is advertised. The current SDK keeps this as the legacy top-level
@@ -100,6 +104,9 @@ export function negotiateCapabilities(
     agentInfo: response.agentInfo ?? undefined,
     authMethods: response.authMethods ?? [],
     initializeMeta: response._meta ?? undefined,
+    // Steering is an initialize-response extension advertisement. Never infer it from the
+    // backend name/version or from agentCapabilities._meta (the separate outgoing-meta gate).
+    supportsSteering: advertisesSteering(response._meta),
     supportsClose: advertised(sessionCapabilities?.close),
     supportsLoadSession:
       agent.loadSession === true || advertised((sessionCapabilities as Record<string, unknown> | undefined)?.load),
@@ -114,6 +121,20 @@ export function negotiateCapabilities(
       : undefined,
     gatedKeys: customCapabilities ? [...customCapabilities.gatedKeys] : undefined,
   };
+}
+
+/** Strict, defensive parser for the top-level steering extension advertisement. Only the exact
+ *  boolean true is support; absent, null, malformed, array, string, numeric, and truthy values are
+ *  all unsupported. */
+function advertisesSteering(meta: InitializeResponse["_meta"]): boolean {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return false;
+  const steering = (meta as Record<string, unknown>).steering;
+  return Boolean(
+    steering &&
+      typeof steering === "object" &&
+      !Array.isArray(steering) &&
+      (steering as Record<string, unknown>).supported === true,
+  );
 }
 
 function advertised(capability: unknown): boolean {

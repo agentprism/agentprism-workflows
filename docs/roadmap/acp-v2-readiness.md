@@ -54,7 +54,7 @@ the migration is a planned train, not a scramble.
 | [Remote transport](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport) | Active, v1-additive | Foundation of [remote execution](remote-execution.md); v2 adds stream resumability |
 | [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp) (`mcp/connect|message|disconnect`) | v2 unstable | Tunnels client-hosted MCP over the session connection — the endgame for remote structured-output capture |
 | Elicitation (`elicitation/create|complete`) | Preview | Protocol-native structured agent→user questions; maps onto checkpoint approvals |
-| `session/inject` (queue & steer) | Open RFD | Mid-turn steering of running agents |
+| `session/inject` (queue & steer) | Open RFD | Standard ACP form of mid-turn steering; until then the first-class Claude/Codex/Pi adapters expose the explicitly negotiated `_session/steering` extension |
 | Subagents (discovery, delegation, parent/child sessions) | Open RFD | Standardizes territory this orchestrator occupies |
 | `session/fork` | v2 unstable | The existing `forkSession` support maps directly onto it |
 | Session rewind (truncate/edit history) | Open RFD | Relevant to checkpoint-restore semantics |

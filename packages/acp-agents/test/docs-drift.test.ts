@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   ACP_CROSS_CUTTING_EVENT_NAMES,
+  ACP_EXTENSION_SUPPORT_MATRIX,
   AUTH_META_MATRIX,
   CODEX_SPAWN_AUTH_ENV,
   PI_ACP_PROTOCOL_CONTRACT,
@@ -33,6 +34,26 @@ test("cross-cutting ACP event names are documented in public event tables", () =
       assert.ok(text.includes(`\`${name}\``), `${path} must document ${name}`);
     }
   }
+});
+
+test("steering documentation stays aligned with the executable extension matrix", () => {
+  assert.deepEqual(
+    ACP_EXTENSION_SUPPORT_MATRIX.map(({ agent, disposition }) => ({ agent, disposition })),
+    [
+      { agent: "claude", disposition: "supported" },
+      { agent: "codex", disposition: "supported" },
+      { agent: "opencode", disposition: "typed-unsupported" },
+      { agent: "pi", disposition: "supported" },
+    ],
+  );
+  for (const path of ["packages/acp-agents/README.md", "packages/workflows/README.md", "docs/api.md"]) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes("_session/steering"), `${path} must document the steering extension`);
+  }
+  const piReadme = readRepoFile("packages/pi-acp/README.md");
+  assert.ok(piReadme.includes("AgentSession.steer"), "Pi README must document native pi steering");
+  const piSpec = readRepoFile("docs/specs/pi-acp-spec.md");
+  assert.ok(piSpec.includes("pi.clearQueue()"), "Pi spec must document queue clearing before abort");
 });
 
 // §4.6.4 item 4 — the full `_meta` support matrix (§3.6) lives as executable data in

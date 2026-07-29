@@ -79,7 +79,7 @@ journal identity without a filesystem-safety annotation.
 
 ### The full ACP spec, enforced by the build
 
-Every client-side ACP method is served (`fs/*`, `terminal/*`, permission requests, elicitation, MCP-over-ACP) and the agent-side surface — session modes, session lifecycle, auth/providers — is driven, not stubbed. A coverage manifest keyed off the SDK's method constants breaks the build on protocol drift; the end-to-end suite covers real Claude, Codex, OpenCode, and pi providers when gated, plus a credential-free pi leg through pi-acp's injected runtime.
+Every client-side ACP method is served (`fs/*`, `terminal/*`, permission requests, elicitation, MCP-over-ACP) and the agent-side surface — session modes, session lifecycle, auth/providers — is driven, not stubbed. A coverage manifest keyed off the SDK's method constants breaks the build on protocol drift; the separate executable extension matrix tracks vendor `_session/steering` support without misclassifying it as standard ACP. The end-to-end suite covers real Claude, Codex, OpenCode, and pi providers when gated, including a Claude/Codex native-steering smoke, plus a credential-free pi leg through pi-acp's injected runtime.
 
 ### Controls for unattended runs
 
@@ -503,8 +503,10 @@ One long-lived ACP process per backend is **pooled** and reused across `agent()`
 
 When an agent returns initialize-response `_meta`, every session ref and session-scoped runner event
 includes it as a stable, recursively frozen `initializeMeta` snapshot. Absent or `null` metadata is
-omitted. This observation-only field does not change routing, authentication, pooling, retries,
-hashes, capabilities, or wire requests.
+omitted. The snapshot itself is observational, but exact advertised extension flags can drive their
+own documented negotiation: `_meta.steering.supported === true` enables held-open session steering for
+Claude, Codex, and pi. This is separate from `agentCapabilities._meta`, which gates optional outgoing
+request metadata; neither form changes routing, pooling, retries, or workflow hashes.
 
 ### Custom backends — run *any* ACP agent
 

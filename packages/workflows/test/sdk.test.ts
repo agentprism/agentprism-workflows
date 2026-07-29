@@ -70,6 +70,7 @@ import type {
   AcpEventListener,
   AcpEventName,
   AcpRunnerEventMap,
+  AcpSteeringEvent,
   AcpSessionUpdate,
   AcpUpdateKind,
   AgentEventPayload,
@@ -142,6 +143,7 @@ import type {
   WorkflowAgentActivityBase,
   WorkflowAgentEventSink,
   WorkflowAgentEventSource,
+  SteeringOutcome,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -239,6 +241,8 @@ type Assert<T extends true> = T;
 type IsNever<T> = [T] extends [never] ? true : false;
 
 type _SessionUpdateExcluded = Assert<IsNever<Extract<WorkflowAgentEventName, "session_update">>>;
+type _SteeringOutcomeExported = Assert<SteeringOutcome extends "injected" | "startedNewTurn" | "failed" ? true : false>;
+type _SteeringEventExported = Assert<AcpSteeringEvent["outcome"] extends SteeringOutcome ? true : false>;
 type _AgentEventNamesComplete = Assert<IsNever<Exclude<Exclude<AcpEventName, "session_update">, WorkflowAgentEventName>>>;
 type _AgentEventNamesExact = Assert<IsNever<Exclude<WorkflowAgentEventName, Exclude<AcpEventName, "session_update">>>>;
 type _SpecializedRunEvent = Assert<WorkflowAgentEvent extends Extract<WorkflowRunEvent, { type: "agentEvent" }> ? true : false>;
@@ -517,6 +521,7 @@ const ALL_MANAGER_CROSS_CUTTING_NAMES = [
   "elicitation_request",
   "elicitation_complete",
   "raw_message",
+  "steering",
   "session_open",
   "session_close",
   "backend_error",
@@ -1143,6 +1148,7 @@ test("WorkflowManager agentEvent union exactly covers every bridged ACP event", 
     ["elicitation_request", { ...context, request: {}, outcome: {} }],
     ["elicitation_complete", { ...context, notification: {} }],
     ["raw_message", { ...context, method: "vendor/message", message: {} }],
+    ["steering", { ...context, outcome: "injected" }],
     ["session_open", context],
     ["session_close", context],
     ["backend_error", { backendId: "claude", error: new Error("backend failed") }],

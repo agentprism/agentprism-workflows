@@ -6,7 +6,7 @@ Use [OpenAI Codex](https://github.com/openai/codex) from [Agent Client Protocol]
 
 `codex-acp` is a stdio ACP agent server. It starts the Codex App Server, translates ACP requests into Codex operations, and maps Codex events back into the client.
 
-This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp), regularly synced with upstream. On top of upstream it exposes Codex App Server features not (yet) piped through the ACP interface — turn-level structured output (`outputSchema`) and per-session instruction overrides — and advertises them under `agentCapabilities._meta` so clients can feature-detect before sending them (see the fork sections below).
+This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp), regularly synced with upstream. On top of upstream it exposes Codex App Server features not (yet) piped through the ACP interface — turn-level structured output (`outputSchema`), per-session instruction overrides, and native session steering. Outgoing metadata capabilities remain under `agentCapabilities._meta`; steering is separately advertised at top-level initialize metadata as `_meta.steering.supported === true`, so clients can feature-detect before sending `_session/steering`.
 
 ## Features
 
@@ -15,6 +15,7 @@ This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/a
 - Text prompts, embedded context, images, resource links, and additional workspace directories.
 - Turn-level structured output: a JSON Schema on the prompt's `_meta.outputSchema` constrains the final assistant message (fork extension, see below).
 - Per-session base and developer instruction overrides via request `_meta` (fork extension, see below).
+- Native session steering via `_session/steering` while the original prompt is active; the response is `injected`, `startedNewTurn`, or `failed` and the original prompt retains output/usage ownership.
 - Fork extensions advertised under `agentCapabilities._meta["@automatalabs/codex-acp"]` for client-side feature detection.
 - Shell command, file change, permission request, MCP tool call, terminal output, reasoning, plan, web search, image generation, image view, token usage, and review events.
 - Client `fs.readTextFile` capability: when the client advertises it, file-change diff content is read through `fs/read_text_file` (so diffs reflect unsaved editor buffers), with local file system fallback otherwise. File writes happen inside codex itself — the app-server delegates no file IO to the client.

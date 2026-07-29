@@ -142,13 +142,21 @@ export {
   PI_PROCESS_EXIT_MARGIN_MS,
   PI_PROCESS_SHUTDOWN_ENVELOPE_MS,
   PooledConnection,
+  SESSION_STEERING_METHOD,
   SessionHandle,
   isChildCleanupError,
 } from "./acp-client.js";
-export type { AcpSessionOptions, PooledConnectionDeps } from "./acp-client.js";
+export type {
+  AcpSessionOptions,
+  PooledConnectionDeps,
+  SteeringOutcome,
+  SteeringRequest,
+  SteeringResponse,
+} from "./acp-client.js";
 
 export {
   AGENT_METHOD_COVERAGE,
+  ACP_EXTENSION_SUPPORT_MATRIX,
   ACP_AUTH_REQUIRED_CODE_EXCLUSIVE,
   AUTH_CAPABILITY_KEYS,
   AUTH_META_CONVENTION_KEYS,
@@ -162,6 +170,7 @@ export {
 } from "./protocol-coverage.js";
 export type {
   AgentMethodCoverage,
+  AcpExtensionSupportMatrixRow,
   AuthMetaMatrixRow,
   BuiltinProtocolCoverageRow,
   ClientMethodCoverage,
@@ -209,6 +218,7 @@ export type {
   AcpPermissionPendingEvent,
   AcpPermissionEvent,
   AcpRawMessageEvent,
+  AcpSteeringEvent,
   AcpBackendErrorEvent,
 } from "./events.js";
 

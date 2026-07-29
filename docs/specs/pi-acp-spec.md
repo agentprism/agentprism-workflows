@@ -134,7 +134,7 @@ output, auth, cancellation, the config surface, and the monorepo integration for
 (§10.1) and the coordinated `acp-agents` caller/release surfaces (§10.4).
 
 **Out of scope (see §11 Non-goals):** fs/terminal client-delegation; subprocess/RPC mode;
-`additionalDirectories`; audio prompt content; mid-turn steering over ACP; branch-topology replay.
+`additionalDirectories`; audio prompt content; branch-topology replay.
 Issue #213 consumes this frozen server contract from the first-class `PiBackend`; direct hosts can also
 drive the server through the generic custom-backend registry. The freshness-gate edit in §10.1 and the
 coordinated `acp-agents` caller/release amendments in §10.4 are the specified out-of-package changes.
@@ -155,10 +155,12 @@ elsewhere by number ("invariant N").
    `session/prompt` request with a `RequestError` carrying a categorical `data.errorKind`; auth walls
    use JSON-RPC code `-32000` exclusively (§7, §8). An empty successful turn is a real `end_turn`,
    never a swallowed error.
-4. **One in-flight turn per session.** pi's `AgentSession.prompt()` throws when a turn is already
+4. **One in-flight prompt turn per session.** pi's `AgentSession.prompt()` throws when a turn is already
    streaming unless a `streamingBehavior` is supplied (`agent-session.ts:1121-1126`); ACP
-   `session/prompt` is serialized per session by construction. The adapter does not expose mid-turn
-   steering/queueing over ACP in v1 (§6.6).
+   `session/prompt` is serialized per session by construction. The separately negotiated
+   `_session/steering` extension (§6.6) injects into that one live turn, or — when the session is
+   idle — starts a fire-and-forget turn that occupies the same single turn slot; two concurrent
+   turns never exist.
 5. **Ordered, drained delivery.** pi's `AgentSession` event bus is **synchronous** — `_emit` calls each
    listener and does not await it (`agent-session.ts:501-505`; listener type is `(e) => void`,
    `:156`). The adapter therefore funnels every translated update through one per-session FIFO send
@@ -858,10 +860,33 @@ Concurrency (resolves issue Open item 2, invariant 4): pi permits **one in-fligh
 `AgentSession.prompt()` throws when already streaming unless a `streamingBehavior` is supplied
 (`agent-session.ts:1121-1126`). ACP clients serialize `session/prompt` per session, so this never fires
 in normal use; if a second `session/prompt` arrives for a busy session, the adapter rejects it with
-`invalidParams` (`-32602`, `errorKind:"session_busy"`) **without** calling `session.prompt` (it never
-supplies `streamingBehavior`, so pi's steer/followUp queue is never engaged). pi's mid-turn
-steering/queued-message APIs (`steer`/`followUp`, `agent-session.ts:1294,1314`) are **not** exposed over ACP in v1
-(§11).
+`invalidParams` (`-32602`, `errorKind:"session_busy"`) **without** calling `session.prompt`.
+
+`_session/steering` is a deliberately separate vendor request, advertised only at top-level
+`InitializeResponse._meta.steering.supported === true`. Its parser accepts `{ sessionId, prompt }` plus
+optional request `_meta`, the agent routes it through `requireLive()`, requests are serialized per
+session, and content is converted with `convertPromptContent()`. Behavior is codex-shaped — the
+"arrived too late" race and the idle session are success outcomes, never errors:
+
+- **Live turn** → `await pi.steer(text, images)` and `{ outcome:"injected" }`. The original
+  `session/prompt` remains the exclusive owner of output updates, usage, and settlement.
+- **Idle session** → the content starts a fire-and-forget turn through the normal turn machinery (it
+  occupies the single turn slot, so a concurrent `session/prompt` is legitimately `session_busy` and
+  cancel/close still work) and resolves `{ outcome:"startedNewTurn" }` as soon as the turn commits —
+  pi's `preflightResult` hook is the acceptance signal. Nothing owns that turn's `PromptResponse`;
+  its output streams through the usual `session/update` path. Preflight failures reject with the
+  same mapped errors a `prompt()` caller would see.
+- **Turn-end race** → pi's steering queue is polled only from inside a run, so an enqueue the
+  settling run never consumed is recovered (`pi.clearQueue()` returns the removed texts) and taken
+  down the new-turn path instead of silently prepending itself to the next `session/prompt`. As a
+  settlement-time backstop, any orphaned queue content is redispatched as a fire-and-forget turn.
+- **Cancellation wins** → a steer racing an in-progress cancel resolves `{ outcome:"failed" }` and
+  never restarts the generation the user stopped. During cancellation cleanup, `pi.clearQueue()` is
+  invoked synchronously before `pi.abort()`; abort is still attempted when clearing throws and the
+  pre-existing cleanup-error precedence remains authoritative.
+- **Unexpected internal failure** → the codex-shaped catch-all resolves `{ outcome:"failed" }`;
+  only typed adapter errors (unknown/terminated session, malformed params, preflight) surface as
+  JSON-RPC errors.
 
 ---
 
@@ -1789,9 +1814,6 @@ workflow→acp-agents→pi-acp dependency edges and the installed smoke checks a
 - **`additionalDirectories`** — not advertised; pi has no allowed-roots concept, so extra roots grant no
   capability pi lacks. A present field is accepted and ignored (§9.1.7).
 - **Audio prompt content** — no pi representation; not advertised; degraded to a text note (§6.1).
-- **Mid-turn steering / queued messages over ACP** — pi's `steer`/`followUp` have no in-band ACP
-  surface; inventing one would be an unadvertised non-portable extension. One serialized turn per session
-  (§6.6).
 - **fs/terminal client-delegation suite** — terminal output is surfaced via the shared `_meta` tool_call
   convention (like claude-agent-acp/codex-acp), not ACP `terminal/*` or `fs/*`.
 - **Client-hosted `acp` MCP transport** — remains owned by the runner; pi-acp serves stdio, Streamable
@@ -2286,7 +2308,7 @@ It MUST cover, at minimum (asserted by T27):
   model's credential is missing** (the no-model case is `-32602 invalid_model`, not auth — §9.5).
 - **reserved tool namespaces** — pi-acp owns the `mcp__` prefix for injected MCP tools (§9.3.2).
 - **v1 limitations** — client-hosted `acp` MCP remains in the runner; no branch-topology/compaction-summary replay; no
-  `additionalDirectories`/audio/mid-turn steering/terminal-login (§11).
+  `additionalDirectories`/audio/terminal-login (§11). Native `_session/steering` is documented in §6.6.
 - **attribution** — a "Built on pi" note and a THIRD-PARTY notice naming pi
   (`@earendil-works/pi-coding-agent`/`-agent-core`/`-ai`), its authors, its MIT license, and the pinned
   version.

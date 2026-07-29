@@ -45,18 +45,20 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 
 ## Testing
 
-`pnpm test` runs the full deterministic suite without credentials. Five files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
+`pnpm test` runs the full deterministic suite without credentials. Six files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
 
-- `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, OpenCode, and pi structured-output/pooling paths.
+- `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, Codex, OpenCode, and pi structured-output/pooling paths; `packages/acp-agents/test/steering.live.e2e.test.ts` drives native held-open `_session/steering` for real Claude and Codex.
 - `packages/acp-agents/test/auth.live.e2e.test.ts` drives the four built-in auth profiles; individual cases have additional credential/gateway gates.
 - `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_PI_E2E_MODEL` plus that model's provider key.
 - `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation through the default backend; `AGENTPRISM_ISOLATION_E2E_MODEL` may reroute its isolated leg.
 - `packages/pi-acp/test/live.e2e.test.ts` drives Pi structured output, a real HTTP MCP tool round-trip, and tracked-bash stop/reap; it additionally requires `AGENTPRISM_PI_E2E_MODEL` and that model's provider key.
 
-Run the MCP live suite explicitly with real auth:
+Run the pre-push live backend and steering gate explicitly with real auth:
 
 ```bash
-AGENTPRISM_LIVE_E2E=1 pnpm --filter @automatalabs/mcp-server test
+AGENTPRISM_LIVE_E2E=1 npx tsx --test \
+  packages/mcp-server/test/live-backend.e2e.test.ts \
+  packages/acp-agents/test/steering.live.e2e.test.ts
 ```
 
 CI must leave `AGENTPRISM_LIVE_E2E` unset.
@@ -71,7 +73,7 @@ Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired b
    - *wrapped runtime freshness*: an adapter can be at npm `latest` while exact-pinning a stale agent runtime inside it (e.g. `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` — the runtime that actually answers prompts), which the freshness check can't see. The gate compares the lockfile's *transitive* resolution of each wrapped runtime against the runtime's npm `latest`. Fix when behind: bump the adapter if its latest already wraps a current runtime, else add a root `pnpm.overrides` pin (then `pnpm install` + run the acp-agents live e2e before pushing). The check warns once an override becomes redundant so versions drift back to upstream-managed.
 
    The gate **fails closed**: if the registry or GitHub API is unreachable after retries, staleness cannot be ruled out and the push is blocked. **There is no bypass.** The same gate also runs as a step of the required **Build & test** CI job — while any tracked dependency is stale, *every* PR merge is blocked — and at the top of `release.yml`, where a failure blocks versioning/publishing, leaves any open Version PR open, and files/updates a "Release blocked: ACP dependency gate failed" issue with the gate output.
-3. **MCP live suite**: builds the workspace and drives Claude, Codex, OpenCode, and pi (~60–120s, spends real tokens). The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. There is no skip: if a leg fails on authentication (stalling turns usually mean an expired OAuth login), re-authenticate and push again. Legs whose default model rides limited credentials can be rerouted — not skipped — via `AGENTPRISM_OPENCODE_E2E_MODEL` / `AGENTPRISM_PI_E2E_MODEL`. On failure the hook re-prints the failing-test section (assertion + per-leg diagnostics) as the last output and keeps the full runner log at `.git/pre-push-live-e2e.log`.
+3. **MCP live suite + native steering smoke**: builds the workspace and drives Claude, Codex, OpenCode, and pi (~60–120s, spends real tokens), then verifies real Claude and Codex top-level steering advertisement and a held-open `_session/steering` call. The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. There is no skip: if a leg fails on authentication (stalling turns usually mean an expired OAuth login), re-authenticate and push again. Legs whose default model rides limited credentials can be rerouted — not skipped — via `AGENTPRISM_OPENCODE_E2E_MODEL` / `AGENTPRISM_PI_E2E_MODEL`. On failure the hook re-prints the failing-test section (assertion + per-leg diagnostics) as the last output and keeps the full runner log at `.git/pre-push-live-e2e.log`.
 
 CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI enforces the dependency gate itself in the required job and the release workflow.
 
