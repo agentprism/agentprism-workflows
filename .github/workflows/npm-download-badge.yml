@@ -4,6 +4,9 @@ on:
   schedule:
     # npm publishes the previous UTC day's counts shortly after midnight.
     - cron: "17 6 * * *"
+    # Second attempt: the generator fails (and publishes nothing) when npm's
+    # edge hands the runner a stale window, so retry later the same day.
+    - cron: "23 18 * * *"
   workflow_dispatch: {}
   push:
     branches: [main]

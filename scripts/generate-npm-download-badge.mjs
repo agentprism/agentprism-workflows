@@ -5,6 +5,14 @@
 // npm's bulk download endpoint does not support scoped packages, so every
 // package is queried separately. All responses must describe the same period;
 // nothing is written unless every response is valid.
+//
+// The named `last-month` period keeps the request URL identical from day to
+// day, and npm's edge has served GitHub-hosted runners a days-old cached
+// window for that URL while other vantage points saw fresh data. Two guards:
+// every request carries a unique cache-busting query param plus no-cache
+// headers, and a response whose period ends more than MAX_END_LAG_DAYS ago
+// fails the run outright — a failed run publishes nothing (the previous data
+// stays live) instead of laundering a stale window under a fresh generatedAt.
 
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -20,11 +28,15 @@ const FETCH_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 1_000;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+// npm normally reports through yesterday or the day before; anything older
+// means npm (or a cache in front of it) is serving a stale window.
+const MAX_END_LAG_DAYS = 4;
 
 const outputDir = parseOutputDir(process.argv.slice(2));
 const packageNames = await discoverPublishedPackages();
 const rows = await Promise.all(packageNames.map(fetchPackageDownloads));
 const { start, end } = requireMatchingPeriod(rows);
+requireFreshPeriod(end);
 const total = rows.reduce((sum, row) => sum + row.downloads, 0);
 
 if (!Number.isSafeInteger(total)) {
@@ -125,6 +137,8 @@ async function fetchPackageDownloads(packageName) {
     `/downloads/point/${PERIOD}/${encodeURIComponent(packageName)}`,
     ensureTrailingSlash(DOWNLOADS_API),
   );
+  // The path is identical every day, so bust any cache between us and npm.
+  url.searchParams.set("t", `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
   const response = await fetchWithRetry(url);
 
   let payload;
@@ -166,7 +180,10 @@ async function fetchWithRetry(url) {
 
   for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      const response = await fetch(url, {
+        headers: { "cache-control": "no-cache", pragma: "no-cache" },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
       if (response.ok) return response;
 
       const error = new Error(`HTTP ${response.status} from ${url}`);
@@ -206,6 +223,19 @@ function requireMatchingPeriod(results) {
     }
   }
   return { start: first.start, end: first.end };
+}
+
+/** Refuse to publish a window npm should long since have moved past. A thrown
+ *  error fails the workflow's build job, so the deploy step never runs and the
+ *  previously published data stays live — loud staleness instead of silent. */
+function requireFreshPeriod(endDate) {
+  const lagDays = Math.floor((Date.now() - Date.parse(`${endDate}T00:00:00.000Z`)) / 86_400_000);
+  if (lagDays > MAX_END_LAG_DAYS) {
+    throw new Error(
+      `npm reported a stale download window: period end ${endDate} is ${lagDays} days old ` +
+        `(max ${MAX_END_LAG_DAYS}) — refusing to republish stale counts`,
+    );
+  }
 }
 
 function validIsoDate(value) {
