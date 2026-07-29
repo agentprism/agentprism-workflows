@@ -35,6 +35,7 @@ import {
 import { shutdownPiSession } from "./pi-shutdown.js";
 import { PiSession } from "./session.js";
 import { ChildProcessRegistrySlot, createTrackedBashOperations } from "./child-process-registry.js";
+import type { SteeringRequest, SteeringResponse } from "./steering.js";
 import { PKG_VERSION } from "./version.js";
 
 export { PKG_VERSION } from "./version.js";
@@ -191,6 +192,7 @@ export class PiAcpAgent {
         sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} },
       },
       authMethods: AUTH_METHODS,
+      _meta: { steering: { supported: true } },
     };
   }
 
@@ -706,6 +708,17 @@ export class PiAcpAgent {
 
   prompt(context: AgentRequestContext<PromptRequest>) {
     return this.requireLive(context.params.sessionId).prompt(context.params, context.signal);
+  }
+
+  steer(context: AgentRequestContext<SteeringRequest>): Promise<SteeringResponse> {
+    return this.requireLive(context.params.sessionId).steer(context.params)
+      .catch((error) => {
+        if (isRequestError(error)) throw error;
+        // Codex-shaped catch-all: an unexpected internal failure resolves as a failed
+        // steering outcome; only typed adapter errors surface as JSON-RPC errors.
+        console.error("pi-acp steering failed:", error);
+        return { outcome: "failed" as const };
+      });
   }
 
   cancel(context: AgentNotificationContext<{ sessionId: string }>): void {

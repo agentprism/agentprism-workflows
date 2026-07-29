@@ -78,3 +78,22 @@ test("multiple text content blocks are joined in order", () => {
   assert.equal(activity.text, "first\nsecond");
   assert.equal(activity.toolName, undefined);
 });
+
+test("steering remains a live observation and never becomes durable workflow activity", () => {
+  const activity = projectWorkflowAgentActivity({
+    name: "steering",
+    event: {
+      sessionId: "session-1",
+      backendId: "claude",
+      runId: "run-1",
+      callIndex: 0,
+      outcome: "injected",
+    },
+    backendId: "claude",
+    sessionId: "session-1",
+    runId: "run-1",
+    scope: "run-1",
+    callIndex: 0,
+  } as Parameters<typeof projectWorkflowAgentActivity>[0]);
+  assert.equal(activity, undefined);
+});

@@ -591,6 +591,7 @@ await runner.dispose();
 | `elicitation_request` | `{ request, outcome }` — the final elicitation response returned to the agent |
 | `elicitation_complete` | `{ notification }` — a URL elicitation completion notification |
 | `raw_message` | `{ method, message }` — a vendor extension notification (e.g. Claude `_claude/sdkMessage`) |
+| `steering` | `{ outcome }` — a resolved live `_session/steering` response; prompt content and request metadata are never emitted |
 | `session_open` / `session_close` | an ACP session opened / was released |
 | `backend_error` | `{ backendId, error }` — a pooled backend process crashed |
 
@@ -959,13 +960,13 @@ WorkflowReplayFirstNonReplay, WorkflowReplayEligibility,
 WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
-InteractiveSessionOptions, InteractiveTurn, ProbeConfigOptionsOptions, ProbedConfigOptions, SessionConfigOption,
+InteractiveSessionOptions, InteractiveTurn, SteeringOutcome, ProbeConfigOptionsOptions, ProbedConfigOptions, SessionConfigOption,
 PermissionResolver,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
 ProviderCapableRunner,        // duck-type gate for the MCP provider tools (providers/list|set|disable)
 ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,
 // ACP events: the runner.on(...) surface
-AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext,
+AcpRunnerEventMap, AcpEventName, AcpEventListener, AcpEventContext, AcpSteeringEvent,
 AcpSessionUpdate, AcpUpdateKind, AcpPermissionPendingEvent, AcpPermissionEvent,
 AcpElicitationPendingEvent, AcpElicitationEvent, AcpElicitationCompleteEvent,
 AcpRawMessageEvent, AcpBackendErrorEvent,

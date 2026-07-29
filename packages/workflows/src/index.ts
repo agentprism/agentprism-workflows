@@ -238,6 +238,7 @@ export type {
   DeleteSessionOptions,
   InteractiveSessionOptions,
   InteractiveTurn,
+  SteeringOutcome,
   ListProvidersOptions,
   ListSessionsOptions,
   LogoutOptions,
@@ -370,6 +371,7 @@ export type {
   AcpPermissionPendingEvent,
   AcpPermissionEvent,
   AcpRawMessageEvent,
+  AcpSteeringEvent,
   AcpBackendErrorEvent,
 } from "@automatalabs/acp-agents";
 

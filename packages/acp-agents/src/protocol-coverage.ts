@@ -7,6 +7,7 @@ import type {
   AuthMethodTerminal,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
+import { SESSION_STEERING_METHOD } from "./acp-client.js";
 
 type ValueOf<T> = T[keyof T];
 type ClientMethod = ValueOf<typeof CLIENT_METHODS>;
@@ -207,11 +208,55 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
   AUTH_META_MATRIX_ROWS.map((row) => Object.freeze(row)),
 );
 
+/** One executable disposition for a vendor extension that is intentionally absent from the
+ *  standard SDK AGENT_METHODS table. `typed-unsupported` means the public wrapper exists and
+ *  rejects from initialize negotiation before emitting a wire request. */
+export interface AcpExtensionSupportMatrixRow {
+  readonly agent: string;
+  readonly method: typeof SESSION_STEERING_METHOD;
+  readonly disposition: "supported" | "typed-unsupported";
+  /** Installed distributions whose method + initialize advertisement are probed by the protocol
+   *  coverage suite. Pi is workspace-owned and covered in its package tests instead. */
+  readonly distProbe?: "claude" | "codex";
+}
+
+const ACP_EXTENSION_SUPPORT_MATRIX_ROWS = [
+  {
+    agent: "claude",
+    method: SESSION_STEERING_METHOD,
+    disposition: "supported",
+    distProbe: "claude",
+  },
+  {
+    agent: "codex",
+    method: SESSION_STEERING_METHOD,
+    disposition: "supported",
+    distProbe: "codex",
+  },
+  {
+    agent: "opencode",
+    method: SESSION_STEERING_METHOD,
+    disposition: "typed-unsupported",
+  },
+  {
+    agent: "pi",
+    method: SESSION_STEERING_METHOD,
+    disposition: "supported",
+  },
+] satisfies readonly AcpExtensionSupportMatrixRow[];
+
+/** Built-in support for non-standard agent request methods. Kept separate from
+ *  AGENT_METHOD_COVERAGE so a vendor extension is never counted as a standard ACP method. */
+export const ACP_EXTENSION_SUPPORT_MATRIX: readonly AcpExtensionSupportMatrixRow[] = Object.freeze(
+  ACP_EXTENSION_SUPPORT_MATRIX_ROWS.map((row) => Object.freeze(row)),
+);
+
 /** One built-in's reference to universal ACP classifications and backend-specific live evidence. */
 export interface BuiltinProtocolCoverageRow {
   readonly clientMethods: Readonly<Record<string, ClientMethodCoverage>>;
   readonly agentMethods: Readonly<Record<string, AgentMethodCoverage>>;
   readonly authMeta: readonly AuthMetaMatrixRow[];
+  readonly extensions: readonly AcpExtensionSupportMatrixRow[];
   readonly installedDistProbes: readonly string[];
   readonly liveProbes: readonly string[];
 }
@@ -225,6 +270,9 @@ function coverageRow(
     agentMethods: AGENT_METHOD_COVERAGE,
     authMeta: Object.freeze(
       AUTH_META_MATRIX.filter((row) => row.agent === id || row.agent === "all"),
+    ),
+    extensions: Object.freeze(
+      ACP_EXTENSION_SUPPORT_MATRIX.filter((row) => row.agent === id),
     ),
     installedDistProbes: Object.freeze([...installedDistProbes]),
     liveProbes: Object.freeze([id]),

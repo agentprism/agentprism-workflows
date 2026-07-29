@@ -7,6 +7,7 @@ import { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
 import type { ClientSideConnection, InitializeResponse } from "@agentclientprotocol/sdk";
 import {
   ACP_AUTH_REQUIRED_CODE_EXCLUSIVE,
+  ACP_EXTENSION_SUPPORT_MATRIX,
   AGENT_METHOD_COVERAGE,
   AUTH_CAPABILITY_KEYS,
   AUTH_META_CONVENTION_KEYS,
@@ -15,6 +16,7 @@ import {
   CODEX_SPAWN_AUTH_ENV,
   HANDLED_AUTH_METHOD_TYPES,
   PI_ACP_PROTOCOL_CONTRACT,
+  SESSION_STEERING_METHOD,
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
 } from "../src/index.js";
@@ -77,6 +79,11 @@ test("agent method coverage classifies every installed SDK agent method", () => 
     Object.values(AGENT_METHOD_COVERAGE).filter((coverage) => coverage === "guarded").length,
     0,
     "agent guarded count should match docs",
+  );
+  assert.equal(
+    Object.hasOwn(AGENT_METHOD_COVERAGE, SESSION_STEERING_METHOD),
+    false,
+    "the steering vendor extension must not be counted as a standard SDK agent method",
   );
 });
 
@@ -150,6 +157,49 @@ test("every dist-probed AUTH_META_MATRIX row's capability literal is present in 
   // The matrix covers all four agent buckets and stays non-empty.
   assert.ok(AUTH_META_MATRIX.length >= 8);
   assert.ok(AUTH_META_MATRIX.some((r) => r.agent === "opencode"));
+});
+
+test("the executable ACP extension matrix pins steering support and installed advertisements", () => {
+  assert.deepEqual(ACP_EXTENSION_SUPPORT_MATRIX, [
+    {
+      agent: "claude",
+      method: "_session/steering",
+      disposition: "supported",
+      distProbe: "claude",
+    },
+    {
+      agent: "codex",
+      method: "_session/steering",
+      disposition: "supported",
+      distProbe: "codex",
+    },
+    {
+      agent: "opencode",
+      method: "_session/steering",
+      disposition: "typed-unsupported",
+    },
+    {
+      agent: "pi",
+      method: "_session/steering",
+      disposition: "supported",
+    },
+  ]);
+
+  for (const row of ACP_EXTENSION_SUPPORT_MATRIX) {
+    const dist =
+      row.distProbe === "claude"
+        ? CLAUDE_DIST
+        : row.distProbe === "codex"
+          ? CODEX_DIST
+          : undefined;
+    if (!dist) continue;
+    assert.ok(dist.includes(row.method), `${row.agent} dist must implement ${row.method}`);
+    assert.match(
+      dist,
+      /_meta\s*:\s*\{\s*steering\s*:\s*\{\s*supported\s*:\s*true\s*,?\s*\}\s*,?\s*\}/,
+      `${row.agent} dist must advertise top-level steering support`,
+    );
+  }
 });
 
 // §4.6.4 item 5 — the code-only matcher (§1.5) relies on `-32000` being auth-exclusive.

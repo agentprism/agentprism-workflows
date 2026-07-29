@@ -151,6 +151,21 @@ const CLIENT_INFO = {
 } as const;
 
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
+/** Cross-agent vendor extension for injecting content into a live prompt turn. */
+export const SESSION_STEERING_METHOD = "_session/steering" as const;
+/** Every outcome an ACP steering agent can resolve with. */
+export type SteeringOutcome = "injected" | "startedNewTurn" | "failed";
+/** Exact `_session/steering` wire request. Optional `_meta` uses the same outgoing custom-meta
+ *  gate as other session requests, independently of the initialize steering advertisement. */
+export interface SteeringRequest {
+  sessionId: string;
+  prompt: ContentBlock[];
+  _meta?: Record<string, unknown>;
+}
+/** Exact `_session/steering` wire response. */
+export interface SteeringResponse {
+  outcome: SteeringOutcome;
+}
 /** Bound the best-effort session/close round-trip so a slow agent can't hang run()'s finally. */
 const CLOSE_SESSION_TIMEOUT_MS = 5_000;
 /** Grace for a cancelled prompt/config lifecycle to settle before close + process quarantine. */
@@ -169,6 +184,7 @@ const GUARDED_STATEFUL_REQUESTS = new Map<string, string>([
   [AGENT_METHODS.session_load, "use loadSession()"],
   [AGENT_METHODS.session_resume, "use resumeSession()"],
   [AGENT_METHODS.session_fork, "use forkSession()"],
+  [SESSION_STEERING_METHOD, "use steerSession()"],
 ]);
 
 interface RawResultSuccess {
@@ -846,6 +862,15 @@ class MultiplexClient {
     this.onEvent?.("elicitation_complete", { ...ctx, notification: params });
   }
 
+  /** Emit one privacy-safe observation after a steering request resolves. Context comes from the
+   *  live session or its teardown tombstone; prompt content and request `_meta` never enter it. */
+  steeringResponse(sessionId: string, outcome: SteeringOutcome): void {
+    this.onEvent?.("steering", {
+      ...this.contextFor(sessionId),
+      outcome,
+    });
+  }
+
   private sessionIdForMcpConnection(connectionId: McpConnectionId): string {
     const sessionId = this.mcpConnectionSessions.get(connectionId);
     if (!sessionId) throw unknownMcpConnection(connectionId);
@@ -914,6 +939,12 @@ function methodNotAdvertised(method: string): RequestError {
 function assertSafeRawRequest(method: string): void {
   const guidance = GUARDED_STATEFUL_REQUESTS.get(method);
   if (!guidance) return;
+  if (method === SESSION_STEERING_METHOD) {
+    throw new Error(
+      `Raw ACP request "${method}" is guarded: ${guidance}. The named wrapper enforces the ` +
+        "initialize-response steering capability and emits the privacy-safe session steering event.",
+    );
+  }
   throw new Error(
     `Raw ACP request "${method}" is guarded: ${guidance}. Sessions created, reopened, or forked ` +
       "outside the router are unregistered: session/update notifications do not fold into an " +
@@ -964,6 +995,22 @@ function lifecycleCapabilityError(
     : "initialize did not complete";
   return new WorkflowError(
     `ACP agent (${backendId}) does not advertise ${method}; advertised lifecycle capabilities: ${advertised}`,
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false, agentLabel: label },
+  );
+}
+
+function steeringCapabilityError(
+  backendId: BackendId,
+  capabilities: NegotiatedCapabilities | undefined,
+  label: string | undefined,
+): WorkflowError {
+  const advertised =
+    capabilities === undefined
+      ? "initialize did not complete"
+      : "InitializeResponse._meta.steering.supported was not exactly true";
+  return new WorkflowError(
+    `ACP agent (${backendId}) does not advertise ${SESSION_STEERING_METHOD}; ${advertised}`,
     WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
     { recoverable: false, agentLabel: label },
   );
@@ -2026,6 +2073,22 @@ export class PooledConnection {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_prompt, request));
   }
 
+  /** Driven `_session/steering` extension request. The top-level initialize advertisement is
+   *  checked before any wire request. rawAgentRequest preserves the response object instead of
+   *  applying an SDK standard-method mapper, and its internal race surfaces process death. */
+  async steerSession(request: SteeringRequest, label?: string): Promise<SteeringResponse> {
+    await this.ready;
+    if (this.negotiated?.supportsSteering !== true) {
+      throw steeringCapabilityError(this.backendId, this.negotiated, label);
+    }
+    const response = await this.rawAgentRequest<SteeringResponse, SteeringRequest>(
+      SESSION_STEERING_METHOD,
+      request,
+    );
+    this.client.steeringResponse(request.sessionId, response.outcome);
+    return response;
+  }
+
   /** session/set_config_option on this connection, raced against process death. */
   setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_set_config_option, request));
@@ -2408,6 +2471,30 @@ export class SessionHandle implements StructuredSource {
       if (this.activeTurn === turn) this.activeTurn = undefined;
       turn.resolveEnded();
     }
+  }
+
+  /** Inject content into the currently running prompt turn through the negotiated steering
+   *  extension. This deliberately owns no turn state: it does not begin/replace a turn, accumulate
+   *  output, record usage, or retry a late `startedNewTurn` outcome. */
+  async steer(
+    content: string | ContentBlock[],
+    promptMeta?: Record<string, unknown>,
+  ): Promise<SteeringOutcome> {
+    this.opts.signal?.throwIfAborted();
+    const prompt =
+      typeof content === "string"
+        ? [{ type: "text", text: content } satisfies ContentBlock]
+        : adaptPromptContent(content, this.pooled.capabilities?.agent ?? {}, this.pooled.backendId);
+    const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
+    const response = await this.pooled.steerSession(
+      {
+        sessionId: this.sessionId,
+        prompt,
+        ...(gatedMeta ? { _meta: gatedMeta } : {}),
+      },
+      this.opts.label,
+    );
+    return response.outcome;
   }
 
   /** StructuredSource — the latest turn's assistant text. */

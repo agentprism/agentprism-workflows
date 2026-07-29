@@ -26,9 +26,17 @@ export interface FakeSessionControl {
   session: AgentSession;
   emit(event: AgentSessionEvent): void;
   promptCalls: Array<{ text: string; options: unknown }>;
+  steerCalls: Array<{ text: string; images: unknown }>;
   activeToolsAtPrompt: string[][];
   disposeCalls: number;
   abortCalls: number;
+  clearQueueCalls: number;
+  operationLog: string[];
+  /** Steering texts the fake still holds (mirrors pi's getSteeringMessages surface). By
+   *  default steer() consumes immediately; set retainSteeredMessages to model a run that
+   *  settles without polling the queue. */
+  steeringQueue: string[];
+  retainSteeredMessages: boolean;
   listenerCount: number;
   tools: ToolDefinition[];
   resolvePrompt?: () => void;
@@ -50,7 +58,9 @@ export function fakeSession(
   const listeners = new Set<(event: AgentSessionEvent) => void>();
   const messages: unknown[] = [];
   const promptCalls: Array<{ text: string; options: unknown }> = [];
+  const steerCalls: Array<{ text: string; images: unknown }> = [];
   const activeToolsAtPrompt: string[][] = [];
+  const operationLog: string[] = [];
   const registeredTools = options.resourceLoader
     ?.getExtensions()
     .extensions.flatMap((extension) => [...extension.tools.values()]) ?? [];
@@ -64,6 +74,10 @@ export function fakeSession(
   let model = options.model;
   let disposeCalls = 0;
   let abortCalls = 0;
+  let clearQueueCalls = 0;
+  let streaming = false;
+  const steeringQueue: string[] = [];
+  let retainSteeredMessages = false;
   let resolvePrompt: (() => void) | undefined;
   let rejectPrompt: ((error: unknown) => void) | undefined;
   const agent = {
@@ -77,109 +91,151 @@ export function fakeSession(
     sessionManager: options.sessionManager,
     get thinkingLevel() { return thinkingLevel; },
     get model() { return model; },
+    get isStreaming() { return streaming; },
     subscribe(listener: (event: AgentSessionEvent) => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
     async bindExtensions() {},
     async abort() {
+      operationLog.push("abort");
       agent.abort();
       if (behavior === "wedged") rejectPrompt?.(new Error("aborted"));
     },
+    clearQueue() {
+      clearQueueCalls += 1;
+      operationLog.push("clearQueue");
+      const steering = steeringQueue.splice(0, steeringQueue.length);
+      return { steering, followUp: [] };
+    },
+    get pendingMessageCount() { return steeringQueue.length; },
+    getSteeringMessages() { return [...steeringQueue]; },
+    getFollowUpMessages() { return []; },
+    async steer(text: string, images: unknown) {
+      steerCalls.push({ text, images });
+      operationLog.push("steer");
+      if (retainSteeredMessages) steeringQueue.push(text);
+    },
+    async followUp(text: string) {
+      operationLog.push("followUp");
+      if (retainSteeredMessages) steeringQueue.push(text);
+    },
     async prompt(text: string, promptOptions: unknown) {
-      promptCalls.push({ text, options: promptOptions });
-      activeToolsAtPrompt.push([...active]);
-      if (behavior === "preflight") throw new Error("No model selected");
-      if (behavior === "auth-preflight") throw new Error("No API key found for test/model");
-      if (behavior === "wedged") {
-        await new Promise<void>((resolve, reject) => {
-          resolvePrompt = resolve;
-          rejectPrompt = reject;
-        });
-        return;
-      }
-      if (behavior === "tool") {
-        const tool = tools.find(({ name }) => name.startsWith("mcp__"));
-        if (!tool) throw new Error("MCP tool missing from fake pi session");
-        const toolCallId = "mcp-call-1";
-        const args = { value: 1 };
-        const start = {
-          type: "tool_execution_start",
-          toolCallId,
-          toolName: tool.name,
-          args,
-        } as AgentSessionEvent;
-        for (const listener of listeners) listener(start);
-        let result: { content: Array<{ type: "text"; text: string }>; details?: unknown };
-        let isError = false;
-        try {
-          const decision = await (agent.beforeToolCall as
-            | ((context: unknown, signal: AbortSignal) => Promise<{ block?: boolean; reason?: string } | undefined>)
+      streaming = true;
+      try {
+        promptCalls.push({ text, options: promptOptions });
+        activeToolsAtPrompt.push([...active]);
+        const preflightResult = (promptOptions as { preflightResult?: (success: boolean) => void } | undefined)
+          ?.preflightResult;
+        if (behavior === "preflight") {
+          preflightResult?.(false);
+          throw new Error("No model selected");
+        }
+        if (behavior === "auth-preflight") {
+          preflightResult?.(false);
+          throw new Error("No API key found for test/model");
+        }
+        preflightResult?.(true);
+        if (behavior === "wedged") {
+          await new Promise<void>((resolve, reject) => {
+            resolvePrompt = resolve;
+            rejectPrompt = reject;
+          });
+          return;
+        }
+        if (behavior === "tool") {
+          const tool = tools.find(({ name }) => name.startsWith("mcp__"));
+          if (!tool) throw new Error("MCP tool missing from fake pi session");
+          const toolCallId = "mcp-call-1";
+          const args = { value: 1 };
+          const start = {
+            type: "tool_execution_start",
+            toolCallId,
+            toolName: tool.name,
+            args,
+          } as AgentSessionEvent;
+          for (const listener of listeners) listener(start);
+          let result: { content: Array<{ type: "text"; text: string }>; details?: unknown };
+          let isError = false;
+          try {
+            const decision = await (agent.beforeToolCall as
+              | ((context: unknown, signal: AbortSignal) => Promise<{ block?: boolean; reason?: string } | undefined>)
+              | undefined)?.(
+              { toolCall: { id: toolCallId, name: tool.name }, args },
+              new AbortController().signal,
+            );
+            if (decision?.block) throw new Error(decision.reason ?? "tool blocked");
+            result = await tool.execute(
+              toolCallId,
+              args,
+              new AbortController().signal,
+              undefined,
+              undefined as never,
+            ) as typeof result;
+          } catch (error) {
+            isError = true;
+            result = {
+              content: [{ type: "text", text: error instanceof Error ? error.message : "tool failed" }],
+            };
+          }
+          const afterResult = await (agent.afterToolCall as
+            | ((context: unknown, signal: AbortSignal) => Promise<{
+              content?: typeof result.content;
+              details?: unknown;
+              isError?: boolean;
+            } | undefined>)
             | undefined)?.(
-            { toolCall: { id: toolCallId, name: tool.name }, args },
+            { toolCall: { id: toolCallId, name: tool.name }, args, result, isError },
             new AbortController().signal,
           );
-          if (decision?.block) throw new Error(decision.reason ?? "tool blocked");
-          result = await tool.execute(toolCallId, args, new AbortController().signal) as typeof result;
-        } catch (error) {
-          isError = true;
-          result = {
-            content: [{ type: "text", text: error instanceof Error ? error.message : "tool failed" }],
-          };
+          if (afterResult) {
+            result = {
+              ...result,
+              content: afterResult.content ?? result.content,
+              details: afterResult.details ?? result.details,
+            };
+            isError = afterResult.isError ?? isError;
+          }
+          const end = {
+            type: "tool_execution_end",
+            toolCallId,
+            toolName: tool.name,
+            result,
+            isError,
+          } as AgentSessionEvent;
+          for (const listener of listeners) listener(end);
         }
-        const afterResult = await (agent.afterToolCall as
-          | ((context: unknown, signal: AbortSignal) => Promise<{
-            content?: typeof result.content;
-            details?: unknown;
-            isError?: boolean;
-          } | undefined>)
-          | undefined)?.(
-          { toolCall: { id: toolCallId, name: tool.name }, args, result, isError },
-          new AbortController().signal,
-        );
-        if (afterResult) {
-          result = {
-            ...result,
-            content: afterResult.content ?? result.content,
-            details: afterResult.details ?? result.details,
-          };
-          isError = afterResult.isError ?? isError;
+        const assistant = {
+          role: "assistant",
+          content: [{ type: "text", text: "hello" }],
+          usage: {
+            input: 3,
+            output: 2,
+            cacheRead: 1,
+            cacheWrite: 0,
+            totalTokens: 6,
+            cost: { total: 0.001 },
+          },
+          stopReason: behavior === "provider-error" ? "error" : "stop",
+          ...(behavior === "provider-error"
+            ? { errorMessage: "opaque provider failure", diagnostics: [] }
+            : {}),
+          timestamp: Date.now(),
+        };
+        messages.push(assistant);
+        if (behavior !== "provider-error") {
+          for (const listener of listeners) {
+            listener({
+              type: "message_update",
+              message: assistant,
+              assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello", partial: assistant },
+            } as AgentSessionEvent);
+          }
         }
-        const end = {
-          type: "tool_execution_end",
-          toolCallId,
-          toolName: tool.name,
-          result,
-          isError,
-        } as AgentSessionEvent;
-        for (const listener of listeners) listener(end);
-      }
-      const assistant = {
-        role: "assistant",
-        content: [{ type: "text", text: "hello" }],
-        usage: {
-          input: 3,
-          output: 2,
-          cacheRead: 1,
-          cacheWrite: 0,
-          totalTokens: 6,
-          cost: { total: 0.001 },
-        },
-        stopReason: behavior === "provider-error" ? "error" : "stop",
-        ...(behavior === "provider-error"
-          ? { errorMessage: "opaque provider failure", diagnostics: [] }
-          : {}),
-        timestamp: Date.now(),
-      };
-      messages.push(assistant);
-      if (behavior !== "provider-error") {
-        for (const listener of listeners) {
-          listener({
-            type: "message_update",
-            message: assistant,
-            assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello", partial: assistant },
-          } as AgentSessionEvent);
-        }
+      } finally {
+        streaming = false;
+        resolvePrompt = undefined;
+        rejectPrompt = undefined;
       }
     },
     getContextUsage() { return { tokens: 6, contextWindow: 100, percent: 6 }; },
@@ -195,7 +251,7 @@ export function fakeSession(
     getToolDefinition(name: string) { return tools.find((tool) => tool.name === name); },
     getActiveToolNames() { return [...active]; },
     setActiveToolsByName(names: string[]) { active = [...names]; },
-    setThinkingLevel(level: string) { thinkingLevel = level; },
+    setThinkingLevel(level: AgentSession["thinkingLevel"]) { thinkingLevel = level; },
     async setModel(next: unknown) { model = next as typeof model; },
     dispose() { disposeCalls += 1; },
   };
@@ -203,9 +259,15 @@ export function fakeSession(
     session: object as unknown as AgentSession,
     emit(event) { for (const listener of listeners) listener(event); },
     promptCalls,
+    steerCalls,
     activeToolsAtPrompt,
     get disposeCalls() { return disposeCalls; },
     get abortCalls() { return abortCalls; },
+    get clearQueueCalls() { return clearQueueCalls; },
+    operationLog,
+    steeringQueue,
+    get retainSteeredMessages() { return retainSteeredMessages; },
+    set retainSteeredMessages(value: boolean) { retainSteeredMessages = value; },
     get listenerCount() { return listeners.size; },
     tools,
     get resolvePrompt() { return resolvePrompt; },

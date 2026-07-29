@@ -285,6 +285,9 @@ class FakeAgent {
     const fixture = scenario.extensionRequest;
     record({ method: "extensionRequest", extensionMethod: method, params });
     if (fixture?.method === method) {
+      if (typeof fixture.delayMs === "number" && fixture.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, fixture.delayMs));
+      }
       if (fixture.exitBeforeResponse === true) process.exit(17);
       if (fixture.error) {
         throw new RequestError(

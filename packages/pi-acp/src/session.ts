@@ -11,7 +11,7 @@ import { adapterError, classifyPreflight, isRequestError, unexpectedError } from
 import type { PiAcpDeps } from "./deps.js";
 import { applyConfig, modelOption, thinkingLevelOption } from "./config.js";
 import { shutdownPiSession } from "./pi-shutdown.js";
-import { convertPromptContent } from "./prompt-content.js";
+import { convertPromptContent, type ConvertedPrompt, type PiImage } from "./prompt-content.js";
 import { replayEntry } from "./replay.js";
 import { stopReasonFor } from "./stop-reason.js";
 import { translateEvent } from "./translate.js";
@@ -24,6 +24,7 @@ import {
 import { installPermissionWrapper } from "./permissions.js";
 import type { McpBridge, McpResultProjection } from "./mcp-bridge.js";
 import { ChildCleanupFailure, type ChildProcessRegistrySlot } from "./child-process-registry.js";
+import type { SteeringRequest, SteeringResponse } from "./steering.js";
 
 interface ActiveTurn {
   controller: AbortController;
@@ -85,6 +86,8 @@ export class PiSession {
   private disposed = false;
   private unsubscribe: (() => void) | undefined;
   private activeTurn: ActiveTurn | undefined;
+  private steerChain: Promise<void> = Promise.resolve();
+  private readonly pendingSteerImages = new Map<string, PiImage[]>();
   private configReserved = false;
   private cleanupDirty = false;
   private cleanupGeneration: CleanupGeneration | undefined;
@@ -311,6 +314,14 @@ export class PiSession {
     else this.mcpBridge.abortRefreshes();
     const turn = this.activeTurn;
     if (turn && !turn.controller.signal.aborted) turn.controller.abort();
+    let clearQueuePi = Promise.resolve();
+    this.pendingSteerImages.clear();
+    try {
+      this.pi.clearQueue();
+    } catch (error) {
+      clearQueuePi = Promise.reject(error);
+    }
+    clearQueuePi.catch(() => undefined);
     let abortPi: Promise<void>;
     try {
       abortPi = this.pi.abort();
@@ -318,7 +329,10 @@ export class PiSession {
       abortPi = Promise.reject(error);
     }
     abortPi.catch(() => undefined);
-    const operations = Promise.allSettled([abortPi, captured.drain]);
+    // Keep the established abort-before-child-drain failure precedence. Queue
+    // clearing is invoked first, but its failure is considered only after both
+    // pre-existing cleanup operations.
+    const operations = Promise.allSettled([abortPi, captured.drain, clearQueuePi]);
 
     generation.promise = new Promise<void>((resolve, reject) => {
       let claimed = false;
@@ -415,6 +429,7 @@ export class PiSession {
       const terminal = terminalAssistant(messages);
       const stopReason = stopReasonFor(terminal, turn.controller.signal.aborted);
       this.finish(turn, { response: { stopReason, usage: promptUsage(messages) } });
+      if (!turn.controller.signal.aborted) this.redispatchOrphanedSteering();
     } catch (error) {
       if (this.pumpFailure !== undefined) this.notificationFailure();
       else this.turnError(turn, error);
@@ -428,6 +443,7 @@ export class PiSession {
       try {
         await this.drain();
         this.finish(turn, { error: classifyPreflight(error) });
+        this.redispatchOrphanedSteering();
       } catch {
         this.notificationFailure();
       }
@@ -448,7 +464,18 @@ export class PiSession {
 
   async prompt(params: PromptRequest, requestSignal: AbortSignal): Promise<PromptResponse> {
     if (this.busy) throw adapterError("session_busy");
-    const converted = convertPromptContent(params.prompt);
+    return this.startTurn(convertPromptContent(params.prompt), { requestSignal });
+  }
+
+  /** Open the session's single turn slot and run one pi prompt through the full turn
+   *  machinery (turn boundary, cancellation, settlement, usage). Admission is the caller's
+   *  job: prompt() rejects while busy, and the steering paths start a turn only when the
+   *  slot is free. Steer-started turns pass no requestSignal (cancel() still aborts them)
+   *  and use preflightResult as their turn-committed acceptance signal. */
+  private startTurn(
+    converted: ConvertedPrompt,
+    opts: { requestSignal?: AbortSignal; preflightResult?: (success: boolean) => void },
+  ): Promise<PromptResponse> {
     const text = converted.text;
 
     let startMessageIndex: number;
@@ -481,11 +508,14 @@ export class PiSession {
       startMessageIndex,
     };
     this.activeTurn = turn;
-    const abortFromRequest = () => this.abortTurn(turn);
-    if (requestSignal.aborted) abortFromRequest();
-    else {
-      requestSignal.addEventListener("abort", abortFromRequest, { once: true });
-      turn.removeRequestAbort = () => requestSignal.removeEventListener("abort", abortFromRequest);
+    const requestSignal = opts.requestSignal;
+    if (requestSignal) {
+      const abortFromRequest = () => this.abortTurn(turn);
+      if (requestSignal.aborted) abortFromRequest();
+      else {
+        requestSignal.addEventListener("abort", abortFromRequest, { once: true });
+        turn.removeRequestAbort = () => requestSignal.removeEventListener("abort", abortFromRequest);
+      }
     }
 
     this.runTurnTask(turn, (async () => {
@@ -509,7 +539,10 @@ export class PiSession {
       }
       let piPromise: Promise<void>;
       try {
-        piPromise = this.pi.prompt(text, { images: converted.images });
+        piPromise = this.pi.prompt(text, {
+          images: converted.images,
+          ...(opts.preflightResult ? { preflightResult: opts.preflightResult } : {}),
+        });
       } catch (error) {
         await this.handlePiRejected(turn, error);
         return;
@@ -520,6 +553,149 @@ export class PiSession {
       );
     })());
     return result;
+  }
+
+  /** `_session/steering`, codex-shaped: inject into the live turn when there is one,
+   *  otherwise start a fire-and-forget turn with the content and answer `startedNewTurn`.
+   *  Requests are serialized per session (pi rejects concurrent runs), so a second steer
+   *  behind an idle one injects into the turn the first one started. */
+  async steer(params: SteeringRequest): Promise<SteeringResponse> {
+    const converted = convertPromptContent(params.prompt);
+    const run = this.steerChain.then(() => this.performSteer(converted));
+    this.steerChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async performSteer(converted: ConvertedPrompt): Promise<SteeringResponse> {
+    for (;;) {
+      if (this.closing || this.disposed) throw adapterError("session_terminated");
+      const turn = this.activeTurn;
+      if (!turn) {
+        if (this.busy) throw adapterError("session_busy");
+        return this.startTurnFromSteer(converted);
+      }
+      if (turn.completed) {
+        await turn.settlement;
+        continue;
+      }
+      if (turn.controller.signal.aborted) {
+        // Cancellation wins: cleanupTurn clears pi's queues so a steer racing a cancel
+        // must not restart the generation the user just stopped. The steer did not take.
+        return { outcome: "failed" };
+      }
+      // A committed-but-not-yet-streaming turn is steerable too: pi's run loop polls the
+      // steering queue before its first LLM call, so the message joins the imminent turn.
+      this.pendingSteerImages.set(converted.text, converted.images);
+      await this.pi.steer(converted.text, converted.images);
+      if (this.activeTurn === turn && !turn.completed && !turn.controller.signal.aborted) {
+        return { outcome: "injected" };
+      }
+      if (turn.controller.signal.aborted) {
+        this.recoverSteer(converted.text);
+        return { outcome: "failed" };
+      }
+      // The run settled underneath the enqueue. pi's queues are polled only from inside a
+      // run, so an undelivered message would silently prepend itself to the next
+      // session/prompt; recover it and place it into a live turn or a new one instead.
+      if (!this.recoverSteer(converted.text)) return { outcome: "injected" };
+    }
+  }
+
+  /** Pull one undelivered steering message back out of pi's queues. Returns false when pi
+   *  already consumed it (or a settlement drain already redispatched it). clearQueue is
+   *  all-or-nothing, so any other queued texts are re-enqueued untouched (text-only: pi
+   *  surfaces only the text mirror of messages it holds). */
+  private recoverSteer(text: string): boolean {
+    try {
+      if (!this.pi.getSteeringMessages().includes(text)) {
+        this.pendingSteerImages.delete(text);
+        return false;
+      }
+      const cleared = this.pi.clearQueue();
+      const steering = [...cleared.steering];
+      const index = steering.indexOf(text);
+      if (index !== -1) steering.splice(index, 1);
+      for (const other of steering) void this.pi.steer(other).catch(() => undefined);
+      for (const other of cleared.followUp) void this.pi.followUp(other).catch(() => undefined);
+      this.pendingSteerImages.delete(text);
+      return index !== -1;
+    } catch (error) {
+      console.error("pi-acp steering recovery error:", error);
+      return false;
+    }
+  }
+
+  /** Idle steer: start a normal turn with the content so it occupies the single turn slot
+   *  (session/prompt during it is legitimately busy; cancel/close still work) and resolve
+   *  as soon as the turn is committed — pi's preflightResult is the acceptance signal, the
+   *  analogue of codex's onTurnStarted. The turn itself is fire-and-forget: nothing owns
+   *  its PromptResponse and its output streams through the usual session/update path. */
+  private async startTurnFromSteer(converted: ConvertedPrompt): Promise<SteeringResponse> {
+    let commit!: (result: "committed" | "preflight-failed") => void;
+    const committed = new Promise<{ kind: "committed" | "preflight-failed" }>((resolve) => {
+      commit = (result) => resolve({ kind: result });
+    });
+    const done = this.startTurn(converted, {
+      preflightResult: (success) => commit(success ? "committed" : "preflight-failed"),
+    });
+    const doneTagged = done.then(
+      (response) => ({ kind: "settled" as const, response }),
+      (error) => ({ kind: "rejected" as const, error }),
+    );
+    const raced = await Promise.race([committed, doneTagged]);
+    switch (raced.kind) {
+      case "committed":
+        done.catch((error) => console.error("pi-acp steer-started turn failed:", error));
+        return { outcome: "startedNewTurn" };
+      case "settled":
+        // The prompt finished without a generation (e.g. extension-handled input). A
+        // cancel that beat the turn start means the steer never took.
+        return raced.response.stopReason === "cancelled"
+          ? { outcome: "failed" }
+          : { outcome: "startedNewTurn" };
+      case "preflight-failed": {
+        // Surface the same mapped preflight rejection a prompt() caller would see.
+        const settled = await doneTagged;
+        if (settled.kind === "rejected") throw settled.error;
+        return { outcome: "startedNewTurn" };
+      }
+      case "rejected":
+        throw raced.error;
+    }
+  }
+
+  /** Settlement-time orphan recovery. pi's steering/follow-up queues are polled only from
+   *  inside a run, so a message still queued when the run settles would silently prepend
+   *  itself to the NEXT session/prompt. Both reference adapters run late content instead of
+   *  leaking or dropping it (codex falls through to a new turn; claude's streaming input
+   *  absorbs it as background generation), so redispatch it as a fire-and-forget turn. */
+  private redispatchOrphanedSteering(): void {
+    if (this.closing || this.disposed || this.busy) return;
+    let texts: string[];
+    let images: PiImage[];
+    try {
+      if (this.pi.pendingMessageCount === 0) {
+        this.pendingSteerImages.clear();
+        return;
+      }
+      const cleared = this.pi.clearQueue();
+      texts = [...cleared.steering, ...cleared.followUp].filter((text) => text.length > 0);
+      images = cleared.steering.flatMap((text) => this.pendingSteerImages.get(text) ?? []);
+    } catch (error) {
+      console.error("pi-acp orphaned steering recovery error:", error);
+      return;
+    }
+    this.pendingSteerImages.clear();
+    if (texts.length === 0) return;
+    try {
+      const done = this.startTurn({ text: texts.join("\n\n"), images }, {});
+      done.catch((error) => console.error("pi-acp orphaned steering turn failed:", error));
+    } catch (error) {
+      console.error("pi-acp orphaned steering turn failed:", error);
+    }
   }
 
   cancel(): void {
