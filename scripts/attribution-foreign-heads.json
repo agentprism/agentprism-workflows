@@ -5,6 +5,11 @@
       "sha": "0c53f0c2ceed6fa7181664a8d85ee6f868713c40",
       "imported": "2026-07-28",
       "what": "codex-acp fork history: VikashLoomba/codex-acp main at the packages/codex-acp subtree import (contains upstream agentclientprotocol/codex-acp main ba5bef59cfcea4229841fe9438d816696621307b)"
+    },
+    {
+      "sha": "f41dcf16ff87cea6f5e0807926bf53cc618ee2c2",
+      "imported": "2026-07-31",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main"
     }
   ]
 }
