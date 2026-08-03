@@ -42,7 +42,7 @@
     "prepublishOnly": "tsc -b"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.63.0",
+    "@agentclientprotocol/claude-agent-acp": "0.64.2",
     "@agentclientprotocol/sdk": "^1.3.0",
     "@automatalabs/codex-acp": "workspace:*",
     "@automatalabs/pi-acp": "workspace:*",
