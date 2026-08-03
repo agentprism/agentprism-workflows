@@ -1,4 +1,11 @@
-export const FIXTURE_PI_PIN = "0.82.1";
+export const FIXTURE_PI_PIN = "0.83.0";
+// 2026-08-03 bump 0.82.1 -> 0.83.0: every fixture string below was re-verified byte-identical
+// against the installed pi v0.83.0 dists — dist/core/auth-guidance.js diffs clean against the
+// 0.82.1 tarball, the auth strings still span the concatenated template literals at
+// dist/core/agent-session.js:186,852, and pi-ai's dist/utils/{retry,overflow,error-body,
+// provider-retry}.js are byte-identical to 0.82.1 (0.83.0's error-surface changes — raw
+// provider stop reasons and the "pending" StopReason — live in the stream layer, not in the
+// classified prose); the per-string citations record where each originated at v0.80.10.
 // 2026-07-25 bump 0.82.0 -> 0.82.1: every fixture string below was re-verified byte-identical
 // against the installed pi v0.82.1 dists — the guidance templates reconstructed from
 // dist/core/auth-guidance.js, the auth strings still spanning concatenated template literals

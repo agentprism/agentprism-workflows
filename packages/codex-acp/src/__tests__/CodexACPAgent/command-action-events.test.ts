@@ -28,6 +28,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-list-path',
                     command: 'ls /test/project',
                     cwd: '/test/project',
@@ -64,6 +66,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-list-no-path',
                     command: 'ls',
                     cwd: '/test/project',
@@ -100,6 +104,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-read-file',
                     command: 'sed -n "1,80p" /test/project/src/index.ts',
                     cwd: '/test/project',
@@ -137,6 +143,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-search-query-path',
                     command: 'rg "Service" src',
                     cwd: '/test/project',
@@ -174,6 +182,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-search-query-only',
                     command: 'rg "Service"',
                     cwd: '/test/project',
@@ -211,6 +221,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-search-path-only',
                     command: 'rg --files -g "*service*"',
                     cwd: '/test/project',
@@ -248,6 +260,8 @@ describe('CodexEventHandler - command action events', () => {
                 startedAtMs: 0,
                 item: {
                     type: 'commandExecution',
+                    pluginId: null,
+                    scriptPath: null,
                     id: 'command-search-no-query-no-path',
                     command: 'rg',
                     cwd: '/test/project',

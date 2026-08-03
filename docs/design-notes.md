@@ -212,7 +212,7 @@ All versions below were re-verified from the installed workspace dependency grap
   client/connection helpers). This is what your orchestrator uses to *speak ACP as a client*.
   Ref: https://agentclientprotocol.com · https://github.com/agentclientprotocol
 
-- **`@agentclientprotocol/claude-agent-acp@0.63.0`** — ACP server wrapping Claude.
+- **`@agentclientprotocol/claude-agent-acp@0.64.2`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
   Wraps **`@anthropic-ai/claude-agent-sdk@0.3.220`** — the adapter itself still exact-pins
   `0.3.219`, so a root `pnpm.overrides` entry lifts the resolved runtime to npm `latest`;
@@ -489,7 +489,7 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.63.0` → `@anthropic-ai/claude-agent-sdk@0.3.220`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.64.2` → `@anthropic-ai/claude-agent-sdk@0.3.220`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
@@ -929,7 +929,7 @@ resurrect a snapshot or sidecar after the run was removed.
 **Packages (verified versions, 2026-07-09):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.3.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.63.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.220`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@agentclientprotocol/claude-agent-acp@0.64.2` (wraps `@anthropic-ai/claude-agent-sdk@0.3.220`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp` (workspace fork of `@agentclientprotocol/codex-acp` at `packages/codex-acp`, patch baked into dist) — upstream: https://github.com/agentclientprotocol/codex-acp
 - `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai

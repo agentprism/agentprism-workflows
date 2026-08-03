@@ -15,6 +15,11 @@ export function stopReasonFor(
       return "max_tokens";
     case "error":
       throw classifyTerminal(terminal);
+    case "pending":
+      // pi >=0.83.0 marks still-streaming partials "pending"; a finalized message always carries
+      // a real reason. A resolved turn whose terminal message is still "pending" means the
+      // stream ended without termination — same diagnostic seam as unknown reasons, but named.
+      throw unexpectedError(new Error("pi turn resolved with a still-pending terminal message"), terminal);
     case undefined:
       return "end_turn";
     default:
