@@ -19,11 +19,6 @@
     "node": ">=22",
     "pnpm": ">=10"
   },
-  "pnpm": {
-    "overrides": {
-      "@anthropic-ai/claude-agent-sdk": "0.3.220"
-    }
-  },
   "devDependencies": {
     "@changesets/cli": "^2.31.0",
     "@types/node": "^22.10.0",
