@@ -93,12 +93,15 @@ export {
   type BrokerTurn,
   type BrokerOpenSessionOptions,
   type BrokerPromptOptions,
+  type BrokerLoadSessionOptions,
   type SteeringOutcomeValue,
   type ReplEvalResult,
   type CheckpointSummary,
   type CheckpointInfo,
   type LiveAgentInfo,
   type ReconcileReport,
+  type SnapshotSink,
+  type SnapshotBoundaryKind,
 } from './broker.js';
 export {
   InMemoryCallStore,
@@ -109,3 +112,27 @@ export {
   type CallKind,
   type CallOutcomeKind,
 } from './store.js';
+
+// Phase D: enveloped snapshots, the per-project store, and the restore
+// path. See the package README's "Snapshots and durability" section.
+export {
+  SNAPSHOT_FORMAT,
+  SNAPSHOT_FORMAT_VERSION,
+  serializeSnapshot,
+  deserializeSnapshot,
+  wasmSha256Of,
+  SnapshotEnvelopeError,
+  type SnapshotEnvelopeMeta,
+  type SnapshotEnvelope,
+  type SnapshotEnvelopeErrorCode,
+} from './snapshot-envelope.js';
+export {
+  ReplWorkspaceStore,
+  REPL_STORE_SUBDIR,
+  SNAPSHOT_FILENAME,
+  CALL_STORE_FILENAME,
+  type ReplStoreOptions,
+  type SnapshotWriteOptions,
+  type RestoredReplSnapshot,
+  type ReplStoreStats,
+} from './repl-store.js';

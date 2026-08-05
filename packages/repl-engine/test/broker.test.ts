@@ -33,6 +33,7 @@ import {
   JsonlCallStore,
   Workspace,
   type BrokerOpenSessionOptions,
+  type BrokerLoadSessionOptions,
   type BrokerPromptOptions,
   type BrokerRunner,
   type BrokerSession,
@@ -135,6 +136,15 @@ class FakeSession implements BrokerSession {
     });
   }
 
+  /** The re-attach seam (phase D): the loaded session's founding-turn
+   *  completion. The test completes it with `completeLoadedTurn`. */
+  readonly loadedTurns: Array<{ resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
+  awaitCurrentTurn(): Promise<BrokerTurn> {
+    return new Promise((resolve, reject) => {
+      this.loadedTurns.push({ resolve, reject });
+    });
+  }
+
   cancel(): Promise<void> {
     this.cancelled++;
     // The real session settles the in-flight turn with stopReason
@@ -182,6 +192,14 @@ class FakeSession implements BrokerSession {
     pending.resolve(outcome);
   }
 
+  /** The re-attached session's loaded turn completes at the backend. */
+  completeLoadedTurn(text: string): void {
+    const pending = this.loadedTurns.shift();
+    assert.ok(pending, 'a loaded turn must be awaited');
+    this.completedTexts.push(text);
+    pending.resolve({ stopReason: this.stopReason, text });
+  }
+
   failSteer(error: unknown): void {
     const pending = this.steers.shift();
     assert.ok(pending, 'a steer wire call must be in flight');
@@ -196,9 +214,16 @@ class FakeSession implements BrokerSession {
 class FakeRunner implements BrokerRunner {
   readonly sessions: FakeSession[] = [];
   readonly openedWith: BrokerOpenSessionOptions[] = [];
+  readonly loadedWith: BrokerLoadSessionOptions[] = [];
   supportsSteering = true;
+  /** The re-attach capability gate (phase D): models acp-agents'
+   *  `supportsLoadSession` — a backend that does not advertise
+   *  session/load rejects the load BEFORE any wire request. */
+  supportsLoadSession = true;
   /** Open failures to inject (each one rejects openSession once). */
   failNextOpens = 0;
+  /** Load failures to inject (each one rejects loadSession once). */
+  failNextLoads = 0;
   disposeCalls = 0;
 
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
@@ -210,6 +235,23 @@ class FakeRunner implements BrokerRunner {
     session.capabilities = { supportsSteering: this.supportsSteering };
     this.sessions.push(session);
     this.openedWith.push(opts);
+    return session;
+  }
+
+  async loadSession(opts: BrokerLoadSessionOptions): Promise<FakeSession> {
+    this.loadedWith.push(opts);
+    if (!this.supportsLoadSession) {
+      // The acp-agents capability gate (capabilities.ts): a backend
+      // that omits session/load rejects before any wire request.
+      throw new Error('backend does not advertise session/load (loadSession capability gate)');
+    }
+    if (this.failNextLoads > 0) {
+      this.failNextLoads--;
+      throw new Error('session not found at the backend');
+    }
+    const session = new FakeSession(opts);
+    session.capabilities = { supportsSteering: this.supportsSteering };
+    this.sessions.push(session);
     return session;
   }
 
@@ -930,7 +972,8 @@ test('review 2b: a crash between enqueue and delivery loses nothing — reconcil
   // at open, the same merge path the same-eval test pins).
   const report = await broker2.reconcile();
   assert.deepEqual(report.settledFromStore, []);
-  assert.deepEqual(report.leftPending, ['c1']);
+  assert.deepEqual(report.reattached, ['c1'], 'the founding call re-attaches to its recorded backend session');
+  assert.deepEqual(report.leftPending, []);
   assert.deepEqual(report.reQueuedUndelivered, ['c2']);
   // Idempotent: a second reconcile does not double-queue.
   const report2 = await broker2.reconcile();
@@ -964,6 +1007,9 @@ test('review 2d: the delivered marker is recorded only AFTER the prompt was hand
     }
     recordReissued(callId: string, atMs: number): void {
       inner.recordReissued(callId, atMs);
+    }
+    recordAttached(callId: string, sessionId: string, atMs: number): void {
+      inner.recordAttached(callId, sessionId, atMs);
     }
     recordCompleted(callId: string, outcome: CallOutcome): boolean {
       return inner.recordCompleted(callId, outcome);
@@ -1161,6 +1207,9 @@ test('review 3: a failing store write during checkpoint.answer leaves the checkp
     }
     recordReissued(callId: string, atMs: number): void {
       inner.recordReissued(callId, atMs);
+    }
+    recordAttached(callId: string, sessionId: string, atMs: number): void {
+      inner.recordAttached(callId, sessionId, atMs);
     }
     recordCompleted(callId: string, outcome: CallOutcome): boolean {
       if (this.failNextCompletion) {

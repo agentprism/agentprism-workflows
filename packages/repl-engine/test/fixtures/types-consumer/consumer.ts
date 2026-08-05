@@ -217,6 +217,7 @@ import {
   type BrokerSession,
   type BrokerTurn,
   type BrokerOpenSessionOptions,
+  type BrokerLoadSessionOptions,
   type BrokerPromptOptions,
   type SteeringOutcomeValue,
   type ReplEvalResult,
@@ -279,6 +280,31 @@ function brokerSurfaceTyping(ws: Workspace): void {
           rawStructuredOutput(): unknown {
             return undefined;
           },
+          async awaitCurrentTurn(): Promise<BrokerTurn> {
+            return { stopReason: 'end_turn', text: 'loaded' };
+          },
+        };
+      },
+      async loadSession(_opts: BrokerLoadSessionOptions): Promise<BrokerSession> {
+        return {
+          sessionId: 's1',
+          async prompt(): Promise<BrokerTurn> {
+            return { stopReason: 'end_turn', text: 'ok' };
+          },
+          async steer(): Promise<string> {
+            return 'injected';
+          },
+          async cancel(): Promise<void> {},
+          async release(): Promise<void> {},
+          currentTurnText(): string {
+            return '';
+          },
+          finalMessageText(): string {
+            return '';
+          },
+          rawStructuredOutput(): unknown {
+            return undefined;
+          },
         };
       },
       async dispose(): Promise<void> {},
@@ -305,7 +331,15 @@ function brokerSurfaceTyping(ws: Workspace): void {
     supportsSteering: true,
     queuedSteers: 0,
   };
-  const report: ReconcileReport = { settledFromStore: ['c1'], leftPending: [], reQueuedUndelivered: [] };
+  const report: ReconcileReport = {
+    settledFromStore: ['c1'],
+    reattached: [],
+    reissued: [],
+    failedLost: [],
+    requeuedCheckpoints: [],
+    leftPending: [],
+    reQueuedUndelivered: [],
+  };
   info satisfies CheckpointInfo;
   live satisfies LiveAgentInfo;
   report satisfies ReconcileReport;
@@ -326,6 +360,107 @@ function brokerSurfaceTyping(ws: Workspace): void {
   void storeTyping;
   void options;
   void brokerSurfaceTyping;
+}
+
+// Phase D: enveloped snapshots, the per-project store, and the restore
+// path — all self-contained (no node types, no quickjs-wasi / workflows
+// types in the published declaration graph; the fixture's non-DOM lib,
+// `types: []` and `skipLibCheck: false` compile the whole surface).
+import {
+  SNAPSHOT_FORMAT,
+  SNAPSHOT_FORMAT_VERSION,
+  serializeSnapshot,
+  deserializeSnapshot,
+  wasmSha256Of,
+  SnapshotEnvelopeError,
+  ReplWorkspaceStore,
+  REPL_STORE_SUBDIR,
+  SNAPSHOT_FILENAME,
+  CALL_STORE_FILENAME,
+  type SnapshotEnvelopeMeta,
+  type SnapshotEnvelope,
+  type SnapshotEnvelopeErrorCode,
+  type ReplStoreOptions,
+  type SnapshotWriteOptions,
+  type RestoredReplSnapshot,
+  type ReplStoreStats,
+  type SnapshotSink,
+  type SnapshotBoundaryKind,
+} from '../../../dist/index.js';
+
+function phaseDSurfaceTyping(): void {
+  SNAPSHOT_FORMAT satisfies string;
+  SNAPSHOT_FORMAT_VERSION satisfies number;
+  REPL_STORE_SUBDIR satisfies string;
+  SNAPSHOT_FILENAME satisfies string;
+  CALL_STORE_FILENAME satisfies string;
+
+  const storeOptions: ReplStoreOptions = {
+    persistenceRoot: '/tmp/persist',
+    env: { AGENTPRISM_PERSISTENCE_ROOT: '/tmp/persist' },
+    snapshotWrite: { debounceBursts: true, fsync: true },
+  };
+  const writeOptions: SnapshotWriteOptions = {};
+  writeOptions.debounceBursts satisfies boolean | undefined;
+  writeOptions.fsync satisfies boolean | undefined;
+  const store = ReplWorkspaceStore.open('/tmp/project', storeOptions);
+  store.projectDir satisfies string;
+  store.replDir satisfies string;
+  store.snapshotPath satisfies string;
+  store.callStorePath satisfies string;
+  store.hasSnapshot() satisfies boolean;
+  const sink: SnapshotSink = {
+    boundary: (kind: SnapshotBoundaryKind) => {
+      kind satisfies 'eval' | 'settlement';
+    },
+    flush: () => {},
+  };
+  const fromWriter: SnapshotSink = store.snapshotWriter(wsPlaceholder(), modulePlaceholder());
+  fromWriter.boundary('eval');
+  store.stats() satisfies ReplStoreStats;
+  store.close();
+  store.reset();
+
+  const snapshot: ReplSnapshot = {
+    memory: new Uint8Array(4),
+    stackPointer: 0,
+    runtimePtr: 0,
+    contextPtr: 0,
+    extensions: [],
+  };
+  const envelope: Uint8Array = serializeSnapshot(snapshot, 'a'.repeat(64), { createdAtMs: 1 });
+  envelope satisfies Uint8Array;
+  const parsed: SnapshotEnvelope = deserializeSnapshot(envelope, { path: '/tmp/snapshot.bin' });
+  parsed.snapshot.runtimePtr satisfies number;
+  parsed.meta satisfies SnapshotEnvelopeMeta;
+  parsed.meta.wasmSha256 satisfies string;
+  parsed.meta.formatVersion satisfies number;
+  const hash: string = wasmSha256Of(new Uint8Array([1, 2, 3]));
+  hash satisfies string;
+  const restored: RestoredReplSnapshot = store.loadSnapshot(new Uint8Array([0, 97, 115, 109]));
+  restored.snapshot satisfies ReplSnapshot;
+  restored.wasmSha256 satisfies string;
+  restored.formatVersion satisfies number;
+  restored.createdAtMs satisfies number;
+  const errorCode: SnapshotEnvelopeErrorCode = 'WASM_HASH_MISMATCH';
+  errorCode satisfies string;
+  const err = new SnapshotEnvelopeError('VERSION_MISMATCH', 'boom', {
+    path: '/tmp/snapshot.bin',
+    recorded: '2',
+    expected: '1',
+  });
+  err.code satisfies SnapshotEnvelopeErrorCode;
+  err.path satisfies string | undefined;
+  void sink;
+  void writeOptions;
+}
+
+function wsPlaceholder(): Workspace {
+  return undefined as unknown as Workspace;
+}
+
+function modulePlaceholder(): WasmInput {
+  return new Uint8Array([0, 97, 115, 109]);
 }
 
 // The self-contained snapshot stand-in round-trips as a type.

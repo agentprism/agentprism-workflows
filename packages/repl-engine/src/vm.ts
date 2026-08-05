@@ -89,11 +89,13 @@
  *     syntax errors / ~3,128 accessor completions).
  */
 
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 import { EvalFlags, JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 import { classifyError, type EvalErrorInfo } from './errors.js';
+import { noteWasmModuleHash } from './snapshot-envelope.js';
 import { readOwnDataProperty, readValue, takeAndFreeException } from './trapfree.js';
 import type { ReplSnapshot, WasmInput, WasmModule } from './types.js';
 
@@ -240,6 +242,14 @@ async function loadStructuredCloneExtension(): Promise<Uint8Array> {
  * Load the `quickjs-wasi` package's shipped `quickjs.wasm` binary and
  * compile it into a reusable module (typed as `WasmModule`, the opaque
  * stand-in for `WebAssembly.Module` — see `types.ts`).
+ *
+ * The binary's sha256 is recorded against the compiled module in the
+ * envelope registry (`noteWasmModuleHash` — see `snapshot-envelope.ts`):
+ * the at-rest snapshot envelope records which binary laid out the VM
+ * memory, and the restore path compares that recorded hash against the
+ * module it restores with. `loadShippedWasm` is the ONLY producer of
+ * `WasmModule` values, so the registry covers every compiled module the
+ * engine can be asked to hash.
  */
 export function loadShippedWasm(): Promise<WasmModule> {
   shippedModule ??= (async () => {
@@ -248,7 +258,9 @@ export function loadShippedWasm(): Promise<WasmModule> {
     // The engine is the only producer of `WasmModule` values: the real
     // `WebAssembly.Module` is branded opaque at this boundary so consumers
     // cannot fabricate `WasmInput` values that would fail at runtime.
-    return WebAssembly.compile(bytes) as unknown as WasmModule;
+    const module = (await WebAssembly.compile(bytes)) as unknown as WasmModule;
+    noteWasmModuleHash(module, createHash('sha256').update(bytes).digest('hex'));
+    return module;
   })();
   return shippedModule;
 }

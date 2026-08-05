@@ -77,8 +77,12 @@ export interface CallRecord {
   /** Present once the call completed (first completion wins). */
   completion: CallOutcome | null;
   /** The FOUNDING session id for steer records (the session being steered
-   *  — the restore path's queue rebuild keys on it); null for agent and
-   *  checkpoint records. */
+   *  — the restore path's queue rebuild keys on it); for AGENT records, the
+   *  backend ACP session id the call's session opened under (`recordAttached`
+   *  — the restore path's re-attach key), overwritten by a re-issue's new
+   *  session. Null for checkpoint records, for steer records is the founding
+   *  id, and for agent records whose session never opened (or whose record
+   *  predates the attachment log). */
   sessionId: string | null;
   /** Queued-for-next-turn delivery state (steer records whose completion
    *  is the `queued` outcome): the unix-ms moment the queued payload was
@@ -109,6 +113,15 @@ export interface CallStore {
    *  an id the store has never seen (a dangling re-issue would corrupt
    *  the replay ledger). */
   recordReissued(callId: string, atMs: number): void;
+  /**
+   * Record the backend ACP session id an agent call's session opened
+   * under — the restore path's re-attach key (`sessionId` on the record).
+   * OVERWRITES: the record carries the CURRENT session — a re-issued
+   * call's new session replaces the lost one (the log keeps the history
+   * as appended lines, and replay applies them in order). Throws for an
+   * id the store has never seen dispatched.
+   */
+  recordAttached(callId: string, sessionId: string, atMs: number): void;
   /**
    * Record a completion. Returns `true` iff the completion was newly
    * recorded; `false` when the call already had one (first-wins, no
@@ -158,6 +171,12 @@ export class InMemoryCallStore implements CallStore {
     record.dispatchedAtMs = atMs;
   }
 
+  recordAttached(callId: string, sessionId: string, _atMs: number): void {
+    const record = this.records.get(callId);
+    if (record === undefined) throw unknownCall(callId);
+    record.sessionId = sessionId;
+  }
+
   recordCompleted(callId: string, outcome: CallOutcome): boolean {
     const record = this.records.get(callId);
     if (record === undefined) throw unknownCall(callId);
@@ -195,6 +214,7 @@ export class InMemoryCallStore implements CallStore {
 type LogLine =
   | { event: 'dispatched'; record: CallRecord }
   | { event: 'reissued'; callId: string; atMs: number }
+  | { event: 'attached'; callId: string; sessionId: string; atMs: number }
   | { event: 'completed'; callId: string; outcome: CallOutcome }
   | { event: 'delivery'; callId: string; state: 'delivered' | 'dropped'; atMs: number };
 
@@ -219,6 +239,10 @@ function isLogLine(value: unknown): value is LogLine {
       typeof (value as { callId?: unknown }).callId === 'string' &&
       typeof (value as { atMs?: unknown }).atMs === 'number'
     );
+  }
+  if (v.event === 'attached') {
+    const a = value as { callId?: unknown; sessionId?: unknown; atMs?: unknown };
+    return typeof a.callId === 'string' && typeof a.sessionId === 'string' && typeof a.atMs === 'number';
   }
   if (v.event === 'completed') {
     const o = (value as { outcome?: unknown }).outcome;
@@ -393,6 +417,12 @@ export class JsonlCallStore implements CallStore {
     this.index.recordReissued(callId, atMs);
   }
 
+  recordAttached(callId: string, sessionId: string, atMs: number): void {
+    if (this.index.lookup(callId) === undefined) throw unknownCall(callId);
+    this.append({ event: 'attached', callId, sessionId, atMs });
+    this.index.recordAttached(callId, sessionId, atMs);
+  }
+
   recordCompleted(callId: string, outcome: CallOutcome): boolean {
     const existing = this.index.lookup(callId);
     if (existing === undefined) throw unknownCall(callId);
@@ -459,6 +489,7 @@ export class JsonlCallStore implements CallStore {
 function replay(index: InMemoryCallStore, line: LogLine): void {
   if (line.event === 'dispatched') index.recordDispatched(line.record);
   else if (line.event === 'reissued') index.recordReissued(line.callId, line.atMs);
+  else if (line.event === 'attached') index.recordAttached(line.callId, line.sessionId, line.atMs);
   else if (line.event === 'completed') index.recordCompleted(line.callId, line.outcome);
   else index.recordDelivery(line.callId, line.state, line.atMs);
 }

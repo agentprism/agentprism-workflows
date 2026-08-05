@@ -435,6 +435,52 @@ Phase C decisions (the broker, the call store, the eval tool-result semantics):
   wraps the identity envelope later); `Workspace.rehost` is the by-name callback re-registration
   the broker uses to take a workspace over — the same re-registration the restore path uses.
 
+Phase D decisions (snapshots + restore; see also the "Snapshots and durability" section):
+
+- **The envelope is a JSON header line + gzip of the shim's own `serializeSnapshot()` output**
+  (its versioned QJSS binary with extension metadata) — the doc's "serializeSnapshot() output
+  wrapped in the identity envelope" is followed verbatim; gzip is the shim-documented
+  compression choice (JS runtimes decompress it natively). The header carries format name +
+  format version + wasm sha256 + createdAtMs; the restore path compares the recorded hash
+  against `wasmSha256Of` of the binary it restores with and REFUSES LOUDLY naming both
+  hashes. The format version is a second refusal axis (version-bump test included).
+- **`loadShippedWasm` records the shipped binary's hash against the compiled module** —
+  `wasmSha256Of(module)` resolves through that registry; a module the engine did not load
+  cannot be hashed (bytes are not recoverable from the compiled form) and refuses loudly
+  (pass raw bytes instead).
+- **The repl store reuses `@automatalabs/workflows`' store-layout helpers verbatim**
+  (`workflowProjectPaths` — the mcp-server project registry's own helpers), so the store key
+  derives from the project directory exactly as the workflow engine's and one project has
+  one repl store. Files: `repl/snapshot.bin` + `repl/calls.jsonl`.
+- **Atomic writes are tmp + rename + fsync** (fixed-name `.tmp`, single-writer discipline;
+  best-effort directory fsync); a failed write removes the tmp and throws, leaving the
+  previous snapshot untouched; the store directory self-heals on write after a `reset()`.
+- **The debounce is boundary-in/burst-out**: the broker fires `boundary(kind)` per
+  doc-defined boundary (after each eval; after each settlement drain that changed VM state)
+  and `flush()` at the end of each serialized operation; the store's `snapshotWriter`
+  debounces the burst into one atomic write. `SnapshotWriteOptions.debounceBursts` (default
+  true) and `fsync` (default true) are the decided knob names; `ReplStoreOptions.persistenceRoot`/
+  `env` override the workflow home.
+- **The re-attach arm keys on a store-recorded backend session id** (`recordAttached`,
+  written at session open BEFORE the prompt — a new append-only log event; overwrites on
+  re-issue so a later restore re-attaches the CURRENT session). The capability gate is the
+  runner's own `loadSession` (acp-agents' `supportsLoadSession` — a custom backend that
+  omits it degrades through the same gate, surfaced guest-visibly).
+- **`BrokerSession.awaitCurrentTurn` is an OPTIONAL seam** (the loaded session's founding-turn
+  completion): the engine's re-attach requires it, so an adapter without it — today's
+  acp-agents `InteractiveSession` exposes no loaded-turn completion — re-attaches the
+  session and then degrades to re-issue (released + re-dispatched, surfaced guest-visibly),
+  never a hanging call. The daemon phase wires the seam onto acp-agents.
+- **Pending steers whose wire call died with the process resolve `failed`** (recorded +
+  settled + warned): their outcome is unknowable and re-injecting would duplicate; the one
+  exception is queued-but-undelivered steers, whose payload is in the store (the phase-C
+  queue rebuild). Pending checkpoints re-surface into the broker's checkpoint table
+  (`PendingCheckpoint.call` is null on that path; answers settle through the reconciliation
+  surface). Reconcile is idempotent (an `isTracked` guard never re-attaches/re-issues twice)
+  and adopts store-unknown entries (foreign snapshot / wiped store) so the replay ledger
+  stays complete. Re-issues respect the concurrency cap (over-cap re-issues refuse with the
+  recoverable `ConcurrencyLimitError`).
+
 Phase B decisions (the guest library, bridge, previewer):
 
 - **`repl.guest` as the surface key** (`Symbol.for("repl.guest")`, marker global
@@ -540,15 +586,70 @@ Phase B decisions (the guest library, bridge, previewer):
   before any of our code runs; the previewer itself adds zero getter fires (pinned by
   baseline-count tests).
 
+## Snapshots and durability (phase D)
+
+Disk persistence is v1 scope (the roadmap doc's §Snapshots): the workspace survives daemon
+restarts — the property that makes a "persistent REPL" trustworthy. Three cooperating pieces:
+
+- **The identity envelope** (`src/snapshot-envelope.ts`, transfer lesson 5): the shim's own
+  `serializeSnapshot()` output wrapped in a JSON header line + gzip — the header carries the
+  format name (`repl-snapshot`), the envelope format version (`SNAPSHOT_FORMAT_VERSION = 1`),
+  the **wasm-binary sha256** (`wasmSha256Of` — raw bytes hash directly; a compiled module
+  hashes through the registry `loadShippedWasm` populates) and the creation time. A restore
+  whose recorded hash mismatches the running binary REFUSES LOUDLY naming both hashes
+  (`WASM_HASH_MISMATCH`) — never a silent restore into garbage; a version bump refuses
+  naming both versions (`VERSION_MISMATCH`); corrupt/truncated files refuse with a specific
+  `SnapshotEnvelopeError` code, single-shot, no crash-loop.
+- **The per-project store** (`src/repl-store.ts`): `ReplWorkspaceStore` lives in a `repl/`
+  subdirectory NEXT TO the workflow state under `workflowHomeDir()/projects/<key>/`, reusing
+  `@automatalabs/workflows`' store-layout helpers verbatim (the same helpers the mcp-server
+  project registry uses — one project, one repl store). It holds `snapshot.bin` (the
+  enveloped snapshot) and `calls.jsonl` (the broker's durable `JsonlCallStore`). Snapshot
+  writes are atomic (tmp + rename + fsync, best-effort directory fsync — a kill at any
+  moment leaves either the old complete snapshot or the new one).
+- **The snapshot cadence + debounce**: the broker fires a state-changing boundary after each
+  eval and after each settlement drain that changed VM state (`BrokerOptions.snapshotSink`:
+  `boundary(kind)` per boundary, `flush()` at the end of each serialized operation — the
+  burst boundary). The daemon wires it to `store.snapshotWriter(workspace, wasm)`, which
+  debounces one drain burst's boundaries into a single atomic write taken before the
+  operation's promise resolves (a broker eval that pumps settlements and then drains the
+  eval is ONE write). The debounced gap is always covered by the call store — settlements
+  are recorded BEFORE they settle, so a restore replays them from the store arm. Config
+  knobs (decided names): `SnapshotWriteOptions.debounceBursts` (default true) and
+  `SnapshotWriteOptions.fsync` (default true), plus `ReplStoreOptions.persistenceRoot` /
+  `env` for the workflow-home root.
+- **The restore path with the full three-way reconciliation** (transfer lesson 1):
+  `Broker.reconcile()` reads the in-VM pending-call registry and settles every outstanding
+  call exactly one way — completed while down → **settle from the store**; still resumable
+  at the backend → **re-attach** via `runner.loadSession` (the capability gate is the
+  runner's own, per acp-agents' `supportsLoadSession` — all four built-ins advertise it per
+  docs/api.md; a custom backend that omits it degrades through the same gate, surfaced
+  guest-visibly as a warn line); lost → **re-issue** under the same call id (reissues
+  counter bumped, the existing guest promise settles exactly once, the concurrency cap
+  applies). The re-attach keys on the backend session id the store recorded at session
+  open (`recordAttached`, written BEFORE the prompt — a crash with a turn in flight leaves
+  a restore able to re-attach instead of duplicating). A re-attached call's completion is
+  the loaded session's founding turn, observed through the OPTIONAL
+  `BrokerSession.awaitCurrentTurn` seam: an adapter without it (today's acp-agents
+  `InteractiveSession` exposes no loaded-turn completion) re-attaches the session, then
+  degrades to re-issue — released and re-dispatched, surfaced guest-visibly, so a
+  re-attached call can never hang unobserved. Pending checkpoints re-surface (answerable
+  across a restore, through the reconciliation surface) and pending steers whose wire call
+  died with the process resolve the honest `failed` with a warn line (their outcome is
+  unknowable; re-injecting would duplicate; queued-but-undelivered steers are the one
+  exception — the phase-C queue rebuild re-queues them exactly once). Reconcile is
+  idempotent: a repeated reconcile never re-attaches or re-issues twice.
+
 ## Out of scope for this phase (later phases, per the roadmap doc)
 
-The enveloped snapshots (wasm-hash + format version + gzip) and the restore path's full
-three-way reconciliation (the broker implements the store arm — settle-from-store — now;
-re-attach and re-issue land with the daemon wiring), the client-presence session-drain policy,
-the per-backend steering mechanism table (the mechanism is decided and documented in
-`src/broker.ts`; the doc's generated documentation table is the observability layer's
-artifact), the workspace manifest, and the `repl` MCP tool registration in `mcp-server` (which
-wires the daemon's project model to `WorkspaceRegistry` and the broker).
+The client-presence session-drain policy, the per-backend steering mechanism table (the
+mechanism is decided and documented in `src/broker.ts`; the doc's generated documentation
+table is the observability layer's artifact), the workspace manifest, and the `repl` MCP
+tool registration in `mcp-server` (which wires the daemon's project model — and this
+phase's store + restore path — to `WorkspaceRegistry` and the broker). The daemon phase also
+wires the `awaitCurrentTurn` seam onto acp-agents' `InteractiveSession` (or extends
+acp-agents to expose a loaded in-flight turn's completion) — until then, the seam's absence
+is the documented re-issue degradation.
 
 ## Development
 
@@ -649,3 +750,26 @@ included), and bounded-memory previews (3,000 revoked-proxy and typed-array prev
 line-granular truncation and UTF-8 byte counting — with physical-line accounting for
 embedded newlines (a rendered line whose property name carries line feeds counts as that
 many lines; exact at the 256 boundary; embedded-LF bytes count toward the 10 KB cap).
+
+Phase D adds the snapshot + restore suites: `snapshot-envelope.test.ts` (the envelope round
+trip — serialize → deserialize → restore with state intact, gzip actually compressing —
+`wasmSha256Of` byte/module/foreign-module behaviors, the version-bump refusal naming BOTH
+versions, the format-name refusal, and corrupt/truncated header + payload refusals),
+`repl-store.test.ts` (the `repl/` subdirectory layout under
+`workflowHomeDir()/projects/<key>/`, the write/load round trip with the call store
+coexisting, the wasm-hash-mismatch refusal NAMING BOTH HASHES, the version-bump refusal
+through the store, corrupted/truncated handling — loud single-shot failure with the store
+immediately usable, no crash-loop — a failed write leaving the previous snapshot untouched
+and removing the tmp, the boundary-in/burst-out debounce (one atomic write per drain burst,
+`debounceBursts: false` writing per boundary), and `reset()` teardown) and `restore.test.ts`
+(the full restore flow with all three reconciliation arms against mock backends — settle
+from the store / re-attach via `loadSession` with the capability gate / re-issue under the
+same call id with the reissues counter bumped and the guest promise settling exactly once —
+the custom-backend-without-the-capability degradation surfaced guest-visibly, the lost-
+session degradation, reconcile idempotence, over-cap re-issue refusal with the recoverable
+`ConcurrencyLimitError`, checkpoint re-surfacing + answering across a restore, in-flight
+steers resolving the honest `failed`, the state-changing-boundary cadence (after each eval
+and each settlement drain that changed VM state; nothing for an empty drain), and the
+end-to-end debounce through the per-project store). The consumer fixture exercises the whole
+phase-D public surface (envelope functions, `ReplWorkspaceStore`, the snapshot sink, the
+extended report/seam types) under the non-DOM `skipLibCheck: false` configuration.
