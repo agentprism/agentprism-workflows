@@ -375,11 +375,31 @@ class FakeAgent {
         : Array.isArray(load.replay)
           ? load.replay
           : [load.replay];
-    for (const text of replay) {
-      await this.conn.sessionUpdate({
-        sessionId: params.sessionId,
-        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
-      });
+    for (const entry of replay) {
+      // A plain string replays an assistant message chunk (the historical
+      // shape); an object may carry `{ role: "user"|"assistant", text }` so
+      // a test can replay the founding turn's PROMPT (user_message_chunk)
+      // alongside its outcome — the transcript shape the re-attach arm's
+      // observability probe keys on, mirroring how a real agent replays
+      // persisted history (getSessionMessages → toAcpNotifications).
+      if (entry && typeof entry === "object") {
+        const role = entry.role === "user" ? "user" : "assistant";
+        await this.conn.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
+            content: { type: "text", text: entry.text },
+          },
+        });
+      } else {
+        await this.conn.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: String(entry) },
+          },
+        });
+      }
     }
     for (const update of Array.isArray(load.updates) ? load.updates : []) {
       await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });

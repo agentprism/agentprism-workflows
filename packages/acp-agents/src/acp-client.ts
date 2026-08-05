@@ -331,6 +331,22 @@ class SessionState {
   modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
+  /** The re-attach arm's transcript probe (phase D): where the LOADED
+   *  session's founding turn starts — the assistant-text length after the
+   *  LAST replayed user message (the founding turn's prompt). Tracked from
+   *  the session/update stream; only meaningful for sessions re-opened via
+   *  `session/load` (whose replay streams in BEFORE the load response). */
+  private loadedTurnStartIndex = 0;
+  /** Whether the transcript ever showed a user message (a turn started at
+   *  all — a session whose replay has none never received its prompt). */
+  private sawUserMessage = false;
+  /** The KIND of the transcript's last content event: an assistant message
+   *  chunk is the ONLY completion evidence the ACP protocol exposes for a
+   *  loaded session (a turn that ended before the load has its final message
+   *  in the replay); any other trailing content (a user message, a tool
+   *  call, a thought, a plan) means the founding turn is either still
+   *  running or ended without a terminal message — not observable. */
+  private trailingContentKind: 'assistant-message' | 'other' = 'other';
 
   /** `label`/`runId`/`callIndex` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
@@ -382,6 +398,7 @@ class SessionState {
   applyUpdate(update: SessionNotification["update"]): void {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
+        this.trailingContentKind = 'assistant-message';
         if (update.content.type === "text") {
           this.textChunks.push(update.content.text);
           this.history.push({
@@ -394,6 +411,7 @@ class SessionState {
         break;
       }
       case "tool_call": {
+        this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
         this.history.push({
           role: "tool",
@@ -406,11 +424,30 @@ class SessionState {
       }
       // Any other CONTENT event also ends the in-flight assistant message — text streamed after
       // it belongs to a new message. Bookkeeping updates (usage, mode) never break a message.
-      case "user_message_chunk":
+      case "user_message_chunk": {
+        // The loaded-session founding-turn probe (see the fields above): the
+        // LAST user message in the replay is the founding turn's prompt, and
+        // its assistant text starts after it.
+        this.sawUserMessage = true;
+        this.loadedTurnStartIndex = this.textChunks.length;
+        this.trailingContentKind = 'other';
+        this.finalMessageStartIndex = this.textChunks.length;
+        break;
+      }
       case "agent_thought_chunk":
       case "tool_call_update":
       case "plan": {
+        // A trailing thought/tool/plan event means the model is still
+        // working — the founding turn is not observably complete.
+        this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        break;
+      }
+      case "plan_update":
+      case "plan_removed": {
+        // Plan mutations are content progress but never a completed
+        // assistant message; they do not segment the final message.
+        this.trailingContentKind = 'other';
         break;
       }
       case "usage_update": {
@@ -438,6 +475,31 @@ class SessionState {
     if (message && message.type === "result" && message.subtype === "success") {
       this.rawResultSuccess = message;
     }
+  }
+
+  /** The loaded-session founding-turn observability probe (the re-attach
+   *  arm's transcript check; see `InteractiveSession.awaitCurrentTurn`):
+   *  whether the transcript shows a turn ever started (a user message) and
+   *  whether the trailing content event is an assistant message — the only
+   *  completion evidence the ACP protocol exposes for a session re-opened
+   *  via `session/load` (the agent replays the entire persisted conversation
+   *  and only then resolves the load, so everything observable is in the
+   *  transcript by then; a still-running turn streams live AFTER the load
+   *  response with no protocol-level end signal). */
+  loadedTurnState(): { hasUserMessage: boolean; complete: boolean } {
+    return {
+      hasUserMessage: this.sawUserMessage,
+      complete: this.trailingContentKind === 'assistant-message',
+    };
+  }
+
+  /** The founding turn's assistant text: the transcript accumulated after
+   *  the last user-message boundary (the outcome text the re-attach arm
+   *  resolves with — identical to `finalMessageText()` exactly when the
+   *  trailing content event is an assistant message, which is the probe's
+   *  completeness condition). */
+  loadedTurnText(): string {
+    return this.textChunks.slice(this.loadedTurnStartIndex).join('');
   }
 
   /** Settle every deferred permission still parked on this session. Used by release/cancel/death
@@ -2510,6 +2572,23 @@ export class SessionHandle implements StructuredSource {
   /** StructuredSource — Claude's raw structured_output for the latest turn, if any. */
   rawStructuredOutput(): unknown {
     return this.state.rawResultSuccess?.structured_output;
+  }
+
+  /** The loaded-session founding-turn observability probe (see
+   *  `InteractiveSession.awaitCurrentTurn`): whether the replayed transcript
+   *  shows a turn ever started, and whether the trailing content event is an
+   *  assistant message — the only completion evidence ACP exposes for a
+   *  session re-opened via `session/load`. Added for the REPL broker's
+   *  re-attach arm; additive passthrough to `SessionState`. */
+  loadedTurnState(): { hasUserMessage: boolean; complete: boolean } {
+    return this.state.loadedTurnState();
+  }
+
+  /** The founding turn's assistant text (the transcript accumulated after
+   *  the last user-message boundary). Added for the REPL broker's re-attach
+   *  arm; additive passthrough to `SessionState`. */
+  loadedTurnText(): string {
+    return this.state.loadedTurnText();
   }
 
   /** Cancel the active turn. A backend that does not settle within the grace window is closed and

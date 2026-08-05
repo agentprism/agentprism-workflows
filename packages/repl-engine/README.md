@@ -466,11 +466,20 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   re-issue so a later restore re-attaches the CURRENT session). The capability gate is the
   runner's own `loadSession` (acp-agents' `supportsLoadSession` — a custom backend that
   omits it degrades through the same gate, surfaced guest-visibly).
-- **`BrokerSession.awaitCurrentTurn` is an OPTIONAL seam** (the loaded session's founding-turn
-  completion): the engine's re-attach requires it, so an adapter without it — today's
-  acp-agents `InteractiveSession` exposes no loaded-turn completion — re-attaches the
-  session and then degrades to re-issue (released + re-dispatched, surfaced guest-visibly),
-  never a hanging call. The daemon phase wires the seam onto acp-agents.
+- **`BrokerSession.awaitCurrentTurn` is REAL on the acp-agents adapter** (the loaded
+  session's founding-turn completion; `InteractiveSession.awaitCurrentTurn`, phase-D
+  review round 1: the seam used to be absent, so every built-in backend loaded, released,
+  and re-issued). Its protocol-bounded semantics: the `session/load` contract (the agent
+  replays the entire persisted conversation and only then resolves the load) makes the
+  founding turn's completion observable exactly when the replayed transcript's trailing
+  content event is an assistant message — a turn that ended while the daemon was down has
+  its final message in the replay, and the seam resolves with it (`stopReason` synthesized
+  `end_turn`; the protocol's replay carries none). A turn still IN FLIGHT at the backend
+  has NO observable completion (the protocol has no turn-end signal for a turn this
+  client did not start), so the seam rejects and the broker degrades to re-issue — the
+  loaded session released best-effort, re-dispatched under the same id, surfaced
+  guest-visibly, never a hanging call. A third-party `BrokerSession` adapter without the
+  seam degrades the same way.
 - **Pending steers whose wire call died with the process resolve `failed`** (recorded +
   settled + warned): their outcome is unknowable and re-injecting would duplicate; the one
   exception is queued-but-undelivered steers, whose payload is in the store (the phase-C
@@ -629,11 +638,14 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
   applies). The re-attach keys on the backend session id the store recorded at session
   open (`recordAttached`, written BEFORE the prompt — a crash with a turn in flight leaves
   a restore able to re-attach instead of duplicating). A re-attached call's completion is
-  the loaded session's founding turn, observed through the OPTIONAL
-  `BrokerSession.awaitCurrentTurn` seam: an adapter without it (today's acp-agents
-  `InteractiveSession` exposes no loaded-turn completion) re-attaches the session, then
-  degrades to re-issue — released and re-dispatched, surfaced guest-visibly, so a
-  re-attached call can never hang unobserved. Pending checkpoints re-surface (answerable
+  the loaded session's founding turn, observed through the REAL
+  `BrokerSession.awaitCurrentTurn` seam on acp-agents' `InteractiveSession` (its
+  protocol-bounded semantics: the `session/load` replay makes the completed-while-down
+  turn's final message observable and the seam resolves with it; a turn still in flight at
+  the backend has no observable completion over the protocol, so the seam rejects and the
+  broker degrades to re-issue — released and re-dispatched, surfaced guest-visibly, so a
+  re-attached call can never hang unobserved; a third-party adapter without the seam
+  degrades the same way). Pending checkpoints re-surface (answerable
   across a restore, through the reconciliation surface) and pending steers whose wire call
   died with the process resolve the honest `failed` with a warn line (their outcome is
   unknowable; re-injecting would duplicate; queued-but-undelivered steers are the one
@@ -646,10 +658,7 @@ The client-presence session-drain policy, the per-backend steering mechanism tab
 mechanism is decided and documented in `src/broker.ts`; the doc's generated documentation
 table is the observability layer's artifact), the workspace manifest, and the `repl` MCP
 tool registration in `mcp-server` (which wires the daemon's project model — and this
-phase's store + restore path — to `WorkspaceRegistry` and the broker). The daemon phase also
-wires the `awaitCurrentTurn` seam onto acp-agents' `InteractiveSession` (or extends
-acp-agents to expose a loaded in-flight turn's completion) — until then, the seam's absence
-is the documented re-issue degradation.
+phase's store + restore path — to `WorkspaceRegistry` and the broker).
 
 ## Development
 
@@ -769,7 +778,14 @@ the custom-backend-without-the-capability degradation surfaced guest-visibly, th
 session degradation, reconcile idempotence, over-cap re-issue refusal with the recoverable
 `ConcurrencyLimitError`, checkpoint re-surfacing + answering across a restore, in-flight
 steers resolving the honest `failed`, the state-changing-boundary cadence (after each eval
-and each settlement drain that changed VM state; nothing for an empty drain), and the
-end-to-end debounce through the per-project store). The consumer fixture exercises the whole
+and each settlement drain that changed VM state; nothing for an empty drain; the
+reconcile-time refusal branches — invalid options and the over-cap re-issue — settle the
+guest and fire the boundary too, and a changed-VM drain that FAILS still fires its
+boundary, on the reconcile and pump paths alike), the end-to-end debounce through the
+per-project store, and the re-attach arm through the REAL acp-agents adapter (a real
+`AcpAgentRunner` + `InteractiveSession` over the fake ACP agent: a completed-while-down
+call re-attaches and settles from the loaded session's replay with no re-issue, wire-log
+proven; a founding turn still in flight at the backend is unobservable over the protocol
+and degrades to an honest, guest-visible re-issue). The consumer fixture exercises the whole
 phase-D public surface (envelope functions, `ReplWorkspaceStore`, the snapshot sink, the
 extended report/seam types) under the non-DOM `skipLibCheck: false` configuration.

@@ -394,3 +394,45 @@ test("openSession({ schema }) states the contract in-band for embedSchemaInPromp
     SCHEMA.properties,
   );
 });
+
+test("awaitCurrentTurn on a loaded session: the founding turn's outcome is observable from the replay (and the still-running case rejects with the honest unobservable error)", async () => {
+  // Phase D re-attach arm over the REAL adapter: `loadSession` replays the persisted
+  // transcript, and the seam's observability probe keys on its trailing content event
+  // (the only completion evidence the ACP protocol exposes for a session re-opened via
+  // session/load).
+  const { cwd } = harness.configure<LogEntry>({
+    loadSessionSupport: true,
+    loadSession: {
+      replay: [
+        { role: "user", text: "task" },
+        { role: "assistant", text: "result B (loaded)" },
+      ],
+    },
+  });
+  const runner = harness.makeRunner();
+  const loaded = await runner.loadSession({ sessionId: "fake-session-any", cwd, model: "claude" });
+  const turn = await loaded.awaitCurrentTurn();
+  // The founding turn's REAL outcome, resolved from the replay; the stop reason is
+  // synthesized `end_turn` (the protocol's replay carries none).
+  assert.deepEqual(turn, { stopReason: "end_turn", text: "result B (loaded)" });
+  // The transcript accessors agree with the seam (the broker's schema ladder reads the
+  // same surface).
+  assert.equal(loaded.finalMessageText(), "result B (loaded)");
+  assert.equal(loaded.currentTurnText(), "result B (loaded)");
+  await loaded.release();
+
+  // The still-running case: the replay ends at the founding turn's user message (no
+  // terminal assistant message) — the completion is not observable over the protocol,
+  // and the seam rejects with the honest host-side error (the broker degrades to
+  // re-issue).
+  const { cwd: cwd2 } = harness.configure<LogEntry>({
+    loadSessionSupport: true,
+    loadSession: { replay: [{ role: "user", text: "task" }] },
+  });
+  const runner2 = harness.makeRunner();
+  const loaded2 = await runner2.loadSession({ sessionId: "fake-session-any", cwd: cwd2, model: "claude" });
+  await assert.rejects(() => loaded2.awaitCurrentTurn(), (error: unknown) =>
+    (error as Error).message.includes("still in flight at the backend"),
+  );
+  await loaded2.release();
+});

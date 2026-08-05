@@ -132,20 +132,33 @@
  *    (`negotiateCapabilities().supportsLoadSession`; all four built-in
  *    backends advertise `loadSession: true` per docs/api.md, and a
  *    custom backend that omits it rejects the load before any wire
- *    request): a load that fails — capability absent, session deleted,
- *    wire failure — degrades to re-issue, surfaced guest-visibly as a
- *    warn line in the next tool result. On success the call's
- *    completion is the loaded session's founding turn, observed through
- *    the session's `awaitCurrentTurn` seam (the engine's contract for a
- *    loaded in-flight turn; the daemon phase wires it onto acp-agents,
- *    whose InteractiveSession currently exposes no loaded-turn
- *    completion). An adapter WITHOUT the seam still re-attaches the
- *    session, then degrades to re-issue — released and re-dispatched,
- *    surfaced guest-visibly — so a re-attached call can never hang
- *    unobserved. The outcome is delivered through the SAME record →
- *    settle → consume pump as a live call — exactly once, first-wins
- *    on both sides. A re-attached call holds a concurrency token until
- *    it settles, like any other live call.
+ *    request). On success the call's completion is the loaded session's
+ *    founding turn, observed through `awaitCurrentTurn` — a REAL seam on
+ *    the acp-agents adapter (phase-D review: the seam used to be absent
+ *    from `InteractiveSession`, so every built-in backend loaded,
+ *    released, and re-issued). Its protocol-bounded semantics: the
+ *    `session/load` contract (the agent replays the entire persisted
+ *    conversation and only then resolves the load) makes the founding
+ *    turn's completion observable exactly when the replayed transcript's
+ *    trailing content event is an assistant message — a turn that ended
+ *    while the daemon was down has its final message in the replay, and
+ *    the seam resolves with it (`stopReason` synthesized as `end_turn`;
+ *    the protocol's replay carries none). When the transcript shows the
+ *    founding turn still IN FLIGHT at the backend, the protocol exposes
+ *    no completion signal for a turn this client did not start, so the
+ *    seam rejects (a host-side error naming the condition) and the
+ *    broker degrades to re-issue — the loaded session is released
+ *    best-effort and the call re-dispatched under the same id, surfaced
+ *    guest-visibly; a re-attached call can never hang unobserved. The
+ *    same degradation covers a transcript with no user message (the
+ *    recorded session never received its prompt) and a load failure
+ *    (capability absent, session deleted, wire failure). A third-party
+ *    `BrokerSession` adapter WITHOUT the seam still re-attaches the
+ *    session, then degrades to re-issue the same way. The outcome is
+ *    delivered through the SAME record → settle → consume pump as a
+ *    live call — exactly once, first-wins on both sides. A re-attached
+ *    call holds a concurrency token until it settles, like any other
+ *    live call.
  * 3. **Lost → re-issue.** A pending agent call with no recorded session
  *    (its session never opened, or a foreign snapshot), or whose
  *    re-attach failed, is re-issued under the SAME call id: the store
@@ -400,15 +413,20 @@ export interface BrokerSession {
   rawStructuredOutput(): unknown;
   /**
    * The loaded session's founding-turn completion — the re-attach arm's
-   * task source (OPTIONAL: the re-attach arm requires it — an adapter
-   * that cannot observe a loaded in-flight turn (today's acp-agents
-   * `InteractiveSession`) degrades to re-issue, surfaced guest-visibly;
-   * the daemon phase wires the seam onto acp-agents). Resolves with the
-   * turn that was in flight (or already completed) at the backend when
-   * the session was loaded, so a re-attached call's continuation fires
-   * exactly once, through the same record → settle → consume pump as a
-   * live call. For a LIVE session the same method returns the in-flight
-   * prompt's completion.
+   * task source. REAL on the acp-agents adapter
+   * (`InteractiveSession.awaitCurrentTurn`): resolves with the founding
+   * turn when the `session/load` replay's trailing content event is an
+   * assistant message (the turn observably completed while the daemon
+   * was down — its final message is in the replay; `stopReason` is
+   * synthesized `end_turn`, the protocol's replay carries none), and
+   * REJECTS with a host-side error when the outcome is unobservable
+   * (the founding turn is still in flight at the backend — the protocol
+   * has no turn-end signal for a turn this client did not start — or
+   * the transcript shows no user message at all); the broker degrades
+   * to re-issue either way, surfaced guest-visibly, so a re-attached
+   * call can never hang unobserved. OPTIONAL for third-party
+   * `BrokerSession` adapters: an adapter without the seam still
+   * re-attaches the session, then degrades to re-issue the same way.
    */
   awaitCurrentTurn?(): Promise<BrokerTurn>;
 }
@@ -929,26 +947,49 @@ export class Broker {
           continue;
         }
         if (entry.kind === 'agent') {
-          // Agent call: the re-attach / re-issue arms.
-          await this.reconcileAgentCall(entry, record, report);
+          // Agent call: the re-attach / re-issue arms. Returns whether a
+          // guest entry was newly settled (a reconcile-time refusal
+          // mutates the VM and must participate in the changed-VM drain
+          // and its settlement snapshot — review regression: refusals
+          // used to settle the guest without the boundary).
+          if (await this.reconcileAgentCall(entry, record, report)) changedVm = true;
           continue;
         }
         // An unrecognized kind (a foreign snapshot from a library version
         // this host does not speak): refuse loudly — settled + recorded +
         // surfaced — never re-issued into the agent machinery.
-        this.refuseReconciled(
-          entry,
-          'agent',
-          new Error(`pending call ${entry.id} has unrecognized kind ${JSON.stringify(entry.kind)} — this host cannot serve it`),
-          `unrecognized pending call kind ${JSON.stringify(entry.kind)}`,
-        );
-        changedVm = true;
+        if (
+          this.refuseReconciled(
+            entry,
+            'agent',
+            new Error(`pending call ${entry.id} has unrecognized kind ${JSON.stringify(entry.kind)} — this host cannot serve it`),
+            `unrecognized pending call kind ${JSON.stringify(entry.kind)}`,
+          )
+        ) {
+          changedVm = true;
+        }
         report.failedLost.push(entry.id);
       }
       report.reQueuedUndelivered = this.rebuildUndeliveredQueues();
       if (changedVm) {
-        this.drain();
+        // The settlement drain fires snapshot-carried continuations. The
+        // state-changing boundary is the doc's cadence (after each
+        // settlement drain that changed VM state) and it fires EVEN when
+        // the drain fails: the settlements landed (the VM changed) and
+        // the operation-end flush must have a dirty boundary to persist
+        // them (review regression: an interrupted drain used to skip the
+        // boundary, so the operation-end flush had nothing to write and
+        // a kill lost the settlements). The DrainJobError still
+        // propagates — the caller reports it like the pump does.
+        let drainError: DrainJobError | undefined;
+        try {
+          this.drain();
+        } catch (error) {
+          if (error instanceof DrainJobError) drainError = error;
+          else throw error;
+        }
         this.sink?.boundary('settlement');
+        if (drainError !== undefined) throw drainError;
       }
       return report;
     });
@@ -1009,19 +1050,22 @@ export class Broker {
    *  session is recorded (capability-gated through the runner's own
    *  `loadSession` — the same gate a custom backend without
    *  `session/load` degrades through), re-issue when it is lost. See
-   *  the module docs' "The restore path" section. */
+   *  the module docs' "The restore path" section. Returns whether a
+   *  guest entry was newly settled (a reconcile-time refusal mutates
+   *  the VM and must participate in the changed-VM drain and its
+   *  settlement boundary). */
   private async reconcileAgentCall(
     entry: GuestSurfaceEntry,
     record: CallRecord | undefined,
     report: ReconcileReport,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.isTracked(entry.id)) {
       // Already live under this broker (a repeated reconcile, or a call
       // this pass already re-attached/re-issued): duplicating the task
       // would double-poll the session. The registry's first-wins settle
       // makes any replay a no-op anyway.
       report.reattached.push(entry.id);
-      return;
+      return false;
     }
     let parsed: ParsedAgentOptions;
     try {
@@ -1030,17 +1074,18 @@ export class Broker {
       // A corrupt options bag (a hostile/foreign registry entry): the
       // same refusal a live dispatch would have produced — recorded,
       // settled, surfaced.
-      this.refuseReconciled(entry, 'agent', error, 're-issue refused (invalid options)');
+      const settled = this.refuseReconciled(entry, 'agent', error, 're-issue refused (invalid options)');
       report.failedLost.push(entry.id);
-      return;
+      return settled;
     }
     const sessionId = record?.sessionId ?? null;
     if (sessionId === null) {
       // The founding session never opened (or its record predates the
       // attachment log): there is nothing at the backend to re-attach.
       this.reissueCall(entry, parsed, 'no resumable backend session was recorded', report);
-      return;
+      return false;
     }
+    let loaded: BrokerSession | undefined;
     try {
       const session = await this.runner.loadSession({
         sessionId,
@@ -1060,13 +1105,14 @@ export class Broker {
         keepSession: true,
         retainSessionLog: true,
       });
-      if (session.awaitCurrentTurn === undefined) {
-        // The adapter cannot observe the loaded session's founding turn
-        // (today's acp-agents InteractiveSession exposes no loaded-turn
-        // completion): re-attaching would leave the call pending
-        // forever. Release the loaded session (best-effort) and degrade
-        // to re-issue through the same honest gate as a backend without
-        // the capability — surfaced guest-visibly.
+      loaded = session;
+      const awaitTurn = session.awaitCurrentTurn;
+      if (awaitTurn === undefined) {
+        // A THIRD-PARTY BrokerSession adapter without the seam (the real
+        // acp-agents adapter has it): the loaded session's founding-turn
+        // completion is unobservable to this host. Release the loaded
+        // session (best-effort) and degrade to re-issue through the same
+        // honest gate — surfaced guest-visibly.
         await Promise.resolve(session.release()).catch(() => undefined);
         this.reissueCall(
           entry,
@@ -1074,29 +1120,55 @@ export class Broker {
           'backend session loaded but its turn completion is not observable (awaitCurrentTurn seam absent) — re-issued',
           report,
         );
-        return;
+        return false;
       }
-      this.registerReattached(entry, parsed, session);
+      // The seam (REAL on acp-agents' InteractiveSession): resolves with
+      // the founding turn when the session/load replay makes its
+      // completion observable (a turn that ended while the daemon was
+      // down — its final message is in the replay), rejects when it is
+      // not (the turn is still in flight at the backend and the protocol
+      // exposes no completion signal for a turn this client did not
+      // start, or the transcript shows no user message). Either way the
+      // call can never hang unobserved.
+      const turn = await awaitTurn.call(session);
+      this.registerReattached(entry, parsed, session, turn);
       report.reattached.push(entry.id);
+      return false;
     } catch (error) {
       // The capability gate (a backend without session/load), a
-      // lost/deleted session, or a wire failure: re-issue is the honest
-      // fallback, surfaced guest-visibly (a warn line in the next tool
-      // result).
-      this.reissueCall(
+      // lost/deleted session, a wire failure, or the seam's rejection
+      // (founding-turn outcome unobservable): release the loaded session
+      // when one was obtained (best-effort — the re-issue opens its own
+      // fresh session) and re-issue is the honest fallback, surfaced
+      // guest-visibly (a warn line in the next tool result). The re-issue
+      // may itself refuse (the concurrency cap) — that refusal settles
+      // the guest, so its newly-settled flag propagates into the
+      // changed-VM bookkeeping (review regression: the catch used to
+      // drop it, skipping the settlement boundary).
+      if (loaded !== undefined) {
+        await Promise.resolve(loaded.release()).catch(() => undefined);
+      }
+      return this.reissueCall(
         entry,
         parsed,
-        `backend session ${sessionId} not resumable (loadSession: ${toRejectionValue(error).message})`,
+        loaded === undefined
+          ? `backend session ${sessionId} not resumable (${toRejectionValue(error).message})`
+          : `backend session ${sessionId} loaded, but its founding turn's outcome is not observable (${toRejectionValue(error).message})`,
         report,
       );
     }
   }
 
   /** Register a successfully re-attached session and arm the call's
-   *  completion on the loaded session's founding turn. The call holds a
-   *  concurrency token until the pump delivers it, exactly like a live
-   *  call. */
-  private registerReattached(entry: GuestSurfaceEntry, parsed: ParsedAgentOptions, session: BrokerSession): void {
+   *  completion on the loaded session's founding turn (already observed
+   *  by the seam). The call holds a concurrency token until the pump
+   *  delivers it, exactly like a live call. */
+  private registerReattached(
+    entry: GuestSurfaceEntry,
+    parsed: ParsedAgentOptions,
+    session: BrokerSession,
+    turn: BrokerTurn,
+  ): void {
     const sessionEntry: SessionEntry = {
       session,
       callId: entry.id,
@@ -1113,31 +1185,22 @@ export class Broker {
     this.sessions.set(entry.id, sessionEntry);
     this.agentSlots.add(entry.id);
     this.warnLine('info', `call ${entry.id}: re-attached to backend session ${session.sessionId}`);
-    const taskPromise = this.runReattachedTask(entry.id, sessionEntry, parsed);
+    const taskPromise = this.runReattachedTask(entry.id, sessionEntry, parsed, turn);
     this.trackInFlight(entry.id, 'agent', taskPromise);
   }
 
-  /** The re-attached call's task: the loaded session's founding turn
-   *  completes, then the ordinary result shaping (schema ladder or the
-   *  empty-output gate) — delivered by the same record → settle →
-   *  consume pump as a live call. */
+  /** The re-attached call's task: shape the seam-observed founding turn
+   *  (schema ladder or the empty-output gate) — delivered by the same
+   *  record → settle → consume pump as a live call. The turn itself was
+   *  already observed during reconcile; only the result shaping remains. */
   private runReattachedTask(
     callId: string,
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
+    turn: BrokerTurn,
   ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
     return (async () => {
       try {
-        // Called ON the session object (a detached method reference
-        // would lose its receiver).
-        const awaitTurn = entry.session.awaitCurrentTurn;
-        if (awaitTurn === undefined) {
-          // Defensive: the arm checked before registering; a session
-          // that lost its seam must not leave a task that never
-          // completes.
-          throw new Error(`Broker: re-attached session ${entry.session.sessionId} lacks the awaitCurrentTurn seam`);
-        }
-        const turn = await awaitTurn.call(entry.session);
         this.assertNormalStopReason(turn.stopReason, callId);
         const value =
           parsed.schema !== undefined
@@ -1158,16 +1221,19 @@ export class Broker {
    *  ledger stays complete. Re-issues respect the concurrency cap: an
    *  over-cap re-issue is refused with the recoverable
    *  `ConcurrencyLimitError`, recorded and settled exactly like a
-   *  dispatch-time refusal. Surfaces the reason guest-visibly. */
+   *  dispatch-time refusal. Surfaces the reason guest-visibly. Returns
+   *  whether a guest entry was newly settled (the over-cap refusal
+   *  settles during reconcile and must participate in the changed-VM
+   *  drain and its settlement boundary). */
   private reissueCall(
     entry: GuestSurfaceEntry,
     parsed: ParsedAgentOptions,
     reason: string,
     report: ReconcileReport,
-  ): void {
+  ): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, 'agent');
     if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      this.refuseReconciled(entry, 'agent', {
+      const settled = this.refuseReconciled(entry, 'agent', {
         name: 'ConcurrencyLimitError',
         message:
           `concurrency limit reached: ${this.maxConcurrentAgents} concurrent subagents per workspace ` +
@@ -1175,7 +1241,7 @@ export class Broker {
         recoverable: true,
       }, `re-issue refused: concurrency limit reached (${this.maxConcurrentAgents} concurrent subagents per workspace; ${reason})`);
       report.failedLost.push(entry.id);
-      return;
+      return settled;
     }
     this.callStore.recordReissued(entry.id, now());
     this.agentSlots.add(entry.id);
@@ -1183,17 +1249,22 @@ export class Broker {
     const taskPromise = this.runAgentTask(entry.id, entry.modelSpec ?? '', entry.detail ?? '', parsed);
     this.trackInFlight(entry.id, 'agent', taskPromise);
     report.reissued.push(entry.id);
+    return false;
   }
 
   /** A reconcile-time dispatch refusal (invalid registry options, or the
    *  concurrency cap): record dispatched-rejected FIRST (a refused call
-   *  is never re-issued again), settle, and surface the reason. */
-  private refuseReconciled(entry: GuestSurfaceEntry, kind: 'agent' | 'steer', error: unknown, warn: string): void {
+   *  is never re-issued again), settle, and surface the reason. Returns
+   *  whether the guest entry was newly settled (a refusal mutates the
+   *  VM and its caller must propagate the change into the changed-VM
+   *  drain and its settlement boundary). */
+  private refuseReconciled(entry: GuestSurfaceEntry, kind: 'agent' | 'steer', error: unknown, warn: string): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, kind);
     const value = toRejectionValue(error);
     this.recordCompletion(entry.id, { outcome: 'reject', value, completedAtMs: now() });
-    this.settleIntoGuest(entry.id, 'reject', value);
+    const newlySettled = this.settleIntoGuest(entry.id, 'reject', value);
     this.warnLine('warn', `call ${entry.id}: ${warn}`);
+    return newlySettled;
   }
 
   /** A pending steer whose wire call died with the process: settle the
@@ -1202,17 +1273,17 @@ export class Broker {
    *  Returns whether the guest entry was newly settled. */
   private settleSteerLost(entry: GuestSurfaceEntry): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, 'steer');
-    const newlyRecorded = this.recordCompletion(entry.id, {
+    this.recordCompletion(entry.id, {
       outcome: 'resolve',
       value: 'failed',
       completedAtMs: now(),
     });
-    this.settleIntoGuest(entry.id, 'resolve', 'failed');
+    const newlySettled = this.settleIntoGuest(entry.id, 'resolve', 'failed');
     this.warnLine(
       'warn',
       `steer ${entry.id}: was in flight when the process died; its outcome is unknowable — failed`,
     );
-    return newlyRecorded;
+    return newlySettled;
   }
 
   /** Re-surface a pending checkpoint into the broker's checkpoint table
@@ -2127,20 +2198,22 @@ export class Broker {
   /** Settle one call into the guest: through its live deferred when this
    *  broker issued it, through the reconciliation surface otherwise
    *  (the restored-broker route). Both converge on the guest's
-   *  idempotent first-wins settle. */
-  private settleIntoGuest(callId: string, outcome: 'resolve' | 'reject', value: unknown): void {
+   *  idempotent first-wins settle. Returns whether the guest entry was
+   *  newly settled (a no-op replay of an already-settled id reports
+   *  false — the changed-VM bookkeeping's source of truth). */
+  private settleIntoGuest(callId: string, outcome: 'resolve' | 'reject', value: unknown): boolean {
     const call = this.deferreds.get(callId);
     this.deferreds.delete(callId);
     if (call !== undefined) {
       if (outcome === 'resolve') call.resolve(value);
       else call.reject(value);
-      return;
+      return true;
     }
     const surface = this.workspace.surface();
     if (surface === undefined) {
       throw new Error(`Broker: cannot settle ${callId} — the guest surface is not installed`);
     }
-    surface.settle(callId, outcome, value);
+    return surface.settle(callId, outcome, value);
   }
 
   /** One settlement drain with the broker's interrupt handler armed (a

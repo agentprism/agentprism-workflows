@@ -136,10 +136,17 @@ class FakeSession implements BrokerSession {
     });
   }
 
-  /** The re-attach seam (phase D): the loaded session's founding-turn
-   *  completion. The test completes it with `completeLoadedTurn`. */
+  /** The re-attach seam (phase D), mirroring the REAL acp-agents adapter:
+   *  resolves IMMEDIATELY with a scripted loaded-turn outcome when one is
+   *  set (the replay made the completed-while-down turn observable),
+   *  parks otherwise (the still-running-at-load case). */
   readonly loadedTurns: Array<{ resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
+  /** The seam's scripted loaded-turn outcome. Null parks the seam. */
+  loadedTurnTextValue: string | null = null;
   awaitCurrentTurn(): Promise<BrokerTurn> {
+    if (this.loadedTurnTextValue !== null) {
+      return Promise.resolve({ stopReason: this.stopReason, text: this.loadedTurnTextValue });
+    }
     return new Promise((resolve, reject) => {
       this.loadedTurns.push({ resolve, reject });
     });
@@ -192,14 +199,6 @@ class FakeSession implements BrokerSession {
     pending.resolve(outcome);
   }
 
-  /** The re-attached session's loaded turn completes at the backend. */
-  completeLoadedTurn(text: string): void {
-    const pending = this.loadedTurns.shift();
-    assert.ok(pending, 'a loaded turn must be awaited');
-    this.completedTexts.push(text);
-    pending.resolve({ stopReason: this.stopReason, text });
-  }
-
   failSteer(error: unknown): void {
     const pending = this.steers.shift();
     assert.ok(pending, 'a steer wire call must be in flight');
@@ -220,6 +219,10 @@ class FakeRunner implements BrokerRunner {
    *  `supportsLoadSession` — a backend that does not advertise
    *  session/load rejects the load BEFORE any wire request. */
   supportsLoadSession = true;
+  /** The scripted loaded-turn outcome for loadSession-created sessions
+   *  (the real adapter resolves the seam from the session/load replay).
+   *  Null parks the seam (the still-running-at-load case). */
+  loadedTurnText: string | null = null;
   /** Open failures to inject (each one rejects openSession once). */
   failNextOpens = 0;
   /** Load failures to inject (each one rejects loadSession once). */
@@ -251,6 +254,7 @@ class FakeRunner implements BrokerRunner {
     }
     const session = new FakeSession(opts);
     session.capabilities = { supportsSteering: this.supportsSteering };
+    session.loadedTurnTextValue = this.loadedTurnText;
     this.sessions.push(session);
     return session;
   }
@@ -966,6 +970,10 @@ test('review 2b: a crash between enqueue and delivery loses nothing — reconcil
   const ws2 = await Workspace.restore(PROJECT, snapshot);
   const runner2 = new FakeRunner();
   runner2.supportsSteering = false;
+  // c1's loaded turn observably completed while we were down (the real
+  // adapter resolves the seam from the session/load replay) — the
+  // re-attach arm awaits it INLINE during reconcile now.
+  runner2.loadedTurnText = 'loaded turn';
   const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
   // The reconcile rebuilds the undelivered queue (the founding call is
   // still pending — its session re-attach delivers the re-queued steer

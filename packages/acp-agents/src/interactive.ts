@@ -389,6 +389,63 @@ export class InteractiveSession {
     await this.session.cancel();
   }
 
+  /**
+   * The loaded session's founding-turn completion — the re-attach arm's task
+   * source (phase D of the REPL orchestrator roadmap; the broker drives this
+   * on a session re-opened with `runner.loadSession()` after a daemon
+   * restart). Resolves with the turn that was in flight at the backend when
+   * the session was loaded, so a re-attached call's continuation fires
+   * exactly once, through the same record → settle → consume pump as a live
+   * call.
+   *
+   * **What is observable over the ACP protocol** (the spec-owed decision,
+   * documented here): `session/load` obliges the agent to replay the entire
+   * persisted conversation via `session/update` notifications and only THEN
+   * resolve the load request. The founding turn's completion is therefore
+   * observable exactly when the replayed transcript's trailing content
+   * event is an assistant message — a turn that ended while this host was
+   * down has its final message in the replay (the transcript probe is
+   * `SessionState.loadedTurnState`, tracked from the update stream). In
+   * that case this resolves with `{ stopReason: "end_turn", text }` — the
+   * stop reason is synthesized because the protocol's replay carries none;
+   * the text is the founding turn's real outcome, and the broker's
+   * result-shaping ladder (`finalMessageText`/schema extraction) reads the
+   * same transcript.
+   *
+   * When the transcript shows the founding turn still IN FLIGHT at the
+   * backend (the replay ends at its user message, and the backend continues
+   * streaming the turn after the load response), its completion is NOT
+   * observable: the protocol has no turn-end signal for a turn this client
+   * did not start (no completion notification, no replay of in-flight
+   * output, no per-turn stop reason on `session/load`). Rejects with a
+   * plain host-side Error (never a wire error) naming the condition — the
+   * broker degrades to re-issue through its documented honest fallback
+   * (re-issuing a call whose turn may still be running is preferrable to
+   * a call that can never settle). The same rejection covers a transcript
+   * with no user message at all (the recorded session never received its
+   * prompt — re-issue is safe there) and a released session.
+   */
+  async awaitCurrentTurn(): Promise<InteractiveTurn> {
+    if (this.releasePromise) {
+      throw new Error("InteractiveSession has been released");
+    }
+    const probe = this.session.loadedTurnState();
+    if (!probe.hasUserMessage) {
+      throw new Error(
+        "the loaded session's transcript shows no user message — the founding turn never reached the backend " +
+          "(its outcome is unobservable; re-issue is the honest fallback)",
+      );
+    }
+    if (!probe.complete) {
+      throw new Error(
+        "the loaded session's founding turn is still in flight at the backend (the replayed transcript has no " +
+          "terminal assistant message) — the ACP protocol exposes no completion signal for a turn this client " +
+          "did not start, so its outcome is not observable; re-issue is the honest fallback",
+      );
+    }
+    return { stopReason: "end_turn", text: this.session.loadedTurnText() };
+  }
+
   /** Subscribe to runner events for THIS ACP session only. Events from other one-shot or
    *  interactive sessions on the same runner are filtered out by sessionId. The returned
    *  unsubscribe thunk and every still-live subscription are removed automatically on release. */
