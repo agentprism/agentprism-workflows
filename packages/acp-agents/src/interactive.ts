@@ -172,6 +172,30 @@ export class InteractiveSession {
     return this.session.text;
   }
 
+  /** The latest turn's assistant text (turn-segmented, like `run()`'s
+   *  no-schema result path). Added for the REPL broker's result shaping;
+   *  additive passthrough to `SessionHandle`. */
+  currentTurnText(): string {
+    return this.session.currentTurnText();
+  }
+
+  /** The latest turn's FINAL assistant message (the schema-extraction
+   *  source `run()` uses; prose extraction over the whole turn would
+   *  resurrect the first-JSON-wins bug for schema-shaped progress
+   *  messages). Added for the REPL broker's structured-output ladder;
+   *  additive passthrough to `SessionHandle`. */
+  finalMessageText(): string {
+    return this.session.finalMessageText();
+  }
+
+  /** Claude's raw `structured_output` for the latest turn, if any (the
+   *  native structured channel the runner's ladder tries first). Added
+   *  for the REPL broker's structured-output ladder; additive passthrough
+   *  to `SessionHandle`. */
+  rawStructuredOutput(): unknown {
+    return this.session.rawStructuredOutput();
+  }
+
   /** Message/tool history accumulated in this session's retained log. */
   get history(): readonly AgentHistoryEntry[] {
     return this.session.history;

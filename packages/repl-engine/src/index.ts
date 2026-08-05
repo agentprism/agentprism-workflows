@@ -81,3 +81,31 @@ export {
   type ObjectPreview,
 } from './preview.js';
 export { applyOutputCaps, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResult } from './caps.js';
+
+// Phase C: the broker, the append-only call store, and the eval
+// tool-result semantics. See the package README's "The broker" section.
+export {
+  Broker,
+  DEFAULT_MAX_CONCURRENT_AGENTS,
+  type BrokerOptions,
+  type BrokerRunner,
+  type BrokerSession,
+  type BrokerTurn,
+  type BrokerOpenSessionOptions,
+  type BrokerPromptOptions,
+  type SteeringOutcomeValue,
+  type ReplEvalResult,
+  type CheckpointSummary,
+  type CheckpointInfo,
+  type LiveAgentInfo,
+  type ReconcileReport,
+} from './broker.js';
+export {
+  InMemoryCallStore,
+  JsonlCallStore,
+  type CallStore,
+  type CallRecord,
+  type CallOutcome,
+  type CallKind,
+  type CallOutcomeKind,
+} from './store.js';

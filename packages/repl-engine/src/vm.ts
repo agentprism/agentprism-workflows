@@ -94,7 +94,7 @@ import { readFile } from 'node:fs/promises';
 import { EvalFlags, JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 import { classifyError, type EvalErrorInfo } from './errors.js';
-import { readOwnDataProperty, readValue } from './trapfree.js';
+import { readOwnDataProperty, readValue, takeAndFreeException } from './trapfree.js';
 import type { ReplSnapshot, WasmInput, WasmModule } from './types.js';
 
 /** Options for creating a VM. */
@@ -130,6 +130,24 @@ export interface ReplEvalOptions {
    * never leaks into later operations.
    */
   interruptHandler?: () => boolean;
+  /**
+   * Attach the engine's uncaught-rejection bridge when the eval SUSPENDS
+   * (its completion promise is still pending after the drain): the bridge
+   * — `p.then(undefined, err => console.error(err))` — routes a late
+   * rejection of the completion promise into the ordinary console bridge,
+   * so it surfaces as an error-level console line in the next tool
+   * result instead of vanishing (the doc's transfer lesson 3: "late
+   * uncaught rejections surface as error-level console lines in the next
+   * tool result"). Attached only on the pending arm; a completion that
+   * resolves is dropped exactly as a `.then` continuation's would be, and
+   * one that rejects within the drain is the eval's ordinary error
+   * outcome. Best-effort by contract: the bridge call runs guest code
+   * (`Promise.prototype.then`), which a hostile realm may have sabotaged
+   * — a throw there is taken out and freed and the pending outcome is
+   * reported unchanged (the harness's stance: a root that sabotages
+   * `Promise.prototype.then` is sabotaging only itself).
+   */
+  rejectionBridge?: boolean;
 }
 
 /** Options for a standalone settlement drain (`ReplVm.drainJobs`). */
@@ -357,6 +375,25 @@ export class ReplVm {
    * rendering — see the module docs.
    */
   async evalCode(code: string, options: ReplEvalOptions = {}): Promise<ReplEvalOutcome> {
+    return this.evalCodeWithCompletion(code, options).outcome;
+  }
+
+  /**
+   * The package-internal eval entry the broker layer drives: like
+   * `evalCode`, but when the eval RESOLVED the live completion-value
+   * handle is returned alongside the shallow snapshot read (`completion`,
+   * OWNED BY THE CALLER — the caller must dispose it; it is the value
+   * handle the broker previews for the tool result's `result` line). For
+   * `pending`/`error` outcomes `completion` is undefined and the caller
+   * owns nothing. The published type graph never names the handle type:
+   * this method is not re-exported from the package index (the bridge's
+   * `getVmShim` precedent), and `completion` is typed `unknown` so the
+   * declaration stays self-contained.
+   */
+  evalCodeWithCompletion(
+    code: string,
+    options: ReplEvalOptions = {},
+  ): { outcome: ReplEvalOutcome; completion?: unknown } {
     this.assertAlive();
     this.assertNotReentrant();
 
@@ -370,7 +407,7 @@ export class ReplVm {
     try {
       const evaluated = this.evalTrapFree(code, options.filename ?? '<repl>', EvalFlags.ASYNC);
       if (evaluated.kind === 'error') {
-        return { kind: 'error', error: evaluated.error };
+        return { outcome: { kind: 'error', error: evaluated.error } };
       }
       handle = evaluated.handle;
       try {
@@ -381,11 +418,11 @@ export class ReplVm {
           // firing inside a resumed continuation). The guest exception was
           // consumed and cleared by the raw drain loop, so the VM stays
           // usable; the info was read trap-free.
-          return { kind: 'error', error: e.info };
+          return { outcome: { kind: 'error', error: e.info } };
         }
         throw e; // host-side failure, not a guest outcome — fail loudly
       }
-      return this.readCompletion(handle);
+      return this.readCompletion(handle, options.rejectionBridge === true);
     } finally {
       handle?.dispose();
       this.interruptSlot.current = previousInterrupt;
@@ -503,14 +540,26 @@ export class ReplVm {
    * `TypeError: Cannot read properties of null (reading 'qjs_is_proxy')`
    * once the WASM exports were nulled); a synchronous read makes the race
    * structurally impossible.
+   *
+   * With `keepCompletion` the resolved arm returns the live completion
+   * VALUE handle (the engine-created `{ value }` wrapper unwrapped
+   * trap-free via its own descriptor — the broker previews the value, not
+   * the wrapper), owned by the caller; the pending arm attaches the
+   * uncaught-rejection bridge first (see `ReplEvalOptions.rejectionBridge`),
+   * so a late rejection of a suspended completion reaches the console
+   * bridge instead of vanishing.
    */
-  private readCompletion(handle: JSValueHandle): ReplEvalOutcome {
+  private readCompletion(
+    handle: JSValueHandle,
+    keepCompletion: boolean,
+  ): { outcome: ReplEvalOutcome; completion?: unknown } {
     try {
       // 0 pending, 1 fulfilled, 2 rejected (quickjs-wasi built-in
       // `promiseState`).
       const state = handle.promiseState;
       if (state === 0) {
-        return { kind: 'pending' };
+        if (keepCompletion) this.attachRejectionBridge(handle);
+        return { outcome: { kind: 'pending' } };
       }
       // For settled promises `qjs_promise_result` returns a new owned
       // reference to the promise's result: the `{ value }` completion
@@ -519,14 +568,81 @@ export class ReplVm {
       const result = new JSValueHandle(this.vm, resultPtr);
       try {
         if (state === 2) {
-          return { kind: 'error', error: readErrorInfo(result) };
+          return { outcome: { kind: 'error', error: readErrorInfo(result) } };
         }
-        return { kind: 'value', value: readCompletionValue(result) };
+        // Trap-free unwrap of the engine-created `{ value }` wrapper — an
+        // own-data-property descriptor read, never `[[Get]]` (R69: a guest
+        // `Object.prototype.value` pollution must not be able to hijack
+        // eval results). When the wrapper shape is unexpected (the
+        // pollution quirk the README pins: the engine's [[Set]] silently
+        // no-ops, leaving the wrapper with no own `value`), the wrapper
+        // itself is read so the caller always sees *a* value.
+        const valueHandle = readOwnDataProperty(result, 'value');
+        const snapshot =
+          valueHandle === undefined ? readValue(result, 0, new Set()) : readValue(valueHandle, 0, new Set());
+        if (keepCompletion) {
+          if (valueHandle !== undefined) {
+            // The caller owns the unwrapped value handle; the wrapper is
+            // disposed here.
+            return { outcome: { kind: 'value', value: snapshot }, completion: valueHandle };
+          }
+          return { outcome: { kind: 'value', value: snapshot }, completion: result };
+        }
+        valueHandle?.dispose();
+        return { outcome: { kind: 'value', value: snapshot } };
+      } finally {
+        if (!keepCompletion || state === 2) result.dispose();
+      }
+    } finally {
+      handle.dispose();
+    }
+  }
+
+  /**
+   * The uncaught-rejection bridge for a suspended eval completion (the
+   * doc's transfer lesson 3): attach `p.then(undefined, err =>
+   * console.error(err))` so a late rejection of the completion promise
+   * travels the ordinary console bridge — frozen into a `$N`, previewed
+   * under the existing rules, delivered at the settlement drain's natural
+   * point — never a new intent-plane surface. Best-effort: the bridge
+   * script is evaluated with the engine's own trap-free eval, the call's
+   * result (including an exception result, whose runtime exception is
+   * taken out and freed) is disposed, and any failure leaves the pending
+   * outcome unchanged.
+   */
+  private attachRejectionBridge(handle: JSValueHandle): void {
+    const e = this.vm._getExports();
+    let bridge: JSValueHandle | undefined;
+    try {
+      const evaluated = this.evalTrapFree(
+        '(p) => { p.then(undefined, (err) => { console.error(err); }); }',
+        '<repl-rejection-bridge>',
+        0,
+      );
+      if (evaluated.kind === 'error') return;
+      bridge = evaluated.handle;
+      // Raw `qjs_call` with one borrowed argument (the completion promise);
+      // the result — including an exception result — is disposed here.
+      const argv = e.wasm_malloc(4);
+      let resultPtr: number;
+      try {
+        new DataView(e.memory.buffer).setUint32(argv, handle.ptr, true);
+        resultPtr = e.qjs_call(bridge.ptr, this.vm.undefined.ptr, 1, argv);
+      } finally {
+        e.wasm_free(argv);
+      }
+      const result = new JSValueHandle(this.vm, resultPtr);
+      try {
+        if (e.qjs_is_exception(result.ptr) !== 0) {
+          // The guest sabotaged `Promise.prototype.then`; the rejection
+          // bridge cannot be attached — the pending outcome is unchanged.
+          takeAndFreeException(e, this.vm);
+        }
       } finally {
         result.dispose();
       }
     } finally {
-      handle.dispose();
+      bridge?.dispose();
     }
   }
 
@@ -561,24 +677,6 @@ export class ReplVm {
 }
 
 /**
- * Trap-free unwrap of the engine-created `{ value }` completion wrapper:
- * an own-data-property descriptor read, never `[[Get]]` (R69: a guest
- * `Object.prototype.value` pollution must not be able to hijack eval
- * results). If the wrapper shape is unexpected, the wrapper itself is
- * rendered so the caller always sees *a* value.
- */
-function readCompletionValue(wrapper: JSValueHandle): unknown {
-  const valueHandle = readOwnDataProperty(wrapper, 'value');
-  if (valueHandle === undefined) {
-    return readValue(wrapper, 0, new Set());
-  }
-  try {
-    return readValue(valueHandle, 0, new Set());
-  } finally {
-    valueHandle.dispose();
-  }
-}
-
 /**
  * Trap-free error info: name/message/stack are read as own data
  * properties; primitives thrown as values convert natively (strings and

@@ -13,11 +13,14 @@
  * down, violating the invariant and multiplying memory use).
  */
 
-import { ReplVm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
-import type { WasmInput } from './types.js';
+import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
+
+import { ReplVm, getVmShim, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
+import type { ReplSnapshot, WasmInput } from './types.js';
 import {
   installGuestBridge,
   readGuestSurface,
+  registerGuestHostCallbacks,
   type ConsoleEvent,
   type GuestBridgeHandlers,
   type GuestCall,
@@ -109,6 +112,36 @@ export class Workspace {
   }
 
   /**
+   * Restore a workspace from a quickjs-wasi snapshot: the VM is restored
+   * and the host callbacks are re-registered by name (`registerGuestHostCallbacks`
+   * — the guest library, its pending-call registry and the `$N` store
+   * travel INSIDE the snapshot; the library is never re-evaluated). This
+   * is the restore-path constructor the daemon layer (a later phase) uses
+   * with the identity-enveloped snapshots; it exists now so the
+   * settlement machinery (store → guest exactly-once delivery across a
+   * simulated crash) is testable at the workspace boundary.
+   */
+  static async restore(projectDir: string, snapshot: ReplSnapshot, options: WorkspaceOptions = {}): Promise<Workspace> {
+    const vm = await ReplVm.restore(snapshot, options);
+    const workspace = new Workspace(projectDir, vm);
+    registerGuestHostCallbacks(vm, options.handlers ?? workspace.defaultHandlers());
+    return workspace;
+  }
+
+  /**
+   * Snapshot the workspace's VM: raw WASM linear memory plus runtime
+   * pointers (the quickjs-wasi snapshot). The guest library, the `$N`
+   * store and the pending-call registry travel inside; the host callbacks
+   * do not (re-register by name after restore — `rehost`). The at-rest
+   * identity envelope (wasm hash + format version + gzip) is the daemon
+   * layer's wrap, a later phase; this is the raw snapshot seam.
+   */
+  snapshot(): ReplSnapshot {
+    this.assertAlive();
+    return (getVmShim(this.vm) as QuickJS).snapshot();
+  }
+
+  /**
    * Evaluate a script in the workspace's VM: eval + job drain + completion
    * report. See `ReplVm.evalCode` for the outcome shapes. The returned
    * promise is fulfilled synchronously (the VM layer performs no `await`),
@@ -117,6 +150,39 @@ export class Workspace {
   eval(code: string, options?: ReplEvalOptions): Promise<ReplEvalOutcome> {
     this.assertAlive();
     return this.vm.evalCode(code, options);
+  }
+
+  /**
+   * @internal Package-internal eval seam for the broker layer: like
+   * `eval`, but when the eval RESOLVED the live completion-value handle
+   * comes back alongside the shallow snapshot (`completion` — an opaque
+   * quickjs-wasi `JSValueHandle`, OWNED BY THE CALLER, who must dispose it
+   * after previewing; `undefined` for pending/error outcomes). The broker
+   * previews it trap-free for the tool result's `result` line. Not part of
+   * the published API (not re-exported from the index); `completion` is
+   * typed `unknown` so the public declaration graph stays self-contained.
+   */
+  evalWithCompletion(
+    code: string,
+    options?: ReplEvalOptions,
+  ): { outcome: ReplEvalOutcome; completion?: unknown } {
+    this.assertAlive();
+    return this.vm.evalCodeWithCompletion(code, options);
+  }
+
+  /**
+   * Re-register the four `__host_*` callbacks by name — the same
+   * re-registration the snapshot-restore path uses. This is the seam the
+   * broker (a later phase wires real backends) takes over a workspace
+   * with: the guest library and its pending-call registry are untouched
+   * (never re-injected), and the guest's `issueCall` looks the host
+   * function up by name at call time, so replacing the host-side
+   * trampoline routes every subsequent call to the new handler. Safe on a
+   * live VM and on a restored one.
+   */
+  rehost(handlers: GuestBridgeHandlers): void {
+    this.assertAlive();
+    registerGuestHostCallbacks(this.vm, handlers);
   }
 
   /**

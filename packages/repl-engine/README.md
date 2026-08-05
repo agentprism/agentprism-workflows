@@ -263,7 +263,73 @@ can interrupt the intent plane even with no backends attached. The workspace als
 rendering seam
 (`renderRef`, `inspectBinding`) and the reconciliation surface (`surface()`) the `repl` tool layer
 builds on. A later phase that wires real backends swaps handlers via `registerGuestHostCallbacks`
-(the same re-registration the restore path uses).
+(the same re-registration the restore path uses) — the broker does exactly that through
+`Workspace.rehost`. `Workspace.snapshot()` / `Workspace.restore` are the raw snapshot seams (the
+identity envelope is the daemon layer's wrap, a later phase).
+
+## The broker (phase C)
+
+`Broker.attach(workspace, options)` takes over a workspace's four `__host_*` callbacks (by-name
+re-registration — the guest library and its pending-call registry are untouched) and implements
+the doc's broker contract against real ACP sessions through `@automatalabs/acp-agents`:
+
+- **`agent(modelSpec, task, opts)` dispatches a held-open ACP session** — the runner's
+  `openSession` with the routing grammar, model spec and per-call `cwd` (default: the workspace's
+  project directory). The guest option bag is exactly `{ schema, cwd, configOptions, mode, tier,
+  label, toolNames, disallowedToolNames, meta, promptMeta, maxSchemaRetries, baseInstructions,
+  developerInstructions }` — any other key refuses the call (`recoverable: false`). `schema` is a
+  JSON Schema object validated by acp-agents' own structured-output ladder (`resolveStructuredOutput`
+  driven over the session: convert/check, native + prose extraction, re-prompt, `SCHEMA_NONCOMPLIANCE`
+  — the one divergence from `run()`: the client-hosted StructuredOutput MCP capture tool is not
+  injected on the interactive path). Sessions stay open for the workspace's lifetime (the
+  live-handle contract) and are opened with `keepSession: true`, so the ACP session persists on the
+  backend for the restore path's lazy re-attach.
+- **Six concurrent subagents per workspace** (doc-settled; `maxConcurrentAgents` configurable —
+  server configuration, invisible to the guest). The cap counts live work: unsettled agent calls
+  plus sessions running a queued-steer delivery turn. An over-cap dispatch is refused at dispatch
+  time — recorded in the store (a refused call is never re-issued after a restore) and rejected
+  with a recoverable `ConcurrencyLimitError`; nothing queues and nothing is hidden.
+- **Steering resolves with what actually happened** (the doc's "nothing is hidden, nothing
+  hard-errors"): `followUp`/`steer` settle with acp-agents' steering-outcome vocabulary where the
+  backend advertises `_session/steering`, with the broker's honest `queued` marker where it does
+  not (the steering mechanism table is in `src/broker.ts`'s module docs). Steering calls NEVER
+  hard-error: backend/wire failures resolve `failed`; the only rejections are guest protocol
+  violations. `cancel()` resolves `cancelled` (turn in flight), `idle` (nothing running) or
+  `failed`; a cancelled call rejects with `AGENT_CANCELLED`.
+- **The append-only call store** (`src/store.ts`, transfer lesson 1): every call's outcome is
+  recorded by call id BEFORE it is settled into the guest. `InMemoryCallStore` for tests and
+  ephemeral hosts; `JsonlCallStore` is the durable append-only JSON-lines file — every mutation
+  one fsynced line, torn-tail repair on open (fragment sidecarred then truncated; unterminated-
+  but-complete records kept; newline-terminated corruption refused), and appends heal to the
+  acknowledged prefix after a failed write. The pump's delivery loop is record → settle →
+  consume, with both sides first-wins idempotent — a crash between the store write and the guest
+  settlement is healed by the next delivery, exactly once (pinned by the simulated-crash tests,
+  including the snapshot/restore + `reconcile()` path).
+- **The eval tool-result shape** (`Broker.eval` → `{ output, outputTruncated, result?, pending,
+  checkpoints, completed }`): output lines (console events rendered through the previewer — one
+  line per logged argument, non-log levels prefixed `warn:`/`error:`/… — capped at 256 lines /
+  10 KB), the previewed completion value when the eval resolved (trap-free, from the live
+  completion handle), the pending call ids when it suspended (no fabricated value), the raised
+  checkpoints (previewed questions), and the call ids this operation settled (checkpoint answers
+  deliberately excluded — an answered id leaves the `checkpoints` list). Eval errors render as
+  plain `Name: message` lines in `output`.
+- **Suspended-eval semantics** (transfer lesson 3): top-level `await` accepted; an eval whose
+  completion resolves within its drain reports the previewed value; a suspension returns
+  immediately with the pending call ids; the continuation resumes at settlement like a `.then`
+  (its output lands in the next tool result); a late uncaught rejection surfaces as an
+  error-level console line in the next tool result (the VM's rejection bridge, armed by the
+  broker); top-level `return` stays a syntax error.
+- **Checkpoints** (transfer lesson 4): `checkpoint(question)` parks a promise and records the
+  dispatch; the question appears in the tool result's `checkpoints` list previewed through the
+  top-level string rule (quoted, head+tail elided past 200 chars — guest-chosen text never
+  crosses unbounded); `checkpoint.answer(id, value)` in a later eval records the answer and
+  settles the parked promise within that eval — root-mediated by construction, first-wins, and
+  the answer's continuation output lands in the delivering eval's own tool result.
+
+The broker's public type surface is fully self-contained (structural `BrokerRunner`/
+`BrokerSession` stand-ins — no acp-agents or quickjs-wasi types leak into the published
+declarations; verified by the consumer fixture). `Broker.eval`/`pump`/`reconcile`/`dispose`
+serialize, so overlapping tool calls can never interleave settlement bookkeeping.
 
 ## Decisions for spec-owed details
 
@@ -310,6 +376,62 @@ build on them rather than re-open them.
 - **Realpath validation of `projectDir`** is deliberately NOT here: that is the daemon's
   project-registry concern (the `repl` tool's phase); the registry keys by the string it is
   given.
+
+Phase C decisions (the broker, the call store, the eval tool-result semantics):
+
+- **The broker dispatches held-open sessions** (`runner.openSession`), not one-shot `run()`
+  calls: the live-handle contract (followUp/steer/cancel on a settled call) requires a session
+  that outlives the call. Sessions are opened with `keepSession: true` (the ACP session persists
+  on the backend for the restore path's re-attach) and stay open for the workspace's lifetime;
+  the daemon layer's client-presence drain policy is a later phase's wiring. `schema` calls
+  drive acp-agents' own `resolveStructuredOutput` over the session (`tryNative` = raw
+  structured output, else the generic parse-final-JSON dialect) — the one divergence from
+  `run()`: the client-hosted StructuredOutput MCP capture tool is not injected on the
+  interactive path.
+- **The concurrency cap counts live work** — unsettled agent calls plus sessions running a
+  queued-steer delivery turn (a follow-up turn is a subagent working). Over-cap dispatches are
+  refused AT DISPATCH TIME (nothing queues): recorded in the store (dispatched + rejected, so a
+  restore never re-issues them) and rejected with a recoverable `ConcurrencyLimitError` with NO
+  code — the doc deletes the budget vocabulary (`AGENT_LIMIT_EXCEEDED`/`BUDGET_EXHAUSTED` have
+  no counterpart here), and `recoverable: true` is the one signal the guest needs.
+- **The steering mechanism table** (the doc's spec-owed decision): extension backend + turn in
+  flight → live `_session/steering` wire call, resolving with the backend's verbatim outcome
+  (`injected`/`startedNewTurn`/`failed`); extension backend + idle session → a new turn
+  (`startedNewTurn`); no-extension backend + turn in flight → queued for next-turn delivery,
+  resolving `queued` IMMEDIATELY (the delivery happens at the next turn boundary; a delivery
+  turn's failure surfaces as a warn-level line in the next tool result; a cancelled call drops
+  its queue — both documented); no-extension backend + idle session → a new turn
+  (`startedNewTurn`). Any wire failure resolves `failed` — steering never hard-errors. `cancel`
+  resolves `cancelled` (a turn was in flight and ACP `session/cancel` completed; the cancelled
+  call itself rejects with `AGENT_CANCELLED`), `idle` (nothing was running), or `failed`. The
+  outcome surface is acp-agents' `SteeringOutcome` plus the honest `queued`/`cancelled`/`idle`
+  additions — urgency delivery (`injected`) is always distinguishable from next-turn delivery
+  (`queued`/`startedNewTurn`).
+- **The store records refused calls too** (dispatched + rejected with the refusal error):
+  without the record, a restore would re-issue a call that was deliberately refused. `admitted`
+  is deliberately absent from the record shape — it was the budget ledger's bookkeeping, and
+  the ledger is deleted vocabulary.
+- **`completed` excludes checkpoint answers** (the harness's pump convention): an answered id
+  leaves the `checkpoints` list — that is its visibility; `completed` reports delegated work
+  (pump deliveries + dispatch-time refusals).
+- **`result` is the FORMAT.md collapsed rendering** of the completion value (the bare body —
+  `42`, `"hello"`, `{a: 1, …}`), previewed from the live completion handle through the
+  previewer's own trap-free machinery (the engine's internal eval-with-completion seam returns
+  the unwrapped value handle; the published type graph stays clean). Eval errors render as a
+  plain `Name: message` line in `output` (the harness's "thrown-exception message" convention;
+  late uncaught top-level rejections are the `error:`-prefixed console-bridge lines).
+- **Checkpoint questions cross previewed** via the previewer's top-level string rule
+  (`stringDescription`: quoted, head+tail elided past 200 chars) — the harness's R74 rule;
+  the id stays exact.
+- **The broker serializes its async operations** (eval/pump/reconcile/dispose share one
+  promise chain): two overlapping tool calls can never interleave settlement bookkeeping or
+  the eval's pump-before-eval ordering. The pump delivers ready outcomes one at a time
+  (record → settle → consume), keeping a failed delivery staged for the next pump — both the
+  store write and the guest settlement are first-wins idempotent, so the retry settles exactly
+  once.
+- **`Workspace.snapshot()`/`Workspace.restore` are the raw snapshot seams** (the daemon layer
+  wraps the identity envelope later); `Workspace.rehost` is the by-name callback re-registration
+  the broker uses to take a workspace over — the same re-registration the restore path uses.
 
 Phase B decisions (the guest library, bridge, previewer):
 
@@ -418,12 +540,13 @@ Phase B decisions (the guest library, bridge, previewer):
 
 ## Out of scope for this phase (later phases, per the roadmap doc)
 
-The call store and exactly-once settlement broker, enveloped snapshots (wasm-hash + format
-version + gzip) and the restore reconciliation loop, the per-backend steering mechanism table,
-the workspace manifest, and the `repl` MCP tool registration in `mcp-server` (which wires the
-daemon's project model to `WorkspaceRegistry` and this phase's bridge: install the guest
-library at workspace creation, drive the four host callbacks against `acp-agents`, render
-console events through the previewer, cap tool results with `applyOutputCaps`).
+The enveloped snapshots (wasm-hash + format version + gzip) and the restore path's full
+three-way reconciliation (the broker implements the store arm — settle-from-store — now;
+re-attach and re-issue land with the daemon wiring), the client-presence session-drain policy,
+the per-backend steering mechanism table (the mechanism is decided and documented in
+`src/broker.ts`; the doc's generated documentation table is the observability layer's
+artifact), the workspace manifest, and the `repl` MCP tool registration in `mcp-server` (which
+wires the daemon's project model to `WorkspaceRegistry` and the broker).
 
 ## Development
 
@@ -482,7 +605,33 @@ is the agent's writable workspace; hostile values including revoked proxies degr
 markers without throwing; 2000-deep nesting freezes without crashing the VM; cycles are
 preserved), and the console payload shapes. The workspace suite pins the phase-B injection:
 a created workspace exposes the DSL, accumulates console events, parks calls, and serves the
-surface/render/manifest seams. The previewer suite pins the FORMAT.md rules (primitives incl.
+surface/render/manifest seams. Phase C adds the store and broker suites: the call-store
+semantics (in-memory first-wins dispatch/completion idempotence and unknown-id refusal; the
+JSONL replay with first-wins across reopens; the torn-tail repair discipline — an
+unterminated unparseable tail is sidecarred and truncated, an unterminated-but-complete
+record is kept with its terminator restored, newline-terminated corruption anywhere is a
+hard error, a partial append heals to the acknowledged prefix — and the missing-file open),
+and the broker against a fake runner/session: the eval tool-result shapes (resolved with the
+previewed value, suspended with the pending call ids and no fabricated value, rejected with
+the error line, top-level `return` as a syntax error), the continuation-at-settlement flow,
+the late-uncaught-rejection error line in the next tool result, the schema ladder (validated
+extraction, re-prompt, `SCHEMA_NONCOMPLIANCE`) and `AGENT_EMPTY_OUTPUT`, exactly-once
+settlement (a simulated crash between the store write and the guest settlement — both the
+live pump retry and the snapshot/restore + reconcile settle-from-store arm, with the guest
+continuation firing exactly once), the checkpoint round trip (raised → previewed question →
+answered in a later eval → settlement within that eval, unknown/answered ids report false,
+the answer recorded before settlement), steering outcome visibility (extension backend: live
+injection with the backend's verbatim outcome and wire failures resolving `failed`;
+no-extension backend: `queued` at enqueue and next-turn delivery, delivery-failure warn
+lines; idle sessions start new turns with and without the extension; cancel → `cancelled` +
+the call's `AGENT_CANCELLED` rejection, idle cancel → `idle`), the concurrency cap
+(dispatch-time refusal recorded in the store, slot release on settlement), trap-free result
+rendering (accessor completions render `(...)` and never fire; the `Object.prototype.value`
+pollution cannot hijack the result line), and the output caps (preview lines one-per-argument
+with level prefixes; truncation at 256 lines with `outputTruncated`). The consumer fixture
+exercises the whole phase-C public surface (`Broker`, the store classes, the self-contained
+`BrokerRunner`/`BrokerSession` stand-ins, the eval-result types) under the non-DOM
+`skipLibCheck: false` configuration. The previewer suite pins the FORMAT.md rules (primitives incl.
 `-0`/exponent forms, string head+tail elisions and escaping, functions, errors with
 own-data-only names, promise states, arrays with holes/named props/overflow, plain objects
 with positional indices and accessor `(...)`, branded objects and typed arrays with expando

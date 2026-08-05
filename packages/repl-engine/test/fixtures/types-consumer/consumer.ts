@@ -203,6 +203,126 @@ async function exercisePhaseB(): Promise<void> {
   bridgeVm.dispose();
 }
 
+// Phase C: the broker, the call store, and the eval tool-result shape —
+// all self-contained (no acp-agents / quickjs-wasi / shared-types types
+// in the published declaration graph; the fixture's non-DOM lib and
+// `skipLibCheck: false` compile the whole surface).
+import {
+  Broker,
+  JsonlCallStore,
+  InMemoryCallStore,
+  DEFAULT_MAX_CONCURRENT_AGENTS,
+  type BrokerOptions,
+  type BrokerRunner,
+  type BrokerSession,
+  type BrokerTurn,
+  type BrokerOpenSessionOptions,
+  type BrokerPromptOptions,
+  type SteeringOutcomeValue,
+  type ReplEvalResult,
+  type CheckpointSummary,
+  type CheckpointInfo,
+  type LiveAgentInfo,
+  type ReconcileReport,
+  type CallStore,
+  type CallRecord,
+  type CallOutcome,
+  type CallKind,
+  type CallOutcomeKind,
+} from '../../../dist/index.js';
+
+function brokerTyping(ws: Workspace, opts: BrokerOptions): Promise<Broker> {
+  return Broker.attach(ws, opts);
+}
+
+function storeTyping(store: CallStore): void {
+  store.recordDispatched({
+    callId: 'c1',
+    kind: 'agent',
+    detail: 'task',
+    optionsJson: null,
+    dispatchedAtMs: 1,
+    reissues: 0,
+    completion: null,
+  });
+  store.recordReissued('c1', 2);
+  store.recordCompleted('c1', { outcome: 'resolve', value: { ok: true }, completedAtMs: 3 }) satisfies boolean;
+  store.lookup('c1') satisfies CallRecord | undefined;
+  store.all() satisfies CallRecord[];
+}
+
+function brokerSurfaceTyping(ws: Workspace): void {
+  const options: BrokerOptions = {
+    runner: {
+      async openSession(_opts: BrokerOpenSessionOptions): Promise<BrokerSession> {
+        return {
+          sessionId: 's1',
+          capabilities: { supportsSteering: true },
+          async prompt(_content: string, _opts?: BrokerPromptOptions): Promise<BrokerTurn> {
+            return { stopReason: 'end_turn', text: 'ok' };
+          },
+          async steer(_content: string, _opts?: BrokerPromptOptions): Promise<string> {
+            return 'injected';
+          },
+          async cancel(): Promise<void> {},
+          currentTurnText(): string {
+            return '';
+          },
+          finalMessageText(): string {
+            return '';
+          },
+          rawStructuredOutput(): unknown {
+            return undefined;
+          },
+        };
+      },
+      async dispose(): Promise<void> {},
+    },
+    store: new InMemoryCallStore(),
+    maxConcurrentAgents: 6,
+  } satisfies BrokerOptions;
+  void brokerTyping(ws, options);
+  DEFAULT_MAX_CONCURRENT_AGENTS satisfies number;
+  const outcome: SteeringOutcomeValue = 'queued';
+  outcome satisfies string;
+  const recordKind: CallKind = 'steer';
+  recordKind satisfies string;
+  const outcomeKind: CallOutcomeKind = 'reject';
+  outcomeKind satisfies string;
+  const summary: CheckpointSummary = { id: 'c1', question: '"What color?"' };
+  summary satisfies { id: string; question: string };
+  const info: CheckpointInfo = { id: 'c1', question: 'x', optionsJson: null, raisedAtMs: 1 };
+  const live: LiveAgentInfo = {
+    callId: 'c1',
+    modelSpec: 'pi/x',
+    task: 't',
+    state: 'running',
+    supportsSteering: true,
+    queuedSteers: 0,
+  };
+  const report: ReconcileReport = { settledFromStore: ['c1'], leftPending: [] };
+  info satisfies CheckpointInfo;
+  live satisfies LiveAgentInfo;
+  report satisfies ReconcileReport;
+  const fileStore = JsonlCallStore.open('/tmp/consumer-calls.jsonl');
+  fileStore.path() satisfies string;
+  fileStore.close();
+  const evalResult: ReplEvalResult = {
+    output: ['[$1 · number · 8B] 42'],
+    outputTruncated: false,
+    result: '42',
+    pending: [],
+    checkpoints: [],
+    completed: [],
+  };
+  evalResult satisfies ReplEvalResult;
+  const callOutcome: CallOutcome = { outcome: 'resolve', value: 'x', completedAtMs: 1 };
+  callOutcome satisfies CallOutcome;
+  void storeTyping;
+  void options;
+  void brokerSurfaceTyping;
+}
+
 // The self-contained snapshot stand-in round-trips as a type.
 function snapshotTyping(snapshot: ReplSnapshot): ReplSnapshot {
   return snapshot;

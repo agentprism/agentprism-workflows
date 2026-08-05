@@ -173,9 +173,18 @@ importers:
 
   packages/repl-engine:
     dependencies:
+      '@automatalabs/acp-agents':
+        specifier: workspace:*
+        version: link:../acp-agents
+      '@automatalabs/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
       quickjs-wasi:
         specifier: 3.3.1
         version: 3.3.1
+      typebox:
+        specifier: 1.3.2
+        version: 1.3.2
 
   packages/shared-types:
     dependencies:

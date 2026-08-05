@@ -223,14 +223,13 @@ function leaf(
 
 /**
  * Generate a collapsed first-level preview of any guest value.
- * Side-effect-free by construction (module docs).
- */
-/**
- * Generate a collapsed first-level preview of any guest value.
  * Side-effect-free by construction (module docs). Internal: takes a raw
  * shim handle, so it is not exported from this module's public surface
- * (the published declarations must stay free of quickjs-wasi types); the
- * public seams are `renderGlobalLine`/`renderRefLine`/`inspectGlobal`.
+ * (the published declarations must stay free of quickjs-wasi types — a
+ * signature naming `JSValueHandle` would drag the shim's DOM-dependent
+ * declarations into the consumer's program); the public seams are
+ * `renderGlobalLine`/`renderRefLine`/`inspectGlobal`, and the broker
+ * layer reaches it through `renderCompletionLine` below.
  */
 function previewHandle(handle: JSValueHandle): ObjectPreview {
   // ---- Primitives (brand-checked before any conversion) ----
@@ -658,7 +657,21 @@ export function isCanonicalIndex(name: string): boolean {
   return Number.isInteger(n) && n >= 0 && n < 2 ** 32 - 1 && String(n) === name;
 }
 
-/** The header label: the CDP subtype when present, else the type. */
+/**
+ * The broker's completion-preview seam: preview the eval completion
+ * value (an opaque quickjs-wasi handle, `unknown` here so the published
+ * declaration graph stays self-contained — see the module docs) and
+ * render the FORMAT.md collapsed line. Trap-free by construction (module
+ * docs); the handle is NOT consumed or disposed here — the caller owns
+ * it.
+ */
+export function renderCompletionLine(completion: unknown): string {
+  return renderCollapsed(previewHandle(completion as JSValueHandle));
+}
+
+/**
+ * The header label: the CDP subtype when present, else the type.
+ */
 function label(preview: ObjectPreview): string {
   return preview.subtype ?? preview.type;
 }
