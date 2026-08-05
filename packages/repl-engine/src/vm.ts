@@ -94,10 +94,8 @@ import { readFile } from 'node:fs/promises';
 import { EvalFlags, JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 import { classifyError, type EvalErrorInfo } from './errors.js';
-import type { WasmInput, WasmModule } from './types.js';
-
-/** The raw WASM exports the engine drives (the type is not exported by the shim). */
-type QuickJSExports = ReturnType<QuickJS['_getExports']>;
+import { readOwnDataProperty, readSymbolDescription, readValue } from './trapfree.js';
+import type { ReplSnapshot, WasmInput, WasmModule } from './types.js';
 
 /** Options for creating a VM. */
 export interface ReplVmOptions {
@@ -198,14 +196,27 @@ type EvalResult =
   | { kind: 'ok'; handle: JSValueHandle }
   | { kind: 'error'; error: EvalErrorInfo };
 
-/** Maximum nesting depth of the trap-free completion-value read. */
-const READ_DEPTH_LIMIT = 4;
-/** Maximum own enumerable data properties read per object/array level. */
-const READ_PROP_LIMIT = 256;
-
 // The shipped binary is compiled once per process and reused across VM
 // instantiations (the pattern quickjs-wasi's README recommends).
 let shippedModule: Promise<WasmModule> | null = null;
+
+// The structured-clone extension (.so) is loaded once per process and
+// attached to every VM: the guest library's $N freezing uses
+// `structuredClone` (the roadmap doc pins the mechanism), and the
+// extension travels in snapshots, so the restore path must attach the same
+// byte-identical artifact it was snapshotted with (quickjs-wasi restores
+// extension memory against the descriptors it was created with).
+let structuredCloneExtension: Promise<Uint8Array> | null = null;
+
+async function loadStructuredCloneExtension(): Promise<Uint8Array> {
+  structuredCloneExtension ??= (async () => {
+    // Resolved through the package export map, like the shipped wasm
+    // binary (`quickjs-wasi/structured-clone.so`).
+    const resolved = import.meta.resolve('quickjs-wasi/structured-clone.so');
+    return readFile(new URL(resolved));
+  })();
+  return structuredCloneExtension;
+}
 
 /**
  * Load the `quickjs-wasi` package's shipped `quickjs.wasm` binary and
@@ -254,6 +265,12 @@ export class ReplVm {
     this.vm = vm;
     this.memoryLimitBytes = memoryLimitBytes;
     this.interruptSlot = interruptSlot;
+    // The bridge and previewer modules drive the shim through this
+    // module-scoped map (see `getVmShim`): the public type graph must stay
+    // free of quickjs-wasi types, because a consumer with a non-DOM lib
+    // and `skipLibCheck: false` type-checks the published declarations
+    // cleanly — quickjs-wasi's own declarations need DOM globals.
+    vmShims.set(this, vm);
   }
 
   /**
@@ -274,11 +291,46 @@ export class ReplVm {
     const vm = await QuickJS.create({
       wasm,
       memoryLimit: memoryLimitBytes,
+      // The structured-clone extension ships with the quickjs-wasi package
+      // and is attached to every VM: the guest library's console bridge
+      // freezes logged values into the $N store via `structuredClone` (the
+      // roadmap doc's pinned mechanism). The extension also travels inside
+      // snapshots, so `restore()` attaches the same artifact.
+      extensions: [{ name: 'structured-clone', wasm: await loadStructuredCloneExtension() }],
       interruptHandler: () => interruptSlot.current?.() ?? false,
     });
 
     return new ReplVm(vm, memoryLimitBytes, interruptSlot);
   }
+
+  /**
+   * Restore a VM from a quickjs-wasi snapshot (the same wasm build and the
+   * same structured-clone extension it was snapshotted with). Host
+   * callbacks are NOT restored by the shim — the caller re-registers them
+   * by name (the roadmap doc's restore path: a quickjs-wasi built-in) and
+   * then reconciles the in-VM pending-call registry through the guest
+   * library's reconciliation surface.
+   *
+   * Snapshot compatibility holds only across the same quickjs-wasi package
+   * version (the doc's rule: a version bump must refuse old snapshots
+   * loudly, never restore them silently); the at-rest identity envelope is
+   * a later phase's concern.
+   */
+  static async restore(snapshot: ReplSnapshot, options: ReplVmOptions = {}): Promise<ReplVm> {
+    const wasm = options.wasm ?? (await loadShippedWasm());
+    const memoryLimitBytes = options.memoryLimit ?? ReplVm.DEFAULT_MEMORY_LIMIT;
+
+    const interruptSlot: { current: (() => boolean) | null } = { current: null };
+    const vm = await QuickJS.restore(snapshot, {
+      wasm,
+      memoryLimit: memoryLimitBytes,
+      extensions: [{ name: 'structured-clone', wasm: await loadStructuredCloneExtension() }],
+      interruptHandler: () => interruptSlot.current?.() ?? false,
+    });
+
+    return new ReplVm(vm, memoryLimitBytes, interruptSlot);
+  }
+
 
   /** The configured malloc limit in bytes (per-VM, set at create time). */
   get memoryLimit(): number {
@@ -528,301 +580,6 @@ function readCompletionValue(wrapper: JSValueHandle): unknown {
 }
 
 /**
- * Trap-free own-data-property read, driven over the raw
- * `qjs_get_own_property_descriptor` export — **never** through
- * `JSValueHandle.getOwnPropertyDescriptor()`, whose failure path throws a
- * `JSException` whose constructor performs guest-visible `[[Get]]` reads
- * of `name`/`message`/`stack` on the exception value (review regression:
- * a getter installed on `InternalError.prototype.name` would execute while
- * a failing descriptor read was being reported). Here a failed read's
- * exception value is taken out of the runtime and freed — no `JSException`
- * is ever constructed — and the engine-created descriptor object's own
- * data properties are read via raw `qjs_get_prop_value` (OrdinaryGet on
- * own data properties: no guest code runs, even against a polluted
- * `Object.prototype`).
- *
- * Returns `undefined` when the property is absent, the read failed, the
- * property is an accessor (accessors are never invoked — their `get`/`set`
- * handles are owned by the caller and are disposed here; a leaked accessor
- * handle pins guest memory, which review measured exhausting a 1 MiB VM
- * after ~3,128 accessor-valued completions), or the object is a proxy (a
- * descriptor read would fire its `getOwnPropertyDescriptor` trap). The
- * returned handle is owned by the caller and must be disposed.
- */
-function readOwnDataProperty(handle: JSValueHandle, key: string): JSValueHandle | undefined {
-  // Proxies fire traps on descriptor reads — this is the backstop guard;
-  // call sites guard too. Engine-level brand check, never a guest trap.
-  if (handle.isProxy) return undefined;
-
-  const vm = handle.vm;
-  const e = vm._getExports();
-  // `qjs_get_own_property_descriptor` takes the key as a JSValue (like the
-  // shim's own descriptor path, which passes `vm.newString(key)`), not as
-  // a C string — passing a `_writeString` pointer makes the C engine read
-  // raw bytes as a JSValue and report “no such property”. The key handle
-  // is engine-created and freed right after the call.
-  const keyHandle = vm.newString(key);
-  let descPtr: number;
-  try {
-    descPtr = e.qjs_get_own_property_descriptor(handle.ptr, keyHandle.ptr);
-  } finally {
-    keyHandle.dispose();
-  }
-  if (descPtr === 0) return undefined; // no such own property
-
-  const desc = new JSValueHandle(vm, descPtr);
-  try {
-    if (e.qjs_is_exception(desc.ptr) !== 0) {
-      // The C descriptor read failed (allocation failure edge). Take the
-      // exception value out of the runtime and free it; never construct
-      // quickjs-wasi's `JSException` (guest-visible getters would run in
-      // its constructor). The property reads as absent.
-      takeAndFreeException(e, vm);
-      return undefined;
-    }
-    // Data vs accessor: `qjs_has_own_property` (raw), which never walks
-    // the prototype — an accessor descriptor must not leak a polluted
-    // `Object.prototype.value` through the `value` read.
-    if (hasOwnRaw(e, vm, desc.ptr, 'value')) {
-      return getPropRaw(e, vm, desc.ptr, 'value');
-    }
-    // Accessor descriptor: never invoke the accessors; free their owned
-    // handles so they don't pin guest memory.
-    getPropRaw(e, vm, desc.ptr, 'get')?.dispose();
-    getPropRaw(e, vm, desc.ptr, 'set')?.dispose();
-    return undefined;
-  } finally {
-    desc.dispose();
-  }
-}
-
-/**
- * Raw `hasOwnProperty` on an engine-created object (no prototype walk, no
- * traps).
- */
-function hasOwnRaw(e: QuickJSExports, vm: QuickJS, objPtr: number, key: string): boolean {
-  const { ptr: keyPtr } = vm._writeString(key);
-  try {
-    return e.qjs_has_own_property(objPtr, keyPtr) !== 0;
-  } finally {
-    e.wasm_free(keyPtr);
-  }
-}
-
-/**
- * Raw own-property read on an engine-created object. `qjs_get_prop_value`
- * is OrdinaryGet: on an engine-created plain object with own data
- * properties no guest code can run — but the read itself can still fail
- * (allocation edge), so the exception is taken out and freed and the read
- * reports `undefined` instead of throwing. The returned handle is owned by
- * the caller and must be disposed.
- */
-function getPropRaw(e: QuickJSExports, vm: QuickJS, objPtr: number, key: string): JSValueHandle | undefined {
-  // `qjs_get_prop_value` takes the key as a JSValue (the shim's `getProp`
-  // passes a handle), never as a C string.
-  const keyHandle = vm.newString(key);
-  let ptr: number;
-  try {
-    ptr = e.qjs_get_prop_value(objPtr, keyHandle.ptr);
-  } finally {
-    keyHandle.dispose();
-  }
-  const handle = new JSValueHandle(vm, ptr);
-  if (e.qjs_is_exception(handle.ptr) !== 0) {
-    takeAndFreeException(e, vm);
-    handle.dispose();
-    return undefined;
-  }
-  return handle;
-}
-
-/**
- * Take the runtime's current exception value out and free it. Used by the
- * raw failure paths so a failed C call never leaves a sticky exception
- * behind (the shim's own `keys()` leaves one, which would poison later
- * operations) and never constructs a `JSException`.
- */
-function takeAndFreeException(e: QuickJSExports, vm: QuickJS): void {
-  // `qjs_get_exception` clears the runtime's slot; with no exception set it
-  // returns JS_UNDEFINED (pointer 0), so a non-zero pointer is a real
-  // exception value owned by us.
-  const excPtr = e.qjs_get_exception();
-  if (excPtr !== 0) {
-    new JSValueHandle(vm, excPtr).dispose();
-  }
-}
-
-/**
- * Trap-free own enumerable string keys (`Object.keys` semantics), driven
- * over the raw `qjs_get_own_property_names` export with exception cleanup —
- * the shim's `keys()` leaves a sticky runtime exception behind when the C
- * call fails, which would poison later operations. Returns `[]` on failure.
- */
-function rawOwnKeys(handle: JSValueHandle): string[] {
-  const vm = handle.vm;
-  const e = vm._getExports();
-  const keysPtr = e.qjs_get_own_property_names(handle.ptr);
-  const keysHandle = new JSValueHandle(vm, keysPtr);
-  if (e.qjs_is_exception(keysHandle.ptr) !== 0) {
-    takeAndFreeException(e, vm);
-    keysHandle.dispose();
-    return [];
-  }
-  try {
-    const lenHandle = getPropRaw(e, vm, keysHandle.ptr, 'length');
-    if (lenHandle === undefined) return [];
-    let len: number;
-    try {
-      len = lenHandle.toNumber();
-    } finally {
-      lenHandle.dispose();
-    }
-    const out: string[] = [];
-    for (let i = 0; i < len; i++) {
-      const keyPtr = e.qjs_get_prop_uint32(keysHandle.ptr, i);
-      const keyHandle = new JSValueHandle(vm, keyPtr);
-      if (e.qjs_is_exception(keyHandle.ptr) !== 0) {
-        takeAndFreeException(e, vm);
-        keyHandle.dispose();
-        break;
-      }
-      try {
-        out.push(keyHandle.toString());
-      } finally {
-        keyHandle.dispose();
-      }
-    }
-    return out;
-  } finally {
-    keysHandle.dispose();
-  }
-}
-
-/**
- * Native string form of a symbol, as `String(symbol)` would produce it:
- * `Symbol(description)` — never a fabricated conversion like `NaN`
- * (review regression: the primitive error-rendering default branch called
- * `toNumber()` on symbols). The description is read through the raw
- * `qjs_get_symbol_description` export — native and trap-free; a symbol
- * without a description (or with an empty one) renders as `Symbol()`.
- */
-function readSymbolDescription(handle: JSValueHandle): string {
-  const vm = handle.vm;
-  const e = vm._getExports();
-  const outPtr = e.wasm_malloc(4);
-  try {
-    e.qjs_get_symbol_description(handle.ptr, outPtr);
-    // The description is written as a JSValue pointer into the out slot.
-    const descPtr = new DataView(e.memory.buffer).getUint32(outPtr, true);
-    if (descPtr === 0) return 'Symbol()'; // JS_UNDEFINED — anonymous symbol
-    const desc = new JSValueHandle(vm, descPtr);
-    try {
-      const text = desc.isString ? desc.toString() : '';
-      return text ? `Symbol(${text})` : 'Symbol()';
-    } finally {
-      desc.dispose();
-    }
-  } finally {
-    e.wasm_free(outPtr);
-  }
-}
-
-/**
- * Render a guest value into host data without ever executing guest code:
- * primitives via native conversions, objects via own enumerable
- * data-property descriptor reads, brand checks for the engine-recognized
- * object kinds (markers), depth/property caps and a cycle guard so
- * adversarial shapes stay bounded.
- *
- * This is the conservative seed of the ObjectPreview rendering the tool
- * result eventually carries (a later phase owns that format); everything
- * read here is trap-free and bounded.
- */
-function readValue(handle: JSValueHandle, depth: number, seen: Set<number>): unknown {
-  if (handle.isUndefined) return undefined;
-  if (handle.isNull) return null;
-
-  const t = handle.typeof;
-  switch (t) {
-    case 'boolean':
-      // JS_ToCString on a boolean primitive is native — no guest code runs.
-      return handle.toString() === 'true';
-    case 'number':
-      return handle.toNumber();
-    case 'string':
-      return handle.toString();
-    case 'bigint':
-      return handle.toBigInt();
-    case 'symbol':
-      return '[Symbol]';
-    case 'function':
-      return '[Function]';
-    default:
-      break; // objects
-  }
-
-  // Engine-level brand checks: never fire traps, cannot be spoofed from
-  // guest JavaScript. Proxies are never touched further (descriptor reads
-  // would fire their traps).
-  if (handle.isProxy) return '[Proxy]';
-  if (handle.isPromise) return '[Promise]';
-  if (handle.isDate) return '[Date]';
-  if (handle.isMap) return '[Map]';
-  if (handle.isSet) return '[Set]';
-  if (handle.isWeakMap) return '[WeakMap]';
-  if (handle.isWeakSet) return '[WeakSet]';
-  if (handle.isWeakRef) return '[WeakRef]';
-  if (handle.isRegExp) return '[RegExp]';
-  if (handle.isArrayBuffer) return '[ArrayBuffer]';
-
-  const ptr = handle.ptr;
-  if (seen.has(ptr)) return '[Circular]';
-  if (depth >= READ_DEPTH_LIMIT) return '[Object]';
-
-  seen.add(ptr);
-  try {
-    if (handle.isArray) {
-      const lengthHandle = readOwnDataProperty(handle, 'length');
-      const length = lengthHandle === undefined ? 0 : lengthHandle.toNumber();
-      lengthHandle?.dispose();
-      const out: unknown[] = [];
-      const count = Math.min(length, READ_PROP_LIMIT);
-      for (let i = 0; i < count; i++) {
-        const v = readOwnDataProperty(handle, String(i));
-        if (v === undefined) continue; // sparse hole
-        try {
-          out.push(readValue(v, depth + 1, seen));
-        } finally {
-          v.dispose();
-        }
-      }
-      if (length > READ_PROP_LIMIT) out.push('[ArrayTruncated]');
-      return out;
-    }
-
-    const out: Record<string, unknown> = {};
-    let count = 0;
-    for (const key of rawOwnKeys(handle)) {
-      if (count >= READ_PROP_LIMIT) {
-        out['[Truncated]'] = true;
-        break;
-      }
-      const v = readOwnDataProperty(handle, key);
-      if (v === undefined) continue; // accessor or deleted between reads
-      try {
-        out[key] = readValue(v, depth + 1, seen);
-      } finally {
-        v.dispose();
-      }
-      count++;
-    }
-    return out;
-  } finally {
-    seen.delete(ptr);
-  }
-}
-
-/**
  * Trap-free error info: name/message/stack are read as own data
  * properties; primitives thrown as values convert natively (strings and
  * bigints as themselves, booleans as `'true'`/`'false'`, numbers as their
@@ -911,4 +668,21 @@ function readErrorInfo(handle: JSValueHandle): EvalErrorInfo {
     stackHandle?.dispose();
     protoHandle?.dispose();
   }
+}
+
+/**
+ * Module-scoped shim registry, populated by the `ReplVm` constructor (see
+ * there for why the public type graph must not name quickjs-wasi types).
+ * WeakMap: disposed VMs drop out with their instances.
+ */
+const vmShims = new WeakMap<ReplVm, unknown>();
+
+/**
+ * The underlying quickjs-wasi instance of a VM. **Internal** — the bridge
+ * and previewer modules cast this to the shim's `QuickJS`; not part of the
+ * package's public API (not re-exported from the index). The `unknown`
+ * return keeps quickjs-wasi types out of the published declarations.
+ */
+export function getVmShim(vm: ReplVm): unknown {
+  return vmShims.get(vm);
 }

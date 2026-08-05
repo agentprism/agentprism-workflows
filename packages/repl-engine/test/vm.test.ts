@@ -12,6 +12,8 @@ import { test } from 'node:test';
 import { EvalFlags, QuickJS } from 'quickjs-wasi';
 
 import { DrainJobError, ReplVm, loadShippedWasm } from '../src/index.js';
+import { getVmShim } from '../src/vm.js';
+import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
 type VmOptions = NonNullable<Parameters<typeof ReplVm.create>[0]>;
 
@@ -623,4 +625,63 @@ test('thrown symbols report their native string form, never NaN', async () => {
   assert.equal(r.message, 'Symbol(rejected)');
   // The VM stays usable.
   assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('a value GETTER on Object.prototype empties the completion wrapper — without running guest code (engine quirk, pinned)', async () => {
+  using v = await vm();
+  // Discovered during phase B: quickjs-ng's async-eval completion wrapper
+  // (`{ value: … }`) comes out EMPTY once `Object.prototype.value` is
+  // rebound to a GETTER — the engine's own wrapper creation is
+  // prototype-sensitive for exactly this key. The engine never executes
+  // the getter (verified with a counter); the completion read degrades
+  // honestly to `{}` (the trap-free fallback renders the wrapper as-is
+  // rather than fabricating a value), and the VM stays fully usable.
+  // The install eval's own completion already degrades (the pollution is
+  // installed mid-eval, so its wrapper comes out empty) — run it, then
+  // assert the degradation and the trap-freedom of subsequent evals.
+  await v.evalCode(`
+    globalThis.__traps = 0;
+    Object.defineProperty(Object.prototype, 'value', {
+      configurable: true,
+      get() { globalThis.__traps++; return 'polluted'; },
+    });
+    'installed';
+  `);
+  const result = value(await v.evalCode('40 + 2'));
+  assert.deepEqual(result, {}, 'the completion wrapper is empty; nothing fabricated');
+  // The getter never ran — read the counter through a descriptor path
+  // (eval completions read as {} under this pollution, by the quirk above).
+  const shim = getVmShim(v) as QuickJS;
+  const e = shim._getExports();
+  const globalHandle = shim.global; // cached singleton — do not dispose
+  const key = shim.newString('__traps');
+  let descPtr: number;
+  try {
+    descPtr = e.qjs_get_own_property_descriptor(globalHandle.ptr, key.ptr);
+  } finally {
+    key.dispose();
+  }
+  assert.notEqual(descPtr, 0);
+  const desc = new JSValueHandle(shim, descPtr);
+  try {
+    const key2 = shim.newString('value');
+    let vp: number;
+    try {
+      vp = e.qjs_get_prop_value(desc.ptr, key2.ptr);
+    } finally {
+      key2.dispose();
+    }
+    const val = new JSValueHandle(shim, vp);
+    try {
+      assert.equal(val.isNumber, true);
+      assert.equal(val.toNumber(), 0, 'no guest getter ran');
+    } finally {
+      val.dispose();
+    }
+  } finally {
+    desc.dispose();
+  }
+  // The VM stays fully usable (completions still degrade to {} — the
+  // quirk persists until the pollution is removed).
+  assert.deepEqual(value(await v.evalCode('1 + 1')), {});
 });

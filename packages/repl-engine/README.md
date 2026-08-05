@@ -136,6 +136,98 @@ satisfied every non-null value). Custom WASM is accepted as raw bytes (`ArrayBuf
 `ArrayBufferView`). A consumer check with the repo's non-DOM lib and
 `skipLibCheck: false` is part of the test suite (`test/public-types.test.ts`).
 
+## The guest library and the bridge (phase B)
+
+At VM creation the host installs the **guest-side library** — a version-marked plain script
+evaluated exactly once in the realm — plus the four `__host_*` callbacks that are the realm's
+entire effect surface. The library is this package's fresh implementation (not a vendor of the
+harness's `guest/dsl.js`); its source is `src/guest/guest-library.ts`, its version is
+`GUEST_LIBRARY_VERSION` (marker global `__REPL_GUEST_VERSION`), and its semantics follow the
+roadmap doc's DSL split: only a sliver needs host effects, everything else is pure JS.
+
+### Sandbox globals
+
+- `agent(prompt, options?) → Promise` — the delegation primitive. `options` (structured-output
+  schema, cwd, backend config) cross the bridge as JSON. The returned promise **is** the live
+  handle: it may sit in a variable across evals, and it carries own non-enumerable handle
+  methods `followUp(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()` — each resolving
+  with **what actually happened** (the host settles with the steering outcome, live injection
+  vs queued delivery, mirroring the outcome values `acp-agents` surfaces in its steering
+  events) — plus `id` (the stable call id `"c1"`, … used by `status`/`interrupt`).
+- `checkpoint(question, options?) → Promise` and `checkpoint.answer(callId, value) → boolean`
+  — the data plane interrupting the intent plane. The answer enters the data plane only
+  through `checkpoint.answer` (the `__host_checkpoint` trailing-argument answer mode); it
+  returns whether a pending checkpoint with that id was answered.
+- `console.{log,info,warn,error,debug}` — the bridge: every argument is frozen (structuredClone
+  via the shipped quickjs-wasi extension, with an iterative marker-copy fallback) into a real
+  `$N` global, then forwarded as `{ refs, args }` to `__host_console`.
+- `parallel` / `pipeline` / `verify` / `judgePanel` / `gate` / `retry` / `loopUntilDry` —
+  pure JavaScript layered on `agent()`, following `packages/workflows/src/dsl.d.ts` semantics.
+  A rejection with `recoverable: false` halts the surrounding orchestration; any other
+  rejection is recoverable (a `null` slot in `parallel`/`pipeline`, reported via
+  `console.warn`). **There is no budget surface**: no `budget()` global, no ledger, no caps
+  vocabulary — resource limits are server configuration, invisible to the guest (the host's
+  non-recoverable signal is exclusively `recoverable: false`). `phase()` is deleted per the
+  doc.
+
+### Guest library ⇄ host contract
+
+| Function | Meaning |
+|---|---|
+| `__host_agent(callId, prompt, optionsJson)` | Kick off one worker run. May return a thenable (the bridge's `GuestCall` promise) — the guest chains onto it — or `undefined` (settle later via the surface). |
+| `__host_checkpoint(callId, question, optionsJson, answerJson?)` | Question mode: three arguments, like `__host_agent`. Answer mode: a PRESENT fourth argument (the JSON-encoded answer) — the host settles the pending checkpoint and returns a boolean synchronously; nothing new pends. |
+| `__host_agent_steer(callId, action, payloadJson)` | Steering: `action` is `"followUp"` \| `"steer"` \| `"cancel"`; `payloadJson` is `{ prompt, options }` or `null` for cancel. The host settles with the steering outcome. |
+| `__host_console(level, payloadJson)` | The console bridge, called synchronously after the guest froze each argument into `$N`. |
+
+Settlement is first-wins idempotent by call id, through two always-valid routes: the live
+`GuestCall` (a quickjs-wasi `Deferred` whose promise handle was returned into the realm) or
+the **reconciliation surface** after a restore. The surface —
+`globalThis[Symbol.for("repl.guest")]`, read host-side via `readGuestSurface(vm)` — exposes
+`version`, `pending()` (verbatim details for re-issuing lost work), `settle(callId, outcome,
+value)` and `stats()`; it is frozen, its binding non-configurable, and its registry operations
+use captured intrinsics, so `Map.prototype` pollution cannot corrupt settlement. The pending-
+call registry lives in the library's closure and **travels inside snapshots**; on restore the
+host re-registers the four callbacks by name (`registerGuestHostCallbacks`) and reconciles —
+the library itself is never re-evaluated (idempotence guard).
+
+**Version compatibility** (the doc's evolution disciplines): the library is versioned with the
+workspace, not the host — a host must serve any snapshot whose resident library is the same or
+an older version, the host-call surface is append-only (new optional trailing arguments =
+minor; new `__host_*` names = major), and the host discovers the resident version through the
+surface rather than assuming. `ReplVm.restore` exists so the evolution discipline is testable
+now: state, `$N` store, registry and marker survive a snapshot/restore round trip.
+
+### The console bridge and the previewer
+
+Every `console.log` is truncated in the tool result but **frozen in full inside the VM** as
+`$1`, `$2`, … (what-you-saw-is-what-you-have: mutation after the log never changes `$N`), and
+the rendered line carries the address, type and size — `[$14 · object · 48kB] {sections:
+Array(12), title: "Auth flow", …}` — so the orchestrator slices deeper in a later eval
+(`console.log($14.sections.map(s => s.title))`) instead of re-running work. Nothing is lost by
+logging it; nothing floods the client's context by being logged.
+
+The truncation format is the Chrome DevTools Protocol's `ObjectPreview` model, adopted as a
+spec; the harness's `previewer/FORMAT.md` is the normative reference and this package imitates
+its rules: one collapsed level, ≤ 8 properties / 8 leading array entries, 40-char property
+strings (24+8 head/tail), 200-char top-level strings (120+40 head/tail), 120-char error
+descriptions (72+24), a 400-char collapsed backstop, the `overflow` flag, head+tail elision
+everywhere (errors live at the end), positional canonical-index rendering, and the byte-size
+format with decimal units and the ≥ 999.95 promotion rule. Preview generation is
+**side-effect-free by construction**: engine brand checks only, own-property-descriptor reads
+only, proxies detected first and previewed *as* proxies (`Proxy(Array)`, `Proxy(revoked)`),
+typed-array elements via the language-guaranteed integer-indexed reads, and the key
+materialization read back through descriptors with honest degradation on a corrupted
+enumeration (FORMAT.md §6). A `$N` slot rebound to an accessor renders an explicit sabotage
+marker — the getter is never invoked.
+
+### Output caps
+
+`applyOutputCaps` enforces the doc's limits — **256 lines or 10 KB per tool result, whichever
+trips first** — line-granular (a line that would trip either cap is not emitted at all) and
+byte-counted in UTF-8 with `\n` separators (the canonical serialization). Over-cap content
+remains reachable through the `$N` refs the capped lines carry: the cap costs reads, never
+data.
+
 ## Decisions for spec-owed details
 
 These are the decisions this phase made where the roadmap doc left room; later phases must
@@ -178,14 +270,63 @@ build on them rather than re-open them.
   project-registry concern (the `repl` tool's phase); the registry keys by the string it is
   given.
 
+Phase B decisions (the guest library, bridge, previewer):
+
+- **`repl.guest` as the surface key** (`Symbol.for("repl.guest")`, marker global
+  `__REPL_GUEST_VERSION`) — a fresh namespace for this product's own library (the harness's
+  `agentprism.guest`/`__AGENTPRISM_GUEST_VERSION` are its sibling project's).
+- **Four host callbacks, no budget function**: `__host_agent`, `__host_checkpoint`,
+  `__host_console`, `__host_agent_steer`. The harness's `__host_budget` is deleted with the
+  budget surface; `__host_agent_steer` carries the doc's handle methods
+  (`followUp`/`steer`/`cancel`) as a new host-callback name in the initial major.
+- **Steering payloads are `{ prompt, options }` JSON** (or `null` for cancel) — the host
+  interprets them; the guest passes the settlement value (the steering outcome) through
+  verbatim, mirroring the outcome values `acp-agents` surfaces in its steering events.
+- **The handle is the promise**: `agent()` returns the promise itself with own non-enumerable
+  `id`/`followUp`/`steer`/`cancel` — started-not-awaited handles come free with top-level
+  await, per the doc (`const research = agent(...)`; end the eval; check in next call). No
+  `agent.start`/`agent.continue` variants (the doc does not carry them; `followUp` is the
+  continuation vector).
+- **Non-recoverable = `recoverable: false` exclusively** — the harness's reserved
+  `BUDGET_EXHAUSTED`/`AGENT_LIMIT_EXCEEDED` codes are budget vocabulary, deleted per the doc.
+- **`retry` without `until` runs all attempts** (deliberate divergence from the harness's
+  `dsl.js`, which returns after the first attempt): the doc names this repo's `dsl.d.ts` as
+  the semantic source — "stopping early once `until(result)` holds" means nothing holds when
+  there is no `until`.
+- **`loopUntilDry` dedupes within rounds too** (the harness dedupes across rounds only) —
+  "collecting fresh (deduped by `key`) items" is honored completely; the default key degrades
+  to a safe string for non-serializable items instead of throwing.
+- **Weak collections keep typed markers in `$N`**: the structured-clone extension silently
+  clones `WeakMap`/`WeakSet`/`WeakRef` to empty plain objects, so `freezeValue` routes
+  functions, symbols, promises and weak collections to the marker fallback before attempting
+  `structuredClone` — an orchestrator must be able to tell a WeakMap from a deleted property.
+- **The console payload keeps the harness's `{ refs, args }` shape** — `args` is the
+  best-effort JSON-safe encoding (capped, tagged wrappers) for hosts without a previewer;
+  `$N` refs are the authoritative channel and are never truncated.
+- **Output caps are decimal KB (10 × 1000 bytes)** — consistent with the preview format's
+  byte-size convention (×1000 units), and line-granular with `\n` separators counted.
+- **`ReplSnapshot` is a self-contained structural stand-in** for the shim's `Snapshot` type,
+  so the public `ReplVm.restore` declaration stays checkable by a non-DOM `skipLibCheck:
+  false` consumer; snapshots produced through the shim satisfy it without conversion.
+- **The internal shim is reached through a module-scoped map** (`getVmShim`, private to the
+  package) — the published type graph never names a quickjs-wasi type (verified by the
+  consumer fixture).
+- **Engine quirk pinned**: a `value` GETTER on `Object.prototype` makes quickjs-ng's
+  async-eval completion wrapper come out empty (engine-internal, guest-code-free — the
+  getter never fires, verified by counter); eval completions honestly degrade to `{}` under
+  that pollution, and the trap-free fallback never fabricates a value. Similarly, the
+  engine's spec-mandated thenability check fires a polluted `then` getter once per eval —
+  before any of our code runs; the previewer itself adds zero getter fires (pinned by
+  baseline-count tests).
+
 ## Out of scope for this phase (later phases, per the roadmap doc)
 
-Host-callback bridge (`agent()`/`checkpoint()`), console interception with `$N` freezing,
-the ObjectPreview previewer, the call store and exactly-once settlement broker, enveloped
-snapshots (wasm-hash + format version + gzip) and restore reconciliation, the guest DSL
-library, and the `repl` MCP tool registration. The engine boundary here — `Workspace` +
-`WorkspaceRegistry` + `ReplVm` — is the surface those phases build on; `Workspace.eval`
-already returns the `{ value, pending, error }` skeleton the tool result shape fills in.
+The call store and exactly-once settlement broker, enveloped snapshots (wasm-hash + format
+version + gzip) and the restore reconciliation loop, the per-backend steering mechanism table,
+the workspace manifest, and the `repl` MCP tool registration in `mcp-server` (which wires the
+daemon's project model to `WorkspaceRegistry` and this phase's bridge: install the guest
+library at workspace creation, drive the four host callbacks against `acp-agents`, render
+console events through the previewer, cap tool results with `applyOutputCaps`).
 
 ## Development
 
@@ -210,3 +351,31 @@ and cancels in-flight creates on dispose; 20,000 consecutive syntax errors and 2
 accessor-valued completions leave a 1 MiB VM healthy; and a non-DOM `skipLibCheck: false`
 consumer compiles the published declarations — including `@ts-expect-error` negative cases
 pinning the opaque `WasmModule` boundary.
+
+Phase B pins the guest library and bridge: install/version-marker/idempotence (re-eval and
+re-install are no-ops), the deleted vocabulary (`phase`, the whole budget surface), agent
+round trips with JSON options, rejections normalizing to Errors carrying `code`/
+`recoverable`, the live handle (`id`/`followUp`/`steer`/`cancel`, non-enumerable, steering
+addressed to the founding call id), synchronous host-refusal rejection, started-not-awaited
+settlement through a later standalone drain, the checkpoint question→answer flow across
+evals (with `false` for unknown/answered ids and a TypeError for non-JSON answers), every
+combinator over a mocked `__host_agent` (parallel order/null slots/non-recoverable halts,
+pipeline stages and slot semantics, retry attempts and `until`, gate feedback loops,
+loopUntilDry dedupe/emptiness/maxRounds and circular-safe keys, verify votes and dropped
+reviewers, judgePanel mean scores and tie-breaks), the reconciliation surface
+(pending/settle/stats, first-wins idempotence, `Map.prototype` pollution immunity via
+captured intrinsics), snapshot travel (state, `$N` store, registry and marker survive;
+callbacks re-register by name; new calls mint fresh ids), `$N` freezing (mutation after log
+never changes the store; the store is the agent's writable workspace; hostile values
+including revoked proxies degrade to typed markers without throwing; 2000-deep nesting
+freezes without crashing the VM; cycles are preserved), and the console payload shapes.
+The previewer suite pins the FORMAT.md rules (primitives incl. `-0`/exponent forms, string
+head+tail elisions and escaping, functions, errors with own-data-only names, promise
+states, arrays with holes/named props/overflow, plain objects with positional indices and
+accessor `(...)`, branded objects and typed arrays with expando overflow, proxies incl.
+revoked, property-level shorthand tokens, the 400-char backstop, byte-size formatting with
+the promotion rule, the `$N` line format) and the trap-freedom guarantees (hostile getters
+on `Object.prototype`/`Array.prototype` never fire — including the `Object.prototype.value`
+pollution case; proxy traps never fire; an accessor-rebound `$N` slot renders the sabotage
+marker; the byte-size estimate is bounded and cycle-safe). `caps.test.ts` pins 256 lines /
+10 KB (whichever trips first), line-granular truncation and UTF-8 byte counting.

@@ -1,0 +1,81 @@
+/**
+ * Phase B tests: the doc's tool-result output caps — 256 lines or 10 KB
+ * per tool result, whichever trips first; over-cap content remains
+ * reachable through the $N refs the capped lines carry.
+ */
+
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import {
+  OUTPUT_MAX_BYTES,
+  OUTPUT_MAX_LINES,
+  applyOutputCaps,
+} from '../src/index.js';
+
+test('under the caps: every line is kept and nothing is truncated', () => {
+  const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`);
+  const result = applyOutputCaps(lines);
+  assert.deepEqual(result.lines, lines);
+  assert.equal(result.truncated, false);
+});
+
+test('empty input: no lines, not truncated', () => {
+  const result = applyOutputCaps([]);
+  assert.deepEqual(result.lines, []);
+  assert.equal(result.truncated, false);
+});
+
+test('the line cap: 256 lines fit exactly; the 257th trips it', () => {
+  const lines = Array.from({ length: 300 }, (_, i) => `l${i}`);
+  const result = applyOutputCaps(lines);
+  assert.equal(result.lines.length, OUTPUT_MAX_LINES);
+  assert.deepEqual(result.lines, lines.slice(0, OUTPUT_MAX_LINES));
+  assert.equal(result.truncated, true);
+});
+
+test('exactly 256 lines (tiny) are kept in full', () => {
+  const lines = Array.from({ length: OUTPUT_MAX_LINES }, () => 'x');
+  const result = applyOutputCaps(lines);
+  assert.equal(result.lines.length, OUTPUT_MAX_LINES);
+  assert.equal(result.truncated, false);
+});
+
+test('the byte cap trips before the line cap for long lines (10 KB decimal, incl. separators)', () => {
+  // 100-byte lines: 99 lines = 9998 bytes (99×100 + 98 separators) fit;
+  // the 100th would carry the total to 10099 > 10 000 — line-granular
+  // truncation drops it.
+  const lines = Array.from({ length: 100 }, () => 'x'.repeat(100));
+  const result = applyOutputCaps(lines);
+  assert.equal(result.lines.length, 99);
+  assert.equal(result.truncated, true);
+  // The kept lines' serialized byte count (with \n separators) fits.
+  const serialized = result.lines.join('\n');
+  assert.ok(Buffer.byteLength(serialized, 'utf8') <= OUTPUT_MAX_BYTES);
+});
+
+test('whichever trips first: short lines hit the line cap, long lines hit the byte cap', () => {
+  // 300 short lines: the LINE cap trips first.
+  const short = applyOutputCaps(Array.from({ length: 300 }, () => 'a'));
+  assert.equal(short.lines.length, OUTPUT_MAX_LINES);
+  assert.equal(short.truncated, true);
+  // 30 long lines: the BYTE cap trips first.
+  const long = applyOutputCaps(Array.from({ length: 30 }, () => 'b'.repeat(2000)));
+  assert.ok(long.lines.length < 30);
+  assert.ok(long.lines.length < OUTPUT_MAX_LINES);
+  assert.equal(long.truncated, true);
+  const serialized = long.lines.join('\n');
+  assert.ok(Buffer.byteLength(serialized, 'utf8') <= OUTPUT_MAX_BYTES);
+});
+
+test('multi-byte characters count as their UTF-8 bytes, not code points', () => {
+  // 4000 'é' characters = 8000 bytes; two of them (16000 bytes) trip the cap.
+  const result = applyOutputCaps(['é'.repeat(4000), 'é'.repeat(4000)]);
+  assert.equal(result.lines.length, 1);
+  assert.equal(result.truncated, true);
+});
+
+test('the constants match the doc: 256 lines, 10 KB', () => {
+  assert.equal(OUTPUT_MAX_LINES, 256);
+  assert.equal(OUTPUT_MAX_BYTES, 10 * 1000);
+});

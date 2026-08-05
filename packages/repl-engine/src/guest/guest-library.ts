@@ -1,0 +1,1276 @@
+/**
+ * The REPL orchestrator's guest-side library — a fresh TypeScript-authored
+ * implementation of the sandbox vocabulary (NOT a vendor of the harness's
+ * `guest/dsl.js`; the harness's evolution disciplines are the model).
+ *
+ * `GUEST_LIBRARY_SOURCE` is a plain script evaluated exactly ONCE at VM
+ * creation, inside the capability-free QuickJS realm — no modules, no
+ * imports, no host assumptions beyond the four documented `__host_*`
+ * functions (see the package README's "Guest library ⇄ host contract").
+ * After the first snapshot this library travels INSIDE the snapshot: it is
+ * versioned with the workspace, not with the host, and a host must accept
+ * snapshots carrying an older copy than the one it ships.
+ *
+ * What it defines in the realm (the roadmap doc's DSL split — only the
+ * sliver that needs host effects calls out; everything else is pure JS):
+ *
+ *   - `agent(prompt, options?)` → Promise (host effect). The returned
+ *     promise IS the live handle: started-not-awaited handles come free
+ *     with top-level await, and the doc's handle methods ride it —
+ *     `followUp(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()` —
+ *     each resolving with what actually happened (the host settles with
+ *     the steering outcome, mirroring the outcome values acp-agents
+ *     surfaces in its steering events). `id` carries the stable call id
+ *     (`"c1"`, …) used by `status`/`interrupt`.
+ *   - `checkpoint(question, options?)` → Promise (host effect), and
+ *     `checkpoint.answer(callId, value)` → boolean — answer delivery
+ *     through the same host function's trailing-argument mode.
+ *   - `console.{log,info,warn,error,debug}` — the bridge: every argument
+ *     is frozen (structuredClone, with an iterative marker-copy fallback)
+ *     into a real `$N` global, then forwarded to `__host_console`.
+ *   - `parallel` / `pipeline` / `verify` / `judgePanel` / `gate` /
+ *     `retry` / `loopUntilDry` — pure JavaScript layered on `agent()`,
+ *     following `packages/workflows/src/dsl.d.ts` semantics.
+ *   - `__REPL_GUEST_VERSION` — the version marker global.
+ *   - `globalThis[Symbol.for("repl.guest")]` — the frozen reconciliation
+ *     surface (version / pending / settle / stats) the host uses after a
+ *     snapshot restore.
+ *
+ * Deleted vocabulary, per the roadmap doc: `phase()` (it presupposes "a
+ * run" that no longer exists) and the whole budget surface — no `budget()`
+ * global, no ledger, no caps vocabulary. Resource limits are server
+ * configuration, invisible to the guest; the host signals non-recoverable
+ * failures exclusively through `recoverable: false` on rejections (the
+ * harness's reserved `BUDGET_EXHAUSTED`/`AGENT_LIMIT_EXCEEDED` codes have
+ * no counterpart here).
+ *
+ * The pending-call registry (callId → { resolve, reject, kind, detail,
+ * optionsJson, createdAt }) lives in the library's closure, so the table
+ * of in-flight host calls travels inside the snapshot itself. The host
+ * settles calls by callId — through the Deferred it returned from a
+ * `__host_*` function in a live session, or through the reconciliation
+ * surface after a restore. Both routes converge on the same idempotent
+ * settlement function; the first settlement wins.
+ */
+
+/** The guest library's version (the `__REPL_GUEST_VERSION` marker value). */
+export const GUEST_LIBRARY_VERSION = '0.1.0';
+
+/** `Symbol.for` key of the reconciliation surface on `globalThis`. */
+export const GUEST_SURFACE_KEY = 'repl.guest';
+
+/** Name of the version-marker global the library installs. */
+export const GUEST_VERSION_GLOBAL = '__REPL_GUEST_VERSION';
+
+/** Host-callback names the guest library calls (the whole effect surface). */
+export const HOST_AGENT = '__host_agent';
+export const HOST_CHECKPOINT = '__host_checkpoint';
+export const HOST_CONSOLE = '__host_console';
+export const HOST_STEER = '__host_agent_steer';
+
+/**
+ * Build the injectable library script. `version` is substituted into the
+ * source so the version marker and the exported constant can never drift.
+ */
+export function buildGuestLibrarySource(version: string = GUEST_LIBRARY_VERSION): string {
+  return GUEST_LIBRARY_SOURCE.replaceAll('__REPL_GUEST_VERSION__', JSON.stringify(version));
+}
+
+/**
+ * The library as a plain script (ES2017-level JavaScript, evaluated in the
+ * realm with no module system). Written as a single template literal with
+ * no interpolation: the guest code is deliberately plain JS (string
+ * concatenation, no backticks) so the source is exactly what the VM
+ * evaluates. All `\\` escapes below are doubled so the guest code receives
+ * the literal escape sequences (`\\n` in the guest source → the guest's
+ * `\n`).
+ */
+const GUEST_LIBRARY_SOURCE = `/*
+ * REPL orchestrator guest-side library, version __REPL_GUEST_VERSION__.
+ * Evaluated exactly ONCE at VM creation; travels inside snapshots. The
+ * four __host_* functions below are the realm's entire effect surface.
+ */
+(function () {
+  'use strict';
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Identity and idempotence
+  // ────────────────────────────────────────────────────────────────────────
+
+  var VERSION = __REPL_GUEST_VERSION__;
+  var SURFACE_KEY = 'repl.guest';
+  var VERSION_GLOBAL = '__REPL_GUEST_VERSION';
+
+  // Evaluating this script twice in one realm (e.g. a host bug that
+  // re-injects it into a restored snapshot) must never wipe the live
+  // registry or the $N counter. If the surface is already installed, this
+  // evaluation is a no-op.
+  if (globalThis[Symbol.for(SURFACE_KEY)]) return;
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Tunables (payload best-effort encoding; the $N store is never truncated)
+  // ────────────────────────────────────────────────────────────────────────
+
+  var PAYLOAD_STRING_LIMIT = 4096; // chars per string in the console payload
+  var PAYLOAD_ARRAY_LIMIT = 256;   // elements per array in the console payload
+  var PAYLOAD_OBJECT_LIMIT = 256;  // keys per object in the console payload
+  var PAYLOAD_ENTRY_LIMIT = 64;    // entries per Map/Set in the console payload
+  var PAYLOAD_DEPTH_LIMIT = 8;     // nesting depth in the console payload
+  var CLONE_DEPTH_LIMIT = 512;     // structuredClone pre-flight nesting bound
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Internal state — all of it lives in this closure, so all of it travels
+  // inside the snapshot.
+  // ────────────────────────────────────────────────────────────────────────
+
+  var state = {
+    callSeq: 0,          // monotonic call-id counter ("c1", "c2", ...)
+    logSeq: 0,           // monotonic $N counter
+    registry: new Map(), // callId -> { id, kind, detail, optionsJson, createdAt, resolve, reject }
+  };
+
+  // Captured intrinsics: the registry is the host's settlement table, so
+  // its operations must stay immune to guest Map.prototype pollution (a
+  // guest that replaces Map.prototype.set must not be able to break
+  // settlement or the host's post-restore reconciliation reads).
+  var registryGet = Map.prototype.get;
+  var registrySet = Map.prototype.set;
+  var registryDelete = Map.prototype.delete;
+  var registryForEach = Map.prototype.forEach;
+  var registrySize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Small utilities
+  // ────────────────────────────────────────────────────────────────────────
+
+  function safeString(value) {
+    try {
+      return String(value);
+    } catch (_err) {
+      // String() throws for e.g. objects with a throwing toString/Symbol.toPrimitive.
+    }
+    try {
+      return Object.prototype.toString.call(value);
+    } catch (_err) {
+      // Even the brand fallback can throw (revoked proxies, all-trap proxies).
+    }
+    return '[unstringifiable]';
+  }
+
+  /**
+   * Normalize an arbitrary rejection value into an Error. Hosts may reject
+   * with a realm Error, a host Error marshalled into the realm, or a plain
+   * { name?, message, code?, recoverable? } object; all of them come out as
+   * an Error carrying code/recoverable when present.
+   */
+  function toError(value) {
+    if (value instanceof Error) return value;
+    if (value && typeof value === 'object') {
+      var err = new Error(typeof value.message === 'string' ? value.message : safeString(value));
+      if (typeof value.name === 'string') err.name = value.name;
+      if (typeof value.stack === 'string') err.stack = value.stack;
+      if (value.code !== undefined) err.code = value.code;
+      if (value.recoverable !== undefined) err.recoverable = !!value.recoverable;
+      return err;
+    }
+    return new Error(safeString(value));
+  }
+
+  /**
+   * A failure is recoverable unless the host said otherwise. Recoverable
+   * failures become null slots in parallel()/pipeline(); non-recoverable
+   * ones (recoverable: false) propagate and halt the surrounding
+   * orchestration. There is NO budget vocabulary in this guest (the
+   * roadmap doc deletes it): the recoverable flag is the only signal.
+   */
+  function isRecoverable(err) {
+    return !(err && err.recoverable === false);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // The pending-call registry and settlement
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Settle a pending call by id. Idempotent: the first settlement wins; a
+   * second settlement of the same id (e.g. the live deferred resolving
+   * after the reconciliation surface already settled it, or vice versa)
+   * returns false and does nothing. Returns true iff a pending entry was
+   * settled.
+   */
+  function settleCall(callId, outcome, value) {
+    var entry = registryGet.call(state.registry, callId);
+    if (!entry) return false;
+    registryDelete.call(state.registry, callId);
+    if (outcome === 'resolve') entry.resolve(value);
+    else entry.reject(toError(value));
+    return true;
+  }
+
+  /**
+   * Issue a host call: mint a call id, park {resolve, reject} in the
+   * registry, and invoke the host function. The host function may return a
+   * thenable (the quickjs-wasi Deferred idiom) — if it does, its settlement
+   * is forwarded into the registry. It may also return undefined and settle
+   * later purely through the reconciliation surface; both routes are always
+   * valid and converge on settleCall.
+   *
+   * 'detail' is kept VERBATIM in the registry entry (the prompt for agent
+   * calls, the question for checkpoints, the action for steering): after a
+   * restore the host may need it to re-issue work it lost track of, so it
+   * must not be truncated.
+   */
+  function issueCall(kind, hostFnName, detail, optionsJson, hostCallId) {
+    var hostFn = globalThis[hostFnName];
+    if (typeof hostFn !== 'function') {
+      throw new Error(
+        hostFnName + ' is not installed — the host must register it before evaluating ' +
+          'guest code (and re-register it by name after every snapshot restore)',
+      );
+    }
+    var id = 'c' + ++state.callSeq;
+    var resolveFn;
+    var rejectFn;
+    var promise = new Promise(function (resolve, reject) {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+    registrySet.call(state.registry, id, {
+      id: id,
+      kind: kind,
+      detail: detail,
+      optionsJson: optionsJson === undefined ? null : optionsJson,
+      createdAt: Date.now(),
+      resolve: resolveFn,
+      reject: rejectFn,
+    });
+    // The id the HOST sees may differ from the registry key: for steering
+    // calls the host must be addressed by the FOUNDING call id (the
+    // session being steered), while the registry entry — the settlement
+    // key — is this call's own minted id.
+    var hostId = hostCallId === undefined ? id : hostCallId;
+    var returned;
+    try {
+      returned = hostFn(hostId, detail, optionsJson);
+    } catch (err) {
+      // Synchronous host refusal (e.g. a per-call cap enforced at dispatch).
+      settleCall(id, 'reject', err);
+      return { id: id, promise: promise };
+    }
+    if (returned && typeof returned.then === 'function') {
+      Promise.resolve(returned).then(
+        function (value) { settleCall(id, 'resolve', value); },
+        function (err) { settleCall(id, 'reject', err); },
+      );
+    }
+    return { id: id, promise: promise };
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // agent() — the delegation primitive, and the live handle
+  // ────────────────────────────────────────────────────────────────────────
+
+  /** Shallow-copy options (plain data by construction — they cross the
+   *  bridge as JSON). */
+  function normalizeAgentOptions(options) {
+    if (options === undefined || options === null) return undefined;
+    if (typeof options !== 'object') {
+      throw new TypeError('agent options must be an object');
+    }
+    var out = {};
+    var keys = Object.keys(options);
+    for (var i = 0; i < keys.length; i++) out[keys[i]] = options[keys[i]];
+    return out;
+  }
+
+  function issueAgentCall(prompt, options) {
+    if (typeof prompt !== 'string') {
+      throw new TypeError('agent(prompt, options?) needs a prompt string');
+    }
+    var normalized = normalizeAgentOptions(options);
+    // Options cross the bridge as JSON: plain data by construction, one
+    // flat, unambiguous decoding host-side (functions or cycles in options
+    // would be meaningless host-side).
+    var optionsJson = normalized === undefined ? undefined : JSON.stringify(normalized);
+    return issueCall('agent', '__host_agent', prompt, optionsJson);
+  }
+
+  /**
+   * A steering operation on a live agent handle: mint a registry entry
+   * (kind "steer") and call __host_agent_steer. The returned promise
+   * resolves with what actually happened — the host settles with the
+   * steering outcome (live injection where the backend supports the
+   * _session/steering extension, queued-for-next-turn delivery where it
+   * doesn't), mirroring the outcome values acp-agents surfaces in its
+   * steering events. Nothing is hidden and nothing hard-errors: the
+   * orchestrator can tell urgency delivery from queued delivery and adapt.
+   */
+  function steerCall(callId, action, prompt, options) {
+    try {
+      var payloadJson;
+      if (action === 'cancel') {
+        payloadJson = null;
+      } else {
+        if (typeof prompt !== 'string') {
+          throw new TypeError('handle.' + action + '(prompt, options?) needs a prompt string');
+        }
+        var normalized = normalizeAgentOptions(options);
+        payloadJson = JSON.stringify({ prompt: prompt, options: normalized === undefined ? {} : normalized });
+      }
+      return issueCall('steer', '__host_agent_steer', action, payloadJson, callId).promise;
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  /**
+   * Run one worker agent to completion and resolve with its result (final
+   * text, or the schema-validated object when options.schema is given —
+   * result shaping is host policy). Recoverable worker failures reject
+   * with an Error whose recoverable is not false.
+   *
+   * The returned promise IS the live handle: it may sit in a REPL variable
+   * across turns (and across snapshot/restore) and be awaited, or driven
+   * with the handle methods followUp/steer/cancel (own, non-enumerable
+   * properties of the promise; 'id' carries the stable call id).
+   */
+  function agent(prompt, options) {
+    try {
+      var call = issueAgentCall(prompt, options);
+      var handle = call.promise;
+      Object.defineProperties(handle, {
+        id: {
+          value: call.id,
+          writable: false,
+          enumerable: false,
+          configurable: false,
+        },
+        followUp: {
+          value: function (nextPrompt, nextOptions) {
+            return steerCall(call.id, 'followUp', nextPrompt, nextOptions);
+          },
+          writable: false,
+          enumerable: false,
+          configurable: false,
+        },
+        steer: {
+          value: function (nextPrompt, nextOptions) {
+            return steerCall(call.id, 'steer', nextPrompt, nextOptions);
+          },
+          writable: false,
+          enumerable: false,
+          configurable: false,
+        },
+        cancel: {
+          value: function () {
+            return steerCall(call.id, 'cancel', undefined, undefined);
+          },
+          writable: false,
+          enumerable: false,
+          configurable: false,
+        },
+      });
+      return handle;
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // checkpoint() — the data plane interrupting the intent plane
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Raise a question from a running orchestration up into the
+   * conversation. The returned promise resolves with the user's answer,
+   * delivered by the host whenever it arrives — possibly turns later,
+   * possibly after a snapshot/restore cycle (the pending entry travels in
+   * the registry like any agent call). 'options' (e.g. { choices, default })
+   * are host policy, passed through as JSON.
+   */
+  function checkpoint(question, options) {
+    try {
+      if (typeof question !== 'string') {
+        throw new TypeError('checkpoint(question, options?) needs a question string');
+      }
+      var optionsJson =
+        options === undefined || options === null ? undefined : JSON.stringify(options);
+      return issueCall('checkpoint', '__host_checkpoint', question, optionsJson).promise;
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  /**
+   * Deliver the user's answer for a pending checkpoint, by call id — the
+   * orchestrator calls this from an eval after the user replies in the
+   * conversation. Answering is a root-mediated act: the host never captures
+   * user text as an answer; the answer enters the data plane only through
+   * this call (the __host_checkpoint answer mode: the same host function
+   * the question left through, with the JSON-encoded answer as a fourth
+   * argument).
+   *
+   * Returns true iff a checkpoint with that id was pending when the call
+   * was made; false for unknown or already-answered ids. Delivery is
+   * first-wins idempotent (the settlement rule every call follows), and
+   * the checkpoint's promise resolves with 'value' during the same
+   * evaluation's settlement flush. No registry entry is minted: nothing
+   * new pends, and a snapshot can never capture an answer in flight.
+   */
+  checkpoint.answer = function answer(callId, value) {
+    if (typeof callId !== 'string' || callId.length === 0) {
+      throw new TypeError('checkpoint.answer(callId, value) needs a call id string (e.g. "c3")');
+    }
+    if (typeof globalThis.__host_checkpoint !== 'function') {
+      throw new Error(
+        '__host_checkpoint is not installed — the host must register it before evaluating ' +
+          'guest code (and re-register it by name after every snapshot restore)',
+      );
+    }
+    // The answer crosses the bridge as JSON (plain data by construction);
+    // undefined normalizes to null so the mode marker — a PRESENT fourth
+    // argument — is unambiguous.
+    var answerJson;
+    try {
+      answerJson = JSON.stringify(value === undefined ? null : value);
+    } catch (_err) {
+      throw new TypeError(
+        'checkpoint.answer(callId, value): value must be JSON-serializable',
+      );
+    }
+    return !!globalThis.__host_checkpoint(callId, undefined, undefined, answerJson);
+  };
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Combinators — pure JavaScript over agent(). No host effects of their
+  // own; every one of them bottoms out in agent() (or in caller-supplied
+  // thunks). Semantics follow packages/workflows/src/dsl.d.ts, adapted for
+  // the persistent REPL (no run, no journal, no phases).
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Run an array of THUNKS concurrently; resolve to their results in input
+   * order. Pass functions, not promises: parallel([() => agent("a"), ...]).
+   * A recoverable failure becomes null in its slot (reported via
+   * console.warn); a non-recoverable one rejects the whole parallel().
+   */
+  async function parallel(thunks) {
+    if (!Array.isArray(thunks)) {
+      throw new TypeError('parallel() expects an array of functions');
+    }
+    if (thunks.some(function (t) { return typeof t !== 'function'; })) {
+      throw new TypeError(
+        'parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)',
+      );
+    }
+    return Promise.all(
+      thunks.map(async function (thunk, index) {
+        try {
+          return await thunk();
+        } catch (error) {
+          var err = toError(error);
+          if (!isRecoverable(err)) throw err;
+          // Closure-internal reference (not the global): sabotaging
+          // console.warn must not be able to alter parallel()'s semantics.
+          consoleObject.warn('parallel[' + index + '] failed: ' + err.message);
+          return null;
+        }
+      }),
+    );
+  }
+
+  /**
+   * Map 'items' through one or more sequential async 'stages', concurrently
+   * across items. Each stage receives (prev, original, index). Resolves to
+   * the final value per item; a recoverable per-item failure yields null
+   * for that item, a non-recoverable one rejects the whole pipeline().
+   */
+  async function pipeline(items) {
+    var stages = Array.prototype.slice.call(arguments, 1);
+    if (!Array.isArray(items)) {
+      throw new TypeError('pipeline() expects an array as the first argument');
+    }
+    if (stages.some(function (s) { return typeof s !== 'function'; })) {
+      throw new TypeError(
+        'pipeline() stages must be functions: pipeline(items, item => ..., result => ...)',
+      );
+    }
+    return Promise.all(
+      items.map(async function (item, index) {
+        var value = item;
+        for (var i = 0; i < stages.length; i++) {
+          try {
+            value = await stages[i](value, item, index);
+          } catch (error) {
+            var err = toError(error);
+            if (!isRecoverable(err)) throw err;
+            consoleObject.warn('pipeline[' + index + '] failed: ' + err.message);
+            return null;
+          }
+        }
+        return value;
+      }),
+    );
+  }
+
+  var VERIFY_SCHEMA = {
+    type: 'object',
+    properties: { real: { type: 'boolean' }, reason: { type: 'string' } },
+    required: ['real'],
+  };
+
+  /**
+   * Adversarial verification panel: 'reviewers' workers vote on whether
+   * 'item' is real/correct; passes when the share voting real meets
+   * 'threshold'. Reviewers that fail recoverably are dropped from the vote
+   * (they are neither yes nor no).
+   */
+  async function verify(item, opts) {
+    opts = opts || {};
+    var reviewers = Math.max(1, opts.reviewers !== undefined ? opts.reviewers : 2);
+    var threshold = opts.threshold !== undefined ? opts.threshold : 0.5;
+    var lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
+    var claim;
+    if (typeof item === 'string') {
+      claim = item;
+    } else {
+      try {
+        claim = JSON.stringify(item);
+      } catch (_err) {
+        // Non-serializable item (circular, hostile) — degrade to a safe
+        // string rather than failing the whole panel.
+        claim = safeString(item);
+      }
+    }
+    var votes = (
+      await parallel(
+        Array.from({ length: reviewers }, function (_v, i) {
+          return function () {
+            return agent(
+              'Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.' +
+                (lenses.length ? ' Focus lens: ' + lenses[i % lenses.length] + '.' : '') +
+                '\\n\\n' + claim,
+              { label: 'verify ' + (i + 1), schema: VERIFY_SCHEMA },
+            );
+          };
+        }),
+      )
+    ).filter(Boolean);
+    var realCount = votes.filter(function (v) { return v && v.real; }).length;
+    return {
+      real: votes.length > 0 && realCount / votes.length >= threshold,
+      realCount: realCount,
+      total: votes.length,
+      votes: votes,
+    };
+  }
+
+  var JUDGE_SCHEMA = {
+    type: 'object',
+    properties: { score: { type: 'number' }, reason: { type: 'string' } },
+    required: ['score'],
+  };
+
+  /**
+   * LLM-judge panel: score each candidate in 'attempts' with 'judges'
+   * graders against 'rubric' and return the highest mean-scoring candidate
+   * as { index, attempt, score, judgments } (stable tie-break by index).
+   */
+  async function judgePanel(attempts, opts) {
+    opts = opts || {};
+    var judges = Math.max(1, opts.judges !== undefined ? opts.judges : 3);
+    var rubric = opts.rubric !== undefined ? opts.rubric : 'overall quality and correctness';
+    var scored = (
+      await parallel(
+        (Array.isArray(attempts) ? attempts : []).map(function (att, idx) {
+          return async function () {
+            var text = typeof att === 'string' ? att : JSON.stringify(att);
+            var js = (
+              await parallel(
+                Array.from({ length: judges }, function (_v, j) {
+                  return function () {
+                    return agent(
+                      'Score this candidate from 0 to 1 on: ' + rubric +
+                        '. Reply with the score.\\n\\nCandidate:\\n' + text,
+                      { label: 'judge ' + (idx + 1) + '.' + (j + 1), schema: JUDGE_SCHEMA },
+                    );
+                  };
+                }),
+              )
+            ).filter(Boolean);
+            var score = js.length
+              ? js.reduce(function (s, v) { return s + (Number(v && v.score) || 0); }, 0) / js.length
+              : 0;
+            return { index: idx, attempt: att, score: score, judgments: js };
+          };
+        }),
+      )
+    ).filter(Boolean);
+    // Highest mean score; stable tie-break by input index.
+    var best = scored[0];
+    for (var i = 0; i < scored.length; i++) {
+      var s = scored[i];
+      if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
+    }
+    return best;
+  }
+
+  /** Dedupe key default: JSON identity, degrading to a safe string for
+   *  non-serializable items (a circular item must not kill the loop). */
+  function defaultKey(x) {
+    try {
+      return JSON.stringify(x);
+    } catch (_err) {
+      return safeString(x);
+    }
+  }
+
+  /**
+   * Repeatedly invoke round(i), collecting fresh (deduped by 'key') items
+   * until it yields nothing 'consecutiveEmpty' rounds in a row (or
+   * 'maxRounds' is hit). Returns every unique item gathered. Round
+   * failures propagate (recoverable ones are not nulled — a round is the
+   * loop's contract, not a slot).
+   */
+  async function loopUntilDry(opts) {
+    if (!opts || typeof opts.round !== 'function') {
+      throw new TypeError('loopUntilDry requires { round: (i) => items[] }');
+    }
+    var key = opts.key || defaultKey;
+    var consecutiveEmpty = Math.max(1, opts.consecutiveEmpty !== undefined ? opts.consecutiveEmpty : 2);
+    var maxRounds = opts.maxRounds !== undefined ? opts.maxRounds : 50;
+    var seen = new Set();
+    var all = [];
+    var dry = 0;
+    for (var r = 0; r < maxRounds && dry < consecutiveEmpty; r++) {
+      var items = (await opts.round(r)) || [];
+      var fresh = (Array.isArray(items) ? items : []).filter(function (x) {
+        return x !== null && x !== undefined && !seen.has(key(x));
+      });
+      if (!fresh.length) {
+        dry++;
+        continue;
+      }
+      dry = 0;
+      for (var i = 0; i < fresh.length; i++) {
+        var k = key(fresh[i]);
+        if (seen.has(k)) continue; // within-round duplicates stay deduped
+        seen.add(k);
+        all.push(fresh[i]);
+      }
+    }
+    return all;
+  }
+
+  /**
+   * Bounded retry: call thunk(attempt) up to 'attempts' times, stopping
+   * early once until(result) holds. Returns the last result when attempts
+   * are exhausted (the caller inspects it). No backoff: there is no timer
+   * in the realm and delegation retries gain nothing from delay.
+   *
+   * NOTE (deliberate divergence from the harness's dsl.js): without
+   * 'until', ALL attempts run — the dsl.d.ts contract is "stopping early
+   * once until(result) holds", and with no 'until' nothing ever holds.
+   * (The harness returns after the first attempt in that case; the doc
+   * names this repo's dsl.d.ts as the semantic source.)
+   */
+  async function retry(thunk, opts) {
+    opts = opts || {};
+    var attempts = Math.max(1, opts.attempts !== undefined ? opts.attempts : 3);
+    var last;
+    for (var i = 0; i < attempts; i++) {
+      last = await thunk(i);
+      if (opts.until && opts.until(last)) return last;
+    }
+    return last;
+  }
+
+  /**
+   * Validation gate: call thunk(feedback, attempt), validate the result,
+   * and feed the validator's feedback into the next attempt until it
+   * passes or 'attempts' run out. The verdict may be a boolean or
+   * { ok, feedback? }. Returns { ok, value, verdict, attempts }.
+   */
+  async function gate(thunk, validator, opts) {
+    opts = opts || {};
+    var attempts = Math.max(1, opts.attempts !== undefined ? opts.attempts : 3);
+    var feedback;
+    var last;
+    var lastVerdict = null;
+    for (var i = 0; i < attempts; i++) {
+      last = await thunk(feedback, i);
+      lastVerdict = await validator(last);
+      var accepted =
+        typeof lastVerdict === 'boolean' ? lastVerdict : Boolean(lastVerdict && lastVerdict.ok);
+      if (accepted) {
+        return {
+          ok: true,
+          value: last,
+          verdict: lastVerdict === undefined ? null : lastVerdict,
+          attempts: i + 1,
+        };
+      }
+      feedback =
+        typeof lastVerdict === 'boolean'
+          ? undefined
+          : lastVerdict
+            ? lastVerdict.feedback
+            : undefined; // fed into the next attempt
+    }
+    return {
+      ok: false,
+      value: last,
+      verdict: lastVerdict === undefined ? null : lastVerdict,
+      attempts: attempts,
+    };
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // The bridge: console -> $N store -> __host_console
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Freeze a copy of a logged value into the $N store: what-you-saw-is-
+   * what-you-have. Prefers structuredClone (the quickjs-wasi prebuilt
+   * extension, attached to every VM by the engine) and falls back to a
+   * guest-side deep copy that substitutes typed markers for
+   * non-cloneables instead of throwing.
+   *
+   * DEPTH SAFETY: on WASI, deep recursion is a fatal wasm trap, not a
+   * catchable exception (agentprism/quickjs-wasi#2) — and that applies to
+   * the native structuredClone's own C recursion too (observed hard-crash
+   * around 10k nesting). So the fallback copy is fully ITERATIVE
+   * (explicit-stack, no recursion at any depth), and structuredClone is
+   * only attempted after an iterative pre-flight confirms the graph's
+   * first-visit nesting stays within CLONE_DEPTH_LIMIT — far below the
+   * observed native crash threshold. Deeper (or hostile, or non-cloneable)
+   * graphs take the iterative fallback, which has NO depth bound of its
+   * own (it is bounded only by VM memory; an allocation failure surfaces
+   * as an "unfreezable" marker, never a throw).
+   */
+  /**
+   * Values the structured-clone algorithm cannot carry. Checked BEFORE
+   * structuredClone: the extension's clone silently normalizes weak
+   * collections to empty plain objects, but the $N store must keep typed
+   * markers for them (what-you-saw-is-what-you-have — an orchestrator
+   * must be able to tell a WeakMap from a deleted property). Functions,
+   * symbols and promises throw in structuredClone anyway; the marker
+   * fallback handles them identically.
+   */
+  function isUncloneable(value) {
+    var t = typeof value;
+    if (t === 'function' || t === 'symbol') return true;
+    if (t !== 'object' || value === null) return false;
+    try {
+      if (value instanceof Promise) return true;
+      if (value instanceof WeakMap) return true;
+      if (value instanceof WeakSet) return true;
+      if (typeof WeakRef === 'function' && value instanceof WeakRef) return true;
+    } catch (_err) {
+      // instanceof probing threw (revoked/all-trap proxy) — treat as
+      // uncloneable; the fallback's own guards produce a marker.
+      return true;
+    }
+    return false;
+  }
+
+  function freezeValue(value) {
+    if (
+      !isUncloneable(value) &&
+      typeof globalThis.structuredClone === 'function' &&
+      depthWithin(value, CLONE_DEPTH_LIMIT)
+    ) {
+      try {
+        return globalThis.structuredClone(value);
+      } catch (_err) {
+        // Graph contains a non-cloneable — fall through to the marker copy.
+      }
+    }
+    try {
+      return safeDeepCopy(value);
+    } catch (_err) {
+      return unclonableMarker('unfreezable', safeString(value));
+    }
+  }
+
+  /** Typed marker stored in place of a value that cannot be copied. */
+  function unclonableMarker(type, description) {
+    var m = { __unclonable__: type };
+    if (description !== undefined) m.description = description;
+    return m;
+  }
+
+  /**
+   * Iterative (explicit-stack) check that a graph's first-visit nesting
+   * stays within 'limit'. Cycles/shared refs are handled with a visited
+   * set — which also mirrors structuredClone's own memoization, so this
+   * bounds ITS recursion depth. Any throw during traversal (revoked or
+   * all-trap proxies, hostile getters) means "not structuredClone-safe".
+   */
+  function depthWithin(root, limit) {
+    try {
+      if (root === null || typeof root !== 'object') return true;
+      var visited = new Set();
+      var stack = [{ v: root, d: 1 }];
+      while (stack.length) {
+        var frame = stack.pop();
+        if (frame.d > limit) return false;
+        var v = frame.v;
+        if (visited.has(v)) continue;
+        visited.add(v);
+        var children = [];
+        if (v instanceof Date || v instanceof RegExp ||
+            v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {
+          continue; // leaves
+        } else if (v instanceof Map) {
+          v.forEach(function (val, key) { children.push(key, val); });
+        } else if (v instanceof Set) {
+          v.forEach(function (val) { children.push(val); });
+        } else if (Array.isArray(v)) {
+          for (var i = 0; i < v.length; i++) children.push(v[i]);
+        } else {
+          var ks = Object.keys(v);
+          for (var j = 0; j < ks.length; j++) children.push(v[ks[j]]);
+        }
+        for (var c = 0; c < children.length; c++) {
+          var child = children[c];
+          if (child !== null && typeof child === 'object' && !visited.has(child)) {
+            stack.push({ v: child, d: frame.d + 1 });
+          }
+        }
+      }
+      return true;
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  /**
+   * Deep-copy fallback for freezeValue — ITERATIVE, driven by an explicit
+   * task stack, so arbitrary nesting depth cannot touch the (fatal-on-WASI)
+   * call stack. Preserves cycles and shared references (via 'seen'), copies
+   * Date/RegExp/Map/Set/Error/ArrayBuffer/typed arrays structurally, keeps
+   * own enumerable string-keyed properties of plain objects (matching
+   * structuredClone's property selection), and substitutes typed markers
+   * for functions, promises, symbols, and weak collections. Hostile
+   * getters/proxies cannot make it throw: every property read and every
+   * container fill is individually guarded.
+   */
+  function copyNode(value, tasks, seen) {
+    if (value === null) return value;
+    var t = typeof value;
+    if (t === 'number' || t === 'string' || t === 'boolean' ||
+        t === 'undefined' || t === 'bigint') {
+      return value;
+    }
+    if (t === 'symbol') {
+      return unclonableMarker('symbol', safeString(value.description));
+    }
+    if (t === 'function') {
+      var fnName = '(anonymous)';
+      try {
+        fnName = value.name || '(anonymous)';
+      } catch (_err) {
+        // A proxy-of-function with a throwing get trap.
+      }
+      return unclonableMarker('function', fnName);
+    }
+    // Objects: shared references and cycles map to the same copy.
+    if (seen.has(value)) return seen.get(value);
+    try {
+      if (value instanceof Promise) return unclonableMarker('promise');
+      if (value instanceof WeakMap) return unclonableMarker('weakmap');
+      if (value instanceof WeakSet) return unclonableMarker('weakset');
+      if (typeof WeakRef === 'function' && value instanceof WeakRef) {
+        return unclonableMarker('weakref');
+      }
+      if (value instanceof Date) return new Date(value.getTime());
+      if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+      if (value instanceof ArrayBuffer) return value.slice(0);
+      if (ArrayBuffer.isView(value)) {
+        if (value instanceof DataView) {
+          return new DataView(value.buffer.slice(0), value.byteOffset, value.byteLength);
+        }
+        return value.slice(); // typed arrays: slice() copies
+      }
+      var shell;
+      if (value instanceof Error) {
+        shell = new Error(value.message);
+        shell.name = value.name;
+        if (typeof value.stack === 'string') shell.stack = value.stack;
+        seen.set(value, shell);
+        tasks.push({ kind: 'props', src: value, dst: shell });
+        return shell;
+      }
+      if (value instanceof Map) {
+        shell = new Map();
+        seen.set(value, shell);
+        tasks.push({ kind: 'map', src: value, dst: shell });
+        return shell;
+      }
+      if (value instanceof Set) {
+        shell = new Set();
+        seen.set(value, shell);
+        tasks.push({ kind: 'set', src: value, dst: shell });
+        return shell;
+      }
+      if (Array.isArray(value)) {
+        shell = new Array(value.length);
+        seen.set(value, shell);
+        tasks.push({ kind: 'array', src: value, dst: shell });
+        return shell;
+      }
+      // Anything else (plain objects, class instances, proxies): copy own
+      // enumerable string-keyed properties onto a plain object. Prototypes
+      // are not preserved — the same normalization structuredClone applies.
+      shell = {};
+      seen.set(value, shell);
+      tasks.push({ kind: 'props', src: value, dst: shell });
+      return shell;
+    } catch (err) {
+      // instanceof / brand probing threw (revoked or all-trap proxy).
+      return unclonableMarker('unfreezable', safeString(err));
+    }
+  }
+
+  function fillTask(task, tasks, seen) {
+    var src = task.src;
+    var dst = task.dst;
+    if (task.kind === 'map') {
+      src.forEach(function (v, k) {
+        dst.set(copyNode(k, tasks, seen), copyNode(v, tasks, seen));
+      });
+      return;
+    }
+    if (task.kind === 'set') {
+      src.forEach(function (v) {
+        dst.add(copyNode(v, tasks, seen));
+      });
+      return;
+    }
+    if (task.kind === 'array') {
+      for (var i = 0; i < src.length; i++) {
+        try {
+          dst[i] = copyNode(src[i], tasks, seen);
+        } catch (err) {
+          dst[i] = unclonableMarker('thrown', safeString(err));
+        }
+      }
+      return;
+    }
+    // "props"
+    var keys;
+    try {
+      keys = Object.keys(src);
+    } catch (err) {
+      // A proxy's ownKeys trap threw — record the fact instead of failing.
+      dst.__unclonable__ = 'thrown';
+      dst.description = safeString(err);
+      return;
+    }
+    for (var j = 0; j < keys.length; j++) {
+      var k = keys[j];
+      try {
+        dst[k] = copyNode(src[k], tasks, seen);
+      } catch (err) {
+        // A getter (or proxy get trap) threw.
+        dst[k] = unclonableMarker('thrown', safeString(err));
+      }
+    }
+  }
+
+  function safeDeepCopy(root) {
+    var seen = new Map();
+    var tasks = [];
+    var result = copyNode(root, tasks, seen);
+    while (tasks.length) {
+      var task = tasks.pop();
+      try {
+        fillTask(task, tasks, seen);
+      } catch (err) {
+        // Container enumeration itself threw mid-fill (hostile iterator,
+        // fake Map/Set brand): record on the partial copy and move on.
+        try {
+          task.dst.__unclonable__ = 'thrown';
+          task.dst.description = safeString(err);
+        } catch (_err) {
+          // dst not expando-able — nothing more to record.
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Best-effort JSON-safe encoding of a (frozen) value for the console
+   * payload. This is a CONVENIENCE channel for hosts without a previewer —
+   * the authoritative channel is the '$N' refs, which the host previews via
+   * trap-free introspection. Strings/arrays/objects are capped (the full
+   * value always lives untruncated in $N); non-JSON values become tagged
+   * wrappers: { __undefined__ }, { __bigint__ }, { __nonfinite__ },
+   * { __date__ }, { __regexp__ }, { __error__ }, { __map__ }, { __set__ },
+   * { __binary__ }, { __cycle__ }, { __depth__ }.
+   */
+  function jsonSafe(value, depth, seen) {
+    if (value === null || typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      if (value.length > PAYLOAD_STRING_LIMIT) {
+        return value.slice(0, PAYLOAD_STRING_LIMIT) +
+          '…[+' + (value.length - PAYLOAD_STRING_LIMIT) + ' chars; full value in $N]';
+      }
+      return value;
+    }
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : { __nonfinite__: String(value) };
+    }
+    if (typeof value === 'bigint') return { __bigint__: value.toString() };
+    if (typeof value === 'undefined') return { __undefined__: true };
+    // DEFENSIVE ONLY — unreachable in practice: jsonSafe consumes freezeValue
+    // output, where symbols/functions/promises were already replaced by
+    // { __unclonable__ } markers. Kept so a future caller of jsonSafe on
+    // unfrozen values cannot make it throw.
+    if (typeof value === 'symbol') return { __symbol__: safeString(value.description) };
+    if (typeof value === 'function') return { __function__: value.name || '(anonymous)' };
+    // Objects.
+    if (seen.has(value)) return { __cycle__: true };
+    if (depth >= PAYLOAD_DEPTH_LIMIT) return { __depth__: true };
+    seen.add(value);
+    try {
+      if (value instanceof Date) return { __date__: value.toISOString() };
+      if (value instanceof RegExp) return { __regexp__: String(value) };
+      // DEFENSIVE ONLY — see the symbol/function note above.
+      if (value instanceof Promise) return { __promise__: true };
+      if (value instanceof Error) {
+        return {
+          __error__: true,
+          name: value.name,
+          message: jsonSafe(value.message, depth + 1, seen),
+        };
+      }
+      if (value instanceof ArrayBuffer) {
+        return { __binary__: 'ArrayBuffer', byteLength: value.byteLength };
+      }
+      if (ArrayBuffer.isView(value)) {
+        return {
+          __binary__: value.constructor && value.constructor.name ? value.constructor.name : 'TypedArray',
+          byteLength: value.byteLength,
+        };
+      }
+      if (value instanceof Map) {
+        var mapEntries = [];
+        var mTruncated = 0;
+        value.forEach(function (v, k) {
+          if (mapEntries.length < PAYLOAD_ENTRY_LIMIT) {
+            mapEntries.push([jsonSafe(k, depth + 1, seen), jsonSafe(v, depth + 1, seen)]);
+          } else {
+            mTruncated++;
+          }
+        });
+        var mapOut = { __map__: mapEntries };
+        if (mTruncated) mapOut.__truncated__ = mTruncated;
+        return mapOut;
+      }
+      if (value instanceof Set) {
+        var setEntries = [];
+        var sTruncated = 0;
+        value.forEach(function (v) {
+          if (setEntries.length < PAYLOAD_ENTRY_LIMIT) {
+            setEntries.push(jsonSafe(v, depth + 1, seen));
+          } else {
+            sTruncated++;
+          }
+        });
+        var setOut = { __set__: setEntries };
+        if (sTruncated) setOut.__truncated__ = sTruncated;
+        return setOut;
+      }
+      if (Array.isArray(value)) {
+        var n = Math.min(value.length, PAYLOAD_ARRAY_LIMIT);
+        var arrOut = new Array(n);
+        for (var i = 0; i < n; i++) arrOut[i] = jsonSafe(value[i], depth + 1, seen);
+        if (value.length > n) arrOut.push({ __truncated__: value.length - n });
+        return arrOut;
+      }
+      var objOut = {};
+      var keys = Object.keys(value);
+      var kn = Math.min(keys.length, PAYLOAD_OBJECT_LIMIT);
+      for (var j = 0; j < kn; j++) objOut[keys[j]] = jsonSafe(value[keys[j]], depth + 1, seen);
+      if (keys.length > kn) objOut.__truncated_keys__ = keys.length - kn;
+      return objOut;
+    } finally {
+      seen.delete(value);
+    }
+  }
+
+  /**
+   * The guest half of the bridge. For every argument: freeze a copy, store
+   * it as the next real '$N' global, and forward
+   * { refs: ["$14", ...], args: [<json-safe best effort>, ...] } to
+   * __host_console as a JSON string. console.* NEVER throws — a broken
+   * value or a missing/failing host sink must not take down guest code.
+   */
+  function emitLog(level, args) {
+    try {
+      var refs = [];
+      var payloadArgs = [];
+      // Every argument is processed under its OWN guard: one hostile value
+      // must never drop the whole log call, orphan sibling $N slots, or
+      // suppress the host event — it degrades to a typed marker instead.
+      for (var i = 0; i < args.length; i++) {
+        var frozen;
+        try {
+          frozen = freezeValue(args[i]);
+        } catch (_err) {
+          frozen = unclonableMarker('unfreezable', '[unstringifiable]');
+        }
+        var n = ++state.logSeq;
+        // Real realm globals, writable: the $N store is the agent's own
+        // workspace — it may slice, transform, or delete entries.
+        globalThis['$' + n] = frozen;
+        refs.push('$' + n);
+        var encoded;
+        try {
+          encoded = jsonSafe(frozen, 0, new Set());
+        } catch (_err) {
+          encoded = unclonableMarker('unfreezable');
+        }
+        payloadArgs.push(encoded);
+      }
+      if (typeof globalThis.__host_console === 'function') {
+        globalThis.__host_console(level, JSON.stringify({ refs: refs, args: payloadArgs }));
+      }
+    } catch (_err) {
+      // Deliberately swallowed: the bridge is best-effort by contract.
+    }
+  }
+
+  var consoleObject = {};
+  ['log', 'info', 'warn', 'error', 'debug'].forEach(function (level) {
+    consoleObject[level] = function () {
+      emitLog(level, Array.prototype.slice.call(arguments));
+    };
+  });
+  // Method-level sabotage protection: the console global is non-writable
+  // (installGlobal), and the OBJECT is frozen so its methods cannot be
+  // reassigned or deleted either — combinator diagnostics (parallel/
+  // pipeline warn on swallowed failures) always reach the bridge.
+  Object.freeze(consoleObject);
+
+  // ────────────────────────────────────────────────────────────────────────
+  // The reconciliation surface — the host's post-restore door back into the
+  // registry. Keyed by Symbol.for so it stays out of the workspace manifest
+  // and out of the DSL vocabulary the orchestrator is conditioned on, while
+  // remaining reachable from any host (global symbols survive snapshots and
+  // round-trip through every host binding). See the package README's host
+  // contract.
+  // ────────────────────────────────────────────────────────────────────────
+
+  var surface = {
+    /** Guest library version (same value as __REPL_GUEST_VERSION). */
+    version: VERSION,
+    /**
+     * JSON-safe manifest of every pending host call, oldest first:
+     * [{ id, kind: "agent" | "checkpoint" | "steer", detail, optionsJson,
+     * createdAt }]. 'detail' is the verbatim prompt/question/action,
+     * 'optionsJson' the verbatim options string (or null) — enough for the
+     * host to re-issue lost work.
+     */
+    pending: function () {
+      var out = [];
+      registryForEach.call(state.registry, function (entry) {
+        out.push({
+          id: entry.id,
+          kind: entry.kind,
+          detail: entry.detail,
+          optionsJson: entry.optionsJson,
+          createdAt: entry.createdAt,
+        });
+      });
+      return out;
+    },
+    /**
+     * Settle a pending call by id: outcome is "resolve" or "reject", value
+     * is the result (or the error / { message, code?, recoverable? }
+     * object). Returns true iff a pending entry was settled; false for
+     * unknown or already-settled ids (idempotent — safe to call on both
+     * the live path and the reconciliation path).
+     */
+    settle: function (callId, outcome, value) {
+      if (outcome !== 'resolve' && outcome !== 'reject') {
+        throw new TypeError('settle(callId, outcome, value): outcome must be "resolve" or "reject"');
+      }
+      return settleCall(callId, outcome, value);
+    },
+    /** Counters for diagnostics and the workspace manifest. */
+    stats: function () {
+      return {
+        version: VERSION,
+        callSeq: state.callSeq,
+        logSeq: state.logSeq,
+        pendingCalls: registrySize.call(state.registry),
+      };
+    },
+  };
+  Object.freeze(surface);
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Install the globals
+  // ────────────────────────────────────────────────────────────────────────
+
+  function installGlobal(name, value) {
+    try {
+      Object.defineProperty(globalThis, name, {
+        value: value,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+      });
+    } catch (_err) {
+      // The realm predefined the name non-configurably — fall back to
+      // assignment so the DSL still works.
+      globalThis[name] = value;
+    }
+  }
+
+  // Freeze every installed function object so its methods and properties
+  // cannot be reassigned (agent carries the handle-method factory surface;
+  // checkpoint carries 'answer'; the combinators are pure functions).
+  Object.freeze(agent);
+  Object.freeze(checkpoint);
+  Object.freeze(parallel);
+  Object.freeze(pipeline);
+  Object.freeze(verify);
+  Object.freeze(judgePanel);
+  Object.freeze(gate);
+  Object.freeze(retry);
+  Object.freeze(loopUntilDry);
+
+  installGlobal('agent', agent);
+  installGlobal('checkpoint', checkpoint);
+  installGlobal('parallel', parallel);
+  installGlobal('pipeline', pipeline);
+  installGlobal('verify', verify);
+  installGlobal('judgePanel', judgePanel);
+  installGlobal('gate', gate);
+  installGlobal('retry', retry);
+  installGlobal('loopUntilDry', loopUntilDry);
+  installGlobal('console', consoleObject);
+
+  // Version marker (snapshot versioning: hosts read this — or
+  // surface.version — to know which guest library a restored workspace
+  // carries; see the README's version-compatibility rules).
+  Object.defineProperty(globalThis, VERSION_GLOBAL, {
+    value: VERSION,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
+  Object.defineProperty(globalThis, Symbol.for(SURFACE_KEY), {
+    value: surface,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+})();
+`;

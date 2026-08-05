@@ -52,3 +52,43 @@ export interface WasmModule {
  * bytes, or a compiled module (from `loadShippedWasm`).
  */
 export type WasmInput = ArrayBuffer | ArrayBufferView | WasmModule;
+
+/**
+ * An extension record in a snapshot's metadata (name, memory/table base,
+ * init function) — the engine's self-contained stand-in for the shim's
+ * `SnapshotExtension`, kept in lockstep with quickjs-wasi's shape so a
+ * snapshot taken through the shim round-trips without conversion.
+ */
+export interface ReplSnapshotExtension {
+  /** Extension name as passed at create/restore time (e.g. `structured-clone`). */
+  name: string;
+  /** Allocated base offset in linear memory for this extension's static data. */
+  memoryBase: number;
+  /** Allocated base offset in the indirect function table. */
+  tableBase: number;
+  /** Name of the init function exported by the extension. */
+  initFn: string;
+}
+
+/**
+ * A snapshot of a VM's full state (raw WASM linear memory plus runtime
+ * pointers) — the engine's self-contained stand-in for the shim's
+ * `Snapshot` type, so `ReplVm.restore` can be declared without naming
+ * quickjs-wasi types (a consumer with a non-DOM lib and `skipLibCheck:
+ * false` must type-check the published declarations cleanly).
+ *
+ * Structurally identical to the shim's `Snapshot`, so a snapshot produced
+ * through the shim (`vm.snapshot()`) satisfies it directly.
+ */
+export interface ReplSnapshot {
+  /** The raw WASM linear memory contents. */
+  memory: Uint8Array;
+  /** The stack pointer value at snapshot time. */
+  stackPointer: number;
+  /** Pointer to the JSRuntime in WASM memory. */
+  runtimePtr: number;
+  /** Pointer to the JSContext in WASM memory. */
+  contextPtr: number;
+  /** Metadata about loaded extensions (empty if none). */
+  extensions: ReplSnapshotExtension[];
+}
