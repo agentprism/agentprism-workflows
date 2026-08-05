@@ -4,6 +4,7 @@
     { "path": "packages/shared-types" },
     { "path": "packages/acp-agents" },
     { "path": "packages/workflow-engine" },
+    { "path": "packages/repl-engine" },
     { "path": "packages/mcp-server" },
     { "path": "packages/pi-acp" },
     { "path": "packages/workflows" },

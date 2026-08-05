@@ -67,7 +67,7 @@ extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (co
 source) and write the rest fresh. The engine imports no Pi code; `acp-agents` reaches Pi only by
 spawning the exact-pinned `@automatalabs/pi-acp` package as an ACP server.
 
-The code is published as **eight packages** with a one-way dependency direction. The three lower
+The code is published as **nine packages** with a one-way dependency direction. The lower
 layers remain independently usable — in particular, the ACP agent logic and workflow engine both
 work **with no MCP server at all** — while the facade and integration leaves stay thin.
 
@@ -90,6 +90,16 @@ work **with no MCP server at all** — while the facade and integration leaves s
               └──────────────┬────────────────┘
                              ▼
                 shared-types — AgentRunner seam
+```
+
+A leaf outside that chain is the REPL engine (roadmap `repl-orchestrator`):
+
+```
+ ┌──────────────────────────┐
+ │ repl-engine              │   persistent JS REPL in a QuickJS-in-WASM VM;
+ │ REPL VM layer            │   composes only the quickjs-wasi shim today.
+ │ (roadmap: repl-orchestrator)│   The repl MCP tool wiring into mcp-server
+ └──────────────────────────┘   is a later phase.
 ```
 
 `workflow-engine` and `acp-agents` are **siblings**: neither imports the other. They meet only at
@@ -163,11 +173,12 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **eight** published packages —
+> Packaging (as implemented): a pnpm monorepo of **nine** published packages —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
 > `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade), and
-> `@automatalabs/agentprism-otel` (the optional telemetry bridge), and `@automatalabs/pi-acp`
-> (the standalone in-process pi ACP server).
+> `@automatalabs/agentprism-otel` (the optional telemetry bridge), `@automatalabs/pi-acp`
+> (the standalone in-process pi ACP server), and `@automatalabs/repl-engine`
+> (the REPL orchestrator's QuickJS-in-WASM VM layer; the `repl` MCP tool is a later roadmap phase).
 > The dependency direction and the `AgentRunner` seam are the contract.
 
 ### Lifted from `pi-dynamic-workflows` → `workflow-engine` (copied/adapted, mostly unchanged)

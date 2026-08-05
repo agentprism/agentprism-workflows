@@ -192,7 +192,7 @@ test("public package inventories cover every workspace package", () => {
       manifest: JSON.parse(readRepoFile(`packages/${entry.name}/package.json`)) as { name: string },
     }));
 
-  assert.equal(manifests.length, 8, "update the documented package-count contract when the workspace changes");
+  assert.equal(manifests.length, 9, "update the documented package-count contract when the workspace changes");
   for (const path of ["README.md", "docs/api.md", "docs/design-notes.md"]) {
     const text = readRepoFile(path);
     for (const { manifest } of manifests) {
@@ -204,8 +204,8 @@ test("public package inventories cover every workspace package", () => {
   for (const { dir } of manifests) {
     assert.ok(contributing.includes(`packages/${dir}`), `CONTRIBUTING.md must inventory packages/${dir}`);
   }
-  assert.match(contributing, /\(monorepo\) of eight packages/);
-  assert.match(readRepoFile("docs/design-notes.md"), /monorepo of \*\*eight\*\* published packages/);
+  assert.match(contributing, /\(monorepo\) of nine packages/);
+  assert.match(readRepoFile("docs/design-notes.md"), /monorepo of \*\*nine\*\* published packages/);
 });
 
 test("auth, MCP, and authoring docs retain the implemented contracts", () => {

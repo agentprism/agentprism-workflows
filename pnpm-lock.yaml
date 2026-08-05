@@ -171,6 +171,12 @@ importers:
         specifier: 0.83.0
         version: 0.83.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.1)(zod@4.4.3)
 
+  packages/repl-engine:
+    dependencies:
+      quickjs-wasi:
+        specifier: 3.3.1
+        version: 3.3.1
+
   packages/shared-types:
     dependencies:
       typebox:
@@ -2148,6 +2154,9 @@ packages:
 
   queue-microtask@1.2.3:
     resolution: {integrity: sha512-NuaNSa6flKT5JaSYQzJok04JzTL1CA6aGhv5rfLW3PgqA+M2ChpZQnAC8h8i4ZFkBS8X5RqkDBHA7r4hej3K9A==}
+
+  quickjs-wasi@3.3.1:
+    resolution: {integrity: sha512-03RhBUA6hNX4274oa10pWpkXsbOhgqTvCoFPm8Dy3E7jcp+obNHVQGQZXghcNOutJaiOWkyezwdgbANHD1/Gxw==}
 
   range-parser@1.2.1:
     resolution: {integrity: sha512-Hrgsx+orqoygnmhFbKaHE6c296J+HTAQXoxEF6gNupROmmGJRoyzfG3ccAveqCBrwr/2yxQ5BVd/GTl5agOwSg==}
@@ -4544,6 +4553,8 @@ snapshots:
   quansync@0.2.11: {}
 
   queue-microtask@1.2.3: {}
+
+  quickjs-wasi@3.3.1: {}
 
   range-parser@1.2.1: {}
 

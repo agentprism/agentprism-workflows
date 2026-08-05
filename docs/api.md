@@ -1,6 +1,6 @@
 # API reference
 
-The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.23.1, `acp-agents` 0.22.1, `workflow-engine` 0.12.0, `shared-types` 0.14.0, `mcp-server` 0.4.1, and `agentprism-otel` 0.1.0.
+The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.23.1, `acp-agents` 0.22.1, `workflow-engine` 0.12.0, `shared-types` 0.14.0, `mcp-server` 0.4.1, and `agentprism-otel` 0.1.0. `repl-engine` is unreleased (0.0.0) until its `repl` tool wiring lands.
 
 Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 
@@ -14,6 +14,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/pi-acp` | Standalone in-process pi coding-agent ACP server (bin `pi-acp`) with a side-effect-free library entry | You use the first-class `pi` backend or embed the ACP server directly |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
+| `@automatalabs/repl-engine` | The REPL orchestrator engine: persistent JavaScript REPL in a QuickJS-in-WASM VM — workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts | You build a persistent-JS-REPL surface (the `repl` MCP tool is the roadmap's later phase; this package is its engine tier) |
 
 ---
 
