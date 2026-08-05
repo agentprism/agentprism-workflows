@@ -108,6 +108,9 @@ importers:
 
   packages/mcp-server:
     dependencies:
+      '@automatalabs/repl-engine':
+        specifier: workspace:*
+        version: link:../repl-engine
       '@automatalabs/shared-types':
         specifier: workspace:*
         version: link:../shared-types

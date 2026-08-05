@@ -20,6 +20,8 @@ import {
   workflowHomeDir,
   type WorkflowRunResult,
 } from "@automatalabs/workflows";
+import type { ReplProjectState } from "./repl-project.js";
+import { disposeReplProjectState } from "./repl-project.js";
 
 export const MAX_BACKGROUND_RUNS = 4;
 
@@ -68,6 +70,10 @@ export interface ProjectContext {
   projectDir: string;
   manager: WorkflowManager;
   backgroundRuns: BackgroundRunRegistry;
+  /** The REPL workspace's daemon state (phase D): created on first touch
+   *  of the `repl` tool, null until then — a pure-workflow project never
+   *  opens a repl store. See `src/repl-project.ts`. */
+  repl?: ReplProjectState;
 }
 
 /** The routing surface WorkflowScriptResources needs — a registry, or a single pinned store. */
@@ -193,6 +199,15 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
     let total = 0;
     for (const context of this.contexts.values()) total += context.backgroundRuns.activeCount();
     return total;
+  }
+
+  /** Dispose every context's REPL workspace (broker teardown — releasing
+   *  every held ACP session — plus the store close). Called by the daemon
+   *  at shutdown; the workflow managers' own lifecycle is untouched. */
+  async disposeReplStates(): Promise<void> {
+    for (const context of this.contexts.values()) {
+      if (context.repl !== undefined) await disposeReplProjectState(context.repl);
+    }
   }
 
   snapshot(): Array<{ projectDir: string; activeRuns: number }> {

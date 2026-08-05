@@ -210,10 +210,17 @@ export class ReplWorkspaceStore {
    * Load the enveloped snapshot and verify its identity against the
    * binary the host is about to restore with. A wasm-hash mismatch
    * REFUSES LOUDLY naming both hashes (never a restore into garbage —
-   * the doc's transfer lesson 5); a version bump or a corrupt/truncated
-   * file refuses with `SnapshotEnvelopeError` naming the file and the
-   * problem. Single-shot: the error propagates to the caller, and the
-   * store stays usable (a fresh `writeSnapshot` or `reset()`).
+   * the doc's transfer lesson 5; the check runs INSIDE the envelope
+   * deserializer, between the header parse and the payload decode, so a
+   * snapshot recorded by another binary refuses as WASM_HASH_MISMATCH
+   * even when its payload would not deserialize here — a phase-D review
+   * regression: the comparison used to happen after the payload was
+   * interpreted, so an incompatible old payload failed as
+   * CORRUPT_PAYLOAD without naming the hashes); a version bump or a
+   * corrupt/truncated file refuses with `SnapshotEnvelopeError` naming
+   * the file and the problem. Single-shot: the error propagates to the
+   * caller, and the store stays usable (a fresh `writeSnapshot` or
+   * `reset()`).
    */
   loadSnapshot(wasm: WasmInput): RestoredReplSnapshot {
     if (!existsSync(this.snapshotPath)) {
@@ -223,17 +230,10 @@ export class ReplWorkspaceStore {
         { path: this.snapshotPath },
       );
     }
-    const envelope = deserializeSnapshot(readFileSync(this.snapshotPath), { path: this.snapshotPath });
-    const running = wasmSha256Of(wasm);
-    if (envelope.meta.wasmSha256 !== running) {
-      throw new SnapshotEnvelopeError(
-        'WASM_HASH_MISMATCH',
-        `snapshot ${this.snapshotPath} was laid out by wasm binary sha256 ${envelope.meta.wasmSha256}, but ` +
-          `the running binary hashes to ${running} — refusing to restore into garbage (a quickjs-wasi ` +
-          `upgrade invalidated this snapshot; recreate the workspace)`,
-        { path: this.snapshotPath, recorded: envelope.meta.wasmSha256, expected: running },
-      );
-    }
+    const envelope = deserializeSnapshot(readFileSync(this.snapshotPath), {
+      path: this.snapshotPath,
+      expectedWasmSha256: wasmSha256Of(wasm),
+    });
     return {
       snapshot: envelope.snapshot,
       wasmSha256: envelope.meta.wasmSha256,
@@ -246,9 +246,12 @@ export class ReplWorkspaceStore {
    * The project's append-only call store (`calls.jsonl` — a durable
    * `JsonlCallStore`, opened lazily on first use and closed by `close`/
    * `reset`). One store per project: forks of one snapshot mint
-   * overlapping call ids, so each project keeps its own ledger.
+   * overlapping call ids, so each project keeps its own ledger. The
+   * `repl/` directory is recreated when missing (after a `reset()` a
+   * fresh use self-heals, like the snapshot writer does).
    */
   callStore(): JsonlCallStore {
+    mkdirSync(this.replDir, { recursive: true });
     this.callStoreInstance ??= JsonlCallStore.open(this.callStorePath);
     return this.callStoreInstance;
   }

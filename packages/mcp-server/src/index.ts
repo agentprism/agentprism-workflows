@@ -50,6 +50,15 @@ export type {
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
+export { replToolInputShape } from "./repl-tool.js";
+export type { ReplToolOptions } from "./repl-tool.js";
+export {
+  createReplProjectState,
+  ensureReplWorkspace,
+  disposeReplProjectState,
+  resetReplProjectState,
+} from "./repl-project.js";
+export type { ReplProjectState, ReplInterruptSignal } from "./repl-project.js";
 export {
   RUN_MONITOR_RESOURCE_URI,
   WORKFLOW_EVENTS_TOOL_NAME,

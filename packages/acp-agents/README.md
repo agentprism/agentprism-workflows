@@ -270,6 +270,9 @@ Also exported: `AcpAgentPool` / `resolvePoolSize` (including the same deadline-o
 | `AGENTPRISM_CODEX_ACP_CMD` / `AGENTPRISM_CODEX_ACP_ARGS` | Override the command (and args) used to spawn the Codex ACP server. |
 | `AGENTPRISM_CODEX_ACP_BIN` | Override only the resolved Codex ACP bin path (keeps the default node launcher). |
 | `AGENTPRISM_OPENCODE_ACP_CMD` / `AGENTPRISM_OPENCODE_ACP_ARGS` | Override the command (and args) used to spawn the OpenCode ACP server. |
+| `AGENTPRISM_OPENCODE_DATA_ROOT` | Override the opencode built-in's stable per-user XDG data/state/cache root (default: `<data home>/agentprism/opencode`) — the tree where agent-persisted sessions live so cross-process `session/load` re-attachment is real. |
+| `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS` | The loaded-session founding-turn stream-settled grace (`awaitCurrentTurn`, default `250` ms). |
+| `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` | The loaded-session founding-turn never-hang-unobserved backstop (`awaitCurrentTurn`, default `900000` = 15 min). |
 | `AGENTPRISM_PI_ACP_CMD` / `AGENTPRISM_PI_ACP_ARGS` | Override the command (and args) used to spawn the bundled pi ACP server. |
 
 ## License

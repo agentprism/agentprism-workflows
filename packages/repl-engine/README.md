@@ -469,17 +469,32 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
 - **`BrokerSession.awaitCurrentTurn` is REAL on the acp-agents adapter** (the loaded
   session's founding-turn completion; `InteractiveSession.awaitCurrentTurn`, phase-D
   review round 1: the seam used to be absent, so every built-in backend loaded, released,
-  and re-issued). Its protocol-bounded semantics: the `session/load` contract (the agent
-  replays the entire persisted conversation and only then resolves the load) makes the
-  founding turn's completion observable exactly when the replayed transcript's trailing
-  content event is an assistant message — a turn that ended while the daemon was down has
-  its final message in the replay, and the seam resolves with it (`stopReason` synthesized
-  `end_turn`; the protocol's replay carries none). A turn still IN FLIGHT at the backend
-  has NO observable completion (the protocol has no turn-end signal for a turn this
-  client did not start), so the seam rejects and the broker degrades to re-issue — the
-  loaded session released best-effort, re-dispatched under the same id, surfaced
-  guest-visibly, never a hanging call. A third-party `BrokerSession` adapter without the
-  seam degrades the same way.
+  and re-issued). Its protocol-bounded semantics (phase-D review round 2: a trailing
+  `agent_message_chunk` used to be treated as proof of completion — ACP message chunks are
+  PROGRESS, not terminal markers, so partial output of a still-streaming turn could be
+  settled as success; and a successfully loaded session whose founding turn was still
+  running used to be released and re-issued, risking duplicated work): the `session/load`
+  contract (the agent replays the entire persisted conversation and only then resolves the
+  load) plus an OBSERVING wait — the seam waits for the update stream to SETTLE (no
+  session/update for the loaded-turn settle grace, default 250 ms,
+  `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS`), and only then reads the transcript's
+  trailing content. A turn that ended while the daemon was down has its final message in
+  the replay, and the seam resolves with it — the REAL accumulated text, `stopReason`
+  synthesized `end_turn` (the protocol's replay carries none; the broker's own
+  result-shaping gates — the empty-output refusal, the schema ladder — still apply). A
+  turn still IN FLIGHT at the backend keeps streaming live chunks after the load response:
+  the seam KEEPS THE LOADED SESSION ATTACHED and waits for the turn's authoritative
+  completion (settling from it — never a re-issue of a running turn). The seam rejects —
+  and the broker degrades to re-issue, surfaced guest-visibly — only on genuine failure: a
+  transcript with no user message (the recorded session never received its prompt), a
+  released/dead session, or a stream that settled without a terminal assistant message
+  within the max-wait bound (default 15 min, `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` —
+  the "never hang unobserved" backstop). The broker arms the re-attached call on the seam
+  WITHOUT blocking reconcile (a still-running turn may take minutes): reconcile returns
+  immediately, the pump delivers the completion through the same record → settle →
+  consume path as a live call, and a seam rejection re-issues inside the task (the call's
+  own concurrency token is reused). A third-party `BrokerSession` adapter without the seam
+  still re-attaches the session, then degrades to re-issue the same way.
 - **Pending steers whose wire call died with the process resolve `failed`** (recorded +
   settled + warned): their outcome is unknowable and re-injecting would duplicate; the one
   exception is queued-but-undelivered steers, whose payload is in the store (the phase-C
@@ -639,26 +654,44 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
   open (`recordAttached`, written BEFORE the prompt — a crash with a turn in flight leaves
   a restore able to re-attach instead of duplicating). A re-attached call's completion is
   the loaded session's founding turn, observed through the REAL
-  `BrokerSession.awaitCurrentTurn` seam on acp-agents' `InteractiveSession` (its
-  protocol-bounded semantics: the `session/load` replay makes the completed-while-down
-  turn's final message observable and the seam resolves with it; a turn still in flight at
-  the backend has no observable completion over the protocol, so the seam rejects and the
-  broker degrades to re-issue — released and re-dispatched, surfaced guest-visibly, so a
-  re-attached call can never hang unobserved; a third-party adapter without the seam
-  degrades the same way). Pending checkpoints re-surface (answerable
+  `BrokerSession.awaitCurrentTurn` seam on acp-agents' `InteractiveSession` (an OBSERVING
+  wait: the seam keeps the loaded session attached while a still-running turn streams live
+  chunks after the load response and settles from its authoritative completion — see the
+  seam's semantics above; it rejects only on genuine unobservability, where the broker
+  re-issues inside the armed task, surfaced guest-visibly, never a hanging call; a
+  third-party adapter without the seam degrades the same way). Pending checkpoints
+  re-surface (answerable
   across a restore, through the reconciliation surface) and pending steers whose wire call
   died with the process resolve the honest `failed` with a warn line (their outcome is
   unknowable; re-injecting would duplicate; queued-but-undelivered steers are the one
   exception — the phase-C queue rebuild re-queues them exactly once). Reconcile is
-  idempotent: a repeated reconcile never re-attaches or re-issues twice.
+  idempotent: a repeated reconcile never re-attaches or re-issues twice. Reconcile-time
+  re-issue refusals (invalid registry options, the concurrency cap — including the
+  no-recorded-session and adapter-without-seam branches) settle the guest and participate
+  in the changed-VM drain + settlement boundary.
+
+## Daemon wiring (phase D, in `mcp-server`)
+
+The `repl` MCP tool is registered in `mcp-server` and wired to the daemon's project model
+(the roadmap doc's Surface section): one persistent VM per `projectDir` context. The
+per-project context opens this phase's store — `repl/` under
+`workflowHomeDir()/projects/<key>/` — and on FIRST TOUCH either restores the stored
+workspace (enveloped snapshot → `Workspace.restore` → broker attach → the three-way
+`reconcile()`) or creates a fresh one; the broker's state-changing-boundary sink is
+attached so every eval and every settlement drain that changed VM state persists. A stored
+snapshot that REFUSES on first touch (corrupt/truncated, format-version bump, or a
+wasm-hash mismatch naming both hashes) is CONTAINED: the refusal is surfaced loudly in
+every `repl` result and `reset` clears the store — the daemon never crash-loops and never
+silently discards the data. The workspace therefore survives daemon restarts: this is the
+production wiring the phase-D review demanded (`ReplWorkspaceStore` used to be
+exported/tested only).
 
 ## Out of scope for this phase (later phases, per the roadmap doc)
 
-The client-presence session-drain policy, the per-backend steering mechanism table (the
+The client-presence session-drain policy and the per-backend steering mechanism table (the
 mechanism is decided and documented in `src/broker.ts`; the doc's generated documentation
-table is the observability layer's artifact), the workspace manifest, and the `repl` MCP
-tool registration in `mcp-server` (which wires the daemon's project model — and this
-phase's store + restore path — to `WorkspaceRegistry` and the broker).
+table is the observability layer's artifact). The workspace manifest (the `status` tool's
+manifest is currently the broker's live-agent/pending surface).
 
 ## Development
 

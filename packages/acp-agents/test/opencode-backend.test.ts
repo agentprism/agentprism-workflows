@@ -12,6 +12,7 @@ const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Bool
 const ENV_KEYS = [
   "AGENTPRISM_OPENCODE_ACP_CMD",
   "AGENTPRISM_OPENCODE_ACP_ARGS",
+  "AGENTPRISM_OPENCODE_DATA_ROOT",
   "OPENCODE_DB",
   "XDG_DATA_HOME",
   "XDG_STATE_HOME",
@@ -57,23 +58,53 @@ test("OpenCodeBackend.spawnConfig: CMD override wins and argv comes only from _A
   });
 });
 
-test("OpenCodeBackend.spawnConfig: every spawn isolates its own XDG data/state/cache trees (anomalyco/opencode#31307)", () => {
-  withEnv({ XDG_DATA_HOME: undefined }, () => {
-    const backend = new OpenCodeBackend();
-    const first = backend.spawnConfig().env;
-    const second = backend.spawnConfig().env;
-    assert.ok(first.XDG_DATA_HOME && second.XDG_DATA_HOME, "each spawn env carries an isolated XDG_DATA_HOME");
-    assert.notEqual(first.XDG_DATA_HOME, second.XDG_DATA_HOME, "concurrent spawns must never share state");
-    assert.match(first.XDG_DATA_HOME!, /agentprism-opencode-[^/]+[/\\]data$/);
-    assert.match(first.XDG_STATE_HOME ?? "", /[/\\]state$/);
-    assert.match(first.XDG_CACHE_HOME ?? "", /[/\\]cache$/);
-    assert.equal(first.OPENCODE_DISABLE_AUTOUPDATE, "1");
-    assert.equal(first.XDG_CONFIG_HOME, process.env.XDG_CONFIG_HOME, "user config stays shared");
-    assert.ok(existsSync(join(first.XDG_DATA_HOME!, "opencode")), "isolated data dir is pre-created");
-  });
+test("OpenCodeBackend.spawnConfig: every spawn uses the SAME stable XDG data/state/cache trees (phase-D re-attach)", () => {
+  // The data root is STABLE per user+host so agent-persisted sessions survive pool recycles
+  // and daemon restarts (phase-D review: a random tmpdir per spawn made cross-process
+  // session/load fall back to a fresh session — re-attachment was not real for opencode).
+  // The test pins the stable root under an explicit override so it never touches the user's
+  // real home, and asserts the exact layout.
+  const stableRoot = mkdtempSync(join(tmpdir(), "oc-stable-root-"));
+  try {
+    withEnv({ AGENTPRISM_OPENCODE_DATA_ROOT: stableRoot }, () => {
+      const backend = new OpenCodeBackend();
+      const first = backend.spawnConfig().env;
+      const second = backend.spawnConfig().env;
+      assert.ok(first.XDG_DATA_HOME && second.XDG_DATA_HOME, "each spawn env carries a dedicated XDG_DATA_HOME");
+      assert.equal(first.XDG_DATA_HOME, second.XDG_DATA_HOME, "the data tree is STABLE across spawns (sessions persist)");
+      assert.equal(first.XDG_STATE_HOME, second.XDG_STATE_HOME, "the state tree is stable across spawns");
+      assert.equal(first.XDG_CACHE_HOME, second.XDG_CACHE_HOME, "the cache tree is stable across spawns");
+      assert.equal(first.XDG_DATA_HOME, join(stableRoot, "data"), "the stable root's data dir is used");
+      assert.match(first.XDG_STATE_HOME ?? "", /[/\\]state$/);
+      assert.match(first.XDG_CACHE_HOME ?? "", /[/\\]cache$/);
+      assert.equal(first.OPENCODE_DISABLE_AUTOUPDATE, "1");
+      assert.equal(first.XDG_CONFIG_HOME, process.env.XDG_CONFIG_HOME, "user config stays shared");
+      assert.ok(existsSync(join(first.XDG_DATA_HOME!, "opencode")), "the data dir is pre-created");
+    });
+  } finally {
+    rmSync(stableRoot, { recursive: true, force: true });
+  }
 });
 
-test("OpenCodeBackend.spawnConfig: seeds credentials from the real data dir into the isolated tree", () => {
+test("OpenCodeBackend.spawnConfig: the stable root lives under the user's data home by default (agentprism/opencode)", () => {
+  // Without an override the root derives from the user's XDG_DATA_HOME (or ~/.local/share),
+  // as a SIBLING of the real opencode dir — the daemon's instances never overlap the user's
+  // own TUI store, and the root is stable across processes.
+  const fixtureData = mkdtempSync(join(tmpdir(), "oc-default-root-"));
+  try {
+    withEnv({ XDG_DATA_HOME: fixtureData }, () => {
+      const env = new OpenCodeBackend().spawnConfig().env;
+      assert.equal(env.XDG_DATA_HOME, join(fixtureData, "agentprism", "opencode", "data"));
+      assert.equal(env.XDG_STATE_HOME, join(fixtureData, "agentprism", "opencode", "state"));
+      assert.equal(env.XDG_CACHE_HOME, join(fixtureData, "agentprism", "opencode", "cache"));
+      assert.ok(existsSync(join(fixtureData, "agentprism", "opencode", "data", "opencode")), "the data dir is pre-created");
+    });
+  } finally {
+    rmSync(fixtureData, { recursive: true, force: true });
+  }
+});
+
+test("OpenCodeBackend.spawnConfig: seeds credentials from the real data dir into the stable tree", () => {
   const fixtureData = mkdtempSync(join(tmpdir(), "oc-auth-fixture-"));
   mkdirSync(join(fixtureData, "opencode"), { recursive: true });
   writeFileSync(join(fixtureData, "opencode", "auth.json"), '{"fixture":true}');
@@ -81,7 +112,7 @@ test("OpenCodeBackend.spawnConfig: seeds credentials from the real data dir into
     withEnv({ XDG_DATA_HOME: fixtureData }, () => {
       const env = new OpenCodeBackend().spawnConfig().env;
       const seeded = join(env.XDG_DATA_HOME!, "opencode", "auth.json");
-      assert.ok(existsSync(seeded), "auth.json is seeded into the isolated data dir");
+      assert.ok(existsSync(seeded), "auth.json is seeded into the stable data dir");
       assert.equal(readFileSync(seeded, "utf8"), '{"fixture":true}');
     });
   } finally {

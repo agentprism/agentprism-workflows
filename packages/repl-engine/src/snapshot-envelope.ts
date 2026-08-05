@@ -155,15 +155,28 @@ export function serializeSnapshot(
 /**
  * Deserialize an at-rest envelope: split the header line, validate the
  * format name and the format version (REFUSING LOUDLY — naming both
- * versions — when a bump invalidated the file), gunzip the payload, and
- * run the shim's binary deserializer. Every failure is a
- * `SnapshotEnvelopeError` with a specific code; a corrupted or truncated
- * file is a loud single-shot error, never a silent pass and never a
- * retry loop.
+ * versions — when a bump invalidated the file), verify the recorded
+ * wasm-binary hash against the binary the host is about to restore with
+ * (REFUSING LOUDLY — naming both hashes — BEFORE any payload
+ * interpretation, so an incompatible old payload can never masquerade
+ * as a corrupt file), then gunzip the payload and run the shim's binary
+ * deserializer. Every failure is a `SnapshotEnvelopeError` with a
+ * specific code; a corrupted or truncated file is a loud single-shot
+ * error, never a silent pass and never a retry loop.
+ *
+ * The identity check is an option (`expectedWasmSha256`) rather than a
+ * separate post-hoc step so it runs between the header parse and the
+ * payload decode: a snapshot recorded by another binary — whose raw
+ * memory layout is garbage to this binary — must refuse as
+ * `WASM_HASH_MISMATCH` naming both hashes, never as `CORRUPT_PAYLOAD`
+ * (phase-D review regression: the payload used to be gunzipped and
+ * passed through `QuickJS.deserializeSnapshot()` before the running
+ * hash was compared, so an incompatible old payload failed as
+ * CORRUPT_PAYLOAD without naming the hashes).
  */
 export function deserializeSnapshot(
   bytes: Uint8Array,
-  options: { path?: string } = {},
+  options: { path?: string; expectedWasmSha256?: string } = {},
 ): SnapshotEnvelope {
   const path = options.path;
   const nl = bytes.indexOf(0x0a);
@@ -188,6 +201,21 @@ export function deserializeSnapshot(
     });
   }
   const meta = validateHeader(header, path);
+  if (options.expectedWasmSha256 !== undefined) {
+    // The recorded hash versus the running binary, BEFORE the payload is
+    // touched: a mismatched restore refuses naming both hashes even when
+    // the old binary's payload would not even parse here (review
+    // regression: the comparison used to happen after deserialization).
+    if (meta.wasmSha256 !== options.expectedWasmSha256) {
+      throw new SnapshotEnvelopeError(
+        'WASM_HASH_MISMATCH',
+        `${label(path)}snapshot was laid out by wasm binary sha256 ${meta.wasmSha256}, but the running ` +
+          `binary hashes to ${options.expectedWasmSha256} — refusing to restore into garbage (a quickjs-wasi ` +
+          `upgrade invalidated this snapshot; recreate the workspace)`,
+        { path, recorded: meta.wasmSha256, expected: options.expectedWasmSha256 },
+      );
+    }
+  }
   const payload = bytes.subarray(nl + 1);
   let raw: Uint8Array;
   try {

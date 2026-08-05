@@ -36,7 +36,7 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["workflow", WORKFLOW_EVENTS_TOOL_NAME],
+      ["repl", "workflow", WORKFLOW_EVENTS_TOOL_NAME],
     );
 
     const workflow = tools.find((tool) => tool.name === "workflow");

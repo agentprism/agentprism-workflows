@@ -22,6 +22,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { gzipSync } from 'node:zlib';
 
 import {
   CALL_STORE_FILENAME,
@@ -150,6 +151,42 @@ test('hash-mismatch refusal: a snapshot recorded by another binary refuses LOUDL
   assert.ok(error.message.includes(recordedHash), `names the recorded hash: ${error.message}`);
   assert.ok(error.message.includes(runningHash), `names the running hash: ${error.message}`);
   assert.equal(error.recorded, recordedHash);
+  assert.equal(error.expected, runningHash);
+  teardown(dir);
+});
+
+test('hash-mismatch refusal PRECEDES payload interpretation: a foreign-binary payload that cannot be deserialized refuses as WASM_HASH_MISMATCH, never CORRUPT_PAYLOAD', async () => {
+  // The phase-D review regression: the payload used to be gunzipped and
+  // passed through `QuickJS.deserializeSnapshot()` BEFORE the running wasm
+  // hash was compared — so a snapshot recorded by an incompatible binary
+  // (whose raw memory layout is garbage to this binary) failed as
+  // CORRUPT_PAYLOAD without naming the hashes. The identity check now
+  // lives between the header parse and the payload decode.
+  const { dir, module, store } = await setup();
+  const runningHash = wasmSha256Of(module);
+  // A FOREIGN recorded hash (valid hex, not the running binary's) over a
+  // payload that is a VALID gzip stream but NOT a serialized snapshot (a
+  // foreign binary's memory image would look exactly like this to this
+  // binary: gunzip succeeds, deserialization would fail).
+  const foreignHash = 'f'.repeat(64);
+  const gz = gzipSync(Buffer.from('not a quickjs snapshot payload'));
+  const header = Buffer.from(
+    JSON.stringify({
+      format: 'repl-snapshot',
+      formatVersion: 1,
+      wasmSha256: foreignHash,
+      createdAtMs: Date.now(),
+    }) + '\n',
+    'utf8',
+  );
+  writeFileSync(store.snapshotPath, Buffer.concat([header, gz]));
+
+  const error = captureThrows(() => store.loadSnapshot(module));
+  assert.ok(error instanceof SnapshotEnvelopeError, error.message);
+  assert.equal((error as SnapshotEnvelopeError).code, 'WASM_HASH_MISMATCH', `names the hashes instead of the payload: ${error.message}`);
+  assert.ok(error.message.includes(foreignHash), `names the recorded hash: ${error.message}`);
+  assert.ok(error.message.includes(runningHash), `names the running hash: ${error.message}`);
+  assert.equal(error.recorded, foreignHash);
   assert.equal(error.expected, runningHash);
   teardown(dir);
 });

@@ -139,6 +139,8 @@ export class InteractiveSession {
   private readonly signal: AbortSignal | undefined;
   private readonly label: string | undefined;
   private readonly subscriptions = new Set<() => void>();
+  /** The re-attach arm's release watchers (see `waitForRelease`). */
+  private readonly releaseWatchers = new Set<() => void>();
   private readonly cwd: string;
   private readonly keepSession: boolean;
   /** The session's structured-output contract (see `InteractiveSessionOptions.schema`). */
@@ -399,31 +401,53 @@ export class InteractiveSession {
    * call.
    *
    * **What is observable over the ACP protocol** (the spec-owed decision,
-   * documented here): `session/load` obliges the agent to replay the entire
-   * persisted conversation via `session/update` notifications and only THEN
-   * resolve the load request. The founding turn's completion is therefore
-   * observable exactly when the replayed transcript's trailing content
-   * event is an assistant message — a turn that ended while this host was
-   * down has its final message in the replay (the transcript probe is
-   * `SessionState.loadedTurnState`, tracked from the update stream). In
-   * that case this resolves with `{ stopReason: "end_turn", text }` — the
-   * stop reason is synthesized because the protocol's replay carries none;
-   * the text is the founding turn's real outcome, and the broker's
-   * result-shaping ladder (`finalMessageText`/schema extraction) reads the
-   * same transcript.
+   * documented here — phase-D review: the seam used to judge completion
+   * from a trailing `agent_message_chunk` at load time and reject a
+   * still-streaming turn, so partial output of a live turn could be
+   * settled as success and a loaded session with its founding turn still
+   * running was released and re-issued, risking duplicated work):
+   * `session/load` obliges the agent to replay the entire persisted
+   * conversation via `session/update` notifications and only THEN resolve
+   * the load request. A turn that ended while this host was down has its
+   * final message in the replay; a turn still running at the backend
+   * continues streaming AFTER the load response. Over the wire the two are
+   * indistinguishable until the stream settles, so this seam OBSERVES the
+   * update stream instead of probing a single instant:
    *
-   * When the transcript shows the founding turn still IN FLIGHT at the
-   * backend (the replay ends at its user message, and the backend continues
-   * streaming the turn after the load response), its completion is NOT
-   * observable: the protocol has no turn-end signal for a turn this client
-   * did not start (no completion notification, no replay of in-flight
-   * output, no per-turn stop reason on `session/load`). Rejects with a
-   * plain host-side Error (never a wire error) naming the condition — the
-   * broker degrades to re-issue through its documented honest fallback
-   * (re-issuing a call whose turn may still be running is preferrable to
-   * a call that can never settle). The same rejection covers a transcript
-   * with no user message at all (the recorded session never received its
-   * prompt — re-issue is safe there) and a released session.
+   * 1. A transcript with no user message at all (the recorded session
+   *    never received its prompt) rejects immediately — re-issue is safe
+   *    there (nothing reached the backend).
+   * 2. Otherwise the seam waits for the stream to SETTLE: no
+   *    session/update for this session for `LOADED_TURN_SETTLE_GRACE_MS`
+   *    (default 250 ms; `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS`).
+   *    Any update kind (message chunk, thought, tool call, usage) resets
+   *    the quiet clock — ACP message chunks are PROGRESS, never terminal
+   *    markers, so a still-streaming turn is never settled with partial
+   *    output.
+   * 3. When the stream has settled AND the trailing content event is an
+   *    assistant message, this resolves with `{ stopReason: "end_turn",
+   *    text }` — the stop reason is synthesized because the protocol's
+   *    replay carries no stop reason for a turn this client did not
+   *    start; the text is the founding turn's REAL accumulated outcome,
+   *    and the broker's result-shaping ladder (`finalMessageText`/schema
+   *    extraction, the empty-output gate) reads the same transcript. The
+   *    loaded session stays ATTACHED (phase-D review: a successfully
+   *    loaded session with its founding turn still running used to be
+   *    released and re-issued — duplicated work; now the seam waits for
+   *    the turn's authoritative completion).
+   * 4. When the stream has settled but the trailing content is NOT a
+   *    terminal assistant message (a user message, a thought, a tool
+   *    call, a plan — the turn ended without a terminal message: refusal,
+   *    silent death), the seam keeps waiting for more updates up to
+   *    `LOADED_TURN_MAX_WAIT_MS` (default 15 min;
+   *    `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS`) — the turn may be
+   *    mid-tool-call. On expiry it rejects with a plain host-side Error
+   *    (never a wire error) naming the condition; the broker degrades to
+   *    re-issue through its documented honest fallback. The bound is the
+   *    "a re-attached call can never hang unobserved" backstop: a
+   *    backend that never ends the turn (and never dies — a dead backend
+   *    auto-releases the session, which also rejects the wait) must not
+   *    park the call forever.
    */
   async awaitCurrentTurn(): Promise<InteractiveTurn> {
     if (this.releasePromise) {
@@ -436,14 +460,52 @@ export class InteractiveSession {
           "(its outcome is unobservable; re-issue is the honest fallback)",
       );
     }
-    if (!probe.complete) {
-      throw new Error(
-        "the loaded session's founding turn is still in flight at the backend (the replayed transcript has no " +
-          "terminal assistant message) — the ACP protocol exposes no completion signal for a turn this client " +
-          "did not start, so its outcome is not observable; re-issue is the honest fallback",
-      );
+    const start = Date.now();
+    const settleGraceMs = loadedTurnSettleGraceMs();
+    const maxWaitMs = loadedTurnMaxWaitMs();
+    for (;;) {
+      if (this.releasePromise) {
+        throw new Error(
+          "InteractiveSession has been released while awaiting the loaded session's founding turn",
+        );
+      }
+      const elapsed = Date.now() - start;
+      const quietForMs = Date.now() - this.session.lastUpdateAtMs();
+      if (quietForMs >= settleGraceMs) {
+        const state = this.session.loadedTurnState();
+        if (state.trailingContentKind === "assistant-message") {
+          // The stream settled with the founding turn's final message in
+          // the transcript — the turn observably completed (while this
+          // host was down, or just now). The loaded session stays
+          // attached; the broker settles the call from this authoritative
+          // completion.
+          return { stopReason: "end_turn", text: this.session.loadedTurnText() };
+        }
+        if (elapsed >= maxWaitMs) {
+          throw new Error(
+            `the loaded session's founding turn never reached a terminal assistant message within ` +
+              `${maxWaitMs} ms of the load (the replayed transcript's trailing content is not a terminal ` +
+              `assistant message, and no further updates arrived) — its outcome is not observable over the ` +
+              `ACP protocol; re-issue is the honest fallback`,
+          );
+        }
+        // Quiet, but the trailing content is not a terminal assistant
+        // message: the turn may be mid-tool-call. Keep waiting for more
+        // updates (the next update resets the quiet clock).
+      }
+      // Wait for the next update, the quiet-clock expiry, the max-wait
+      // expiry, or the session's release — whichever comes first (no
+      // polling: a long still-running turn is observed with zero busy
+      // work).
+      const quietRemaining = Math.max(0, settleGraceMs - quietForMs);
+      const budgetRemaining = Math.max(0, maxWaitMs - elapsed);
+      const waitMs = quietRemaining > 0 ? quietRemaining : budgetRemaining;
+      await Promise.race([
+        this.nextLoadedTurnUpdate(),
+        sleep(waitMs),
+        this.waitForRelease(),
+      ]);
     }
-    return { stopReason: "end_turn", text: this.session.loadedTurnText() };
   }
 
   /** Subscribe to runner events for THIS ACP session only. Events from other one-shot or
@@ -464,6 +526,36 @@ export class InteractiveSession {
     };
     this.subscriptions.add(off);
     return off;
+  }
+
+  /** Resolve on the session's next update (the re-attach arm's wait
+   *  primitive — zero polling; the subscription is one-shot and removed
+   *  the moment it fires). */
+  private nextLoadedTurnUpdate(): Promise<void> {
+    return new Promise((resolve) => {
+      const off = this.session.subscribeUpdates(() => {
+        off();
+        resolve();
+      });
+    });
+  }
+
+  /** Resolve when the session is released (or immediately when it
+   *  already is) — the re-attach arm's release watch, so a session that
+   *  dies or is disposed while the seam waits unblocks the wait instead
+   *  of parking it until the max-wait expiry. */
+  private waitForRelease(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.releasePromise) {
+        resolve();
+        return;
+      }
+      const watcher = () => {
+        this.releaseWatchers.delete(watcher);
+        resolve();
+      };
+      this.releaseWatchers.add(watcher);
+    });
   }
 
   /** Release the ACP session and close the dedicated process. Idempotent. Session close is
@@ -498,6 +590,13 @@ export class InteractiveSession {
   private async doRelease(): Promise<void> {
     this.removeAbort?.();
     this.removeAbort = undefined;
+    // Wake the re-attach arm's release watchers FIRST: an awaiting
+    // `awaitCurrentTurn` must unblock the moment the session is released
+    // (its loop re-checks `releasePromise` and rejects).
+    for (const watcher of [...this.releaseWatchers]) {
+      this.releaseWatchers.delete(watcher);
+      watcher();
+    }
     let childFailure: unknown;
     try {
       await this.session.release({ keepOpen: this.keepSession });
@@ -520,4 +619,44 @@ export class InteractiveSession {
     for (const off of subscriptions) off();
     this.subscriptions.clear();
   }
+}
+
+/** The loaded-session founding-turn stream-settled grace: how long the
+ *  update stream must stay quiet before the re-attach arm treats the turn
+ *  as observably complete (see `awaitCurrentTurn`). A still-running turn
+ *  streams progress — any update kind resets the quiet clock — so the
+ *  grace is the classifier between "a turn that ended while the host was
+ *  down" (replay ended, nothing more arrives) and "a turn still running"
+ *  (live chunks keep arriving after the load response). Default 250 ms;
+ *  `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS` overrides (clamped to
+ *  >= 1 ms). */
+function loadedTurnSettleGraceMs(): number {
+  const env = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+  if (env !== undefined) {
+    const parsed = Number.parseInt(env, 10);
+    if (Number.isFinite(parsed) && parsed >= 1) return parsed;
+  }
+  return 250;
+}
+
+/** The loaded-session founding-turn max wait: the re-attach arm's
+ *  "never hang unobserved" backstop (see `awaitCurrentTurn`). A still-
+ *  running turn whose stream settled WITHOUT a terminal assistant message
+ *  (trailing user message / thought / tool call / plan) is waited out up
+ *  to this bound — it may be mid-tool-call — then the seam rejects with
+ *  the honest host-side error and the broker re-issues. Default 15 min;
+ *  `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` overrides (clamped to
+ *  >= 1 ms). */
+function loadedTurnMaxWaitMs(): number {
+  const env = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+  if (env !== undefined) {
+    const parsed = Number.parseInt(env, 10);
+    if (Number.isFinite(parsed) && parsed >= 1) return parsed;
+  }
+  return 15 * 60 * 1000;
+}
+
+/** Timer sleep (the re-attach arm's quiet-wait primitive). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

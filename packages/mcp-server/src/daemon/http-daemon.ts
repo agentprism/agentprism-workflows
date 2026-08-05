@@ -190,6 +190,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       const closed = new Promise<void>((resolvePromise) => {
         httpServer.close(() => resolvePromise());
       });
+      await projects.disposeReplStates();
       await sessions.closeAll();
       httpServer.closeAllConnections();
       await closed;

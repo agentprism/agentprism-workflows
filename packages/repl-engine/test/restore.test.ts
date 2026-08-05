@@ -108,10 +108,12 @@ async function tick(): Promise<void> {
 
 /** A fake held-open ACP session (phase-C shape plus the phase-D re-attach
  *  seam: `awaitCurrentTurn`, mirroring the REAL acp-agents adapter's
- *  semantics — it resolves IMMEDIATELY with a scripted loaded-turn outcome
- *  when one is set (the replay made the completed-while-down turn
- *  observable), and parks otherwise (the still-running-at-load case, which
- *  the real adapter rejects — reconcile then degrades to re-issue). */
+ *  semantics — it resolves with a scripted loaded-turn outcome when one is
+ *  set (the replay made the completed-while-down turn observable), and
+ *  PARKS otherwise (the still-running-at-load case: the real adapter keeps
+ *  the loaded session attached and waits for the turn's authoritative
+ *  completion — reconcile arms the call on the seam and returns; the test
+ *  resolves or rejects the parked seam to drive the outcome). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
   capabilities: { supportsSteering: boolean } | undefined;
@@ -124,7 +126,8 @@ class FakeSession implements BrokerSession {
   stopReason = 'end_turn';
   readonly completedTexts: string[] = [];
   /** The seam's scripted loaded-turn outcome (the real adapter reads it
-   *  from the session/load replay). Null parks the seam (still running). */
+   *  from the session/load replay + stream settling). Null parks the seam
+   *  (still running at load). */
   loadedTurnTextValue: string | null = null;
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
@@ -206,6 +209,11 @@ class FakeRunner implements BrokerRunner {
   supportsSteering = true;
   /** The re-attach capability gate (acp-agents' supportsLoadSession). */
   supportsLoadSession = true;
+  /** When true, loadSession returns sessions WITHOUT the awaitCurrentTurn
+   *  seam (a third-party adapter whose loaded-turn completion is
+   *  unobservable — the broker degrades to re-issue through the same
+   *  honest gate). */
+  seamless = false;
   /** The scripted loaded-turn outcome for loadSession-created sessions
    *  (the real adapter resolves the seam from the session/load replay).
    *  Null parks the seam (the still-running-at-load case). */
@@ -246,6 +254,11 @@ class FakeRunner implements BrokerRunner {
     const session = new FakeSession(opts);
     session.capabilities = { supportsSteering: this.supportsSteering };
     session.loadedTurnTextValue = this.loadedTurnText;
+    if (this.seamless) {
+      // Shadow the prototype method with an own undefined property — the
+      // broker's optional-seam probe sees a seam-less adapter.
+      Object.defineProperty(session, 'awaitCurrentTurn', { value: undefined, configurable: true });
+    }
     this.sessions.push(session);
     return session;
   }
@@ -905,8 +918,19 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
       );
       assert.ok(!byPid.some((e) => e.method === 'newSession'), 'no fresh session — the call was NOT re-issued');
       // The re-attached call settles with the loaded turn's real outcome,
-      // exactly once, and the store is authoritative.
-      assert.equal((await broker2.eval('await p')).result, '"result B (loaded)"');
+      // exactly once, and the store is authoritative. The seam's stream-
+      // settled wait is bounded by the settle grace, so the settlement
+      // lands a moment after reconcile — poll for it like a live call.
+      let settled: string | undefined;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+        if (got.result !== undefined) {
+          settled = got.result;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(settled, '"result B (loaded)"');
       assert.equal(broker2.store().lookup('c1')!.completion!.value, 'result B (loaded)');
       assert.equal(broker2.store().lookup('c1')!.reissues, 0, 're-attachment is not a re-issue');
     } finally {
@@ -921,95 +945,395 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
   }
 });
 
-test('restore through the REAL acp-agents adapter: a founding turn still in flight at the backend is unobservable → honest re-issue, surfaced guest-visibly', async () => {
+test('restore through the REAL acp-agents adapter: a founding turn still in flight at the backend is KEPT ATTACHED and settles from its live completion (no re-issue)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-run-'));
   const storePath = join(dir, 'calls.jsonl');
-  // The replay ends at the founding turn's user message — the turn is
-  // still running at the backend when we load, and the ACP protocol
-  // exposes no completion signal for it.
-  configureFakeAgent(
-    {
-      loadSessionSupport: true,
-      turns: [{ text: 'fresh result' }],
-      loadSession: { replay: [{ role: 'user', text: 'task' }] },
-    },
-    join(dir, 'log1.jsonl'),
-  );
-  const runner = new AcpAgentRunner();
-  const ws = await Workspace.create(PROJECT);
-  const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
+  const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = '100';
   try {
-    await broker.eval('const p = agent("fake/x", "task"); "started"');
-    await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
-    const recordedId = broker.store().lookup('c1')!.sessionId!;
-    const snapshot = ws.snapshot();
-    await broker.dispose();
-    ws.dispose();
+    // The replay ends at the founding turn's user message, and the backend
+    // CONTINUES streaming live chunks AFTER the session/load response —
+    // the turn is still running at the backend when we reconnect. The
+    // seam keeps the loaded session attached and settles from the turn's
+    // authoritative completion (phase-D review: this case used to be
+    // released and re-issued, risking duplicated work).
+    configureFakeAgent(
+      {
+        loadSessionSupport: true,
+        turns: [{ text: 'fresh result' }],
+        loadSession: {
+          replay: [{ role: 'user', text: 'task' }],
+          continue: [
+            { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
+            { afterMs: 100, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'result' } } },
+          ],
+        },
+      },
+      join(dir, 'log1.jsonl'),
+    );
+    const runner = new AcpAgentRunner();
+    const ws = await Workspace.create(PROJECT);
+    const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
+    try {
+      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
+      const recordedId = broker.store().lookup('c1')!.sessionId!;
+      const snapshot = ws.snapshot();
+      await broker.dispose();
+      ws.dispose();
 
+      configureFakeAgent(
+        {
+          loadSessionSupport: true,
+          turns: [{ text: 'fresh result' }],
+          loadSession: {
+            replay: [{ role: 'user', text: 'task' }],
+            continue: [
+              { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
+              { afterMs: 100, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'result' } } },
+            ],
+          },
+        },
+        join(dir, 'log2.jsonl'),
+      );
+      const runner2 = new AcpAgentRunner();
+      const ws2 = await Workspace.restore(PROJECT, snapshot);
+      const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+      try {
+        // Reconcile returns IMMEDIATELY (it arms the call on the seam
+        // instead of blocking on the still-running turn) and reports the
+        // call as re-attached — never re-issued.
+        const report = await broker2.reconcile();
+        assert.deepEqual(report.reattached, ['c1'], 'the still-running turn stays attached');
+        assert.deepEqual(report.reissued, [], 'no re-issue — the loaded session is kept');
+        assert.deepEqual(report.failedLost, []);
+        // Wire evidence: the restored process LOADED the recorded session
+        // and never opened a fresh session (no re-issue, no duplicated
+        // work).
+        const entries = readWireLog(join(dir, 'log2.jsonl'));
+        assert.ok(
+          entries.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
+          JSON.stringify(entries),
+        );
+        assert.ok(!entries.some((e) => e.method === 'newSession'), 'no fresh session — the call was NOT re-issued');
+        // The call settles with the turn's AUTHORITATIVE completion — the
+        // live stream's full accumulated text, delivered through the same
+        // pump as a live call (reconcile's arming does not block it; the
+        // seam settles once the stream goes quiet after the last chunk).
+        // The first poll eval also carries the re-attach info line (the
+        // guest-visible surfacing).
+        let resolved: string | undefined;
+        let sawReattachLine = false;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+          if (!sawReattachLine) {
+            sawReattachLine = output(got).some((l) => l.startsWith('info: ') && l.includes('c1') && l.includes('re-attached'));
+          }
+          if (got.result !== undefined) {
+            resolved = got.result;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        assert.equal(resolved, '"live result"');
+        assert.equal(broker2.store().lookup('c1')!.completion!.value, 'live result');
+        assert.equal(broker2.store().lookup('c1')!.reissues, 0, 're-attachment is not a re-issue');
+        assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the same backend session stays attached');
+        assert.ok(sawReattachLine, 'the re-attach info line surfaced guest-visibly');
+      } finally {
+        await broker2.dispose();
+        ws2.dispose();
+        await runner2.dispose();
+      }
+    } finally {
+      await broker.dispose();
+      ws.dispose();
+      await runner.dispose();
+    }
+  } finally {
+    if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
+    clearFakeEnv();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('restore through the REAL acp-agents adapter: a still-attached turn whose completion never becomes observable degrades to re-issue, surfaced guest-visibly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-expire-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+  const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = '50';
+  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = '150';
+  try {
+    // The replay ends at the founding turn's user message and NOTHING
+    // continues after the load response (the turn died silently at the
+    // backend, or the backend never streams after load): the seam's
+    // max-wait backstop rejects, the loaded session is released, and the
+    // call is re-issued under the same id — the honest fallback for a
+    // genuinely unobservable outcome, surfaced guest-visibly.
     configureFakeAgent(
       {
         loadSessionSupport: true,
         turns: [{ text: 'fresh result' }],
         loadSession: { replay: [{ role: 'user', text: 'task' }] },
       },
-      join(dir, 'log2.jsonl'),
+      join(dir, 'log1.jsonl'),
     );
-    const runner2 = new AcpAgentRunner();
-    const ws2 = await Workspace.restore(PROJECT, snapshot);
-    const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+    const runner = new AcpAgentRunner();
+    const ws = await Workspace.create(PROJECT);
+    const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
     try {
-      const report = await broker2.reconcile();
-      assert.deepEqual(report.reattached, [], 'the still-running turn is not observable');
-      assert.deepEqual(report.reissued, ['c1'], 're-issue is the honest fallback');
-      // Wire evidence: the session was loaded, found still in flight, and
-      // the call was re-issued under a fresh session (the re-issue's
-      // session open is async — wait for the fresh session to log). The
-      // re-issue opens its own dedicated process, so the entries span
-      // pids.
-      await waitFor(() =>
-        readWireLog(join(dir, 'log2.jsonl')).some((e) => e.method === 'newSession'),
+      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
+      const recordedId = broker.store().lookup('c1')!.sessionId!;
+      const snapshot = ws.snapshot();
+      await broker.dispose();
+      ws.dispose();
+
+      configureFakeAgent(
+        {
+          loadSessionSupport: true,
+          turns: [{ text: 'fresh result' }],
+          loadSession: { replay: [{ role: 'user', text: 'task' }] },
+        },
+        join(dir, 'log2.jsonl'),
       );
-      const entries = readWireLog(join(dir, 'log2.jsonl'));
-      assert.ok(
-        entries.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
-        JSON.stringify(entries),
-      );
-      assert.ok(entries.some((e) => e.method === 'newSession'), 'the re-issue opened a fresh session');
-      // The degradation is surfaced guest-visibly, naming the condition.
-      const probe = await broker2.eval('"probe"');
-      assert.ok(
-        output(probe).some(
-          (l) =>
-            l.startsWith('warn: ') &&
-            l.includes('c1') &&
-            l.includes('still in flight at the backend') &&
-            l.includes('outcome is not observable'),
-        ),
-        output(probe).join('\n'),
-      );
-      // The re-issued call's fresh turn completes and settles the SAME
-      // guest promise exactly once.
-      await waitFor(() => broker2.store().lookup('c1')!.sessionId !== recordedId);
-      let result: string | undefined;
-      for (let attempt = 0; attempt < 100; attempt++) {
-        await broker2.pump();
-        const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
-        if (got.result !== undefined) {
-          result = got.result;
-          break;
+      const runner2 = new AcpAgentRunner();
+      const ws2 = await Workspace.restore(PROJECT, snapshot);
+      const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+      try {
+        const report = await broker2.reconcile();
+        assert.deepEqual(report.reattached, ['c1'], 'the call is armed on the loaded session first');
+        assert.deepEqual(report.reissued, [], 'the in-task degradation is not part of the reconcile report');
+        // The in-task re-issue opens a fresh session (the seam's max-wait
+        // expiry is bounded — wait for the fresh session to log).
+        await waitFor(() =>
+          readWireLog(join(dir, 'log2.jsonl')).some((e) => e.method === 'newSession'),
+        );
+        const entries = readWireLog(join(dir, 'log2.jsonl'));
+        assert.ok(
+          entries.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
+          JSON.stringify(entries),
+        );
+        assert.ok(entries.some((e) => e.method === 'newSession'), 'the re-issue opened a fresh session');
+        // The degradation is surfaced guest-visibly, naming the condition.
+        const probe = await broker2.eval('"probe"');
+        assert.ok(
+          output(probe).some(
+            (l) =>
+              l.startsWith('warn: ') &&
+              l.includes('c1') &&
+              l.includes('never reached a terminal assistant message') &&
+              l.includes('re-issued'),
+          ),
+          output(probe).join('\n'),
+        );
+        // The re-issued call's fresh turn completes and settles the SAME
+        // guest promise exactly once.
+        await waitFor(() => broker2.store().lookup('c1')!.sessionId !== recordedId);
+        let result: string | undefined;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          await broker2.pump();
+          const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+          if (got.result !== undefined) {
+            result = got.result;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(result, '"fresh result"');
+        assert.equal(broker2.store().lookup('c1')!.reissues, 1);
+      } finally {
+        await broker2.dispose();
+        ws2.dispose();
+        await runner2.dispose();
       }
-      assert.equal(result, '"fresh result"');
-      assert.equal(broker2.store().lookup('c1')!.reissues, 1);
     } finally {
-      await broker2.dispose();
-      ws2.dispose();
-      await runner2.dispose();
+      await broker.dispose();
+      ws.dispose();
+      await runner.dispose();
     }
   } finally {
-    await runner.dispose();
+    if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
+    if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
     clearFakeEnv();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a still-running-at-load call stays attached: reconcile arms it on the parked seam and the call settles from the turn\'s later completion (never a re-issue)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-still-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const recordedId = broker.store().lookup('c1')!.sessionId!;
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  // No scripted loaded-turn outcome: the seam parks — the founding turn is
+  // still running at the backend (live chunks keep streaming after the
+  // load response).
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reattached, ['c1'], 'the still-running call is re-attached and KEPT attached');
+  assert.deepEqual(report.reissued, [], 'never a re-issue while the loaded session is attached');
+  assert.deepEqual(report.failedLost, []);
+  assert.equal(runner2.loadedWith.length, 1);
+  assert.equal(
+    runner2.loadedWith[0].sessionId,
+    recordedId,
+    'the load was addressed at the RECORDED backend session (the fake mints a fresh id per load, the real adapter keeps the loaded id)',
+  );
+  // The call is still pending — the seam observes the turn's completion.
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1']);
+  // The backend finishes the turn: the parked seam resolves with the real
+  // accumulated text, the pump delivers it, and the guest settles exactly
+  // once — no duplicate dispatch ever happened.
+  const parked = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(parked, 'the seam is parked on the loaded session');
+  parked.resolve({ stopReason: 'end_turn', text: 'completed live' });
+  await tick();
+  await broker2.pump();
+  assert.equal((await broker2.eval('await p')).result, '"completed live"');
+  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'completed live');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'kept attached — no re-issue');
+  assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId);
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a seam rejection degrades to re-issue inside the task: the loaded session is released and the fresh turn settles the SAME guest promise', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-seamreject-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const recordedId = broker.store().lookup('c1')!.sessionId!;
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reattached, ['c1'], 'armed on the loaded session first');
+  assert.deepEqual(report.reissued, [], 'the in-task degradation is not part of the reconcile report');
+  // The seam rejects — the founding turn's outcome is genuinely
+  // unobservable (e.g. the stream settled without a terminal assistant
+  // message within the max-wait bound).
+  const parked = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(parked, 'the seam is parked on the loaded session');
+  parked.reject(new Error('the loaded session\'s founding turn never reached a terminal assistant message'));
+  await tick();
+  await tick();
+  // The loaded session was released and a FRESH session opened for the
+  // re-issue; the store bumped the reissues counter.
+  assert.equal(runner2.sessions[0].releases, 1, 'the loaded session was released');
+  assert.equal(runner2.sessions.length, 2, 'a fresh session opened for the re-issue');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 1);
+  assert.equal(broker2.store().lookup('c1')!.sessionId, runner2.sessions[1].sessionId, 'the re-issue\'s session is the new attach key');
+  // The degradation is surfaced guest-visibly, naming the reason.
+  const probe = await broker2.eval('"probe"');
+  assert.ok(
+    output(probe).some(
+      (l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('re-issued') && l.includes('released'),
+    ),
+    output(probe).join('\n'),
+  );
+  // The re-issued call's fresh turn completes and settles the SAME guest
+  // promise exactly once.
+  runner2.sessions[1].completeTurn('fresh result');
+  await tick();
+  await broker2.pump();
+  assert.equal((await broker2.eval('await p')).result, '"fresh result"');
+  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'fresh result');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// The re-issue branches' refusal cadence (phase-D review round 2)
+// ────────────────────────────────────────────────────────────────────────
+
+test('cadence: a no-recorded-session re-issue refused by the cap settles the guest and fires the settlement boundary', async () => {
+  const kinds: Array<'eval' | 'settlement'> = [];
+  const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nosess-'));
+  const storePath = join(dir, 'calls.jsonl');
+
+  // Two pending agent calls with NO recorded backend session (parked with
+  // the parking bridge — the store never saw them; reconcile adopts them,
+  // the sessionId stays null → the re-issue arm). The restored broker runs
+  // cap=1: the first re-issue takes the slot, the second is REFUSED — the
+  // refusal settles the guest, so its drain must fire the settlement
+  // boundary (review regression: this branch used to drop the newly-settled
+  // flag, skipping the drain and the snapshot boundary).
+  const ws = await Workspace.create(PROJECT);
+  await ws.eval('const p1 = agent("pi/x", "t1"); const p2 = agent("pi/y", "t2"); "started"');
+  assert.equal(ws.surface()!.pending().length, 2);
+  const snapshot = ws.snapshot();
+  ws.dispose();
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const broker2 = await Broker.attach(ws2, {
+    runner: new FakeRunner(),
+    store: JsonlCallStore.open(storePath),
+    maxConcurrentAgents: 1,
+    snapshotSink: sink,
+  });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reissued, ['c1']);
+  assert.deepEqual(report.failedLost, ['c2'], 'the over-cap re-issue was refused');
+  assert.deepEqual(kinds, ['settlement'], 'the refusal settled the guest — its drain fired the boundary');
+  const record = broker2.store().lookup('c2')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('cadence: an adapter-without-seam re-issue refused by the cap settles the guest and fires the settlement boundary', async () => {
+  const kinds: Array<'eval' | 'settlement'> = [];
+  const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-noseam-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await broker.eval('const p1 = agent("pi/x", "t1"); const p2 = agent("pi/y", "t2"); "started"');
+  await tick();
+  assert.equal(runner.sessions.length, 2);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  runner2.seamless = true; // a third-party adapter: loads fine, no completion seam
+  const broker2 = await Broker.attach(ws2, {
+    runner: runner2,
+    store: JsonlCallStore.open(storePath),
+    maxConcurrentAgents: 1,
+    snapshotSink: sink,
+  });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reattached, []);
+  assert.deepEqual(report.reissued, ['c1']);
+  assert.deepEqual(report.failedLost, ['c2'], 'the over-cap re-issue was refused');
+  assert.equal(runner2.loadedWith.length, 2, 'both sessions loaded — the seam absence is discovered after a successful load');
+  assert.equal(runner2.sessions[0].releases, 1, 'the loaded session was released before the re-issue');
+  assert.deepEqual(kinds, ['settlement'], 'the refusal settled the guest — its drain fired the boundary');
+  const record = broker2.store().lookup('c2')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
 });

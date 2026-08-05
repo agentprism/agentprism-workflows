@@ -2,9 +2,8 @@
 // a native structured-output result channel and ignores request._meta today, so the backend uses
 // the repo's generic schema dialect plus prompt embedding. When OpenCode advertises HTTP MCP, the
 // runner can also inject the client-hosted StructuredOutput MCP tool.
-import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
@@ -25,20 +24,44 @@ import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
 
-/** Per-spawn OpenCode isolation env: fresh XDG data/state/cache trees seeded with the user's
+/** Per-spawn OpenCode isolation env: dedicated XDG data/state/cache trees seeded with the user's
  *  credentials, plus autoupdate off so a concurrent TUI upgrade never swaps state formats
- *  underneath a running server. Config (XDG_CONFIG_HOME) is deliberately NOT overridden. */
+ *  underneath a running server. Config (XDG_CONFIG_HOME) is deliberately NOT overridden.
+ *
+ *  The root is STABLE per user+host (phase-D review: it used to be a fresh random tmpdir per
+ *  spawn, so agent-persisted sessions lived in a tree no later process could reach — cross-
+ *  process `session/load` fell back to the runner's fresh-session path, and re-attachment was
+ *  not real for the opencode built-in despite it advertising `loadSession: true`). The stable
+ *  root keeps every spawned server's persisted sessions reachable by later processes — pool
+ *  recycles within one daemon AND daemon restarts — so the restore path's re-attach arm and the
+ *  lazy followUp re-attach both work. It lives OUTSIDE the user's real opencode data dir (a
+ *  sibling `agentprism/opencode` tree under the same data home), so the daemon's instances
+ *  never contend with the user's own interactive TUI for the sqlite store; the contention
+ *  protection that motivated the original isolation is retained for exactly that overlap. The
+ *  residual tradeoff: CONCURRENT daemon-spawned opencode processes (pool size > 1, or a recycle
+ *  overlapping its predecessor) share the stable tree, like every other backend shares the
+ *  user's real state — the documented anomalyco/opencode#31307 busy-wait risk is bounded to
+ *  that overlap instead of being traded away entirely.
+ *
+ *  `AGENTPRISM_OPENCODE_DATA_ROOT` overrides the root (tests and ops); the stable default is
+ *  `<data home>/agentprism/opencode` where the data home is the user's `XDG_DATA_HOME` (or
+ *  `~/.local/share`). */
 function isolatedOpenCodeEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const root = join(tmpdir(), `agentprism-opencode-${randomUUID()}`);
-  const dataHome = join(root, "data");
-  const dataDir = join(dataHome, "opencode");
+  const override = base.AGENTPRISM_OPENCODE_DATA_ROOT;
+  const dataHome = base.XDG_DATA_HOME && base.XDG_DATA_HOME.trim() !== ""
+    ? base.XDG_DATA_HOME
+    : join(homedir(), ".local", "share");
+  const root = override && override.trim() !== ""
+    ? override.trim()
+    : join(dataHome, "agentprism", "opencode");
+  const dataDir = join(root, "data", "opencode");
   const stateHome = join(root, "state");
   const cacheHome = join(root, "cache");
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(stateHome, { recursive: true });
   mkdirSync(cacheHome, { recursive: true });
   // Credentials live in the REAL data dir; seed them so the isolated instance authenticates.
-  // Refresh-token write-back stays in the isolated copy — re-auth churn is the accepted cost of
+  // Refresh-token write-back stays in the dedicated tree — re-auth churn is the accepted cost of
   // not letting concurrent instances revoke each other's tokens (anomalyco/opencode#37059).
   const sourceData = base.XDG_DATA_HOME && base.XDG_DATA_HOME.trim() !== ""
     ? join(base.XDG_DATA_HOME, "opencode")
@@ -48,7 +71,7 @@ function isolatedOpenCodeEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (existsSync(source)) copyFileSync(source, join(dataDir, file));
   }
   return {
-    XDG_DATA_HOME: dataHome,
+    XDG_DATA_HOME: join(root, "data"),
     XDG_STATE_HOME: stateHome,
     XDG_CACHE_HOME: cacheHome,
     OPENCODE_DISABLE_AUTOUPDATE: "1",
@@ -91,12 +114,16 @@ export class OpenCodeBackend implements Backend {
     // auth.json. Overlapping processes — routine since process-exclusive injected pooling
     // (#292) — surface that as mid-run "ACP connection closed" and cross-instance auth
     // revocation (upstream: anomalyco/opencode#31307, #29395, #21215, #38366, #37059).
-    // Give every spawned server its own XDG data/state/cache trees with credentials seeded in
-    // (OPENCODE_DB alone is insufficient per #33321 — the snapshot gitdir stays shared).
-    // XDG_CONFIG_HOME stays shared so the user's opencode.jsonc and providers apply, and an
-    // explicitly exported OPENCODE_DB still wins over the isolated tree's database. Tradeoff:
-    // agent-persisted sessions live in the spawned process's isolated tree, so cross-process
-    // session/load|resume falls back to the runner's fresh-session path.
+    // Every spawned server gets its own dedicated XDG data/state/cache trees with credentials
+    // seeded in (OPENCODE_DB alone is insufficient per #33321 — the snapshot gitdir stays
+    // shared). The root is STABLE per user+host (phase-D review: it used to be a random
+    // tmpdir per spawn, which made cross-process session/load|resume fall back to the
+    // runner's fresh-session path — re-attachment was not real for opencode); persisted
+    // sessions therefore survive pool recycles and daemon restarts. The dedicated tree sits
+    // OUTSIDE the user's live opencode data dir, so the daemon's instances never overlap the
+    // user's own TUI — the contention the isolation exists for — and XDG_CONFIG_HOME stays
+    // shared so the user's opencode.jsonc and providers apply. An explicitly exported
+    // OPENCODE_DB still wins over the dedicated tree's database.
     const env: NodeJS.ProcessEnv = { ...process.env, ...isolatedOpenCodeEnv(process.env) };
     const override = env.AGENTPRISM_OPENCODE_ACP_CMD;
     if (override) {

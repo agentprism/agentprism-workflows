@@ -404,6 +404,24 @@ class FakeAgent {
     for (const update of Array.isArray(load.updates) ? load.updates : []) {
       await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
     }
+    // Post-response LIVE continuation: a real agent whose founding turn is still in flight
+    // keeps streaming session/update notifications AFTER the session/load response (the
+    // replay ends at the last persisted chunk; the live turn continues). The re-attach arm
+    // observes these on the same update stream — the transcript probe must see them arrive
+    // AFTER the load response to tell "still running" from "completed while down". The
+    // response is returned immediately; the continuation streams in the background.
+    if (Array.isArray(load.continue)) {
+      for (const entry of load.continue) {
+        const afterMs = typeof entry.afterMs === "number" ? entry.afterMs : 0;
+        setTimeout(async () => {
+          try {
+            await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(entry.update) });
+          } catch {
+            // The client may have disconnected before the continuation fired; best-effort.
+          }
+        }, afterMs);
+      }
+    }
     return {
       configOptions,
       ...(modes ? { modes } : {}),

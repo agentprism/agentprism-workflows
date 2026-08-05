@@ -44,6 +44,10 @@ import type {
   WorkflowResumeReport,
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
+import {
+  loadShippedWasm,
+  type BrokerRunner,
+} from "@automatalabs/repl-engine";
 
 import { EXTENSION_ID, registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 
@@ -69,6 +73,7 @@ import type {
 import { createAwaitProgressReporter, createProgressReporter, formatAgentProgressMessage } from "./progress.js";
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
+import { registerReplTool } from "./repl-tool.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
 import {
   WorkflowScriptResources,
@@ -1138,6 +1143,12 @@ export interface CreateWorkflowServerOptions {
    * The daemon sets this: it serves every project from one process and has no ambient cwd.
    */
   requireProjectDir?: boolean;
+  /**
+   * The REPL workspaces' ACP runner (the broker's structural seam). Omitted: every
+   * workspace's broker owns its own `AcpAgentRunner` (disposed with the workspace). Tests
+   * inject a fake and own its lifetime.
+   */
+  replRunner?: BrokerRunner;
 }
 
 export interface WorkflowServer extends McpServer, WorkflowServerControl {}
@@ -1192,6 +1203,20 @@ export function createWorkflowServer(
   };
 
   registerAuthoringPrompt(mcp);
+
+  // The REPL tool (roadmap doc's Surface section; phase D wiring): one
+  // persistent VM per project context, restored from the daemon's
+  // per-project repl store on first touch and reconciled; the snapshot
+  // sink attached by `ensureReplWorkspace` persists every state-changing
+  // boundary. The wasm is the engine's shipped binary (its hash is the
+  // snapshot envelope's identity — a version bump refuses loudly).
+  registerReplTool(mcp, {
+    projects,
+    wasm: loadShippedWasm(),
+    requireProjectDir,
+    runner: options.replRunner,
+    acceptingWork: () => acceptingWork,
+  });
 
   // MCP Apps surface, per the extension's graceful-degradation model: registered for every
   // client. Apps-capable hosts render the panel from the `workflow` tool's `_meta.ui`;

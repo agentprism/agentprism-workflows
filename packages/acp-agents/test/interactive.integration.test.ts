@@ -395,44 +395,89 @@ test("openSession({ schema }) states the contract in-band for embedSchemaInPromp
   );
 });
 
-test("awaitCurrentTurn on a loaded session: the founding turn's outcome is observable from the replay (and the still-running case rejects with the honest unobservable error)", async () => {
-  // Phase D re-attach arm over the REAL adapter: `loadSession` replays the persisted
-  // transcript, and the seam's observability probe keys on its trailing content event
-  // (the only completion evidence the ACP protocol exposes for a session re-opened via
-  // session/load).
-  const { cwd } = harness.configure<LogEntry>({
-    loadSessionSupport: true,
-    loadSession: {
-      replay: [
-        { role: "user", text: "task" },
-        { role: "assistant", text: "result B (loaded)" },
-      ],
-    },
-  });
-  const runner = harness.makeRunner();
-  const loaded = await runner.loadSession({ sessionId: "fake-session-any", cwd, model: "claude" });
-  const turn = await loaded.awaitCurrentTurn();
-  // The founding turn's REAL outcome, resolved from the replay; the stop reason is
-  // synthesized `end_turn` (the protocol's replay carries none).
-  assert.deepEqual(turn, { stopReason: "end_turn", text: "result B (loaded)" });
-  // The transcript accessors agree with the seam (the broker's schema ladder reads the
-  // same surface).
-  assert.equal(loaded.finalMessageText(), "result B (loaded)");
-  assert.equal(loaded.currentTurnText(), "result B (loaded)");
-  await loaded.release();
+test("awaitCurrentTurn on a loaded session: completed-while-down resolves from the replay; a still-running turn is KEPT ATTACHED and settles from its live completion; a never-terminal stream rejects", async () => {
+  // Phase D re-attach arm over the REAL adapter: `session/load` replays the persisted
+  // transcript and the seam OBSERVES the update stream — completion is a SETTLED stream
+  // (no updates for the loaded-turn settle grace) with a trailing assistant message, never
+  // a trailing chunk at an arbitrary instant (phase-D review: a trailing chunk used to be
+  // treated as proof of completion, so partial output of a still-streaming turn could be
+  // settled as success; and a still-running turn used to reject, releasing the loaded
+  // session and re-issuing — duplicated work).
+  const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = "100";
+  try {
+    // 1) Completed while down: the replay carries the turn's final message; nothing more
+    //    arrives after the load response. The seam resolves with the REAL outcome text
+    //    (stop reason synthesized `end_turn` — the protocol's replay carries none).
+    const { cwd } = harness.configure<LogEntry>({
+      loadSessionSupport: true,
+      loadSession: {
+        replay: [
+          { role: "user", text: "task" },
+          { role: "assistant", text: "result B (loaded)" },
+        ],
+      },
+    });
+    const runner = harness.makeRunner();
+    const loaded = await runner.loadSession({ sessionId: "fake-session-any", cwd, model: "claude" });
+    const turn = await loaded.awaitCurrentTurn();
+    assert.deepEqual(turn, { stopReason: "end_turn", text: "result B (loaded)" });
+    // The transcript accessors agree with the seam (the broker's schema ladder reads the
+    // same surface).
+    assert.equal(loaded.finalMessageText(), "result B (loaded)");
+    assert.equal(loaded.currentTurnText(), "result B (loaded)");
+    await loaded.release();
 
-  // The still-running case: the replay ends at the founding turn's user message (no
-  // terminal assistant message) — the completion is not observable over the protocol,
-  // and the seam rejects with the honest host-side error (the broker degrades to
-  // re-issue).
-  const { cwd: cwd2 } = harness.configure<LogEntry>({
-    loadSessionSupport: true,
-    loadSession: { replay: [{ role: "user", text: "task" }] },
-  });
-  const runner2 = harness.makeRunner();
-  const loaded2 = await runner2.loadSession({ sessionId: "fake-session-any", cwd: cwd2, model: "claude" });
-  await assert.rejects(() => loaded2.awaitCurrentTurn(), (error: unknown) =>
-    (error as Error).message.includes("still in flight at the backend"),
-  );
-  await loaded2.release();
+    // 2) Still in flight at load: the replay ends at the founding turn's user message, and
+    //    the backend CONTINUES streaming live chunks after the load response (a real agent
+    //    resumes the turn for the reconnected client). The seam must NOT reject and must NOT
+    //    settle partial output: it keeps the loaded session attached and resolves with the
+    //    turn's AUTHORITATIVE completion once the live stream settles.
+    const { cwd: cwd2 } = harness.configure<LogEntry>({
+      loadSessionSupport: true,
+      loadSession: {
+        replay: [{ role: "user", text: "task" }],
+        // Live chunks stream at gaps SMALLER than the settle grace (real
+        // streaming), so the seam's quiet clock keeps resetting until the
+        // turn actually ends — then settles with the FULL accumulated text.
+        continue: [
+          { afterMs: 60, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "live " } } },
+          { afterMs: 120, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "result" } } },
+        ],
+      },
+    });
+    const runner2 = harness.makeRunner();
+    const loaded2 = await runner2.loadSession({ sessionId: "fake-session-any", cwd: cwd2, model: "claude" });
+    const turn2 = await loaded2.awaitCurrentTurn();
+    assert.deepEqual(turn2, { stopReason: "end_turn", text: "live result" });
+    assert.equal(loaded2.finalMessageText(), "live result");
+    await loaded2.release();
+
+    // 3) Never terminal: the replay ends at the user message and NOTHING ever continues
+    //    (the turn died silently at the backend, or the backend never streams after load).
+    //    The seam's max-wait backstop rejects with the honest host-side error so the broker
+    //    can re-issue — a re-attached call can never hang unobserved.
+    const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+    process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = "200";
+    try {
+      const { cwd: cwd3 } = harness.configure<LogEntry>({
+        loadSessionSupport: true,
+        loadSession: { replay: [{ role: "user", text: "task" }] },
+      });
+      const runner3 = harness.makeRunner();
+      const loaded3 = await runner3.loadSession({ sessionId: "fake-session-any", cwd: cwd3, model: "claude" });
+      await assert.rejects(
+        () => loaded3.awaitCurrentTurn(),
+        (error: unknown) =>
+          (error as Error).message.includes("never reached a terminal assistant message"),
+      );
+      await loaded3.release();
+    } finally {
+      if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+      else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
+    }
+  } finally {
+    if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
+  }
 });

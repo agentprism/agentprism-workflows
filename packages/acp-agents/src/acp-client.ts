@@ -341,12 +341,22 @@ class SessionState {
    *  all — a session whose replay has none never received its prompt). */
   private sawUserMessage = false;
   /** The KIND of the transcript's last content event: an assistant message
-   *  chunk is the ONLY completion evidence the ACP protocol exposes for a
-   *  loaded session (a turn that ended before the load has its final message
-   *  in the replay); any other trailing content (a user message, a tool
-   *  call, a thought, a plan) means the founding turn is either still
-   *  running or ended without a terminal message — not observable. */
+   *  chunk is a PROGRESS event, never a terminal marker by itself — the
+   *  re-attach arm's completion evidence is a terminal assistant message
+   *  on a SETTLED stream (no updates for the loaded-turn settle grace),
+   *  not a trailing chunk at an arbitrary instant (phase-D review: a
+   *  trailing chunk used to be treated as proof of completion, so partial
+   *  output of a still-streaming turn could be settled as success). Any
+   *  other trailing content (a user message, a tool call, a thought, a
+   *  plan) means the founding turn ended without a terminal message —
+   *  not observable as a successful completion. */
   private trailingContentKind: 'assistant-message' | 'other' = 'other';
+  /** Monotonic wall-clock of the session's most recent update (the
+   *  re-attach arm's stream-settled probe — `applyUpdate` is synchronous
+   *  on the wire, so this is the authoritative last-progress instant). */
+  private lastUpdateAt = Date.now();
+  /** The re-attach arm's update watchers (woken by every session/update). */
+  private readonly updateWatchers = new Set<() => void>();
 
   /** `label`/`runId`/`callIndex` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
@@ -396,6 +406,7 @@ class SessionState {
   }
 
   applyUpdate(update: SessionNotification["update"]): void {
+    this.lastUpdateAt = Date.now();
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         this.trailingContentKind = 'assistant-message';
@@ -469,6 +480,10 @@ class SessionState {
       default:
         break;
     }
+    // Wake the re-attach arm's stream watchers after EVERY update kind
+    // (any update — chunk, thought, tool call, usage — resets the loaded
+    // turn's settle clock; the seam's quiet wait keys on this).
+    for (const watcher of this.updateWatchers) watcher();
   }
 
   applyRawMessage(message: RawResultSuccess | undefined): void {
@@ -479,17 +494,33 @@ class SessionState {
 
   /** The loaded-session founding-turn observability probe (the re-attach
    *  arm's transcript check; see `InteractiveSession.awaitCurrentTurn`):
-   *  whether the transcript shows a turn ever started (a user message) and
-   *  whether the trailing content event is an assistant message — the only
-   *  completion evidence the ACP protocol exposes for a session re-opened
-   *  via `session/load` (the agent replays the entire persisted conversation
-   *  and only then resolves the load, so everything observable is in the
-   *  transcript by then; a still-running turn streams live AFTER the load
-   *  response with no protocol-level end signal). */
-  loadedTurnState(): { hasUserMessage: boolean; complete: boolean } {
+   *  whether the transcript shows a turn ever started (a user message)
+   *  and the KIND of the trailing content event. The trailing kind is
+   *  PROGRESS evidence, not completion: the seam decides completion from
+   *  the stream SETTLING (no updates for the loaded-turn settle grace)
+   *  with a trailing assistant message — see `awaitCurrentTurn`. */
+  loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
     return {
       hasUserMessage: this.sawUserMessage,
-      complete: this.trailingContentKind === 'assistant-message',
+      trailingContentKind: this.trailingContentKind,
+    };
+  }
+
+  /** The most recent instant a session/update arrived for this session
+   *  (the re-attach arm's stream-settled clock; `applyUpdate` runs
+   *  synchronously on the wire, so the timestamp is authoritative). */
+  lastUpdateAtMs(): number {
+    return this.lastUpdateAt;
+  }
+
+  /** Watch the session/update stream: the listener fires after every
+   *  applied update. Returns the unsubscribe thunk. The re-attach arm
+   *  waits on this instead of polling, so a long still-running turn is
+   *  observed with zero busy work. */
+  subscribeUpdates(listener: () => void): () => void {
+    this.updateWatchers.add(listener);
+    return () => {
+      this.updateWatchers.delete(listener);
     };
   }
 
@@ -2576,12 +2607,27 @@ export class SessionHandle implements StructuredSource {
 
   /** The loaded-session founding-turn observability probe (see
    *  `InteractiveSession.awaitCurrentTurn`): whether the replayed transcript
-   *  shows a turn ever started, and whether the trailing content event is an
-   *  assistant message — the only completion evidence ACP exposes for a
-   *  session re-opened via `session/load`. Added for the REPL broker's
-   *  re-attach arm; additive passthrough to `SessionState`. */
-  loadedTurnState(): { hasUserMessage: boolean; complete: boolean } {
+   *  shows a turn ever started, and the KIND of the trailing content event.
+   *  The trailing kind is PROGRESS evidence, never completion by itself —
+   *  the seam decides completion from the stream SETTLING with a trailing
+   *  assistant message. Added for the REPL broker's re-attach arm;
+   *  additive passthrough to `SessionState`. */
+  loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
     return this.state.loadedTurnState();
+  }
+
+  /** The most recent instant a session/update arrived for this session
+   *  (the re-attach arm's stream-settled clock). Added for the REPL
+   *  broker's re-attach arm; additive passthrough to `SessionState`. */
+  lastUpdateAtMs(): number {
+    return this.state.lastUpdateAtMs();
+  }
+
+  /** Watch the session/update stream (fires after every applied update;
+   *  returns the unsubscribe thunk). Added for the REPL broker's re-attach
+   *  arm; additive passthrough to `SessionState`. */
+  subscribeUpdates(listener: () => void): () => void {
+    return this.state.subscribeUpdates(listener);
   }
 
   /** The founding turn's assistant text (the transcript accumulated after
