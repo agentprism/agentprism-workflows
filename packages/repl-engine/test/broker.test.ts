@@ -33,6 +33,7 @@ import {
   JsonlCallStore,
   Workspace,
   type BrokerOpenSessionOptions,
+  type BrokerPromptOptions,
   type BrokerRunner,
   type BrokerSession,
   type BrokerTurn,
@@ -49,7 +50,12 @@ async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** A fake held-open ACP session: the test drives turns and steer calls. */
+/** A fake held-open ACP session: the test drives turns and steer calls.
+ *  Models acp-agents' preflight/handoff split: when `released` is set,
+ *  prompt() rejects WITHOUT firing the handoff acknowledgment (the
+ *  backend prompt is never invoked — the async pre-handoff rejection
+ *  the review probe hit); otherwise it accepts the prompt and fires
+ *  the acknowledgment. */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
   capabilities: { supportsSteering: boolean } | undefined;
@@ -57,6 +63,10 @@ class FakeSession implements BrokerSession {
   readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
   cancelled = 0;
   releases = 0;
+  /** When true, prompt() rejects pre-handoff (released session) — the
+   *  handoff acknowledgment never fires and the backend is never
+   *  invoked. */
+  released = false;
   stopReason = 'end_turn';
   readonly texts: string[] = [];
   /** The assistant text of each COMPLETED turn (the result-shaping
@@ -70,10 +80,19 @@ class FakeSession implements BrokerSession {
 
   static nextId = 0;
 
-  prompt(content: string): Promise<BrokerTurn> {
+  prompt(content: string, opts: BrokerPromptOptions = {}): Promise<BrokerTurn> {
+    if (this.released) {
+      // The async pre-handoff rejection: the promise rejects and the
+      // handoff acknowledgment is NEVER fired (acp-agents' preflight:
+      // released session, aborted signal, prompt-in-flight).
+      return Promise.reject(new Error('InteractiveSession has been released'));
+    }
     this.texts.push(content);
     return new Promise((resolve, reject) => {
       this.prompts.push({ content, resolve, reject });
+      // The handoff acknowledgment — the fake's model of acp-agents
+      // invoking the backend prompt once every preflight passed.
+      opts.onHandoff?.();
     });
   }
 
@@ -944,6 +963,63 @@ test('review 2d: the delivered marker is recorded only AFTER the prompt was hand
   await broker.pump();
   assert.equal(markers, 1, 'the delivered marker was recorded exactly once, after the hand-off');
   assert.equal(runner.last().prompts.length, 1, 'the queued content became the next turn');
+  await ws.dispose();
+});
+
+test('review 2e: an async pre-handoff prompt rejection never records the delivered marker — the steer stays re-deliverable (never skipped by reconcile)', async () => {
+  const runner = new FakeRunner();
+  runner.supportsSteering = false;
+  const { ws, broker } = await setup({ runner });
+  await dispatchAgent(broker, runner);
+  const session = runner.last();
+  // The adversarial probe: the session is released while the delivery
+  // turn is being started. The fake models acp-agents' async preflight
+  // rejection (released session / aborted signal / prompt-in-flight):
+  // the prompt promise rejects and the handoff acknowledgment NEVER
+  // fires — the backend prompt is never invoked.
+  session.released = true;
+  await broker.eval('await pi.steer("go deeper"); "queued"');
+  // The founding turn completes; the kick starts the delivery turn,
+  // whose prompt pre-handoff-rejects (asynchronously).
+  session.completeTurn('first pass');
+  await tick();
+  await broker.pump();
+  await tick();
+  const record = broker.store().lookup('c2')!;
+  assert.equal(
+    record.deliveredAtMs,
+    null,
+    'no delivered marker for a steer the backend never saw (the regression: the marker used to be non-null)',
+  );
+  assert.equal(record.droppedAtMs, null, 'not dropped either — the next-turn delivery is still owed');
+  assert.equal(record.completion!.value, 'queued', 'the queued acceptance stands');
+  // Nothing is hidden: the failed delivery surfaces as a warn line in
+  // the next tool result.
+  const probe = await broker.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('delivery failed') && l.includes('released')),
+    output(probe).join('\n'),
+  );
+  // Reconcile re-queues the never-delivered steer (the regression: the
+  // non-null marker used to make the queue rebuild skip it forever).
+  const report = await broker.reconcile();
+  assert.deepEqual(report.reQueuedUndelivered, ['c2']);
+  // The re-queued steer is still deliverable: the session re-attaches
+  // (the restore path's analog — the released flag clears) and a freed
+  // concurrency slot kicks the delivery.
+  session.released = false;
+  await broker.eval('const q = agent("pi/y", "other"); "ok"');
+  await tick();
+  const other = runner.last();
+  other.completeTurn('other done');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(session.prompts.length, 1, 'the re-queued steer was delivered once the session re-attached');
+  session.completeTurn('deeper results');
+  await tick();
+  await broker.pump();
+  assert.notEqual(broker.store().lookup('c2')!.deliveredAtMs, null, 'the re-delivered steer records its delivered marker');
   await ws.dispose();
 });
 

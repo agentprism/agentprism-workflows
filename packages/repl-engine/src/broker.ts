@@ -41,11 +41,15 @@
  *   marker where it does not (see the steering mechanism table below).
  *   Queued-for-next-turn delivery is DURABLE: the steer's payload and
  *   founding session id live in the call store, and the store records
- *   each delivery turn's start (the `delivered` marker — the point of
- *   no return) and each drop (`dropped`), so a crash between enqueue
- *   and delivery loses nothing and a restored broker replays undelivered
- *   steers without duplicating delivered ones (`reconcile()`'s queue
- *   rebuild arm).
+ *   each delivery turn's start (the `delivered` marker — recorded in
+ *   the session's handoff acknowledgment, i.e. only once the prompt has
+ *   passed every preflight and is actually handed to the backend: an
+ *   async pre-handoff rejection — released session, aborted signal,
+ *   prompt-in-flight — leaves the steer undelivered-in-the-store, so
+ *   reconcile re-queues it instead of skipping it forever) and each
+ *   drop (`dropped`), so a crash between enqueue and delivery loses
+ *   nothing and a restored broker replays undelivered steers without
+ *   duplicating delivered ones (`reconcile()`'s queue rebuild arm).
  *   Steering calls NEVER hard-error: every backend/wire failure resolves
  *   `failed`; the only rejections are guest protocol violations.
  * - **The append-only call store** (`store.ts`): every call's outcome is
@@ -234,6 +238,18 @@ export interface BrokerOpenSessionOptions {
 export interface BrokerPromptOptions {
   /** Generic turn-scoped ACP `_meta` passthrough. */
   promptMeta?: Record<string, unknown>;
+  /** Handoff acknowledgment: the session invokes this exactly when the
+   *  prompt has passed every preflight check (released session, aborted
+   *  signal, prompt-in-flight) and is being handed to the underlying ACP
+   *  session/prompt — the point of no return. The broker records its
+   *  queued-steer `delivered` marker inside this callback: a marker
+   *  recorded here can never precede the backend handoff (review
+   *  regression: the marker used to be recorded when the prompt promise
+   *  was CREATED, so an async pre-handoff rejection — released session,
+   *  aborted signal, prompt-in-flight — produced a non-null marker for a
+   *  steer the backend never saw, and reconcile then skipped that
+   *  never-delivered steer permanently). */
+  onHandoff?: () => void;
 }
 
 /** One completed interactive turn (the broker's structural stand-in for
@@ -1315,23 +1331,34 @@ export class Broker {
       entry.delivering = entry.callSettled;
       if (entry.delivering) this.deliverySlots.add(entry.callId);
       // Invoke the prompt FIRST — the hand-off to the backend — and
-      // record the `delivered` marker only after it: a crash between a
-      // pre-invocation marker and the prompt used to make a restore
-      // skip a steer that was never handed to the backend, silently
-      // losing promised queued delivery (review regression). After the
-      // invocation the payload is on the wire — the true point of no
-      // return — so a restore never re-delivers it. The marker applies
-      // only to QUEUED steers (their store completion is `queued`); a
-      // direct steer's completion is recorded by the pump when its turn
-      // settles, which is its own authority. A failing marker record
-      // aborts the turn as a delivery failure (the at-least-once
-      // direction: the payload was already handed off; re-delivery
-      // after a restore is preferrable to loss).
-      const turnPromise = entry.session.prompt(prompt, { promptMeta });
-      const record = this.callStore.lookup(callId);
-      if (record?.completion?.value === 'queued') {
-        this.callStore.recordDelivery(callId, 'delivered', now());
-      }
+      // record the `delivered` marker only in the session's handoff
+      // acknowledgment, which fires exactly when the prompt has passed
+      // every preflight check (released session, aborted signal,
+      // prompt-in-flight) and is being handed to the underlying ACP
+      // session/prompt (review regression: the marker used to be
+      // recorded right after the prompt promise was CREATED, so an ASYNC
+      // pre-handoff rejection produced a non-null marker for a steer the
+      // backend never saw — and reconcile then skipped that
+      // never-delivered steer permanently). A marker recorded here can
+      // never precede the hand-off: a crash before the acknowledgment
+      // leaves the steer undelivered-in-the-store, so a restore
+      // re-queues it; after it, the payload is on the wire and replay
+      // would duplicate — the at-least-once direction is preserved on
+      // both sides. The marker applies only to QUEUED steers (their
+      // store completion is `queued`); a direct steer's completion is
+      // recorded by the pump when its turn settles, which is its own
+      // authority. A failing marker record aborts the turn as a delivery
+      // failure (the payload was already handed off; re-delivery after a
+      // restore is preferrable to loss).
+      const turnPromise = entry.session.prompt(prompt, {
+        promptMeta,
+        onHandoff: () => {
+          const record = this.callStore.lookup(callId);
+          if (record?.completion?.value === 'queued') {
+            this.callStore.recordDelivery(callId, 'delivered', now());
+          }
+        },
+      });
       const turn = await turnPromise;
       this.assertNormalStopReason(turn.stopReason, callId);
       return { outcome: 'resolve', value: 'startedNewTurn' };
@@ -1400,12 +1427,14 @@ export class Broker {
   }
 
   /** Start one queued steer's delivery turn. The `delivered` marker is
-   *  NOT recorded here — `runPromptTask` records it only once the prompt
-   *  has been handed to the backend (see there): a marker recorded
-   *  before the invocation would make a crash between the two skip a
-   *  steer that was never delivered (review regression). The absolute
-   *  cap guard stays here too: a delivery turn is subagent work and
-   *  never starts while the cap is exhausted (kickQueuedDeliveries is
+   *  NOT recorded here — `runPromptTask` records it inside the session's
+   *  handoff acknowledgment, i.e. only once the prompt has passed every
+   *  preflight and is actually being handed to the backend (see there):
+   *  a marker recorded before that would make a crash — or an async
+   *  pre-handoff rejection — leave a never-delivered steer marked
+   *  delivered, skipped by reconcile forever (review regression). The
+   *  absolute cap guard stays here too: a delivery turn is subagent work
+   *  and never starts while the cap is exhausted (kickQueuedDeliveries is
    *  the scheduler; this guard makes the ceiling unconditional). */
   private startQueuedDelivery(entry: SessionEntry): void {
     if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;

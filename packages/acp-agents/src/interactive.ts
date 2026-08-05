@@ -228,10 +228,25 @@ export class InteractiveSession {
   /** Send one prompt turn. A concurrent prompt on the same InteractiveSession is rejected with a
    *  clear host-side error; queueing is deliberately left to the host so turn boundaries remain
    *  explicit. Per-turn images are appended only to this prompt, and SessionHandle.prompt()
-   *  performs capability adaptation before sending. */
+   *  performs capability adaptation before sending.
+   *
+   *  The `onHandoff` option is the host's explicit handoff acknowledgment: it fires exactly
+   *  when the prompt has passed every preflight check (released session, aborted signal,
+   *  prompt-in-flight, image validation) and is being handed to the underlying ACP
+   *  session/prompt — the point of no return. A host that records a "delivered" marker for
+   *  the prompt (the REPL broker's queued-steer delivery marker) MUST record it here rather
+   *  than when the returned promise is created: an async pre-handoff rejection (released
+   *  session, aborted signal, or prompt-in-flight) never reaches this line, and a marker
+   *  recorded before it would make a restore skip a turn that was never delivered. A
+   *  throwing callback aborts the turn — its error propagates through the normal mapping,
+   *  and the backend prompt is never invoked. */
   async prompt(
     content: string | ContentBlock[],
-    opts: { images?: readonly PromptImage[]; promptMeta?: Record<string, unknown> } = {},
+    opts: {
+      images?: readonly PromptImage[];
+      promptMeta?: Record<string, unknown>;
+      onHandoff?: () => void;
+    } = {},
   ): Promise<InteractiveTurn> {
     if (this.releasePromise) throw new Error("InteractiveSession has been released");
     this.signal?.throwIfAborted();
@@ -252,6 +267,9 @@ export class InteractiveSession {
           : content;
       const turnContent = appendPromptImages(shaped, opts.images);
       const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(this.schema));
+      // The handoff acknowledgment (see the method docs above): fires only after every
+      // preflight check, immediately before the backend prompt is invoked.
+      opts.onHandoff?.();
       const response = await this.session.prompt(turnContent, promptMeta);
       return {
         stopReason: response.stopReason,

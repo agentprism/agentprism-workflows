@@ -246,6 +246,61 @@ test("InteractiveSession.prompt embeds the schema contract in the prompt for emb
   assert.equal(sent[2], "research X");
 });
 
+test("InteractiveSession.prompt fires the handoff acknowledgment only after every preflight, immediately before the backend prompt", async () => {
+  const order: string[] = [];
+  const gate = deferred<void>();
+  const session = fakeInteractive({
+    prompt: async () => {
+      order.push("backend");
+      await gate.promise;
+      return { stopReason: "end_turn" };
+    },
+  });
+  // Preflight rejection: a second prompt while one is in flight. The
+  // acknowledgment must never fire for a turn the backend was never
+  // handed (the REPL broker records its delivered marker in it — a
+  // false positive would make a restore skip a never-delivered turn).
+  const first = session.prompt("one", { onHandoff: () => order.push("handoff") });
+  assert.deepEqual(
+    order,
+    ["handoff", "backend"],
+    "the first prompt's acknowledgment fires exactly once, after every preflight and before the backend prompt is invoked",
+  );
+  await assert.rejects(
+    () => session.prompt("two", { onHandoff: () => order.push("handoff") }),
+    /already has a prompt in flight/,
+  );
+  assert.deepEqual(
+    order,
+    ["handoff", "backend"],
+    "a preflight-rejected prompt never fires the acknowledgment (a false positive would make a restore skip a never-delivered turn)",
+  );
+  gate.resolve();
+  assert.deepEqual(await first, { stopReason: "end_turn", text: "" });
+  assert.deepEqual(order, ["handoff", "backend"], "still exactly one acknowledgment");
+});
+
+test("InteractiveSession.prompt: a throwing handoff acknowledgment aborts the turn before the backend is invoked", async () => {
+  let backendCalls = 0;
+  const session = fakeInteractive({
+    prompt: async () => {
+      backendCalls++;
+      return { stopReason: "end_turn" };
+    },
+  });
+  await assert.rejects(
+    () => session.prompt("task", { onHandoff: () => {
+      throw new Error("store write failed");
+    } }),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /store write failed/);
+      return true;
+    },
+  );
+  assert.equal(backendCalls, 0, "the backend prompt was never invoked");
+});
+
 test("InteractiveSession.outputSchema exposes the session's contract", () => {
   const schema = { type: "object", properties: { n: { type: "number" } } };
   const session = fakeInteractive({}, { schema });
