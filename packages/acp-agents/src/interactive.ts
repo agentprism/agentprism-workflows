@@ -231,15 +231,24 @@ export class InteractiveSession {
    *  performs capability adaptation before sending.
    *
    *  The `onHandoff` option is the host's explicit handoff acknowledgment: it fires exactly
-   *  when the prompt has passed every preflight check (released session, aborted signal,
-   *  prompt-in-flight, image validation) and is being handed to the underlying ACP
-   *  session/prompt — the point of no return. A host that records a "delivered" marker for
-   *  the prompt (the REPL broker's queued-steer delivery marker) MUST record it here rather
-   *  than when the returned promise is created: an async pre-handoff rejection (released
-   *  session, aborted signal, or prompt-in-flight) never reaches this line, and a marker
-   *  recorded before it would make a restore skip a turn that was never delivered. A
-   *  throwing callback aborts the turn — its error propagates through the normal mapping,
-   *  and the backend prompt is never invoked. */
+   *  once the prompt has passed every preflight check (released session, aborted signal,
+   *  prompt-in-flight, image validation) AND the underlying ACP session/prompt request has
+   *  actually been invoked — the call below runs synchronously through request construction
+   *  and the wire send, so by the time the acknowledgment fires the payload is on the wire:
+   *  the point of no return. A host that records a "delivered" marker for the prompt (the
+   *  REPL broker's queued-steer delivery marker) MUST record it here rather than when the
+   *  returned promise is created: an async pre-handoff rejection (released session, aborted
+   *  signal, or prompt-in-flight) never reaches this line, and a marker recorded before it
+   *  would make a restore skip a turn that was never delivered. The acknowledgment firing
+   *  AFTER the invocation is the crash-boundary contract (review regression: it used to
+   *  fire BEFORE, so a crash in that interval left a durable "delivered" marker on a prompt
+   *  the backend never received — and a restore then skipped a never-delivered turn): a
+   *  crash before the acknowledgment leaves the prompt undelivered-in-the-store and a
+   *  restore re-issues it (at-least-once); a crash after it would replay a turn that is
+   *  already on the wire, which the marker's host prevents. A throwing callback aborts the
+   *  turn — its error propagates through the normal mapping — but the backend prompt is
+   *  ALREADY invoked at that point, so the turn is the host's delivery-failure path, never
+   *  a not-sent turn. */
   async prompt(
     content: string | ContentBlock[],
     opts: {
@@ -267,10 +276,24 @@ export class InteractiveSession {
           : content;
       const turnContent = appendPromptImages(shaped, opts.images);
       const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(this.schema));
-      // The handoff acknowledgment (see the method docs above): fires only after every
-      // preflight check, immediately before the backend prompt is invoked.
-      opts.onHandoff?.();
-      const response = await this.session.prompt(turnContent, promptMeta);
+      // The handoff acknowledgment (see the method docs above): fires only after the
+      // underlying ACP session/prompt request has been invoked — the call below runs
+      // synchronously through request construction and the wire send, so the payload is
+      // on the wire before the acknowledgment (review crash-boundary regression: the
+      // acknowledgment used to fire BEFORE the invocation, so a crash in that interval
+      // left a durable host "delivered" marker on a prompt the backend never received).
+      const responsePromise = this.session.prompt(turnContent, promptMeta);
+      try {
+        opts.onHandoff?.();
+      } catch (error) {
+        // The prompt is already on the wire: the marker write failed (or the host's
+        // acknowledgment threw) AFTER the hand-off, so the turn is a delivery failure,
+        // not a not-sent turn. The abandoned response must not become an unhandled
+        // rejection in the host process.
+        responsePromise.catch(() => {});
+        throw error;
+      }
+      const response = await responsePromise;
       return {
         stopReason: response.stopReason,
         text: this.session.currentTurnText(),

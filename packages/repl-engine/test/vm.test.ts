@@ -343,6 +343,38 @@ test('repeated accessor-valued completions do not accumulate guest memory (acces
   assert.equal(value(await v.evalCode('1 + 1')), 2);
 });
 
+test('resolved evals do not accumulate completion memory (wrapper + discarded handles are freed)', async () => {
+  // Adversarial regression (review): the resolved completion path
+  // returned the unwrapped value handle while RETAINING the
+  // engine-created `{ value }` wrapper (the finally condition never
+  // disposed it when the completion was kept), and the public evalCode()
+  // discarded any returned completion handle without disposing it. Every
+  // Broker.eval (rejectionBridge: true) took both paths, and an
+  // adversarial 2 MiB VM probe died at eval ~19,346 with `Error: null`;
+  // 50,000 ordinary evals stayed healthy. Rejection bridging is now
+  // separate from completion ownership: the wrapper is disposed on the
+  // unwrap path and evalCode disposes the handle it discards, so the VM
+  // is long-lived under both entries.
+  using v = await vm({ memoryLimit: 2 * 1024 * 1024 });
+  for (let i = 0; i < 20_000; i++) {
+    // The broker entry: keepCompletion + bridge, the caller disposes the
+    // returned completion handle.
+    const kept = v.evalCodeWithCompletion('({ n: ' + i + ' })', { rejectionBridge: true });
+    assert.equal(kept.outcome.kind, 'value');
+    if (kept.completion !== undefined) (kept.completion as JSValueHandle).dispose();
+    // The public entry: the bridge is armed but the completion handle is
+    // discarded by evalCode itself — it must dispose it.
+    const dropped = await v.evalCode('({ m: ' + i + ' })', { rejectionBridge: true });
+    assert.equal(dropped.kind, 'value');
+    if (dropped.kind === 'value') assert.deepEqual(dropped.value, { m: i });
+  }
+  // A suspended eval with the bridge attached also stays healthy (the
+  // bridge attaches to the pending completion — no fabricated value).
+  const pending = await v.evalCode('const gate = new Promise(() => {}); await gate; 1', { rejectionBridge: true });
+  assert.equal(pending.kind, 'pending');
+  assert.equal(value(await v.evalCode('1 + 1')), 2, 'the VM is healthy after 40,000 resolved evals plus a suspended one');
+});
+
 test('memory limit: a per-VM limit turns oversized allocations into out-of-memory errors', async () => {
   using v = await vm({ memoryLimit: 1024 * 1024 });
   assert.equal(v.memoryLimit, 1024 * 1024);

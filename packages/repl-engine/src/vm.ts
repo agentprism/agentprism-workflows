@@ -375,7 +375,17 @@ export class ReplVm {
    * rendering — see the module docs.
    */
   async evalCode(code: string, options: ReplEvalOptions = {}): Promise<ReplEvalOutcome> {
-    return this.evalCodeWithCompletion(code, options).outcome;
+    const { outcome, completion } = this.evalCodeWithCompletion(code, options);
+    // The completion handle is owned by the caller of
+    // evalCodeWithCompletion — this public entry discards it, so it must
+    // dispose it (review regression: a resolved eval with
+    // `rejectionBridge: true` used to leak the handle — an adversarial
+    // 2 MiB VM probe died at eval ~19,346). Rejection bridging is
+    // decided by `options.rejectionBridge` alone (see
+    // `evalCodeWithCompletion`): a caller that wants the bridge does not
+    // thereby own a completion handle.
+    if (completion !== undefined) (completion as JSValueHandle).dispose();
+    return outcome;
   }
 
   /**
@@ -396,6 +406,15 @@ export class ReplVm {
   ): { outcome: ReplEvalOutcome; completion?: unknown } {
     this.assertAlive();
     this.assertNotReentrant();
+
+    // Rejection bridging and completion ownership are SEPARATE decisions
+    // (review regression: they used to be one flag, so a resolved eval
+    // leaked its completion wrapper and a discarded completion was never
+    // disposed): the bridge attaches to a SUSPENDED completion when
+    // `rejectionBridge` is set; the live completion handle is returned
+    // to this internal entry's caller on every resolved eval, and the
+    // caller (the broker, or `evalCode` which disposes it) owns it.
+    const attachBridge = options.rejectionBridge === true;
 
     // Arm the per-eval interrupt slot for the whole operation (eval + its
     // drain). Because the body below is synchronous, this save/restore
@@ -422,7 +441,7 @@ export class ReplVm {
         }
         throw e; // host-side failure, not a guest outcome — fail loudly
       }
-      return this.readCompletion(handle, options.rejectionBridge === true);
+      return this.readCompletion(handle, true, attachBridge);
     } finally {
       handle?.dispose();
       this.interruptSlot.current = previousInterrupt;
@@ -544,21 +563,26 @@ export class ReplVm {
    * With `keepCompletion` the resolved arm returns the live completion
    * VALUE handle (the engine-created `{ value }` wrapper unwrapped
    * trap-free via its own descriptor — the broker previews the value, not
-   * the wrapper), owned by the caller; the pending arm attaches the
-   * uncaught-rejection bridge first (see `ReplEvalOptions.rejectionBridge`),
-   * so a late rejection of a suspended completion reaches the console
-   * bridge instead of vanishing.
+   * the wrapper), owned by the caller; the wrapper itself is disposed on
+   * that path (review regression: it used to be retained, so every
+   * resolved eval leaked it — a 2 MiB VM died at eval ~19,346). The
+   * pending arm attaches the uncaught-rejection bridge first when
+   * `attachBridge` is set (see `ReplEvalOptions.rejectionBridge`) —
+   * bridging is independent of completion ownership, so a caller that
+   * discards the completion (public `evalCode`) still gets the bridge
+   * and never leaks the handle.
    */
   private readCompletion(
     handle: JSValueHandle,
     keepCompletion: boolean,
+    attachBridge: boolean,
   ): { outcome: ReplEvalOutcome; completion?: unknown } {
     try {
       // 0 pending, 1 fulfilled, 2 rejected (quickjs-wasi built-in
       // `promiseState`).
       const state = handle.promiseState;
       if (state === 0) {
-        if (keepCompletion) this.attachRejectionBridge(handle);
+        if (attachBridge) this.attachRejectionBridge(handle);
         return { outcome: { kind: 'pending' } };
       }
       // For settled promises `qjs_promise_result` returns a new owned
@@ -566,6 +590,9 @@ export class ReplVm {
       // wrapper on fulfillment, the raw thrown value on rejection.
       const resultPtr = this.vm._getExports().qjs_promise_result(handle.ptr);
       const result = new JSValueHandle(this.vm, resultPtr);
+      // `result` is disposed in the finally unless the caller took
+      // ownership of it (the wrapper-as-completion fallback below).
+      let callerOwnsWrapper = false;
       try {
         if (state === 2) {
           return { outcome: { kind: 'error', error: readErrorInfo(result) } };
@@ -583,15 +610,16 @@ export class ReplVm {
         if (keepCompletion) {
           if (valueHandle !== undefined) {
             // The caller owns the unwrapped value handle; the wrapper is
-            // disposed here.
+            // disposed by the finally below.
             return { outcome: { kind: 'value', value: snapshot }, completion: valueHandle };
           }
+          callerOwnsWrapper = true;
           return { outcome: { kind: 'value', value: snapshot }, completion: result };
         }
         valueHandle?.dispose();
         return { outcome: { kind: 'value', value: snapshot } };
       } finally {
-        if (!keepCompletion || state === 2) result.dispose();
+        if (!callerOwnsWrapper) result.dispose();
       }
     } finally {
       handle.dispose();

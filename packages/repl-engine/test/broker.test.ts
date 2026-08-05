@@ -54,8 +54,13 @@ async function tick(): Promise<void> {
  *  Models acp-agents' preflight/handoff split: when `released` is set,
  *  prompt() rejects WITHOUT firing the handoff acknowledgment (the
  *  backend prompt is never invoked — the async pre-handoff rejection
- *  the review probe hit); otherwise it accepts the prompt and fires
- *  the acknowledgment. */
+ *  the review probe hit); otherwise it accepts the prompt. The seam
+ *  order models the FIXED acp-agents contract (the crash-boundary
+ *  regression): the backend prompt is registered (invoked) FIRST, and
+ *  the handoff acknowledgment fires only after it — so a delivered
+ *  marker recorded by the broker can never precede the hand-off. The
+ *  `dieBeforeHandoff`/`dieAfterHandoff` modes simulate a process death
+ *  in the seam itself. */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
   capabilities: { supportsSteering: boolean } | undefined;
@@ -67,6 +72,18 @@ class FakeSession implements BrokerSession {
    *  handoff acknowledgment never fires and the backend is never
    *  invoked. */
   released = false;
+  /** Crash-boundary simulation: the prompt is invoked (registered) and
+   *  then the process dies BEFORE the handoff acknowledgment fires —
+   *  the only interval the fixed seam leaves between "the backend
+   *  received the prompt" and "the delivered marker is durable". The
+   *  steer must stay undelivered-in-the-store: reconcile re-queues it
+   *  (never lost). */
+  dieBeforeHandoff = false;
+  /** Crash-boundary simulation: the prompt is invoked, the handoff
+   *  acknowledgment fires (the delivered marker is durable), and then
+   *  the process dies — reconcile must never replay it (never
+   *  duplicated). */
+  dieAfterHandoff = false;
   stopReason = 'end_turn';
   readonly texts: string[] = [];
   /** The assistant text of each COMPLETED turn (the result-shaping
@@ -89,7 +106,23 @@ class FakeSession implements BrokerSession {
     }
     this.texts.push(content);
     return new Promise((resolve, reject) => {
+      // The backend prompt is invoked (registered) FIRST — the seam
+      // order of the fixed acp-agents contract; the handoff
+      // acknowledgment fires only after it.
       this.prompts.push({ content, resolve, reject });
+      if (this.dieBeforeHandoff) {
+        // The prompt reached the backend, but the process died before
+        // the acknowledgment — the delivered marker was never recorded.
+        reject(new Error('process died in the hand-off seam'));
+        return;
+      }
+      if (this.dieAfterHandoff) {
+        // The acknowledgment fires (the broker durably records the
+        // delivered marker), then the process dies.
+        opts.onHandoff?.();
+        reject(new Error('process died after the delivered marker'));
+        return;
+      }
       // The handoff acknowledgment — the fake's model of acp-agents
       // invoking the backend prompt once every preflight passed.
       opts.onHandoff?.();
@@ -631,9 +664,14 @@ test('cancel with a turn in flight: the handle resolves "cancelled" and the canc
   const r = await broker.eval('"probe"');
   assert.ok(output(r).some((line) => line.includes('"cancelled"')), output(r).join('\n'));
   assert.ok(output(r).some((line) => line.includes('cancel-outcome')), output(r).join('\n'));
-  // The call itself rejects with the machine-readable cancellation.
-  const call = await broker.eval('await pi.catch((e) => e.code + "/" + e.message)');
-  assert.equal(call.result, '"AGENT_CANCELLED/call c1 was cancelled"');
+  // The call itself rejects with the machine-readable cancellation —
+  // and the rejection is RECOVERABLE (review regression: it used to be
+  // recoverable: false, which the guest combinators treat as a halt
+  // signal — cancelling one worker then aborted the surrounding
+  // parallel()/pipeline()). One call's cancellation must never abort
+  // the orchestration owning it.
+  const call = await broker.eval('await pi.catch((e) => e.code + "/" + e.recoverable)');
+  assert.equal(call.result, '"AGENT_CANCELLED/true"');
   assert.equal(runner.last().cancelled, 1, 'a second cancel of the idle session is a no-op');
   const idle = await broker.eval('await pi.cancel()');
   assert.equal(idle.result, '"idle"');
@@ -1020,6 +1058,97 @@ test('review 2e: an async pre-handoff prompt rejection never records the deliver
   await tick();
   await broker.pump();
   assert.notEqual(broker.store().lookup('c2')!.deliveredAtMs, null, 'the re-delivered steer records its delivered marker');
+  await ws.dispose();
+});
+
+test('review 7a (the true crash-boundary regression): a process death between the backend hand-off and the delivered marker leaves the steer re-deliverable — reconcile re-queues it, never loses it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-broker-crash-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  runner.supportsSteering = false;
+  await dispatchAgent(broker, runner);
+  const session = runner.last();
+  await broker.eval('await pi.steer("go deeper"); "queued"');
+  // The delivery turn starts; the fake models the fixed acp-agents seam
+  // (prompt invoked first, then the handoff acknowledgment). The
+  // process dies in the ONLY interval the fixed seam leaves: after the
+  // backend prompt was invoked, before the acknowledgment fired — the
+  // delivered marker was never recorded.
+  session.dieBeforeHandoff = true;
+  session.completeTurn('first pass');
+  await tick();
+  await broker.pump();
+  await tick();
+  const record = broker.store().lookup('c2')!;
+  assert.equal(record.deliveredAtMs, null, 'no marker — the steer is undelivered-in-the-store');
+  assert.equal(record.completion!.value, 'queued', 'the queued acceptance stands');
+  // Nothing is hidden: the delivery failure surfaces as a warn line.
+  const probe = await broker.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('delivery failed') && l.includes('hand-off seam')),
+    output(probe).join('\n'),
+  );
+  // The restore's reconcile re-queues the never-delivered steer (the
+  // regression: with the marker written BEFORE the invocation, a crash
+  // in that interval left the steer marked delivered and skipped
+  // forever).
+  const report = await broker.reconcile();
+  assert.deepEqual(report.reQueuedUndelivered, ['c2']);
+  // The re-queued steer is delivered exactly once on the next kick (a
+  // freed slot — the founding session is idle again). The died delivery
+  // turn stays registered in the fake; the re-delivery is the NEXT
+  // registered prompt.
+  session.dieBeforeHandoff = false;
+  const promptsAfterDeath = session.prompts.length;
+  await broker.eval('const q = agent("pi/y", "other"); "ok"');
+  await tick();
+  runner.last().completeTurn('other done');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(session.prompts.length, promptsAfterDeath + 1, 'the re-queued steer was delivered once a slot freed');
+  assert.equal(session.prompts[promptsAfterDeath].content, 'go deeper');
+  session.prompts[promptsAfterDeath].resolve({ stopReason: 'end_turn', text: 'deeper results' });
+  await tick();
+  await broker.pump();
+  assert.notEqual(broker.store().lookup('c2')!.deliveredAtMs, null, 'the re-delivered steer records its marker');
+  const report2 = await broker.reconcile();
+  assert.deepEqual(report2.reQueuedUndelivered, [], 'delivered exactly once — never re-queued again');
+  await ws.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('review 7b (the crash-boundary regression, delivered side): a process death AFTER the delivered marker is durable never replays the steer', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  runner.supportsSteering = false;
+  await dispatchAgent(broker, runner);
+  const session = runner.last();
+  await broker.eval('await pi.steer("go deeper"); "queued"');
+  // The delivery turn dies after the handoff acknowledgment fired — the
+  // marker is durable, the payload was on the wire; replay would
+  // duplicate the delivery.
+  session.dieAfterHandoff = true;
+  session.completeTurn('first pass');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.notEqual(broker.store().lookup('c2')!.deliveredAtMs, null, 'the marker was recorded at the hand-off');
+  // Nothing is hidden: the failed delivery surfaces as a warn line.
+  const probe = await broker.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('delivery failed') && l.includes('after the delivered marker')),
+    output(probe).join('\n'),
+  );
+  // Reconcile must NOT replay the delivered steer — no duplicate
+  // delivery turns (the one registered prompt is the original delivery,
+  // which died after the marker; reconcile must not start another).
+  session.dieAfterHandoff = false;
+  const promptsAtFailure = session.prompts.length;
+  const report = await broker.reconcile();
+  assert.deepEqual(report.reQueuedUndelivered, []);
+  assert.equal(session.prompts.length, promptsAtFailure, 'no duplicate delivery turn');
   await ws.dispose();
 });
 

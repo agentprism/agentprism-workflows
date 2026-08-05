@@ -246,7 +246,7 @@ test("InteractiveSession.prompt embeds the schema contract in the prompt for emb
   assert.equal(sent[2], "research X");
 });
 
-test("InteractiveSession.prompt fires the handoff acknowledgment only after every preflight, immediately before the backend prompt", async () => {
+test("InteractiveSession.prompt fires the handoff acknowledgment only after the backend prompt was invoked (the crash-boundary ordering)", async () => {
   const order: string[] = [];
   const gate = deferred<void>();
   const session = fakeInteractive({
@@ -263,8 +263,8 @@ test("InteractiveSession.prompt fires the handoff acknowledgment only after ever
   const first = session.prompt("one", { onHandoff: () => order.push("handoff") });
   assert.deepEqual(
     order,
-    ["handoff", "backend"],
-    "the first prompt's acknowledgment fires exactly once, after every preflight and before the backend prompt is invoked",
+    ["backend", "handoff"],
+    "the acknowledgment fires exactly once, after the backend prompt was invoked (a crash before it leaves the turn undelivered-in-the-store — the at-least-once direction)",
   );
   await assert.rejects(
     () => session.prompt("two", { onHandoff: () => order.push("handoff") }),
@@ -272,20 +272,23 @@ test("InteractiveSession.prompt fires the handoff acknowledgment only after ever
   );
   assert.deepEqual(
     order,
-    ["handoff", "backend"],
+    ["backend", "handoff"],
     "a preflight-rejected prompt never fires the acknowledgment (a false positive would make a restore skip a never-delivered turn)",
   );
   gate.resolve();
   assert.deepEqual(await first, { stopReason: "end_turn", text: "" });
-  assert.deepEqual(order, ["handoff", "backend"], "still exactly one acknowledgment");
+  assert.deepEqual(order, ["backend", "handoff"], "still exactly one acknowledgment");
 });
 
-test("InteractiveSession.prompt: a throwing handoff acknowledgment aborts the turn before the backend is invoked", async () => {
+test("InteractiveSession.prompt: a throwing handoff acknowledgment aborts the turn AFTER the backend was invoked (delivery-failure semantics)", async () => {
   let backendCalls = 0;
+  let resolveBackend!: (value: { stopReason: "end_turn" }) => void;
   const session = fakeInteractive({
-    prompt: async () => {
+    prompt: () => {
       backendCalls++;
-      return { stopReason: "end_turn" };
+      return new Promise((resolve) => {
+        resolveBackend = resolve;
+      });
     },
   });
   await assert.rejects(
@@ -298,7 +301,12 @@ test("InteractiveSession.prompt: a throwing handoff acknowledgment aborts the tu
       return true;
     },
   );
-  assert.equal(backendCalls, 0, "the backend prompt was never invoked");
+  assert.equal(backendCalls, 1, "the backend prompt was already invoked when the acknowledgment threw — the turn is a delivery failure, never a not-sent turn");
+  // The abandoned turn's response settles later (resolve AND reject — a
+  // late failure must not become an unhandled rejection in the host
+  // process).
+  resolveBackend({ stopReason: "end_turn" });
+  await new Promise((r) => setTimeout(r, 0));
 });
 
 test("InteractiveSession.outputSchema exposes the session's contract", () => {

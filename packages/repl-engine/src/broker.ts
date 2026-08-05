@@ -43,10 +43,12 @@
  *   founding session id live in the call store, and the store records
  *   each delivery turn's start (the `delivered` marker — recorded in
  *   the session's handoff acknowledgment, i.e. only once the prompt has
- *   passed every preflight and is actually handed to the backend: an
- *   async pre-handoff rejection — released session, aborted signal,
- *   prompt-in-flight — leaves the steer undelivered-in-the-store, so
- *   reconcile re-queues it instead of skipping it forever) and each
+ *   passed every preflight AND the underlying ACP session/prompt
+ *   request has actually been invoked: a crash before the
+ *   acknowledgment — or an async pre-handoff rejection: released
+ *   session, aborted signal, prompt-in-flight — leaves the steer
+ *   undelivered-in-the-store, so reconcile re-queues it instead of
+ *   skipping it forever) and each
  *   drop (`dropped`), so a crash between enqueue and delivery loses
  *   nothing and a restored broker replays undelivered steers without
  *   duplicating delivered ones (`reconcile()`'s queue rebuild arm).
@@ -1292,8 +1294,18 @@ export class Broker {
           agentLabel: `repl:${callId}`,
         });
       case 'cancelled':
+        // Orchestrator-driven cancellation is RECOVERABLE (review
+        // regression: this used to be recoverable: false, which the guest
+        // combinators treat as a halt signal — cancelling one worker then
+        // aborted the parallel()/pipeline() owning it). The module docs'
+        // cancel contract ("the cancelled call itself rejects with the
+        // recoverable CancelledError") and the monorepo convention agree:
+        // one call's cancellation must never abort the surrounding
+        // orchestration. The store's cancelled-founding-call check keys on
+        // the CODE, not the flag, so the queue-drop semantics are
+        // unchanged.
         throw new WorkflowError(`call ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
-          recoverable: false,
+          recoverable: true,
           agentLabel: `repl:${callId}`,
         });
       default:
@@ -1332,19 +1344,21 @@ export class Broker {
       if (entry.delivering) this.deliverySlots.add(entry.callId);
       // Invoke the prompt FIRST — the hand-off to the backend — and
       // record the `delivered` marker only in the session's handoff
-      // acknowledgment, which fires exactly when the prompt has passed
+      // acknowledgment, which fires only once the prompt has passed
       // every preflight check (released session, aborted signal,
-      // prompt-in-flight) and is being handed to the underlying ACP
-      // session/prompt (review regression: the marker used to be
-      // recorded right after the prompt promise was CREATED, so an ASYNC
-      // pre-handoff rejection produced a non-null marker for a steer the
-      // backend never saw — and reconcile then skipped that
-      // never-delivered steer permanently). A marker recorded here can
-      // never precede the hand-off: a crash before the acknowledgment
-      // leaves the steer undelivered-in-the-store, so a restore
-      // re-queues it; after it, the payload is on the wire and replay
-      // would duplicate — the at-least-once direction is preserved on
-      // both sides. The marker applies only to QUEUED steers (their
+      // prompt-in-flight) AND the underlying ACP session/prompt request
+      // has actually been invoked — the wire send happens synchronously
+      // inside the invocation, so a marker recorded in the acknowledgment
+      // can never precede the hand-off (review regression: the marker
+      // used to be recorded right after the prompt promise was CREATED,
+      // before the backend prompt was invoked — a crash in that interval,
+      // or an ASYNC pre-handoff rejection, produced a non-null marker
+      // for a steer the backend never saw, and reconcile then skipped
+      // that never-delivered steer permanently). A crash before the
+      // acknowledgment leaves the steer undelivered-in-the-store, so a
+      // restore re-queues it; after it, the payload is on the wire and
+      // replay would duplicate — the at-least-once direction is preserved
+      // on both sides. The marker applies only to QUEUED steers (their
       // store completion is `queued`); a direct steer's completion is
       // recorded by the pump when its turn settles, which is its own
       // authority. A failing marker record aborts the turn as a delivery
@@ -1429,7 +1443,7 @@ export class Broker {
   /** Start one queued steer's delivery turn. The `delivered` marker is
    *  NOT recorded here — `runPromptTask` records it inside the session's
    *  handoff acknowledgment, i.e. only once the prompt has passed every
-   *  preflight and is actually being handed to the backend (see there):
+   *  preflight and has actually been handed to the backend (see there):
    *  a marker recorded before that would make a crash — or an async
    *  pre-handoff rejection — leave a never-delivered steer marked
    *  delivered, skipped by reconcile forever (review regression). The

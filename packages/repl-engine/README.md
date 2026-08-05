@@ -295,7 +295,8 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
   not (the steering mechanism table is in `src/broker.ts`'s module docs). Steering calls NEVER
   hard-error: backend/wire failures resolve `failed`; the only rejections are guest protocol
   violations. `cancel()` resolves `cancelled` (turn in flight), `idle` (nothing running) or
-  `failed`; a cancelled call rejects with `AGENT_CANCELLED`.
+  `failed`; a cancelled call rejects with the RECOVERABLE `AGENT_CANCELLED` (one worker's
+  cancellation never halts the surrounding orchestration).
 - **The append-only call store** (`src/store.ts`, transfer lesson 1): every call's outcome is
   recorded by call id BEFORE it is settled into the guest. `InMemoryCallStore` for tests and
   ephemeral hosts; `JsonlCallStore` is the durable append-only JSON-lines file — every mutation
@@ -403,7 +404,8 @@ Phase C decisions (the broker, the call store, the eval tool-result semantics):
   its queue — both documented); no-extension backend + idle session → a new turn
   (`startedNewTurn`). Any wire failure resolves `failed` — steering never hard-errors. `cancel`
   resolves `cancelled` (a turn was in flight and ACP `session/cancel` completed; the cancelled
-  call itself rejects with `AGENT_CANCELLED`), `idle` (nothing was running), or `failed`. The
+  call itself rejects with the recoverable `AGENT_CANCELLED` — never a halt signal for the
+  orchestration owning it), `idle` (nothing was running), or `failed`. The
   outcome surface is acp-agents' `SteeringOutcome` plus the honest `queued`/`cancelled`/`idle`
   additions — urgency delivery (`injected`) is always distinguishable from next-turn delivery
   (`queued`/`startedNewTurn`).
