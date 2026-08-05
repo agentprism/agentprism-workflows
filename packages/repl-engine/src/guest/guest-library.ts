@@ -14,14 +14,17 @@
  * What it defines in the realm (the roadmap doc's DSL split — only the
  * sliver that needs host effects calls out; everything else is pure JS):
  *
- *   - `agent(prompt, options?)` → Promise (host effect). The returned
- *     promise IS the live handle: started-not-awaited handles come free
- *     with top-level await, and the doc's handle methods ride it —
- *     `followUp(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()` —
- *     each resolving with what actually happened (the host settles with
- *     the steering outcome, mirroring the outcome values acp-agents
- *     surfaces in its steering events). `id` carries the stable call id
- *     (`"c1"`, …) used by `status`/`interrupt`.
+ *   - `agent(modelSpec, task, options?)` → Promise (host effect). `modelSpec`
+ *     is the backend-routing spec (`"pi/deepseek-v4-flash-max"`, per the
+ *     roadmap doc's own example); `task` the worker's prompt; `options`
+ *     (structured-output schema, cwd, backend config) cross the bridge as
+ *     JSON. The returned promise IS the live handle: started-not-awaited
+ *     handles come free with top-level await, and the doc's handle methods
+ *     ride it — `followUp(prompt, opts?)` / `steer(prompt, opts?)` /
+ *     `cancel()` — each resolving with what actually happened (the host
+ *     settles with the steering outcome, mirroring the outcome values
+ *     acp-agents surfaces in its steering events). `id` carries the stable
+ *     call id (`"c1"`, …) used by `status`/`interrupt`.
  *   - `checkpoint(question, options?)` → Promise (host effect), and
  *     `checkpoint.answer(callId, value)` → boolean — answer delivery
  *     through the same host function's trailing-argument mode.
@@ -45,12 +48,16 @@
  * no counterpart here).
  *
  * The pending-call registry (callId → { resolve, reject, kind, detail,
- * optionsJson, createdAt }) lives in the library's closure, so the table
- * of in-flight host calls travels inside the snapshot itself. The host
- * settles calls by callId — through the Deferred it returned from a
- * `__host_*` function in a live session, or through the reconciliation
- * surface after a restore. Both routes converge on the same idempotent
- * settlement function; the first settlement wins.
+ * optionsJson, createdAt, sessionId, modelSpec }) lives in the library's
+ * closure, so the table of in-flight host calls travels inside the snapshot
+ * itself. Every entry records the id the host addresses the call by
+ * (`sessionId` — the founding session id for steering calls, the call's own
+ * id otherwise), so a pending steer survives a restore with full
+ * correlation: the host can settle it by its registry id and re-issue it
+ * to the session it steers. The host settles calls by callId — through the
+ * Deferred it returned from a `__host_*` function in a live session, or
+ * through the reconciliation surface after a restore. Both routes converge
+ * on the same idempotent settlement function; the first settlement wins.
  */
 
 /** The guest library's version (the `__REPL_GUEST_VERSION` marker value). */
@@ -218,9 +225,18 @@ const GUEST_LIBRARY_SOURCE = `/*
    * 'detail' is kept VERBATIM in the registry entry (the prompt for agent
    * calls, the question for checkpoints, the action for steering): after a
    * restore the host may need it to re-issue work it lost track of, so it
-   * must not be truncated.
+   * must not be truncated. 'sessionId' is the id the HOST addresses the
+   * call by — the founding call id for steering calls (the session being
+   * steered), the call's own id otherwise — and 'modelSpec' the agent
+   * call's backend-routing spec (null otherwise); both are recorded in the
+   * entry so a pending call survives a snapshot/restore with full
+   * correlation.
+   *
+   * 'hostArgs' builds the actual host invocation (each __host_* function
+   * has its own argument layout): it receives the host function and the
+   * freshly minted id and returns the host result.
    */
-  function issueCall(kind, hostFnName, detail, optionsJson, hostCallId) {
+  function issueCall(kind, hostFnName, detail, optionsJson, sessionId, modelSpec, hostArgs) {
     var hostFn = globalThis[hostFnName];
     if (typeof hostFn !== 'function') {
       throw new Error(
@@ -241,17 +257,18 @@ const GUEST_LIBRARY_SOURCE = `/*
       detail: detail,
       optionsJson: optionsJson === undefined ? null : optionsJson,
       createdAt: Date.now(),
+      // The id the host addresses this call by: the founding session id for
+      // steering calls, this call's own id for everything else. Recorded so
+      // the pending-call manifest never omits the correlation the host
+      // needs to settle or re-issue a pending steer after a restore.
+      sessionId: sessionId === undefined ? id : sessionId,
+      modelSpec: modelSpec === undefined ? null : modelSpec,
       resolve: resolveFn,
       reject: rejectFn,
     });
-    // The id the HOST sees may differ from the registry key: for steering
-    // calls the host must be addressed by the FOUNDING call id (the
-    // session being steered), while the registry entry — the settlement
-    // key — is this call's own minted id.
-    var hostId = hostCallId === undefined ? id : hostCallId;
     var returned;
     try {
-      returned = hostFn(hostId, detail, optionsJson);
+      returned = hostArgs(hostFn, id);
     } catch (err) {
       // Synchronous host refusal (e.g. a per-call cap enforced at dispatch).
       settleCall(id, 'reject', err);
@@ -283,16 +300,26 @@ const GUEST_LIBRARY_SOURCE = `/*
     return out;
   }
 
-  function issueAgentCall(prompt, options) {
-    if (typeof prompt !== 'string') {
-      throw new TypeError('agent(prompt, options?) needs a prompt string');
+  function issueAgentCall(modelSpec, task, options) {
+    if (typeof modelSpec !== 'string') {
+      throw new TypeError(
+        'agent(modelSpec, task, options?) needs a model spec string (e.g. "pi/deepseek-v4-flash-max")',
+      );
+    }
+    if (typeof task !== 'string') {
+      throw new TypeError('agent(modelSpec, task, options?) needs a task string');
     }
     var normalized = normalizeAgentOptions(options);
     // Options cross the bridge as JSON: plain data by construction, one
     // flat, unambiguous decoding host-side (functions or cycles in options
     // would be meaningless host-side).
     var optionsJson = normalized === undefined ? undefined : JSON.stringify(normalized);
-    return issueCall('agent', '__host_agent', prompt, optionsJson);
+    // The registry entry records the model spec verbatim so a restore can
+    // re-issue the call against the same backend routing. The host
+    // receives (callId, modelSpec, task, optionsJson).
+    return issueCall('agent', '__host_agent', task, optionsJson, undefined, modelSpec, function (hostFn, id) {
+      return hostFn(id, modelSpec, task, optionsJson);
+    });
   }
 
   /**
@@ -304,8 +331,15 @@ const GUEST_LIBRARY_SOURCE = `/*
    * doesn't), mirroring the outcome values acp-agents surfaces in its
    * steering events. Nothing is hidden and nothing hard-errors: the
    * orchestrator can tell urgency delivery from queued delivery and adapt.
+   *
+   * The registry entry is keyed by THIS call's own minted id (the
+   * settlement key), while 'sessionId' records the FOUNDING call id — the
+   * session being steered — so a pending steer is snapshot-reconcilable:
+   * the host sees both ids at dispatch and the pending manifest reports
+   * both, letting it durably settle (by registry id) or re-issue (to the
+   * session) a steer after a restore.
    */
-  function steerCall(callId, action, prompt, options) {
+  function steerCall(foundingCallId, action, prompt, options) {
     try {
       var payloadJson;
       if (action === 'cancel') {
@@ -317,7 +351,13 @@ const GUEST_LIBRARY_SOURCE = `/*
         var normalized = normalizeAgentOptions(options);
         payloadJson = JSON.stringify({ prompt: prompt, options: normalized === undefined ? {} : normalized });
       }
-      return issueCall('steer', '__host_agent_steer', action, payloadJson, callId).promise;
+      return issueCall('steer', '__host_agent_steer', action, payloadJson, foundingCallId, null, function (hostFn, id) {
+        // The host receives BOTH ids: the operation's own registry id (the
+        // settlement key — the host's live bookkeeping keys by it) and the
+        // founding call id (the session being steered — the dispatch and
+        // post-restore re-issue target).
+        return hostFn(id, foundingCallId, action, payloadJson);
+      }).promise;
     } catch (err) {
       return Promise.reject(err);
     }
@@ -326,17 +366,20 @@ const GUEST_LIBRARY_SOURCE = `/*
   /**
    * Run one worker agent to completion and resolve with its result (final
    * text, or the schema-validated object when options.schema is given —
-   * result shaping is host policy). Recoverable worker failures reject
-   * with an Error whose recoverable is not false.
+   * result shaping is host policy). 'modelSpec' is the backend-routing
+   * spec ("pi/deepseek-v4-flash-max"); 'task' is the worker's prompt;
+   * 'options' (structured-output schema, cwd, backend config) cross the
+   * bridge as JSON. Recoverable worker failures reject with an Error
+   * whose recoverable is not false.
    *
    * The returned promise IS the live handle: it may sit in a REPL variable
    * across turns (and across snapshot/restore) and be awaited, or driven
    * with the handle methods followUp/steer/cancel (own, non-enumerable
    * properties of the promise; 'id' carries the stable call id).
    */
-  function agent(prompt, options) {
+  function agent(modelSpec, task, options) {
     try {
-      var call = issueAgentCall(prompt, options);
+      var call = issueAgentCall(modelSpec, task, options);
       var handle = call.promise;
       Object.defineProperties(handle, {
         id: {
@@ -395,7 +438,9 @@ const GUEST_LIBRARY_SOURCE = `/*
       }
       var optionsJson =
         options === undefined || options === null ? undefined : JSON.stringify(options);
-      return issueCall('checkpoint', '__host_checkpoint', question, optionsJson).promise;
+      return issueCall('checkpoint', '__host_checkpoint', question, optionsJson, undefined, null, function (hostFn, id) {
+        return hostFn(id, question, optionsJson);
+      }).promise;
     } catch (err) {
       return Promise.reject(err);
     }
@@ -524,12 +569,19 @@ const GUEST_LIBRARY_SOURCE = `/*
    * 'item' is real/correct; passes when the share voting real meets
    * 'threshold'. Reviewers that fail recoverably are dropped from the vote
    * (they are neither yes nor no).
+   *
+   * The spawned reviewers are agent() calls; their model spec is
+   * 'opts.model' when given, else the reserved sentinel ''default'' — host
+   * policy routes that to its configured default backend (this mirrors
+   * dsl.d.ts's verify, where reviewers inherit the run's default model
+   * when none is given).
    */
   async function verify(item, opts) {
     opts = opts || {};
     var reviewers = Math.max(1, opts.reviewers !== undefined ? opts.reviewers : 2);
     var threshold = opts.threshold !== undefined ? opts.threshold : 0.5;
     var lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
+    var modelSpec = opts.model !== undefined ? opts.model : 'default';
     var claim;
     if (typeof item === 'string') {
       claim = item;
@@ -547,6 +599,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         Array.from({ length: reviewers }, function (_v, i) {
           return function () {
             return agent(
+              modelSpec,
               'Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.' +
                 (lenses.length ? ' Focus lens: ' + lenses[i % lenses.length] + '.' : '') +
                 '\\n\\n' + claim,
@@ -575,11 +628,15 @@ const GUEST_LIBRARY_SOURCE = `/*
    * LLM-judge panel: score each candidate in 'attempts' with 'judges'
    * graders against 'rubric' and return the highest mean-scoring candidate
    * as { index, attempt, score, judgments } (stable tie-break by index).
+   * The spawned graders are agent() calls with model spec 'opts.model'
+   * (else the reserved ''default'' sentinel — host-routed, same decision
+   * as verify).
    */
   async function judgePanel(attempts, opts) {
     opts = opts || {};
     var judges = Math.max(1, opts.judges !== undefined ? opts.judges : 3);
     var rubric = opts.rubric !== undefined ? opts.rubric : 'overall quality and correctness';
+    var modelSpec = opts.model !== undefined ? opts.model : 'default';
     var scored = (
       await parallel(
         (Array.isArray(attempts) ? attempts : []).map(function (att, idx) {
@@ -590,6 +647,7 @@ const GUEST_LIBRARY_SOURCE = `/*
                 Array.from({ length: judges }, function (_v, j) {
                   return function () {
                     return agent(
+                      modelSpec,
                       'Score this candidate from 0 to 1 on: ' + rubric +
                         '. Reply with the score.\\n\\nCandidate:\\n' + text,
                       { label: 'judge ' + (idx + 1) + '.' + (j + 1), schema: JUDGE_SCHEMA },
@@ -1171,9 +1229,13 @@ const GUEST_LIBRARY_SOURCE = `/*
     /**
      * JSON-safe manifest of every pending host call, oldest first:
      * [{ id, kind: "agent" | "checkpoint" | "steer", detail, optionsJson,
-     * createdAt }]. 'detail' is the verbatim prompt/question/action,
-     * 'optionsJson' the verbatim options string (or null) — enough for the
-     * host to re-issue lost work.
+     * createdAt, sessionId, modelSpec }]. 'detail' is the verbatim
+     * prompt/question/action, 'optionsJson' the verbatim options string
+     * (or null), 'sessionId' the id the host addresses the call by (the
+     * founding session id for steering calls — a pending steer is fully
+     * reconcilable after a restore), 'modelSpec' the agent call's backend
+     * routing spec (null otherwise) — enough for the host to re-issue
+     * lost work.
      */
     pending: function () {
       var out = [];
@@ -1184,6 +1246,8 @@ const GUEST_LIBRARY_SOURCE = `/*
           detail: entry.detail,
           optionsJson: entry.optionsJson,
           createdAt: entry.createdAt,
+          sessionId: entry.sessionId,
+          modelSpec: entry.modelSpec,
         });
       });
       return out;

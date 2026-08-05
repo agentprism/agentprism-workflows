@@ -608,23 +608,48 @@ test('concurrent evals never leak interrupt handlers across the batch', async ()
   assert.equal(v.drainJobs(), 0);
 });
 
-test('thrown symbols report their native string form, never NaN', async () => {
+test('thrown symbols render the bare brand — the description is not readable trap-free', async () => {
   using v = await vm();
   // Review regression: the primitive error-rendering default branch called
   // `toNumber()` on symbols, so `throw Symbol('x')` reported message `NaN`
-  // — a fabricated conversion. The native conversion is
-  // `String(Symbol(desc))`; the description is read through the raw export.
-  const e = error(await v.evalCode('throw Symbol("boom")'));
-  assert.equal(e.name, 'Error');
-  assert.equal(e.message, 'Symbol(boom)');
-  assert.equal(error(await v.evalCode('throw Symbol()')).message, 'Symbol()');
-  assert.equal(error(await v.evalCode('throw Symbol("")')).message, 'Symbol()');
-  assert.equal(error(await v.evalCode('throw Symbol.for("shared")')).message, 'Symbol(shared)');
+  // — a fabricated conversion. The honest rendering is the bare brand
+  // `Symbol` (FORMAT.md §5.7): the description sits behind
+  // `qjs_get_symbol_description`, which invokes guest `Symbol.keyFor` — a
+  // forbidden seam (FORMAT.md §1.1), because a guest that replaces
+  // `Symbol.keyFor` could forge the classification. The next test pins
+  // that the seam is never reached.
+  assert.equal(error(await v.evalCode('throw Symbol("boom")')).message, 'Symbol');
+  assert.equal(error(await v.evalCode('throw Symbol()')).message, 'Symbol');
+  assert.equal(error(await v.evalCode('throw Symbol("")')).message, 'Symbol');
+  assert.equal(error(await v.evalCode('throw Symbol.for("shared")')).message, 'Symbol');
   // Rejected top-level awaits surface the same conversion.
-  const r = error(await v.evalCode('await Promise.reject(Symbol("rejected"))'));
-  assert.equal(r.message, 'Symbol(rejected)');
+  assert.equal(error(await v.evalCode('await Promise.reject(Symbol("rejected"))')).message, 'Symbol');
   // The VM stays usable.
   assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('a guest that replaces Symbol.keyFor cannot influence error rendering (no forbidden seam)', async () => {
+  using v = await vm();
+  // The FORMAT.md §1.1 seam: reading a symbol's description calls guest
+  // `Symbol.keyFor` through the binary. The engine must never reach it —
+  // a hostile guest swaps it for a trap counter and throws symbols; the
+  // rendered message must be the bare brand and the counter must stay 0.
+  value(
+    await v.evalCode(`
+      globalThis.__keyForTraps = 0;
+      Symbol.keyFor = function () { globalThis.__keyForTraps++; return 'FORGED'; };
+      try {
+        Object.defineProperty(Symbol.prototype, 'description', {
+          configurable: true,
+          get() { globalThis.__keyForTraps++; return 'FORGED'; },
+        });
+      } catch (_e) { /* non-configurable on this build — keyFor is the seam anyway */ }
+      'installed'
+    `),
+  );
+  const e = error(await v.evalCode('throw Symbol("secret")'));
+  assert.equal(e.message, 'Symbol');
+  assert.equal(value(await v.evalCode('globalThis.__keyForTraps')), 0, 'Symbol.keyFor/description never ran');
 });
 
 test('a value GETTER on Object.prototype empties the completion wrapper — without running guest code (engine quirk, pinned)', async () => {

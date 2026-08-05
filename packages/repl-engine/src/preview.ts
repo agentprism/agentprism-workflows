@@ -407,12 +407,17 @@ function typedArrayPreview(handle: JSValueHandle, info: TypedArrayInfo): ObjectP
       elemHandle.dispose();
     }
   }
-  const hasExpandos = ownKeyCount(handle) > len;
+  const ownKeys = ownKeyCount(handle);
+  const hasExpandos = ownKeys.count > len;
   return {
     type: 'object',
     subtype: 'typedarray',
     description: `${kindName}(${len})`,
-    overflow: len > show || hasExpandos,
+    // FORMAT.md §6: a corrupted key materialization degrades with
+    // overflow:true — omitted or unverifiable expandos must never be
+    // concealed behind a fabricated "no expandos" count (review: the
+    // corrupted count read as zero, hiding the expando signal).
+    overflow: len > show || hasExpandos || ownKeys.corrupted,
     properties,
   };
 }
@@ -623,10 +628,12 @@ function ownDataString(handle: JSValueHandle, name: string): string | undefined 
 
 /** The own-key COUNT (Reflect.ownKeys length), materialized engine-side —
  *  no descriptor reads, no getters. Used for the typed-array expando
- *  signal (FORMAT.md §5.12). */
-function ownKeyCount(handle: JSValueHandle): number {
+ *  signal (FORMAT.md §5.12). A corrupted materialization reports
+ *  `corrupted: true` (count 0) so callers degrade with `overflow: true`
+ *  instead of concealing the expando question (FORMAT.md §6). */
+function ownKeyCount(handle: JSValueHandle): { count: number; corrupted: boolean } {
   const { keys, corrupted } = rawOwnKeysAll(handle);
-  return corrupted ? 0 : keys.length;
+  return { count: corrupted ? 0 : keys.length, corrupted };
 }
 
 // ---- Rendering ----

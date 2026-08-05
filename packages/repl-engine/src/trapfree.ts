@@ -340,21 +340,36 @@ export function typedArrayInfo(handle: JSValueHandle): TypedArrayInfo | undefine
   const e = vm._getExports();
   const outPtr = e.wasm_malloc(12);
   try {
+    // The export returns the view's backing ArrayBuffer as an OWNED JSValue
+    // (heap box) — or the exception sentinel box for non-views. Both are
+    // owned by us and both are disposed here: a leaked buffer handle pins
+    // the entire backing store of the view, so repeated previews without
+    // disposal accumulate WASM/QuickJS allocations (review measured the
+    // same class of leak exhausting small VMs). The exception path also
+    // takes the runtime exception the C read set, out and frees it.
     const bufferPtr = e.qjs_get_typed_array_buffer(handle.ptr, outPtr, outPtr + 4, outPtr + 8);
-    if (e.qjs_is_exception(bufferPtr) !== 0) {
-      takeAndFreeException(e, vm);
-      return undefined;
+    if (bufferPtr === 0) return undefined; // allocation edge — nothing owned
+    const buffer = new JSValueHandle(vm, bufferPtr);
+    try {
+      if (e.qjs_is_exception(buffer.ptr) !== 0) {
+        // Not a typed-array view: free the sentinel box and clear the
+        // pending engine exception it set (mirrors the Rust reference
+        // implementation's typed_array_info).
+        takeAndFreeException(e, vm);
+        return undefined;
+      }
+      const view = new DataView(e.memory.buffer);
+      const byteLength = view.getUint32(outPtr + 4, true);
+      const bytesPerElement = view.getUint32(outPtr + 8, true);
+      if (bytesPerElement === 0) return undefined;
+      return {
+        byteLength,
+        bytesPerElement,
+        length: byteLength / bytesPerElement,
+      };
+    } finally {
+      buffer.dispose();
     }
-    if (bufferPtr === 0) return undefined; // not a typed array
-    const view = new DataView(e.memory.buffer);
-    const byteLength = view.getUint32(outPtr + 4, true);
-    const bytesPerElement = view.getUint32(outPtr + 8, true);
-    if (bytesPerElement === 0) return undefined;
-    return {
-      byteLength,
-      bytesPerElement,
-      length: byteLength / bytesPerElement,
-    };
   } finally {
     e.wasm_free(outPtr);
   }
@@ -368,14 +383,22 @@ export function typedArrayInfo(handle: JSValueHandle): TypedArrayInfo | undefine
 export function arrayBufferByteLength(handle: JSValueHandle): number | undefined {
   const vm = handle.vm;
   const e = vm._getExports();
+  // Callers brand-check `isArrayBuffer` first (FORMAT.md §1: engine brand
+  // checks only). The export returns a RAW byte pointer into WASM linear
+  // memory — NOT a JSValue — so it must never be passed to
+  // `qjs_is_exception`: a guest-controlled buffer could begin with the
+  // exception tag and be misread as a failed read (review: a 16-byte
+  // buffer then rendered as `ArrayBuffer(0)`). A NULL return means not an
+  // ArrayBuffer, a detached buffer, or an allocation edge; the runtime
+  // exception slot is cleared defensively (the C read may set one — the
+  // Rust reference implementation does the same).
   const outPtr = e.wasm_malloc(4);
   try {
     const dataPtr = e.qjs_get_array_buffer(handle.ptr, outPtr);
-    if (e.qjs_is_exception(dataPtr) !== 0) {
+    if (dataPtr === 0) {
       takeAndFreeException(e, vm);
       return undefined;
     }
-    if (dataPtr === 0) return undefined;
     return new DataView(e.memory.buffer).getUint32(outPtr, true);
   } finally {
     e.wasm_free(outPtr);
@@ -391,47 +414,25 @@ export function arrayBufferByteLength(handle: JSValueHandle): number | undefined
 export function readProxyTarget(handle: JSValueHandle): JSValueHandle | undefined {
   const vm = handle.vm;
   const e = vm._getExports();
+  // The export returns an OWNED heap box: the target for a live proxy, or
+  // the exception sentinel for a revoked one (the C read also sets a
+  // pending runtime exception). Every non-success path disposes the box
+  // AND takes the runtime exception out — a leaked exception box
+  // accumulates on every revoked-proxy preview (review: repeated previews
+  // grew WASM/QuickJS allocations).
   const targetPtr = e.qjs_get_proxy_target(handle.ptr);
-  if (e.qjs_is_exception(targetPtr) !== 0) {
+  if (targetPtr === 0) return undefined; // allocation edge — nothing owned
+  const target = new JSValueHandle(vm, targetPtr);
+  if (e.qjs_is_exception(target.ptr) !== 0) {
+    target.dispose();
     takeAndFreeException(e, vm);
     return undefined; // revoked proxy
   }
-  if (targetPtr === 0) return undefined; // JS_UNDEFINED — revoked
-  const target = new JSValueHandle(vm, targetPtr);
   if (target.isUndefined || target.isNull) {
     target.dispose();
     return undefined; // revoked
   }
-  return target;
-}
-
-/**
- * Native string form of a symbol, as `String(symbol)` would produce it:
- * `Symbol(description)` — never a fabricated conversion like `NaN`
- * (review regression: the primitive error-rendering default branch called
- * `toNumber()` on symbols). The description is read through the raw
- * `qjs_get_symbol_description` export — native and trap-free; a symbol
- * without a description (or with an empty one) renders as `Symbol()`.
- */
-export function readSymbolDescription(handle: JSValueHandle): string {
-  const vm = handle.vm;
-  const e = vm._getExports();
-  const outPtr = e.wasm_malloc(4);
-  try {
-    e.qjs_get_symbol_description(handle.ptr, outPtr);
-    // The description is written as a JSValue pointer into the out slot.
-    const descPtr = new DataView(e.memory.buffer).getUint32(outPtr, true);
-    if (descPtr === 0) return 'Symbol()'; // JS_UNDEFINED — anonymous symbol
-    const desc = new JSValueHandle(vm, descPtr);
-    try {
-      const text = desc.isString ? desc.toString() : '';
-      return text ? `Symbol(${text})` : 'Symbol()';
-    } finally {
-      desc.dispose();
-    }
-  } finally {
-    e.wasm_free(outPtr);
-  }
+  return target; // owned by the caller — must be disposed
 }
 
 /**

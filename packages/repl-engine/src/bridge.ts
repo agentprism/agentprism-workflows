@@ -45,7 +45,7 @@ import {
 } from './guest/guest-library.js';
 import { getVmShim, type ReplVm } from './vm.js';
 import type { EvalErrorInfo } from './errors.js';
-import { getPropRaw, hasOwnRaw, readOwnDataProperty, readValue } from './trapfree.js';
+import { getPropRaw, hasOwnRaw, readOwnDataProperty, readValue, takeAndFreeException, type QuickJSExports } from './trapfree.js';
 
 /** The console levels the guest bridge emits. */
 export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug';
@@ -65,19 +65,37 @@ export interface ConsoleEvent {
 }
 
 /**
- * A host call in flight: wraps a quickjs-wasi `Deferred` whose promise
- * handle was returned into the realm. The handler settles the call with a
- * host value (`resolve`) or a host error value (`reject`); both are
- * marshalled into the realm (plain data, errors, arrays, objects — never
- * guest code). Settlement is first-wins: a second resolve/reject is a
- * no-op, matching the guest's own idempotent settle-by-call-id. The
- * caller must run a job drain after settling for the guest's
- * continuations to fire.
+ * A host call in flight: wraps a promise created through the raw
+ * `qjs_new_promise` export whose parts (promise + resolve/reject
+ * functions) the call owns and disposes completely.
+ *
+ * The handler settles the call with a host value (`resolve`) or a host
+ * error value (`reject`); both are marshalled into the realm (plain data,
+ * errors, arrays, objects — never guest code). Settlement is first-wins: a
+ * second resolve/reject is a no-op, matching the guest's own idempotent
+ * settle-by-call-id. The caller must run a job drain after settling for
+ * the guest's continuations to fire.
+ *
+ * Handle ownership (mirrors the Rust reference broker's Deferred
+ * discipline): the marshalled value handle handed to `resolve`/`reject`
+ * is disposed here after the call — the engine does not consume it — and
+ * settling disposes BOTH resolving functions. This deliberately does NOT
+ * use the shim's `newPromise()` Deferred, whose reject-function handle is
+ * pinned in the VM's `_ownedHandles` set until VM dispose even when the
+ * promise is resolved — measured at ~2 objects + 7 heap boxes per call,
+ * which exhausted a 2 MiB VM after roughly 5,000 sequential resolved
+ * agent calls (review regression, pinned by test).
+ *
+ * The promise handle itself is returned into the realm once (the
+ * host-callback trampoline dups it and the shim's host_call path never
+ * frees the host-side original), then released through `releaseToRealm`,
+ * which defers the dispose to a microtask so it runs only after the
+ * trampoline's synchronous dup.
  */
 export class GuestCall {
   /** The owning VM (private — elided from the published declarations). */
   private readonly vm: ReplVm;
-  /** The quickjs-wasi Deferred; its `handle` is the guest promise. */
+  /** The raw deferred; its `handle` is the guest promise. */
   private readonly deferred: {
     handle: JSValueHandle;
     resolve(value: JSValueHandle): void;
@@ -88,7 +106,7 @@ export class GuestCall {
   constructor(vm: ReplVm) {
     this.vm = vm;
     const shim = getVmShim(vm) as QuickJS;
-    this.deferred = shim.newPromise();
+    this.deferred = newRawDeferred(shim);
     guestCallHandles.set(this, this.deferred.handle);
   }
 
@@ -97,7 +115,17 @@ export class GuestCall {
    * promise's reactions fire on the next job drain.
    */
   resolve(value: unknown): void {
-    this.settle(() => this.deferred.resolve(marshalValue(this.shim(), value)));
+    this.settle((shim) => {
+      const valueHandle = marshalValue(shim, value);
+      try {
+        this.deferred.resolve(valueHandle);
+      } finally {
+        // The raw call borrows the value; the caller owns it and must
+        // release it (Rust reference: the broker disposes the marshalled
+        // value after settling).
+        valueHandle.dispose();
+      }
+    });
   }
 
   /**
@@ -106,18 +134,120 @@ export class GuestCall {
    * normalizes both). The promise's reactions fire on the next job drain.
    */
   reject(error: unknown): void {
-    this.settle(() => this.deferred.reject(marshalValue(this.shim(), error)));
+    this.settle((shim) => {
+      const valueHandle = marshalValue(shim, error);
+      try {
+        this.deferred.reject(valueHandle);
+      } finally {
+        valueHandle.dispose();
+      }
+    });
+  }
+
+  /**
+   * Release this call's host-side reference to the realm promise. Called
+   * by the host-function wrappers after the promise handle has been
+   * returned into the realm: the trampoline dups the returned pointer
+   * synchronously after the callback returns, so the dispose is deferred
+   * to a microtask — it runs only once that dup has happened. After this
+   * the handle must not be used (settlement goes through the deferred's
+   * resolve/reject functions, which are independent of the promise
+   * handle).
+   */
+  releaseToRealm(): void {
+    const handle = guestCallHandles.get(this);
+    if (handle === undefined) return;
+    queueMicrotask(() => handle.dispose());
+  }
+
+  /** True once the call has been settled (first-wins). */
+  get isSettled(): boolean {
+    return this.settled;
   }
 
   private shim(): QuickJS {
     return getVmShim(this.vm) as QuickJS;
   }
 
-  private settle(apply: () => void): void {
+  private settle(apply: (shim: QuickJS) => void): void {
     if (this.settled) return; // first settlement wins, like the guest registry
     this.settled = true;
-    apply();
+    apply(this.shim());
   }
+}
+
+/**
+ * Create a promise through the raw `qjs_new_promise` export and return a
+ * deferred over the three owned parts — the TS analogue of the Rust
+ * reference broker's `new_promise_raw`/`Deferred` (which settles by
+ * calling the resolving function and then disposes BOTH functions, plus
+ * the promise handle at `releaseToRealm` time). See `GuestCall` for why
+ * the shim's `newPromise()` Deferred is not used.
+ */
+function newRawDeferred(shim: QuickJS): {
+  handle: JSValueHandle;
+  resolve(value: JSValueHandle): void;
+  reject(value: JSValueHandle): void;
+} {
+  const e = shim._getExports() as QuickJSExports;
+  const resolveOut = e.wasm_malloc(4);
+  const rejectOut = e.wasm_malloc(4);
+  let promise: JSValueHandle | undefined;
+  let resolveFn: JSValueHandle | undefined;
+  let rejectFn: JSValueHandle | undefined;
+  try {
+    const promisePtr = e.qjs_new_promise(resolveOut, rejectOut);
+    const view = new DataView(e.memory.buffer);
+    const resolvePtr = view.getUint32(resolveOut, true);
+    const rejectPtr = view.getUint32(rejectOut, true);
+    promise = new JSValueHandle(shim, promisePtr);
+    resolveFn = new JSValueHandle(shim, resolvePtr);
+    rejectFn = new JSValueHandle(shim, rejectPtr);
+  } finally {
+    e.wasm_free(resolveOut);
+    e.wasm_free(rejectOut);
+  }
+
+  let settled = false;
+  const settleWith = (fn: JSValueHandle, value: JSValueHandle): void => {
+    if (settled) return;
+    settled = true;
+    try {
+      // Raw `qjs_call` with one borrowed argument (mirrors the shim's own
+      // callFunctionRaw, which is private). The result — including an
+      // exception result, whose runtime exception is taken out and freed
+      // — is disposed here; the engine never consumes the argument.
+      const argv = e.wasm_malloc(4);
+      let resultPtr: number;
+      try {
+        new DataView(e.memory.buffer).setUint32(argv, value.ptr, true);
+        resultPtr = e.qjs_call(fn.ptr, shim.undefined.ptr, 1, argv);
+      } finally {
+        e.wasm_free(argv);
+      }
+      const result = new JSValueHandle(shim, resultPtr);
+      try {
+        if (e.qjs_is_exception(result.ptr) !== 0) {
+          takeAndFreeException(e, shim);
+        }
+      } finally {
+        result.dispose();
+      }
+    } finally {
+      // Settling consumes both resolving functions (Rust reference:
+      // `Deferred::dispose` releases every part the deferred still owns).
+      resolveFn?.dispose();
+      rejectFn?.dispose();
+      resolveFn = undefined;
+      rejectFn = undefined;
+    }
+  };
+
+  return {
+    handle: promise!,
+    resolve: (value) => settleWith(resolveFn!, value),
+    reject: (value) => settleWith(rejectFn!, value),
+  };
 }
 
 // Registered by the constructor above; read by `guestCallHandle` so the
@@ -148,12 +278,20 @@ function marshalValue(shim: QuickJS, value: unknown): JSValueHandle {
 /** The host's handlers for the four guest calls. */
 export interface GuestBridgeHandlers {
   /**
-   * An `agent()` call. `optionsJson` is the JSON-encoded options bag
+   * An `agent(modelSpec, task, options?)` call. `modelSpec` is the
+   * backend-routing spec (`"pi/deepseek-v4-flash-max"`), `task` the
+   * worker's prompt; `optionsJson` is the JSON-encoded options bag
    * (or `null` when none were given). Settle `call` when the worker's
    * result (final text, or the schema-validated object when the options
    * carried a schema) is ready.
    */
-  agent(call: GuestCall, callId: string, prompt: string, optionsJson: string | null): void;
+  agent(
+    call: GuestCall,
+    callId: string,
+    modelSpec: string,
+    task: string,
+    optionsJson: string | null,
+  ): void;
   /**
    * A checkpoint question (question mode: `call` is a fresh `GuestCall`,
    * `answerJson` is `null`) or answer delivery (answer mode: `call` is
@@ -170,14 +308,24 @@ export interface GuestBridgeHandlers {
     answerJson: string | null,
   ): boolean | void;
   /**
-   * A steering operation on a live agent handle: `action` is
-   * `"followUp"` | `"steer"` | `"cancel"`; `payloadJson` is the
-   * JSON-encoded `{ prompt, options }` bag for followUp/steer or `null`
-   * for cancel. Settle `call` with what actually happened (the steering
-   * outcome — live injection vs queued delivery — mirroring the outcome
-   * values acp-agents surfaces in its steering events).
+   * A steering operation on a live agent handle: `callId` is the
+   * operation's OWN registry id (the settlement key — the host keys its
+   * live bookkeeping by it), `sessionId` the FOUNDING call id of the
+   * session being steered (the dispatch and post-restore re-issue
+   * target), `action` is `"followUp"` | `"steer"` | `"cancel"` and
+   * `payloadJson` the JSON-encoded `{ prompt, options }` bag for
+   * followUp/steer or `null` for cancel. Settle `call` with what actually
+   * happened (the steering outcome — live injection vs queued delivery,
+   * mirroring the outcome values acp-agents surfaces in its steering
+   * events).
    */
-  steer(call: GuestCall, callId: string, action: string, payloadJson: string | null): void;
+  steer(
+    call: GuestCall,
+    callId: string,
+    sessionId: string,
+    action: string,
+    payloadJson: string | null,
+  ): void;
   /**
    * A console event (log/info/warn/error/debug). The frozen arguments are
    * already stored in the realm as the `$N` globals named by
@@ -248,26 +396,36 @@ function makeCallbacks(vm: ReplVm, handlers: GuestBridgeHandlers): Array<[string
 function makeAgentHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
   return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
     const callId = requireString(args[0], HOST_AGENT, 'callId');
-    const prompt = requireString(args[1], HOST_AGENT, 'prompt');
-    const optionsJson = optionalString(args[2]);
+    const modelSpec = requireString(args[1], HOST_AGENT, 'modelSpec');
+    const task = requireString(args[2], HOST_AGENT, 'task');
+    const optionsJson = optionalString(args[3]);
     const call = new GuestCall(vm);
-    handlers.agent(call, callId, prompt, optionsJson);
+    handlers.agent(call, callId, modelSpec, task, optionsJson);
+    // The trampoline dups the returned pointer after this callback
+    // returns; release the host-side reference once that has happened.
+    call.releaseToRealm();
     return guestCallHandle(call);
   };
 }
 
 /**
  * The `__host_agent_steer` shape: same pattern as `__host_agent`, with
- * `action` ("followUp" | "steer" | "cancel") and a JSON-encoded payload
- * (or null for cancel).
+ * the operation's own call id FIRST (the settlement key) and the founding
+ * `sessionId` second (the session being steered), then `action`
+ * ("followUp" | "steer" | "cancel") and a JSON-encoded payload (or null
+ * for cancel). The guest records both ids in its pending-call registry,
+ * so a pending steer is snapshot-reconcilable: the host settles it by
+ * call id and re-issues it against the session.
  */
 function makeSteerHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
   return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
     const callId = requireString(args[0], HOST_STEER, 'callId');
-    const action = requireString(args[1], HOST_STEER, 'action');
-    const payloadJson = optionalString(args[2]);
+    const sessionId = requireString(args[1], HOST_STEER, 'sessionId');
+    const action = requireString(args[2], HOST_STEER, 'action');
+    const payloadJson = optionalString(args[3]);
     const call = new GuestCall(vm);
-    handlers.steer(call, callId, action, payloadJson);
+    handlers.steer(call, callId, sessionId, action, payloadJson);
+    call.releaseToRealm();
     return guestCallHandle(call);
   };
 }
@@ -293,6 +451,7 @@ function makeCheckpointHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): 
     const optionsJson = optionalString(args[2]);
     const call = new GuestCall(vm);
     handlers.checkpoint(call, callId, question, optionsJson, null);
+    call.releaseToRealm();
     return guestCallHandle(call);
   };
 }
@@ -375,6 +534,15 @@ export interface GuestSurfaceEntry {
   optionsJson: string | null;
   /** Realm `Date.now()` at issue time. */
   createdAt: number;
+  /**
+   * The id the host addresses this call by: the call's own id for agent/
+   * checkpoint calls, the FOUNDING session id for steering calls — the
+   * correlation a restore needs to settle (by `id`) or re-issue (to the
+   * session) a pending steer.
+   */
+  sessionId: string;
+  /** The agent call's backend-routing spec (null for other kinds). */
+  modelSpec: string | null;
 }
 
 /**
@@ -404,6 +572,13 @@ export interface GuestSurface {
  * Read the reconciliation surface from a VM. Returns `undefined` when the
  * guest library is not installed (a bare VM, or a host that has not yet
  * injected it).
+ *
+ * The returned surface object pins NO guest memory: it is plain data plus
+ * closures over the VM. Every handle it needs (the surface object itself,
+ * the member functions) is acquired per call and disposed on the spot —
+ * a long-lived surface must not accumulate handles (review: the previous
+ * shape captured three owned function handles in closures with no
+ * disposal contract).
  */
 export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
   const shim = getVmShim(vm) as QuickJS;
@@ -422,24 +597,30 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
         versionHandle.dispose();
       }
     }
+
+    // Presence check once: the three functions must exist for the surface
+    // to be usable. The handles are only touched here — the closures below
+    // re-acquire per call (see `callSurfaceFunction`).
     const pendingHandle = readOwnDataProperty(surfaceHandle, 'pending');
     const settleHandle = readOwnDataProperty(surfaceHandle, 'settle');
     const statsHandle = readOwnDataProperty(surfaceHandle, 'stats');
-    if (
-      pendingHandle === undefined ||
-      settleHandle === undefined ||
-      statsHandle === undefined ||
-      !pendingHandle.isFunction ||
-      !settleHandle.isFunction ||
-      !statsHandle.isFunction
-    ) {
-      return undefined;
-    }
+    const complete =
+      pendingHandle !== undefined &&
+      settleHandle !== undefined &&
+      statsHandle !== undefined &&
+      pendingHandle.isFunction &&
+      settleHandle.isFunction &&
+      statsHandle.isFunction;
+    pendingHandle?.dispose();
+    settleHandle?.dispose();
+    statsHandle?.dispose();
+    if (!complete) return undefined;
+
     return {
       version,
-      pending: () => readCallFunction(vm, pendingHandle) as GuestSurfaceEntry[],
-      settle: (callId, outcome, value) => callSettle(vm, settleHandle, callId, outcome, value),
-      stats: () => readCallFunction(vm, statsHandle) as ReturnType<GuestSurface['stats']>,
+      pending: () => callSurfaceFunction(vm, 'pending') as GuestSurfaceEntry[],
+      settle: (callId, outcome, value) => callSurfaceSettle(vm, callId, outcome, value),
+      stats: () => callSurfaceFunction(vm, 'stats') as ReturnType<GuestSurface['stats']>,
     };
   } finally {
     symbol.dispose();
@@ -448,26 +629,76 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
 }
 
 /**
- * Call one of the library's own surface functions and read its result
- * trap-free. The functions are the library's frozen closures (no
- * guest-authored code can be substituted), and the arguments are
- * pre-validated so the library functions cannot throw; the result read
- * uses the trap-free `readValue` path.
+ * Raw `qjs_call` (the shim's private `callFunctionRaw` drives the same
+ * export): invoke a guest function with borrowed arguments and return the
+ * raw result pointer (owned by the caller). The arguments are written into
+ * a wasm argv array exactly like the shim's own path; they are NOT
+ * consumed by the call.
  */
-function readCallFunction(vm: ReplVm, fn: JSValueHandle): unknown {
-  const shim = getVmShim(vm) as QuickJS;
-  const result = shim.callFunction(fn, shim.undefined);
+function callRaw(e: QuickJSExports, shim: QuickJS, fnPtr: number, args: JSValueHandle[]): number {
+  const argc = args.length;
+  let argvPtr = 0;
+  if (argc > 0) {
+    argvPtr = e.wasm_malloc(argc * 4);
+    const view = new DataView(e.memory.buffer);
+    for (let i = 0; i < argc; i++) {
+      view.setUint32(argvPtr + i * 4, args[i].ptr, true);
+    }
+  }
   try {
-    if (result.isUndefined) return undefined;
-    return readValue(result, 0, new Set());
+    return e.qjs_call(fnPtr, shim.undefined.ptr, argc, argvPtr);
   } finally {
-    result.dispose();
+    if (argvPtr !== 0) e.wasm_free(argvPtr);
   }
 }
 
-function callSettle(
+/**
+ * Acquire the surface and one of its member functions, call it with the
+ * given arguments, and read the result trap-free. Every handle is
+ * disposed on every path — nothing is retained by the caller.
+ *
+ * The functions are the library's frozen closures (no guest-authored code
+ * can be substituted), and settle's arguments are pre-validated so the
+ * library functions cannot throw; the raw call is still checked for an
+ * exception result and the runtime exception is taken out and freed —
+ * never routed through quickjs-wasi's `JSException` constructor (which
+ * performs guest-visible `[[Get]]` reads of name/message/stack on the
+ * exception value).
+ */
+function callSurfaceFunction(
   vm: ReplVm,
-  settleFn: JSValueHandle,
+  member: 'pending' | 'stats',
+): unknown {
+  const shim = getVmShim(vm) as QuickJS;
+  const e = shim._getExports() as QuickJSExports;
+  const symbol = shim.newSymbolFor(GUEST_SURFACE_KEY);
+  let surfaceHandle: JSValueHandle | undefined;
+  let fn: JSValueHandle | undefined;
+  try {
+    surfaceHandle = shim.getProp(shim.global, symbol);
+    if (surfaceHandle.isUndefined || !surfaceHandle.isObject) return undefined;
+    fn = readOwnDataProperty(surfaceHandle, member);
+    if (fn === undefined || !fn.isFunction) return undefined;
+    const result = new JSValueHandle(shim, callRaw(e, shim, fn.ptr, []));
+    try {
+      if (e.qjs_is_exception(result.ptr) !== 0) {
+        takeAndFreeException(e, shim);
+        return undefined;
+      }
+      if (result.isUndefined) return undefined;
+      return readValue(result, 0, new Set());
+    } finally {
+      result.dispose();
+    }
+  } finally {
+    fn?.dispose();
+    surfaceHandle?.dispose();
+    symbol.dispose();
+  }
+}
+
+function callSurfaceSettle(
+  vm: ReplVm,
   callId: string,
   outcome: 'resolve' | 'reject',
   value: unknown,
@@ -482,19 +713,42 @@ function callSettle(
     throw new TypeError('settle(callId, outcome, value): outcome must be "resolve" or "reject"');
   }
   const shim = getVmShim(vm) as QuickJS;
-  const callIdHandle = shim.newString(callId);
-  const outcomeHandle = shim.newString(outcome);
-  const valueHandle = marshalValue(shim, value);
-  let result: JSValueHandle | undefined;
+  const e = shim._getExports();
+  const symbol = shim.newSymbolFor(GUEST_SURFACE_KEY);
+  let surfaceHandle: JSValueHandle | undefined;
+  let settleFn: JSValueHandle | undefined;
+  let callIdHandle: JSValueHandle | undefined;
+  let outcomeHandle: JSValueHandle | undefined;
+  let valueHandle: JSValueHandle | undefined;
   try {
-    result = shim.callFunction(settleFn, shim.undefined, callIdHandle, outcomeHandle, valueHandle);
-    if (!result.isBool) return false;
-    return result.toBoolean();
+    surfaceHandle = shim.getProp(shim.global, symbol);
+    if (surfaceHandle.isUndefined || !surfaceHandle.isObject) return false;
+    settleFn = readOwnDataProperty(surfaceHandle, 'settle');
+    if (settleFn === undefined || !settleFn.isFunction) return false;
+    callIdHandle = shim.newString(callId);
+    outcomeHandle = shim.newString(outcome);
+    valueHandle = marshalValue(shim, value);
+    const result = new JSValueHandle(
+      shim,
+      callRaw(e, shim, settleFn.ptr, [callIdHandle, outcomeHandle, valueHandle]),
+    );
+    try {
+      if (e.qjs_is_exception(result.ptr) !== 0) {
+        takeAndFreeException(e, shim);
+        return false;
+      }
+      if (!result.isBool) return false;
+      return result.toBoolean();
+    } finally {
+      result.dispose();
+    }
   } finally {
-    callIdHandle.dispose();
-    outcomeHandle.dispose();
-    valueHandle.dispose();
-    result?.dispose();
+    callIdHandle?.dispose();
+    outcomeHandle?.dispose();
+    valueHandle?.dispose();
+    settleFn?.dispose();
+    surfaceHandle?.dispose();
+    symbol.dispose();
   }
 }
 

@@ -15,6 +15,15 @@
 
 import { ReplVm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
 import type { WasmInput } from './types.js';
+import {
+  installGuestBridge,
+  readGuestSurface,
+  type ConsoleEvent,
+  type GuestBridgeHandlers,
+  type GuestCall,
+  type GuestSurface,
+} from './bridge.js';
+import { inspectGlobal, renderGlobalLine } from './preview.js';
 
 export type { ReplDrainOptions, ReplEvalOptions, ReplEvalOutcome } from './vm.js';
 export type { WasmInput, WasmModule } from './types.js';
@@ -35,6 +44,20 @@ export interface WorkspaceOptions {
    * `ReplVm.DEFAULT_MEMORY_LIMIT` (64 MiB).
    */
   memoryLimit?: number;
+  /**
+   * Host handlers for the guest bridge, installed at VM creation — the
+   * doc's injection discipline (the library and its `__host_*` callbacks
+   * are in place from the first eval on; a workspace never exposes the
+   * DSL as undefined). When omitted, the workspace installs its default
+   * **parking bridge**: agent/checkpoint/steer calls park (they pend in
+   * the guest registry, visible through `surface()`/`parkedCalls()`, and
+   * stay unsolved until a later phase attaches real backends — parking
+   * never fabricates a result), and console events accumulate in
+   * `consoleEvents()`. A later phase that wires real backends swaps
+   * handlers via `registerGuestHostCallbacks` (the same re-registration
+   * the restore path uses).
+   */
+  handlers?: GuestBridgeHandlers;
 }
 
 /**
@@ -49,6 +72,8 @@ export class Workspace {
   readonly memoryLimit: number;
 
   private readonly vm: ReplVm;
+  private readonly consoleEventBuffer: ConsoleEvent[] = [];
+  private readonly parkedCallsBuffer = new Map<string, GuestCall>();
   private disposed = false;
 
   private constructor(projectDir: string, vm: ReplVm) {
@@ -59,11 +84,18 @@ export class Workspace {
 
   /**
    * Create a workspace: instantiate its VM (defaulting to the shipped
-   * `quickjs.wasm` binary and the default memory limit).
+   * `quickjs.wasm` binary and the default memory limit) and install the
+   * guest bridge — the version-marked library plus its `__host_*`
+   * callbacks — so the DSL (`agent`, `checkpoint`, `console`, the
+   * combinators) is live from the first eval on (the doc's injection
+   * discipline; see `WorkspaceOptions.handlers` for the default parking
+   * bridge).
    */
   static async create(projectDir: string, options: WorkspaceOptions = {}): Promise<Workspace> {
     const vm = await ReplVm.create(options);
-    return new Workspace(projectDir, vm);
+    const workspace = new Workspace(projectDir, vm);
+    await installGuestBridge(vm, options.handlers ?? workspace.defaultHandlers());
+    return workspace;
   }
 
   /**
@@ -111,6 +143,86 @@ export class Workspace {
     return this.disposed;
   }
 
+  /**
+   * The console events accumulated by the default parking bridge, in
+   * order (only populated when `options.handlers` was omitted — custom
+   * handlers own their events). The tool layer renders each event's
+   * `$N` refs through the previewer and caps the result.
+   */
+  consoleEvents(): readonly ConsoleEvent[] {
+    return this.consoleEventBuffer;
+  }
+
+  /**
+   * The parked host calls of the default parking bridge, by call id
+   * (only populated when `options.handlers` was omitted). A later phase
+   * that attaches real backends settles these `GuestCall`s (or takes
+   * them over) — parking is the honest no-backend state, it never
+   * fabricates results.
+   */
+  parkedCalls(): ReadonlyMap<string, GuestCall> {
+    return this.parkedCallsBuffer;
+  }
+
+  /**
+   * The guest library's reconciliation surface — the host's door back
+   * into the pending-call registry (`pending`/`settle`/`stats`, used by
+   * `status` and by the post-restore reconciliation loop). `undefined`
+   * only when the bridge is not installed (it always is on workspaces
+   * created through this class).
+   */
+  surface(): GuestSurface | undefined {
+    this.assertAlive();
+    return readGuestSurface(this.vm);
+  }
+
+  /**
+   * Render the preview line for a realm global slot (`$N` refs and any
+   * other top-level binding): `[$14 · object · 48kB] {…}` — trap-free
+   * (never executes guest getters; a slot rebound to an accessor renders
+   * the sabotage marker instead of firing it). This is the tool-result
+   * rendering seam; `fallbackArg` is used when the slot cannot be
+   * previewed.
+   */
+  renderRef(ref: string, fallbackArg?: unknown): string {
+    this.assertAlive();
+    return renderGlobalLine(this.vm, ref, fallbackArg);
+  }
+
+  /**
+   * Content-free metadata for one realm global slot — the workspace-
+   * manifest seam (`status`): name, type, size; metadata, never content.
+   */
+  inspectBinding(name: string): { kind: 'data' | 'accessor' | 'absent'; label: string; sizeBytes: number } {
+    this.assertAlive();
+    return inspectGlobal(this.vm, name);
+  }
+
+  private defaultHandlers(): GuestBridgeHandlers {
+    const events = this.consoleEventBuffer;
+    const parked = this.parkedCallsBuffer;
+    return {
+      agent: (call, callId) => {
+        parked.set(callId, call);
+      },
+      checkpoint: (call, callId, _question, _optionsJson, answerJson) => {
+        if (answerJson !== null) {
+          // Answer mode under the parking bridge: nothing can be pending
+          // (no checkpoint was ever answered), so delivery reports false.
+          return false;
+        }
+        parked.set(callId, call!);
+        return undefined;
+      },
+      steer: (call, callId) => {
+        parked.set(callId, call);
+      },
+      console: (event) => {
+        events.push(event);
+      },
+    };
+  }
+
   private assertAlive(): void {
     if (this.disposed) {
       throw new Error(`Workspace ${this.projectDir}: operation on a disposed workspace`);
@@ -131,6 +243,12 @@ export interface WorkspaceRegistryOptions {
    * their own `memoryLimit` (per-workspace limits override this).
    */
   memoryLimit?: number;
+  /**
+   * Default guest-bridge handlers for workspaces created without their
+   * own `handlers` (per-workspace handlers override this). See
+   * `WorkspaceOptions.handlers` for the default parking bridge.
+   */
+  handlers?: GuestBridgeHandlers;
 }
 
 /** An in-flight workspace creation, tracked so concurrent `get`s dedupe. */
@@ -186,6 +304,7 @@ export class WorkspaceRegistry {
     const merged: WorkspaceOptions = {
       wasm: options.wasm ?? this.options.wasm,
       memoryLimit: options.memoryLimit ?? this.options.memoryLimit,
+      handlers: options.handlers ?? this.options.handlers,
     };
     pending.promise = Workspace.create(projectDir, merged).then(
       (created) => {

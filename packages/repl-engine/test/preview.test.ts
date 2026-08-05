@@ -27,7 +27,7 @@ import {
 } from '../src/index.js';
 import { installGuestBridge } from '../src/index.js';
 import { getVmShim } from '../src/vm.js';
-import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
+import { EvalFlags, JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
 // ────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -321,6 +321,64 @@ test('typed arrays: kind resolution, leading elements, overflow for expandos', a
     'Uint8Array(2) [7, 9, …]',
   );
   assert.match(header(await lineOf(vm, 'new Uint8Array([1, 2, 3])')), /^\[\$\d+ · typedarray · 19B\]$/);
+});
+
+test('a corrupted key materialization degrades with overflow (FORMAT.md §6) — typed arrays and plain objects', async () => {
+  // Review regression: the typed-array expando signal converted a corrupted
+  // own-key enumeration into a count of zero, so overflow stayed false and
+  // omitted/unknown expandos were concealed. Corrupted materialization must
+  // degrade with overflow:true — list nothing, flag there-is-more.
+  using vm = await createVm();
+  await vm.evalCode('globalThis.$900 = new Uint8Array([7, 9]); "stored"');
+  await vm.evalCode('globalThis.$901 = { a: 1 }; "stored"');
+
+  // Force every key materialization to produce a HOLEY guest array — a
+  // binary contract violation (FORMAT.md §6: holes must not be read back
+  // with [[Get]] and must not fabricate keys). The real export is restored
+  // in the finally below.
+  const qjs = (vm as unknown as { vm: QuickJS }).vm;
+  const originalExports = qjs._getExports();
+  const patched = Object.create(originalExports);
+  Object.defineProperty(patched, 'qjs_get_own_property_keys', {
+    configurable: true,
+    writable: true,
+    value: () => {
+      const code = qjs._writeString('(() => { const a = []; a.length = 3; a[0] = "k0"; a[2] = "k2"; return a; })()');
+      const fn = qjs._writeString('<corrupt>');
+      const arr = originalExports.qjs_eval(code.ptr, code.len, fn.ptr, EvalFlags.TYPE_GLOBAL);
+      originalExports.wasm_free(code.ptr);
+      originalExports.wasm_free(fn.ptr);
+      return arr;
+    },
+  });
+  (qjs as unknown as { exports: typeof originalExports }).exports = patched;
+  try {
+    // Typed array: the element entries stay (descriptor/index reads do not
+    // touch the materialization path) but overflow must be true.
+    assert.equal(body(renderRefLine(vm, '$900')), 'Uint8Array(2) [7, 9, …]');
+    // Plain object: properties list nothing, overflow flags there-is-more.
+    assert.equal(body(renderRefLine(vm, '$901')), '{…}');
+  } finally {
+    (qjs as unknown as { exports: typeof originalExports }).exports = originalExports;
+  }
+});
+
+test('repeated revoked-proxy and typed-array previews do not accumulate guest memory', async () => {
+  // Review regression: raw exports returning heap-allocated JSValues were
+  // not disposed on all paths — typedArrayInfo leaked the backing
+  // ArrayBuffer handle and readProxyTarget leaked the revoked-proxy
+  // exception box, so repeated previews grew WASM/QuickJS allocations
+  // until a small VM died. Both paths now dispose every owned handle.
+  const vm = await ReplVm.create({ memoryLimit: 2 * 1024 * 1024 });
+  await vm.evalCode(`globalThis.$902 = (() => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); return proxy; })(); "stored"`);
+  await vm.evalCode('globalThis.$903 = new Uint16Array([1, 2, 3, 4, 5]); "stored"');
+  for (let i = 0; i < 3000; i++) {
+    assert.equal(body(renderRefLine(vm, '$902')), 'Proxy(revoked)');
+    assert.equal(body(renderRefLine(vm, '$903')), 'Uint16Array(5) [1, 2, 3, 4, 5]');
+  }
+  // The VM is fully healthy afterwards.
+  assert.equal((await vm.evalCode('1 + 1')).kind, 'value');
+  vm.dispose();
 });
 
 // ────────────────────────────────────────────────────────────────────────

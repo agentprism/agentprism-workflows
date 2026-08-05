@@ -94,7 +94,7 @@ import { readFile } from 'node:fs/promises';
 import { EvalFlags, JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 import { classifyError, type EvalErrorInfo } from './errors.js';
-import { readOwnDataProperty, readSymbolDescription, readValue } from './trapfree.js';
+import { readOwnDataProperty, readValue } from './trapfree.js';
 import type { ReplSnapshot, WasmInput, WasmModule } from './types.js';
 
 /** Options for creating a VM. */
@@ -613,7 +613,12 @@ function readErrorInfo(handle: JSValueHandle): EvalErrorInfo {
         message = handle.toBigInt().toString();
         break;
       case 'symbol':
-        message = readSymbolDescription(handle);
+        // FORMAT.md §1.1/§5.7: a symbol's description sits behind
+        // `qjs_get_symbol_description`, which invokes guest `Symbol.keyFor`
+        // — a forbidden seam (guest code would run, and a guest that
+        // replaces `Symbol.keyFor` could forge the classification). The
+        // bare brand is the only trap-free rendering.
+        message = 'Symbol';
         break;
       default:
         message = String(t === 'boolean' ? handle.toString() === 'true' : handle.toNumber());

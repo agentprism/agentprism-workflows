@@ -147,13 +147,16 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
 
 ### Sandbox globals
 
-- `agent(prompt, options?) → Promise` — the delegation primitive. `options` (structured-output
-  schema, cwd, backend config) cross the bridge as JSON. The returned promise **is** the live
-  handle: it may sit in a variable across evals, and it carries own non-enumerable handle
-  methods `followUp(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()` — each resolving
-  with **what actually happened** (the host settles with the steering outcome, live injection
-  vs queued delivery, mirroring the outcome values `acp-agents` surfaces in its steering
-  events) — plus `id` (the stable call id `"c1"`, … used by `status`/`interrupt`).
+- `agent(modelSpec, task, options?) → Promise` — the delegation primitive, per the roadmap
+  doc's own example (`agent("pi/deepseek-v4-flash-max", "research X")`). `modelSpec` is
+  the backend-routing spec; `task` the worker's prompt; `options` (structured-output
+  schema, cwd, backend config) cross the bridge as JSON. The returned promise **is** the
+  live handle: it may sit in a variable across evals, and it carries own non-enumerable
+  handle methods `followUp(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()` — each
+  resolving with **what actually happened** (the host settles with the steering outcome,
+  live injection vs queued delivery, mirroring the outcome values `acp-agents` surfaces
+  in its steering events) — plus `id` (the stable call id `"c1"`, … used by
+  `status`/`interrupt`).
 - `checkpoint(question, options?) → Promise` and `checkpoint.answer(callId, value) → boolean`
   — the data plane interrupting the intent plane. The answer enters the data plane only
   through `checkpoint.answer` (the `__host_checkpoint` trailing-argument answer mode); it
@@ -174,21 +177,27 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
 
 | Function | Meaning |
 |---|---|
-| `__host_agent(callId, prompt, optionsJson)` | Kick off one worker run. May return a thenable (the bridge's `GuestCall` promise) — the guest chains onto it — or `undefined` (settle later via the surface). |
+| `__host_agent(callId, modelSpec, task, optionsJson)` | Kick off one worker run against the backend routed by `modelSpec`. May return a thenable (the bridge's `GuestCall` promise) — the guest chains onto it — or `undefined` (settle later via the surface). |
 | `__host_checkpoint(callId, question, optionsJson, answerJson?)` | Question mode: three arguments, like `__host_agent`. Answer mode: a PRESENT fourth argument (the JSON-encoded answer) — the host settles the pending checkpoint and returns a boolean synchronously; nothing new pends. |
-| `__host_agent_steer(callId, action, payloadJson)` | Steering: `action` is `"followUp"` \| `"steer"` \| `"cancel"`; `payloadJson` is `{ prompt, options }` or `null` for cancel. The host settles with the steering outcome. |
+| `__host_agent_steer(callId, sessionId, action, payloadJson)` | Steering: `callId` is the operation's OWN registry id (the settlement key), `sessionId` the FOUNDING call id of the session being steered (the dispatch and post-restore re-issue target); `action` is `"followUp"` \| `"steer"` \| `"cancel"` and `payloadJson` is `{ prompt, options }` or `null` for cancel. The host settles with the steering outcome. |
 | `__host_console(level, payloadJson)` | The console bridge, called synchronously after the guest froze each argument into `$N`. |
 
 Settlement is first-wins idempotent by call id, through two always-valid routes: the live
-`GuestCall` (a quickjs-wasi `Deferred` whose promise handle was returned into the realm) or
-the **reconciliation surface** after a restore. The surface —
-`globalThis[Symbol.for("repl.guest")]`, read host-side via `readGuestSurface(vm)` — exposes
-`version`, `pending()` (verbatim details for re-issuing lost work), `settle(callId, outcome,
-value)` and `stats()`; it is frozen, its binding non-configurable, and its registry operations
-use captured intrinsics, so `Map.prototype` pollution cannot corrupt settlement. The pending-
-call registry lives in the library's closure and **travels inside snapshots**; on restore the
-host re-registers the four callbacks by name (`registerGuestHostCallbacks`) and reconciles —
-the library itself is never re-evaluated (idempotence guard).
+`GuestCall` (a promise created via the raw `qjs_new_promise` export whose parts the call
+owns and disposes completely — the TS analogue of the Rust reference broker's
+`new_promise_raw`/`Deferred`; the shim's `newPromise()` Deferred is deliberately not used
+because it pins the reject-function handle until VM dispose, measured to exhaust a 2 MiB
+VM after ~5,000 resolved calls) or the **reconciliation surface** after a restore. The
+surface — `globalThis[Symbol.for("repl.guest")]`, read host-side via
+`readGuestSurface(vm)` — exposes `version`, `pending()` (verbatim details for re-issuing
+lost work, including `sessionId` — the founding session id for steering calls — and
+`modelSpec`), `settle(callId, outcome, value)` and `stats()`; it is frozen, its binding
+non-configurable, and its registry operations use captured intrinsics, so `Map.prototype`
+pollution cannot corrupt settlement. The returned surface object pins NO guest memory:
+every handle it needs is acquired per call and disposed on the spot. The pending-call
+registry lives in the library's closure and **travels inside snapshots**; on restore the
+host re-registers the four callbacks by name (`registerGuestHostCallbacks`) and
+reconciles — the library itself is never re-evaluated (idempotence guard).
 
 **Version compatibility** (the doc's evolution disciplines): the library is versioned with the
 workspace, not the host — a host must serve any snapshot whose resident library is the same or
@@ -217,8 +226,15 @@ format with decimal units and the ≥ 999.95 promotion rule. Preview generation 
 only, proxies detected first and previewed *as* proxies (`Proxy(Array)`, `Proxy(revoked)`),
 typed-array elements via the language-guaranteed integer-indexed reads, and the key
 materialization read back through descriptors with honest degradation on a corrupted
-enumeration (FORMAT.md §6). A `$N` slot rebound to an accessor renders an explicit sabotage
-marker — the getter is never invoked.
+enumeration (FORMAT.md §6 — a corrupted typed-array key count degrades with `overflow: true`,
+never a fabricated "no expandos"). The forbidden seams stay unwired: symbol descriptions are
+never read (`qjs_get_symbol_description` invokes guest `Symbol.keyFor` — FORMAT.md §1.1), so
+symbols render as the bare brand `Symbol` everywhere, including thrown-symbol error messages,
+and `qjs_get_array_buffer`'s raw data pointer is never passed to `qjs_is_exception` (a
+guest-controlled buffer must not be able to forge a failed read). Every raw export that
+returns heap-allocated JSValues (`qjs_get_typed_array_buffer`'s backing buffer,
+`qjs_get_proxy_target`'s exception box) is disposed on every path. A `$N` slot rebound to an
+accessor renders an explicit sabotage marker — the getter is never invoked.
 
 ### Output caps
 
@@ -227,6 +243,18 @@ trips first** — line-granular (a line that would trip either cap is not emitte
 byte-counted in UTF-8 with `\n` separators (the canonical serialization). Over-cap content
 remains reachable through the `$N` refs the capped lines carry: the cap costs reads, never
 data.
+
+## The workspace (phase B)
+
+`Workspace.create` installs the guest bridge at VM creation — the doc's injection discipline:
+`agent`/`checkpoint`/the combinators are live from the first eval, never undefined. `options.handlers`
+may supply custom bridge handlers; the default is a **parking bridge** (agent/checkpoint/steer calls
+park — they pend in the guest registry, visible through `surface()`/`parkedCalls()`, and stay
+unsolved until a later phase attaches real backends; parking never fabricates a result — console
+events accumulate in `consoleEvents()`). The workspace also exposes the rendering seam
+(`renderRef`, `inspectBinding`) and the reconciliation surface (`surface()`) the `repl` tool layer
+builds on. A later phase that wires real backends swaps handlers via `registerGuestHostCallbacks`
+(the same re-registration the restore path uses).
 
 ## Decisions for spec-owed details
 
@@ -264,8 +292,12 @@ build on them rather than re-open them.
   first caller's options win). `dispose` during an in-flight create cancels it — the created
   VM is torn down without materializing, the waiting `get` rejects, and a later `get`
   starts fresh.
-- **Primitive error rendering follows native conversions for every primitive type**, symbols
-  included (`Symbol(description)`), so a thrown value is reported as it actually was.
+- **Primitive error rendering follows native conversions for every primitive type**, with
+  symbols as the one deliberate exception: a thrown symbol renders the bare brand `Symbol`
+  (FORMAT.md §5.7) — its description is not readable trap-free, because reading it reaches
+  `qjs_get_symbol_description`, which invokes guest `Symbol.keyFor` (FORMAT.md §1.1). A
+  guest that replaces `Symbol.keyFor` must not be able to forge error rendering (pinned by
+  test).
 - **Realpath validation of `projectDir`** is deliberately NOT here: that is the daemon's
   project-registry concern (the `repl` tool's phase); the registry keys by the string it is
   given.
@@ -279,9 +311,21 @@ Phase B decisions (the guest library, bridge, previewer):
   `__host_console`, `__host_agent_steer`. The harness's `__host_budget` is deleted with the
   budget surface; `__host_agent_steer` carries the doc's handle methods
   (`followUp`/`steer`/`cancel`) as a new host-callback name in the initial major.
+- **`agent(modelSpec, task, opts?)` carries the model spec as a first-class argument** — the
+  roadmap doc's own signature (`agent("pi/deepseek-v4-flash-max", "research X")`). The spec
+  crosses the bridge to `__host_agent` verbatim and is recorded in the pending-call registry
+  entry (`modelSpec`) so a restore can re-issue the call against the same routing.
 - **Steering payloads are `{ prompt, options }` JSON** (or `null` for cancel) — the host
   interprets them; the guest passes the settlement value (the steering outcome) through
   verbatim, mirroring the outcome values `acp-agents` surfaces in its steering events.
+- **A pending steer is snapshot-reconcilable**: `__host_agent_steer` receives the operation's
+  OWN registry id first (the settlement key) and the founding session id second, and the
+  registry entry records both (`id` + `sessionId`) in the pending manifest — the host can
+  durably settle (by registry id) or re-issue (to the session) a pending steer after a
+  restore (review regression: the entry used to omit the founding id).
+- **Combinator model specs**: `verify`/`judgePanel` spawn their reviewers/graders through
+  `agent(opts.model ?? "default", …)` — the `"default"` sentinel is host-routed (mirrors
+  dsl.d.ts, where reviewers inherit the run's default model when none is given).
 - **The handle is the promise**: `agent()` returns the promise itself with own non-enumerable
   `id`/`followUp`/`steer`/`cancel` — started-not-awaited handles come free with top-level
   await, per the doc (`const research = agent(...)`; end the eval; check in next call). No
@@ -300,6 +344,16 @@ Phase B decisions (the guest library, bridge, previewer):
   clones `WeakMap`/`WeakSet`/`WeakRef` to empty plain objects, so `freezeValue` routes
   functions, symbols, promises and weak collections to the marker fallback before attempting
   `structuredClone` — an orchestrator must be able to tell a WeakMap from a deleted property.
+- **`GuestCall` owns and disposes every handle it touches** (the Rust broker's Deferred
+  discipline): the marshalled value is disposed after settling, both resolving functions are
+  disposed at settlement (raw `qjs_new_promise` parts — the shim's `newPromise()` pins the
+  reject function until VM dispose, measured to exhaust a 2 MiB VM after ~5,000 resolved
+  calls), and the promise handle is released via microtask once the host-callback trampoline
+  has dupped it (the shim's host_call path never frees the host-side original). Pinned by
+  5,000-call / 20,000-call bounded-memory tests.
+- **`readGuestSurface` returns a surface that pins no guest memory**: every handle is
+  acquired per call and disposed on the spot (review regression: the surface used to capture
+  three owned function handles in closures with no disposal contract).
 - **The console payload keeps the harness's `{ refs, args }` shape** — `args` is the
   best-effort JSON-safe encoding (capped, tagged wrappers) for hosts without a previewer;
   `$N` refs are the authoritative channel and are never truncated.
@@ -354,28 +408,37 @@ pinning the opaque `WasmModule` boundary.
 
 Phase B pins the guest library and bridge: install/version-marker/idempotence (re-eval and
 re-install are no-ops), the deleted vocabulary (`phase`, the whole budget surface), agent
-round trips with JSON options, rejections normalizing to Errors carrying `code`/
-`recoverable`, the live handle (`id`/`followUp`/`steer`/`cancel`, non-enumerable, steering
-addressed to the founding call id), synchronous host-refusal rejection, started-not-awaited
-settlement through a later standalone drain, the checkpoint question→answer flow across
-evals (with `false` for unknown/answered ids and a TypeError for non-JSON answers), every
-combinator over a mocked `__host_agent` (parallel order/null slots/non-recoverable halts,
-pipeline stages and slot semantics, retry attempts and `until`, gate feedback loops,
-loopUntilDry dedupe/emptiness/maxRounds and circular-safe keys, verify votes and dropped
-reviewers, judgePanel mean scores and tie-breaks), the reconciliation surface
-(pending/settle/stats, first-wins idempotence, `Map.prototype` pollution immunity via
-captured intrinsics), snapshot travel (state, `$N` store, registry and marker survive;
-callbacks re-register by name; new calls mint fresh ids), `$N` freezing (mutation after log
-never changes the store; the store is the agent's writable workspace; hostile values
-including revoked proxies degrade to typed markers without throwing; 2000-deep nesting
-freezes without crashing the VM; cycles are preserved), and the console payload shapes.
-The previewer suite pins the FORMAT.md rules (primitives incl. `-0`/exponent forms, string
-head+tail elisions and escaping, functions, errors with own-data-only names, promise
-states, arrays with holes/named props/overflow, plain objects with positional indices and
-accessor `(...)`, branded objects and typed arrays with expando overflow, proxies incl.
-revoked, property-level shorthand tokens, the 400-char backstop, byte-size formatting with
-the promotion rule, the `$N` line format) and the trap-freedom guarantees (hostile getters
-on `Object.prototype`/`Array.prototype` never fire — including the `Object.prototype.value`
-pollution case; proxy traps never fire; an accessor-rebound `$N` slot renders the sabotage
-marker; the byte-size estimate is bounded and cycle-safe). `caps.test.ts` pins 256 lines /
-10 KB (whichever trips first), line-granular truncation and UTF-8 byte counting.
+round trips with the model-spec signature and JSON options, rejections normalizing to Errors
+carrying `code`/`recoverable`, the live handle (`id`/`followUp`/`steer`/`cancel`,
+non-enumerable, steering addressed to the founding session id), synchronous host-refusal
+rejection, started-not-awaited settlement through a later standalone drain, the checkpoint
+question→answer flow across evals (with `false` for unknown/answered ids and a TypeError for
+non-JSON answers), every combinator over a mocked `__host_agent` (parallel order/null
+slots/non-recoverable halts, pipeline stages and slot semantics, retry attempts and `until`,
+gate feedback loops, loopUntilDry dedupe/emptiness/maxRounds and circular-safe keys, verify
+votes and dropped reviewers with `opts.model` routing, judgePanel mean scores and
+stable tie-breaks), the reconciliation surface (pending/settle/stats with `sessionId` and
+`modelSpec` on entries, first-wins idempotence, `Map.prototype` pollution immunity via
+captured intrinsics, no pinning of guest memory), steering snapshot-reconciliation (the
+pending steer entry carries both ids; settle works by registry id across a restore), handle
+hygiene (5,000 resolved and 5,000 parked agent calls leave a 2 MiB VM healthy), snapshot
+travel (state, `$N` store, registry and marker survive; callbacks re-register by name; new
+calls mint fresh ids), `$N` freezing (mutation after log never changes the store; the store
+is the agent's writable workspace; hostile values including revoked proxies degrade to typed
+markers without throwing; 2000-deep nesting freezes without crashing the VM; cycles are
+preserved), and the console payload shapes. The workspace suite pins the phase-B injection:
+a created workspace exposes the DSL, accumulates console events, parks calls, and serves the
+surface/render/manifest seams. The previewer suite pins the FORMAT.md rules (primitives incl.
+`-0`/exponent forms, string head+tail elisions and escaping, functions, errors with
+own-data-only names, promise states, arrays with holes/named props/overflow, plain objects
+with positional indices and accessor `(...)`, branded objects and typed arrays with expando
+overflow, proxies incl. revoked, property-level shorthand tokens, the 400-char backstop,
+byte-size formatting with the promotion rule, the `$N` line format), the trap-freedom
+guarantees (hostile getters on `Object.prototype`/`Array.prototype` never fire — including
+the `Object.prototype.value` pollution case; proxy traps never fire; an accessor-rebound
+`$N` slot renders the sabotage marker; a guest that replaces `Symbol.keyFor` cannot forge
+thrown-symbol rendering; the byte-size estimate is bounded and cycle-safe), the FORMAT.md §6
+degradation (a corrupted key materialization lists nothing and flags overflow — typed arrays
+included), and bounded-memory previews (3,000 revoked-proxy and typed-array previews leave a
+2 MiB VM healthy). `caps.test.ts` pins 256 lines / 10 KB (whichever trips first),
+line-granular truncation and UTF-8 byte counting.

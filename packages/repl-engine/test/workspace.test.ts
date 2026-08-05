@@ -33,6 +33,98 @@ test('workspace lifecycle: create → eval → drain → dispose', async () => {
   ws.dispose(); // idempotent
 });
 
+test('the guest bridge is installed at VM creation: DSL globals, console bridge, parked calls, surface', async () => {
+  // Review rejection: a production Workspace exposed agent/checkpoint/
+  // combinators as undefined because creation never installed the bridge.
+  // The injection happens at creation now — the doc's discipline.
+  const ws = await workspace();
+  // The DSL vocabulary is live from the first eval.
+  const globals = await ws.eval(`({
+    agent: typeof agent, checkpoint: typeof checkpoint,
+    answer: typeof checkpoint.answer, parallel: typeof parallel,
+    console: typeof console, marker: typeof globalThis.__REPL_GUEST_VERSION,
+    phase: typeof phase, budget: typeof budget,
+  })`);
+  assert.equal(globals.kind, 'value');
+  if (globals.kind === 'value') {
+    assert.deepEqual(globals.value, {
+      agent: 'function',
+      checkpoint: 'function',
+      answer: 'function',
+      parallel: 'function',
+      console: 'object',
+      marker: 'string',
+      phase: 'undefined',
+      budget: 'undefined',
+    });
+  }
+
+  // The console bridge accumulates events on the default parking bridge.
+  const logged = await ws.eval('console.log({ a: 1 }, "text"); "done"');
+  assert.equal(logged.kind, 'value');
+  const events = ws.consoleEvents();
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].refs, ['$1', '$2']);
+  // The rendered line is the previewer seam the tool layer uses.
+  assert.match(ws.renderRef('$1'), /^\[\$1 · object · \d+B\] \{a: 1\}$/);
+  assert.equal(ws.renderRef('$2'), '[$2 · string · 4B] "text"');
+
+  // The default parking bridge parks agent calls (honest no-backend state:
+  // nothing is fabricated, the calls pend until a later phase attaches
+  // backends) and the reconciliation surface sees them.
+  const started = await ws.eval('const research = agent("pi/deepseek-v4-flash-max", "research X"); "started"');
+  assert.equal(started.kind, 'value');
+  const surface = ws.surface();
+  assert.ok(surface !== undefined, 'the guest surface is reachable from the workspace');
+  const pending = surface!.pending();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].kind, 'agent');
+  assert.equal(pending[0].modelSpec, 'pi/deepseek-v4-flash-max');
+  assert.equal(pending[0].sessionId, 'c1');
+  assert.equal(ws.parkedCalls().size, 1);
+  // The parked call can be settled through the surface, exactly like the
+  // post-restore reconciliation route.
+  assert.equal(surface!.settle('c1', 'resolve', { ok: true }), true);
+  ws.drainJobs();
+  const settled = await ws.eval('await research');
+  assert.equal(settled.kind, 'value');
+  if (settled.kind === 'value') assert.deepEqual(settled.value, { ok: true });
+  // The parked record remains (the surface route settled the GUEST
+  // registry, not the live deferred); the registry itself is empty — the
+  // honest "no pending work" signal.
+  assert.equal(surface!.pending().length, 0);
+
+  // inspectBinding is the manifest seam (name, type, size — never content).
+  await ws.eval('globalThis.notes = { depth: 3 }; "ok"');
+  const meta = ws.inspectBinding('notes');
+  assert.equal(meta.kind, 'data');
+  assert.equal(meta.label, 'object');
+  assert.ok(meta.sizeBytes > 0);
+  ws.dispose();
+});
+
+test('custom bridge handlers passed to create override the parking bridge', async () => {
+  const calls: Array<{ callId: string; modelSpec: string; task: string }> = [];
+  const ws = await Workspace.create('/tmp/repl-test-custom-bridge', {
+    handlers: {
+      agent: (call, callId, modelSpec, task) => {
+        calls.push({ callId, modelSpec, task });
+        call.resolve('custom handled');
+      },
+      checkpoint: () => undefined,
+      steer: () => undefined,
+      console: () => undefined,
+    },
+  });
+  const out = await ws.eval('await agent("pi/custom", "do it")');
+  assert.equal(out.kind, 'value');
+  if (out.kind === 'value') assert.equal(out.value, 'custom handled');
+  assert.deepEqual(calls, [{ callId: 'c1', modelSpec: 'pi/custom', task: 'do it' }]);
+  // Custom handlers own their events: the workspace buffer stays empty.
+  assert.equal(ws.consoleEvents().length, 0);
+  ws.dispose();
+});
+
 test('workspace state persists across evals (the REPL property)', async () => {
   const ws = await workspace();
   await ws.eval('let findings = ["a", "b", "c"]; let notes = { depth: 3 }');

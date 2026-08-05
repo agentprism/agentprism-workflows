@@ -118,9 +118,10 @@ async function exercisePhaseB(): Promise<void> {
   // a non-DOM lib and skipLibCheck: false (no quickjs-wasi types leak).
   const bridgeVm = await ReplVm.create();
   const handlers: GuestBridgeHandlers = {
-    agent: (call: GuestCall, callId: string, prompt: string, optionsJson: string | null) => {
+    agent: (call: GuestCall, callId: string, modelSpec: string, task: string, optionsJson: string | null) => {
       callId satisfies string;
-      prompt satisfies string;
+      modelSpec satisfies string;
+      task satisfies string;
       optionsJson satisfies string | null;
       call.resolve({ ok: true });
     },
@@ -133,7 +134,9 @@ async function exercisePhaseB(): Promise<void> {
       call?.resolve('answered');
       return undefined;
     },
-    steer: (call, callId, action, payloadJson) => {
+    steer: (call, callId, sessionId, action, payloadJson) => {
+      callId satisfies string;
+      sessionId satisfies string;
       action satisfies string;
       payloadJson satisfies string | null;
       call.resolve('injected');
