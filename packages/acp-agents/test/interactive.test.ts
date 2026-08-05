@@ -19,7 +19,13 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   return { promise, resolve };
 }
 
-function fakeInteractive(session: Partial<SessionHandle>): InteractiveSession {
+function fakeInteractive(
+  session: Partial<SessionHandle>,
+  options: {
+    schema?: unknown;
+    backend?: Partial<Backend>;
+  } = {},
+): InteractiveSession {
   return new InteractiveSession({
     session: {
       sessionId: "unit-session",
@@ -41,9 +47,11 @@ function fakeInteractive(session: Partial<SessionHandle>): InteractiveSession {
       sessionMeta: () => undefined,
       promptMeta: () => undefined,
       nativeStructured: () => undefined,
+      ...options.backend,
     } as Backend,
     subscribe: () => () => undefined,
     onRelease: () => undefined,
+    schema: options.schema as never,
   });
 }
 
@@ -162,6 +170,87 @@ test("InteractiveSession.steer adapts images/meta and surfaces every outcome unc
 
   promptGate.resolve();
   await prompt;
+});
+
+test("InteractiveSession.prompt merges the backend's schema channel UNDER the user turn meta", async () => {
+  const schema = { type: "object", properties: { answer: { type: "string" } } };
+  const SCHEMA_KEY = "outputSchema";
+  const sent: Array<Record<string, unknown> | undefined> = [];
+  const session = fakeInteractive(
+    {
+      prompt: async (_content, meta) => {
+        sent.push(meta as Record<string, unknown> | undefined);
+        return { stopReason: "end_turn" };
+      },
+    },
+    {
+      schema,
+      backend: {
+        id: "codex",
+        promptMeta: (s) => (s ? { [SCHEMA_KEY]: s } : undefined),
+      },
+    },
+  );
+
+  await session.prompt("task", { promptMeta: { trace: "user-1" } });
+  assert.deepEqual(sent, [{ trace: "user-1", [SCHEMA_KEY]: schema }]);
+  // Without user meta the backend channel alone travels.
+  await session.prompt("task");
+  assert.deepEqual(sent[1], { [SCHEMA_KEY]: schema });
+  // A user key never clobbers the schema channel (backend-computed keys merge over).
+  await session.prompt("task", { promptMeta: { [SCHEMA_KEY]: "user-clobber" } });
+  assert.deepEqual(sent[2], { [SCHEMA_KEY]: schema });
+});
+
+test("InteractiveSession.prompt embeds the schema contract in the prompt for embedSchemaInPrompt backends", async () => {
+  const schema = { type: "object", properties: { answer: { type: "string" } } };
+  const sent: Array<string | import("@agentclientprotocol/sdk").ContentBlock[]> = [];
+  const session = fakeInteractive(
+    {
+      prompt: async (content) => {
+        sent.push(content);
+        return { stopReason: "end_turn" };
+      },
+    },
+    {
+      schema,
+      backend: {
+        id: "custom",
+        embedSchemaInPrompt: true,
+        promptMeta: () => undefined,
+      },
+    },
+  );
+
+  await session.prompt("research X");
+  assert.equal(sent.length, 1);
+  const text = typeof sent[0] === "string" ? sent[0] : "";
+  assert.ok(text.includes("research X"), text);
+  assert.ok(text.includes("Final output contract"), text);
+  assert.ok(text.includes(JSON.stringify(schema)), "the schema is stated in-band");
+  // ContentBlock prompts are left untouched (the host owns their shaping).
+  const blocks = [{ type: "text" as const, text: "verbatim" }];
+  await session.prompt(blocks);
+  assert.deepEqual(sent[1], blocks);
+  // A backend WITHOUT embedSchemaInPrompt keeps the prompt verbatim (the native channel is authoritative).
+  const plain = fakeInteractive(
+    {
+      prompt: async (content) => {
+        sent.push(content);
+        return { stopReason: "end_turn" };
+      },
+    },
+    { schema, backend: { id: "claude", promptMeta: () => undefined } },
+  );
+  await plain.prompt("research X");
+  assert.equal(sent[2], "research X");
+});
+
+test("InteractiveSession.outputSchema exposes the session's contract", () => {
+  const schema = { type: "object", properties: { n: { type: "number" } } };
+  const session = fakeInteractive({}, { schema });
+  assert.equal(session.outputSchema, schema);
+  assert.equal(fakeInteractive({}).outputSchema, undefined);
 });
 
 test("InteractiveSession does not serialize concurrent steer calls", async () => {

@@ -21,17 +21,31 @@
  *   on the backend for the restore path's lazy re-attach.
  * - **Six concurrent subagents per workspace** (the doc-settled cap).
  *   The cap counts live work: unsettled agent calls plus sessions
- *   currently running a queued-steer delivery turn. A dispatch over the
- *   cap is refused at dispatch time — recorded in the call store
- *   (dispatched + rejected, so a restore never re-issues it) and the
- *   guest call rejects with a recoverable error; nothing is queued and
- *   nothing is hidden. `maxConcurrentAgents` is configurable (server
+ *   running a follow-up turn (a queued-steer delivery turn or a
+ *   startedNewTurn prompt on a settled handle — a subagent is working
+ *   even on a follow-up turn). The cap is ABSOLUTE for turn starts, not
+ *   just dispatches: a dispatch over the cap is refused at dispatch
+ *   time — recorded in the call store (dispatched + rejected, so a
+ *   restore never re-issues it) and the guest call rejects with a
+ *   recoverable error — and a followUp/steer on an idle session whose
+ *   start would exceed the cap is queued for the next free slot with
+ *   the honest `queued` outcome (never a seventh concurrent turn, never
+ *   a hard error). Queued delivery turns likewise start only while a
+ *   slot is free; the kick (`kickQueuedDeliveries`) runs whenever a
+ *   slot frees. `maxConcurrentAgents` is configurable (server
  *   configuration, invisible to the guest).
  * - **Steering resolves with what actually happened** (the doc's
  *   "nothing is hidden, nothing hard-errors"): followUp/steer settle
  *   with the acp-agents steering-outcome vocabulary where the backend
  *   advertises `_session/steering`, with the broker's honest `queued`
  *   marker where it does not (see the steering mechanism table below).
+ *   Queued-for-next-turn delivery is DURABLE: the steer's payload and
+ *   founding session id live in the call store, and the store records
+ *   each delivery turn's start (the `delivered` marker — the point of
+ *   no return) and each drop (`dropped`), so a crash between enqueue
+ *   and delivery loses nothing and a restored broker replays undelivered
+ *   steers without duplicating delivered ones (`reconcile()`'s queue
+ *   rebuild arm).
  *   Steering calls NEVER hard-error: every backend/wire failure resolves
  *   `failed`; the only rejections are guest protocol violations.
  * - **The append-only call store** (`store.ts`): every call's outcome is
@@ -74,8 +88,24 @@
  * ## The steering mechanism table (spec-owed decision)
  *
  * The roadmap doc's per-backend steering *mechanism* table is decided
- * here (the doc's remaining item — the documentation table generated
- * from live capability probes — is the observability layer's artifact):
+ * here. The CURRENT per-backend inventory (the doc's owed decision,
+ * sourced from the live capability probes in acp-agents —
+ * `ACP_EXTENSION_SUPPORT_MATRIX` in `src/protocol-coverage.ts`, probed
+ * by the protocol-coverage suite against the installed Claude/Codex
+ * distributions, plus the live-verified initialize matrix in
+ * `docs/api.md`):
+ *
+ * | Backend | `_session/steering` | Steering mechanism |
+ * |---|---|---|
+ * | claude | advertised (`_meta.steering.supported` probe, live-verified) | live injection via `session.steer()` |
+ * | codex | advertised (same probe, live-verified) | live injection via `session.steer()` |
+ * | pi | advertised (same probe; workspace-owned package tested in its own suite) | live injection via `session.steer()` |
+ * | opencode | NOT advertised (`typed-unsupported` in the extension matrix — no safe driven wrapper) | queued-for-next-turn delivery |
+ * | custom backend | whatever the agent's initialize response advertises (capability-gated per session) | live injection when advertised, queued delivery otherwise |
+ *
+ * The per-session capability is read ONCE at session open
+ * (`session.capabilities.supportsSteering`); the mechanism table for one
+ * session:
  *
  * | Case | Mechanism | Outcome the handle resolves with |
  * |---|---|---|
@@ -83,6 +113,7 @@
  * | backend advertises `_session/steering`, session idle | `session.prompt(content)` — a new turn (there is nothing to inject into) | `startedNewTurn` |
  * | backend does NOT advertise steering, turn in flight | content enqueued for next-turn delivery | `queued` (immediately — accepted for next-turn delivery; if the call is later cancelled the queue is dropped, and a delivery-turn failure surfaces as a warn-level line in the next tool result — both documented) |
  * | backend does NOT advertise steering, session idle | `session.prompt(content)` — a new turn | `startedNewTurn` |
+ * | ANY backend, session idle, but the workspace cap is exhausted | content enqueued for the next free slot (the same durable queue) | `queued` (a follow-up turn IS the subagent working — the six-agent ceiling is absolute; the steer starts the moment a slot frees) |
  * | any backend/wire failure on the steering path | — | `failed` (never a hard rejection) |
  * | the founding call is still OPENING (its session does not exist yet —
  *   a steer in the same eval as the dispatch) | content queued for the
@@ -107,9 +138,17 @@
  *
  * - `schema` — a JSON Schema object; acp-agents validates per call (its
  *   own convert/check + re-prompt ladder, driven by the broker over the
- *   session — the one divergence from `run()`: the client-hosted
- *   StructuredOutput MCP capture tool is not injected on the interactive
- *   path; the native + prose-extraction channels are the same ladder).
+ *   session). The schema reaches the backend through acp-agents' native
+ *   channels exactly like `run()`: the broker passes it into session
+ *   creation (`openSession({ schema })` folds it into session/new
+ *   `_meta` where the backend carries it there — Claude), and
+ *   acp-agents' `InteractiveSession.prompt` merges the backend-computed
+ *   turn meta (the Codex `outputSchema` forward) and embeds the
+ *   contract in the prompt text for backends that ignore the `_meta`
+ *   forward (pi, custom). The one divergence from `run()` stays: the
+ *   client-hosted StructuredOutput MCP capture tool is not injected on
+ *   the interactive path; the native + prose-extraction channels are
+ *   the same ladder.
  * - `cwd` — absolute working directory for the ACP session; defaults to
  *   the workspace's project directory.
  * - `configOptions` — ACP session config options (record of string |
@@ -155,6 +194,12 @@ export type SteeringOutcomeValue = 'injected' | 'startedNewTurn' | 'queued' | 'c
 export interface BrokerOpenSessionOptions {
   /** The model spec — routed by the runner's own grammar. */
   model?: string;
+  /** The structured-output contract (a JSON Schema object) — folded into
+   *  the backend's native schema channels by the runner's session
+   *  (session/new `_meta` where the backend carries it there; the
+   *  per-turn `_meta` forward and the in-band prompt contract come from
+   *  the same value inside `InteractiveSession.prompt`). */
+  schema?: unknown;
   /** Agent-advertised ACP session mode id (strict confinement lever). */
   mode?: string;
   /** ACP session config options, applied verbatim in sorted id order. */
@@ -211,6 +256,10 @@ export interface BrokerSession {
   steer(content: string, opts?: BrokerPromptOptions): Promise<string>;
   /** Cancel the active turn (ACP `session/cancel`). */
   cancel(): Promise<void>;
+  /** Release the ACP session and close its dedicated process (the
+   *  session stays re-openable on the backend when it was opened with
+   *  `keepSession: true`). Idempotent. */
+  release(): Promise<void>;
   /** The latest turn's assistant text. */
   currentTurnText(): string;
   /** The latest turn's FINAL assistant message (schema extraction). */
@@ -292,6 +341,13 @@ export interface ReconcileReport {
    *  re-attach / re-issue arms belong to the restore path, a later
    *  phase). */
   leftPending: string[];
+  /** Queued-for-next-turn steers the store showed as accepted but
+   *  undelivered (completion `queued`, no delivered/dropped marker) —
+   *  re-queued against their founding sessions (or held for the
+   *  session's next open), so a crash between enqueue and delivery
+   *  loses nothing. Delivered and dropped steers are never replayed
+   *  (the markers are first-wins). */
+  reQueuedUndelivered: string[];
 }
 
 /** Options for attaching a broker to a workspace. */
@@ -299,16 +355,27 @@ export interface BrokerOptions {
   /** The ACP runner (structural subset of `AcpAgentRunner`; fakes for
    *  tests). Defaults to a bare `AcpAgentRunner` owned by this broker
    *  (disposed with it); hosts with a backend registry pass their own
-   *  configured runner and own its lifetime. */
+   *  configured runner and own its lifetime (the broker still RELEASES
+   *  every session it opened before dropping its state). */
   runner?: BrokerRunner;
   /** The append-only call store. Defaults to `InMemoryCallStore`. */
   store?: CallStore;
   /** The concurrency cap: max concurrent subagents per workspace
    *  (doc-settled default 6). Counts unsettled agent calls plus sessions
-   *  running queued-steer delivery turns. */
+   *  running a follow-up turn (a queued-steer delivery or a
+   *  startedNewTurn prompt on a settled handle). The cap gates turn
+   *  starts as well as dispatches: an idle-session follow-up that would
+   *  exceed it queues with the honest `queued` outcome. Validated as an
+   *  integer in
+   *  `[1, DEFAULT_MAX_CONCURRENT_AGENTS]`: invalid values (NaN,
+   *  fractional, < 1) throw at attach time; values ABOVE the doc-settled
+   *  ceiling are clamped to it (the ceiling is absolute — a
+   *  misconfigured host can never open a seventh subagent). */
   maxConcurrentAgents?: number;
   /** Per-eval and per-settlement-drain interrupt handler (a runaway
-   *  guest continuation stays bounded). */
+   *  guest continuation stays bounded). Also the DEFAULT interrupt
+   *  handler for evals: a direct eval that runs away is interrupted
+   *  with this signal unless the caller passes a per-eval handler. */
   interruptHandler?: () => boolean;
 }
 
@@ -346,8 +413,8 @@ interface SessionEntry {
   callSettled: boolean;
   /** True when the founding call was cancelled — the queue is dropped. */
   callCancelled: boolean;
-  /** Queued followUp/steer payloads (no-extension backends, turn in
-   *  flight), in order. */
+  /** Queued followUp/steer payloads (no-extension backends with a turn
+   *  in flight, and cap-pressure queues on idle sessions), in order. */
   queue: Array<{ callId: string; prompt: string; promptMeta?: Record<string, unknown> }>;
 }
 
@@ -411,6 +478,15 @@ const STEER_OPTION_KEYS = new Set(['promptMeta']);
 /** Default per-workspace concurrency cap (the doc-settled limit). */
 export const DEFAULT_MAX_CONCURRENT_AGENTS = 6;
 
+/** The guest library's reserved model-spec sentinel (`verify`/`judgePanel`
+ *  route their spawned reviewers/graders through it — the DSL options have
+ *  no per-call model, so the reviewers inherit "the run's default model").
+ *  acp-agents treats an unknown bare spec as a LITERAL model selection, so
+ *  the broker maps the sentinel to an omitted model — which routes to the
+ *  runner's configured default backend (the guest-library contract:
+ *  "host policy routes it to its configured default backend"). */
+const GUEST_DEFAULT_MODEL_SENTINEL = 'default';
+
 /** The error-code vocabulary the broker rejects with (shared-types'
  *  `WorkflowErrorCode`, kept in lockstep with the runner's own errors). */
 const CODE = WorkflowErrorCode;
@@ -456,7 +532,8 @@ export class Broker {
   private readonly inFlight = new Map<string, InFlightTask>();
   /** Unsettled agent call ids — one concurrency token each. */
   private readonly agentSlots = new Set<string>();
-  /** Sessions running a queued-steer delivery turn — one concurrency
+  /** Sessions running a follow-up turn (a queued-steer delivery turn or
+   *  a startedNewTurn prompt on a settled handle) — one concurrency
    *  token each (a subagent is working even on a follow-up turn). */
   private readonly deliverySlots = new Set<string>();
   /** Call ids settled synchronously at dispatch (refusals) since the
@@ -467,7 +544,20 @@ export class Broker {
 
   private constructor(workspace: Workspace, options: BrokerOptions) {
     this.workspace = workspace;
-    this.maxConcurrentAgents = options.maxConcurrentAgents ?? DEFAULT_MAX_CONCURRENT_AGENTS;
+    // Validate the cap: an integer in [1, DEFAULT_MAX_CONCURRENT_AGENTS].
+    // Non-integer / NaN / < 1 values are programming errors at attach time
+    // (loud throw); values ABOVE the doc-settled ceiling are clamped to it
+    // — the six-per-workspace maximum is absolute, so a misconfigured host
+    // can never open a seventh subagent (review regression: a config of 7
+    // used to open seven sessions).
+    const rawCap = options.maxConcurrentAgents ?? DEFAULT_MAX_CONCURRENT_AGENTS;
+    if (typeof rawCap !== 'number' || !Number.isInteger(rawCap) || rawCap < 1) {
+      throw new Error(
+        `Broker: maxConcurrentAgents must be an integer in [1, ${DEFAULT_MAX_CONCURRENT_AGENTS}] ` +
+          `(got ${String(rawCap)})`,
+      );
+    }
+    this.maxConcurrentAgents = Math.min(rawCap, DEFAULT_MAX_CONCURRENT_AGENTS);
     this.callStore = options.store ?? new InMemoryCallStore();
     this.interruptHandler = options.interruptHandler;
     this.ownsRunner = options.runner === undefined;
@@ -519,24 +609,24 @@ export class Broker {
     return this.serialized(async () => {
       this.assertAlive();
       let completed: string[];
-      try {
-        completed = await this.pumpUnlocked();
-      } catch (error) {
-        if (error instanceof DrainJobError) {
-          // The pump's drain ran PREVIOUS evals' continuations and one
-          // failed. The current eval did not fail; the background
-          // failure is honest output (rendered alongside the eval's own
-          // error, if it has one), and the VM stays usable.
-          const { outcome, completion } = this.runEval(code, options);
-          return this.render(outcome, completion, this.syncSettled.splice(0), errorLine(error.info));
-        }
-        throw error; // host-side failure — fail loudly
+      let pumpDrainErrorLine: string | undefined;
+      const pumped = await this.pumpUnlocked();
+      completed = pumped.settled;
+      if (pumped.drainError !== undefined) {
+        // The pump's drain ran PREVIOUS evals' continuations and one
+        // failed. The current eval did not fail; the background
+        // failure is honest output (rendered alongside the eval's own
+        // error, if it has one), the already-settled call ids are
+        // STILL reported (a continuation drain failure must never
+        // erase the deliveries it followed — review regression), and
+        // the VM stays usable.
+        pumpDrainErrorLine = errorLine(pumped.drainError.info);
       }
       const { outcome, completion } = this.runEval(code, options);
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
       completed = [...completed, ...this.syncSettled.splice(0)];
-      return this.render(outcome, completion, completed);
+      return this.render(outcome, completion, completed, pumpDrainErrorLine);
     });
   }
 
@@ -549,17 +639,28 @@ export class Broker {
    * idempotent), so the next pump retries it — a crash between the
    * store write and the guest settlement is healed, not doubled. A drain
    * failure (a guest continuation threw) propagates as `DrainJobError`
-   * with the VM left usable.
+   * with the VM left usable and the already-settled ids still reported.
    */
   async pump(): Promise<string[]> {
-    return this.serialized(() => this.pumpUnlocked());
+    return this.serialized(async () => {
+      const { settled, drainError } = await this.pumpUnlocked();
+      if (drainError !== undefined) throw drainError;
+      return settled;
+    });
   }
 
   /**
    * The store arm of the three-way post-restore reconciliation: read the
    * guest registry's pending calls, and settle every one whose call the
    * store shows as completed — from the store, exactly once (the guest's
-   * own idempotent settle-by-id makes a double delivery a no-op). The
+   * own idempotent settle-by-id makes a double delivery a no-op). Also
+   * rebuilds the queued-for-next-turn delivery queues: steer records the
+   * store shows as accepted-but-undelivered (`queued` completion, no
+   * delivered/dropped marker) are re-queued against their founding
+   * sessions — merged at the session's next open (live session entries
+   * get the re-queued payload appended directly, deduplicated) — so a
+   * crash between enqueue and delivery loses nothing, and delivered or
+   * dropped steers are never replayed (the markers are first-wins). The
    * re-attach and re-issue arms belong to the restore path (a later
    * phase); entries without a store completion are reported in
    * `leftPending`. Drains once after settling.
@@ -571,7 +672,7 @@ export class Broker {
       if (surface === undefined) {
         throw new Error('Broker: cannot reconcile — the guest surface is not installed');
       }
-      const report: ReconcileReport = { settledFromStore: [], leftPending: [] };
+      const report: ReconcileReport = { settledFromStore: [], leftPending: [], reQueuedUndelivered: [] };
       for (const entry of surface.pending()) {
         const record = this.callStore.lookup(entry.id);
         const completion = record?.completion;
@@ -582,9 +683,59 @@ export class Broker {
         }
         report.leftPending.push(entry.id);
       }
+      report.reQueuedUndelivered = this.rebuildUndeliveredQueues();
       if (report.settledFromStore.length > 0) this.drain();
       return report;
     });
+  }
+
+  /**
+   * Rebuild the per-session delivery queues from the store: every steer
+   * record with a `queued` completion and NO delivered/dropped marker is
+   * undelivered-at-crash — its payload and founding session id are in the
+   * store, so delivery can be replayed exactly once. A steer whose
+   * founding call was CANCELLED is not re-queued (its queue was dropped
+   * when the cancel landed — the dropped marker covers the normal drop
+   * path; this is the belt-and-braces check for a crash between the
+   * cancel and the drop record). Returns the re-queued steer call ids.
+   */
+  private rebuildUndeliveredQueues(): string[] {
+    const reQueued: string[] = [];
+    const records = this.callStore.all();
+    for (const record of records) {
+      if (record.kind !== 'steer') continue;
+      const completion = record.completion;
+      if (completion === null || completion === undefined || completion.value !== 'queued') continue;
+      if (record.deliveredAtMs !== null || record.droppedAtMs !== null) continue;
+      if (record.sessionId === null) continue;
+      if (this.isCancelledFoundingCall(record.sessionId)) continue;
+      const sessionId = record.sessionId;
+      const payload = parseSteerPayload(record.optionsJson);
+      if (payload === null) continue;
+      const entry = this.sessions.get(sessionId);
+      if (entry !== undefined) {
+        if (entry.queue.some((item) => item.callId === record.callId)) continue;
+        entry.queue.push({ callId: record.callId, ...payload });
+        reQueued.push(record.callId);
+      } else {
+        const pending = this.pendingSteers.get(sessionId) ?? [];
+        if (pending.some((item) => item.callId === record.callId)) continue;
+        pending.push({ callId: record.callId, ...payload });
+        this.pendingSteers.set(sessionId, pending);
+        reQueued.push(record.callId);
+      }
+    }
+    return reQueued;
+  }
+
+  /** Did this founding call end in an orchestrator-driven cancel (the
+   *  only settlement that drops its delivery queue)? */
+  private isCancelledFoundingCall(callId: string): boolean {
+    const record = this.callStore.lookup(callId);
+    const completion = record?.completion;
+    if (completion === null || completion === undefined || completion.outcome !== 'reject') return false;
+    const value = completion.value as { code?: unknown } | null | undefined;
+    return value !== null && typeof value === 'object' && value.code === CODE.AGENT_CANCELLED;
   }
 
   /**
@@ -647,21 +798,28 @@ export class Broker {
   }
 
   /**
-   * Teardown: cancel in-flight turns (best-effort), dispose the runner
-   * (releasing every session — opened with `keepSession: true`, so the
-   * ACP sessions persist on the backends for a later re-attach), and
-   * drop the broker's state. The workspace (and its VM) is the caller's
-   * to dispose.
+   * Teardown: cancel in-flight turns (best-effort), release EVERY
+   * session the broker opened (whether or not it owns the runner — a
+   * host-injected runner keeps its own lifetime, but the broker's
+   * dedicated ACP processes are still released; review regression: an
+   * injected-runner disposal used to leak every session), then dispose
+   * the runner when this broker owns it, and drop the broker's state.
+   * The workspace (and its VM) is the caller's to dispose.
    */
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     await this.serialized(async () => {
       const cancels: Promise<unknown>[] = [];
-      for (const entry of this.sessions.values()) {
+      const sessions = [...this.sessions.values()];
+      for (const entry of sessions) {
         if (entry.busy) cancels.push(this.cancelSession(entry));
       }
       await Promise.allSettled(cancels);
+      const releases: Promise<unknown>[] = sessions.map((entry) =>
+        Promise.resolve(entry.session.release()).catch(() => undefined),
+      );
+      await Promise.allSettled(releases);
       this.sessions.clear();
       this.pendingSteers.clear();
       this.checkpoints.clear();
@@ -715,10 +873,14 @@ export class Broker {
    * `__host_checkpoint`: question mode parks the call and records the
    * dispatch; answer mode delivers the user's answer for the matching
    * pending checkpoint — recorded FIRST (an accepted answer must survive
-   * a kill between the eval and the next snapshot), then settled within
-   * the same eval, first-wins. Returns whether a pending checkpoint with
-   * that id was answered; an answer never touches the agent/steer call
-   * table (the phase-B review regression's id-space separation).
+   * a kill between the eval and the next snapshot; a FAILING store write
+   * must leave the checkpoint pending so a later answer retry can
+   * succeed — review regression: the checkpoint used to be forgotten
+   * before its answer was durable, and a failed write left the guest
+   * promise pending forever), then settled within the same eval,
+   * first-wins. Returns whether a pending checkpoint with that id was
+   * answered; an answer never touches the agent/steer call table (the
+   * phase-B review regression's id-space separation).
    */
   private onCheckpoint(
     call: GuestCall | null,
@@ -730,27 +892,33 @@ export class Broker {
     if (answerJson !== null) {
       const pending = this.checkpoints.get(callId);
       if (pending === undefined) return false;
-      this.checkpoints.delete(callId);
       let answer: unknown;
       try {
         answer = JSON.parse(answerJson);
       } catch {
         // A host-side contract violation (the guest only sends
         // JSON.stringify output): reject rather than park the question
-        // forever.
+        // forever. Recorded FIRST, then the checkpoint is consumed, then
+        // the call settles (a failing record leaves the checkpoint
+        // pending and the call unsettled — the next answer retry works).
         this.recordCompletion(callId, {
           outcome: 'reject',
           value: toRejectionValue(new Error(`checkpoint ${callId}: answer was not valid JSON`)),
           completedAtMs: now(),
         });
+        this.checkpoints.delete(callId);
         pending.call.reject(new Error(`checkpoint ${callId}: answer was not valid JSON`));
         return true;
       }
+      // Record FIRST (durable), THEN consume the pending checkpoint,
+      // THEN settle — a failing store write propagates as a guest error
+      // in the answering eval and the checkpoint stays pending.
       this.recordCompletion(callId, { outcome: 'resolve', value: answer, completedAtMs: now() });
+      this.checkpoints.delete(callId);
       pending.call.resolve(answer);
       return true;
     }
-    this.recordDispatch(callId, 'checkpoint', question ?? '', optionsJson);
+    this.recordDispatch(callId, 'checkpoint', question ?? '', optionsJson, null);
     this.checkpoints.set(callId, {
       callId,
       call: call!,
@@ -782,7 +950,7 @@ export class Broker {
       this.refuse(call, callId, 'steer', action, payloadJson, error);
       return;
     }
-    this.recordDispatch(callId, 'steer', action, payloadJson);
+    this.recordDispatch(callId, 'steer', action, payloadJson, sessionId);
 
     const entry = this.sessions.get(sessionId);
     if (entry === undefined) {
@@ -861,7 +1029,19 @@ export class Broker {
       return;
     }
 
-    // The session is idle: the content starts a new turn right now.
+    // The session is idle: the content starts a new turn right now —
+    // UNLESS the workspace cap is exhausted (a follow-up turn IS the
+    // subagent working; the six-agent ceiling is absolute). Cap pressure
+    // queues the steer on the same durable queue with the honest
+    // `queued` outcome; `kickQueuedDeliveries` starts it the moment a
+    // slot frees (review regression: idle-handle follow-ups used to
+    // start without checking the cap, so a maxConcurrentAgents=1
+    // workspace could run two subagent turns concurrently).
+    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
+      entry.queue.push({ callId, prompt, promptMeta });
+      this.settleSteerSync(call, callId, 'queued');
+      return;
+    }
     const task = this.runPromptTask(callId, entry, prompt, promptMeta);
     this.deferreds.set(callId, call);
     this.trackInFlight(callId, 'steer', task);
@@ -876,8 +1056,16 @@ export class Broker {
   // ── Dispatch, tasks, settlement ───────────────────────────────────────
 
   /** Record a dispatch (idempotent per id — a re-issue of a known id
-   *  keeps the original record). */
-  private recordDispatch(callId: string, kind: 'agent' | 'checkpoint' | 'steer', detail: string, optionsJson: string | null): void {
+   *  keeps the original record). Steer records carry the FOUNDING session
+   *  id (`sessionId` — the restore path's queue rebuild keys on it);
+   *  agent/checkpoint records pass null. */
+  private recordDispatch(
+    callId: string,
+    kind: 'agent' | 'checkpoint' | 'steer',
+    detail: string,
+    optionsJson: string | null,
+    sessionId: string | null = null,
+  ): void {
     this.callStore.recordDispatched({
       callId,
       kind,
@@ -886,6 +1074,9 @@ export class Broker {
       dispatchedAtMs: now(),
       reissues: 0,
       completion: null,
+      sessionId,
+      deliveredAtMs: null,
+      droppedAtMs: null,
     });
   }
 
@@ -934,16 +1125,27 @@ export class Broker {
 
   /** The agent call task: open the session, run the prompt, shape the
    *  result (schema ladder or text), and report the outcome. The session
-   *  stays open after the call settles — the live-handle contract. */
+   *  stays open after the call settles — the live-handle contract. The
+   *  guest's reserved `"default"` model sentinel maps to an OMITTED model
+   *  (acp-agents routes it to the configured default backend; a bare
+   *  unknown spec would be treated as a literal model selection — review
+   *  regression). The schema rides session creation (`openSession`
+   *  folds it into the backend's native session/new channel — Claude);
+   *  the per-turn channels (Codex's `outputSchema` forward, the in-band
+   *  contract for pi/custom) are the runner's own, applied inside
+   *  `InteractiveSession.prompt` from that same schema.
+   */
   private async runAgentTask(
     callId: string,
     modelSpec: string,
     task: string,
     parsed: ParsedAgentOptions,
   ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+    let openedSession: BrokerSession | undefined;
     try {
       const session = await this.runner.openSession({
-        model: modelSpec,
+        model: modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : modelSpec,
+        schema: parsed.schema as never,
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
         mode: parsed.mode,
@@ -958,6 +1160,7 @@ export class Broker {
         keepSession: true,
         retainSessionLog: true,
       });
+      openedSession = session;
       const entry: SessionEntry = {
         session,
         callId,
@@ -981,7 +1184,39 @@ export class Broker {
           : this.finalText(entry);
       return { outcome: 'resolve', value };
     } catch (error) {
+      if (openedSession === undefined) {
+        // The founding session never opened: same-eval steers queued
+        // against this call (their promises already resolved `queued`)
+        // can never be delivered. Nothing is hidden — each gets the
+        // documented delivery warning in the next tool result — and the
+        // undelivered state is recorded durably (dropped marker) so a
+        // restore never resurrects a dead queue.
+        this.dropPendingSteers(callId, error);
+      }
       return { outcome: 'reject', value: toRejectionValue(error) };
+    }
+  }
+
+  /** The founding session failed to open: every steer queued against the
+   *  still-opening call is dropped — recorded in the store (first-wins
+   *  `dropped` marker; the guest promises already resolved `queued`) and
+   *  surfaced as a warn-level line per steer. */
+  private dropPendingSteers(callId: string, error: unknown): void {
+    const pending = this.pendingSteers.get(callId);
+    this.pendingSteers.delete(callId);
+    if (pending === undefined) return;
+    for (const steer of pending) {
+      try {
+        this.callStore.recordDelivery(steer.callId, 'dropped', now());
+      } catch (recordError) {
+        // A failing store must not silence the visible warning.
+        this.consoleBuffer.push({
+          level: 'warn',
+          refs: [],
+          args: [`steer ${steer.callId} (on ${callId}): queued delivery dropped, but its drop could not be recorded: ${toRejectionValue(recordError).message}`],
+        });
+      }
+      this.warnDeliveryFailure(steer.callId, callId, error);
     }
   }
 
@@ -1079,7 +1314,25 @@ export class Broker {
       entry.busy = true;
       entry.delivering = entry.callSettled;
       if (entry.delivering) this.deliverySlots.add(entry.callId);
-      const turn = await entry.session.prompt(prompt, { promptMeta });
+      // Invoke the prompt FIRST — the hand-off to the backend — and
+      // record the `delivered` marker only after it: a crash between a
+      // pre-invocation marker and the prompt used to make a restore
+      // skip a steer that was never handed to the backend, silently
+      // losing promised queued delivery (review regression). After the
+      // invocation the payload is on the wire — the true point of no
+      // return — so a restore never re-delivers it. The marker applies
+      // only to QUEUED steers (their store completion is `queued`); a
+      // direct steer's completion is recorded by the pump when its turn
+      // settles, which is its own authority. A failing marker record
+      // aborts the turn as a delivery failure (the at-least-once
+      // direction: the payload was already handed off; re-delivery
+      // after a restore is preferrable to loss).
+      const turnPromise = entry.session.prompt(prompt, { promptMeta });
+      const record = this.callStore.lookup(callId);
+      if (record?.completion?.value === 'queued') {
+        this.callStore.recordDelivery(callId, 'delivered', now());
+      }
+      const turn = await turnPromise;
       this.assertNormalStopReason(turn.stopReason, callId);
       return { outcome: 'resolve', value: 'startedNewTurn' };
     } catch (error) {
@@ -1119,44 +1372,88 @@ export class Broker {
     entry.callCancelled = true;
   }
 
-  /** Drop a cancelled call's queued steers (their promises already
+  /** Drop a cancelled/failed call's queued steers (their promises already
    *  resolved `queued` at enqueue — the cancellation is the visible
-   *  reason delivery never happens). */
+   *  reason delivery never happens). Every dropped steer is recorded
+   *  DURABLY (first-wins `dropped` marker) before the in-memory queue is
+   *  cleared: a restore must never resurrect a dropped delivery. A
+   *  failing record propagates (host-side failure) and the queue is left
+   *  untouched for the next attempt. */
   private dropQueue(entry: SessionEntry): void {
+    for (const item of entry.queue) {
+      this.callStore.recordDelivery(item.callId, 'dropped', now());
+    }
     entry.queue = [];
   }
 
-  /** A queued-steer delivery turn failed: surface a warn-level line in
-   *  the next tool result (nothing is hidden — the steer's own promise
-   *  already resolved `queued`). */
+  /** A delivery turn failed (a queued steer's delivery or a direct
+   *  follow-up's prompt): surface a warn-level line in the next tool
+   *  result (nothing is hidden — a queued steer's own promise already
+   *  resolved `queued`; a direct steer resolves `failed`). */
   private warnDeliveryFailure(steerCallId: string, sessionCallId: string, error: unknown): void {
     const message = toRejectionValue(error).message;
     this.consoleBuffer.push({
       level: 'warn',
       refs: [],
-      args: [`steer ${steerCallId} (on ${sessionCallId}): queued delivery failed: ${message}`],
+      args: [`steer ${steerCallId} (on ${sessionCallId}): delivery failed: ${message}`],
     });
   }
 
-  /** A delivery turn ended (settled or cancelled): the session is idle
-   *  unless more queued steers start the next turn. */
+  /** Start one queued steer's delivery turn. The `delivered` marker is
+   *  NOT recorded here — `runPromptTask` records it only once the prompt
+   *  has been handed to the backend (see there): a marker recorded
+   *  before the invocation would make a crash between the two skip a
+   *  steer that was never delivered (review regression). The absolute
+   *  cap guard stays here too: a delivery turn is subagent work and
+   *  never starts while the cap is exhausted (kickQueuedDeliveries is
+   *  the scheduler; this guard makes the ceiling unconditional). */
+  private startQueuedDelivery(entry: SessionEntry): void {
+    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;
+    const next = entry.queue[0];
+    if (next === undefined) return;
+    entry.queue.shift();
+    void this.runPromptTask(next.callId, entry, next.prompt, next.promptMeta);
+  }
+
+  /** Start as many queued delivery turns as the cap allows, sessions in
+   *  open order (called whenever a concurrency slot frees — an agent
+   *  call settling or a follow-up turn ending). This is the ONLY
+   *  scheduler for queued payloads, including cap-pressure queues on
+   *  idle sessions: without the global pass, a steer queued on an idle
+   *  session would wait forever for its own session's turn to end. */
+  private kickQueuedDeliveries(): void {
+    for (;;) {
+      if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;
+      let candidate: SessionEntry | undefined;
+      for (const entry of this.sessions.values()) {
+        if (!entry.busy && !entry.callCancelled && entry.queue.length > 0) {
+          candidate = entry;
+          break;
+        }
+      }
+      if (candidate === undefined) return;
+      this.startQueuedDelivery(candidate);
+    }
+  }
+
+  /** A delivery turn ended (settled or cancelled): the session is idle;
+   *  any queued steers (its own or any other session's) start through
+   *  the global kick as slots allow. */
   private endDeliveryTurn(entry: SessionEntry): void {
     entry.busy = false;
     entry.delivering = false;
     this.deliverySlots.delete(entry.callId);
     if (entry.callCancelled) {
       this.dropQueue(entry);
+      this.kickQueuedDeliveries();
       return;
     }
-    if (entry.queue.length > 0) {
-      const next = entry.queue.shift()!;
-      void this.runPromptTask(next.callId, entry, next.prompt, next.promptMeta);
-    }
+    this.kickQueuedDeliveries();
   }
 
   // ── The settlement pump ───────────────────────────────────────────────
 
-  private async pumpUnlocked(): Promise<string[]> {
+  private async pumpUnlocked(): Promise<{ settled: string[]; drainError?: DrainJobError }> {
     this.assertAlive();
     const settled: string[] = [];
     for (;;) {
@@ -1180,38 +1477,74 @@ export class Broker {
         settled.push(entry.callId);
       }
     }
-    if (settled.length > 0) this.drain();
-    return settled;
+    if (settled.length === 0) return { settled };
+    try {
+      this.drain();
+      return { settled };
+    } catch (error) {
+      if (error instanceof DrainJobError) {
+        // The deliveries happened; the continuation drain failed. The
+        // settled call ids must NOT be lost with the error (review
+        // regression: an interrupted continuation used to erase every
+        // id the pump had settled) — the caller reports them alongside
+        // the drain-failure line.
+        return { settled, drainError: error };
+      }
+      throw error;
+    }
   }
 
   /** An agent call's settlement transition: the session is idle (its
-   *  concurrency token is released) and queued steers start their
-   *  delivery turns; a cancelled call's queue is dropped. */
+   *  concurrency token is released — UNCONDITIONALLY, so an agent call
+   *  whose session never opened (openSession failure) still frees its
+   *  slot; review regression: a failed open used to leak the token and
+   *  refuse every later dispatch under a tight cap) and queued steers
+   *  start their delivery turns through the global kick; a cancelled
+   *  call's queue is dropped. */
   private onCallSettled(callId: string): void {
-    const entry = this.sessions.get(callId);
-    if (entry === undefined) return;
-    entry.callSettled = true;
-    entry.busy = false;
     this.agentSlots.delete(callId);
-    if (entry.callCancelled) {
-      this.dropQueue(entry);
-      return;
+    const entry = this.sessions.get(callId);
+    if (entry !== undefined) {
+      entry.callSettled = true;
+      entry.busy = false;
+      if (entry.callCancelled) {
+        this.dropQueue(entry);
+        this.kickQueuedDeliveries();
+        return;
+      }
     }
-    if (entry.queue.length > 0) {
-      const next = entry.queue.shift()!;
-      void this.runPromptTask(next.callId, entry, next.prompt, next.promptMeta);
-    }
+    this.kickQueuedDeliveries();
   }
 
   /** Record → settle → consume for one ready outcome (the exactly-once
    *  discipline). The store write happens BEFORE the guest settlement;
    *  on a crash between the two, the next delivery (or the restore's
-   *  reconcile) settles from the store — never twice. */
+   *  reconcile) settles from the store — never twice. When the store
+   *  ALREADY holds a first completion (a re-delivery after a crash, or a
+   *  second pump attempt), the guest settles with the STORE's completion,
+   *  never the newer host outcome — the store's first completion is the
+   *  authority and the guest must never see a different value than the
+   *  store records (review regression: the newer live outcome used to
+   *  settle the guest while the store kept the first, leaving them
+   *  disagreeing). */
   private deliver(
     callId: string,
     outcome: { outcome: 'resolve' | 'reject'; value: unknown },
   ): void {
-    this.recordCompletion(callId, { outcome: outcome.outcome, value: outcome.value, completedAtMs: now() });
+    const newlyRecorded = this.recordCompletion(callId, {
+      outcome: outcome.outcome,
+      value: outcome.value,
+      completedAtMs: now(),
+    });
+    if (!newlyRecorded) {
+      const record = this.callStore.lookup(callId);
+      const completion = record?.completion;
+      if (completion === null || completion === undefined) {
+        throw new Error(`Broker: store lost the recorded completion for ${callId}`);
+      }
+      this.settleIntoGuest(callId, completion.outcome, completion.value);
+      return;
+    }
     this.settleIntoGuest(callId, outcome.outcome, outcome.value);
   }
 
@@ -1243,10 +1576,16 @@ export class Broker {
   // ── Eval + rendering ──────────────────────────────────────────────────
 
   /** Run the eval (with the rejection bridge armed) and read the
-   *  completion. The caller owns `completion` when present. */
+   *  completion. The broker-level interrupt handler is the DEFAULT for
+   *  evals too: a direct eval that runs away must be bounded even when
+   *  the caller supplies no per-eval handler (review regression: the
+   *  configured handler used to apply only to settlement drains, so a
+   *  runaway eval could hang the workspace indefinitely). A caller's
+   *  per-eval handler still overrides it. */
   private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown } {
     return this.workspace.evalWithCompletion(code, {
       ...options,
+      interruptHandler: options.interruptHandler ?? this.interruptHandler,
       rejectionBridge: true,
     });
   }
@@ -1527,4 +1866,32 @@ function renderFallback(arg: unknown): string {
   }
   if (s === undefined) return '…';
   return s.length > 400 ? `${s.slice(0, 399)}…` : s;
+}
+
+/** Recover a queued steer's payload from its store record (the verbatim
+ *  `{ prompt, options }` bag recorded at dispatch — the queue rebuild's
+ *  crash-durable source). Returns null for a record whose payload is
+ *  malformed (a corrupt log line must not resurrect a bogus delivery). */
+function parseSteerPayload(
+  optionsJson: string | null,
+): { prompt: string; promptMeta?: Record<string, unknown> } | null {
+  if (optionsJson === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(optionsJson);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const payload = parsed as { prompt?: unknown; options?: unknown };
+  if (typeof payload.prompt !== 'string') return null;
+  const result: { prompt: string; promptMeta?: Record<string, unknown> } = { prompt: payload.prompt };
+  if (payload.options !== undefined && payload.options !== null && typeof payload.options === 'object') {
+    const options = payload.options as Record<string, unknown>;
+    const promptMeta = options.promptMeta;
+    if (promptMeta !== undefined && typeof promptMeta === 'object' && promptMeta !== null) {
+      result.promptMeta = promptMeta as Record<string, unknown>;
+    }
+  }
+  return result;
 }

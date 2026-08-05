@@ -1101,7 +1101,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
     const prepared = this.prepareSession(opts, {
       cwd: opts.cwd,
-      schema: undefined,
+      schema: opts.schema,
       registry: this.backends,
       permissionResolver: opts.permissionResolver ?? opts.onPermissionRequest,
       elicitationResolver: opts.onElicitation,
@@ -1138,6 +1138,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         label: opts.label,
         cwd: opts.cwd,
         keepSession: opts.keepSession === true,
+        schema: opts.schema,
       });
       this.interactiveSessions.set(interactive, connection);
       return interactive;

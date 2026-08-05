@@ -3,10 +3,18 @@
 // session can take multiple prompt turns, but it never consumes the pool slot used by run().
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PROTOCOL_VERSION, type ContentBlock, type RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
-import { AcpAgentRunner, type AcpRunnerOptions } from "../src/index.js";
-import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
+import { AcpAgentRunner, type AcpRunnerOptions, type CustomBackendConfig } from "../src/index.js";
+import {
+  createFakeAgentHarness,
+  FAKE_AGENT_FIXTURE,
+  readLog as readLogFile,
+  waitFor,
+} from "./helpers/fake-agent.js";
 
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
 const REJECT: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "reject-1" } };
@@ -21,11 +29,41 @@ interface LogEntry {
     prompt?: ContentBlock[];
     configId?: string;
     value?: string;
+    _meta?: Record<string, unknown> | null;
+  };
+}
+
+const SCHEMA = {
+  type: "object",
+  properties: { city: { type: "string" }, hot: { type: "boolean" } },
+  required: ["city", "hot"],
+};
+
+/** A registry config that spawns the fake ACP agent (custom-backend path). */
+function fakeCustomBackend(scenario: unknown): {
+  config: CustomBackendConfig;
+  cwd: string;
+  readLog: () => LogEntry[];
+} {
+  const dir = mkdtempSync(join(tmpdir(), "acp-interactive-custom-"));
+  const log = join(dir, "log.jsonl");
+  return {
+    config: {
+      command: process.execPath,
+      args: [FAKE_AGENT_FIXTURE],
+      env: {
+        AGENTPRISM_FAKE_SCENARIO: JSON.stringify(scenario),
+        AGENTPRISM_FAKE_LOG: log,
+      },
+    },
+    cwd: dir,
+    readLog: () => readLogFile<LogEntry>(log),
   };
 }
 
 const harness = createFakeAgentHarness({ prefix: "acp-interactive-it-", backends: ["claude"] });
-const configure = (scenario: unknown) => harness.configure<LogEntry>(scenario);
+const configure = (scenario: unknown, options?: Parameters<ReturnType<typeof createFakeAgentHarness>["configure"]>[1]) =>
+  harness.configure<LogEntry>(scenario, options);
 
 function makeRunner(options: AcpRunnerOptions = {}): AcpAgentRunner {
   return harness.makeRunner(options);
@@ -284,4 +322,75 @@ test("runner.dispose() releases a still-open interactive session before the pool
   assert.ok(log.some((entry) => entry.method === "closeSession" && entry.pid === pid), "session closed");
   assert.ok(log.some((entry) => entry.method === "__exit" && entry.pid === pid), "process reaped");
   await assert.rejects(() => session.prompt("after dispose"), /InteractiveSession has been released/);
+});
+
+test("openSession({ schema }) folds the contract into the backend's native schema channels", async () => {
+  const schema = {
+    type: "object",
+    properties: { city: { type: "string" }, hot: { type: "boolean" } },
+    required: ["city", "hot"],
+  };
+
+  // Claude: the schema rides session/new `_meta.claudeCode.options.outputFormat`; the turns
+  // carry NOTHING (the channel is session-scoped, exactly like run()).
+  const claude = configure({ turns: [{ text: "one" }] });
+  const runner = makeRunner();
+  const session = await runner.openSession({ cwd: claude.cwd, schema: schema as never, label: "schema-session" });
+  assert.equal((await session.prompt("classify")).text, "one");
+  await session.release();
+  const claudeLog = claude.readLog();
+  const claudeCode = claudeLog.find((e) => e.method === "newSession")?.params?._meta?.claudeCode as
+    | { options: { outputFormat: { type: string; schema: Record<string, unknown> } }; emitRawSDKMessages: boolean }
+    | undefined;
+  assert.equal(claudeCode?.options.outputFormat.type, "json_schema");
+  assert.deepEqual(claudeCode?.options.outputFormat.schema.properties, schema.properties);
+  assert.equal(claudeCode?.emitRawSDKMessages, true);
+  assert.equal(claudeLog.find((e) => e.method === "prompt")?.params?._meta ?? undefined, undefined);
+
+  // Codex: the STRICT schema rides each turn's `_meta[outputSchema]`; session/new carries
+  // nothing schema-shaped. (`model: "codex/..."` routes to the codex backend — the
+  // schema channels are backend-specific, so the backend must actually be codex.)
+  const codex = configure({ turns: [{ text: "one" }] }, { backends: ["codex"] });
+  const runner2 = makeRunner();
+  const session2 = await runner2.openSession({
+    cwd: codex.cwd,
+    model: "codex/gpt-5.6-luna",
+    schema: schema as never,
+    label: "codex-schema",
+  });
+  assert.equal((await session2.prompt("classify")).text, "one");
+  await session2.release();
+  const codexLog = codex.readLog();
+  const forwarded = codexLog.find((e) => e.method === "prompt")?.params?._meta?.outputSchema as
+    | Record<string, unknown>
+    | undefined;
+  // strict-normalized: every prop required + additionalProperties:false (the same shape
+  // run()'s (2b) test pins for the one-shot path).
+  assert.deepEqual(forwarded, {
+    type: "object",
+    required: ["city", "hot"],
+    properties: { city: { type: "string" }, hot: { type: "boolean" } },
+    additionalProperties: false,
+  });
+  assert.equal(codexLog.find((e) => e.method === "newSession")?.params?._meta ?? undefined, undefined);
+});
+
+test("openSession({ schema }) states the contract in-band for embedSchemaInPrompt backends", async () => {
+  // A custom backend (embedSchemaInPrompt defaults true): the prompt text carries the
+  // contract because its agent may ignore the `_meta.outputSchema` forward entirely.
+  const { config, cwd, readLog } = fakeCustomBackend({ turns: [{ text: "done" }] });
+  const runner = makeRunner({ backends: { fake: config } });
+  const session = await runner.openSession({ cwd, model: "fake", schema: SCHEMA as never });
+  assert.equal((await session.prompt("classify")).text, "done");
+  await session.release();
+  const promptEntry = readLog().find((e) => e.method === "prompt");
+  const text = (promptEntry?.params?.prompt ?? []).map((b) => (b.type === "text" ? (b.text ?? "") : "")).join("");
+  assert.ok(text.includes("classify"), text);
+  assert.match(text, /Final output contract/);
+  assert.ok(text.includes(JSON.stringify(SCHEMA)), "the schema is embedded in-band");
+  // And the generic `_meta.outputSchema` forward is present on the turn too.
+  assert.deepEqual(
+    (promptEntry?.params?._meta?.outputSchema as { properties: unknown }).properties,
+    SCHEMA.properties,
+  );
 });

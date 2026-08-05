@@ -14,6 +14,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import type { AgentHistoryEntry, AgentSessionRef, McpServerConfig, PromptImage } from "@automatalabs/shared-types";
 import type { RunOptions } from "@automatalabs/shared-types";
+import type { TSchema } from "typebox";
 import type { Backend, BackendId } from "./backend.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
 import {
@@ -27,6 +28,7 @@ import { mapThrownError } from "./errors-map.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 import {
   appendPromptImages,
+  buildRunPrompt,
   mergeTurnMeta,
   validatePromptImages,
 } from "./prompt.js";
@@ -39,6 +41,17 @@ import {
 export interface InteractiveSessionOptions {
   /** Model spec: registered first segment routes once; any remaining id is sent verbatim. */
   model?: string;
+  /** Structured-output contract for this session's turns (same dialect `run()` accepts).
+   *  Folded into the backend's native schema channels exactly like `run()`: session/new
+   *  `_meta` for backends that carry the schema there (Claude), per-turn `_meta` for
+   *  backends that forward it on the turn (Codex, custom), and — for backends whose agent
+   *  may ignore the `_meta` forward entirely (`embedSchemaInPrompt`) — into the prompt
+   *  text itself. The schema does not change the interactive contract otherwise: the host
+   *  drives the repair ladder itself (e.g. `resolveStructuredOutput` over the session) and
+   *  reads the result through `currentTurnText()`/`finalMessageText()`/`rawStructuredOutput()`.
+   *  The client-hosted StructuredOutput capture tool is never injected on the interactive
+   *  path (it is a per-call run() device). */
+  schema?: TSchema;
   /** Agent-advertised session mode id. Strict: openSession fails rather than running unconfined. */
   mode?: string;
   /** Agent-advertised ACP session config options, applied verbatim in sorted option-id order. */
@@ -102,6 +115,8 @@ interface InteractiveSessionDeps {
   readonly label?: string;
   readonly cwd: string;
   readonly keepSession: boolean;
+  /** The session's structured-output contract (see `InteractiveSessionOptions.schema`). */
+  readonly schema: TSchema | undefined;
 }
 
 /** A held-open multi-turn ACP session backed by a dedicated agent process. Only one prompt may
@@ -126,6 +141,8 @@ export class InteractiveSession {
   private readonly subscriptions = new Set<() => void>();
   private readonly cwd: string;
   private readonly keepSession: boolean;
+  /** The session's structured-output contract (see `InteractiveSessionOptions.schema`). */
+  private readonly schema: TSchema | undefined;
   private removeAbort: (() => void) | undefined;
   private promptInFlight = false;
   private releasePromise: Promise<void> | undefined;
@@ -143,6 +160,7 @@ export class InteractiveSession {
     this.label = deps.label;
     this.cwd = deps.cwd;
     this.keepSession = deps.keepSession;
+    this.schema = deps.schema;
     this.sessionId = deps.session.sessionId;
     this.backendId = deps.connection.backendId;
 
@@ -188,6 +206,12 @@ export class InteractiveSession {
     return this.session.finalMessageText();
   }
 
+  /** This session's structured-output contract (set at open via
+   *  `InteractiveSessionOptions.schema`), or undefined for plain sessions. */
+  get outputSchema(): TSchema | undefined {
+    return this.schema;
+  }
+
   /** Claude's raw `structured_output` for the latest turn, if any (the
    *  native structured channel the runner's ladder tries first). Added
    *  for the REPL broker's structured-output ladder; additive passthrough
@@ -218,8 +242,16 @@ export class InteractiveSession {
 
     this.promptInFlight = true;
     try {
-      const turnContent = appendPromptImages(content, opts.images);
-      const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(undefined));
+      // Same request shaping as run(): a schema-bearing generic backend whose agent may
+      // ignore the `_meta` forward gets the contract stated in-band; the backend-computed
+      // turn meta (e.g. Codex's outputSchema forward) merges UNDER the user meta so the
+      // schema channel is never clobbered.
+      const shaped =
+        typeof content === "string" && this.schema !== undefined && this.backend.embedSchemaInPrompt
+          ? buildRunPrompt(content, {}, this.schema, this.backend)
+          : content;
+      const turnContent = appendPromptImages(shaped, opts.images);
+      const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(this.schema));
       const response = await this.session.prompt(turnContent, promptMeta);
       return {
         stopReason: response.stopReason,

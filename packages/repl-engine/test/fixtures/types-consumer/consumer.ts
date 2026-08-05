@@ -244,9 +244,13 @@ function storeTyping(store: CallStore): void {
     dispatchedAtMs: 1,
     reissues: 0,
     completion: null,
+    sessionId: null,
+    deliveredAtMs: null,
+    droppedAtMs: null,
   });
   store.recordReissued('c1', 2);
   store.recordCompleted('c1', { outcome: 'resolve', value: { ok: true }, completedAtMs: 3 }) satisfies boolean;
+  store.recordDelivery('c1', 'delivered', 4);
   store.lookup('c1') satisfies CallRecord | undefined;
   store.all() satisfies CallRecord[];
 }
@@ -265,6 +269,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
             return 'injected';
           },
           async cancel(): Promise<void> {},
+          async release(): Promise<void> {},
           currentTurnText(): string {
             return '';
           },
@@ -300,7 +305,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
     supportsSteering: true,
     queuedSteers: 0,
   };
-  const report: ReconcileReport = { settledFromStore: ['c1'], leftPending: [] };
+  const report: ReconcileReport = { settledFromStore: ['c1'], leftPending: [], reQueuedUndelivered: [] };
   info satisfies CheckpointInfo;
   live satisfies LiveAgentInfo;
   report satisfies ReconcileReport;

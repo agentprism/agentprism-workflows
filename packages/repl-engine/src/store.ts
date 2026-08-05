@@ -76,6 +76,24 @@ export interface CallRecord {
   reissues: number;
   /** Present once the call completed (first completion wins). */
   completion: CallOutcome | null;
+  /** The FOUNDING session id for steer records (the session being steered
+   *  — the restore path's queue rebuild keys on it); null for agent and
+   *  checkpoint records. */
+  sessionId: string | null;
+  /** Queued-for-next-turn delivery state (steer records whose completion
+   *  is the `queued` outcome): the unix-ms moment the queued payload was
+   *  handed to the session as a delivery turn, or null while the steer
+   *  still awaits delivery. A `delivered` marker is the point of no
+   *  return: a restored broker must never re-deliver a marked steer
+   *  (replay without duplication). */
+  deliveredAtMs: number | null;
+  /** The unix-ms moment a queued steer's delivery was DROPPED (the
+   *  founding call was cancelled, its delivery turn was cancelled, or
+   *  the founding session never opened) — the durable counterpart of
+   *  the in-memory queue drop, so a restore never resurrects a dropped
+   *  delivery. Null while undropped. At most one of `deliveredAtMs` /
+   *  `droppedAtMs` is ever set. */
+  droppedAtMs: number | null;
 }
 
 /**
@@ -97,6 +115,12 @@ export interface CallStore {
    * change). Throws for an id the store has never seen dispatched.
    */
   recordCompleted(callId: string, outcome: CallOutcome): boolean;
+  /**
+   * Record a queued steer's delivery state (first-wins per state; a
+   * second `delivered`/`dropped` record for the same call is a no-op).
+   * Throws for an id the store has never seen dispatched.
+   */
+  recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void;
   lookup(callId: string): CallRecord | undefined;
   /** Every record, in first-dispatch order. */
   all(): CallRecord[];
@@ -118,7 +142,13 @@ export class InMemoryCallStore implements CallStore {
   recordDispatched(record: CallRecord): void {
     if (this.records.has(record.callId)) return; // idempotent — keep the original
     this.order.push(record.callId);
-    this.records.set(record.callId, record);
+    // Normalize legacy records (pre-delivery-marker logs) onto the current shape.
+    this.records.set(record.callId, {
+      ...record,
+      sessionId: record.sessionId ?? null,
+      deliveredAtMs: record.deliveredAtMs ?? null,
+      droppedAtMs: record.droppedAtMs ?? null,
+    });
   }
 
   recordReissued(callId: string, atMs: number): void {
@@ -134,6 +164,18 @@ export class InMemoryCallStore implements CallStore {
     if (record.completion !== null) return false; // first completion wins
     record.completion = outcome;
     return true;
+  }
+
+  recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void {
+    const record = this.records.get(callId);
+    if (record === undefined) throw unknownCall(callId);
+    if (state === 'delivered') {
+      if (record.deliveredAtMs !== null) return; // first-wins
+      record.deliveredAtMs = atMs;
+      return;
+    }
+    if (record.droppedAtMs !== null) return; // first-wins
+    record.droppedAtMs = atMs;
   }
 
   lookup(callId: string): CallRecord | undefined {
@@ -153,7 +195,8 @@ export class InMemoryCallStore implements CallStore {
 type LogLine =
   | { event: 'dispatched'; record: CallRecord }
   | { event: 'reissued'; callId: string; atMs: number }
-  | { event: 'completed'; callId: string; outcome: CallOutcome };
+  | { event: 'completed'; callId: string; outcome: CallOutcome }
+  | { event: 'delivery'; callId: string; state: 'delivered' | 'dropped'; atMs: number };
 
 function isLogLine(value: unknown): value is LogLine {
   if (typeof value !== 'object' || value === null) return false;
@@ -184,6 +227,14 @@ function isLogLine(value: unknown): value is LogLine {
       o !== null &&
       ((o as CallOutcome).outcome === 'resolve' || (o as CallOutcome).outcome === 'reject') &&
       typeof (o as CallOutcome).completedAtMs === 'number'
+    );
+  }
+  if (v.event === 'delivery') {
+    const d = value as { callId?: unknown; state?: unknown; atMs?: unknown };
+    return (
+      typeof d.callId === 'string' &&
+      (d.state === 'delivered' || d.state === 'dropped') &&
+      typeof d.atMs === 'number'
     );
   }
   return false;
@@ -350,6 +401,15 @@ export class JsonlCallStore implements CallStore {
     return this.index.recordCompleted(callId, outcome);
   }
 
+  recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void {
+    const existing = this.index.lookup(callId);
+    if (existing === undefined) throw unknownCall(callId);
+    const marker = state === 'delivered' ? existing.deliveredAtMs : existing.droppedAtMs;
+    if (marker !== null) return; // first-wins per state
+    this.append({ event: 'delivery', callId, state, atMs });
+    this.index.recordDelivery(callId, state, atMs);
+  }
+
   lookup(callId: string): CallRecord | undefined {
     return this.index.lookup(callId);
   }
@@ -399,7 +459,8 @@ export class JsonlCallStore implements CallStore {
 function replay(index: InMemoryCallStore, line: LogLine): void {
   if (line.event === 'dispatched') index.recordDispatched(line.record);
   else if (line.event === 'reissued') index.recordReissued(line.callId, line.atMs);
-  else index.recordCompleted(line.callId, line.outcome);
+  else if (line.event === 'completed') index.recordCompleted(line.callId, line.outcome);
+  else index.recordDelivery(line.callId, line.state, line.atMs);
 }
 
 /** Current file size of an open fd. */

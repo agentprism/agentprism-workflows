@@ -29,12 +29,15 @@ import { test } from 'node:test';
 
 import {
   Broker,
+  InMemoryCallStore,
   JsonlCallStore,
   Workspace,
   type BrokerOpenSessionOptions,
   type BrokerRunner,
   type BrokerSession,
   type BrokerTurn,
+  type CallOutcome,
+  type CallStore,
   type ReplEvalResult,
 } from '../src/index.js';
 
@@ -53,6 +56,7 @@ class FakeSession implements BrokerSession {
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
   readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
   cancelled = 0;
+  releases = 0;
   stopReason = 'end_turn';
   readonly texts: string[] = [];
   /** The assistant text of each COMPLETED turn (the result-shaping
@@ -86,6 +90,11 @@ class FakeSession implements BrokerSession {
     for (const pending of this.prompts.splice(0)) {
       pending.resolve({ stopReason: 'cancelled', text: '' });
     }
+    return Promise.resolve();
+  }
+
+  release(): Promise<void> {
+    this.releases++;
     return Promise.resolve();
   }
 
@@ -136,8 +145,15 @@ class FakeRunner implements BrokerRunner {
   readonly sessions: FakeSession[] = [];
   readonly openedWith: BrokerOpenSessionOptions[] = [];
   supportsSteering = true;
+  /** Open failures to inject (each one rejects openSession once). */
+  failNextOpens = 0;
+  disposeCalls = 0;
 
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
+    if (this.failNextOpens > 0) {
+      this.failNextOpens--;
+      throw new Error('spawn failed');
+    }
     const session = new FakeSession(opts);
     session.capabilities = { supportsSteering: this.supportsSteering };
     this.sessions.push(session);
@@ -145,7 +161,9 @@ class FakeRunner implements BrokerRunner {
     return session;
   }
 
-  async dispose(): Promise<void> {}
+  async dispose(): Promise<void> {
+    this.disposeCalls++;
+  }
 
   last(): FakeSession {
     assert.ok(this.sessions.length > 0, 'a session must have been opened');
@@ -154,13 +172,19 @@ class FakeRunner implements BrokerRunner {
 }
 
 /** Create a workspace + attached broker with a fake runner. */
-async function setup(options: { maxConcurrentAgents?: number; runner?: FakeRunner; store?: ConstructorParameters<typeof Broker['attach']>[1]['store'] } = {}) {
+async function setup(options: {
+  maxConcurrentAgents?: number;
+  runner?: FakeRunner;
+  store?: ConstructorParameters<typeof Broker['attach']>[1]['store'];
+  interruptHandler?: () => boolean;
+} = {}) {
   const ws = await Workspace.create(PROJECT);
   const runner = options.runner ?? new FakeRunner();
   const broker = await Broker.attach(ws, {
     runner,
     store: options.store,
     maxConcurrentAgents: options.maxConcurrentAgents,
+    interruptHandler: options.interruptHandler,
   });
   return { ws, broker, runner };
 }
@@ -613,7 +637,7 @@ test('a queued delivery turn that fails surfaces a warn line in the next tool re
   await broker.pump();
   const r = await broker.eval('"probe"');
   assert.ok(
-    output(r).some((line) => line.startsWith('warn: ') && line.includes('queued delivery failed') && line.includes('worker crashed')),
+    output(r).some((line) => line.startsWith('warn: ') && line.includes('delivery failed') && line.includes('worker crashed')),
     output(r).join('\n'),
   );
   await ws.dispose();
@@ -684,5 +708,452 @@ test('output lines are preview lines (one per logged argument, levels prefixed) 
   assert.equal(big.output.length, 256);
   // The truncated content stays reachable through $N.
   assert.ok(output(big).some((line) => line.startsWith('[$')) );
+  await ws.dispose();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Review-regression suite (phase C review round 1)
+// ────────────────────────────────────────────────────────────────────────
+
+test('review 1: the store\'s FIRST completion is authoritative — a newer live outcome never settles the guest against it', async () => {
+  const { ws, broker, runner } = await setup();
+  await broker.eval('const p = agent("pi/x", "task"); p.then((v) => console.log("settled:", v)); "started"');
+  await tick();
+  // A previous crash-retry already recorded the FIRST completion in the
+  // store. The live outcome is newer AND different — the store wins.
+  broker.store().recordCompleted('c1', { outcome: 'resolve', value: 'stored-first', completedAtMs: Date.now() });
+  runner.last().completeTurn('live-second');
+  await tick();
+  const pumped = await broker.pump();
+  assert.deepEqual(pumped, ['c1']);
+  const r = await broker.eval('await p');
+  assert.equal(r.result, '"stored-first"');
+  assert.equal(broker.store().lookup('c1')!.completion!.value, 'stored-first');
+  assert.equal(broker.store().lookup('c1')!.completion!.outcome, 'resolve');
+  await ws.dispose();
+});
+
+test('review 1b: the cap is absolute for follow-up turns — an idle-session steer under cap pressure queues (queued) and starts only when a slot frees', async () => {
+  const { ws, broker, runner } = await setup({ maxConcurrentAgents: 1 });
+  // c1 opens and settles (idle).
+  await broker.eval('const a = agent("pi/x", "a"); "started"');
+  await tick();
+  runner.sessions[0].completeTurn('a done');
+  await tick();
+  await broker.pump();
+  // c2 opens and settles (idle) — admitted because c1's slot was freed.
+  await broker.eval('const b = agent("pi/x", "b"); "started"');
+  await tick();
+  runner.sessions[1].completeTurn('b done');
+  await tick();
+  await broker.pump();
+  const bSession = runner.sessions[1];
+  // c3 now holds the workspace's ONLY slot.
+  await broker.eval('const c = agent("pi/x", "c"); "started"');
+  await tick();
+  // A follow-up on the idle b handle must NOT start a turn while c3 is
+  // in flight — the cap gates turn starts, not just dispatches (review
+  // regression: idle-handle follow-ups used to start unconditionally,
+  // so a cap-1 workspace ran two subagent turns concurrently). The
+  // honest outcome is queued.
+  const steered = await broker.eval('const o = await b.steer("more"); "outcome:" + o');
+  assert.equal(steered.result, '"outcome:queued"');
+  await tick();
+  assert.equal(bSession.prompts.length, 0, 'no follow-up turn started under cap pressure');
+  // c3 settles; its slot frees; the queued follow-up starts its turn.
+  runner.sessions[2].completeTurn('c done');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(bSession.prompts.length, 1, 'the queued follow-up started once a slot freed');
+  assert.equal(bSession.prompts[0].content, 'more');
+  await ws.dispose();
+});
+
+test('review 1c: queued delivery turns respect the cap across sessions — one follow-up turn at a time under cap 1', async () => {
+  const runner = new FakeRunner();
+  runner.supportsSteering = false;
+  const { ws, broker } = await setup({ maxConcurrentAgents: 1, runner });
+  // Two subagents, both settled and idle.
+  await broker.eval('const a = agent("pi/x", "a"); "started"');
+  await tick();
+  runner.sessions[0].completeTurn('a done');
+  await tick();
+  await broker.pump();
+  await broker.eval('const b = agent("pi/x", "b"); "started"');
+  await tick();
+  runner.sessions[1].completeTurn('b done');
+  await tick();
+  await broker.pump();
+  // c3 now holds the workspace's ONLY slot.
+  await broker.eval('const c = agent("pi/x", "c"); "started"');
+  await tick();
+  // A queued steer on each idle session (cap exhausted → both queue).
+  await broker.eval('await a.steer("more-a"); "queued"');
+  await broker.eval('await b.steer("more-b"); "queued"');
+  assert.equal(runner.sessions[0].prompts.length, 0);
+  assert.equal(runner.sessions[1].prompts.length, 0);
+  // c settles → its slot frees → EXACTLY ONE queued delivery starts.
+  runner.sessions[2].completeTurn('c done');
+  await tick();
+  await broker.pump();
+  await tick();
+  const withDelivery = [runner.sessions[0], runner.sessions[1]].filter((s) => s.prompts.length === 1);
+  assert.equal(withDelivery.length, 1, 'exactly one delivery turn runs under cap 1');
+  // It completes → the second delivery starts (the kick fires on every
+  // freed slot, including the delivery turn's own end).
+  withDelivery[0].completeTurn('delivered');
+  await tick();
+  await broker.pump();
+  await tick();
+  const remaining = [runner.sessions[0], runner.sessions[1]].filter((s) => s.prompts.length === 1);
+  assert.equal(remaining.length, 1, 'the second queued steer delivered after the first turn ended');
+  await ws.dispose();
+});
+
+test('review 2a: queued steering is durable — payload + founding session in the store, delivered marker recorded at the point of no return', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-broker-steer-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  runner.supportsSteering = false;
+  await dispatchAgent(broker, runner);
+  const queued = await broker.eval('await pi.steer("go deeper"); "queued"');
+  assert.equal(queued.result, '"queued"');
+  // The payload + founding session id live in the store (crash-durable —
+  // a crash before delivery loses nothing).
+  const steerRecord = broker.store().all().find((r) => r.kind === 'steer')!;
+  assert.equal(steerRecord.sessionId, 'c1');
+  assert.ok(steerRecord.optionsJson!.includes('go deeper'), 'the payload survives in the record');
+  assert.equal(steerRecord.completion!.value, 'queued');
+  assert.equal(steerRecord.deliveredAtMs, null, 'undelivered before the delivery turn starts');
+  // The founding turn completes; the delivery turn starts — the prompt
+  // is handed to the backend, and the delivered marker is recorded only
+  // after that hand-off (the true point of no return: replay after it
+  // would duplicate delivery, but a crash BEFORE it must not make a
+  // restore skip a steer that was never delivered).
+  runner.last().completeTurn('first pass');
+  await tick();
+  await broker.pump();
+  assert.notEqual(broker.store().lookup('c2')!.deliveredAtMs, null, 'delivered marker recorded at the hand-off');
+  await tick();
+  assert.equal(runner.last().prompts[0].content, 'go deeper');
+  runner.last().completeTurn('deeper results');
+  await tick();
+  await broker.pump();
+  // A later reconcile must NOT re-queue the delivered steer.
+  const report = await broker.reconcile();
+  assert.deepEqual(report.reQueuedUndelivered, []);
+  assert.equal(runner.last().prompts.length, 0, 'no duplicate delivery turn after reconcile');
+  await ws.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('review 2b: a crash between enqueue and delivery loses nothing — reconcile re-queues undelivered steers from the store exactly once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-broker-steer-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  runner.supportsSteering = false;
+  const r1 = await broker.eval('const pi = agent("pi/x", "task"); const o = await pi.steer("go deeper"); "outcome:" + o');
+  assert.equal(r1.result, '"outcome:queued"');
+  await tick();
+  // Simulated crash: snapshot before any settlement; dispose without
+  // delivering anything. The store durably holds the queued steer.
+  const snapshot = ws.snapshot();
+  await broker.dispose();
+  ws.dispose();
+  // Restore: a fresh workspace + broker over the same store.
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  runner2.supportsSteering = false;
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  // The reconcile rebuilds the undelivered queue (the founding call is
+  // still pending — its session re-attach delivers the re-queued steer
+  // at open, the same merge path the same-eval test pins).
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.settledFromStore, []);
+  assert.deepEqual(report.leftPending, ['c1']);
+  assert.deepEqual(report.reQueuedUndelivered, ['c2']);
+  // Idempotent: a second reconcile does not double-queue.
+  const report2 = await broker2.reconcile();
+  assert.deepEqual(report2.reQueuedUndelivered, []);
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('review 2c: a cancelled call drops its queued steers durably — reconcile never resurrects them', async () => {
+  const { ws, broker, runner } = await setup();
+  runner.supportsSteering = false;
+  await dispatchAgent(broker, runner);
+  await broker.eval('await pi.steer("go deeper"); "queued"');
+  await broker.eval('const o = await pi.cancel(); "outcome:" + o');
+  await tick();
+  await broker.pump();
+  assert.notEqual(broker.store().lookup('c2')!.droppedAtMs, null, 'the drop is recorded durably');
+  const report = await broker.reconcile();
+  assert.deepEqual(report.reQueuedUndelivered, [], 'a dropped steer is never re-queued');
+  await ws.dispose();
+});
+
+test('review 2d: the delivered marker is recorded only AFTER the prompt was handed to the backend (crash-between-loss regression)', async () => {
+  const inner = new InMemoryCallStore();
+  let sessionRef: FakeSession | undefined;
+  let markers = 0;
+  const store = new class implements CallStore {
+    recordDispatched(r: Parameters<CallStore['recordDispatched']>[0]): void {
+      inner.recordDispatched(r);
+    }
+    recordReissued(callId: string, atMs: number): void {
+      inner.recordReissued(callId, atMs);
+    }
+    recordCompleted(callId: string, outcome: CallOutcome): boolean {
+      return inner.recordCompleted(callId, outcome);
+    }
+    recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void {
+      if (state === 'delivered') {
+        // The review regression: the marker used to be written before
+        // session.prompt was invoked, so a crash between the two made
+        // reconcile skip a steer that was never handed to the backend
+        // (silently losing promised queued delivery). The marker must
+        // never precede the hand-off.
+        assert.ok(
+          sessionRef !== undefined && sessionRef.prompts.length > 0,
+          'the prompt hand-off must precede the delivered marker',
+        );
+        markers++;
+      }
+      inner.recordDelivery(callId, state, atMs);
+    }
+    lookup(callId: string) {
+      return inner.lookup(callId);
+    }
+    all() {
+      return inner.all();
+    }
+  }();
+  const runner = new FakeRunner();
+  runner.supportsSteering = false;
+  const { ws, broker } = await setup({ store, runner });
+  await dispatchAgent(broker, runner);
+  sessionRef = runner.last();
+  await broker.eval('await pi.steer("go deeper"); "queued"');
+  runner.last().completeTurn('first pass');
+  await tick();
+  await broker.pump();
+  assert.equal(markers, 1, 'the delivered marker was recorded exactly once, after the hand-off');
+  assert.equal(runner.last().prompts.length, 1, 'the queued content became the next turn');
+  await ws.dispose();
+});
+
+test('review 3: a failing store write during checkpoint.answer leaves the checkpoint pending — a later answer retry succeeds', async () => {
+  const inner = new InMemoryCallStore();
+  const store = new class implements CallStore {
+    failNextCompletion = false;
+    recordDispatched(r: Parameters<CallStore['recordDispatched']>[0]): void {
+      inner.recordDispatched(r);
+    }
+    recordReissued(callId: string, atMs: number): void {
+      inner.recordReissued(callId, atMs);
+    }
+    recordCompleted(callId: string, outcome: CallOutcome): boolean {
+      if (this.failNextCompletion) {
+        this.failNextCompletion = false;
+        throw new Error('disk full');
+      }
+      return inner.recordCompleted(callId, outcome);
+    }
+    recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void {
+      inner.recordDelivery(callId, state, atMs);
+    }
+    lookup(callId: string) {
+      return inner.lookup(callId);
+    }
+    all() {
+      return inner.all();
+    }
+  }();
+  const { ws, broker } = await setup({ store });
+  await broker.eval('const q = checkpoint("What color?"); "raised"');
+  // The answer's record write fails: the host callback throws, the guest
+  // answer call fails, and the checkpoint stays PENDING (it must not be
+  // consumed before its answer is durable — review regression).
+  store.failNextCompletion = true;
+  const failed = await broker.eval('checkpoint.answer("c1", "blue")');
+  assert.equal(failed.result, undefined);
+  assert.ok(output(failed).some((l) => l.includes('disk full')), output(failed).join('\n'));
+  assert.deepEqual((await broker.eval('"probe"')).checkpoints.map((c) => c.id), ['c1']);
+  assert.equal(broker.store().lookup('c1')!.completion, null, 'nothing was recorded');
+  // The retry (with the store healthy again) delivers the answer.
+  const ok = await broker.eval('checkpoint.answer("c1", "blue"); "delivered"');
+  assert.equal(ok.result, '"delivered"');
+  const r = await broker.eval('await q');
+  assert.equal(r.result, '"blue"');
+  assert.equal(broker.store().lookup('c1')!.completion!.value, 'blue');
+  await ws.dispose();
+});
+
+test('review 4: the guest schema reaches session creation — the native schema channels are configured, not validated blind', async () => {
+  const { ws, broker, runner } = await setup();
+  const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
+  await dispatchAgent(
+    broker,
+    runner,
+    `const p = agent("pi/x", "task", { schema: ${JSON.stringify(schema)} }); "ok"`,
+  );
+  assert.deepEqual(runner.openedWith[0].schema, schema, 'the schema rides openSession (session/new channel + per-turn channels)');
+  await ws.dispose();
+});
+
+test('review 5: the concurrency cap validates — default 6, over-ceiling clamps to 6, invalid values throw at attach', async () => {
+  const { ws, broker } = await setup();
+  assert.equal(broker.maxConcurrentAgents, 6, 'the doc-settled default');
+  await ws.dispose();
+  // Over the ceiling: clamped (the six-per-workspace maximum is absolute).
+  const { ws: ws2, broker: broker2 } = await setup({ maxConcurrentAgents: 7 });
+  assert.equal(broker2.maxConcurrentAgents, 6);
+  await ws2.dispose();
+  // Invalid values are programming errors at attach time.
+  for (const bad of [NaN, 0, -1, 1.5, Infinity]) {
+    await assert.rejects(
+      async () => Broker.attach(await Workspace.create(PROJECT), { runner: new FakeRunner(), maxConcurrentAgents: bad }),
+      new RegExp('maxConcurrentAgents must be an integer'),
+    );
+  }
+  // At the ceiling: six sessions open, the seventh dispatch is refused.
+  const { ws: ws3, broker: broker3, runner: runner3 } = await setup();
+  const r = await broker3.eval('for (let i = 0; i < 7; i++) agent("pi/x", "t" + i); "started"');
+  assert.equal(r.result, '"started"');
+  await tick();
+  assert.equal(runner3.sessions.length, 6, 'six sessions opened — never seven');
+  assert.equal(broker3.store().lookup('c7')!.completion!.outcome, 'reject');
+  assert.ok(r.completed.includes('c7'), 'the refusal is reported in completed');
+  await ws3.dispose();
+});
+
+test('review 6: an agent call whose session never opens releases its concurrency slot (cap 1 — the next dispatch is admitted)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ maxConcurrentAgents: 1, runner });
+  runner.failNextOpens = 1;
+  await broker.eval('const p = agent("pi/x", "boom"); "started"');
+  await tick(); // openSession rejects
+  await broker.pump(); // the rejection settles; the slot MUST be released
+  assert.equal(broker.store().lookup('c1')!.completion!.outcome, 'reject');
+  const r = await broker.eval('await p.catch((e) => e.message)');
+  assert.ok(String(r.result).includes('spawn failed'), String(r.result));
+  const admitted = await broker.eval('const p2 = agent("pi/x", "ok"); "started"');
+  assert.equal(admitted.result, '"started"', 'the second dispatch was admitted after the failed open');
+  await tick();
+  assert.equal(runner.sessions.length, 1);
+  await ws.dispose();
+});
+
+test('review 7: same-eval steers of a call whose session never opens are dropped with the documented warning (outcome visibility)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  runner.failNextOpens = 1;
+  const r1 = await broker.eval('const pi = agent("pi/x", "task"); const o = await pi.steer("same eval"); "outcome:" + o');
+  assert.equal(r1.result, '"outcome:queued"');
+  await tick(); // open fails; the pending steers are dropped + warned
+  await broker.pump();
+  const r2 = await broker.eval('"probe"');
+  assert.ok(
+    output(r2).some((l) => l.startsWith('warn: ') && l.includes('delivery failed') && l.includes('spawn failed')),
+    output(r2).join('\n'),
+  );
+  // The drop is durable: reconcile never resurrects it.
+  assert.notEqual(broker.store().lookup('c2')!.droppedAtMs, null);
+  const report = await broker.reconcile();
+  assert.deepEqual(report.reQueuedUndelivered, []);
+  await ws.dispose();
+});
+
+test('review 8: an interrupted continuation keeps the already-settled ids in the eval\'s completed list', async () => {
+  let checks = 0;
+  const { ws, broker, runner } = await setup({ interruptHandler: () => ++checks > 20000 });
+  await broker.eval('const p = agent("pi/x", "task"); p.then(() => { let i = 0; while (true) i++; }); "started"');
+  await tick();
+  runner.last().completeTurn('final');
+  await tick();
+  // The eval's OWN pump delivers c1, then its drain runs the runaway
+  // continuation, which the interrupt handler breaks: the eval returns
+  // the drain-failure line AND the ids it settled before the drain
+  // failed (review regression: completed used to come back empty).
+  const r = await broker.eval('"probe"');
+  assert.deepEqual(r.completed, ['c1'], 'the settled id survives the drain failure');
+  assert.ok(
+    output(r).some((l) => l.includes('interrupted') || l.includes('Job execution error')),
+    output(r).join('\n'),
+  );
+  // pump() still propagates the drain failure as its public contract.
+  checks = 0;
+  await broker.eval('const p2 = agent("pi/x", "task2"); p2.then(() => { let i = 0; while (true) i++; }); "started"');
+  await tick();
+  runner.last().completeTurn('final2');
+  await tick();
+  await assert.rejects(() => broker.pump(), (e: unknown) =>
+    (e as Error).message.includes('Job execution error'),
+  );
+  await ws.dispose();
+});
+
+test('review 8b: the broker-level interrupt handler bounds a DIRECT runaway eval (the default ReplEvalOptions handler)', async () => {
+  let checks = 0;
+  const { ws, broker } = await setup({ interruptHandler: () => ++checks > 1000 });
+  // No settlement involved: the eval itself runs away. The broker's
+  // configured handler must bound it (review regression: it used to
+  // apply only to settlement drains, so a direct runaway eval could
+  // hang the workspace indefinitely).
+  const r = await broker.eval('let i = 0; while (true) i++;');
+  assert.equal(r.result, undefined);
+  assert.ok(output(r).some((l) => l.includes('InternalError: interrupted')), output(r).join('\n'));
+  assert.ok(checks > 1000, 'the broker-level handler fired');
+  // The broker default is a floor: a per-eval handler overrides it
+  // (the broker's own closure must not fire while the override runs).
+  const brokerChecks = checks;
+  let perEval = 0;
+  const r2 = await broker.eval('let j = 0; while (true) j++;', { interruptHandler: () => ++perEval > 1000 });
+  assert.ok(output(r2).some((l) => l.includes('InternalError: interrupted')), output(r2).join('\n'));
+  assert.ok(perEval > 1000, 'the per-eval handler fired');
+  assert.equal(checks, brokerChecks, 'the broker default did not fire under the per-eval override');
+  await ws.dispose();
+});
+
+test('review 9: the guest "default" model sentinel maps to an OMITTED model — verify/judgePanel combinator coverage', async () => {
+  const { ws, broker, runner } = await setup();
+  // verify() routes its reviewers through the reserved "default"
+  // sentinel (no per-call model in the DSL options).
+  await broker.eval('const v = verify("some claim", { reviewers: 2 }); "started"');
+  await tick();
+  assert.equal(runner.openedWith.length, 2);
+  assert.ok(
+    runner.openedWith.every((o) => o.model === undefined),
+    'the sentinel never reaches the runner as a literal model selection',
+  );
+  for (const session of runner.sessions) session.completeTurn('{"real": true, "reason": "ok"}');
+  await tick();
+  await broker.pump();
+  const v = await broker.eval('await v');
+  assert.equal(v.result, '{real: true, realCount: 2, total: 2, votes: Array(2)}');
+  // judgePanel() graders route the same way.
+  await broker.eval('const jp = judgePanel(["a", "b"], { judges: 2 }); "started"');
+  await tick();
+  assert.equal(runner.openedWith.length, 6);
+  assert.ok(runner.openedWith.slice(2).every((o) => o.model === undefined));
+  await ws.dispose();
+});
+
+test('review 10: dispose releases every session the broker opened, even with a host-injected runner', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await dispatchAgent(broker, runner);
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  assert.equal(runner.sessions.length, 1);
+  await broker.dispose();
+  assert.equal(runner.sessions[0].releases, 1, 'the dedicated session was released');
+  assert.equal(runner.disposeCalls, 0, 'the injected runner itself is the host\'s to dispose');
   await ws.dispose();
 });

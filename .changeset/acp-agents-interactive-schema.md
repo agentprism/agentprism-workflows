@@ -1,0 +1,5 @@
+---
+"@automatalabs/acp-agents": minor
+---
+
+Interactive sessions gain the structured-output contract: `openSession({ schema })` (and the other `*Session` entry points) folds the schema into the backend's native channels exactly like `run()` — session/new `_meta` where the backend carries it there (Claude), the per-turn `_meta` forward where the backend computes it on the turn (Codex), and an in-band prompt contract for backends whose agent may ignore the `_meta` forward entirely (`embedSchemaInPrompt`). The schema never changes the interactive contract otherwise: the host drives the repair ladder itself and reads the result through the session's additive surface — the new `outputSchema` accessor, plus `currentTurnText()`/`finalMessageText()`/`rawStructuredOutput()`. The client-hosted StructuredOutput capture tool is never injected on the interactive path (it stays a per-call `run()` device). Also updates the engine seams for the REPL broker: `AcpAgentRunner.openSession`/`loadSession`/`forkSession`/`resumeSession` forward the schema to session creation and the per-turn channels.
