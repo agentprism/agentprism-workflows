@@ -100,14 +100,53 @@ export class GuestCall {
     handle: JSValueHandle;
     resolve(value: JSValueHandle): void;
     reject(value: JSValueHandle): void;
+    /** Free both resolving functions without settling (see `dispose`). */
+    dispose(): void;
   };
   private settled = false;
+  /** True once the promise handle was released to the realm. */
+  private released = false;
 
   constructor(vm: ReplVm) {
     this.vm = vm;
     const shim = getVmShim(vm) as QuickJS;
     this.deferred = newRawDeferred(shim);
     guestCallHandles.set(this, this.deferred.handle);
+  }
+
+  /**
+   * Dispose every part this call still owns, WITHOUT settling: the raw
+   * promise handle (when it was never released to the realm) and both
+   * resolving functions (when no settlement consumed them). This is the
+   * throwing-handler path — a handler that refuses by throwing leaves the
+   * call unsettled and its promise never returned into the realm, so
+   * nothing the call owns is reachable afterwards. Without this, every
+   * refusal leaked the raw promise plus its two resolving functions
+   * (~3 JSValues + heap boxes per call — measured: 30,000 rejected
+   * calls filled a 2 MiB VM and the next agent call failed with
+   * `Error: null`; review regression, pinned by test).
+   *
+   * Idempotent, and safe in every order with resolve/reject/
+   * releaseToRealm: after dispose the call reads as settled (nothing can
+   * settle it), a released promise handle is left to its queued microtask
+   * dispose, and the deferred's own dispose is a no-op once settlement
+   * consumed the functions.
+   */
+  dispose(): void {
+    this.settled = true;
+    if (!this.released) {
+      const handle = guestCallHandles.get(this);
+      if (handle !== undefined) {
+        guestCallHandles.delete(this);
+        // Safe to free synchronously on this path: when the handler
+        // threw, the host-call trampoline never dupped a return value
+        // (there was none), so no other reference to this promise exists
+        // host-side. (`releaseToRealm` defers only because the trampoline
+        // dups the pointer AFTER a successful callback returns.)
+        handle.dispose();
+      }
+    }
+    this.deferred.dispose();
   }
 
   /**
@@ -155,6 +194,8 @@ export class GuestCall {
    * handle).
    */
   releaseToRealm(): void {
+    if (this.released) return;
+    this.released = true;
     const handle = guestCallHandles.get(this);
     if (handle === undefined) return;
     queueMicrotask(() => handle.dispose());
@@ -181,13 +222,17 @@ export class GuestCall {
  * deferred over the three owned parts — the TS analogue of the Rust
  * reference broker's `new_promise_raw`/`Deferred` (which settles by
  * calling the resolving function and then disposes BOTH functions, plus
- * the promise handle at `releaseToRealm` time). See `GuestCall` for why
- * the shim's `newPromise()` Deferred is not used.
+ * the promise handle at `releaseToRealm` time). `dispose()` frees the
+ * resolving functions without settling — the throwing-handler path, where
+ * a call is abandoned before its promise is ever returned to the realm
+ * (see `GuestCall.dispose`). See `GuestCall` for why the shim's
+ * `newPromise()` Deferred is not used.
  */
 function newRawDeferred(shim: QuickJS): {
   handle: JSValueHandle;
   resolve(value: JSValueHandle): void;
   reject(value: JSValueHandle): void;
+  dispose(): void;
 } {
   const e = shim._getExports() as QuickJSExports;
   const resolveOut = e.wasm_malloc(4);
@@ -209,6 +254,12 @@ function newRawDeferred(shim: QuickJS): {
   }
 
   let settled = false;
+  const freeFunctions = (): void => {
+    resolveFn?.dispose();
+    rejectFn?.dispose();
+    resolveFn = undefined;
+    rejectFn = undefined;
+  };
   const settleWith = (fn: JSValueHandle, value: JSValueHandle): void => {
     if (settled) return;
     settled = true;
@@ -236,10 +287,7 @@ function newRawDeferred(shim: QuickJS): {
     } finally {
       // Settling consumes both resolving functions (Rust reference:
       // `Deferred::dispose` releases every part the deferred still owns).
-      resolveFn?.dispose();
-      rejectFn?.dispose();
-      resolveFn = undefined;
-      rejectFn = undefined;
+      freeFunctions();
     }
   };
 
@@ -247,6 +295,15 @@ function newRawDeferred(shim: QuickJS): {
     handle: promise!,
     resolve: (value) => settleWith(resolveFn!, value),
     reject: (value) => settleWith(rejectFn!, value),
+    dispose: () => {
+      // Free the resolving functions without calling them. A settled
+      // deferred's functions are already freed (settleWith's finally);
+      // the `settled` flag makes a post-dispose resolve/reject a no-op,
+      // so a handler that (pathologically) kept a reference to the call
+      // and settles it later can never call into freed memory.
+      settled = true;
+      freeFunctions();
+    },
   };
 }
 
@@ -392,6 +449,15 @@ function makeCallbacks(vm: ReplVm, handlers: GuestBridgeHandlers): Array<[string
  * return its promise handle into the realm. The guest chains onto the
  * returned thenable; settlement happens whenever the handler settles the
  * call (then a drain).
+ *
+ * A handler that throws synchronously (the documented refusal path)
+ * leaves the call unsettled and its promise never returned into the
+ * realm: dispose every owned part BEFORE the shim converts the throw
+ * into a guest error (which the guest library turns into a call
+ * rejection), then re-throw — otherwise each refusal strands the raw
+ * promise plus both resolving functions (measured: repeated refusals
+ * corrupt the VM until a normal agent call fails with `Error: null`;
+ * review regression, pinned by the 30,000-refusals bounded-memory test).
  */
 function makeAgentHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
   return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
@@ -400,7 +466,12 @@ function makeAgentHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostF
     const task = requireString(args[2], HOST_AGENT, 'task');
     const optionsJson = optionalString(args[3]);
     const call = new GuestCall(vm);
-    handlers.agent(call, callId, modelSpec, task, optionsJson);
+    try {
+      handlers.agent(call, callId, modelSpec, task, optionsJson);
+    } catch (err) {
+      call.dispose();
+      throw err;
+    }
     // The trampoline dups the returned pointer after this callback
     // returns; release the host-side reference once that has happened.
     call.releaseToRealm();
@@ -424,7 +495,15 @@ function makeSteerHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostF
     const action = requireString(args[2], HOST_STEER, 'action');
     const payloadJson = optionalString(args[3]);
     const call = new GuestCall(vm);
-    handlers.steer(call, callId, sessionId, action, payloadJson);
+    try {
+      handlers.steer(call, callId, sessionId, action, payloadJson);
+    } catch (err) {
+      // Same disposal discipline as `__host_agent` (see there): a
+      // throwing steer handler must not strand the raw promise and its
+      // resolving functions.
+      call.dispose();
+      throw err;
+    }
     call.releaseToRealm();
     return guestCallHandle(call);
   };
@@ -450,7 +529,17 @@ function makeCheckpointHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): 
     const question = optionalString(args[1]);
     const optionsJson = optionalString(args[2]);
     const call = new GuestCall(vm);
-    handlers.checkpoint(call, callId, question, optionsJson, null);
+    try {
+      handlers.checkpoint(call, callId, question, optionsJson, null);
+    } catch (err) {
+      // Same disposal discipline as `__host_agent` (see there): a
+      // throwing checkpoint handler must not strand the raw promise and
+      // its resolving functions. (Answer mode mints no GuestCall, so a
+      // throw there has nothing to dispose — it propagates as the
+      // documented protocol-violation guest error.)
+      call.dispose();
+      throw err;
+    }
     call.releaseToRealm();
     return guestCallHandle(call);
   };

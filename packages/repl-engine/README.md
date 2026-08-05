@@ -240,9 +240,13 @@ accessor renders an explicit sabotage marker — the getter is never invoked.
 
 `applyOutputCaps` enforces the doc's limits — **256 lines or 10 KB per tool result, whichever
 trips first** — line-granular (a line that would trip either cap is not emitted at all) and
-byte-counted in UTF-8 with `\n` separators (the canonical serialization). Over-cap content
-remains reachable through the `$N` refs the capped lines carry: the cap costs reads, never
-data.
+byte-counted in UTF-8 with `\n` separators (the canonical serialization). The 256-line cap
+counts **physical lines**, not rendered entries: the previewer renders property names verbatim
+(FORMAT.md §5.18), so a name carrying 300 line feeds reaches the tool result as 301 physical
+lines inside ONE rendered line — both caps account for embedded newlines (the byte cap via
+`Buffer.byteLength`, the line cap by splitting on `\n`; review regression, pinned by test).
+Over-cap content remains reachable through the `$N` refs the capped lines carry: the cap
+costs reads, never data.
 
 ## The workspace (phase B)
 
@@ -361,6 +365,25 @@ Phase B decisions (the guest library, bridge, previewer):
   calls), and the promise handle is released via microtask once the host-callback trampoline
   has dupped it (the shim's host_call path never frees the host-side original). Pinned by
   5,000-call / 20,000-call bounded-memory tests.
+- **A throwing handler disposes every deferred part** — `GuestCall.dispose()` frees the raw
+  promise handle (synchronously — on the throwing path the trampoline never dups a return
+  value) and both resolving functions, without settling, and every `__host_*` question-mode
+  maker wraps its handler call in try/catch: the documented synchronous-refusal path can no
+  longer strand the unused raw promise/resolver handles (review regression: ~3 JSValues +
+  heap boxes leaked per refusal — 30,000 rejected calls filled a 2 MiB VM and the next
+  normal agent call failed with `Error: null`; pinned by the 30,000-refusals
+  bounded-memory test, which then re-registers working handlers and proves the VM is
+  healthy). Answer mode mints no `GuestCall`, so a throw there has nothing to dispose.
+- **The $N freeze path and the argument gatherers use captured intrinsics.** The library is
+  evaluated exactly once at VM creation, before any guest code can run, so it captures what
+  it needs then: the structured-clone extension's native function (a guest that replaces
+  `globalThis.structuredClone` with an aliasing function must not make `$N` hold LIVE
+  references — mutation after a log must never change the frozen store; review regression,
+  pinned by test) and a bound copy of `Array.prototype.slice` (created via
+  `Function.prototype.call.bind` at installation — no property lookups at call time, so
+  replacing either prototype method with a throwing function cannot make `console.*` or
+  `pipeline()` throw; `console.*` NEVER throws by contract; review regression, pinned by
+  test).
 - **`readGuestSurface` returns a surface that pins no guest memory**: every handle is
   acquired per call and disposed on the spot (review regression: the surface used to capture
   three owned function handles in closures with no disposal contract).
@@ -368,7 +391,12 @@ Phase B decisions (the guest library, bridge, previewer):
   best-effort JSON-safe encoding (capped, tagged wrappers) for hosts without a previewer;
   `$N` refs are the authoritative channel and are never truncated.
 - **Output caps are decimal KB (10 × 1000 bytes)** — consistent with the preview format's
-  byte-size convention (×1000 units), and line-granular with `\n` separators counted.
+  byte-size convention (×1000 units), and line-granular with `\n` separators counted. The
+  256-line cap counts PHYSICAL lines (embedded `\n`s inside a rendered line included —
+  property names render verbatim per FORMAT.md §5.18, so a name can carry line feeds), so
+  the cap matches what the client agent actually receives, line for line (review
+  regression: an entry with 300 embedded LFs used to be retained whole with
+  `truncated: false`, silently shipping 301 serialized lines).
 - **`ReplSnapshot` is a self-contained structural stand-in** for the shim's `Snapshot` type,
   so the public `ReplVm.restore` declaration stays checkable by a non-DOM `skipLibCheck:
   false` consumer; snapshots produced through the shim satisfy it without conversion.
@@ -434,7 +462,13 @@ pending steer entry carries both ids; settle works by registry id across a resto
 hygiene (5,000 resolved agent calls leave a 2 MiB VM healthy; 5,000 parked agent calls leave a
 3 MiB VM healthy — parked registry entries are live for the VM's lifetime, so their honest
 footprint fills a 2 MiB limit to 99.9%, a knife-edge where any library evolution tips it; the
-3 MiB limit keeps ~70% headroom while a per-call leak still cannot hide), snapshot
+3 MiB limit keeps ~70% headroom while a per-call leak still cannot hide; 30,000 synchronous
+host refusals — agent, steer and checkpoint — leave a 2 MiB VM healthy, with a normal agent
+call still completing afterwards), the captured-intrinsic regressions ($N freezing is immune
+to `structuredClone` aliasing pollution; `console.*`/`pipeline` keep working when
+`Array.prototype.slice` and `Function.prototype.call` are replaced by throwing functions),
+host-serving-an-older-library (a workspace whose resident library is v0.0.1 installs, works,
+and keeps its resident version under the current host's install path), snapshot
 travel (state, `$N` store, registry and marker survive; callbacks re-register by name; new
 calls mint fresh ids), `$N` freezing (mutation after log never changes the store; the store
 is the agent's writable workspace; hostile values including revoked proxies degrade to typed
@@ -454,4 +488,6 @@ thrown-symbol rendering; the byte-size estimate is bounded and cycle-safe), the 
 degradation (a corrupted key materialization lists nothing and flags overflow — typed arrays
 included), and bounded-memory previews (3,000 revoked-proxy and typed-array previews leave a
 2 MiB VM healthy). `caps.test.ts` pins 256 lines / 10 KB (whichever trips first),
-line-granular truncation and UTF-8 byte counting.
+line-granular truncation and UTF-8 byte counting — with physical-line accounting for
+embedded newlines (a rendered line whose property name carries line feeds counts as that
+many lines; exact at the 256 boundary; embedded-LF bytes count toward the 10 KB cap).

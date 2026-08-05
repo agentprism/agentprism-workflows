@@ -13,6 +13,7 @@ import { test } from 'node:test';
 
 import {
   ReplVm,
+  applyOutputCaps,
   escapeString,
   formatByteSize,
   formatNumber,
@@ -678,4 +679,30 @@ test('the doc headline: previewed $N lines let the orchestrator slice deeper in 
   const sliced = await vm.evalCode('$1.sections.map((s) => s.title)');
   assert.equal(sliced.kind, 'value');
   assert.deepEqual(sliced.value, ['Auth flow', 'Billing']);
+});
+
+test('a property name carrying line feeds renders verbatim and caps count its physical lines (review regression)', async () => {
+  // FORMAT.md §5.18: property names render verbatim (no quoting, no
+  // escaping) — a name that carries \n characters therefore puts PHYSICAL
+  // newlines into the rendered line. The tool-result line cap counts
+  // physical lines, so one such rendered line is several lines of output
+  // (previously an entry with 300 embedded LFs was retained whole with
+  // truncated: false — 301 serialized lines inside the tool result).
+  using vm = await createVm();
+  const out = await vm.evalCode(`globalThis.$951 = { ['a\\nb\\nc']: 1 }; "stored"`);
+  assert.equal(out.kind, 'value');
+  const line = renderRefLine(vm, '$951');
+  assert.ok(line.includes('a\nb\nc'), 'the LF-carrying name renders verbatim');
+  // The cap pipeline counts the rendered line as 3 PHYSICAL lines: 253
+  // ordinary lines + this line = exactly 256 → fits (254 entries kept,
+  // not truncated); adding one more line trips the cap and drops the
+  // tail (line-granular), reporting truncation.
+  const fit = applyOutputCaps([...Array.from({ length: 253 }, () => 'x'), line]);
+  assert.equal(fit.lines.length, 254);
+  assert.equal(fit.truncated, false);
+  assert.equal(fit.lines.join('\n').split('\n').length, 256);
+  const capped = applyOutputCaps([...Array.from({ length: 253 }, () => 'x'), line, 'tail']);
+  assert.equal(capped.lines.length, 254);
+  assert.equal(capped.truncated, true);
+  assert.equal(capped.lines.join('\n').split('\n').length, 256);
 });

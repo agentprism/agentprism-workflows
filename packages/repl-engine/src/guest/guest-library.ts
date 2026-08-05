@@ -146,6 +146,29 @@ const GUEST_LIBRARY_SOURCE = `/*
   var registryForEach = Map.prototype.forEach;
   var registrySize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
 
+  // Captured intrinsics for the $N freeze path and the argument gatherers.
+  // This library is evaluated exactly once, at VM creation, BEFORE any
+  // guest code runs — so everything captured here is pristine, and a guest
+  // that later pollutes a realm global or prototype cannot change what the
+  // captured functions do:
+  //
+  // - nativeStructuredClone is the structured-clone extension's native
+  //   function. The $N freezing discipline is what-you-saw-is-what-you-
+  //   have: mutation after a log must never change $N. Reading the global
+  //   at USE time would let a guest replace it with an aliasing function
+  //   (structuredClone = v => v), making $N hold LIVE references instead
+  //   of frozen copies (review regression, pinned by test).
+  // - arraySlice is a BOUND copy of Array.prototype.slice (created via
+  //   Function.prototype.call.bind at installation — both pristine).
+  //   console.* and pipeline() gather their arguments through it; a guest
+  //   that replaces Array.prototype.slice or Function.prototype.call with
+  //   a throwing function must not make console.log (or pipeline) throw —
+  //   console.* NEVER throws by contract (review regression, pinned by
+  //   test). A bound function performs no property lookups at call time,
+  //   so neither replacement can reach it.
+  var nativeStructuredClone = globalThis.structuredClone;
+  var arraySlice = Function.prototype.call.bind(Array.prototype.slice);
+
   // ────────────────────────────────────────────────────────────────────────
   // Small utilities
   // ────────────────────────────────────────────────────────────────────────
@@ -531,7 +554,10 @@ const GUEST_LIBRARY_SOURCE = `/*
    * for that item, a non-recoverable one rejects the whole pipeline().
    */
   async function pipeline(items) {
-    var stages = Array.prototype.slice.call(arguments, 1);
+    // Captured intrinsic (see the captured-intrinsics note): guest
+    // pollution of Array.prototype.slice / Function.prototype.call must
+    // not be able to break the combinators.
+    var stages = arraySlice(arguments, 1);
     if (!Array.isArray(items)) {
       throw new TypeError('pipeline() expects an array as the first argument');
     }
@@ -787,10 +813,12 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   /**
    * Freeze a copy of a logged value into the $N store: what-you-saw-is-
-   * what-you-have. Prefers structuredClone (the quickjs-wasi prebuilt
-   * extension, attached to every VM by the engine) and falls back to a
-   * guest-side deep copy that substitutes typed markers for
-   * non-cloneables instead of throwing.
+   * what-you-have. Prefers structuredClone — the quickjs-wasi prebuilt
+   * extension's native function, CAPTURED at installation (a guest that
+   * replaces the globalThis binding with an aliasing function must not
+   * make $N hold live references; see the captured-intrinsics note) —
+   * and falls back to a guest-side deep copy that substitutes typed
+   * markers for non-cloneables instead of throwing.
    *
    * DEPTH SAFETY: on WASI, deep recursion is a fatal wasm trap, not a
    * catchable exception (agentprism/quickjs-wasi#2) — and that applies to
@@ -834,11 +862,11 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   function freezeValue(value) {
     if (
-      typeof globalThis.structuredClone === 'function' &&
+      typeof nativeStructuredClone === 'function' &&
       clonePreflight(value, CLONE_DEPTH_LIMIT)
     ) {
       try {
-        return globalThis.structuredClone(value);
+        return nativeStructuredClone(value);
       } catch (_err) {
         // Graph contains a non-cloneable — fall through to the marker copy.
       }
@@ -1216,7 +1244,12 @@ const GUEST_LIBRARY_SOURCE = `/*
   var consoleObject = {};
   ['log', 'info', 'warn', 'error', 'debug'].forEach(function (level) {
     consoleObject[level] = function () {
-      emitLog(level, Array.prototype.slice.call(arguments));
+      // Captured intrinsic (see the captured-intrinsics note): the
+      // bridge contract is console.* NEVER throws, and a guest that
+      // replaces Array.prototype.slice (or Function.prototype.call) with
+      // a throwing function must not be able to break it (review
+      // regression, pinned by test).
+      emitLog(level, arraySlice(arguments));
     };
   });
   // Method-level sabotage protection: the console global is non-writable

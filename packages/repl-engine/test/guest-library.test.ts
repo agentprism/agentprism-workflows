@@ -24,12 +24,13 @@ import {
   readRealmSlot,
   registerGuestHostCallbacks,
   type ConsoleEvent,
+  type ConsoleLevel,
   type GuestBridgeHandlers,
   type GuestCall,
 } from '../src/index.js';
 import { buildGuestLibrarySource } from '../src/guest/guest-library.js';
 import { getVmShim } from '../src/vm.js';
-import type { QuickJS } from 'quickjs-wasi';
+import type { JSValueHandle, QuickJS, HostFunction } from 'quickjs-wasi';
 
 // ────────────────────────────────────────────────────────────────────────
 // Mock host
@@ -105,6 +106,59 @@ async function createGuest(): Promise<{ vm: ReplVm; bridge: MockBridge }> {
   const bridge = mockBridge();
   await installGuestBridge(vm, bridge.handlers);
   return { vm, bridge };
+}
+
+/**
+ * Install the guest library at an arbitrary version, with minimal
+ * host functions — simulates the OLDER host that snapshotted a workspace
+ * (the doc's evolution discipline: a host must serve snapshots carrying
+ * older library versions than the one it currently injects, and the
+ * resident version stays authoritative). The minimal surface is enough
+ * for the discipline assertions: agent/steer/checkpoint park (their
+ * registry entries pend), answer mode reports false, console events
+ * bridge into the mock's event list.
+ */
+async function installGuestLibraryAtVersion(
+  vm: ReplVm,
+  version: string,
+  bridge: MockBridge,
+): Promise<void> {
+  const shim = getVmShim(vm) as QuickJS;
+  const hostFn = (
+    fn: (args: Array<string | null>) => JSValueHandle | undefined,
+  ): HostFunction => {
+    return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
+      const strs = args.map((a) => (a.isString ? a.toString() : null));
+      return fn(strs) ?? shim.undefined;
+    };
+  };
+  const callbacks: Array<[string, (args: Array<string | null>) => JSValueHandle | undefined]> = [
+    [HOST_AGENT, () => undefined],
+    [HOST_CHECKPOINT, (args) => (args.length >= 4 ? shim.false : undefined)],
+    [HOST_STEER, () => undefined],
+    [
+      HOST_CONSOLE,
+      (args) => {
+        const level = args[0];
+        const payload = args[1] !== null ? JSON.parse(args[1]) : null;
+        if (level !== null && payload !== null) {
+          bridge.events.push({
+            level: level as ConsoleLevel,
+            refs: payload.refs as string[],
+            args: payload.args as unknown[],
+          });
+        }
+        return undefined;
+      },
+    ],
+  ];
+  for (const [name, fn] of callbacks) {
+    const fnHandle = shim.newFunction(name, hostFn(fn));
+    shim.setProp(shim.global, name, fnHandle);
+    fnHandle.dispose();
+  }
+  const outcome = await vm.evalCode(buildGuestLibrarySource(version));
+  assert.equal(outcome.kind, 'value', `library v${version} install failed: ${JSON.stringify(outcome)}`);
 }
 
 function value(outcome: Awaited<ReturnType<ReplVm['evalCode']>>): unknown {
@@ -651,6 +705,63 @@ test('console.log freezes arguments into $N: mutation after the log does not cha
   vm.dispose();
 });
 
+test('$N freezing is immune to structuredClone pollution (native clone captured at installation)', async () => {
+  // Review regression: freezeValue consulted globalThis.structuredClone at
+  // USE time, so a guest that replaced the global with an aliasing
+  // function (structuredClone = v => v) made $N hold LIVE references —
+  // mutation after the log changed the frozen store. The library captures
+  // the extension's native function at installation (before any guest
+  // code can run), so the replacement is ignored and the freeze is a
+  // faithful copy.
+  const { vm } = await createGuest();
+  value(await vm.evalCode(`
+    globalThis.structuredClone = (v) => v; // alias instead of copy
+    "polluted"
+  `));
+  value(await vm.evalCode(`
+    const x = { a: 1, nested: { b: [1, 2] } };
+    console.log(x);
+    x.a = 999;
+    x.nested.b.push(3);
+    "done"
+  `));
+  assert.deepEqual(value(await vm.evalCode('$1')), { a: 1, nested: { b: [1, 2] } });
+  // The store holds a copy, not the original object (the sabotage would
+  // alias the ORIGINAL — mutating it after the log must not move $N).
+  value(await vm.evalCode(`
+    const original = { k: 'v' };
+    console.log(original);
+    original.k = 'changed';
+    "done"
+  `));
+  assert.deepEqual(value(await vm.evalCode('$2')), { k: 'v' });
+  vm.dispose();
+});
+
+test('console.* and pipeline are immune to Array.prototype.slice / Function.prototype.call pollution (captured intrinsics)', async () => {
+  // Review regression: console.* gathered its arguments through
+  // Array.prototype.slice at call time, so replacing that method with a
+  // throwing function made console.log throw — contradicting the bridge
+  // contract (console.* NEVER throws). The library captures the
+  // slice/call intrinsic pair at installation; pipeline() had the same
+  // exposure for its stage list.
+  const { vm, bridge } = await createGuest();
+  value(await vm.evalCode(`
+    Array.prototype.slice = () => { throw new Error('sabotaged slice'); };
+    Function.prototype.call = () => { throw new Error('sabotaged call'); };
+    "polluted"
+  `));
+  // console.log still bridges every argument, complete with refs and args.
+  value(await vm.evalCode('console.log("a", 42, { k: 1 }); "done"'));
+  assert.equal(bridge.events.length, 1);
+  assert.deepEqual(bridge.events[0].refs, ['$1', '$2', '$3']);
+  assert.deepEqual(bridge.events[0].args, ['a', 42, { k: 1 }]);
+  // pipeline still gathers its stage list under the same pollution.
+  const out = value(await vm.evalCode('await pipeline([1, 2], (x) => x * 10, (x) => x + 1)'));
+  assert.deepEqual(out, [11, 21]);
+  vm.dispose();
+});
+
 test('the $N store is the agent workspace: slots are writable, deletable, transformable', async () => {
   const { vm } = await createGuest();
   value(await vm.evalCode('console.log({ v: 1 }); "done"'));
@@ -925,6 +1036,11 @@ test('snapshot/restore: state, $N store, pending registry and version marker tra
   assert.equal(value(await restored.evalCode('typeof agent')), 'function');
   restoredBridge.script.push({ resolveWith: 'after' });
   assert.equal(value(await restored.evalCode('await agent("pi/x", "next")')), 'after');
+  // $N freezing still works after restore: the captured native
+  // structuredClone travels inside the snapshot like every other value in
+  // the library's closure.
+  value(await restored.evalCode('console.log({ z: 1 }); "ok"'));
+  assert.deepEqual(value(await restored.evalCode('$2')), { z: 1 });
   restored.dispose();
 });
 
@@ -940,6 +1056,46 @@ test('a VM restored from a snapshot keeps working without the guest library re-i
   await installGuestBridge(restored, bridge.handlers); // no-op
   assert.equal(value(await restored.evalCode('counter + 1')), 8);
   restored.dispose();
+});
+
+test('a host serves a workspace whose resident library is OLDER than the one it ships (evolution discipline)', async () => {
+  // The doc's rule: the library carries a version marker and travels
+  // inside snapshots, and a host must serve a restored workspace whose
+  // resident library is older than the version it currently injects — the
+  // resident version stays authoritative (never re-inject over a
+  // workspace) and the host re-registers its callbacks by name against
+  // whatever version it finds. Simulate the older host: a fresh VM with
+  // the library built at version 0.0.1.
+  const vm = await ReplVm.create();
+  const bridge = mockBridge();
+  await installGuestLibraryAtVersion(vm, '0.0.1', bridge);
+
+  // The surface reports the RESIDENT version, not the host's shipped one.
+  const surface = readGuestSurface(vm)!;
+  assert.equal(surface.version, '0.0.1');
+  assert.equal(value(await vm.evalCode(GUEST_VERSION_GLOBAL)), '0.0.1');
+  assert.deepEqual(surface.stats(), {
+    version: '0.0.1',
+    callSeq: 0,
+    logSeq: 0,
+    pendingCalls: 0,
+  });
+
+  // The old library's surface is fully usable and host calls work against
+  // it (the host-callback surface is backward compatible): agent parks,
+  // console events bridge.
+  value(await vm.evalCode('agent("pi/x", "work"); "started"'));
+  value(await vm.evalCode('console.log({ a: 1 }); "done"'));
+  assert.equal(surface.pending().length, 1);
+  assert.equal(surface.pending()[0].modelSpec, 'pi/x');
+  assert.equal(bridge.events.length, 1);
+  assert.deepEqual(bridge.events[0].refs, ['$1']);
+
+  // The current host's install path over the old library is a no-op: the
+  // resident (older) copy stays authoritative.
+  await installGuestBridge(vm, mockBridge().handlers);
+  assert.equal(readGuestSurface(vm)!.version, '0.0.1', 'the resident version stays authoritative');
+  vm.dispose();
 });
 
 test('GuestLibraryInstallError carries trap-free info (the install-failure surface)', async () => {
@@ -1091,3 +1247,78 @@ test('unsettled parked calls do not leak either (promise handles are released af
   assert.equal(value(await vm.evalCode('1 + 1')), 2);
   vm.dispose();
 });
+
+test('30,000 synchronous host refusals leave a 2 MiB VM healthy (throwing handlers dispose every deferred part)', async () => {
+  // Review regression: when a handler threw, the shim converted the throw
+  // into a guest error — but the GuestCall's raw promise and both
+  // resolving functions were never disposed (`releaseToRealm` was
+  // bypassed on the throwing path), so every refusal leaked ~490 bytes of
+  // guest memory (promise + 2 resolvers + heap boxes). After 30,000
+  // rejected calls the 2 MiB VM was saturated and the next NORMAL agent
+  // call failed with `Error: null`. Every throwing-handler path (agent,
+  // steer, checkpoint question mode) now disposes all owned parts before
+  // re-throwing.
+  //
+  // The regression is pinned TWO ways, both deterministic: the guest
+  // runtime's own memory usage after the refusals (qjs_compute_memory_
+  // usage — ~190–250 KB on the fixed code at any refusal volume; 1.6 MB
+  // at 3,000 refusals and the 2 MiB cap at 9,000+ on the broken code),
+  // and the behavioral probe (a normal agent call still completes).
+  const vm = await ReplVm.create({ memoryLimit: 2 * 1024 * 1024 });
+  const bridge = mockBridge();
+  bridge.handlers.agent = () => {
+    throw new Error('refused at dispatch');
+  };
+  bridge.handlers.steer = () => {
+    throw new Error('refused at dispatch');
+  };
+  bridge.handlers.checkpoint = () => {
+    throw new Error('refused at dispatch');
+  };
+  await installGuestBridge(vm, bridge.handlers);
+  // 30,000 refused calls across all three host-callback kinds (100 evals
+  // × 100 iterations × 3 calls), every promise rejection handled in-eval.
+  for (let i = 0; i < 100; i++) {
+    const out = await vm.evalCode(`
+      (async () => {
+        for (let k = 0; k < 100; k++) {
+          const h = agent("pi/x", "t" + k);
+          const s = h.steer("go");
+          const q = checkpoint("q?");
+          await Promise.all([h, s, q].map((p) => p.then(() => "no", (e) => e.message)));
+        }
+      })()
+    `);
+    assert.equal(out.kind, 'value');
+  }
+  // The guest runtime's memory stayed flat: far below the 2 MiB limit
+  // (the broken code saturates the cap — qjs_memory_usage() reads
+  // 2,092,244 there; the fixed code holds ~190–250 KB).
+  const usageBytes = vmMemoryUsage(vm);
+  assert.ok(
+    usageBytes < 1024 * 1024,
+    `guest memory after 30,000 refusals must stay below 1 MiB, got ${usageBytes} bytes`,
+  );
+  // A NORMAL agent call still works after the mass refusals (the review's
+  // exact failure mode) — swap in working handlers via the
+  // re-registration path, and the VM is fully healthy.
+  const working = mockBridge();
+  working.script.push({ resolveWith: 'after' });
+  registerGuestHostCallbacks(vm, working.handlers);
+  assert.equal(value(await vm.evalCode('await agent("pi/x", "after")')), 'after');
+  assert.equal(value(await vm.evalCode('1 + 1')), 2);
+  vm.dispose();
+});
+
+/** Guest runtime memory usage in bytes (qjs_compute_memory_usage). */
+function vmMemoryUsage(vm: ReplVm): number {
+  const shim = getVmShim(vm) as QuickJS;
+  const e = shim._getExports();
+  const outPtr = e.wasm_malloc(4);
+  try {
+    e.qjs_compute_memory_usage(outPtr);
+    return new DataView(e.memory.buffer).getUint32(outPtr, true);
+  } finally {
+    e.wasm_free(outPtr);
+  }
+}
