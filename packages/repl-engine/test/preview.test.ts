@@ -18,6 +18,7 @@ import {
   formatNumber,
   headTailDescription,
   inspectGlobal,
+  previewGlobal,
   renderRefLine,
   shortString,
   stringDescription,
@@ -545,6 +546,33 @@ test('formatByteSize: decimal units with the promotion rule', () => {
   assert.equal(formatByteSize(2_100_000), '2.1MB');
   assert.equal(formatByteSize(7_000_000_000), '7GB');
   assert.equal(formatByteSize(3_200_000_000_000), '3.2TB');
+});
+
+test('PropertyPreview serialization preserves the FORMAT.md field order: name, type, value, subtype', async () => {
+  // Review regression: propertyPreviewOf constructed { name, type,
+  // subtype, value } — the serialized form put subtype BEFORE value,
+  // violating FORMAT.md §4 ("field order is normative for serialized
+  // forms"). The serialization vector below pins the order end-to-end,
+  // with an object-valued property (subtype present) exercising the full
+  // field set.
+  using vm = await createVm();
+  await vm.evalCode(`globalThis.$910 = { arr: [1, 2], n: 42, get g() { return 1; } }; "stored"`);
+  const preview = previewGlobal(vm, '$910');
+  assert.ok(preview !== undefined, 'structured preview is available');
+  assert.equal(
+    JSON.stringify(preview),
+    '{"type":"object","description":"Object","overflow":false,' +
+      '"properties":[' +
+      '{"name":"arr","type":"object","value":"Array(2)","subtype":"array"},' +
+      '{"name":"n","type":"number","value":"42"},' +
+      '{"name":"g","type":"accessor"}' +
+      ']}',
+  );
+  // previewGlobal and the rendered line agree on the same slot.
+  assert.equal(body(renderRefLine(vm, '$910')), '{arr: Array(2), n: 42, g: (...)}');
+  // Absent / accessor slots resolve to undefined (same contract as
+  // renderGlobalLine, which renders the sabotage marker instead).
+  assert.equal(previewGlobal(vm, '$911'), undefined);
 });
 
 test('estimateByteSize is bounded, trap-free and counts shared subgraphs once', async () => {

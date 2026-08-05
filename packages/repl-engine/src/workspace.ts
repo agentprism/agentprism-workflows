@@ -52,10 +52,13 @@ export interface WorkspaceOptions {
    * **parking bridge**: agent/checkpoint/steer calls park (they pend in
    * the guest registry, visible through `surface()`/`parkedCalls()`, and
    * stay unsolved until a later phase attaches real backends — parking
-   * never fabricates a result), and console events accumulate in
-   * `consoleEvents()`. A later phase that wires real backends swaps
-   * handlers via `registerGuestHostCallbacks` (the same re-registration
-   * the restore path uses).
+   * never fabricates a result). The one deliberate exception is
+   * `checkpoint.answer`: answering a parked question settles the matching
+   * pending checkpoint first-wins (the data plane interrupting the intent
+   * plane works even with no backends attached). Console events
+   * accumulate in `consoleEvents()`. A later phase that wires real
+   * backends swaps handlers via `registerGuestHostCallbacks` (the same
+   * re-registration the restore path uses).
    */
   handlers?: GuestBridgeHandlers;
 }
@@ -74,6 +77,13 @@ export class Workspace {
   private readonly vm: ReplVm;
   private readonly consoleEventBuffer: ConsoleEvent[] = [];
   private readonly parkedCallsBuffer = new Map<string, GuestCall>();
+  /** Parked CHECKPOINT calls only, by call id — the answer-delivery
+   *  table of the parking bridge. Kept separate from `parkedCallsBuffer`
+   *  so `checkpoint.answer` can settle a pending question first-wins
+   *  without ever touching a parked agent/steer call that happens to
+   *  share the id space (review regression: the bridge rejected every
+   *  answer with `false`, leaving the original promise pending forever). */
+  private readonly parkedCheckpointCalls = new Map<string, GuestCall>();
   private disposed = false;
 
   private constructor(projectDir: string, vm: ReplVm) {
@@ -159,6 +169,12 @@ export class Workspace {
    * that attaches real backends settles these `GuestCall`s (or takes
    * them over) — parking is the honest no-backend state, it never
    * fabricates results.
+   *
+   * Parked checkpoint QUESTIONS are in this map too, but answers do NOT
+   * arrive through here: `checkpoint.answer` settles the matching
+   * pending checkpoint directly (see `defaultHandlers`) — the entry is
+   * removed from both maps on delivery, so this map only ever lists
+   * still-parked calls.
    */
   parkedCalls(): ReadonlyMap<string, GuestCall> {
     return this.parkedCallsBuffer;
@@ -201,17 +217,46 @@ export class Workspace {
   private defaultHandlers(): GuestBridgeHandlers {
     const events = this.consoleEventBuffer;
     const parked = this.parkedCallsBuffer;
+    const parkedCheckpoints = this.parkedCheckpointCalls;
     return {
       agent: (call, callId) => {
         parked.set(callId, call);
       },
       checkpoint: (call, callId, _question, _optionsJson, answerJson) => {
         if (answerJson !== null) {
-          // Answer mode under the parking bridge: nothing can be pending
-          // (no checkpoint was ever answered), so delivery reports false.
-          return false;
+          // Answer mode: the orchestrator is delivering the user's answer
+          // for a parked checkpoint. Find the matching pending checkpoint
+          // (checkpoints are tracked SEPARATELY from parked agent/steer
+          // calls — a checkpoint.answer must never settle an agent call
+          // that shares the id space), parse the JSON answer, settle the
+          // call, and report delivery. First-wins: the entry is removed
+          // before settling, so a second delivery of the same id reports
+          // false (unknown or already-answered), exactly like the guest's
+          // idempotent settle-by-call-id. A malformed answer (a host-side
+          // contract violation — the guest only sends JSON.stringify
+          // output) rejects the call rather than parking the question
+          // forever.
+          const pending = parkedCheckpoints.get(callId);
+          if (pending === undefined) return false;
+          parkedCheckpoints.delete(callId);
+          parked.delete(callId);
+          let answer: unknown;
+          try {
+            answer = JSON.parse(answerJson);
+          } catch {
+            pending.reject(
+              new Error(`checkpoint ${callId}: answer was not valid JSON`),
+            );
+            return true;
+          }
+          pending.resolve(answer);
+          return true;
         }
+        // Question mode: park the call in both tables — the general
+        // parked-calls map (the no-backend state a later phase settles
+        // or takes over) and the checkpoint table (answer delivery).
         parked.set(callId, call!);
+        parkedCheckpoints.set(callId, call!);
         return undefined;
       },
       steer: (call, callId) => {

@@ -103,6 +103,69 @@ test('the guest bridge is installed at VM creation: DSL globals, console bridge,
   ws.dispose();
 });
 
+test('default parking bridge: checkpoint.answer settles the parked checkpoint (first-wins)', async () => {
+  // Review rejection: the parking bridge's answer mode returned `false`
+  // for every checkpoint.answer, so the original promise stayed pending
+  // forever — the data plane could never interrupt the intent plane on
+  // a default workspace. The bridge now tracks parked checkpoint calls
+  // separately, parses the answer, and settles the matching call.
+  const ws = await workspace();
+  const asked = await ws.eval('const q = checkpoint("proceed?"); "asked"');
+  assert.equal(asked.kind, 'value');
+  // The parked checkpoint is visible through the parked-calls surface.
+  assert.equal(ws.parkedCalls().size, 1);
+
+  // The orchestrator delivers the answer in a later eval; the bridge
+  // reports delivery truthfully.
+  const delivered = await ws.eval('checkpoint.answer("c1", { yes: true, note: "go" }); "delivered"');
+  assert.equal(delivered.kind, 'value');
+  if (delivered.kind === 'value') assert.equal(delivered.value, 'delivered');
+  // Delivery consumed the parked record.
+  assert.equal(ws.parkedCalls().size, 0);
+  // The checkpoint promise resolved with the ANSWER (not `false`), during
+  // the delivering eval's own job drain.
+  const settled = await ws.eval('await q');
+  assert.equal(settled.kind, 'value');
+  if (settled.kind === 'value') assert.deepEqual(settled.value, { yes: true, note: 'go' });
+
+  // Unknown and already-answered ids report false and pend nothing new.
+  const unknown = await ws.eval('checkpoint.answer("c99", 1)');
+  assert.equal(unknown.kind, 'value');
+  if (unknown.kind === 'value') assert.equal(unknown.value, false);
+  const again = await ws.eval('checkpoint.answer("c1", 2)');
+  assert.equal(again.kind, 'value');
+  if (again.kind === 'value') assert.equal(again.value, false);
+  ws.dispose();
+});
+
+test('default parking bridge: checkpoint.answer never settles a parked agent call', async () => {
+  // The bridge tracks parked CHECKPOINT calls separately from parked
+  // agent/steer calls: an answer addressed at an agent call's id must
+  // report false and leave the agent call parked (ids share one space).
+  const ws = await workspace();
+  await ws.eval('const research = agent("pi/deepseek-v4-flash-max", "research X"); const q = checkpoint("q?"); "started"');
+  assert.equal(ws.parkedCalls().size, 2);
+
+  // c1 is the AGENT call — answering it must not settle it.
+  const wrong = await ws.eval('checkpoint.answer("c1", "nope")');
+  assert.equal(wrong.kind, 'value');
+  if (wrong.kind === 'value') assert.equal(wrong.value, false);
+  assert.equal(ws.parkedCalls().size, 2, 'the agent call is still parked');
+
+  // The checkpoint (c2) answers normally, leaving only the agent parked.
+  const ok = await ws.eval('checkpoint.answer("c2", "yes")');
+  assert.equal(ok.kind, 'value');
+  if (ok.kind === 'value') assert.equal(ok.value, true);
+  assert.equal(ws.parkedCalls().size, 1);
+  const qOutcome = await ws.eval('await q');
+  assert.equal(qOutcome.kind, 'value');
+  if (qOutcome.kind === 'value') assert.equal(qOutcome.value, 'yes');
+  // The agent call is untouched by all of it.
+  assert.equal(ws.surface()!.pending().length, 1);
+  assert.equal(ws.surface()!.pending()[0].kind, 'agent');
+  ws.dispose();
+});
+
 test('custom bridge handlers passed to create override the parking bridge', async () => {
   const calls: Array<{ callId: string; modelSpec: string; task: string }> = [];
   const ws = await Workspace.create('/tmp/repl-test-custom-bridge', {

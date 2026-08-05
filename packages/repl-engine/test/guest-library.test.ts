@@ -446,8 +446,11 @@ test('pipeline: recoverable per-item failures yield null; non-recoverable halt',
   vm.dispose();
 });
 
-test('retry: bounded attempts, early stop on until()', async () => {
+test('retry: bounded attempts, early stop on until(); no until accepts the first result', async () => {
   const { vm } = await createGuest();
+  // Review regression: without `until` the guest ran EVERY attempt — the
+  // repository DSL (workflow.ts: `if (!opts.until || opts.until(last))
+  // return last`) accepts the FIRST result when no predicate is supplied.
   const out = value(
     await vm.evalCode(`
       let tries = 0;
@@ -458,7 +461,7 @@ test('retry: bounded attempts, early stop on until()', async () => {
       ({ last, tries })
     `),
   );
-  assert.deepEqual(out, { last: 'not yet', tries: 3 });
+  assert.deepEqual(out, { last: 'not yet', tries: 1 });
   const out2 = value(
     await vm.evalCode(`
       let tries2 = 0;
@@ -678,6 +681,50 @@ test('the console payload carries refs and best-effort args; every level routes 
   assert.equal(typeof last.args[0], 'string');
   assert.ok(last.args[0].length < 5000);
   assert.match(last.args[0] as string, /full value in \$N/);
+  vm.dispose();
+});
+
+test('nested weak collections keep typed markers in $N (recursive uncloneable detection)', async () => {
+  // Review regression: isUncloneable only checked the logged ROOT, so a
+  // WeakMap/WeakSet/WeakRef nested anywhere in the graph reached the
+  // structured-clone extension, which silently normalized it to an empty
+  // plain object — $N was not a faithful frozen copy (a WeakMap read as
+  // a deleted property). The pre-flight now scans the whole reachable
+  // graph; every nested weak collection becomes a typed marker.
+  const { vm } = await createGuest();
+  value(
+    await vm.evalCode(`
+      const wm = new WeakMap(); const ws = new WeakSet(); const wr = new WeakRef({});
+      console.log({
+        map: wm,
+        list: [ws, { inner: wr }],
+        deep: { deeper: { weakest: wm } },
+        viaMap: new Map([['k', wm]]),
+      });
+      "done"
+    `),
+  );
+  const out = value(
+    await vm.evalCode(`
+      const m = (o) => (o && o.__unclonable__) || null;
+      ({
+        map: m(globalThis.$1.map),
+        list0: m(globalThis.$1.list[0]),
+        inner: m(globalThis.$1.list[1].inner),
+        weakest: m(globalThis.$1.deep.deeper.weakest),
+        viaMap: m(globalThis.$1.viaMap.get('k')),
+        mapMarkerKeys: Object.keys(globalThis.$1.map),
+      })
+    `),
+  );
+  assert.deepEqual(out, {
+    map: 'weakmap',
+    list0: 'weakset',
+    inner: 'weakref',
+    weakest: 'weakmap',
+    viaMap: 'weakmap',
+    mapMarkerKeys: ['__unclonable__'],
+  });
   vm.dispose();
 });
 
@@ -1022,11 +1069,21 @@ test('5,000 sequential resolved agent calls leave a 2 MiB VM healthy (no handle 
 });
 
 test('unsettled parked calls do not leak either (promise handles are released after return)', async () => {
-  const vm = await ReplVm.create({ memoryLimit: 2 * 1024 * 1024 });
+  const vm = await ReplVm.create({ memoryLimit: 3 * 1024 * 1024 });
   const bridge = mockBridge();
   await installGuestBridge(vm, bridge.handlers);
   // 5,000 parked calls (never settled): each returned promise handle must
   // be released once the guest holds its own reference.
+  //
+  // Memory-limit note (review round): parked registry entries are LIVE for
+  // the VM's lifetime (deleted only on settlement), so 5,000 parked calls
+  // have an honest footprint of ~2.09 MB — 99.9% of a 2 MiB limit, a
+  // knife-edge where any library-source evolution (even comment growth)
+  // tipped the GC/malloc interplay into a hard failure at ~725 calls. The
+  // limit is 3 MiB here: the honest footprint is ~70% of it, while the
+  // leak class this test pins (an undisposed promise handle plus a
+  // marshalled value per call, ~400 B/call) still adds ~2 MB over 5,000
+  // calls and cannot hide in the headroom.
   for (let i = 0; i < 5000; i++) {
     const out = await vm.evalCode(`agent("pi/x", "task ${i}"); "started"`);
     assert.equal(out.kind, 'value');

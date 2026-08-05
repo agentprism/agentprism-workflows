@@ -251,7 +251,10 @@ data.
 may supply custom bridge handlers; the default is a **parking bridge** (agent/checkpoint/steer calls
 park — they pend in the guest registry, visible through `surface()`/`parkedCalls()`, and stay
 unsolved until a later phase attaches real backends; parking never fabricates a result — console
-events accumulate in `consoleEvents()`). The workspace also exposes the rendering seam
+events accumulate in `consoleEvents()`). The one deliberate exception is `checkpoint.answer`:
+answering a parked question settles the matching pending checkpoint first-wins, so the data plane
+can interrupt the intent plane even with no backends attached. The workspace also exposes the
+rendering seam
 (`renderRef`, `inspectBinding`) and the reconciliation surface (`surface()`) the `repl` tool layer
 builds on. A later phase that wires real backends swaps handlers via `registerGuestHostCallbacks`
 (the same re-registration the restore path uses).
@@ -333,17 +336,24 @@ Phase B decisions (the guest library, bridge, previewer):
   continuation vector).
 - **Non-recoverable = `recoverable: false` exclusively** — the harness's reserved
   `BUDGET_EXHAUSTED`/`AGENT_LIMIT_EXCEEDED` codes are budget vocabulary, deleted per the doc.
-- **`retry` without `until` runs all attempts** (deliberate divergence from the harness's
-  `dsl.js`, which returns after the first attempt): the doc names this repo's `dsl.d.ts` as
-  the semantic source — "stopping early once `until(result)` holds" means nothing holds when
-  there is no `until`.
+- **`retry` mirrors the workflow engine exactly**: without `until`, the FIRST attempt's
+  result is returned (`workflow.ts`: `if (!opts.until || opts.until(last)) return last` —
+  "stopping early once `until(result)` holds" holds trivially when there is no predicate);
+  with `until`, attempts run until the predicate holds or `attempts` are exhausted, and the
+  last result is then returned for the caller to inspect. Review regression: the guest used
+  to run every attempt without `until`, diverging from the repository DSL.
 - **`loopUntilDry` dedupes within rounds too** (the harness dedupes across rounds only) —
   "collecting fresh (deduped by `key`) items" is honored completely; the default key degrades
   to a safe string for non-serializable items instead of throwing.
-- **Weak collections keep typed markers in `$N`**: the structured-clone extension silently
-  clones `WeakMap`/`WeakSet`/`WeakRef` to empty plain objects, so `freezeValue` routes
-  functions, symbols, promises and weak collections to the marker fallback before attempting
-  `structuredClone` — an orchestrator must be able to tell a WeakMap from a deleted property.
+- **Weak collections keep typed markers in `$N` — nested ones too**: the structured-clone
+  extension silently clones `WeakMap`/`WeakSet`/`WeakRef` to empty plain objects, at ANY
+  depth of the logged graph, so `freezeValue` runs an iterative pre-flight over the whole
+  reachable graph — depth bound AND nested-uncloneable detection — before attempting
+  `structuredClone`; every weak collection (and function/symbol/promise) at any depth
+  becomes a typed marker instead of an empty `{}`. An orchestrator must be able to tell a
+  WeakMap from a deleted property even inside an object, array, or Map/Set. Review
+  regression: the uncloneable check used to test only the logged root, so nested weak
+  collections were silently normalized. (Pinned by the nested-weak-collections test.)
 - **`GuestCall` owns and disposes every handle it touches** (the Rust broker's Deferred
   discipline): the marshalled value is disposed after settling, both resolving functions are
   disposed at settlement (raw `qjs_new_promise` parts — the shim's `newPromise()` pins the
@@ -421,7 +431,10 @@ stable tie-breaks), the reconciliation surface (pending/settle/stats with `sessi
 `modelSpec` on entries, first-wins idempotence, `Map.prototype` pollution immunity via
 captured intrinsics, no pinning of guest memory), steering snapshot-reconciliation (the
 pending steer entry carries both ids; settle works by registry id across a restore), handle
-hygiene (5,000 resolved and 5,000 parked agent calls leave a 2 MiB VM healthy), snapshot
+hygiene (5,000 resolved agent calls leave a 2 MiB VM healthy; 5,000 parked agent calls leave a
+3 MiB VM healthy — parked registry entries are live for the VM's lifetime, so their honest
+footprint fills a 2 MiB limit to 99.9%, a knife-edge where any library evolution tips it; the
+3 MiB limit keeps ~70% headroom while a per-call leak still cannot hide), snapshot
 travel (state, `$N` store, registry and marker survive; callbacks re-register by name; new
 calls mint fresh ids), `$N` freezing (mutation after log never changes the store; the store
 is the agent's writable workspace; hostile values including revoked proxies degrade to typed

@@ -564,10 +564,16 @@ function descriptorPreview(name: string, desc: OwnDescriptor): PropertyPreview {
 
 /** First-level abbreviation of a property VALUE (CDP `PropertyPreview`):
  *  primitives render inline (with string truncation); objects render as
- *  shorthand brand tokens, never expanded. Trap-free on every path. */
+ *  shorthand brand tokens, never expanded. Trap-free on every path.
+ *
+ *  The constructed object's FIELD ORDER is normative (FORMAT.md §4:
+ *  `name`, `type`, `value`, `subtype` — the serialized form must put
+ *  `subtype` AFTER `value`; review regression: it was inserted before).
+ *  `value` is the abbreviated token, absent for accessors; `subtype` is
+ *  absent for primitives (and omitted by JSON serialization). */
 function propertyPreviewOf(name: string, value: JSValueHandle): PropertyPreview {
   const { type, subtype, token } = shortForm(value);
-  return { name, type, subtype, value: token };
+  return { name, type, value: token, subtype };
 }
 
 /** FORMAT.md §5.17: the property-level shorthand tokens. */
@@ -981,11 +987,36 @@ function slotAddress(name: string): number {
 }
 
 /**
+ * The structured preview of a realm global slot — the ObjectPreview
+ * object behind `renderGlobalLine`'s rendered line: the CDP model the
+ * tool-result seam is built on, as plain data (JSON-serializable, with
+ * the FORMAT.md §4 normative field order preserved — pinned by the
+ * serialization-vector test). Trap-free by construction (module docs):
+ * own-property-descriptor reads only, no guest getters, no guest code.
+ * Returns `undefined` when the slot is absent, rebound to an accessor
+ * (never invoked), or unreadable — the same resolution contract as
+ * `renderGlobalLine` (which degrades to a fallback line; callers that
+ * need the structured form instead can degrade themselves).
+ */
+export function previewGlobal(vm: ReplVm, name: string): ObjectPreview | undefined {
+  const value = readSlotValue(vm, name);
+  if (value === undefined) return undefined;
+  try {
+    return previewHandle(value);
+  } catch {
+    return undefined;
+  } finally {
+    value.dispose();
+  }
+}
+
+/**
  * Metadata for one realm global slot, content-free: the CDP label (type
  * or subtype), the byte-size estimate, and the resolution kind. This is
  * the workspace-manifest seam — `ls` for the data plane (the doc: top-
  * level bindings with name, type, size; metadata, never content). The
- * full preview is available through `renderGlobalLine`.
+ * full preview is available through `renderGlobalLine` (or the
+ * structured form through `previewGlobal`).
  */
 export function inspectGlobal(vm: ReplVm, name: string): {
   kind: 'data' | 'accessor' | 'absent';

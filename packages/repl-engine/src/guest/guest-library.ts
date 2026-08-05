@@ -722,15 +722,13 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   /**
    * Bounded retry: call thunk(attempt) up to 'attempts' times, stopping
-   * early once until(result) holds. Returns the last result when attempts
-   * are exhausted (the caller inspects it). No backoff: there is no timer
-   * in the realm and delegation retries gain nothing from delay.
-   *
-   * NOTE (deliberate divergence from the harness's dsl.js): without
-   * 'until', ALL attempts run — the dsl.d.ts contract is "stopping early
-   * once until(result) holds", and with no 'until' nothing ever holds.
-   * (The harness returns after the first attempt in that case; the doc
-   * names this repo's dsl.d.ts as the semantic source.)
+   * early once until(result) holds. Without 'until' the FIRST result is
+   * accepted — exactly the repository DSL behavior
+   * (workflow-engine/src/workflow.ts: if (!opts.until || opts.until(last))
+   * return last); the final return last only runs when an 'until'
+   * predicate was given and never held (attempts exhausted — the caller
+   * inspects the last result). No backoff: there is no timer in the realm
+   * and delegation retries gain nothing from delay.
    */
   async function retry(thunk, opts) {
     opts = opts || {};
@@ -738,7 +736,7 @@ const GUEST_LIBRARY_SOURCE = `/*
     var last;
     for (var i = 0; i < attempts; i++) {
       last = await thunk(i);
-      if (opts.until && opts.until(last)) return last;
+      if (!opts.until || opts.until(last)) return last;
     }
     return last;
   }
@@ -807,13 +805,15 @@ const GUEST_LIBRARY_SOURCE = `/*
    * as an "unfreezable" marker, never a throw).
    */
   /**
-   * Values the structured-clone algorithm cannot carry. Checked BEFORE
-   * structuredClone: the extension's clone silently normalizes weak
-   * collections to empty plain objects, but the $N store must keep typed
-   * markers for them (what-you-saw-is-what-you-have — an orchestrator
-   * must be able to tell a WeakMap from a deleted property). Functions,
-   * symbols and promises throw in structuredClone anyway; the marker
-   * fallback handles them identically.
+   * Values the structured-clone algorithm cannot carry. Checked by the
+   * clone PRE-FLIGHT on every reachable node of the logged graph, not
+   * just the root: the extension's clone silently normalizes weak
+   * collections to empty plain objects at ANY depth, but the $N store
+   * must keep typed markers for them (what-you-saw-is-what-you-have — an
+   * orchestrator must be able to tell a WeakMap from a deleted property,
+   * even nested inside an object, array, or Map/Set). Functions, symbols
+   * and promises throw in structuredClone anyway; the marker fallback
+   * handles them identically.
    */
   function isUncloneable(value) {
     var t = typeof value;
@@ -834,9 +834,8 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   function freezeValue(value) {
     if (
-      !isUncloneable(value) &&
       typeof globalThis.structuredClone === 'function' &&
-      depthWithin(value, CLONE_DEPTH_LIMIT)
+      clonePreflight(value, CLONE_DEPTH_LIMIT)
     ) {
       try {
         return globalThis.structuredClone(value);
@@ -859,13 +858,19 @@ const GUEST_LIBRARY_SOURCE = `/*
   }
 
   /**
-   * Iterative (explicit-stack) check that a graph's first-visit nesting
-   * stays within 'limit'. Cycles/shared refs are handled with a visited
-   * set — which also mirrors structuredClone's own memoization, so this
-   * bounds ITS recursion depth. Any throw during traversal (revoked or
-   * all-trap proxies, hostile getters) means "not structuredClone-safe".
+   * Iterative (explicit-stack) pre-flight that answers the two questions
+   * structuredClone cannot answer safely, in one walk over the reachable
+   * graph: is the first-visit nesting within 'limit', AND does the graph
+   * contain ANY uncloneable value (function, symbol, promise, weak
+   * collection) anywhere — root or nested? A 'false' routes the value to
+   * the marker-copy fallback, which substitutes typed markers at every
+   * depth instead of normalizing (or throwing). Cycles/shared refs are
+   * handled with a visited set — which also mirrors structuredClone's own
+   * memoization, so this bounds ITS recursion depth. Any throw during
+   * traversal (revoked or all-trap proxies, hostile getters) means "not
+   * structuredClone-safe".
    */
-  function depthWithin(root, limit) {
+  function clonePreflight(root, limit) {
     try {
       if (root === null || typeof root !== 'object') return true;
       var visited = new Set();
@@ -876,6 +881,12 @@ const GUEST_LIBRARY_SOURCE = `/*
         var v = frame.v;
         if (visited.has(v)) continue;
         visited.add(v);
+        // Nested uncloneables — including weak collections — route the
+        // whole graph to the marker-copy fallback: the clone extension
+        // silently normalizes them to {} at any depth (review
+        // regression: the root-only check let nested WeakMap/WeakSet/
+        // WeakRef through as empty plain objects).
+        if (isUncloneable(v)) return false;
         var children = [];
         if (v instanceof Date || v instanceof RegExp ||
             v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {

@@ -55,6 +55,7 @@ export {
   renderCollapsed,
   renderRefLine,
   renderGlobalLine,
+  previewGlobal,
   inspectGlobal,
   formatByteSize,
   formatNumber,
