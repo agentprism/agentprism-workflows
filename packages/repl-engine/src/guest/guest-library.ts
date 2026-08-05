@@ -596,18 +596,19 @@ const GUEST_LIBRARY_SOURCE = `/*
    * 'threshold'. Reviewers that fail recoverably are dropped from the vote
    * (they are neither yes nor no).
    *
-   * The spawned reviewers are agent() calls; their model spec is
-   * 'opts.model' when given, else the reserved sentinel ''default'' — host
-   * policy routes that to its configured default backend (this mirrors
-   * dsl.d.ts's verify, where reviewers inherit the run's default model
-   * when none is given).
+   * The DSL options are EXACTLY { reviewers, threshold, lens }
+   * (packages/workflows/src/dsl.d.ts) — there is no per-call model option
+   * (an invented opts.model was removed in review; the dsl.d.ts verify
+   * lets reviewers inherit the run's default model, so the spawned
+   * reviewers always route through the reserved ''default'' sentinel,
+   * which host policy routes to its configured default backend).
    */
   async function verify(item, opts) {
     opts = opts || {};
     var reviewers = Math.max(1, opts.reviewers !== undefined ? opts.reviewers : 2);
     var threshold = opts.threshold !== undefined ? opts.threshold : 0.5;
     var lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
-    var modelSpec = opts.model !== undefined ? opts.model : 'default';
+    var modelSpec = 'default';
     var claim;
     if (typeof item === 'string') {
       claim = item;
@@ -654,15 +655,16 @@ const GUEST_LIBRARY_SOURCE = `/*
    * LLM-judge panel: score each candidate in 'attempts' with 'judges'
    * graders against 'rubric' and return the highest mean-scoring candidate
    * as { index, attempt, score, judgments } (stable tie-break by index).
-   * The spawned graders are agent() calls with model spec 'opts.model'
-   * (else the reserved ''default'' sentinel — host-routed, same decision
-   * as verify).
+   * The DSL options are EXACTLY { judges, rubric }
+   * (packages/workflows/src/dsl.d.ts) — no per-call model option; the
+   * spawned graders route through the reserved ''default'' sentinel
+   * (host-routed, same decision as verify).
    */
   async function judgePanel(attempts, opts) {
     opts = opts || {};
     var judges = Math.max(1, opts.judges !== undefined ? opts.judges : 3);
     var rubric = opts.rubric !== undefined ? opts.rubric : 'overall quality and correctness';
-    var modelSpec = opts.model !== undefined ? opts.model : 'default';
+    var modelSpec = 'default';
     var scored = (
       await parallel(
         (Array.isArray(attempts) ? attempts : []).map(function (att, idx) {

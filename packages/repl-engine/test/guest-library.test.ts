@@ -623,7 +623,7 @@ test('verify: reviewers vote; passes when the real-share meets threshold', async
   bridge.script.push({ resolveWith: { real: true, reason: 'yes' } });
   bridge.script.push({ resolveWith: { real: false, reason: 'no' } });
   bridge.script.push({ resolveWith: { real: true, reason: 'yes2' } });
-  const out = value(await vm.evalCode('await verify("claim", { reviewers: 3, threshold: 0.5, model: "pi/verify-model" })'));
+  const out = value(await vm.evalCode('await verify("claim", { reviewers: 3, threshold: 0.5 })'));
   assert.deepEqual(out, {
     real: true,
     realCount: 2,
@@ -634,15 +634,19 @@ test('verify: reviewers vote; passes when the real-share meets threshold', async
       { real: true, reason: 'yes2' },
     ],
   });
-  // Reviewers were spawned as schema-carrying agent calls with the
-  // default model spec (host-routed sentinel) — or opts.model when given.
+  // Reviewers were spawned as schema-carrying agent calls, all routed
+  // through the reserved "default" sentinel (host policy routes it to its
+  // configured default backend). The DSL options are exactly
+  // { reviewers, threshold, lens } — there is no per-call model option
+  // (an invented opts.model was removed in review; dsl.d.ts's verify lets
+  // reviewers inherit the run's default model).
   assert.equal(bridge.agentCalls.length, 3);
   for (const call of bridge.agentCalls) {
     const options = JSON.parse(call.optionsJson!);
     assert.equal(options.schema.type, 'object');
     assert.ok(call.task.includes('claim'));
   }
-  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'pi/verify-model'), 'opts.model routes the reviewers');
+  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'default'), 'reviewers route through the default sentinel');
   vm.dispose();
 });
 
@@ -670,15 +674,16 @@ test('judgePanel: highest mean score wins; stable tie-break by index', async () 
     { resolveWith: { score: 0.5, reason: 'r' } },
   );
   const out = value(
-    await vm.evalCode('await judgePanel(["cand-a", "cand-b", "cand-c"], { judges: 2, rubric: "quality", model: "pi/judge-model" })'),
+    await vm.evalCode('await judgePanel(["cand-a", "cand-b", "cand-c"], { judges: 2, rubric: "quality" })'),
   );
   assert.equal(out.index, 1);
   assert.equal(out.attempt, 'cand-b');
   assert.ok(Math.abs(out.score - 0.7) < 1e-9);
   assert.equal(out.judgments.length, 2);
-  // Judge prompts carried the rubric, and the graders ran under opts.model.
+  // Judge prompts carried the rubric, and the graders all routed through
+  // the "default" sentinel (no opts.model in the DSL's { judges, rubric }).
   assert.ok(bridge.agentCalls.some((c) => c.task.includes('quality')));
-  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'pi/judge-model'), 'opts.model routes the graders');
+  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'default'), 'graders route through the default sentinel');
   vm.dispose();
 });
 
@@ -1310,15 +1315,17 @@ test('30,000 synchronous host refusals leave a 2 MiB VM healthy (throwing handle
   vm.dispose();
 });
 
-/** Guest runtime memory usage in bytes (qjs_compute_memory_usage). */
+/**
+ * Guest runtime memory usage in bytes (mallocSize from the runtime's
+ * memory-usage statistics). Read through the shim's getMemoryUsage(),
+ * which allocates the COMPLETE 26-int64 (208-byte) JSMemoryUsage
+ * structure before qjs_compute_memory_usage writes into it, reads every
+ * field back, and frees it — a raw 4-byte buffer would let the C write
+ * 208 bytes past its end, corrupting adjacent WASM memory and
+ * invalidating the very measurement it feeds (review regression: the
+ * corruption made the deterministic refusal-memory assertion read
+ * garbage).
+ */
 function vmMemoryUsage(vm: ReplVm): number {
-  const shim = getVmShim(vm) as QuickJS;
-  const e = shim._getExports();
-  const outPtr = e.wasm_malloc(4);
-  try {
-    e.qjs_compute_memory_usage(outPtr);
-    return new DataView(e.memory.buffer).getUint32(outPtr, true);
-  } finally {
-    e.wasm_free(outPtr);
-  }
+  return (getVmShim(vm) as QuickJS).getMemoryUsage().mallocSize;
 }

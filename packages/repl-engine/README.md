@@ -119,10 +119,12 @@ result). This package follows the rule from its first line of engine code, and i
   descriptors' `get`/`set` handles are disposed on the spot — long-lived VMs must not
   accumulate guest memory from error paths (both leaks were measured during adversarial
   review and are pinned by bounded-memory regression tests).
-- Error rendering converts **symbols** natively (`String(Symbol(desc))` →
-  `Symbol(desc)`, read through the raw `qjs_get_symbol_description` export): a thrown
-  `Symbol('x')` reports `Symbol(x)`, never the fabricated `NaN` the default number
-  conversion produced (review regression, pinned by test).
+- Error rendering converts **symbols** natively (the bare brand, FORMAT.md §5.7): a
+  thrown `Symbol('x')` reports `Symbol`, never the fabricated `NaN` the default
+  number conversion produced. The description is deliberately NOT read — the raw
+  `qjs_get_symbol_description` export invokes guest `Symbol.keyFor` (FORMAT.md §1.1),
+  a forbidden seam, so `Symbol(x)` is unimplementable trap-free, not merely
+  unimplemented (review regression, pinned by test).
 
 The published type graph is also self-contained: the public options take `WasmInput` — a
 locally declared stand-in for `WebAssembly.Module | BufferSource` (`ArrayBuffer |
@@ -331,8 +333,11 @@ Phase B decisions (the guest library, bridge, previewer):
   durably settle (by registry id) or re-issue (to the session) a pending steer after a
   restore (review regression: the entry used to omit the founding id).
 - **Combinator model specs**: `verify`/`judgePanel` spawn their reviewers/graders through
-  `agent(opts.model ?? "default", …)` — the `"default"` sentinel is host-routed (mirrors
-  dsl.d.ts, where reviewers inherit the run's default model when none is given).
+  `agent("default", …)` — the DSL options are exactly `{ reviewers, threshold, lens }`
+  and `{ judges, rubric }` (packages/workflows/src/dsl.d.ts); there is no per-call model
+  option (an invented `opts.model` was removed in review). The `"default"` sentinel is
+  host-routed to the configured default backend (mirrors dsl.d.ts, where reviewers
+  inherit the run's default model when none is given).
 - **The handle is the promise**: `agent()` returns the promise itself with own non-enumerable
   `id`/`followUp`/`steer`/`cancel` — started-not-awaited handles come free with top-level
   await, per the doc (`const research = agent(...)`; end the eval; check in next call). No
@@ -435,7 +440,8 @@ fabricated value, trap-free completion reads under `Object.prototype` pollution 
 adversarial regressions: no guest getter runs during synchronous parse failures, rejected
 completions, drain failures, or **failing descriptor reads** (the raw descriptor path never
 constructs quickjs-wasi's getter-invoking `JSException`); thrown proxies and proxy
-prototypes report trap-free markers; thrown symbols report `Symbol(desc)`, never `NaN`;
+prototypes report trap-free markers; thrown symbols report the bare brand `Symbol`, never
+`NaN`;
 standalone settlement drains arm their own interrupt handler and break delayed runaway
 continuations; `dispose()` cannot race an in-flight eval; concurrent evals never leak
 interrupt handlers; the registry instantiates exactly one VM under concurrent first touches
@@ -454,8 +460,9 @@ question→answer flow across evals (with `false` for unknown/answered ids and a
 non-JSON answers), every combinator over a mocked `__host_agent` (parallel order/null
 slots/non-recoverable halts, pipeline stages and slot semantics, retry attempts and `until`,
 gate feedback loops, loopUntilDry dedupe/emptiness/maxRounds and circular-safe keys, verify
-votes and dropped reviewers with `opts.model` routing, judgePanel mean scores and
-stable tie-breaks), the reconciliation surface (pending/settle/stats with `sessionId` and
+votes and dropped reviewers routed through the `"default"` sentinel (no `opts.model` in the
+DSL options), judgePanel mean scores and stable tie-breaks), the reconciliation surface
+(pending/settle/stats with `sessionId` and
 `modelSpec` on entries, first-wins idempotence, `Map.prototype` pollution immunity via
 captured intrinsics, no pinning of guest memory), steering snapshot-reconciliation (the
 pending steer entry carries both ids; settle works by registry id across a restore), handle

@@ -365,6 +365,46 @@ test('a corrupted key materialization degrades with overflow (FORMAT.md §6) —
   }
 });
 
+test('repeated previews of many-property objects do not leak omitted property handles (bounded memory)', async () => {
+  // Review regression: ownStringProperties read every key's descriptor but
+  // only disposed the value handle of properties that were LISTED — a
+  // property omitted because it was non-enumerable or beyond the
+  // eight-property cap left its owned value handle undisposed. Each
+  // leaked handle pinned a JSValue box in WASM memory: a 20,000-call
+  // previewGlobal() probe on a 100-property object grew WASM memory from
+  // 1.31 MB to 30.74 MB (92 omitted handles × 16 bytes × 20,000 calls)
+  // despite the 2 MiB VM limit. The boxes are dlmalloc'd — outside the
+  // runtime's counted heap, so JSMemoryUsage.mallocSize stays flat and
+  // JS_SetMemoryLimit does not stop them; the growth shows in the WASM
+  // linear-memory size (memory.buffer.byteLength), which is the metric
+  // pinned here. Omitted data handles are disposed on the spot now; the
+  // probe below must stay flat.
+  const vm = await ReplVm.create({ memoryLimit: 2 * 1024 * 1024 });
+  await vm.evalCode(
+    `globalThis.$950 = (() => { const o = {}; for (let i = 0; i < 100; i++) o['k' + i] = i; Object.defineProperty(o, 'hidden', { value: 1, enumerable: false }); return o; })(); "stored"`,
+  );
+  const e = (getVmShim(vm) as QuickJS)._getExports();
+  const before = e.memory.buffer.byteLength;
+  for (let i = 0; i < 20000; i++) {
+    const preview = previewGlobal(vm, '$950');
+    assert.ok(preview !== undefined, 'structured preview is available');
+    // The object exercises BOTH omitted paths: 92 properties beyond the
+    // eight-property cap and one non-enumerable hidden property.
+    assert.equal(preview.overflow, true);
+  }
+  const after = e.memory.buffer.byteLength;
+  // The broken code grew ~29 MB here (right through the 2 MiB limit); the
+  // fixed code stays flat — the measured delta is exactly 0, 1 MiB slack
+  // covers page-granular dlmalloc noise without hiding a real leak.
+  assert.ok(
+    after - before < 1024 * 1024,
+    `previewing must not grow WASM linear memory: ${before} -> ${after} bytes`,
+  );
+  // The VM is fully healthy afterwards.
+  assert.equal((await vm.evalCode('1 + 1')).kind, 'value');
+  vm.dispose();
+});
+
 test('repeated revoked-proxy and typed-array previews do not accumulate guest memory', async () => {
   // Review regression: raw exports returning heap-allocated JSValues were
   // not disposed on all paths — typedArrayInfo leaked the backing

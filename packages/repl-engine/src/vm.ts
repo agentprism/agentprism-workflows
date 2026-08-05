@@ -583,7 +583,7 @@ function readCompletionValue(wrapper: JSValueHandle): unknown {
  * Trap-free error info: name/message/stack are read as own data
  * properties; primitives thrown as values convert natively (strings and
  * bigints as themselves, booleans as `'true'`/`'false'`, numbers as their
- * native string form, symbols as `Symbol(description)`). Guest getters are
+ * native string form, symbols as the bare brand `Symbol`). Guest getters are
  * never invoked while rendering the error.
  *
  * Two adversarial shapes are guarded before any descriptor/prototype

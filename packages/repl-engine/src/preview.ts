@@ -540,6 +540,13 @@ function ownStringProperties(
       continue;
     }
     if (!desc.enumerable || properties.length >= cap) {
+      // Omitted from the preview, but the descriptor's owned value handle
+      // must still be disposed — an omitted property is not listed, yet
+      // its handle is just as owned as a listed one's (review regression:
+      // every omitted data-property handle leaked, pinning one JSValue
+      // box per preview call; a 20,000-call previewGlobal() probe on a
+      // 100-property object grew WASM memory from 1.31 MB to 30.74 MB).
+      if (desc.kind === 'data') desc.value.dispose();
       overflow = true;
       continue;
     }
