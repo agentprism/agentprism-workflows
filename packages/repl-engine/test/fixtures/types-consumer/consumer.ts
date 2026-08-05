@@ -70,3 +70,28 @@ async function exercise(): Promise<void> {
   registry.disposeAll();
   vm.dispose();
 }
+
+// Negative cases — the public boundary must reject accidental values.
+// Review regression: `WasmModule` was an empty interface, so `{ wasm: 42 }`
+// type-checked (every non-null value satisfies an empty interface) and
+// failed only at runtime. The branded opaque module type must make all of
+// these compile-time errors; the `@ts-expect-error` directives fail the
+// fixture build if any line stops erroring.
+
+// @ts-expect-error a bare number is not a wasm input
+const badNumber: WasmInput = 42;
+
+// @ts-expect-error a bare object is not a compiled module (opaque brand)
+const badModule: WasmModule = {};
+
+// @ts-expect-error a string is not a wasm input
+const badString: WasmInput = 'quickjs.wasm';
+
+// @ts-expect-error `{ wasm: 42 }` must not type-check as VM options
+const badVmOptions: ReplVmOptions = { wasm: 42 };
+
+// @ts-expect-error `{ wasm: 42 }` must not type-check as workspace options
+const badWsOptions: WorkspaceOptions = { wasm: 42 };
+
+// @ts-expect-error a boolean is not a wasm input
+const badBoolean: WasmInput = true;

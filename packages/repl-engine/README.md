@@ -33,13 +33,18 @@ bump must refuse old snapshots loudly, never restore them silently.
   `InternalError: out of memory` (an `EvalErrorInfo` with `outOfMemory: true`); the VM stays
   usable. Default when unconfigured: **64 MiB** (`ReplVm.DEFAULT_MEMORY_LIMIT`) — generous for
   data-plane state while still bounding what a single workspace can make the daemon hold.
-- **`interruptHandler` per eval** — quickjs-wasi's `interruptHandler` is a per-VM
-  create-time option, so the engine composes per-eval semantics on top of the built-in: one
-  VM-level handler delegates to a per-eval slot that `evalCode` arms for the duration of the
-  eval **and its drain**, then restores. Handlers never leak across evals. Returning `true`
-  aborts with `InternalError: interrupted` (`EvalErrorInfo.interrupted === true`). Note the
+- **`interruptHandler` per eval and per settlement drain** — quickjs-wasi's `interruptHandler` is a per-VM
+  create-time option, so the engine composes per-operation semantics on top of the built-in: one
+  VM-level handler delegates to a per-operation slot that `evalCode` arms for the duration of the
+  eval **and its drain**, and `drainJobs({ interruptHandler })` arms for the duration of a
+  standalone settlement drain, then restores. Handlers never leak across operations. Returning
+  `true` aborts with `InternalError: interrupted` (`EvalErrorInfo.interrupted === true`). Note the
   interrupt budget is instruction-based (quickjs's built-in check interval), so against a
   tiny loop body the handler fires comparatively rarely — that is the shim's native behavior.
+  **Why the drain takes its own handler:** a suspended eval's handler is removed when the eval
+  returns, and a settlement drain that later resumes a runaway continuation (a continuation left
+  queued by an interrupted drain, or resumed by host-side settlement) would run unguarded — the
+  drain boundary therefore carries its own interrupt signal.
 
 ## Eval semantics
 
@@ -51,12 +56,19 @@ stays a syntax error** (the parser's "return not in function" check is independe
 async flag — pinned by test). The eval returns a promise; the engine drains the job queue
 (quickjs-wasi's built-in `executePendingJobs()`, with the per-eval interrupt still armed, so a
 runaway microtask loop is bounded) and reports one of:
-
 | Outcome | Meaning |
 |---|---|
 | `{ kind: 'value', value }` | completion promise fulfilled within the drain |
 | `{ kind: 'pending' }` | suspended on an unsettled promise — no fabricated value; the continuation resumes at settlement like a `.then` |
 | `{ kind: 'error', error }` | threw (synchronously, via a rejected completion promise, or via a job error during the drain — the canonical drain error is the per-eval interrupt firing inside a resumed continuation) |
+
+The eval promise is fulfilled **synchronously** — the completion is read straight from the
+runtime through the raw `qjs_promise_result` export, never through `resolvePromise()` (whose
+host promise yields through the microtask queue even when already settled). This makes an eval
+structurally un-raceable by `dispose()`: `const p = ws.eval('6*7'); ws.dispose(); await p`
+returns `42` (review regression: the yielding completion read crashed on nulled WASM exports).
+All VM operations serialize for the same reason, so concurrent evals can never reorder the
+interrupt-slot save/restore (review regression: a stale handler stayed armed).
 
 ## Trap-free rendering (from day one)
 
@@ -77,6 +89,14 @@ result). This package follows the rule from its first line of engine code, and i
   `[Proxy]` marker (proxies fire traps on descriptor/prototype reads — every such read is
   `isProxy`-guarded, including the prototype of an error whose prototype was replaced with a
   proxy via `Object.setPrototypeOf`).
+- `JSValueHandle.getOwnPropertyDescriptor()` throws a `JSException` when the C descriptor read
+  fails (allocation edge) — and that constructor runs the same guest-visible getters. The
+  engine's descriptor path (`readOwnDataProperty`) never calls it: it drives
+  `qjs_get_own_property_descriptor` directly, takes a failed read's exception value out of
+  the runtime and frees it (no `JSException` is ever constructed), and reads the
+  engine-created descriptor object's own data properties through raw `qjs_get_prop_value`.
+  A regression test forces every descriptor read to fail C-side and asserts zero guest
+  getter executions and a still-usable VM.
 - `QuickJS.executePendingJobs()` renders a failed job's exception through `exc.toString()` —
   a JavaScript string conversion that **executes guest code**. The engine's `drainJobs()`
   runs the same built-in pending-job loop (`qjs_is_job_pending` / `qjs_execute_pending_job`,
@@ -94,17 +114,26 @@ result). This package follows the rule from its first line of engine code, and i
 - Error names come from the error prototype's own `name` data property when instances carry
   none (quickjs-ng stores `name` on the prototype) — still trap-free; a guest-installed
   accessor or proxy prototype is skipped and the name falls back to `'Error'`.
-- **No handle is ever leaked from a failed path**: the caught `JSException` (defensive —
-  the eval path never constructs one) and the exception values of failed evals and failed
-  jobs are disposed in `finally` blocks. Review measured a 1 MiB VM exhausting after ~4,018
-  syntax errors when the exception handle was retained; the memory-bound regression tests
-  run 20,000 of each shape and assert the VM still evaluates.
+- **No handle is ever leaked from a failed path**: the exception values of failed evals, failed
+  jobs, and failed descriptor reads are disposed in `finally` blocks, and accessor
+  descriptors' `get`/`set` handles are disposed on the spot — long-lived VMs must not
+  accumulate guest memory from error paths (both leaks were measured during adversarial
+  review and are pinned by bounded-memory regression tests).
+- Error rendering converts **symbols** natively (`String(Symbol(desc))` →
+  `Symbol(desc)`, read through the raw `qjs_get_symbol_description` export): a thrown
+  `Symbol('x')` reports `Symbol(x)`, never the fabricated `NaN` the default number
+  conversion produced (review regression, pinned by test).
 
 The published type graph is also self-contained: the public options take `WasmInput` — a
 locally declared stand-in for `WebAssembly.Module | BufferSource` (`ArrayBuffer |
 ArrayBufferView | WasmModule`, see `src/types.ts`) — because the repo's tsconfig has no DOM
 lib and the ambient declarations the package compiles against are source-only (never
-published; the package ships `dist` only). A consumer check with the repo's non-DOM lib and
+published; the package ships `dist` only). `WasmModule` is **opaque/branded**: its only
+producer is `loadShippedWasm()`, so accidental values (`{ wasm: 42 }`, a plain object, a
+string) are compile-time errors — pinned by `@ts-expect-error` negative cases in the
+consumer fixture (review regression: `WasmModule` used to be an empty interface that
+satisfied every non-null value). Custom WASM is accepted as raw bytes (`ArrayBuffer` /
+`ArrayBufferView`). A consumer check with the repo's non-DOM lib and
 `skipLibCheck: false` is part of the test suite (`test/public-types.test.ts`).
 
 ## Decisions for spec-owed details
@@ -113,13 +142,17 @@ These are the decisions this phase made where the roadmap doc left room; later p
 build on them rather than re-open them.
 
 - **Default memory limit: 64 MiB per VM** (configurable per workspace and per registry).
-- **Per-eval interrupts composed over the built-in per-VM handler** (see Engine posture) —
-  this is the only composition quickjs-wasi's API allows, and it keeps the whole
-  interrupt mechanism on the built-in `qjs_set_interrupt_handler` path.
+- **Per-eval and per-drain interrupts composed over the built-in per-VM handler** (see
+  Engine posture) — this is the only composition quickjs-wasi's API allows, and it keeps the
+  whole interrupt mechanism on the built-in `qjs_set_interrupt_handler` path. A standalone
+  settlement drain arms its own handler because the suspended eval's handler is gone.
 - **`<repl>` as the default eval filename** for guest stack traces.
-- **`Workspace.eval` is synchronous in guest time**: host execution is synchronous from the
-  guest's perspective (the only async hop is awaiting quickjs-wasi's already-settled
-  `resolvePromise`), so the drain result and the completion state it observes are coherent.
+- **Eval completion is synchronous**: the completion value is read through the raw
+  `qjs_promise_result` export instead of the shim's `resolvePromise()` (whose host promise
+  yields even when already settled). This makes `dispose()` structurally un-raceable and
+  serializes all VM operations, which in turn makes the interrupt-slot save/restore
+  concurrency-safe (an `opDepth` reentrancy guard makes the serialization invariant
+  structural).
 - **Drain errors are authoritative eval errors**: when a drained job throws (interrupt-in-job
   is the canonical case), the eval reports that error; the guest exception has already been
   consumed and cleared by the drain loop, so the VM stays usable. The drain is the built-in
@@ -129,12 +162,18 @@ build on them rather than re-open them.
   descriptors' `get`/`set` handles are disposed on the spot — long-lived VMs must not
   accumulate guest memory from error paths (both leaks were measured during adversarial
   review and are pinned by bounded-memory regression tests).
-- **The public wasm surface uses self-contained types** (`WasmInput`/`WasmModule` from
-  `src/types.ts`) instead of the DOM-lib `BufferSource`/`WebAssembly.Module` names, so the
-  published declarations compile under the repo's non-DOM lib with `skipLibCheck: false`.
-- **The registry dedupes concurrent first-touches**: `WorkspaceRegistry.get` under a race
-  disposes the duplicate VM and returns the winner, keeping the one-VM-per-workspace
-  invariant even under concurrent tool calls.
+- **The public wasm surface uses self-contained, branded types** (`WasmInput`/`WasmModule`
+  from `src/types.ts`) instead of the DOM-lib `BufferSource`/`WebAssembly.Module` names, so
+  the published declarations compile under the repo's non-DOM lib with `skipLibCheck: false`
+  — and `WasmModule` is opaque, so only `loadShippedWasm()` can produce one (custom wasm
+  goes in as raw bytes).
+- **The registry dedupes the in-flight creation promise**: concurrent first-touches of one
+  project key share a single creation, so exactly one VM is instantiated per workspace (the
+  first caller's options win). `dispose` during an in-flight create cancels it — the created
+  VM is torn down without materializing, the waiting `get` rejects, and a later `get`
+  starts fresh.
+- **Primitive error rendering follows native conversions for every primitive type**, symbols
+  included (`Symbol(description)`), so a thrown value is reported as it actually was.
 - **Realpath validation of `projectDir`** is deliberately NOT here: that is the daemon's
   project-registry concern (the `repl` tool's phase); the registry keys by the string it is
   given.
@@ -161,7 +200,13 @@ memory-limit enforcement, interrupt breaking a runaway eval with the VM still us
 top-level-await acceptance, top-level-`return` rejection, pending-suspension with no
 fabricated value, trap-free completion reads under `Object.prototype` pollution — plus the
 adversarial regressions: no guest getter runs during synchronous parse failures, rejected
-completions, or drain failures; thrown proxies and proxy prototypes report trap-free
-markers; 20,000 consecutive syntax errors and 20,000 accessor-valued completions leave a
-1 MiB VM healthy; and a non-DOM `skipLibCheck: false` consumer compiles the published
-declarations.
+completions, drain failures, or **failing descriptor reads** (the raw descriptor path never
+constructs quickjs-wasi's getter-invoking `JSException`); thrown proxies and proxy
+prototypes report trap-free markers; thrown symbols report `Symbol(desc)`, never `NaN`;
+standalone settlement drains arm their own interrupt handler and break delayed runaway
+continuations; `dispose()` cannot race an in-flight eval; concurrent evals never leak
+interrupt handlers; the registry instantiates exactly one VM under concurrent first touches
+and cancels in-flight creates on dispose; 20,000 consecutive syntax errors and 20,000
+accessor-valued completions leave a 1 MiB VM healthy; and a non-DOM `skipLibCheck: false`
+consumer compiles the published declarations — including `@ts-expect-error` negative cases
+pinning the opaque `WasmModule` boundary.

@@ -18,6 +18,7 @@ export {
   loadShippedWasm,
   type ReplVmOptions,
   type ReplEvalOptions,
+  type ReplDrainOptions,
   type ReplEvalOutcome,
 } from './vm.js';
 export { Workspace, WorkspaceRegistry, type WorkspaceOptions, type WorkspaceRegistryOptions } from './workspace.js';

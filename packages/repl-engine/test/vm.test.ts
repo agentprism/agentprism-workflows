@@ -9,7 +9,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { ReplVm, loadShippedWasm } from '../src/index.js';
+import { EvalFlags, QuickJS } from 'quickjs-wasi';
+
+import { DrainJobError, ReplVm, loadShippedWasm } from '../src/index.js';
 
 type VmOptions = NonNullable<Parameters<typeof ReplVm.create>[0]>;
 
@@ -439,4 +441,186 @@ test('the shipped binary round-trips as the public wasm type (loadShippedWasm �
   using v = await vm({ wasm: await loadShippedWasm() });
   assert.equal(value(await v.evalCode('6 * 7')), 42);
   assert.equal(v.memoryLimit, ReplVm.DEFAULT_MEMORY_LIMIT);
+});
+
+test('a failing own-descriptor read never constructs JSException and leaves the VM usable', async () => {
+  using v = await vm();
+  // Adversarial regression (review): `JSValueHandle.getOwnPropertyDescriptor()`
+  // throws a `JSException` when the C descriptor read fails, and that
+  // constructor performs guest-visible `[[Get]]` reads of name/message/stack
+  // on the exception value — a getter on `SyntaxError.prototype.name` would
+  // execute during error construction, before any host catch. The engine's
+  // raw descriptor path must take the failed read's exception out of the
+  // runtime and free it without ever constructing a `JSException`.
+  value(
+    await v.evalCode(`
+      globalThis.__traps = 0;
+      for (const key of ['name', 'message', 'stack']) {
+        Object.defineProperty(SyntaxError.prototype, key, {
+          configurable: true,
+          get() { globalThis.__traps++; return 'trapped'; },
+        });
+      }
+      'installed';
+    `),
+  );
+  // Drive the raw exports directly — the same surface the engine drives —
+  // and make every descriptor read fail the way the C engine fails under
+  // an allocation edge: the export returns the exception sentinel and a
+  // real exception value lands in the runtime slot. Running a real failing
+  // `qjs_eval` per read keeps the sentinel and the runtime exception
+  // genuine. The WASM exports object is frozen with non-configurable data
+  // properties (a Proxy `get` trap cannot override them), so the shim's
+  // `exports` field (a plain TS-private property) is swapped for an object
+  // that shadows the descriptor export and delegates everything else to
+  // the real exports.
+  const qjs = (v as unknown as { vm: QuickJS }).vm;
+  const originalExports = qjs._getExports();
+  const patched = Object.create(originalExports);
+  Object.defineProperty(patched, 'qjs_get_own_property_descriptor', {
+    configurable: true,
+    writable: true,
+    value: () => {
+      const code = qjs._writeString('const =');
+      const fn = qjs._writeString('<fail>');
+      const sentinel = originalExports.qjs_eval(code.ptr, code.len, fn.ptr, EvalFlags.TYPE_GLOBAL);
+      originalExports.wasm_free(code.ptr);
+      originalExports.wasm_free(fn.ptr);
+      return sentinel;
+    },
+  });
+  (qjs as unknown as { exports: typeof originalExports }).exports = patched;
+  try {
+    const outcome = await v.evalCode('({ a: 1 })');
+    // Every descriptor read failed and read as absent; the completion
+    // renders as an empty object instead of crashing or fabricating data.
+    assert.equal(outcome.kind, 'value');
+    if (outcome.kind === 'value') assert.deepEqual(outcome.value, {});
+  } finally {
+    (qjs as unknown as { exports: typeof originalExports }).exports = originalExports;
+  }
+  // No `JSException` was constructed: none of the getters ran.
+  assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no guest getter ran');
+  // The failed reads took the runtime exception out each time — no sticky
+  // exception poisons the VM.
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('standalone settlement drains arm their own interrupt handler (delayed continuation interruption)', async () => {
+  using v = await vm();
+  // Two runaway continuations, interrupted mid-drain by the per-eval
+  // handler: the drain stops at the first failed job, so at least one
+  // runaway continuation stays queued in the VM. Its per-eval handler is
+  // gone with the eval — a later settlement drain would resume the loop
+  // with no interrupt protection unless the drain carries its own signal.
+  let evalChecks = 0;
+  const outcome = await v.evalCode(
+    `
+      for (let k = 0; k < 2; k++) {
+        (async () => { let i = 0; while (true) { i++; await 0 } })();
+      }
+      'queued';
+    `,
+    { interruptHandler: () => ++evalChecks > 3 },
+  );
+  const e = error(outcome);
+  assert.equal(e.interrupted, true);
+
+  // Drain the leftovers with a per-drain handler: each failed job throws a
+  // `DrainJobError` reporting the interrupt; the loop consumes every queued
+  // continuation and terminates. (Without a handler, this drain would run
+  // the leftover runaway forever.)
+  let drainChecks = 0;
+  let interruptedDrains = 0;
+  for (;;) {
+    let n = 0;
+    try {
+      n = v.drainJobs({ interruptHandler: () => ++drainChecks > 1 });
+    } catch (err) {
+      assert.ok(err instanceof DrainJobError, 'drain failure is a DrainJobError');
+      assert.equal(err.info.interrupted, true);
+      interruptedDrains++;
+      continue;
+    }
+    if (n === 0) break;
+  }
+  assert.ok(
+    interruptedDrains >= 1,
+    'a leftover runaway continuation was interrupted by the standalone drain',
+  );
+  // The per-drain handler is gone too — nothing leaked.
+  assert.equal(v.drainJobs(), 0);
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
+  assert.equal(value(await v.evalCode('await Promise.resolve(42)')), 42);
+});
+
+test('dispose cannot race an in-flight eval: settled and suspended evals complete first', async () => {
+  // Review regression: the completion read used to yield through an
+  // already-settled host promise, so `const p = ws.eval('6*7');
+  // ws.dispose(); await p` rejected with `TypeError: Cannot read
+  // properties of null (reading 'qjs_is_proxy')` once the WASM exports
+  // were nulled. Eval completion is now synchronous: the eval finishes
+  // before `dispose` even runs, and both outcomes survive.
+  const v = await vm();
+  const settled = v.evalCode('6 * 7');
+  v.dispose();
+  const settledOutcome = await settled;
+  assert.equal(settledOutcome.kind, 'value');
+  if (settledOutcome.kind === 'value') assert.equal(settledOutcome.value, 42);
+
+  const v2 = await vm();
+  const suspended = v2.evalCode('const gate = new Promise(() => {}); await gate; "never"');
+  v2.dispose();
+  const suspendedOutcome = await suspended;
+  assert.equal(suspendedOutcome.kind, 'pending', 'suspended eval reports pending, not a crash');
+
+  const v3 = await vm();
+  const failed = v3.evalCode('const =');
+  v3.dispose();
+  const failedOutcome = await failed;
+  assert.equal(failedOutcome.kind, 'error');
+  if (failedOutcome.kind === 'error') assert.equal(failedOutcome.error.name, 'SyntaxError');
+});
+
+test('concurrent evals never leak interrupt handlers across the batch', async () => {
+  using v = await vm();
+  // Review regression: two overlapping evals restored the interrupt slot
+  // out of nesting order and left the first handler armed indefinitely; a
+  // later standalone drain then inherited the unrelated handler. Eval is
+  // now synchronous, so the calls serialize — this pins that the slot
+  // save/restore leaves nothing behind under a concurrent call pattern.
+  const budgets = new Array<number>(32).fill(0);
+  const results = await Promise.all(
+    budgets.map((_, k) =>
+      v.evalCode('while (true) {}', { interruptHandler: () => ++budgets[k] > k + 1 }),
+    ),
+  );
+  for (let k = 0; k < results.length; k++) {
+    const e = error(results[k]);
+    assert.equal(e.interrupted, true);
+    assert.ok(budgets[k] >= k + 1, `eval ${k} was interrupted by its own handler`);
+  }
+  // No handler survives the batch: a no-handler eval runs to completion
+  // and a no-handler drain is clean.
+  assert.equal(value(await v.evalCode('6 * 7')), 42);
+  assert.equal(v.drainJobs(), 0);
+});
+
+test('thrown symbols report their native string form, never NaN', async () => {
+  using v = await vm();
+  // Review regression: the primitive error-rendering default branch called
+  // `toNumber()` on symbols, so `throw Symbol('x')` reported message `NaN`
+  // — a fabricated conversion. The native conversion is
+  // `String(Symbol(desc))`; the description is read through the raw export.
+  const e = error(await v.evalCode('throw Symbol("boom")'));
+  assert.equal(e.name, 'Error');
+  assert.equal(e.message, 'Symbol(boom)');
+  assert.equal(error(await v.evalCode('throw Symbol()')).message, 'Symbol()');
+  assert.equal(error(await v.evalCode('throw Symbol("")')).message, 'Symbol()');
+  assert.equal(error(await v.evalCode('throw Symbol.for("shared")')).message, 'Symbol(shared)');
+  // Rejected top-level awaits surface the same conversion.
+  const r = error(await v.evalCode('await Promise.reject(Symbol("rejected"))'));
+  assert.equal(r.message, 'Symbol(rejected)');
+  // The VM stays usable.
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
 });
