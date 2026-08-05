@@ -109,6 +109,101 @@ test('syntax errors report name and message, VM stays usable', async () => {
   assert.equal(value(await v.evalCode('1 + 1')), 2);
 });
 
+test('synchronous parse failures never invoke guest getters (trap-free error boundary)', async () => {
+  using v = await vm();
+  // Adversarial regression (review): quickjs-wasi's `evalCode()` wraps a
+  // synchronous parse failure in a `JSException` whose constructor
+  // performs guest-visible `[[Get]]` reads of name/message/stack — a
+  // getter installed on `SyntaxError.prototype.name` executed during
+  // error reporting, before any host catch. The engine's eval path must
+  // never construct that exception: descriptor reads only.
+  assert.equal(
+    value(
+      await v.evalCode(`
+        globalThis.__traps = 0;
+        for (const key of ['name', 'message', 'stack']) {
+          Object.defineProperty(SyntaxError.prototype, key, {
+            configurable: true,
+            get() { globalThis.__traps++; return 'trapped'; },
+          });
+        }
+        'installed';
+      `),
+    ),
+    'installed',
+  );
+  const e = error(await v.evalCode('const ='));
+  // The real message is an own data property of the SyntaxError instance
+  // and is still reported; the accessor `name` (and stack) are skipped,
+  // never invoked, so the name falls back to 'Error'.
+  assert.equal(e.name, 'Error');
+  assert.ok(e.message.length > 0);
+  assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no guest getter ran');
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('rejected completions never invoke guest getters on the error', async () => {
+  using v = await vm();
+  value(
+    await v.evalCode(`
+      globalThis.__traps = 0;
+      Object.defineProperty(TypeError.prototype, 'name', {
+        configurable: true,
+        get() { globalThis.__traps++; return 'TypeError'; },
+      });
+      'installed';
+    `),
+  );
+  const e = error(await v.evalCode('const err = new TypeError("boom"); throw err'));
+  assert.equal(e.message, 'boom');
+  assert.equal(e.name, 'Error', 'accessor name is skipped, never invoked');
+  assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no guest getter ran');
+});
+
+test('a thrown proxy is reported trap-free (no descriptor/prototype traps)', async () => {
+  using v = await vm();
+  // Adversarial regression (review): a thrown proxy executed three guest
+  // traps (one per name/message/stack descriptor read). Every descriptor
+  // and prototype inspection must be guarded with `isProxy` first, and
+  // the proxy reports a trap-free marker.
+  const e = error(
+    await v.evalCode(`
+      globalThis.__traps = 0;
+      const p = new Proxy({}, {
+        getOwnPropertyDescriptor(t, k) { globalThis.__traps++; return Reflect.getOwnPropertyDescriptor(t, k); },
+        getPrototypeOf(t) { globalThis.__traps++; return Reflect.getPrototypeOf(t); },
+        get(t, k) { globalThis.__traps++; return Reflect.get(t, k); },
+        ownKeys(t) { globalThis.__traps++; return Reflect.ownKeys(t); },
+      });
+      throw p;
+    `),
+  );
+  assert.equal(e.name, 'Error');
+  assert.equal(e.message, '[Proxy]');
+  assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no proxy trap ran');
+});
+
+test('an error whose prototype is a proxy is reported without firing its traps', async () => {
+  using v = await vm();
+  // The error object itself is not a proxy, but its prototype is
+  // (`Object.setPrototypeOf` works on errors) — reading `name` off that
+  // prototype would fire the proxy's `getOwnPropertyDescriptor` trap.
+  const e = error(
+    await v.evalCode(`
+      globalThis.__traps = 0;
+      const proto = new Proxy({ name: 'TypeError' }, {
+        getOwnPropertyDescriptor(t, k) { globalThis.__traps++; return Reflect.getOwnPropertyDescriptor(t, k); },
+      });
+      const err = new TypeError('boom');
+      Object.setPrototypeOf(err, proto);
+      throw err;
+    `),
+  );
+  assert.equal(e.message, 'boom');
+  assert.equal(e.name, 'Error', 'proxy-prototype name is never read');
+  assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no proxy trap ran');
+});
+
 test('an eval suspended on an unsettled promise reports pending, with no fabricated value', async () => {
   using v = await vm();
   const outcome = await v.evalCode('const gate = new Promise(() => {}); await gate; "never"');
@@ -190,6 +285,57 @@ test('job drain: drainJobs() is the standalone settlement drain', async () => {
   assert.equal(pending.kind, 'pending');
   assert.equal(v.drainJobs(), 0);
   // And the VM keeps working after both.
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('job-drain errors never invoke guest getters (trap-free drain boundary)', async () => {
+  using v = await vm();
+  // Adversarial regression: quickjs-wasi's `executePendingJobs()` renders
+  // a failed job's exception through `toString()`, which executes guest
+  // code (a getter on `Error.prototype.name` fires while the drain error
+  // is reported). The engine's drain reads the exception trap-free.
+  value(
+    await v.evalCode(`
+      globalThis.__traps = 0;
+      Object.defineProperty(Error.prototype, 'name', {
+        configurable: true,
+        get() { globalThis.__traps++; return 'Error'; },
+      });
+      'installed';
+    `),
+  );
+  const e = error(
+    await v.evalCode('queueMicrotask(() => { throw new Error("job boom") }); "queued"'),
+  );
+  assert.equal(e.message, 'job boom');
+  assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no guest getter ran');
+  // The VM stays usable after the drain failure.
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('repeated syntax errors do not accumulate guest memory (exception handles are freed)', async () => {
+  // Adversarial regression (review): the caught `JSException` and its
+  // owned handle were never disposed, and a 1 MiB VM exhausted after
+  // ~4,018 syntax errors — even `1 + 1` then returned a null error. The
+  // exception value must be freed immediately, so the VM is long-lived.
+  using v = await vm({ memoryLimit: 1024 * 1024 });
+  for (let i = 0; i < 20_000; i++) {
+    const e = error(await v.evalCode('const ='));
+    assert.equal(e.name, 'SyntaxError');
+  }
+  assert.equal(value(await v.evalCode('1 + 1')), 2);
+});
+
+test('repeated accessor-valued completions do not accumulate guest memory (accessor handles are freed)', async () => {
+  // Adversarial regression (review): accessor descriptors own `get`/`set`
+  // handles that were never disposed, exhausting a 1 MiB VM after ~3,128
+  // accessor-valued completions. Both handles must be freed.
+  using v = await vm({ memoryLimit: 1024 * 1024 });
+  for (let i = 0; i < 20_000; i++) {
+    const out = await v.evalCode('({ get secret() { return "x" } })');
+    assert.equal(out.kind, 'value');
+    if (out.kind === 'value') assert.deepEqual(out.value, {}, 'accessor is skipped');
+  }
   assert.equal(value(await v.evalCode('1 + 1')), 2);
 });
 
@@ -287,4 +433,10 @@ test('dispose: the VM is torn down and refuses further use', async () => {
   assert.throws(() => v.drainJobs(), /disposed/);
   // Idempotent.
   v.dispose();
+});
+
+test('the shipped binary round-trips as the public wasm type (loadShippedWasm → create)', async () => {
+  using v = await vm({ wasm: await loadShippedWasm() });
+  assert.equal(value(await v.evalCode('6 * 7')), 42);
+  assert.equal(v.memoryLimit, ReplVm.DEFAULT_MEMORY_LIMIT);
 });

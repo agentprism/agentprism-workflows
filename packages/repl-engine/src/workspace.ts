@@ -10,16 +10,21 @@
  */
 
 import { ReplVm, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
+import type { WasmInput } from './types.js';
 
 export type { ReplEvalOptions, ReplEvalOutcome } from './vm.js';
+export type { WasmInput, WasmModule } from './types.js';
 
 /** Options for creating a workspace (per-VM configuration). */
 export interface WorkspaceOptions {
   /**
-   * WASM bytes or a pre-compiled `WebAssembly.Module`. Defaults to the
-   * `quickjs-wasi` package's shipped `quickjs.wasm` binary.
+   * WASM bytes or a pre-compiled module (`WasmInput` — a self-contained
+   * stand-in for `WebAssembly.Module | BufferSource`; the published type
+   * graph must not depend on the consumer's lib, see `types.ts`).
+   * Defaults to the `quickjs-wasi` package's shipped `quickjs.wasm`
+   * binary.
    */
-  wasm?: BufferSource | WebAssembly.Module;
+  wasm?: WasmInput;
   /**
    * Per-VM malloc limit in bytes. Resource limits are server
    * configuration, invisible to the guest; the default is
@@ -108,9 +113,10 @@ export class Workspace {
 export interface WorkspaceRegistryOptions {
   /**
    * WASM bytes or module shared as the default by every workspace the
-   * registry creates. Defaults to the shipped `quickjs.wasm` binary.
+   * registry creates (see `WasmInput` in `types.ts`). Defaults to the
+   * shipped `quickjs.wasm` binary.
    */
-  wasm?: BufferSource | WebAssembly.Module;
+  wasm?: WasmInput;
   /**
    * Default per-VM malloc limit in bytes for workspaces created without
    * their own `memoryLimit` (per-workspace limits override this).

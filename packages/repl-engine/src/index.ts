@@ -14,6 +14,7 @@
 
 export {
   ReplVm,
+  DrainJobError,
   loadShippedWasm,
   type ReplVmOptions,
   type ReplEvalOptions,
@@ -21,3 +22,4 @@ export {
 } from './vm.js';
 export { Workspace, WorkspaceRegistry, type WorkspaceOptions, type WorkspaceRegistryOptions } from './workspace.js';
 export type { EvalErrorInfo } from './errors.js';
+export type { WasmInput, WasmModule } from './types.js';
