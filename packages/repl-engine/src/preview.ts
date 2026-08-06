@@ -1078,29 +1078,38 @@ export function inspectGlobal(vm: ReplVm, name: string): {
   }
 }
 
-/**
- * One binding's manifest metadata (the workspace-manifest seam): a
- * STRUCTURE-ONLY token plus the live-handle call id when the binding is
- * an agent handle. Resolution is trap-free: the binding is read through
- * its own property descriptor on globalThis, never a `[[Get]]` — an
- * accessor-rebound binding renders the explicit sabotage marker and its
- * getter is NEVER invoked (rendering the manifest must not execute guest
- * code).
+/** One binding's manifest metadata (the workspace-manifest seam): the
+ *  structure-only token, the byte-size estimate, and the live-handle
+ *  call id when the binding is an agent handle. Resolution is trap-free:
+ *  the binding is read through its own property descriptor on
+ *  globalThis, never a `[[Get]]` — an accessor-rebound binding renders
+ *  the explicit sabotage marker and its getter is NEVER invoked
+ *  (rendering the manifest must not execute guest code).
  *
  * The token NEVER embeds value content (the harness manifest's hygiene
- * rule): type label plus shape count plus byte size — for strings the
- * bare `string` label plus size, for arrays/buffers the structural
- * `<Kind>(<len>)` description, for plain objects `{N keys}`, for every
- * other brand the brand label alone. A live agent handle (an own
- * non-enumerable marker property under the registered handle symbol,
- * read through the descriptor machinery — a guest-rebound handle can
- * never forge the read) reports `agent handle` plus its call id; the
- * caller (the broker) appends the live-handle status from the call
- * store.
+ * rule): type label plus shape count plus byte size — EVERY binding
+ * reports name, type, and size (the doc's manifest contract; phase-E
+ * review rejection: undefined/null/numbers/booleans/bigints/symbols/
+ * functions and plain promises used to render without any size). For
+ * strings the bare `string` label plus size, for arrays/buffers the
+ * structural `<Kind>(<len>)` description, for plain objects `{N keys}`,
+ * for every other brand the brand label plus size. A live agent handle
+ * (an own non-enumerable marker property under the registered handle
+ * symbol, read through the descriptor machinery — a guest-rebound
+ * handle can never forge the read) reports `agent handle` plus its call
+ * id; the caller (the broker) appends the live-handle status from the
+ * call store.
+ *
+ * `sizeBytes` is the trap-free byte-size estimate (`estimateSize` — an
+ * undercount by design for opaque internals; 0 for the accessor and
+ * unreadable cases, where no size exists without invoking the getter).
  *
  * Returns null for an absent/unreadable slot.
  */
-export function manifestBinding(vm: ReplVm, name: string): { token: string; handleCallId: string | null } | null {
+export function manifestBinding(
+  vm: ReplVm,
+  name: string,
+): { token: string; handleCallId: string | null; sizeBytes: number } | null {
   // The lexical view first (see `inspectGlobal`): a global lexical
   // binding shadows a same-named global-object property, so the
   // manifest's binding is the lexical one. Lexical bindings are always
@@ -1117,7 +1126,9 @@ export function manifestBinding(vm: ReplVm, name: string): { token: string; hand
   const value = readSlotValue(vm, name);
   if (value === undefined) {
     const kind = readRealmSlotKind(vm, name);
-    if (kind === 'accessor') return { token: 'accessor (getter not invoked)', handleCallId: null };
+    if (kind === 'accessor') {
+      return { token: 'accessor (getter not invoked)', handleCallId: null, sizeBytes: 0 };
+    }
     return null;
   }
   try {
@@ -1129,35 +1140,47 @@ export function manifestBinding(vm: ReplVm, name: string): { token: string; hand
 
 /** The shared manifest-token logic over one resolved binding value (see
  *  `manifestBinding`): the live-handle detector first, then the
- *  structure-only token. Trap-free throughout (see `manifestBinding`); a
- *  preview failure degrades to the `?` token, never a throw. */
-function describeBindingValue(vm: ReplVm, value: JSValueHandle): { token: string; handleCallId: string | null } {
+ *  structure-only token — EVERY binding carries its byte-size estimate
+ *  (the doc's name/type/size contract; the size is computed for the
+ *  agent-handle case too, before the handle marker short-circuit).
+ *  Trap-free throughout (see `manifestBinding`); a preview failure
+ *  degrades to the `?` token with size 0, never a throw. */
+function describeBindingValue(
+  vm: ReplVm,
+  value: JSValueHandle,
+): { token: string; handleCallId: string | null; sizeBytes: number } {
   try {
     // The live-handle detector first: an own data property under the
     // registered handle symbol, read through the raw descriptor export
     // (never a [[Get]]; proxies are guarded before any descriptor read).
     const handleCallId = agentHandleCallId(vm, value);
-    if (handleCallId !== null) {
-      return { token: 'agent handle', handleCallId };
-    }
+    // The preview and the plain-object key count must be read BEFORE
+    // `estimateSize` (which consumes the handle — its established
+    // dispose contract; the preview is plain data, the key count is
+    // not). The size itself is computed for EVERY binding — the
+    // agent-handle case included (phase-E review rejection: the
+    // manifest used to omit size for handle bindings).
     const preview = previewHandle(value);
-    // The plain-object key count must be read BEFORE `estimateSize` (which
-    // consumes the handle — its established dispose contract; the preview
-    // is plain data, the key count is not).
     const keyCount =
       preview.type === 'object' && preview.subtype === undefined ? ownKeyCount(value) : null;
     const size = estimateSize(value);
+    if (handleCallId !== null) {
+      return { token: 'agent handle', handleCallId, sizeBytes: size };
+    }
     const token = describeManifest(preview, size, keyCount);
-    return { token, handleCallId: null };
+    return { token, handleCallId: null, sizeBytes: size };
   } catch {
-    return { token: '?', handleCallId: null };
+    return { token: '?', handleCallId: null, sizeBytes: 0 };
   }
 }
 
 /** The structure-only token for a previewed value (see `manifestBinding`;
  *  mirrors the harness manifest's `describe`). `keyCount` is the plain-
  *  object own string-key count read before the size estimate consumed the
- *  handle (`null` for non-plain-objects). */
+ *  handle (`null` for non-plain-objects). EVERY branch carries the byte
+ *  size — the doc's manifest contract is name, type, AND size for every
+ *  top-level binding (phase-E review rejection: primitives, null,
+ *  functions and plain promises used to render without size). */
 function describeManifest(
   preview: ObjectPreview,
   size: number,
@@ -1165,18 +1188,23 @@ function describeManifest(
 ): string {
   switch (preview.type) {
     case 'undefined':
+      return `undefined \u00b7 ${formatByteSize(size)}`;
     case 'number':
+      return `number \u00b7 ${formatByteSize(size)}`;
     case 'boolean':
+      return `boolean \u00b7 ${formatByteSize(size)}`;
     case 'bigint':
+      return `bigint \u00b7 ${formatByteSize(size)}`;
     case 'symbol':
+      return `symbol \u00b7 ${formatByteSize(size)}`;
     case 'function':
-      return preview.type;
+      return `function \u00b7 ${formatByteSize(size)}`;
     case 'string':
       return `string \u00b7 ${formatByteSize(size)}`;
     case 'object':
       switch (preview.subtype) {
         case 'null':
-          return 'null';
+          return `null \u00b7 ${formatByteSize(size)}`;
         case 'array':
         case 'typedarray':
         case 'arraybuffer':
@@ -1189,8 +1217,9 @@ function describeManifest(
           return `Set(?) \u00b7 ${formatByteSize(size)}`;
         case 'promise':
           // A promise WITHOUT the handle marker is not an agent handle
-          // (a plain guest promise): the brand label alone.
-          return 'Promise';
+          // (a plain guest promise): the brand label plus size (phase-E
+          // review rejection: the size used to be omitted).
+          return `Promise \u00b7 ${formatByteSize(size)}`;
         case 'proxy':
           return `Proxy \u00b7 ${formatByteSize(size)}`;
         default:

@@ -469,6 +469,14 @@ test("wait absorbs a still-running call until the backend settles it; interrupt 
     const armed = await repl(connected, { action: "interrupt", projectDir: PROJECT });
     assert.ok(!isErrorResult(armed), textOf(armed));
     assert.ok(textOf(armed).includes("interrupting the running eval"), textOf(armed));
+    // TARGETING (phase-E review rejection): an UNRELATED eval neither
+    // consumes the eval-break signal nor is broken by it — the signal is
+    // consulted only by settlement drains (the executions that resume
+    // the suspended eval's continuation), never by a fresh eval's own
+    // code — so it is still armed for the running eval when the
+    // continuation executes.
+    const unrelated = await repl(connected, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+    assert.ok(textOf(unrelated).includes("result: 42"), `unrelated eval unaffected: ${textOf(unrelated)}`);
     await tick();
     runner.last().completeTurn("resumed");
     const runaway = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"after"' });
@@ -477,6 +485,57 @@ test("wait absorbs a still-running call until the backend settles it; interrupt 
     // normally, and the VM stays usable.
     const after = await repl(connected, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
     assert.ok(textOf(after).includes("result: 42"), textOf(after));
+  } finally {
+    await connected.dispose();
+  }
+});
+
+test("interrupt without an id on an IDLE workspace is an honest no-op — nothing is armed, and the next eval runs normally (phase-E review rejection: the project-wide boolean used to be armed regardless, so an idle workspace's next eval consumed it)", async () => {
+  const runner = new FakeRunner();
+  const connected = await connectWithRepl(runner);
+  try {
+    // Idle from the start: no eval has ever run — there is no running
+    // eval to target, so the interrupt REFUSES and arms nothing.
+    const idle = await repl(connected, { action: "interrupt", projectDir: PROJECT });
+    assert.ok(!isErrorResult(idle), textOf(idle));
+    assert.ok(textOf(idle).includes("no running eval to interrupt"), textOf(idle));
+    // The next eval is NOT broken (nothing was armed).
+    const r = await repl(connected, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+    assert.ok(textOf(r).includes("result: 42"), textOf(r));
+    // After a RESOLVED eval the workspace is idle again.
+    const idle2 = await repl(connected, { action: "interrupt", projectDir: PROJECT });
+    assert.ok(textOf(idle2).includes("no running eval to interrupt"), textOf(idle2));
+    // After a suspended eval's continuation COMPLETES, the workspace
+    // returns to idle: the eval that was running no longer exists, so the
+    // interrupt is refused again instead of arming a stale signal.
+    // (Unique binding names: the module-level PROJECT's workspace is
+    // shared across this file's tests through the persisted repl store.)
+    const started = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const idleWait = agent("pi/x", "task"); await idleWait; "waited"',
+    });
+    assert.ok(!isErrorResult(started), textOf(started));
+    // The call id continues the shared workspace's sequence (earlier
+    // tests in this file used c1..c3); capture it from the result.
+    const pendingId = /pending: (c\d+)/.exec(textOf(started))?.[1];
+    assert.ok(pendingId !== undefined, textOf(started));
+    runner.last().completeTurn("done");
+    await tick();
+    const waited = await repl(connected, {
+      action: "wait",
+      projectDir: PROJECT,
+      ids: [pendingId!],
+      timeoutMs: 5000,
+    });
+    assert.ok(textOf(waited).includes(`completed: ${pendingId}`), textOf(waited));
+    const idle3 = await repl(connected, { action: "interrupt", projectDir: PROJECT });
+    assert.ok(
+      textOf(idle3).includes("no running eval to interrupt"),
+      `idle after the continuation completed: ${textOf(idle3)}`,
+    );
+    const stillFine = await repl(connected, { action: "eval", projectDir: PROJECT, code: "3 + 4" });
+    assert.ok(textOf(stillFine).includes("result: 7"), textOf(stillFine));
   } finally {
     await connected.dispose();
   }

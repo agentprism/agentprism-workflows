@@ -28,7 +28,16 @@
  *   attributes NEW or REBOUND bindings (SameValue — NaN is stable) to the
  *   operation's host-shaped origin label (`eval N` with the registry's
  *   own monotonic, snapshot-durable counter; `worker c1+c2`; `session
- *   restore`). In-place mutation deliberately does NOT re-attribute (the
+ *   restore`). GLOBAL LEXICAL bindings (top-level let/const/class) are
+ *   tracked by their VALUES: the host reads each binding's current value
+ *   through the internal global-var object and hands it to the registry,
+ *   which RE-ATTRIBUTES a changed value to the operation that produced
+ *   it — a `let` binding assigned a worker result, or a suspended `const
+ *   finding = await research` whose continuation assigned the settled
+ *   value, re-attributes to the settlement's `worker cN` label, so the
+ *   manifest reports which subagent produced the current value, from
+ *   what task, when. In-place mutation of a binding's VALUE (a property
+ *   of the bound object, say) deliberately does NOT re-attribute (the
  *   binding still refers to the value its recorded origin produced).
  *   The pass is trap-free by construction: own-property-descriptor reads
  *   only (an accessor-rebound binding is detected through its getter
@@ -48,7 +57,7 @@ import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
 import { installGuestBridge, type GuestBridgeHandlers } from './bridge.js';
 import { GUEST_PROVENANCE_KEY, PROVENANCE_FACTORY } from './guest/guest-library.js';
-import { rawLexicalKeys } from './global-lexical.js';
+import { rawLexicalKeys, readLexicalSlotValue } from './global-lexical.js';
 import { wasmSha256Of } from './snapshot-envelope.js';import {
   getPropRaw,
   hasOwnRaw,
@@ -288,15 +297,46 @@ export function provenanceRecord(vm: ReplVm, origin: ProvenanceOrigin): void {
     // the pass (no guest-visible surface grows for it). A registry whose
     // record closure predates the feature (an older snapshot) simply
     // ignores the argument.
-    lexHandle = shim.newString(JSON.stringify(rawLexicalKeys(vm)));
-    const result = new JSValueHandle(
-      shim,
-      callRaw(e, shim, recordFn.ptr, [labelHandle, atHandle, lexHandle]),
-    );
+    const lexNames = rawLexicalKeys(vm);
+    lexHandle = shim.newString(JSON.stringify(lexNames));
+    // The pass's FOURTH+ arguments: the realm's CURRENT LEXICAL VALUES,
+    // one realm value per name in the names array's order (the factory
+    // reads them at `arguments[3 + i]`). The host reads each binding
+    // through the internal global-var object's descriptor machinery and
+    // hands the VALUES over so the registry can detect a CHANGE
+    // (SameValue) and RE-ATTRIBUTE: a `let` binding assigned a worker
+    // result, or a suspended `const finding = await research` whose
+    // continuation assigned the settled value, re-attributes to the
+    // settlement's `worker cN` label — the manifest then reports WHICH
+    // subagent produced the current value, from what task, when
+    // (phase-E review rejection: the lexical entry was recorded on
+    // first sight only, so a value the worker settlement produced kept
+    // the declaring eval's label with no task). A registry whose record
+    // closure predates the feature (an older snapshot) ignores the
+    // extra arguments and degrades to first-sight-only attribution.
+    // The handles are BORROWED by the call (callRaw never frees its
+    // arguments) and disposed afterwards; `shim.undefined` (a cached
+    // singleton — dispose is a no-op) stands in for an unreadable
+    // binding (a TDZ cell reads as its raw uninitialized marker, which
+    // is passed through unchanged — SameValue against the settled value
+    // differs, so the re-attribution still fires).
+    const lexValues: JSValueHandle[] = [];
+    for (const name of lexNames) {
+      const value = readLexicalSlotValue(vm, name);
+      lexValues.push(value ?? shim.undefined);
+    }
     try {
-      if (e.qjs_is_exception(result.ptr) !== 0) takeAndFreeException(e, shim);
+      const result = new JSValueHandle(
+        shim,
+        callRaw(e, shim, recordFn.ptr, [labelHandle, atHandle, lexHandle, ...lexValues]),
+      );
+      try {
+        if (e.qjs_is_exception(result.ptr) !== 0) takeAndFreeException(e, shim);
+      } finally {
+        result.dispose();
+      }
     } finally {
-      result.dispose();
+      for (const value of lexValues) value.dispose();
     }
   } finally {
     if (ownsLabel) labelHandle?.dispose();

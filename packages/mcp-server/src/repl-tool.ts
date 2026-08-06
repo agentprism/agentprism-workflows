@@ -28,9 +28,12 @@
  * - `interrupt { projectDir, id? }` → cancel one subagent call (ACP
  *   `session/cancel` downward; a drained handle's recorded session is
  *   re-attached lazily first); without an id, BREAK THE RUNNING EVAL:
- *   the armed signal is consumed by the in-flight eval's execution — a
- *   suspended eval's continuation is broken by the quickjs interrupt
- *   handler when it runs (a later eval is unaffected). The daemon is
+ *   the broker's eval-break arm targets the tracked suspended eval —
+ *   the armed signal is consumed by the running eval's continuation
+ *   execution (the quickjs interrupt handler breaks it MID-RUN when it
+ *   resumes; a later eval is unaffected — fresh eval code never
+ *   consults the signal), and an IDLE workspace is refused honestly
+ *   (nothing is armed). The daemon is
  *   single-threaded, so a request cannot be PROCESSED while a
  *   synchronous top-level runaway executes — every eval and settlement
  *   drain runs under a per-eval wall-clock deadline enforced by the
@@ -70,7 +73,8 @@ export const replToolInputShape = {
     .describe(
       "Operation. eval runs a script in the workspace's VM (persistent between calls); wait pumps server-side " +
         "until the target calls settle or the timeout elapses; status reports workspaces, the workspace manifest, " +
-        "live agents, and pending ops; interrupt cancels one subagent call or arms the eval-break signal; reset " +
+        "live agents, and pending ops; interrupt cancels one subagent call or breaks the running eval (refused when " +
+        "nothing is running); reset " +
         "drops the VM and its stored state.",
     ),
   projectDir: z
@@ -102,7 +106,7 @@ export const replToolInputShape = {
   id: z
     .string()
     .optional()
-    .describe("The call id to cancel (interrupt action). Omitted: arm the eval-break signal."),
+    .describe("The call id to cancel (interrupt action). Omitted: break the running eval (honestly refused when no eval is in flight)."),
 };
 
 export interface ReplToolOptions {
@@ -435,25 +439,41 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       // synchronous top-level runaway executes (the per-eval wall-clock
       // deadline bounds that case independently) — but an eval that is
       // in flight (suspended on a subagent call) has its continuation
-      // executed by later settlement drains, and the armed signal is
-      // consumed by THE RUNNING EVAL'S execution: when its continuation
-      // (a runaway loop, say) runs, the quickjs interrupt handler fires
-      // MID-RUN and breaks it (phase-E review rejection: the signal
-      // used to be described as merely arming "the next VM execution",
-      // and the test pre-armed it before the eval even started — the
-      // required ability to interrupt a RUNNING eval was never
-      // exercised). A later eval is unaffected: the signal is consumed
-      // by the running eval's execution, not by arbitrary later ones.
+      // executed by later settlement drains, and the broker's
+      // eval-break arm TARGETS that running eval: the armed signal is
+      // consumed by the running eval's continuation execution (the
+      // quickjs interrupt handler fires MID-RUN and breaks it), it is
+      // consulted ONLY by settlement drains — never by a fresh eval's
+      // own code — and it is refused when NO eval is running (phase-E
+      // review rejection: the signal used to be a project-wide boolean
+      // armed even when idle, so the next eval — or an unrelated
+      // drain — could consume it before the intended suspended
+      // continuation). A later eval is unaffected: the signal is
+      // consumed by the running eval's execution, not by arbitrary
+      // later ones.
       if (args.id === undefined) {
-        state.interrupt.armed = true;
+        const targeted = await broker.armEvalBreak();
+        if (!targeted) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: capToolResultText(
+                  `workspace ${context.projectDir}: no running eval to interrupt — the workspace is idle ` +
+                    `(no eval is suspended or in flight) and nothing was armed`,
+                ),
+              },
+            ],
+          };
+        }
         return {
           content: [
             {
               type: "text",
               text: capToolResultText(
                 `workspace ${context.projectDir}: interrupting the running eval — the eval-break signal is set for ` +
-                  `the quickjs interrupt handler; a suspended eval's continuation is broken when it resumes, and a ` +
-                  `currently-executing synchronous runaway is already bounded by the per-eval deadline (it cannot run away)`,
+                  `the quickjs interrupt handler; the suspended eval's continuation is broken when it resumes (a ` +
+                  `currently-executing synchronous runaway is already bounded by the per-eval deadline — it cannot run away)`,
               ),
             },
           ],

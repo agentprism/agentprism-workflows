@@ -97,6 +97,14 @@ export const PROVENANCE_FACTORY = `(function (names) {
     evalSeq: 0,
     origins: Object.create(null),
     prev: Object.create(null),
+    // The lexical pass's value tracker (see record): the CURRENT value
+    // of each global lexical binding (top-level let/const/class), by
+    // name — the SameValue comparison base for re-attribution. The
+    // guest cannot read lexical bindings (the global declarative record
+    // is non-reflectable), so the HOST passes the values in; this map
+    // is where the registry keeps them (a strong reference, exactly
+    // like the property pass's prev values).
+    lexPrev: Object.create(null),
     known: Object.create(null),
   };
   function record(label, atMs) {
@@ -119,12 +127,29 @@ export const PROVENANCE_FACTORY = `(function (names) {
       // per name, the lexical view authoritative). A pass without the
       // argument (an older host, or a registry snapshot whose record
       // closure predates the feature) skips the merge.
+      //
+      // The pass's FOURTH+ arguments carry the CURRENT lexical VALUES,
+      // one realm value per name in the names array's order (the host
+      // reads them through the internal global-var object — the same
+      // host-driven channel as the names; a guest can never forge the
+      // values). With the values the registry can detect a CHANGE
+      // (SameValue) and RE-ATTRIBUTE: a 'let' binding assigned a worker
+      // result, or a suspended 'const finding = await research' whose
+      // continuation assigned the settled value, re-attributes to the
+      // settlement's 'worker cN' label — the manifest then reports
+      // WHICH subagent produced the current value, from what task, when
+      // (phase-E review rejection: the lexical entry was recorded on
+      // first sight only, so a value the worker settlement produced
+      // kept the declaring eval's label with no task). Without the
+      // values (an older host) the pass degrades to first-sight-only
+      // attribution, the pre-feature behavior.
       var lexNames = null;
       try {
         if (arguments.length >= 3 && typeof arguments[2] === 'string' && arguments[2].length > 0) {
           lexNames = jparse(arguments[2]);
         }
       } catch (e) { lexNames = null; }
+      var lexValueCount = Math.max(0, arguments.length - 3);
       var lexSet = Object.create(null);
       if (lexNames !== null && typeof lexNames.length === 'number') {
         for (var li = 0; li < lexNames.length; li++) {
@@ -156,9 +181,12 @@ export const PROVENANCE_FACTORY = `(function (names) {
           reg.prev[k] = v;
         }
       }
-      // The lexical pass: attribute on first sight. A lexical binding
-      // can only be CREATED (never redeclared or removed), so name
-      // presence IS the event; the entry is stable afterwards. A name
+      // The lexical pass: attribute on first sight; with the host's
+      // VALUE arguments, RE-ATTRIBUTE on a value change (SameValue —
+      // the current label produced the current value: a 'let' assigned
+      // a worker result, or a suspended 'const finding = await
+      // research' whose continuation assigned the settled value,
+      // re-attributes to the settlement's 'worker cN' label). A name
       // first attributed as a global PROPERTY and later shadowed by a
       // lexical declaration is re-attributed when the lexical binding
       // appears — the property path stored the property VALUE in
@@ -166,16 +194,31 @@ export const PROVENANCE_FACTORY = `(function (names) {
       // predates the lexical binding (after re-attribution prev[k] is
       // undefined and stays; the corner where the property value itself
       // was literally undefined is accepted — orientation metadata).
-      for (var lk2 in lexSet) {
-        if (reg.known[lk2]) continue;
-        seen[lk2] = true;
-        if (reg.origins[lk2] === undefined || reg.prev[lk2] !== undefined) {
-          reg.origins[lk2] = { via: label, at: atMs };
-          reg.prev[lk2] = undefined;
+      if (lexNames !== null && typeof lexNames.length === 'number') {
+        for (var li2 = 0; li2 < lexNames.length; li2++) {
+          var lk2 = lexNames[li2];
+          if (typeof lk2 !== 'string') continue;
+          if (reg.known[lk2]) continue;
+          seen[lk2] = true;
+          if (lexValueCount > 0) {
+            var cur = arguments[3 + li2];
+            if (!hasOwnProp.call(reg.lexPrev, lk2)) {
+              reg.origins[lk2] = { via: label, at: atMs };
+              reg.lexPrev[lk2] = cur;
+            } else if (reg.lexPrev[lk2] !== cur && !(reg.lexPrev[lk2] !== reg.lexPrev[lk2] && cur !== cur)) {
+              reg.origins[lk2] = { via: label, at: atMs };
+              reg.lexPrev[lk2] = cur;
+            }
+          } else {
+            if (reg.origins[lk2] === undefined || reg.prev[lk2] !== undefined) {
+              reg.origins[lk2] = { via: label, at: atMs };
+              reg.prev[lk2] = undefined;
+            }
+          }
         }
       }
       for (var gone in reg.origins) {
-        if (!seen[gone]) { delete reg.origins[gone]; delete reg.prev[gone]; }
+        if (!seen[gone]) { delete reg.origins[gone]; delete reg.prev[gone]; delete reg.lexPrev[gone]; }
       }
     } catch (e) {}
   }

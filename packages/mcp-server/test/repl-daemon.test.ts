@@ -290,10 +290,11 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       assert.ok(!isErrorResult(evaled), textOf(evaled));
       assert.ok(textOf(evaled).includes("result: 42"), textOf(evaled));
       // status: the workspace manifest — metadata (name/type token),
-      // never content.
+      // never content. EVERY binding carries its byte size (phase-E
+      // review rejection: primitives used to render without size).
       const status = await repl(session, { action: "status", projectDir: PROJECT });
       assert.ok(textOf(status).includes(`workspace ${PROJECT}: fresh`), textOf(status));
-      assert.ok(textOf(status).includes("answer = number"), textOf(status));
+      assert.ok(textOf(status).includes("answer = number · 8B"), textOf(status));
       assert.ok(!textOf(status).includes("40 + 2"), `content leaked: ${textOf(status)}`);
       // A pending subagent call; wait is bounded ("still running" on
       // timeout — absorbs client tool-call timeouts).
@@ -366,7 +367,9 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       assert.ok(textOf(lexed).includes("pending: c1"), textOf(lexed));
       const statusLex = await repl(session, { action: "status", projectDir: PROJECT });
       assert.ok(
-        textOf(statusLex).includes("research = agent handle · pending · call c1 · via eval 2 · task \"task\""),
+        textOf(statusLex).includes(
+          "research = agent handle · pending · call c1 · 151B · via eval 2 · task \"task\"",
+        ),
         `lexical binding in status: ${textOf(statusLex)}`,
       );
     } finally {

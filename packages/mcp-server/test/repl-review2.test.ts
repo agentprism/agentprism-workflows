@@ -232,7 +232,7 @@ test("review2: status renders the workspace manifest — bindings with structure
     const r = await repl(connected, {
       action: "eval",
       projectDir: PROJECT,
-      code: 'globalThis.findings = { zekret: "MARKER".repeat(10), n: 1 }; globalThis.research = agent("pi/x", "investigate"); "done"',
+      code: 'globalThis.findings = { zekret: "MARKER".repeat(10), n: 1 }; globalThis.n = 3; globalThis.research = agent("pi/x", "investigate"); "done"',
     });
     assert.ok(!isErrorResult(r), textOf(r));
     await tick();
@@ -240,7 +240,12 @@ test("review2: status renders the workspace manifest — bindings with structure
     const text = textOf(status);
     assert.ok(text.includes("bindings:"), text);
     assert.ok(text.includes("findings = {2 keys}"), text);
+    // EVERY binding carries its byte size in the rendered token —
+    // primitives included (phase-E review rejection: the manifest's size
+    // surface used to stop at strings, containers and brands).
+    assert.ok(text.includes("n = number · 8B"), `primitive size in status: ${text}`);
     assert.ok(text.includes("research = agent handle · pending · call c1"), text);
+    assert.ok(text.includes("· 151B"), `handle size in status: ${text}`);
     assert.ok(text.includes("via eval 1"), text);
     // The doc's full provenance surface (phase-D review round 3): the
     // binding renders "from what task, when" — the founding task text and

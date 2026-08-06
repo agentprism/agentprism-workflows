@@ -45,6 +45,10 @@ export interface WorkspaceBinding {
   /** Structure-only token (type/shape/size — never value content), or
    *  `agent handle` for a live agent handle. */
   token: string;
+  /** The trap-free byte-size estimate of the binding's value (the doc's
+   *  manifest contract: every top-level binding reports name, type, AND
+   *  size; 0 only for the unreadable accessor/sabotage cases). */
+  sizeBytes: number;
   /** The stable call id when the binding is an agent handle (the broker
    *  appends the live-handle status from the call store); null otherwise. */
   handleCallId: string | null;
@@ -267,7 +271,11 @@ export class Workspace {
    * `eval`, but when the eval RESOLVED the live completion-value handle
    * comes back alongside the shallow snapshot (`completion` — an opaque
    * quickjs-wasi `JSValueHandle`, OWNED BY THE CALLER, who must dispose it
-   * after previewing; `undefined` for pending/error outcomes). The broker
+   * after previewing; for a SUSPENDED eval (the completion pending on a
+   * host call) it is the eval wrapper promise handle — the caller's
+   * active-eval probe (the wrapper settles when the continuation
+   * completes or is broken; the caller owns and must dispose it);
+   * `undefined` for error outcomes). The broker
    * previews it trap-free for the tool result's `result` line. Not part of
    * the published API (not re-exported from the index); `completion` is
    * typed `unknown` so the public declaration graph stays self-contained.
@@ -454,6 +462,7 @@ export class Workspace {
       bindings.push({
         name,
         token: info.token,
+        sizeBytes: info.sizeBytes,
         handleCallId: info.handleCallId,
         provenance: origin === undefined ? null : origin.via,
         provenanceAtMs: origin === undefined ? null : origin.at,

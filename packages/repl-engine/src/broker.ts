@@ -333,7 +333,7 @@ import { isWorkflowError, WorkflowError, WorkflowErrorCode } from '@automatalabs
 import { isAbsolute } from 'node:path';
 
 import type { GuestBridgeHandlers, GuestCall, GuestSurfaceEntry } from './bridge.js';
-import { headTailDescription, renderCompletionLine, stringDescription } from './preview.js';
+import { formatByteSize, headTailDescription, renderCompletionLine, stringDescription } from './preview.js';
 import { applyOutputCaps } from './caps.js';
 import { InMemoryCallStore, type CallOutcome, type CallRecord, type CallStore } from './store.js';
 import { DrainJobError, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
@@ -607,9 +607,19 @@ export type SnapshotBoundaryKind = 'eval' | 'settlement';
 export interface WorkspaceManifestBinding {
   name: string;
   /** Structure-only token — for an agent handle, `agent handle ·
-   *  pending|settled · call <id>` (the live-handle status appended from
-   *  the call store; the id maps to the task and timestamps). */
+   *  pending|settled · call <id> · <size>` (the live-handle status
+   *  appended from the call store; the id maps to the task and
+   *  timestamps). Every token carries the binding's byte size (phase-E
+   *  review rejection: the token used to omit size for primitives,
+   *  null, functions and plain promises). */
   token: string;
+  /** The trap-free byte-size estimate of the binding's value — the
+   *  doc's manifest contract is name, type, AND size for every
+   *  top-level binding; exposed as its own field so a structured
+   *  consumer never has to parse the token (phase-E review rejection:
+   *  the broker exposed no separate size field). 0 only for the
+   *  unreadable accessor/sabotage cases. */
+  sizeBytes: number;
   /** The sanitized provenance label (`eval 3`, `worker c2`, `session
    *  restore`), or null when untracked. */
   provenance: string | null;
@@ -885,6 +895,33 @@ export class Broker {
   /** Call ids settled synchronously at dispatch (refusals) since the
    *  last eval result — reported in that eval's `completed`. */
   private readonly syncSettled: string[] = [];
+  /** Completion wrappers of SUSPENDED evals whose continuation is still
+   *  in flight (see `eval`): the wrapper settles when the continuation
+   *  completes or is broken — the broker's "an eval is running" probe.
+   *  This is the interrupt tool's eval-break TARGET surface (phase-E
+   *  review rejection: the no-id interrupt used to arm a project-wide
+   *  "next VM execution" boolean with no notion of a running eval, so
+   *  an idle workspace's next eval — or an unrelated drain — consumed
+   *  it; the doc's "break a runaway eval" requires a tracked,
+   *  targetable running eval). Handles are owned by the broker;
+   *  released by `sweepActiveEvals` when they settle and by `dispose`.
+   *  A suspended eval stacks alongside earlier ones (each suspension
+   *  retains its own wrapper; the eval-break signal targets the
+   *  arming-time set). */
+  private readonly activeEvalCompletions = new Set<JSValueHandle>();
+  /** The eval-break signal (the interrupt tool's no-id arm): consulted
+   *  ONLY by settlement drains (`drain` — the executions that resume
+   *  suspended-eval continuations), NEVER by a fresh eval's own code or
+   *  its own job drain (`runEval` does not compose it) — an unrelated
+   *  eval can neither consume the signal nor be broken by it. Consumed
+   *  on first observation (the quickjs interrupt polls constantly, so
+   *  the next continuation execution after arming breaks mid-run). */
+  private evalBreakArmed = false;
+  /** The arming-time active-eval set the eval-break signal is scoped
+   *  to: when every target settles, the signal is cleared with them —
+   *  a signal whose target no longer exists must never leak into a
+   *  later execution. */
+  private evalBreakTargets = new Set<JSValueHandle>();
   /** True once the client-presence drain released every child (see
    *  `drainForDisconnect`): the workspace stays live, and later
    *  followUp/steer/cancel on a settled handle lazily re-attach the
@@ -1014,6 +1051,16 @@ export class Broker {
       // rebound (including the `$N` refs its console.logs froze) are
       // attributed to `eval N` (the registry's snapshot-durable counter).
       this.provenancePass('eval');
+      // A SUSPENDED eval's completion wrapper is retained as the
+      // active-eval probe (the interrupt tool's eval-break target
+      // surface): the wrapper is pending while the eval's continuation
+      // is in flight and settles when the continuation completes or is
+      // broken — `sweepActiveEvals` releases it at the next operation.
+      // A RESOLVED eval's completion handle is owned by `render` (it
+      // previews and disposes it); an error outcome carries none.
+      if (outcome.kind === 'pending' && completion !== undefined) {
+        this.activeEvalCompletions.add(completion as JSValueHandle);
+      }
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
       completed = [...completed, ...this.syncSettled.splice(0)];
@@ -1152,8 +1199,15 @@ export class Broker {
         try {
           this.drain();
         } catch (error) {
-          if (error instanceof DrainJobError) drainError = error;
-          else throw error;
+          if (error instanceof DrainJobError) {
+            drainError = error;
+            // The interrupted drain BROKE a suspended eval's continuation
+            // (see `noteInterruptedDrain`): the tracked running eval is
+            // no longer running — its engine wrapper never settles on an
+            // interrupt, so the tracking must be dropped here or a later
+            // eval-break arm would target a dead eval.
+            this.noteInterruptedDrain();
+          } else throw error;
         }
         // The reconciliation's provenance pass: bindings the reconciled
         // settlements' continuations created are attributed to the settled
@@ -2093,6 +2147,129 @@ export class Broker {
     return this.workspace.surface()?.pending() ?? [];
   }
 
+  /**
+   * Arm the eval-break signal — the `interrupt` tool's no-id path (the
+   * roadmap doc: "break a runaway eval (the quickjs interrupt
+   * handler)"). Returns `false` when NO eval is in flight — the
+   * workspace is idle, there is no continuation to break, and NOTHING
+   * is armed (phase-E review rejection: the old project-wide boolean
+   * was armed regardless, so an idle workspace's next eval — or an
+   * unrelated drain — consumed it before the intended continuation).
+   *
+   * When an eval IS in flight (a suspended eval whose continuation will
+   * run at a later settlement drain), the signal is armed and SCOPED to
+   * the arming-time active evals: it is consulted ONLY by settlement
+   * drains (`drain` — the executions that resume continuations), never
+   * by a fresh eval's own code or its own job drain, so an unrelated
+   * eval can neither consume the signal nor be broken by it; the first
+   * continuation execution after arming breaks mid-run (the quickjs
+   * interrupt handler), and the signal is consumed on that observation.
+   * When every arming-time target settles (completed or broken), the
+   * signal is cleared with them — it never leaks into a later
+   * execution.
+   *
+   * With MULTIPLE concurrently suspended evals (each suspension retains
+   * its own completion), the first continuation execution after arming
+   * is broken — honest ambiguity, the same stance as the provenance
+   * batch labels; the doc's model runs one eval per tool call, where
+   * the armed signal targets exactly the running eval.
+   */
+  async armEvalBreak(): Promise<boolean> {
+    return this.serialized(async () => {
+      this.assertAlive();
+      this.sweepActiveEvals();
+      if (this.activeEvalCompletions.size === 0) return false;
+      this.evalBreakArmed = true;
+      this.evalBreakTargets = new Set(this.activeEvalCompletions);
+      return true;
+    });
+  }
+
+  /**
+   * One pass over the retained suspended-eval completions: a completion
+   * that SETTLED (its continuation completed, or was broken) is
+   * released. The eval-break signal is scoped to its arming-time
+   * targets: when every target settled, the signal is cleared with them
+   * — a signal whose target no longer exists must never leak into a
+   * later execution (a settled target can no longer be broken, and an
+   * armed signal would otherwise fire at the next unrelated drain).
+   * Runs at the start of every serialized operation — the only moments
+   * between operations, since a drain that settles a continuation can
+   * only run inside one. Trap-free: a raw promise-state read per
+   * retained handle.
+   */
+  private sweepActiveEvals(): void {
+    if (this.activeEvalCompletions.size === 0 && !this.evalBreakArmed) return;
+    const settled = new Set<JSValueHandle>();
+    for (const completion of this.activeEvalCompletions) {
+      if (completion.promiseState !== 0) settled.add(completion);
+    }
+    if (this.evalBreakArmed && this.evalBreakTargets.size > 0) {
+      let anyLive = false;
+      for (const target of this.evalBreakTargets) {
+        // A target still in the active set is still pending; one in
+        // `settled` was just released (its state already read — skip
+        // re-reading a disposed handle).
+        if (!settled.has(target) && target.promiseState === 0) {
+          anyLive = true;
+          break;
+        }
+      }
+      if (!anyLive) {
+        this.evalBreakArmed = false;
+        this.evalBreakTargets = new Set();
+      }
+    }
+    for (const completion of settled) {
+      this.activeEvalCompletions.delete(completion);
+      completion.dispose();
+    }
+  }
+
+  /**
+   * A settlement drain was INTERRUPTED (the eval-break signal's
+   * consumption, or the per-eval deadline bounding a runaway
+   * continuation): the drain broke a suspended eval's continuation, and
+   * the interrupted continuation's engine wrapper NEVER settles (the
+   * quickjs interrupt aborts the async job without rejecting its
+   * promise — verified against the shipped binary), so the tracked
+   * "running eval" can only be released HERE. Every tracked eval is
+   * dropped and the eval-break signal is cleared: the interrupted
+   * drain's target — the arming-time active eval — is no longer
+   * running, and a stale entry would make a later eval-break arm
+   * target a dead eval (its signal would then fire at an unrelated
+   * continuation — the phase-E review rejection's leak). With multiple
+   * concurrently suspended evals, all are dropped — honest ambiguity
+   * (the broker cannot attribute which continuation the interrupted
+   * drain was running; refusing a later arm beats breaking the wrong
+   * eval). The released handles are disposed here (between
+   * operations — the drain's exception already unwound).
+   */
+  private noteInterruptedDrain(): void {
+    this.evalBreakArmed = false;
+    this.evalBreakTargets = new Set();
+    for (const completion of this.activeEvalCompletions) completion.dispose();
+    this.activeEvalCompletions.clear();
+  }
+
+  /** The eval-break signal's interrupt handler: consulted ONLY by
+   *  settlement drains (`drain`) — the executions that resume
+   *  suspended-eval continuations — never by a fresh eval's own code or
+   *  its own job drain (`runEval` does not compose it), so an unrelated
+   *  eval can neither consume the signal nor be broken by it (phase-E
+   *  review rejection). Consumed on first observation: the quickjs
+   *  interrupt polls it constantly, so the first continuation execution
+   *  after arming breaks mid-run. Returns `undefined` while nothing is
+   *  armed (the composition drops it). */
+  private evalBreakHandler(): (() => boolean) | undefined {
+    if (!this.evalBreakArmed) return undefined;
+    return () => {
+      if (!this.evalBreakArmed) return false;
+      this.evalBreakArmed = false;
+      return true;
+    };
+  }
+
   /** Every pending checkpoint, oldest first (raw questions — the tool
    *  result's `checkpoints` field carries the previewed form). */
   pendingCheckpoints(): CheckpointInfo[] {
@@ -2589,6 +2766,10 @@ export class Broker {
               this.drain(deadline);
             } catch (drainError) {
               if (drainError instanceof DrainJobError) {
+                // The forced-stop settlements resumed a continuation that
+                // the disconnect bound interrupted — the tracked running
+                // eval is no longer running (see `noteInterruptedDrain`).
+                this.noteInterruptedDrain();
                 this.warnLine(
                   'warn',
                   `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`,
@@ -2655,11 +2836,16 @@ export class Broker {
         const record = this.callStore.lookup(binding.handleCallId);
         const status =
           record === undefined || record.completion === null ? 'pending' : 'settled';
-        token = `agent handle \u00b7 ${status} \u00b7 call ${binding.handleCallId}`;
+        // The size travels with the handle token too (phase-E review
+        // rejection: the manifest's size surface used to stop at the
+        // handle marker). `formatByteSize` is the previewer's decimal
+        // formatter — the same one the structure tokens use.
+        token = `agent handle \u00b7 ${status} \u00b7 call ${binding.handleCallId} \u00b7 ${formatByteSize(binding.sizeBytes)}`;
       }
       return {
         name: binding.name,
         token,
+        sizeBytes: binding.sizeBytes,
         provenance: binding.provenance,
         provenanceAtMs: binding.provenanceAtMs,
         // The doc's "from what task" provenance half: the task text behind
@@ -2778,6 +2964,13 @@ export class Broker {
       this.deliverySlots.clear();
       this.openingCalls.clear();
       this.stoppedOpens.clear();
+      // The retained suspended-eval completions and the eval-break
+      // signal die with the broker (the handles are released before the
+      // VM is disposed by the caller).
+      for (const completion of this.activeEvalCompletions) completion.dispose();
+      this.activeEvalCompletions.clear();
+      this.evalBreakTargets = new Set();
+      this.evalBreakArmed = false;
       if (this.ownsRunner) {
         // The owned runner's disposal races the remaining bound too
         // (review round 7: it used to be awaited without any deadline).
@@ -3612,6 +3805,11 @@ export class Broker {
           this.sink?.boundary('settlement');
         } catch (error) {
           if (error instanceof DrainJobError) {
+            // The interrupted drain BROKE a suspended eval's continuation
+            // (the eval-break signal's target, or a runaway bounded by the
+            // per-eval deadline): the tracked running eval is no longer
+            // running — see `noteInterruptedDrain`.
+            this.noteInterruptedDrain();
             // The delivery happened; the continuation drain failed. The
             // settled call ids must NOT be lost with the error (review
             // regression: an interrupted continuation used to erase
@@ -3719,7 +3917,16 @@ export class Broker {
     const boundHandler =
       boundDeadlineMs === undefined ? undefined : () => Date.now() >= boundDeadlineMs;
     this.workspace.drainJobs({
-      interruptHandler: this.composedInterrupt(this.interruptHandler, boundHandler),
+      // The eval-break signal rides ONLY the settlement drains (see
+      // `evalBreakHandler`): a fresh eval's own code and its own job
+      // drain never consult it (phase-E review rejection — the armed
+      // signal used to be the broker's DEFAULT eval handler, so an
+      // unrelated eval consumed it before the intended continuation).
+      interruptHandler: this.composedInterrupt(
+        this.interruptHandler,
+        this.evalBreakHandler(),
+        boundHandler,
+      ),
     });
   }
 
@@ -4044,9 +4251,13 @@ export class Broker {
 
   /** One serialized operation with the sink's end-of-burst flush: the
    *  boundaries fired inside the op are written (debounced) before the
-   *  op's promise resolves — a kill after the op returns loses nothing. */
+   *  op's promise resolves — a kill after the op returns loses nothing.
+   *  The active-eval sweep runs first: a suspended eval's completion
+   *  can only settle inside an operation's drain, so the operation
+   *  boundaries are exactly the moments the tracking can advance. */
   private async runSerialized<T>(fn: () => Promise<T>): Promise<T> {
     try {
+      this.sweepActiveEvals();
       return await fn();
     } finally {
       this.sink?.flush();

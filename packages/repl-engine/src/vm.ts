@@ -402,15 +402,22 @@ export class ReplVm {
 
   /**
    * The package-internal eval entry the broker layer drives: like
-   * `evalCode`, but when the eval RESOLVED the live completion-value
-   * handle is returned alongside the shallow snapshot read (`completion`,
-   * OWNED BY THE CALLER — the caller must dispose it; it is the value
-   * handle the broker previews for the tool result's `result` line). For
-   * `pending`/`error` outcomes `completion` is undefined and the caller
-   * owns nothing. The published type graph never names the handle type:
-   * this method is not re-exported from the package index (the bridge's
-   * `getVmShim` precedent), and `completion` is typed `unknown` so the
-   * declaration stays self-contained.
+   * `evalCode`, but the completion handle is returned alongside the
+   * shallow snapshot read (`completion`, OWNED BY THE CALLER — the
+   * caller must dispose it). For a RESOLVED eval it is the live
+   * completion-value handle the broker previews for the tool result's
+   * `result` line; for a PENDING eval (the completion suspended on a
+   * host call) it is the eval WRAPPER promise handle — the broker's
+   * active-eval tracking probe: the wrapper stays pending while the
+   * eval's continuation is in flight and settles when the continuation
+   * completes or is broken (phase-E review rejection: the pending
+   * completion used to be dropped, so the workspace had no host-side
+   * notion of "an eval is running" and the interrupt tool could not
+   * target it). For `error` outcomes `completion` is undefined and the
+   * caller owns nothing. The published type graph never names the
+   * handle type: this method is not re-exported from the package index
+   * (the bridge's `getVmShim` precedent), and `completion` is typed
+   * `unknown` so the declaration stays self-contained.
    */
   evalCodeWithCompletion(
     code: string,
@@ -455,6 +462,11 @@ export class ReplVm {
       }
       return this.readCompletion(handle, true, attachBridge);
     } finally {
+      // The wrapper is disposed here on every arm except the retained-
+      // pending one: `readCompletion` returns a DUP for the retained
+      // arm (the caller owns it) and disposes the original itself, so
+      // this dispose is either a no-op (the value arm already disposed
+      // it) or the genuine release (the error/DrainJobError arms).
       handle?.dispose();
       this.interruptSlot.current = previousInterrupt;
       this.opDepth--;
@@ -595,6 +607,16 @@ export class ReplVm {
       const state = handle.promiseState;
       if (state === 0) {
         if (attachBridge) this.attachRejectionBridge(handle);
+        if (keepCompletion) {
+          // Retained-pending arm: the caller owns a DUP of the wrapper
+          // promise handle (the completion stays pending — the eval
+          // suspended on a host call; its continuation runs at a later
+          // settlement drain, and the wrapper settles when the
+          // continuation completes or is broken — the broker's
+          // active-eval probe). The original is disposed by the finally
+          // below like every other arm.
+          return { outcome: { kind: 'pending' }, completion: handle.dup() };
+        }
         return { outcome: { kind: 'pending' } };
       }
       // For settled promises `qjs_promise_result` returns a new owned

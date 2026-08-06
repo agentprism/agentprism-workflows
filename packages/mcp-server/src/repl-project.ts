@@ -54,20 +54,23 @@
  * during a first touch abort the touch's materialization (the created
  * workspace is torn down without being registered).
  *
- * ## The interrupt signal and the eval deadline (spec-owed mechanism)
+ * ## The eval-break interrupt and the eval deadline (spec-owed mechanism)
  *
- * The `interrupt` tool's eval-break path (no call id) arms a per-project
- * signal that the broker's default per-eval interrupt handler consumes.
- * The daemon is single-threaded, so a request cannot be PROCESSED while
- * an eval is executing — but a runaway eval can never hang the workspace
- * forever: the broker bounds every eval and settlement drain with a
- * per-eval wall-clock deadline enforced by the quickjs interrupt handler
+ * The `interrupt` tool's eval-break path (no call id) targets the
+ * RUNNING eval through the broker (`Broker.armEvalBreak` — phase-E
+ * review rejection: the signal used to live here as a project-wide
+ * boolean that an idle workspace's next eval — or an unrelated drain —
+ * could consume; the broker now tracks the suspended eval's completion
+ * and refuses to arm when nothing is running). The daemon is
+ * single-threaded, so a request cannot be PROCESSED while an eval is
+ * executing — but a runaway eval can never hang the workspace forever:
+ * the broker bounds every eval and settlement drain with a per-eval
+ * wall-clock deadline enforced by the quickjs interrupt handler
  * (`BrokerOptions.evalTimeoutMs` — the harness's eval guard; phase-D
  * review round 2: the armed signal alone could only break the NEXT VM
  * execution, because a synchronous runaway eval blocks the event loop
  * before a later MCP request can arm it — the deadline makes the
- * CURRENTLY running eval always breakable). The armed signal breaks the
- * next VM execution immediately. The call-cancel path
+ * CURRENTLY running eval always breakable). The call-cancel path
  * (`interrupt { id }`) is immediate: it drives ACP `session/cancel`
  * downward (lazily re-attaching a drained handle's recorded session
  * first).
@@ -112,11 +115,6 @@ import {
 
 import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 
-/** The per-project interrupt signal (see module docs). */
-export interface ReplInterruptSignal {
-  armed: boolean;
-}
-
 /** One project context's REPL workspace: the store plus the live
  *  workspace/broker pair, created on first touch. */
 export interface ReplProjectState {
@@ -135,8 +133,6 @@ export interface ReplProjectState {
    *  wasm-hash mismatch) — surfaced in every repl tool result until
    *  `reset` clears the store. Null when no refusal occurred. */
   restoreError: SnapshotEnvelopeError | null;
-  /** The interrupt tool's eval-break signal (see module docs). */
-  readonly interrupt: ReplInterruptSignal;
   /** The MCP sessions currently present on this workspace (the
    *  client-presence ledger's per-project set). */
   readonly clients: Set<string>;
@@ -175,22 +171,11 @@ export function createReplProjectState(
     source: null,
     reconcileReport: null,
     restoreError: null,
-    interrupt: { armed: false },
     clients: new Set(),
     firstTouch: null,
     generation: 0,
     drained: false,
     drainError: null,
-  };
-}
-
-/** The broker's default per-eval interrupt handler for this project: the
- *  interrupt tool's signal, consumed on first observation. */
-function interruptHandlerFor(state: ReplProjectState): () => boolean {
-  return () => {
-    const armed = state.interrupt.armed;
-    state.interrupt.armed = false;
-    return armed;
   };
 }
 
@@ -261,7 +246,11 @@ async function doFirstTouch(
       runner,
       store: state.store.callStore(),
       snapshotSink: state.store.snapshotWriter(workspace, wasm),
-      interruptHandler: interruptHandlerFor(state),
+      // The eval-break signal no longer lives here — the broker owns it
+      // (see `Broker.armEvalBreak`; phase-E review rejection: the
+      // project-wide boolean used to be consumable by an unrelated eval
+      // or drain). The per-eval wall-clock deadline still bounds every
+      // eval and drain.
       evalTimeoutMs,
     });
     if (state.generation !== generation) {
