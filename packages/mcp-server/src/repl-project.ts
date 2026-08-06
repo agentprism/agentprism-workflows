@@ -58,19 +58,25 @@
  *
  * The `interrupt` tool's eval-break path (no call id) targets the
  * RUNNING eval through the broker (`Broker.armEvalBreak` — phase-E
- * review rejection: the signal used to live here as a project-wide
- * boolean that an idle workspace's next eval — or an unrelated drain —
- * could consume; the broker now tracks the suspended eval's completion
- * and refuses to arm when nothing is running). The daemon is
- * single-threaded, so a request cannot be PROCESSED while an eval is
- * executing — but a runaway eval can never hang the workspace forever:
- * the broker bounds every eval and settlement drain with a per-eval
- * wall-clock deadline enforced by the quickjs interrupt handler
- * (`BrokerOptions.evalTimeoutMs` — the harness's eval guard; phase-D
- * review round 2: the armed signal alone could only break the NEXT VM
- * execution, because a synchronous runaway eval blocks the event loop
- * before a later MCP request can arm it — the deadline makes the
- * CURRENTLY running eval always breakable). The call-cancel path
+ * review rejection round 1: the signal used to live here as a
+ * project-wide boolean that an idle workspace's next eval — or an
+ * unrelated drain — could consume; the broker now tracks the in-flight
+ * eval's completion, refuses to arm when nothing is running, and the
+ * armed signal is consumed by the first subsequent execution of that
+ * eval — a settlement drain resuming its continuation, or a direct
+ * eval's own drain when a synchronous host-callback settlement like
+ * `checkpoint.answer` resumes it — phase-E review rejection round 2),
+ * breaking it MID-RUN through the quickjs interrupt handler. The daemon
+ * is single-threaded, so a request cannot be PROCESSED while a
+ * fully synchronous (never-yielding) eval executes — that case is
+ * bounded by the per-eval wall-clock deadline (the harness's eval
+ * guard): every eval and settlement drain runs under
+ * `BrokerOptions.evalTimeoutMs` enforced by the quickjs interrupt
+ * handler, so a runaway eval can never hang the workspace forever. An
+ * eval that YIELDS (suspends on a subagent call or a checkpoint) is
+ * interruptible at its next execution; the wait tool's pumps release
+ * the broker chain between iterations, so an interrupt lands promptly
+ * mid-wait. The call-cancel path
  * (`interrupt { id }`) is immediate: it drives ACP `session/cancel`
  * downward (lazily re-attaching a drained handle's recorded session
  * first).

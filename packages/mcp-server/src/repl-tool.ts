@@ -28,18 +28,23 @@
  * - `interrupt { projectDir, id? }` → cancel one subagent call (ACP
  *   `session/cancel` downward; a drained handle's recorded session is
  *   re-attached lazily first); without an id, BREAK THE RUNNING EVAL:
- *   the broker's eval-break arm targets the tracked suspended eval —
- *   the armed signal is consumed by the running eval's continuation
- *   execution (the quickjs interrupt handler breaks it MID-RUN when it
- *   resumes; a later eval is unaffected — fresh eval code never
- *   consults the signal), and an IDLE workspace is refused honestly
- *   (nothing is armed). The daemon is
- *   single-threaded, so a request cannot be PROCESSED while a
- *   synchronous top-level runaway executes — every eval and settlement
- *   drain runs under a per-eval wall-clock deadline enforced by the
- *   quickjs interrupt handler, so a currently-running runaway is ALWAYS
- *   breakable (bounded) even without the signal (see
- *   `src/repl-project.ts`).
+ *   the broker's eval-break arm targets the workspace's in-flight eval
+ *   (suspended on a call or a checkpoint, its continuation registered;
+ *   refused — nothing armed — when the workspace is idle), and the
+ *   armed signal is consulted by EVERY subsequent execution of that
+ *   eval — the settlement drains that resume its continuation (a
+ *   wait's pumps, a later eval's pump, the client-presence drain) AND
+ *   a direct eval's own drain (a `checkpoint.answer` in a later eval
+ *   resumes the continuation synchronously inside that eval's drain) —
+ *   and the quickjs interrupt handler breaks it MID-RUN, consumed on
+ *   first observation so a later eval is unaffected (see
+ *   `src/repl-project.ts`). A fully synchronous (never-yielding)
+ *   runaway blocks the single-threaded daemon's event loop, so the
+ *   request itself cannot arrive mid-run — that case is bounded by the
+ *   per-eval wall-clock deadline (the harness's eval guard); every
+ *   eval that YIELDS (suspends on a call) is interruptible at its next
+ *   execution, and the wait tool's pumps run with the broker chain
+ *   released between them so an interrupt lands promptly mid-wait.
  * - `reset { projectDir }` → teardown (cancels in-flight ACP sessions,
  *   drops the VM and the whole `repl/` store), clearing any contained
  *   snapshot refusal.
@@ -434,23 +439,30 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           content: [{ type: "text", text: capToolResultText(waitText) }],
         };
       }
-      // interrupt without an id: BREAK THE RUNNING EVAL. The daemon is
-      // single-threaded, so a request cannot be PROCESSED while a
-      // synchronous top-level runaway executes (the per-eval wall-clock
-      // deadline bounds that case independently) — but an eval that is
-      // in flight (suspended on a subagent call) has its continuation
-      // executed by later settlement drains, and the broker's
-      // eval-break arm TARGETS that running eval: the armed signal is
-      // consumed by the running eval's continuation execution (the
-      // quickjs interrupt handler fires MID-RUN and breaks it), it is
-      // consulted ONLY by settlement drains — never by a fresh eval's
-      // own code — and it is refused when NO eval is running (phase-E
-      // review rejection: the signal used to be a project-wide boolean
-      // armed even when idle, so the next eval — or an unrelated
-      // drain — could consume it before the intended suspended
-      // continuation). A later eval is unaffected: the signal is
-      // consumed by the running eval's execution, not by arbitrary
-      // later ones.
+      // interrupt without an id: BREAK THE RUNNING EVAL — the doc's
+      // "break a runaway eval (the quickjs interrupt handler)". The
+      // broker's eval-break arm targets the workspace's RUNNING eval
+      // (in flight — suspended on a subagent call or a checkpoint, its
+      // continuation registered) and REFUSES — nothing armed — when the
+      // workspace is idle (phase-E review rejection round 1: the old
+      // project-wide boolean was armed even when idle, so an unrelated
+      // eval consumed it before the intended continuation). The armed
+      // signal is consulted by EVERY subsequent execution of the
+      // running eval: the settlement drains that resume its
+      // continuation (a wait's pumps — the wait releases the broker
+      // chain between pumps, so this interrupt lands promptly mid-wait
+      // — a later eval's pump, the client-presence drain) AND a direct
+      // eval's own drain (a `checkpoint.answer` in a later eval resumes
+      // the continuation synchronously inside that eval's drain —
+      // phase-E review rejection round 2: the old settlement-drain-only
+      // signal was blind there). The quickjs interrupt handler breaks
+      // it MID-RUN, and the signal is consumed on first observation — a
+      // later eval's own code is never broken by it. A fully
+      // synchronous (never-yielding) runaway blocks the single-threaded
+      // daemon's event loop, so the request itself cannot arrive
+      // mid-run — that case is bounded by the per-eval wall-clock
+      // deadline (the harness's eval guard); every eval that YIELDS is
+      // interruptible at its next execution.
       if (args.id === undefined) {
         const targeted = await broker.armEvalBreak();
         if (!targeted) {
@@ -460,7 +472,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
                 type: "text",
                 text: capToolResultText(
                   `workspace ${context.projectDir}: no running eval to interrupt — the workspace is idle ` +
-                    `(no eval is suspended or in flight) and nothing was armed`,
+                    `(no eval is in flight) and nothing was armed`,
                 ),
               },
             ],
@@ -471,9 +483,9 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
             {
               type: "text",
               text: capToolResultText(
-                `workspace ${context.projectDir}: interrupting the running eval — the eval-break signal is set for ` +
-                  `the quickjs interrupt handler; the suspended eval's continuation is broken when it resumes (a ` +
-                  `currently-executing synchronous runaway is already bounded by the per-eval deadline — it cannot run away)`,
+                `workspace ${context.projectDir}: interrupting the running eval — the eval-break signal is set; ` +
+                  `the eval's next execution (a settlement drain resuming its continuation, or a direct eval's drain) ` +
+                  `is broken mid-run by the quickjs interrupt handler`,
               ),
             },
           ],

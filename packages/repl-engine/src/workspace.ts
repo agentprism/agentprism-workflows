@@ -283,7 +283,7 @@ export class Workspace {
   evalWithCompletion(
     code: string,
     options?: ReplEvalOptions,
-  ): { outcome: ReplEvalOutcome; completion?: unknown } {
+  ): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
     this.assertAlive();
     return this.vm.evalCodeWithCompletion(code, options);
   }

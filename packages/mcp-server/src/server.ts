@@ -75,7 +75,7 @@ import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { registerReplTool } from "./repl-tool.js";
 import { ReplPresenceLedger } from "./repl-presence.js";
-import { DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
+import { createReplProjectState, DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
 import { SESSION_IDLE_TTL_MS } from "./daemon/constants.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
 import {
@@ -1219,6 +1219,16 @@ export function createWorkflowServer(
   const scriptResources = new WorkflowScriptResources(mcp, { router: projects });
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
+  // The REPL client-presence ledger (see `repl-presence.ts`): one per
+  // server, shared by the repl tool AND the workflow tool — a session
+  // that addresses a project through WORKFLOW calls is present on that
+  // project exactly like one that touched the repl workspace (phase-E
+  // review rejection round 2: the workflow handler resolved the same
+  // project context without registering presence, so a workflow-only
+  // client's presence was invisible to the last-client-disconnect drain
+  // and a repl client's disconnect could drain children while the
+  // workflow client was still connected).
+  const replPresence = options.replPresence ?? new ReplPresenceLedger(options.replDrainBoundMs ?? SESSION_IDLE_TTL_MS);
 
   /** Route a parsed input to its project context; undefined = runId found in no known store. */
   const resolveContext = (input: ReturnType<typeof parseWorkflowToolInput>): ProjectContext | undefined => {
@@ -1249,7 +1259,7 @@ export function createWorkflowServer(
     requireProjectDir,
     runner: options.replRunner,
     evalTimeoutMs: replEvalTimeoutMs(),
-    presence: options.replPresence ?? new ReplPresenceLedger(options.replDrainBoundMs ?? SESSION_IDLE_TTL_MS),
+    presence: replPresence,
     clientId: options.replClientId ?? (() => "single-project"),
     acceptingWork: () => acceptingWork,
   });
@@ -1316,6 +1326,19 @@ export function createWorkflowServer(
           isError: true,
         };
       }
+      // Project-presence registration for the REPL's client-presence
+      // drain (phase-E review rejection round 2): the workflow tool
+      // resolves the SAME per-project context the repl tool addresses,
+      // and a session that calls it is connected to the project for the
+      // doc's "any MCP client connected to the project" warmth rule.
+      // The repl STATE is created if missing — a pure-workflow project
+      // keeps a stateless context (no VM: the workspace is materialized
+      // only on the first repl tool touch); the state is what the
+      // presence ledger keys presence by, so a workflow-only client B
+      // staying connected keeps the workspace warm when repl-client A
+      // disconnects.
+      if (context.repl === undefined) context.repl = createReplProjectState(context.projectDir);
+      replPresence.touch(context.repl, options.replClientId?.() ?? "unknown");
       const manager = context.manager;
       const backgroundRuns = context.backgroundRuns;
       if ((parsedInput.action === undefined || parsedInput.action === "run") && parsedInput.resumeFromRunId !== undefined) {

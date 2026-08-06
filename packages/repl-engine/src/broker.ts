@@ -1046,7 +1046,22 @@ export class Broker {
         // the VM stays usable.
         pumpDrainErrorLine = errorLine(pumped.drainError.info);
       }
-      const { outcome, completion } = this.runEval(code, options);
+      const { outcome, completion, interruptedInDrain } = this.runEval(code, options);
+      if (interruptedInDrain === true) {
+        // The eval's OWN drain was interrupted (the armed eval-break
+        // signal's target resumed by a synchronous host-callback
+        // settlement — a checkpoint answer — inside this eval's drain,
+        // or the per-eval deadline): the interrupted continuation's
+        // engine wrapper NEVER settles (the quickjs interrupt aborts
+        // the async job without rejecting its promise — verified
+        // against the shipped binary), so the tracked "running eval"
+        // can only be released HERE — exactly like the pump path's
+        // `noteInterruptedDrain` (phase-E review rejection round 2: the
+        // old signal was consulted only by settlement drains, and
+        // without this release a broken target stayed tracked forever,
+        // making a later eval-break arm target a dead eval).
+        this.noteInterruptedDrain();
+      }
       // The eval's own provenance pass: bindings this eval created or
       // rebound (including the `$N` refs its console.logs froze) are
       // attributed to `eval N` (the registry's snapshot-durable counter).
@@ -2157,13 +2172,18 @@ export class Broker {
    * unrelated drain — consumed it before the intended continuation).
    *
    * When an eval IS in flight (a suspended eval whose continuation will
-   * run at a later settlement drain), the signal is armed and SCOPED to
-   * the arming-time active evals: it is consulted ONLY by settlement
-   * drains (`drain` — the executions that resume continuations), never
-   * by a fresh eval's own code or its own job drain, so an unrelated
-   * eval can neither consume the signal nor be broken by it; the first
-   * continuation execution after arming breaks mid-run (the quickjs
-   * interrupt handler), and the signal is consumed on that observation.
+   * run at a later execution — a settlement drain, or a direct eval's
+   * own drain when a synchronous host-callback settlement like
+   * `checkpoint.answer` resumes it), the signal is armed and SCOPED to
+   * the arming-time active evals: it is consulted ONLY by the
+   * executions that resume those evals' continuations (settlement
+   * drains and direct evals' own drains — `runEval` composes it as the
+   * drain-phase handler — phase-E review rejection round 2), never by
+   * a fresh eval's own code or an unrelated eval's code, so an
+   * unrelated eval can neither consume the signal nor be broken by it;
+   * the first continuation execution after arming breaks mid-run (the
+   * quickjs interrupt handler), and the signal is consumed on that
+   * observation.
    * When every arming-time target settles (completed or broken), the
    * signal is cleared with them — it never leaks into a later
    * execution.
@@ -2227,13 +2247,17 @@ export class Broker {
   }
 
   /**
-   * A settlement drain was INTERRUPTED (the eval-break signal's
+   * A guest execution that resumes a suspended eval's continuation was
+   * INTERRUPTED (the eval-break signal's
    * consumption, or the per-eval deadline bounding a runaway
-   * continuation): the drain broke a suspended eval's continuation, and
+   * continuation): the execution broke a suspended eval's continuation, and
    * the interrupted continuation's engine wrapper NEVER settles (the
    * quickjs interrupt aborts the async job without rejecting its
    * promise — verified against the shipped binary), so the tracked
-   * "running eval" can only be released HERE. Every tracked eval is
+   * "running eval" can only be released HERE. The callers are the
+   * pump path's drain-failure arm AND the direct-eval path (an eval's
+   * own drain interrupted — `runEval` reports `interruptedInDrain`;
+   * phase-E review rejection round 2). Every tracked eval is
    * dropped and the eval-break signal is cleared: the interrupted
    * drain's target — the arming-time active eval — is no longer
    * running, and a stale entry would make a later eval-break arm
@@ -2252,15 +2276,20 @@ export class Broker {
     this.activeEvalCompletions.clear();
   }
 
-  /** The eval-break signal's interrupt handler: consulted ONLY by
-   *  settlement drains (`drain`) — the executions that resume
-   *  suspended-eval continuations — never by a fresh eval's own code or
-   *  its own job drain (`runEval` does not compose it), so an unrelated
-   *  eval can neither consume the signal nor be broken by it (phase-E
-   *  review rejection). Consumed on first observation: the quickjs
-   *  interrupt polls it constantly, so the first continuation execution
-   *  after arming breaks mid-run. Returns `undefined` while nothing is
-   *  armed (the composition drops it). */
+  /** The eval-break signal's interrupt handler: consulted by the
+   *  executions that resume suspended-eval continuations — the
+   *  settlement drains (`drain`) AND a direct eval's own drain
+   *  (`runEval` composes it as the drain-phase handler — a continuation
+   *  resumed by a synchronous host-callback settlement like
+   *  `checkpoint.answer` executes inside the answering eval's drain,
+   *  where the phase-E review rejection round 2's old settlement-drain-
+   *  only signal was blind). A fresh eval's OWN CODE still never
+   *  consults it (an unrelated eval's code can neither consume the
+   *  signal nor be broken by it — the phase-E review rejection).
+   *  Consumed on first observation: the quickjs interrupt polls it
+   *  constantly, so the first continuation execution after arming
+   *  breaks mid-run. Returns `undefined` while nothing is armed (the
+   *  composition drops it). */
   private evalBreakHandler(): (() => boolean) | undefined {
     if (!this.evalBreakArmed) return undefined;
     return () => {
@@ -2331,46 +2360,93 @@ export class Broker {
    * into the buffer; the doc requires wait to return the same shape, and
    * deferring output to the next eval would lose immediate guest-visible
    * restored-call output and warnings — phase-D review round 2).
-   * `ids` omitted waits for every pending call. Returns the rendered
-   * result plus whether the target set drained within the bound.
+   * `ids` omitted waits for the calls pending at ENTRY (with other
+   * operations interleaving between pumps, the entry-time set is the
+   * only stable "every pending call" reading — a call a concurrent eval
+   * dispatches after entry is not waited on; see the phase-E review
+   * rejection round 2 note below). Returns the rendered result plus
+   * whether the target set drained within the bound.
    */
   async waitForCalls(
     ids: string[] | undefined,
     timeoutMs: number,
   ): Promise<{ result: ReplEvalResult; drained: boolean }> {
-    return this.serialized(async () => {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    // The target set is captured at ENTRY under the chain (phase-E
+    // review rejection round 2: the wait used to run its whole bounded
+    // poll inside ONE serialized op, so a concurrent interrupt —
+    // `cancelCall` / `armEvalBreak` — queued behind it and could not
+    // cancel or break until the wait finished or timed out, up to 120 s,
+    // by which point the target could already have completed). The wait
+    // now runs each PUMP as its own serialized unit and RELEASES the
+    // chain between pumps, so other operations — interrupts, other
+    // waits, the client-presence drain — interleave mid-wait: an
+    // interrupt landing mid-wait arms the eval-break signal against the
+    // eval the wait is pumping, and the wait's very next pump breaks it
+    // mid-run. With other operations interleaving, "wait for every
+    // pending call" can only mean "the calls pending when the wait
+    // started" — a call a concurrent eval dispatches after entry is not
+    // waited on (the wait stays bounded and deterministic).
+    const targets = await this.serialized(async () => {
       this.assertAlive();
-      const deadline = Date.now() + Math.max(0, timeoutMs);
-      const targets = ids === undefined ? null : new Set(ids);
-      const completed: string[] = [];
-      const initialPending = new Set(this.pendingIds());
-      for (;;) {
-        const { settled } = await this.pumpUnlocked();
+      return ids === undefined ? new Set(this.pendingIds()) : new Set(ids);
+    });
+    const completed: string[] = [];
+    let drainErrorLine: string | undefined;
+    let drained = false;
+    for (;;) {
+      drained = await this.serialized(async () => {
+        this.assertAlive();
+        // Each pump runs under the REMAINING wait time: a settlement
+        // drain that resumes a runaway continuation near the deadline is
+        // interrupted at the wait's bound, never at the eval deadline —
+        // the wait's bound is absolute (the same posture as the
+        // disconnect drain).
+        const { settled, drainError } = await this.pumpUnlocked(deadline);
         if (settled.length > 0) {
           // The per-call settlement boundaries fired inside
           // `pumpUnlocked` (one per settled call's continuation drain).
           completed.push(...settled);
         }
+        if (drainError !== undefined) {
+          // The pump's drain broke a suspended eval's continuation (the
+          // armed eval-break signal's target, or the wait-bound): the
+          // break is honest output in the wait's result, exactly like an
+          // eval's pump-drain error line.
+          drainErrorLine = errorLine(drainError.info);
+        }
         const pending = new Set(this.pendingIds());
-        const drained =
-          targets === null ? pending.size === 0 : [...targets].every((id) => !pending.has(id));
-        if (drained) break;
-        if (Date.now() >= deadline) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      const drained = targets === null ? this.pendingIds().length === 0 : [...targets].every((id) => !this.pendingIds().includes(id));
-      const result = this.renderWaitResult(completed, initialPending);
-      return { result, drained };
-    });
+        return [...targets].every((id) => !pending.has(id));
+      });
+      if (drained) break;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!drained) {
+      // The deadline tripped between the last pump and the timeout
+      // check — an interleaved operation (an interrupt's cancel, or
+      // another pump) may have settled the targets in that window:
+      // re-check once under the chain so the result is not a stale
+      // "still running".
+      drained = await this.serialized(async () => {
+        this.assertAlive();
+        const pending = new Set(this.pendingIds());
+        return [...targets].every((id) => !pending.has(id));
+      });
+    }
+    const result = this.renderWaitResult(completed, drainErrorLine);
+    return { result, drained };
   }
 
   /** Render the wait result in the eval-result shape (output lines from
-   *  the console buffer, pending ids, checkpoints, completed ids). */
-  private renderWaitResult(completed: string[], initialPending: Set<string>): ReplEvalResult {
+   *  the console buffer, the pump-drain error line when one occurred,
+   *  pending ids, checkpoints, completed ids). */
+  private renderWaitResult(completed: string[], drainErrorLine?: string): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {
       lines.push(...this.renderConsoleEvent(event));
     }
+    if (drainErrorLine !== undefined) lines.push(drainErrorLine);
     const capped = applyOutputCaps(lines);
     return {
       output: capped.lines,
@@ -3970,7 +4046,7 @@ export class Broker {
    *  — the deadline makes the CURRENTLY running eval always breakable
    *  through the quickjs interrupt handler, even when an explicit signal
    *  handler is armed and unset). */
-  private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown } {
+  private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
     return this.workspace.evalWithCompletion(code, {
       ...options,
       // The per-eval handler overrides the broker-level default (the
@@ -3978,6 +4054,18 @@ export class Broker {
       // composes on top (phase-D review round 2: a currently-running
       // runaway eval is always breakable).
       interruptHandler: this.composedInterrupt(options.interruptHandler ?? this.interruptHandler),
+      // The eval-break signal rides the eval's OWN DRAIN as well
+      // (phase-E review rejection round 2: the signal used to be
+      // consulted only by settlement drains, but a suspended eval's
+      // continuation can be resumed by a SYNCHRONOUS host-callback
+      // settlement — `checkpoint.answer` in a later eval — and that
+      // execution runs inside the answering eval's own drain, where the
+      // old signal was blind: the runaway continuation burned the eval
+      // deadline instead of being broken by the interrupt). The eval's
+      // own CODE still never consults the signal — an unrelated eval's
+      // code is never broken by it (the phase-E review rejection's
+      // targeting discipline).
+      drainInterruptHandler: this.evalBreakHandler(),
       rejectionBridge: true,
     });
   }

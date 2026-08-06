@@ -133,6 +133,19 @@ export interface ReplEvalOptions {
    */
   interruptHandler?: () => boolean;
   /**
+   * An interrupt handler consulted ONLY by the eval's OWN job drain —
+   * never by the eval code itself. The eval-break signal's direct-eval
+   * seam: a suspended eval's continuation can be resumed by a
+   * SYNCHRONOUS host-callback settlement (`checkpoint.answer` in a
+   * later eval resolves the checkpoint's deferred right there), and
+   * that resumed continuation executes inside the answering eval's own
+   * drain — an execution the settlement-drain handler cannot reach.
+   * The eval's own code deliberately never consults this handler: an
+   * unrelated eval's code must never be broken by a signal armed
+   * against another eval (the phase-E review rejection's leak).
+   */
+  drainInterruptHandler?: () => boolean;
+  /**
    * Attach the engine's uncaught-rejection bridge when the eval SUSPENDS
    * (its completion promise is still pending after the drain): the bridge
    * — `p.then(undefined, err => console.error(err))` — routes a late
@@ -422,7 +435,7 @@ export class ReplVm {
   evalCodeWithCompletion(
     code: string,
     options: ReplEvalOptions = {},
-  ): { outcome: ReplEvalOutcome; completion?: unknown } {
+  ): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
     this.assertAlive();
     this.assertNotReentrant();
 
@@ -439,7 +452,8 @@ export class ReplVm {
     // drain). Because the body below is synchronous, this save/restore
     // cannot be reordered by a concurrent eval: operations serialize.
     const previousInterrupt = this.interruptSlot.current;
-    this.interruptSlot.current = options.interruptHandler ?? null;
+    const evalHandler = options.interruptHandler ?? null;
+    this.interruptSlot.current = evalHandler;
     this.opDepth++;
     let handle: JSValueHandle | undefined;
     try {
@@ -448,15 +462,32 @@ export class ReplVm {
         return { outcome: { kind: 'error', error: evaluated.error } };
       }
       handle = evaluated.handle;
+      // The drain phase arms the eval's own handler PLUS the drain-phase
+      // extra handler (see `ReplEvalOptions.drainInterruptHandler`): a
+      // continuation resumed by a synchronous host-callback settlement
+      // (a checkpoint answer) executes here and must be breakable by the
+      // armed interrupt signal even though the eval's own code never
+      // consults it.
+      this.interruptSlot.current =
+        options.drainInterruptHandler === undefined
+          ? evalHandler
+          : evalHandler === null
+            ? options.drainInterruptHandler
+            : () => evalHandler() || options.drainInterruptHandler!();
       try {
         this.runDrain();
       } catch (e) {
         if (e instanceof DrainJobError) {
-          // A drained job threw (the canonical case: the per-eval interrupt
-          // firing inside a resumed continuation). The guest exception was
-          // consumed and cleared by the raw drain loop, so the VM stays
-          // usable; the info was read trap-free.
-          return { outcome: { kind: 'error', error: e.info } };
+          // The drain was INTERRUPTED (the armed eval-break signal, or
+          // the per-eval deadline): the interrupted continuation's
+          // engine wrapper never settles (the quickjs interrupt aborts
+          // the async job without rejecting its promise), so the
+          // caller — the broker — must release its tracked running eval
+          // (exactly like the pump path's `noteInterruptedDrain`). The
+          // flag distinguishes this from a code-phase interrupt (the
+          // fresh eval's own code hitting the deadline), which affects
+          // no tracked eval.
+          return { outcome: { kind: 'error', error: e.info }, interruptedInDrain: true };
         }
         throw e; // host-side failure, not a guest outcome — fail loudly
       }

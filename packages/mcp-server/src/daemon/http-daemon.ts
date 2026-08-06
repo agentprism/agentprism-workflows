@@ -58,6 +58,14 @@ export interface DaemonHandle {
   sessions: SessionRegistry;
   projects: WorkflowProjectRegistry;
   activeRunCount(): number;
+  /**
+   * The number of REPL workspaces with a client-presence drain scheduled
+   * or in flight (the daemon idleness accounting seam — phase-E review
+   * rejection round 2: a drain may legitimately run for the full
+   * session-eviction TTL after the last session is gone, and the idle
+   * shutdown must never replace that bound with the shutdown deadline).
+   */
+  activeReplDrainCount(): number;
   close(): Promise<void>;
 }
 
@@ -221,6 +229,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     sessions,
     projects,
     activeRunCount: () => projects.activeRunCount(),
+    activeReplDrainCount: () => replPresence.drainingCount(),
     async close() {
       const closed = new Promise<void>((resolvePromise) => {
         httpServer.close(() => resolvePromise());

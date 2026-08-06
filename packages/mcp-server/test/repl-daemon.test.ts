@@ -38,9 +38,13 @@
  *   alike, with the truncation marker shipping — and the `$N` refs the
  *   kept lines carry reach the truncated values (the cap costs reads,
  *   never data),
- * - interrupt without an id breaks a RUNNING eval: an eval suspended
- *   in flight is interrupted when its continuation (a runaway loop)
- *   executes, and the signal is consumed by that execution.
+ * - interrupt without an id breaks a RUNNING eval: an eval that keeps
+ *   EXECUTING across drains (a runaway loop over subagent calls) is in
+ *   flight while a wait pumps it; the interrupt lands mid-wait (the
+ *   wait releases the broker chain between its pumps) and the wait's
+ *   very next pump breaks the loop's next iteration MID-RUN via the
+ *   quickjs interrupt handler; the signal is consumed by that
+ *   execution (a later eval is unaffected).
  */
 
 import assert from "node:assert/strict";
@@ -324,29 +328,52 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       assert.ok(!isErrorResult(interrupted), textOf(interrupted));
       assert.ok(textOf(interrupted).includes("session/cancel sent"), textOf(interrupted));
       // interrupt without an id BREAKS THE RUNNING EVAL (phase-E review
-      // rejection: the old test pre-armed the signal before the eval
-      // started, so it never exercised the required ability to interrupt
-      // a RUNNING eval). The eval is started first — it suspends on an
-      // in-flight call, so it IS running (its continuation is registered
-      // and will execute); the interrupt lands while it is in flight;
-      // when the continuation (a runaway loop) executes, the quickjs
-      // interrupt handler breaks it MID-RUN. The signal is consumed by
-      // the running eval's execution — a later eval is unaffected.
+      // rejection round 2: the old test exercised a suspended
+      // continuation — the eval had never executed when the interrupt
+      // landed, and the old waitForCalls held the broker chain across
+      // its whole bounded poll, so an interrupt sent mid-wait could not
+      // even be PROCESSED until the wait finished or timed out). Here
+      // the eval is a runaway that KEEPS EXECUTING across drains (each
+      // iteration does real work, fires the next subagent call, and
+      // suspends — it is in flight the whole time, mid-run), a wait is
+      // pumping it, and the interrupt lands WHILE THE WAIT IS IN
+      // FLIGHT; the wait's very next pump resumes the loop's next
+      // iteration and the quickjs interrupt handler breaks it MID-RUN.
       const inFlight = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
-        code: 'const s = agent("pi/x", "task4"); await s; while (true) {}',
+        code: 'const s = agent("pi/x", "task4"); await s; for (;;) { let x = 0; for (let i = 0; i < 200000; i++) x += i; await agent("pi/x", "again"); }',
       });
       assert.ok(!isErrorResult(inFlight), textOf(inFlight));
       assert.ok(textOf(inFlight).includes("pending: c1, c4"), textOf(inFlight));
+      // The wait starts pumping the running eval; the interrupt must be
+      // PROCESSED while the wait is still in flight — the wait releases
+      // the broker chain between its pumps, so the interrupt call is
+      // served mid-wait (the old code held the chain: the interrupt
+      // queued behind the whole bounded wait and could not break the
+      // eval before the target completed).
+      let wait1Done = false;
+      const waiting1 = repl(session, { action: "wait", projectDir: PROJECT, ids: ["c4"], timeoutMs: 30000 }).then((r) => {
+        wait1Done = true;
+        return r;
+      });
+      await tick();
+      await tick();
       const armed = await repl(session, { action: "interrupt", projectDir: PROJECT });
       assert.ok(!isErrorResult(armed), textOf(armed));
       assert.ok(textOf(armed).includes("interrupting the running eval"), textOf(armed));
+      assert.ok(!wait1Done, "the interrupt was processed MID-WAIT (the wait was still pumping, its target unsettled)");
+      // The first settlement: the wait's very next pump resumes the
+      // loop's next iteration — and the armed signal breaks it MID-RUN
+      // (the break is the wait's own pump-drain error — honest output
+      // in the wait's result).
       runner.last().completeTurn("resumed");
-      const runaway = await repl(session, { action: "eval", projectDir: PROJECT, code: '"after"' });
-      assert.ok(textOf(runaway).includes("interrupted"), `the running eval was broken: ${textOf(runaway)}`);
-      // The signal was consumed by the running eval: the next eval is
-      // NOT broken, and the VM stays usable.
+      const waited1 = await waiting1;
+      assert.ok(!isErrorResult(waited1), textOf(waited1));
+      assert.ok(textOf(waited1).includes("completed: c4"), textOf(waited1));
+      assert.ok(textOf(waited1).includes("interrupted"), `the executing runaway was broken mid-run: ${textOf(waited1)}`);
+      // The signal was consumed by the running eval's execution: the
+      // next eval is NOT broken, and the VM stays usable.
       const afterInterrupt = await repl(session, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
       assert.ok(textOf(afterInterrupt).includes("result: 42"), textOf(afterInterrupt));
       // reset: teardown — the VM and its stored state are dropped; the
@@ -614,6 +641,63 @@ test("reset does not clear client presence: with a second client still connected
       const got = await repl(sessionB, { action: "eval", projectDir: PROJECT, code: "await q" });
       assert.ok(!isErrorResult(got), textOf(got));
       assert.ok(textOf(got).includes("post-reset result"), textOf(got));
+      // B's disconnect is the LAST client: NOW the drain runs and closes
+      // the idle child.
+      await sessionB.dispose();
+      for (let attempt = 0; attempt < 200 && child.releases === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(child.releases, 1, "the last-client disconnect drains and closes the idle child");
+    } finally {
+      await sessionA.dispose().catch(() => undefined);
+      await sessionB.dispose().catch(() => undefined);
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("workflow calls register project presence: a workflow-only client B keeps the workspace warm when repl-client A disconnects (phase-E review rejection round 2)", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const PROJECT = makeProjectDir("repl-workflow-presence");
+    const sessionA = await connectHttp(daemon.url);
+    const sessionB = await connectHttp(daemon.url);
+    try {
+      // A touches the repl workspace (a child opens).
+      const start = await repl(sessionA, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
+      assert.ok(!isErrorResult(start), textOf(start));
+      await tick();
+      const child = runner.last();
+      // B addresses the SAME project through the WORKFLOW tool (a
+      // trivial script — no agents, nothing repl-related). The workflow
+      // handler resolves the same per-project context and registers the
+      // session's presence on it (phase-E review rejection round 2: only
+      // repl calls used to register presence, so B's connection was
+      // invisible to the drain and A's disconnect below would have
+      // drained/closed children while B was still connected).
+      const ran = await sessionB.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "run",
+          projectDir: PROJECT,
+          script: 'export const meta = { name: "empty", description: "empty script" };',
+        },
+      });
+      assert.ok(!(ran as { isError?: boolean }).isError, textOf(ran));
+      // A's connection drops while B is still connected to the project
+      // through workflow calls: NO drain may fire — the post-workflow
+      // child stays warm.
+      await sessionA.dispose();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(child.releases, 0, "no drain while B (a workflow-only client) is connected");
+      assert.equal(child.cancelCalls, 0, "nothing was cancelled");
+      // The in-flight turn completes and settles into the live workspace.
+      child.completeTurn("wf-presence result");
+      const got = await repl(sessionB, { action: "eval", projectDir: PROJECT, code: "await p" });
+      assert.ok(!isErrorResult(got), textOf(got));
+      assert.ok(textOf(got).includes("wf-presence result"), textOf(got));
       // B's disconnect is the LAST client: NOW the drain runs and closes
       // the idle child.
       await sessionB.dispose();
