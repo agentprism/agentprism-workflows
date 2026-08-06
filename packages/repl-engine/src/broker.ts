@@ -1242,6 +1242,24 @@ export class Broker {
       report.reattached.push(entry.id);
       return false;
     }
+    if (this.draining || this.disposed) {
+      // A PARKED restore-time load resumed after the client-presence
+      // drain force-stopped (or after disposal): the drain already
+      // settled EVERY outstanding call at its bound — including the
+      // registry entries this serialized loop had not reached yet (see
+      // `drainForDisconnect`'s forced stop) — and a disposed broker
+      // must never open a child. Never initiate a NEW load or re-issue
+      // from the resumed loop: a fresh child must not open and run
+      // after the last client disconnected, nor after disposal
+      // (phase-D review rejection: the generation fence covered only
+      // the parked load itself, so a load that landed after the
+      // drain/disposal bump let the reconciliation loop initiate
+      // SUBSEQUENT loads for the registry entries behind it). The call
+      // stays pending (leftPending — the state owning it is being torn
+      // down or drained).
+      report.leftPending.push(entry.id);
+      return false;
+    }
     let parsed: ParsedAgentOptions;
     try {
       parsed = this.parseAgentOptions(entry.optionsJson);
@@ -1328,7 +1346,15 @@ export class Broker {
           );
           report.leftPending.push(entry.id);
         }
-        await Promise.resolve(session.release()).catch(() => undefined);
+        // The teardown-fence release is DETACHED, never awaited
+        // (phase-D review rejection: the fence used to await
+        // `session.release()` with no deadline — a custom backend with a
+        // hung release kept the reconciliation — and with it the daemon's
+        // first touch — pending indefinitely, reintroducing the
+        // unbounded-teardown defect). The child's close is best-effort
+        // here: the drain/disposal already returned at its bound, and a
+        // parked release must not hold the resumed reconcile.
+        void Promise.resolve(session.release()).catch(() => undefined);
         loaded = undefined;
         return false;
       }
@@ -1378,7 +1404,11 @@ export class Broker {
       const stoppedByDrain = this.stoppedOpens.delete(entry.id);
       if (stoppedByDrain || this.disposed || this.generation !== generation) {
         if (loaded !== undefined) {
-          await Promise.resolve(loaded.release()).catch(() => undefined);
+          // The teardown-fence release is DETACHED, never awaited (the
+          // same boundless-release family as the try arm above — phase-D
+          // review rejection: a hung release must not keep the resumed
+          // reconciliation pending forever).
+          void Promise.resolve(loaded.release()).catch(() => undefined);
           loaded = undefined;
         }
         if (!stoppedByDrain) report.leftPending.push(entry.id);
@@ -1719,7 +1749,10 @@ export class Broker {
           `call ${sessionId}: lazy re-attach of backend session ${record.sessionId} landed after the ` +
             `client-presence drain (or disposal) — the child was closed without registering`, // eslint-disable-line max-len
         );
-        await Promise.resolve(session.release()).catch(() => undefined);
+        // Detached, never awaited: the drain/disposal already returned at
+        // its bound, and a hung release must not hold the re-attach task
+        // (the same boundless-release family as the restore fence).
+        void Promise.resolve(session.release()).catch(() => undefined);
         return undefined;
       }
       const entry: SessionEntry = {
@@ -2222,6 +2255,24 @@ export class Broker {
    * have settled — so the drain never reports drained with a pending
    * call of any kind.
    *
+   * **The forced stop also settles every restored call the serialized
+   * reconcile had NOT yet reached** (phase-D review rejection: the
+   * reconciliation registers calls in `openingCalls` only as its loop
+   * reaches them — parked on the FIRST pending call's never-resolving
+   * `loadSession`, it never processes the entries behind it, so a
+   * forced stop that covered only the tracked calls left those entries
+   * pending and uncancelable while `isDrained` reported true, and a
+   * load that later landed let the resumed loop initiate SUBSEQUENT
+   * loads after the drain/disposal generation bump — children opening
+   * and running after the last client disconnected). Every pending
+   * registry entry that is not tracked is settled at the bound
+   * (completed-while-down entries from the store — the store arm's
+   * semantics; agent entries with the recoverable `AGENT_CANCELLED`;
+   * steers with the honest `failed`), and `reconcileAgentCall` refuses
+   * to initiate any load or re-issue while the broker is
+   * draining/disposed — the resumed loop settles the recorded
+   * completions from the store, first-wins, and opens nothing.
+   *
    * **The outer bound is measured from METHOD ENTRY, before the
    * serialized-chain wait** (phase-D review round 7: the clock used to
    * start inside the serialized closure, so a drain queued behind a
@@ -2407,6 +2458,87 @@ export class Broker {
               'warn',
               `steer ${task.callId}: cut off by the client-presence drain — nothing was delivered`,
             );
+          }
+          // The bound's forced stop also settles EVERY restored call the
+          // serialized reconcile had NOT yet reached. The passes above
+          // own the tracked calls (openingCalls, registered sessions,
+          // in-flight tasks), but a registry entry behind a parked
+          // loadSession — the serialized reconcile parks on the FIRST
+          // pending call's never-resolving load and never processes the
+          // entries after it — is in NONE of them: without this pass it
+          // would stay pending and uncancelable while `isDrained`
+          // reports true, and a load that later landed would let the
+          // resumed loop initiate SUBSEQUENT loads after the generation
+          // bump (a fresh child opening and running after the last
+          // client disconnected — phase-D review rejection). A
+          // completed-while-down entry settles from the store (the
+          // reconcile store arm's semantics — a recorded completion is
+          // the authority, never overwritten by the forced stop); an
+          // unreached agent entry settles with the recoverable
+          // AGENT_CANCELLED; an unreached steer with the honest
+          // `failed` (exactly what its fenced late landing would have
+          // settled). All recorded FIRST, then settled, drained and
+          // snapshotted with the other bound settlements below. (The
+          // gate above is always entered when unreached entries exist:
+          // the reconcile loop's only await — the re-attach load — is
+          // covered by the opening-call registry before it parks.)
+          const pendingEntries = this.workspace.surface()?.pending() ?? [];
+          for (const registryEntry of pendingEntries) {
+            if (registryEntry.kind === 'checkpoint') {
+              // A checkpoint the parked reconcile never re-surfaced is
+              // re-registered in the broker's checkpoint table here — it
+              // stays pending (a checkpoint awaits the human's answer;
+              // the drain must never fabricate one) but must stay
+              // ANSWERABLE across the cut-off restore (the doc:
+              // "answering works across a restore" — without the
+              // re-surface, `checkpoint.answer` could not find it).
+              this.requeueCheckpoint(registryEntry, this.callStore.lookup(registryEntry.id));
+              continue;
+            }
+            if (this.openingCalls.has(registryEntry.id)) continue; // owned by the pass above
+            if (this.isTracked(registryEntry.id)) continue; // owned by the passes above
+            const storedRecord = this.callStore.lookup(registryEntry.id);
+            const storedCompletion = storedRecord?.completion;
+            if (storedCompletion !== null && storedCompletion !== undefined) {
+              // Completed while down: settle from the store (the same
+              // settle the store arm would have performed).
+              if (this.settleIntoGuest(registryEntry.id, storedCompletion.outcome, storedCompletion.value)) {
+                settledIds.push(registryEntry.id);
+              }
+              continue;
+            }
+            if (registryEntry.kind === 'steer') {
+              // The deliver() discipline: the store write first; a
+              // store that already holds a first completion stays the
+              // authority.
+              if (this.recordCompletion(registryEntry.id, { outcome: 'resolve', value: 'failed', completedAtMs: now() })) {
+                if (this.settleIntoGuest(registryEntry.id, 'resolve', 'failed')) settledIds.push(registryEntry.id);
+              } else {
+                const completion = this.callStore.lookup(registryEntry.id)?.completion;
+                if (completion === null || completion === undefined) {
+                  throw new Error(`Broker: store lost the recorded completion for ${registryEntry.id}`);
+                }
+                if (this.settleIntoGuest(registryEntry.id, completion.outcome, completion.value)) {
+                  settledIds.push(registryEntry.id);
+                }
+              }
+              this.warnLine(
+                'warn',
+                `steer ${registryEntry.id}: cut off by the client-presence drain before its wire call started — nothing was delivered`,
+              );
+              continue;
+            }
+            const value = toRejectionValue(
+              new WorkflowError(
+                `call ${registryEntry.id} was cancelled by the client-presence drain: its restore reconciliation ` +
+                  `was cut off at the bound — the call is settled`, // eslint-disable-line max-len
+                CODE.AGENT_CANCELLED,
+                { recoverable: true },
+              ),
+            );
+            this.recordCompletion(registryEntry.id, { outcome: 'reject', value, completedAtMs: now() });
+            if (this.settleIntoGuest(registryEntry.id, 'reject', value)) settledIds.push(registryEntry.id);
+            this.warnLine('warn', `call ${registryEntry.id}: ${value.message}`);
           }
           if (settledIds.length > 0) {
             try {
@@ -3029,7 +3161,10 @@ export class Broker {
           callId,
           new Error('the client-presence drain stopped this call while its session was still opening'),
         );
-        await Promise.resolve(session.release()).catch(() => undefined);
+        // Detached, never awaited: the drain already settled the call at
+        // its bound, and a hung release must not park the stopped task
+        // (the same boundless-release family as the restore fence).
+        void Promise.resolve(session.release()).catch(() => undefined);
         return {
           outcome: 'reject',
           value: toRejectionValue(

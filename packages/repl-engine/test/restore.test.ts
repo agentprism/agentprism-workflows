@@ -1793,3 +1793,142 @@ test('a restore-time loadSession that lands AFTER a bounded dispose is released 
   assert.equal(broker2.store().lookup('c1')!.completion, null, 'the call was not settled from a quiet gap');
   ws2.dispose();
 });
+
+test('a bounded drain with MULTIPLE pending restored calls settles EVERY outstanding call at the bound — a reconcile parked on a never-resolving first loadSession leaves no pending, uncancelable entry, and the resumed reconcile never initiates subsequent loads after the generation bump (phase-D review rejection)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-multi-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await broker.eval('const p1 = agent("pi/x", "t1"); const p2 = agent("pi/y", "t2"); const q = checkpoint("Question?"); "started"');
+  await tick();
+  assert.equal(runner.sessions.length, 2);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  // Restore: the re-attach of the FIRST pending call parks FOREVER, so
+  // the serialized reconciliation can never reach the second registry
+  // entry (it registers calls in `openingCalls` only as the loop reaches
+  // them).
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  let loadCalls = 0;
+  let resolveLoad!: () => void;
+  const parkedLoad = new Promise<void>((resolve) => {
+    resolveLoad = resolve;
+  });
+  const originalLoad = runner2.loadSession.bind(runner2);
+  runner2.loadSession = async (opts) => {
+    loadCalls++;
+    await parkedLoad;
+    return originalLoad(opts);
+  };
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const reconcilePromise = broker2.reconcile();
+  await tick();
+  assert.equal(loadCalls, 1, 'reconcile parked on the FIRST call\'s re-attach load');
+  assert.deepEqual(
+    broker2.pendingCalls().map((e) => e.id),
+    ['c1', 'c2', 'c3'],
+    'all three entries (two calls + the checkpoint) are pending in the guest registry',
+  );
+
+  // The bounded drain: c1 is covered by the opening-call registry, but
+  // c2 was never REACHED by the serialized reconcile — the forced stop
+  // must settle it too (the old code settled only c1, then reported
+  // drained with c2 pending and uncancelable forever — reconcile never
+  // runs again on a live workspace).
+  assert.equal(await broker2.drainForDisconnect(80), false, 'the bound expired with the load parked');
+  assert.ok(broker2.isDrained, 'the broker reports drained');
+  assert.deepEqual(
+    broker2.pendingCalls().map((e) => e.id),
+    ['c3'],
+    'EVERY outstanding CALL was settled at the bound — only the checkpoint (which awaits the human\'s answer) stays pending',
+  );
+  for (const id of ['c1', 'c2']) {
+    const record = broker2.store().lookup(id)!;
+    assert.equal(record.completion!.outcome, 'reject', `${id} settled durably at the bound`);
+    assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED', `${id} carries the forced-stop code`);
+    assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true, `${id} is recoverable`);
+  }
+
+  // The parked load lands AFTER the drain: the resumed reconciliation
+  // must NOT initiate the SECOND call's load — a fresh child must never
+  // open and run after the last client disconnected (the generation
+  // fence used to cover only the parked load itself, so the resumed
+  // loop initiated subsequent loads for the entries behind it). The
+  // already-recorded completions settle from the store, first-wins.
+  resolveLoad();
+  const report = await reconcilePromise;
+  assert.equal(loadCalls, 1, 'no second loadSession after the drain generation bump');
+  assert.equal(runner2.openedWith.length, 0, 'no re-issue — no fresh session was opened');
+  assert.equal(runner2.sessions.length, 1, 'only the parked-load session exists');
+  assert.equal(runner2.sessions[0].releases, 1, 'the late-loaded session was released exactly once');
+  assert.equal(runner2.sessions[0].prompts.length, 0, 'the late-loaded session never prompted');
+  assert.deepEqual(report.reissued, [], 'nothing was re-issued');
+  assert.deepEqual(report.reattached, [], 'nothing was re-attached after the drain');
+  assert.deepEqual(report.leftPending, [], 'no call left pending');
+  // The bound settlements are exactly-once: the resumed store arm did
+  // not double-settle (the registry still holds only the checkpoint).
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c3']);
+  // The checkpoint the parked reconcile never re-surfaced was re-surfaced
+  // by the bound's pass — it stays ANSWERABLE across the cut-off restore
+  // (the doc: "answering works across a restore").
+  const answered = await broker2.eval('checkpoint.answer("c3", "blue"); "delivered"');
+  assert.equal(answered.result, '"delivered"');
+  assert.equal((await broker2.eval('await q')).result, '"blue"');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a late-landing restore load whose session.release HANGS cannot hold the reconciliation (or the daemon\'s first touch) — the teardown fence DETACHES the best-effort release (phase-D review rejection: the fence awaited session.release() with no deadline, so a custom backend with a hung release kept reconcile/first-touch pending indefinitely)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-hungrel-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  // Restore: the re-attach load parks; a bounded dispose completes while
+  // it is parked (the daemon shutdown path — the disposal runs unlocked
+  // at its deadline because the parked reconcile holds the chain).
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  let resolveLoad!: () => void;
+  const parkedLoad = new Promise<void>((resolve) => {
+    resolveLoad = resolve;
+  });
+  const originalLoad = runner2.loadSession.bind(runner2);
+  runner2.loadSession = async (opts) => {
+    await parkedLoad;
+    const session = await originalLoad(opts);
+    session.hangRelease = true; // the custom backend's release hangs forever
+    return session;
+  };
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const reconcilePromise = broker2.reconcile();
+  await tick();
+  await broker2.dispose(150);
+
+  // The parked load lands LATER, with a HUNG release: the teardown fence
+  // must DETACH the release (best-effort, catch attached) instead of
+  // awaiting it — the reconciliation completes promptly and the first
+  // touch is never left pending on the hung release (the old code
+  // awaited `session.release()` with no deadline: reconcile stayed
+  // parked forever).
+  const started = Date.now();
+  resolveLoad();
+  const report = await reconcilePromise;
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1000, `reconcile completed without awaiting the hung release: ${elapsed} ms`);
+  assert.equal(runner2.sessions.length, 1, 'only the loaded session exists');
+  assert.equal(runner2.sessions[0].releases, 1, 'the release was ISSUED (best-effort, detached)');
+  assert.equal(runner2.sessions[0].prompts.length, 0, 'the late-loaded session never prompted');
+  assert.deepEqual(report.leftPending, ['c1'], 'the call stays pending — the state owning it was torn down');
+  assert.deepEqual(report.reissued, [], 'never re-issued');
+  assert.equal(runner2.openedWith.length, 0, 'no fresh session was opened');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});

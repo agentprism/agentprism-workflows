@@ -369,6 +369,25 @@ export async function drainReplProject(state: ReplProjectState, boundMs: number)
   }
 }
 
+/** Detach a stale in-flight first-touch flight (reset/dispose during a
+ *  parked restore-time reconcile): the flight is dropped from the state
+ *  so a fresh touch starts a NEW first touch instead of awaiting the
+ *  never-resolving promise forever, and its eventual rejection — the
+ *  generation check aborting the stale touch when the parked
+ *  loadSession finally lands — is marked handled (the original toucher
+ *  still observes it; a detached promise must never become an unhandled
+ *  rejection). Phase-D review rejection: reset/dispose used to leave
+ *  `state.firstTouch` parked — the generation check only ran after
+ *  `broker.reconcile()` resolved — so every subsequent touch returned
+ *  the stale promise and hung forever. */
+function detachFirstTouch(state: ReplProjectState): void {
+  const flight = state.firstTouch;
+  state.firstTouch = null;
+  if (flight !== null) {
+    void flight.catch(() => undefined);
+  }
+}
+
 /** Teardown the live workspace and broker (releasing every held ACP
  *  session) and close the store. The `repl/` directory is kept (a later
  *  touch restores from it). The broker's disposal drains what it can
@@ -388,6 +407,7 @@ export async function disposeReplProjectState(
   state.broker = null;
   state.workspace = null;
   state.generation++;
+  detachFirstTouch(state);
   try {
     if (broker !== null) await broker.dispose(boundMs);
   } finally {
@@ -407,7 +427,10 @@ export async function disposeReplProjectState(
 /** The `reset` tool's engine-side: teardown the workspace and delete the
  *  whole `repl/` directory, clearing any contained refusal. The broker
  *  teardown is bounded like the shutdown path's (a hung backend must
- *  not hang `reset` either). */
+ *  not hang `reset` either). The stale first-touch flight is detached
+ *  like the shutdown path's (see `disposeReplProjectState`): a reset
+ *  during a parked restore-time reconcile must not leave every
+ *  subsequent touch awaiting the never-resolving promise forever. */
 export async function resetReplProjectState(
   state: ReplProjectState,
   boundMs: number = SHUTDOWN_DEADLINE_MS,
@@ -416,6 +439,7 @@ export async function resetReplProjectState(
   state.broker = null;
   state.workspace = null;
   state.generation++;
+  detachFirstTouch(state);
   try {
     if (broker !== null) await broker.dispose(boundMs);
   } finally {

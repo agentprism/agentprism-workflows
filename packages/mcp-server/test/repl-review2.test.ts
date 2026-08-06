@@ -28,7 +28,7 @@ import type {
   BrokerTurn,
 } from "@automatalabs/repl-engine";
 
-import { createWorkflowServer } from "../src/index.js";
+import { createWorkflowServer, resetReplProjectState } from "../src/index.js";
 import { WorkflowProjectRegistry } from "../src/project-registry.js";
 import { ReplPresenceLedger } from "../src/repl-presence.js";
 import { okRunner, textOf, type Connected } from "./_harness.js";
@@ -742,6 +742,100 @@ test("review8b: a concurrent first touch during a parked restore-time loadSessio
     assert.ok(
       textOf((touch1Result as PromiseFulfilledResult<{ content: unknown[] }>).value).includes("aborted by reset/dispose"),
       "the abort names the teardown loudly",
+    );
+  } finally {
+    await second.dispose();
+  }
+});
+
+test("review-rejection: reset during a parked restore-time loadSession DETACHES the stale first-touch flight — a fresh touch after the reset starts a new workspace instead of awaiting the never-resolving promise forever (phase-D review rejection: reset/dispose left the parked firstTouch in place, and the generation check ran only after broker.reconcile() resolved)", async () => {
+  const PROJECT = freshProject();
+  // Phase 1 — seed a stored snapshot with a pending call whose backend
+  // session is recorded (the restore's re-attach key).
+  const runner1 = new FakeRunner();
+  const first = await connectWithRepl(runner1);
+  try {
+    const r = await repl(first, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "task"); "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    assert.equal(runner1.sessions.length, 1, "the founding session opened");
+  } finally {
+    await first.dispose();
+  }
+
+  // Phase 2 — a fresh daemon whose restore-time loadSession NEVER
+  // resolves: the first touch parks in the reconcile.
+  const runner2 = new FakeRunner();
+  const presence = new ReplPresenceLedger(60_000);
+  const projects = new WorkflowProjectRegistry(okRunner());
+  const second = await connectWithRepl(runner2, { presence, projects });
+  let loadCalls = 0;
+  let resolveLoad!: () => void;
+  const parkedLoad = new Promise<void>((resolve) => {
+    resolveLoad = resolve;
+  });
+  const loadedSessions: FakeSession[] = [];
+  const originalLoad = runner2.loadSession.bind(runner2);
+  runner2.loadSession = async (opts) => {
+    loadCalls++;
+    await parkedLoad;
+    const session = await originalLoad(opts);
+    loadedSessions.push(session);
+    return session;
+  };
+  try {
+    // The first touch: restore + reconcile, parked in the re-attach load.
+    const touch1 = repl(second, { action: "eval", projectDir: PROJECT, code: '"probe 1"' });
+    await waitFor(() => loadCalls === 1);
+    const projectContext = projects.stores().find((c) => c.projectDir === PROJECT)!;
+    const state = projectContext.repl!;
+    assert.ok(state.firstTouch !== null, "the first touch is parked in the restore reconcile");
+
+    // RESET while the touch is parked: the bounded disposal completes,
+    // and the stale first-touch flight is DETACHED (the old code left it
+    // in place — every subsequent touch returned the never-resolving
+    // promise and hung forever). The reset is driven directly with a
+    // short bound (the MCP tool's reset runs the same path with the
+    // default shutdown bound).
+    await resetReplProjectState(state, 300);
+    assert.equal(state.firstTouch, null, "the stale first-touch flight was detached by the reset");
+    assert.equal(state.workspace, null, "the workspace was torn down");
+    assert.equal(state.broker, null, "the broker was torn down");
+
+    // A FRESH touch after the reset starts a NEW first touch (a fresh
+    // workspace — the repl/ store was cleared) instead of awaiting the
+    // stale parked flight forever.
+    const fresh = await Promise.race([
+      repl(second, { action: "eval", projectDir: PROJECT, code: "6 * 7" }).then((r) => ({ ok: true as const, r })),
+      new Promise<{ ok: false }>((resolve) => setTimeout(() => resolve({ ok: false }), 3000)),
+    ]);
+    assert.ok(fresh.ok, "the fresh touch after the reset completed — it did not await the stale parked flight forever");
+    assert.ok(!isErrorResult(fresh.r), textOf(fresh.r));
+    assert.ok(textOf(fresh.r).includes("result: 42"), `the fresh workspace evaluated: ${textOf(fresh.r)}`);
+    assert.equal(state.source, "fresh", "the fresh touch created a new workspace");
+
+    // The parked load lands even later: the OLD broker's disposal fence
+    // releases the child exactly once — never registered, never
+    // re-issued — and the stale touch aborts loudly (its rejection is
+    // marked handled by the detach — never an unhandled rejection).
+    resolveLoad();
+    await waitFor(() => loadedSessions.length === 1);
+    assert.equal(loadedSessions[0].releases, 1, "the late-loaded session was released by the old broker's disposal fence");
+    assert.equal(loadedSessions[0].prompts.length, 0, "the late-loaded session never prompted");
+    assert.equal(runner2.openedWith.length, 0, "no re-issue — no fresh session was opened");
+    const [touch1Result] = await Promise.allSettled([touch1]);
+    assert.equal(touch1Result.status, "fulfilled", "the stale touch settled when its parked load landed");
+    assert.ok(
+      isErrorResult((touch1Result as PromiseFulfilledResult<unknown>).value),
+      "the stale touch aborted as an error result",
+    );
+    assert.ok(
+      textOf((touch1Result as PromiseFulfilledResult<{ content: unknown[] }>).value).includes("aborted by reset/dispose"),
+      "the stale touch names the teardown loudly",
     );
   } finally {
     await second.dispose();
