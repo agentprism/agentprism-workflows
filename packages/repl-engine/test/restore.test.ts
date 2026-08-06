@@ -1299,6 +1299,81 @@ test('a seam rejection degrades to re-issue inside the task: the loaded session 
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('a safe loaded-turn reissue whose release parks past the disconnect bound is HELD — no reissue recorded, no fresh child opens after the broker reported drained (late-resolving-release regression)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-laterelease-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reattached, ['c1'], 'armed on the loaded session first');
+
+  // The seam rejects with a SAFE re-issue class error, and the loaded
+  // session's release PARKS (a hung backend release): the re-issue is
+  // now blocked inside `reissueReattached`'s awaited release.
+  const loaded = runner2.sessions[0];
+  const parkedSeam = loaded.loadedTurns.shift();
+  assert.ok(parkedSeam, 'the seam is parked on the loaded session');
+  // Every release invocation parks on its own resolver — the drain's
+  // release phase calls `release()` a second time, so the re-issue
+  // task's await and the drain's bounded release share the parking
+  // family; all parks are released together later.
+  const releaseResolvers: Array<() => void> = [];
+  loaded.release = () => {
+    loaded.releases++;
+    return new Promise<void>((resolve) => {
+      releaseResolvers.push(resolve);
+    });
+  };
+  parkedSeam.reject(new Error("the loaded session's founding turn never reached a terminal assistant message"));
+  await tick();
+  await tick();
+  assert.equal(runner2.sessions.length, 1, 'no fresh session yet — the re-issue is parked in the release');
+  assert.equal(loaded.releases, 1, 'the release was issued and parked');
+
+  // The disconnect drain runs while the release is parked: the bound
+  // expires (the call is still pending on the busy entry), the forced
+  // stop settles the call DURABLY as AGENT_CANCELLED (recorded first,
+  // settled into the guest), and the drain reports drained.
+  const started = Date.now();
+  const drained = await broker2.drainForDisconnect(120);
+  assert.equal(drained, false, 'the bound is the honest outcome — the call could not drain');
+  assert.ok(Date.now() - started < 2000, 'the drain returned at its bound (never awaited the parked release)');
+  assert.ok(broker2.isDrained);
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the forced stop settled the call');
+  const record = broker2.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+
+  // The parked release resolves LATE, after the drain reported drained.
+  // The re-issue must NOT proceed: no reissue recorded, no fresh session,
+  // no prompt — a fresh child must never open after the broker reported
+  // drained (phase-D review rejection: the fence was checked only BEFORE
+  // the awaited release, so a release that parked past the bound resumed
+  // into a post-drain re-issue that recorded a reissue and opened/prompted
+  // a new child).
+  for (const resolve of releaseResolvers) resolve();
+  await tick();
+  await tick();
+  assert.equal(runner2.sessions.length, 1, 'no fresh session opened after the drain');
+  assert.ok(
+    runner2.sessions.every((s) => s.prompts.length === 0),
+    'no new child prompted after the drain',
+  );
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'no reissue was recorded');
+  assert.equal(record.completion!.outcome, 'reject', 'the call stays as the drain settled it');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
 // ────────────────────────────────────────────────────────────────────────
 // The re-issue branches' refusal cadence (phase-D review round 2)
 // ────────────────────────────────────────────────────────────────────────

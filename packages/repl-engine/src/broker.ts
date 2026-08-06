@@ -1427,6 +1427,22 @@ export class Broker {
       if (loaded !== undefined) {
         await Promise.resolve(loaded.release()).catch(() => undefined);
       }
+      // The disposed/drain fence RE-CHECKED after the awaited release
+      // (phase-D review rejection — the same late-fence family as
+      // `reissueReattached`): the release can park past the drain's
+      // bound or a disposal's generation bump, and the drain's forced
+      // stop then settles the call durably (the opening-call pass —
+      // recorded AGENT_CANCELLED, guest-settled, drained, snapshotted)
+      // and reports `isDrained` while the release is still parked. A
+      // late re-issue would open a fresh child after the broker
+      // reported drained; the re-check holds instead — the call stays
+      // as the drain settled it (the stopped-open marker is consumed
+      // here when the forced stop landed during the parked release).
+      const stoppedByDrainLate = this.stoppedOpens.delete(entry.id);
+      if (stoppedByDrainLate || this.disposed || this.generation !== generation) {
+        if (!stoppedByDrainLate) report.leftPending.push(entry.id);
+        return false;
+      }
       return this.reissueCall(
         entry,
         parsed,
@@ -1617,14 +1633,42 @@ export class Broker {
    *  still-running backend turn is never duplicated by this path (the
    *  seam only rejects on genuine unobservability). Steers queued
    *  against the re-attached session are handed to the fresh session
-   *  (the dispatch path merges `pendingSteers` into its entry's queue). */
+   *  (the dispatch path merges `pendingSteers` into its entry's queue).
+   *
+   *  The drain/disposal fence is checked by the CALLER before this path
+   *  is entered AND re-checked HERE after the awaited release (phase-D
+   *  review rejection: the release can park past the client-presence
+   *  drain's bound — or past a disposal — and the drain's forced stop
+   *  settles the call durably and reports `isDrained` while the release
+   *  is still parked; the old code resumed into a post-drain re-issue
+   *  that recorded a reissue and opened a FRESH child after the broker
+   *  reported drained). The generation is captured at entry so the
+   *  re-check is exact; a fenced landing holds the call (its outcome
+   *  stays as the drain/disposal left it — settled, or pending on a
+   *  torn-down state) and never records a reissue, never opens. */
   private async reissueReattached(
     callId: string,
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
     error: unknown,
   ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
+    const generation = this.generation;
     await Promise.resolve(entry.session.release()).catch(() => undefined);
+    // The fence RE-CHECK after the awaited release (see above): the
+    // release may have parked past the drain's bound, during which the
+    // forced stop recorded + settled the call and the drain reported
+    // drained, or past a disposal's generation bump. Re-issuing now
+    // would open a fresh child after the last client disconnected (or
+    // on a torn-down broker) — the call stays as the drain left it.
+    if (this.draining || this.disposed || this.generation !== generation) {
+      this.warnLine(
+        'warn',
+        `call ${callId}: ${toRejectionValue(error).message} — the loaded session's release outlived the ` +
+          `client-presence drain (or the broker was disposed); the call stays as the drain/disposal left it, ` +
+          `never re-issued after the last client disconnected`, // eslint-disable-line max-len
+      );
+      return { outcome: 'hold', value: undefined };
+    }
     if (entry.queue.length > 0) {
       const pending = this.pendingSteers.get(callId) ?? [];
       this.pendingSteers.set(callId, [...pending, ...entry.queue]);

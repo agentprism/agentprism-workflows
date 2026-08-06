@@ -26,13 +26,17 @@ import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type {
-  BrokerLoadSessionOptions,
-  BrokerOpenSessionOptions,
-  BrokerPromptOptions,
-  BrokerRunner,
-  BrokerSession,
-  BrokerTurn,
+import {
+  deserializeSnapshot,
+  loadShippedWasm,
+  serializeSnapshot,
+  wasmSha256Of,
+  type BrokerLoadSessionOptions,
+  type BrokerOpenSessionOptions,
+  type BrokerPromptOptions,
+  type BrokerRunner,
+  type BrokerSession,
+  type BrokerTurn,
 } from "@automatalabs/repl-engine";
 import { workflowProjectPaths } from "@automatalabs/workflows";
 
@@ -341,6 +345,72 @@ test("a corrupted stored snapshot is CONTAINED: loud refusal in the tool result,
     assert.ok(textOf(fresh).includes("result: 7"), textOf(fresh));
     const statusAfter = await repl(second, { action: "status", projectDir: PROJECT });
     assert.ok(textOf(statusAfter).includes("fresh"), `the fresh workspace persists again: ${textOf(statusAfter)}`);
+  } finally {
+    await second.dispose();
+  }
+});
+
+test("a STRUCTURALLY VALID corrupted snapshot (a corrupted in-range VM header that passes every at-rest check) is contained at RESTORE time: the refusal is stable across repeated touches — never a retry loop into garbage — and reset clears it", async () => {
+  const first = await connectWithRepl(new FakeRunner());
+  try {
+    await repl(first, { action: "eval", projectDir: PROJECT, code: "globalThis.doomed = 1" });
+  } finally {
+    await first.dispose();
+  }
+  const { snapshotPath } = replStorePaths();
+  assert.ok(existsSync(snapshotPath));
+  // Re-encode the stored snapshot with the VM header's STACK POINTER
+  // patched to an in-range-but-wrong value (1): the envelope stays fully
+  // valid (the same wasm binary hash — the identity is untouched — and
+  // a properly recompressed gzip), the QJSS payload parses, and the
+  // engine's shape/bounds check passes — but materializing the VM from
+  // it fails (`RuntimeError: memory access out of bounds`). This is the
+  // corruption class NO at-rest check can see (phase-D review
+  // rejection: `loadSnapshot()` accepted it and `Workspace.restore()`
+  // crashed with the raw wasm error, which escaped the
+  // `SnapshotEnvelopeError` containment — every touch retried the
+  // restore). The restore path must contain it as a coded refusal.
+  const module = await loadShippedWasm();
+  const originalBytes = readFileSync(snapshotPath);
+  const { snapshot } = deserializeSnapshot(originalBytes);
+  const corrupted = { ...snapshot, stackPointer: 1 };
+  writeFileSync(snapshotPath, serializeSnapshot(corrupted, wasmSha256Of(module)));
+
+  const second = await connectWithRepl(new FakeRunner());
+  try {
+    const r = await repl(second, { action: "eval", projectDir: PROJECT, code: "1 + 1" });
+    assert.ok(isErrorResult(r), textOf(r));
+    assert.ok(textOf(r).includes("REPL workspace refused"), textOf(r));
+    assert.ok(
+      textOf(r).includes("restoring the workspace VM from the snapshot failed") ||
+        textOf(r).includes("initializing the restored workspace failed"),
+      `names the restore stage: ${textOf(r)}`,
+    );
+    assert.ok(textOf(r).includes("memory access out of bounds"), `names the underlying failure: ${textOf(r)}`);
+    // Repeated touches surface the SAME recorded refusal — the recorded
+    // refusal is stable (the restore is not re-attempted into garbage),
+    // the daemon stays alive, no crash-loop.
+    const again = await repl(second, { action: "eval", projectDir: PROJECT, code: "2 + 2" });
+    assert.ok(isErrorResult(again), "the refusal is stable, not a crash");
+    assert.ok(textOf(again).includes("REPL workspace refused"), textOf(again));
+    const status = await repl(second, { action: "status", projectDir: PROJECT });
+    assert.ok(textOf(status).includes("REFUSED"), textOf(status));
+    // The recorded refusal is AUTHORITATIVE until reset: a repaired
+    // snapshot on disk (the original, perfectly restorable bytes) does
+    // not silently un-refuse the workspace — later touches surface the
+    // recorded refusal without re-attempting the restore (the
+    // stable-refusal short-circuit; only `reset` clears it).
+    writeFileSync(snapshotPath, originalBytes);
+    const repaired = await repl(second, { action: "eval", projectDir: PROJECT, code: "9 + 9" });
+    assert.ok(isErrorResult(repaired), "the recorded refusal is authoritative until reset");
+    assert.ok(textOf(repaired).includes("REPL workspace refused"), textOf(repaired));
+    // reset clears the store and a fresh workspace starts.
+    const reset = await repl(second, { action: "reset", projectDir: PROJECT });
+    assert.ok(!isErrorResult(reset), textOf(reset));
+    assert.ok(!existsSync(snapshotPath), "the refused snapshot was dropped");
+    const fresh = await repl(second, { action: "eval", projectDir: PROJECT, code: "3 + 4" });
+    assert.ok(!isErrorResult(fresh), textOf(fresh));
+    assert.ok(textOf(fresh).includes("result: 7"), textOf(fresh));
   } finally {
     await second.dispose();
   }

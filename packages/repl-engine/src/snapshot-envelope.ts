@@ -82,15 +82,21 @@ export type SnapshotEnvelopeErrorCode =
   | 'FORMAT_MISMATCH'
   | 'VERSION_MISMATCH'
   | 'CORRUPT_PAYLOAD'
-  | 'WASM_HASH_MISMATCH';
+  | 'WASM_HASH_MISMATCH'
+  | 'RESTORE_CORRUPT';
 
 /**
  * A loud envelope failure. `WASM_HASH_MISMATCH` is raised by the restore
  * path (the store's `loadSnapshot`), which compares the recorded hash
- * against the running binary; the other codes are raised by
- * `deserializeSnapshot` itself. Every message names the offending file
- * path (when one was given) and the recorded vs expected values, so a
- * restore that refuses can never be mistaken for a silent pass.
+ * against the running binary; `RESTORE_CORRUPT` is raised by
+ * `Workspace.restore` when a payload that PASSED every decode check
+ * cannot be materialized (or initialized) — the corruption class that no
+ * at-rest check can see (a structurally valid envelope whose VM header
+ * or memory content is garbage, phase-D review rejection); the other
+ * codes are raised by `deserializeSnapshot` itself. Every message names
+ * the offending file path (when one was given) and the recorded vs
+ * expected values, so a restore that refuses can never be mistaken for a
+ * silent pass.
  */
 export class SnapshotEnvelopeError extends Error {
   readonly code: SnapshotEnvelopeErrorCode;
@@ -112,6 +118,36 @@ export class SnapshotEnvelopeError extends Error {
     this.path = details.path;
     this.recorded = details.recorded;
     this.expected = details.expected;
+  }
+}
+
+/**
+ * A restore-time corruption refusal (`code: 'RESTORE_CORRUPT'`, part of
+ * the `SnapshotEnvelopeError` family so one containment catch covers the
+ * whole load path — decode AND materialization): the envelope's own
+ * checks passed (format, version, wasm hash, gzip, the shim's binary
+ * parse, the shape/bounds check), yet restoring the VM from the payload
+ * failed — `RuntimeError: memory access out of bounds` on a corrupted
+ * in-range VM header (a context/runtime/stack pointer patched to a
+ * wrong-but-in-bounds value), a guest surface that cannot be rehosted, a
+ * provenance registry that cannot bootstrap. This is exactly the doc's
+ * "restore into garbage" class, caught one step later than the envelope
+ * can see it: the refusal must be CONTAINED (recorded as a stable
+ * refusal by the daemon, never crash-looped, never retried into
+ * garbage). `Workspace.restore` raises it after disposing any partially
+ * created VM; the original failure's message travels inside the refusal
+ * so the tool result names the problem.
+ */
+export class SnapshotRestoreError extends SnapshotEnvelopeError {
+  constructor(message: string, details: { cause?: unknown } = {}) {
+    super('RESTORE_CORRUPT', message);
+    this.name = 'SnapshotRestoreError';
+    if (details.cause !== undefined) {
+      // ES2022 `Error` cause (target-compatible; the declaration stays
+      // self-contained — no explicit `cause` field is declared, the
+      // option is the standard constructor one).
+      (this as Error & { cause?: unknown }).cause = details.cause;
+    }
   }
 }
 
@@ -326,7 +362,22 @@ function validateHeader(raw: unknown, path: string | undefined): SnapshotEnvelop
   };
 }
 
-/** The shim's deserialized snapshot must satisfy the engine's shape. */
+/** The shim's deserialized snapshot must satisfy the engine's shape —
+ *  and its pointers must be STRUCTURALLY SANE (phase-D review rejection:
+ *  the check used to be type-only, so a valid gzip/QJSS payload with a
+ *  corrupted in-range-format VM header — `contextPtr` patched to
+ *  `0xfffffff0`, say — deserialized cleanly and then crashed the restore
+ *  with `RuntimeError: memory access out of bounds`, an uncoded failure
+ *  the daemon could not contain). A quickjs runtime/context pointer is a
+ *  malloc'd offset into the snapshot's own linear memory: never 0, never
+ *  negative, never at/above the memory end — a pointer outside (0,
+ *  memory.length) cannot be a legitimate restored VM. The stack pointer
+ *  is the wasm stack's top, likewise strictly inside the memory. These
+ *  bounds cannot prove a payload GOOD (in-memory corruption stays
+ *  invisible to any at-rest check — the restore-time containment in
+ *  `Workspace.restore` catches that class), but they make the cheap,
+ *  obvious header-corruption class a clean `CORRUPT_PAYLOAD` refusal at
+ *  decode, before any VM exists. */
 function isReplSnapshot(value: unknown): value is ReplSnapshot {
   if (typeof value !== 'object' || value === null) return false;
   const v = value as ReplSnapshot;
@@ -335,8 +386,17 @@ function isReplSnapshot(value: unknown): value is ReplSnapshot {
     typeof v.stackPointer === 'number' &&
     typeof v.runtimePtr === 'number' &&
     typeof v.contextPtr === 'number' &&
-    Array.isArray(v.extensions)
+    Array.isArray(v.extensions) &&
+    sanePointer(v.stackPointer, v.memory.byteLength) &&
+    sanePointer(v.runtimePtr, v.memory.byteLength) &&
+    sanePointer(v.contextPtr, v.memory.byteLength)
   );
+}
+
+/** A quickjs-wasi VM pointer: a non-negative integer strictly inside the
+ *  snapshot memory (malloc'd offsets are never 0 — see `isReplSnapshot`). */
+function sanePointer(ptr: number, memoryLength: number): boolean {
+  return Number.isInteger(ptr) && ptr > 0 && ptr < memoryLength;
 }
 
 function label(path: string | undefined): string {

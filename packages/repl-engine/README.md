@@ -459,6 +459,25 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
 - **Atomic writes are tmp + rename + fsync** (fixed-name `.tmp`, single-writer discipline;
   best-effort directory fsync); a failed write removes the tmp and throws, leaving the
   previous snapshot untouched; the store directory self-heals on write after a `reset()`.
+- **Restore-time corruption is contained in the same refusal family**
+  (`SnapshotRestoreError`, code `RESTORE_CORRUPT` — a `SnapshotEnvelopeError` subclass, so
+  the daemon's single containment catch covers the whole load path): the envelope's decode
+  checks now include pointer-BOUNDS validation (runtime/context/stack pointers must be
+  integers strictly inside the snapshot memory — a corrupted in-range VM header like
+  `contextPtr: 0xfffffff0` refuses as `CORRUPT_PAYLOAD` at decode, before any VM exists),
+  and a payload that passes every at-rest check yet cannot be materialized (a header
+  patched to a wrong-but-in-bounds value, a guest surface that cannot be rehosted, a
+  provenance registry that cannot bootstrap) refuses from `Workspace.restore` naming the
+  underlying failure — after DISPOSING the partially created VM. The daemon records the
+  refusal as stable state (later touches surface it without re-attempting the restore;
+  `reset` clears it) — never a raw `RuntimeError` retry loop into garbage.
+- **The safe-re-issue fence is re-checked after every awaited release** (`reissueReattached`
+  and the reconcile catch arm): the loaded session's `release()` can park past the
+  client-presence drain's bound (or a disposal's generation bump), during which the drain's
+  forced stop settles the call durably and reports `isDrained`; a re-issue that resumed
+  after the release would record a reissue and open a FRESH child post-drain. The
+  generation captured at entry is re-checked after the await — a fenced landing holds the
+  call (no reissue recorded, nothing opened; the call stays as the drain/disposal left it).
 - **The debounce is boundary-in/burst-out**: the broker fires `boundary(kind)` per
   doc-defined boundary (after each eval; after each settlement drain that changed VM state)
   and `flush()` at the end of each serialized operation; the store's `snapshotWriter`

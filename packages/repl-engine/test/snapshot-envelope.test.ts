@@ -55,13 +55,16 @@ async function shippedBytes(): Promise<Uint8Array> {
 
 /** A tiny but structurally valid snapshot stand-in for the pure
  *  envelope round trip (the shim's deserialize accepts the header +
- *  memory layout). */
+ *  memory layout). The pointers are IN-RANGE integers (strictly inside
+ *  the 4-byte memory, nonzero) — the shape/bounds check the engine's
+ *  decoder applies (phase-D review rejection: the check used to be
+ *  type-only). */
 function tinySnapshot(memory: Uint8Array = new Uint8Array([1, 2, 3, 4])): ReplSnapshot {
   return {
     memory,
-    stackPointer: 0,
-    runtimePtr: 0,
-    contextPtr: 0,
+    stackPointer: 1,
+    runtimePtr: 2,
+    contextPtr: 3,
     extensions: [],
   };
 }
@@ -166,6 +169,88 @@ test('format-name refusal: an envelope carrying another format refuses naming th
 // ────────────────────────────────────────────────────────────────────────
 // Corrupt / truncated handling
 // ────────────────────────────────────────────────────────────────────────
+
+test('a snapshot whose VM-header pointers are out of bounds refuses as CORRUPT_PAYLOAD at decode — the corrupted in-range-format header never reaches the restore (phase-D review rejection: the shape check used to be type-only, so a valid gzip/QJSS payload with `contextPtr` patched to `0xfffffff0` decoded cleanly and then crashed `Workspace.restore` with `RuntimeError: memory access out of bounds`)', async () => {
+  const module = await loadShippedWasm();
+  const ws = await Workspace.create(PROJECT, { wasm: module });
+  const raw = ws.snapshot();
+  ws.dispose();
+  const hash = wasmSha256Of(module);
+  const cases: Array<[string, number]> = [
+    // The reviewer's repro: a pointer patched far outside the memory.
+    ['contextPtr', 0xfffffff0],
+    // Just past the memory end.
+    ['runtimePtr', raw.memory.byteLength],
+    // Zeroed (malloc'd offsets are never 0).
+    ['stackPointer', 0],
+    // Negative (wraps in the wasm ABI).
+    ['runtimePtr', -1],
+  ];
+  for (const [field, value] of cases) {
+    const corrupted = { ...raw, [field]: value };
+    const envelope = serializeSnapshot(corrupted, hash);
+    const error = captureThrows(() => deserializeSnapshot(envelope, { expectedWasmSha256: hash }));
+    assert.ok(error instanceof SnapshotEnvelopeError, `${field}=${value}: ${error.message}`);
+    assert.equal(error.code, 'CORRUPT_PAYLOAD');
+    assert.ok(error.message.includes('unrecognized shape'), `${field}=${value}: ${error.message}`);
+  }
+});
+
+test('a corrupted in-range VM header that PASSES the decode checks refuses at RESTORE as SnapshotRestoreError (RESTORE_CORRUPT), never a raw RuntimeError', async () => {
+  const module = await loadShippedWasm();
+  const hash = wasmSha256Of(module);
+  const ws = await Workspace.create(PROJECT, { wasm: module });
+  await ws.eval('globalThis.x = 1');
+  const raw = ws.snapshot();
+  ws.dispose();
+  // The stack pointer patched to an in-range-but-wrong value (1): the
+  // envelope is fully valid (same binary hash, proper gzip), the QJSS
+  // payload parses, and the shape/bounds check passes — yet the wasm
+  // restore traps (`RuntimeError: memory access out of bounds`) the
+  // moment the stack is used. This is the corruption class NO at-rest
+  // check can see; `Workspace.restore` must refuse it as a coded,
+  // single-shot error naming the underlying failure.
+  const corrupted = { ...raw, stackPointer: 1 };
+  const envelope = serializeSnapshot(corrupted, hash);
+  const decoded = deserializeSnapshot(envelope, { expectedWasmSha256: hash });
+  assert.equal(decoded.snapshot.stackPointer, 1, 'decode accepts the in-range header (the corruption is invisible at rest)');
+  let error: unknown;
+  try {
+    await Workspace.restore(PROJECT, decoded.snapshot, { wasm: module });
+    assert.fail('expected the restore to refuse');
+  } catch (caught) {
+    error = caught;
+  }
+  assert.ok(error instanceof SnapshotEnvelopeError, `the refusal is in the envelope family: ${(error as Error).message}`);
+  assert.equal((error as SnapshotEnvelopeError).code, 'RESTORE_CORRUPT');
+  // The trap lands on the FIRST wasm call after the memory copy — the
+  // host-callback re-registration (`registerGuestHostCallbacks`) — so
+  // this payload exercises the INITIALIZATION-stage wrap (the partial-VM
+  // disposal path, the reviewer's exact "callback/provenation
+  // initialization throws" case). Either stage names itself; both are
+  // the same coded refusal.
+  const stage = (error as Error).message;
+  assert.ok(
+    stage.includes('restoring the workspace VM from the snapshot failed') ||
+      stage.includes('initializing the restored workspace failed'),
+    `names the restore stage: ${stage}`,
+  );
+  assert.ok(stage.includes('memory access out of bounds'), `names the cause: ${stage}`);
+  // Repeatable and stable: a second attempt refuses identically (and the
+  // failed attempt's partial VM was disposed — a good snapshot still
+  // restores right after).
+  try {
+    await Workspace.restore(PROJECT, decoded.snapshot, { wasm: module });
+    assert.fail('expected the second restore to refuse identically');
+  } catch (caught) {
+    assert.ok(caught instanceof SnapshotEnvelopeError && caught.code === 'RESTORE_CORRUPT', String(caught));
+  }
+  const good = await Workspace.restore(PROJECT, raw, { wasm: module });
+  const outcome = await good.eval('x');
+  assert.equal(outcome.kind, 'value');
+  assert.equal(outcome.value, 1, 'an uncorrupted snapshot restores after the refused attempts');
+  good.dispose();
+});
 
 test('corrupt envelopes refuse loudly, naming the file and the problem (single-shot, no silent pass)', () => {
   // No header line at all.

@@ -24,16 +24,25 @@
  *   re-attach via `loadSession`; lost → re-issue). The reconcile report
  *   and the source (`restored`) are recorded on the state for `status`.
  * - **A stored snapshot that REFUSES** (corrupt/truncated, a format
- *   version bump, or a wasm-hash mismatch naming both hashes) → the
- *   failure is CONTAINED: the `SnapshotEnvelopeError` is recorded on the
- *   state, no workspace is created, the daemon keeps serving (every
- *   subsequent `repl` call surfaces the refusal loudly in its result),
- *   and `reset` clears the `repl/` store so a fresh workspace can start.
- *   The alternative — re-creating a fresh VM over a refused snapshot —
- *   would silently discard the user's data; propagating the throw would
- *   crash-loop the daemon at every first touch. This is the doc's "a
- *   version bump makes old snapshots refuse loudly instead of
- *   corrupting" made daemon-safe.
+ *   version bump, a wasm-hash mismatch naming both hashes, or a
+ *   payload that passes every at-rest check but cannot be RESTORED — a
+ *   corrupted in-range VM header, `SnapshotRestoreError`) → the
+ *   failure is CONTAINED: the `SnapshotEnvelopeError` (the restore-time
+ *   corruption is part of the same family) is recorded on the state, no
+ *   workspace is created, the daemon keeps serving (every subsequent
+ *   `repl` call surfaces the refusal loudly in its result), and the
+ *   refusal is STABLE: once recorded, later touches surface it without
+ *   re-attempting the restore (phase-D review rejection: a restore-time
+ *   `RuntimeError` used to escape the `SnapshotEnvelopeError`
+ *   containment, so every touch retried the restore into garbage; the
+ *   refusal short-circuit makes the recorded refusal the single,
+ *   idempotent answer until `reset` clears it). `reset` clears the
+ *   `repl/` store so a fresh workspace can start. The alternative —
+ *   re-creating a fresh VM over a refused snapshot — would silently
+ *   discard the user's data; propagating the throw would crash-loop
+ *   the daemon at every first touch. This is the doc's "a version bump
+ *   makes old snapshots refuse loudly instead of corrupting" made
+ *   daemon-safe.
  *
  * First touches are SINGLE-FLIGHT: concurrent first-touch calls share
  * one in-flight promise (phase-D review round 2: an asynchronous null
@@ -217,6 +226,14 @@ export async function ensureReplWorkspace(
   const flight = state.firstTouch;
   if (flight !== null) return flight;
   if (state.workspace !== null) return;
+  // A RECORDED refusal is stable (phase-D review rejection: the old code
+  // re-attempted the restore on every touch — a restore-time corruption
+  // that escaped the `SnapshotEnvelopeError` catch (a raw wasm
+  // `RuntimeError`) retried the restore into garbage every time). Once
+  // the first touch recorded the refusal, later touches surface it
+  // without re-running the restore; only `reset` (which clears
+  // `restoreError`) makes a fresh touch attempt again.
+  if (state.restoreError !== null) return;
   const promise = doFirstTouch(state, wasm, runner, evalTimeoutMs);
   state.firstTouch = promise;
   try {
@@ -283,7 +300,12 @@ async function doFirstTouch(
     } catch (error) {
       if (error instanceof SnapshotEnvelopeError) {
         // Contained: the refusal is loud (surfaced in every repl result),
-        // the daemon keeps serving, and reset clears the store.
+        // the daemon keeps serving, and reset clears the store. The
+        // envelope family covers the whole load path — the decode-time
+        // refusals (hash/version/gzip/shape) AND the restore-time
+        // corruption (`SnapshotRestoreError` — a payload that passed
+        // every at-rest check but failed to materialize; `Workspace.restore`
+        // disposed its partial VM before raising it).
         state.restoreError = error;
         return;
       }

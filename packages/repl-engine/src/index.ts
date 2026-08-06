@@ -146,6 +146,7 @@ export {
   deserializeSnapshot,
   wasmSha256Of,
   SnapshotEnvelopeError,
+  SnapshotRestoreError,
   type SnapshotEnvelopeMeta,
   type SnapshotEnvelope,
   type SnapshotEnvelopeErrorCode,

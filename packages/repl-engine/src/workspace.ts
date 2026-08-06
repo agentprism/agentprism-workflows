@@ -22,6 +22,7 @@ import {
   type ProvenanceOrigin,
   type ProvenanceView,
 } from './provenance.js';
+import { SnapshotRestoreError } from './snapshot-envelope.js';
 import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
 import type { ReplSnapshot, WasmInput } from './types.js';
 import {
@@ -171,21 +172,61 @@ export class Workspace {
    * exists now so the settlement machinery (store → guest exactly-once
    * delivery across a simulated crash) is testable at the workspace
    * boundary.
+   *
+   * A payload that PASSED every envelope check (hash, version, gzip,
+   * shape, pointer bounds) but cannot be materialized — a corrupted
+   * in-range VM header (a pointer patched to a wrong-but-in-bounds
+   * value), garbage the shim's binary parse accepted, a guest surface
+   * that cannot be rehosted, a provenance registry that cannot
+   * bootstrap — REFUSES as `SnapshotRestoreError` (code
+   * `RESTORE_CORRUPT`, the envelope family's restore-time member), and
+   * any partially created VM is DISPOSED before the refusal propagates
+   * (phase-D review rejection: the callback/provenance initialization
+   * used to throw with the half-built VM still live, and the raw
+   * `RuntimeError` leaked past the daemon's `SnapshotEnvelopeError`
+   * containment, so every subsequent touch retried the restore into
+   * garbage). The refusal is single-shot and coded — the daemon records
+   * it as a stable refusal and never crash-loops.
    */
   static async restore(projectDir: string, snapshot: ReplSnapshot, options: WorkspaceOptions = {}): Promise<Workspace> {
     const wasm = options.wasm ?? (await loadShippedWasm());
-    const vm = await ReplVm.restore(snapshot, { wasm, memoryLimit: options.memoryLimit });
-    const workspace = new Workspace(projectDir, vm, new Set());
-    registerGuestHostCallbacks(vm, options.handlers ?? workspace.defaultHandlers());
-    const bootstrap = await provenanceBootstrap(vm, wasm);
-    workspace.baselineKeysSet.clear();
-    for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
-    if (bootstrap.created) {
-      // The pre-provenance restore sweep: attribute bindings that existed
-      // before this host started tracking.
-      provenanceRecord(vm, { kind: 'restore' });
+    let vm: ReplVm;
+    try {
+      vm = await ReplVm.restore(snapshot, { wasm, memoryLimit: options.memoryLimit });
+    } catch (error) {
+      // The VM never materialized (nothing to dispose): the shim's
+      // restore choked on the payload — a structurally valid envelope
+      // whose in-range header or memory is garbage. Raise the coded
+      // refusal with the underlying failure named, never a raw wasm
+      // `RuntimeError` (the daemon's containment catches the envelope
+      // family only).
+      throw new SnapshotRestoreError(
+        `restoring the workspace VM from the snapshot failed (${(error as Error)?.message ?? String(error)})`, // eslint-disable-line max-len
+        { cause: error },
+      );
     }
-    return workspace;
+    const workspace = new Workspace(projectDir, vm, new Set());
+    try {
+      registerGuestHostCallbacks(vm, options.handlers ?? workspace.defaultHandlers());
+      const bootstrap = await provenanceBootstrap(vm, wasm);
+      workspace.baselineKeysSet.clear();
+      for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
+      if (bootstrap.created) {
+        // The pre-provenance restore sweep: attribute bindings that existed
+        // before this host started tracking.
+        provenanceRecord(vm, { kind: 'restore' });
+      }
+      return workspace;
+    } catch (error) {
+      // The VM EXISTS but cannot be rehosted/bootstraped: dispose it
+      // (a partial VM must never be left live — phase-D review
+      // rejection) and raise the same coded refusal.
+      vm.dispose();
+      throw new SnapshotRestoreError(
+        `initializing the restored workspace failed (${(error as Error)?.message ?? String(error)})`, // eslint-disable-line max-len
+        { cause: error },
+      );
+    }
   }
 
   /**
