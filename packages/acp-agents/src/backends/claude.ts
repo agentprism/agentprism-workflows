@@ -1,4 +1,4 @@
-// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.64.2 (over the Claude
+// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.65.0 (over the Claude
 // Agent SDK). Structured output rides the vendor `_meta.claudeCode` channel at session/new:
 //   options.outputFormat = { type:"json_schema", schema }   // the SDK's native constraint
 //   emitRawSDKMessages = true                                // MANDATORY to READ the result
