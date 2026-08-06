@@ -31,7 +31,7 @@ import type {
     TurnPlanUpdatedNotification,
     WarningNotification
 } from "./app-server/v2";
-import {LOADED_TURN_ENDED_METHOD, type LoadedTurnEndedNotification} from "./AcpExtensions";
+import {pushLoadedTurnEnded} from "./AcpExtensions";
 import type { McpStartupCompleteEvent } from "./app-server";
 import {toTokenCount} from "./TokenCount";
 import {
@@ -122,37 +122,27 @@ export class CodexEventHandler {
      * The `_session/loaded_turn/ended` push (see `AcpExtensions.ts`): when
      * a `_session/loaded_turn/query` answered `running` for this session,
      * the client is waiting for that turn's authoritative end — this
-     * fires the ended notification when the turn completes, with the
-     * ACP stop reason for a completed/interrupted turn or the turn's
-     * error for a failed one, and clears the watch. Best-effort: a
-     * failing notification must not break turn processing.
+     * fires the ended notification when the watched turn completes, with
+     * the ACP stop reason for a completed/interrupted turn or the turn's
+     * error for a failed one, and clears the watch. The watch targets the
+     * LOADED active turn when one is recorded (its `turn/completed` —
+     * another turn's completion is not its terminal marker); otherwise
+     * any completing turn settles it (the in-process arm — the watched
+     * turn is the one `currentTurnId` tracks). Best-effort: a failing
+     * notification must not break turn processing.
      */
     private notifyLoadedTurnEnded(notification: TurnCompletedNotification): void {
-        if (!this.sessionState.loadedTurnReportedRunning) return;
-        this.sessionState.loadedTurnReportedRunning = false;
-        const turn = notification.turn;
-        let ended: LoadedTurnEndedNotification;
-        switch (turn.status) {
-            case "completed":
-                ended = {sessionId: this.sessionState.sessionId, stopReason: "end_turn"};
-                break;
-            case "interrupted":
-                ended = {sessionId: this.sessionState.sessionId, stopReason: "cancelled"};
-                break;
-            case "failed":
-                ended = {
-                    sessionId: this.sessionState.sessionId,
-                    error: {
-                        name: "TurnError",
-                        message: turn.error?.message ?? "the codex turn failed",
-                    },
-                };
-                break;
-            default:
-                ended = {sessionId: this.sessionState.sessionId, stopReason: "end_turn"};
-                break;
+        const loadedActiveTurnId = this.sessionState.loadedActiveTurnId;
+        if (loadedActiveTurnId !== null && notification.turn.id !== loadedActiveTurnId) return;
+        if (loadedActiveTurnId !== null) {
+            // The loaded active turn ended: its terminal status becomes
+            // the loaded thread's authoritative last-turn status, and the
+            // active-turn detection clears (a later query classifies
+            // consistently).
+            this.sessionState.loadedLastTurnStatus = notification.turn.status;
+            this.sessionState.loadedActiveTurnId = null;
         }
-        void this.session.notify(LOADED_TURN_ENDED_METHOD, ended).catch(() => undefined);
+        pushLoadedTurnEnded(this.session, this.sessionState, notification.turn);
     }
 
     getFailure(): RequestError | null {

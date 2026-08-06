@@ -14,6 +14,7 @@ import type {
     ReasoningEffortOption,
     Thread,
     ThreadItem,
+    TurnCompletedNotification,
     TurnStatus,
     UserInput
 } from "./app-server/v2";
@@ -55,6 +56,7 @@ import {
     type LoadedTurnQueryResponse,
     type LoadedTurnQueryRequest,
     LOADED_TURN_QUERY_METHOD,
+    pushLoadedTurnEnded,
     GOAL_CONTROL_METHOD,
     isExtMethodRequest,
     LEGACY_SET_SESSION_MODEL_METHOD,
@@ -129,20 +131,45 @@ export interface SessionState {
     goalRevision: number;
     sessionTitle: string | null;
     sessionTitleSource: "unset" | "fallback" | "explicit" | "unknown";
-    /** The loaded thread's LAST turn status (`loadedSession` only): the
+    /** The loaded thread's FOUNDING-TURN active detection — the
      *  `_session/loaded_turn/query` answer's authoritative source when no
-     *  turn is running in-process (a `completed` last turn means the
-     *  replayed thread's final message is the founding turn's final
-     *  message; `inProgress`/`interrupted`/`failed` mean it ended without
-     *  a terminal message — nothing is running, so re-issue is safe).
-     *  Null for sessions that did not come from `session/load`. */
+     *  turn is running in-process. Non-null when the loaded thread says a
+     *  turn was in flight at persist time — the thread's runtime status
+     *  is `active` and/or its last turn is `inProgress` — meaning the
+     *  founding turn MAY STILL BE RUNNING at the backend (the codex
+     *  thread store is shared across processes, so an `inProgress` turn
+     *  on disk never proves it died with this host). The query then
+     *  answers `running` — NEVER the re-issue-unsafe `interrupted`
+     *  mapping — and the `_session/loaded_turn/ended` notification fires
+     *  when that turn's `turn/completed` arrives (the load-time watcher;
+     *  an arrival BEFORE any query armed the watch is recorded on
+     *  `loadedTurnEndedBeforeWatch` and settles the first `running`
+     *  answer immediately). Null when the thread is idle and its last
+     *  turn ended, and for sessions that did not come from
+     *  `session/load`. */
+    loadedActiveTurnId: string | null;
+    /** The loaded thread's LAST turn status (`session/load` only): the
+     *  `_session/loaded_turn/query` answer's authoritative source when
+     *  NO turn is running in-process and the thread is idle (a
+     *  `completed` last turn means the replayed thread's final message
+     *  is the founding turn's final message; `interrupted`/`failed` mean
+     *  it ended without a terminal message — nothing is running, so
+     *  re-issue is safe). Null for sessions that did not come from
+     *  `session/load`. */
     loadedLastTurnStatus: TurnStatus | null;
     /** The `_session/loaded_turn` extension's watch flag: set when a
      *  query answered `running` (a client waits for that turn's
      *  authoritative end), cleared — and the `_session/loaded_turn/ended`
-     *  notification sent — when the turn completes (see
-     *  `CodexEventHandler`). */
+     *  notification sent — when the watched turn completes (see
+     *  `pushLoadedTurnEnded`). */
     loadedTurnReportedRunning: boolean;
+    /** The loaded active turn's terminal notification when
+     *  `turn/completed` for it arrived BEFORE any query armed the watch
+     *  (the load-time watcher records it, first-wins): a query answering
+     *  `running` then settles the ended push immediately, so a turn that
+     *  finished between `session/load` and the query is never missed.
+     *  Null otherwise. */
+    loadedTurnEndedBeforeWatch: TurnCompletedNotification | null;
 }
 
 interface ActiveAuthState {
@@ -502,8 +529,10 @@ export class CodexAcpServer {
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: "sessionId" in request ? "unknown" : "unset",
+            loadedActiveTurnId: null,
             loadedLastTurnStatus: null,
             loadedTurnReportedRunning: false,
+            loadedTurnEndedBeforeWatch: null,
         };
         this.sessions.set(sessionId, sessionState);
         resumeSubscribed = false;
@@ -1145,25 +1174,81 @@ export class CodexAcpServer {
 
     /** `_session/loaded_turn/query` (see `AcpExtensions.ts`): the loaded
      *  session's authoritative founding-turn terminal classification. A
-     *  turn running in THIS process answers `running` (and arms the
-     *  ended-notification watch); otherwise the loaded thread's last turn
-     *  status is authoritative: `completed` means the replayed thread's
-     *  final message is the founding turn's final message (settle from
-     *  the replay); any other status means the founding turn ended
-     *  without a terminal message and no turn is running (re-issue is
-     *  safe). */
+     *  turn executing in THIS process (`currentTurnId`) or a loaded
+     *  founding turn that was in flight when the thread was persisted
+     *  (`loadedActiveTurnId` — the load-time active-turn detection)
+     *  answers `running` and arms the ended-notification watch; a
+     *  `turn/completed` that already arrived for the loaded active turn
+     *  settles the ended push immediately. Otherwise the loaded thread's
+     *  last turn status is authoritative: `completed` means the replayed
+     *  thread's final message is the founding turn's final message
+     *  (settle from the replay); `interrupted`/`failed` mean the founding
+     *  turn ended without a terminal message AND nothing is running
+     *  (re-issue is safe — a persisted `inProgress` turn NEVER lands
+     *  here: the thread store is shared across codex processes, so an
+     *  in-flight turn on disk may still be running elsewhere, and
+     *  re-issuing it could duplicate work). */
     async loadedTurnQuery(params: LoadedTurnQueryRequest): Promise<LoadedTurnQueryResponse> {
         const sessionState = this.sessions.get(params.sessionId);
         if (!sessionState) {
             throw RequestError.invalidParams(undefined, `Unknown session: ${params.sessionId}`);
         }
-        if (sessionState.currentTurnId !== null) {
+        if (sessionState.currentTurnId !== null || sessionState.loadedActiveTurnId !== null) {
             sessionState.loadedTurnReportedRunning = true;
+            // The loaded active turn ALREADY completed before this query
+            // (the load-time watcher recorded its `turn/completed`): the
+            // ended notification settles the `running` answer immediately
+            // — a turn that finished between `session/load` and the query
+            // is never missed and never re-issued.
+            const recorded = sessionState.loadedTurnEndedBeforeWatch;
+            if (recorded !== null) {
+                sessionState.loadedTurnEndedBeforeWatch = null;
+                sessionState.loadedActiveTurnId = null;
+                // The helper owns the armed flag: it clears it when it
+                // pushes (the caller must NOT pre-clear — the push's gate
+                // reads it).
+                pushLoadedTurnEnded(this.connection, sessionState, recorded.turn);
+            }
             return {status: "running"};
         }
         return {
             status: sessionState.loadedLastTurnStatus === "completed" ? "completed" : "interrupted",
         };
+    }
+
+    /** The `_session/loaded_turn` extension's load-time watch (the
+     *  authoritative load-time active-turn detection's subscription side):
+     *  installed when `session/load` finds the loaded thread's founding
+     *  turn may still be running at the backend. This persistent
+     *  per-session listener watches that turn's `turn/completed` terminal
+     *  marker: armed by a query answering `running`, it pushes the
+     *  `_session/loaded_turn/ended` notification; an unarmed arrival is
+     *  recorded on the session state (first-wins) so a LATER query
+     *  settling `running` pushes the ended notification immediately. The
+     *  listener is replaced by a prompt's own session-event subscription
+     *  when a turn runs in-process — that handler pushes the same ended
+     *  notification through `pushLoadedTurnEnded` (see
+     *  `CodexEventHandler`), so the terminal marker is never unobserved. */
+    private watchLoadedTurn(sessionState: SessionState, loadedActiveTurnId: string): void {
+        this.codexAcpClient.onSessionNotification(sessionState.sessionId, (event) => {
+            if (event.method !== "turn/completed") return;
+            if (event.params.turn.id !== loadedActiveTurnId) return;
+            // The loaded active turn ended: its terminal status becomes
+            // the loaded thread's authoritative last-turn status (a later
+            // query classifies consistently).
+            sessionState.loadedLastTurnStatus = event.params.turn.status;
+            if (sessionState.loadedTurnReportedRunning) {
+                sessionState.loadedActiveTurnId = null;
+                // The helper owns the armed flag: it clears it when it
+                // pushes (the caller must NOT pre-clear — the push's gate
+                // reads it).
+                pushLoadedTurnEnded(this.connection, sessionState, event.params.turn);
+            } else {
+                // Record the terminal marker (first-wins): a later query
+                // answering `running` settles the ended push immediately.
+                sessionState.loadedTurnEndedBeforeWatch = event.params;
+            }
+        });
     }
 
     private createSessionConfigOptions(sessionState: SessionState): Array<acp.SessionConfigOption> {
@@ -1344,6 +1429,25 @@ export class CodexAcpServer {
         const sessionMcpServers = this.resolveSessionMcpServers(requestedMcpServers, true);
         const currentModel = this.findCurrentModel(models, currentModelId);
         const currentModelSupportsFast = modelSupportsFast(currentModel);
+        // The authoritative load-time active-turn detection (the
+        // `_session/loaded_turn` query's `running` classification source):
+        // the loaded thread says a turn was in flight at persist time —
+        // its runtime status is `active` and/or its last turn is
+        // `inProgress` — so the founding turn MAY STILL BE RUNNING at the
+        // backend (the codex thread store is shared across processes). The
+        // load-time watcher is installed below: the turn's `turn/completed`
+        // terminal marker is recorded (or forwarded) so a query answering
+        // `running` can settle it authoritatively. A thread whose status is
+        // idle with an ended last turn carries NO active turn: the query's
+        // `completed`/`interrupted` classification reads `loadedLastTurnStatus`.
+        const lastLoadedTurn = thread.turns.at(-1) ?? null;
+        // Defensive optional reads: a backend (or a test fixture) may
+        // return a thread without the runtime status field — the
+        // persisted last-turn status alone then drives the detection.
+        const loadedActiveTurnId =
+            thread.status?.type === "active" || lastLoadedTurn?.status === "inProgress"
+                ? lastLoadedTurn?.id ?? null
+                : null;
         const sessionState: SessionState = {
             sessionId: sessionId,
             currentModelId: currentModelId,
@@ -1369,10 +1473,15 @@ export class CodexAcpServer {
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: "unset",
-            loadedLastTurnStatus: thread.turns.at(-1)?.status ?? null,
+            loadedActiveTurnId: loadedActiveTurnId,
+            loadedLastTurnStatus: lastLoadedTurn?.status ?? null,
             loadedTurnReportedRunning: false,
+            loadedTurnEndedBeforeWatch: null,
         };
         this.sessions.set(sessionId, sessionState);
+        if (loadedActiveTurnId !== null) {
+            this.watchLoadedTurn(sessionState, loadedActiveTurnId);
+        }
         subscribed = false;
 
         if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {

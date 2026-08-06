@@ -6,6 +6,7 @@ import type {
     ResumeSessionResponse,
     SessionId,
 } from "@agentclientprotocol/sdk";
+import type { Turn } from "./app-server/v2";
 
 export const LEGACY_SET_SESSION_MODEL_METHOD = "session/set_model";
 export const SESSION_STEERING_METHOD = "_session/steering";
@@ -140,4 +141,49 @@ export type LoadedTurnEndedNotification = {
 export type LoadedTurnQueryExtRequest = {
     method: typeof LOADED_TURN_QUERY_METHOD;
     params: LoadedTurnQueryRequest;
+}
+
+/**
+ * Push the `_session/loaded_turn/ended` notification for a completing
+ * turn — the extension's authoritative terminal marker, shared by the
+ * load-time watcher (`CodexAcpServer.watchLoadedTurn`) and the prompt
+ * event handler (`CodexEventHandler`). Gated on the watch flag: a client
+ * that was told this turn was `running` at query time gets the ended
+ * notification — with the ACP stop reason for a completed/interrupted
+ * turn (a server-specific reason synthesizes `end_turn`) or the turn's
+ * error for a failed one, never both — and the watch clears. Best-effort:
+ * a failing notification must never break turn processing.
+ */
+export function pushLoadedTurnEnded(
+    connection: Pick<ClientContext, "notify">,
+    state: { sessionId: SessionId; loadedTurnReportedRunning: boolean },
+    turn: Turn,
+): void {
+    if (!state.loadedTurnReportedRunning) return;
+    state.loadedTurnReportedRunning = false;
+    let ended: LoadedTurnEndedNotification;
+    switch (turn.status) {
+        case "completed":
+            ended = { sessionId: state.sessionId, stopReason: "end_turn" };
+            break;
+        case "interrupted":
+            ended = { sessionId: state.sessionId, stopReason: "cancelled" };
+            break;
+        case "failed":
+            ended = {
+                sessionId: state.sessionId,
+                error: {
+                    name: "TurnError",
+                    message: turn.error?.message ?? "the codex turn failed",
+                },
+            };
+            break;
+        default:
+            ended = { sessionId: state.sessionId, stopReason: "end_turn" };
+            break;
+    }
+    // Best-effort: a failing notification must never break turn
+    // processing (Promise.resolve wraps any connection's notify — a raw
+    // transport or a test mock may return a non-promise).
+    void Promise.resolve(connection.notify(LOADED_TURN_ENDED_METHOD, ended)).catch(() => undefined);
 }

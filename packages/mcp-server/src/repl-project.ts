@@ -135,7 +135,10 @@ export interface ReplProjectState {
    *  changed aborts its materialization. */
   generation: number;
   /** True once the client-presence drain ran (children closed; the
-   *  workspace stays live and re-attaches lazily). */
+   *  workspace stays live and re-attaches lazily). The latch resets on
+   *  every client touch, and the drain's skip guard double-checks the
+   *  broker's authoritative warmth — a second disconnect after a
+   *  re-attach must drain again (phase-D review). */
   drained: boolean;
 }
 
@@ -257,9 +260,15 @@ async function doFirstTouch(
 
 /** Mark an MCP session present on this project's workspace (the
  *  client-presence ledger's touch side; every `repl` tool call touches).
- *  The workspace stays warm while any session is present. */
+ *  The workspace stays warm while any session is present, and the drain
+ *  latch resets: a present client makes the workspace warmable again, so
+ *  the NEXT disconnect must drain whatever the workspace warmed (phase-D
+ *  review: drain → reconnect → followUp re-attaches children → a second
+ *  disconnect used to skip the drain and leave the reattached children
+ *  running). */
 export function touchReplProject(state: ReplProjectState, clientId: string): void {
   state.clients.add(clientId);
+  state.drained = false;
 }
 
 /** Remove an MCP session's presence (the ledger's disconnect side); a
@@ -279,10 +288,16 @@ export function disconnectReplProject(state: ReplProjectState, clientId: string)
  * backend sessions. A client that reconnected before the drain started
  * skips it (presence is re-checked); one that reconnects mid-drain
  * self-heals via the lazy re-attach (documented in `repl-presence.ts`).
+ *
+ * The latch is not a permanent skip: `touchReplProject` clears it on
+ * every connect, and a stale latch (the broker reports warm children —
+ * a lazy re-attach after the latch was set) never skips the drain
+ * (phase-D review: drain → reconnect → followUp → second disconnect
+ * left the reattached child running).
  */
 export async function drainReplProject(state: ReplProjectState, boundMs: number): Promise<void> {
   if (state.broker === null || state.clients.size > 0) return;
-  if (state.drained) return;
+  if (state.drained && state.broker.isDrained) return;
   const drained = await state.broker.drainForDisconnect(boundMs);
   if (state.broker !== null) state.drained = drained;
 }

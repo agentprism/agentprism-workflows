@@ -3383,11 +3383,19 @@ function now(): number {
  *  shutdown indefinitely past the session-eviction TTL). After the
  *  deadline the drain returns without waiting; every promise in the batch
  *  already carries its own catch handler, so the fire-and-forget tail can
- *  never become an unhandled rejection. */
+ *  never become an unhandled rejection. The bound timer is CLEARED when
+ *  the batch wins the race — a satisfied drain must not leave a timer
+ *  pending for the whole remaining bound (it would keep the process
+ *  alive and fire needlessly later). */
 async function boundedAll(promises: Promise<unknown>[], deadline: number): Promise<void> {
   const remaining = deadline - Date.now();
   if (remaining <= 0) return;
-  await Promise.race([Promise.allSettled(promises), sleep(remaining)]);
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, remaining);
+  });
+  await Promise.race([Promise.allSettled(promises), bound]);
+  if (timer !== undefined) clearTimeout(timer);
 }
 
 /** Timer sleep (the drain's yield and bounded-wait primitive). */

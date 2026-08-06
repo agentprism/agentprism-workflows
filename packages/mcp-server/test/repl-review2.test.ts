@@ -331,6 +331,24 @@ test("review2: last-client disconnect drains in-flight turns to completion and c
     await tick();
     assert.equal(runner.loadedWith.length, 1, "the recorded session was loaded lazily on the next connect");
     assert.equal(runner.loadedWith[0].sessionId, session.sessionId, "the SAME backend session");
+    // SECOND DISCONNECT (phase-D review regression): the re-attached child
+    // is warm again. The project-level drain latch reset when the client
+    // reconnected (touch), so this disconnect must drain the re-attached
+    // child too — the latch used to skip every later drain permanently,
+    // leaving the reattached child running.
+    const reattached = runner.last();
+    presence.disconnect("client-A");
+    // The followUp started a NEW turn on the reattached session: the
+    // drain waits for it to complete (drain-to-completion is the policy),
+    // then closes the reattached child.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    reattached.completeTurn("second-drain result");
+    for (let attempt = 0; attempt < 100 && reattached.releases === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(reattached.releases, 1, "the re-attached child closed after the SECOND disconnect");
+    const status2 = await repl(connected, { action: "status", projectDir: PROJECT });
+    assert.ok(textOf(status2).includes("children: closed"), textOf(status2));
   } finally {
     await connected.dispose();
   }

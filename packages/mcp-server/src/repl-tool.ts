@@ -237,7 +237,11 @@ function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectSt
     if (manifest.inFlight.length > 0) {
       lines.push(`in-flight calls: ${manifest.inFlight.join(", ")}`);
     }
-    if (state.drained) lines.push("children: closed (client-presence drain; re-attach on demand)");
+    // The broker's authoritative child-warmth state (the project-level
+    // latch alone is the drain-skip guard: it resets on every connect, so
+    // the renderer reads the broker — a lazy re-attach after a drain
+    // makes the workspace warm again and the line disappears).
+    if (broker.isDrained) lines.push("children: closed (client-presence drain; re-attach on demand)");
     for (const agent of broker.liveAgents()) {
       // The task is part of the agent's provenance surface (the doc:
       // "from what task") — the renderer shows it alongside the state.
