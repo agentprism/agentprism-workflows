@@ -502,9 +502,9 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
 
     // 4) A `running` turn whose terminal notification never arrives hits the max-wait
     //    backstop: the seam rejects with the RE-ARMABLE still-running class (the
-    //    duplicate-risk marker — the broker keeps the loaded session attached and the
-    //    call pending; it never settles a quiet gap and never re-issues a turn that may
-    //    still be running).
+    //    duplicate-risk marker — the broker keeps the loaded session attached and re-arms
+    //    the seam on it; it never settles a quiet gap, and a later notification or a
+    //    cancel still settles the call).
     const { cwd: cwd4 } = harness.configure<LogEntry>({
       loadSessionSupport: true,
       loadSession: {
@@ -531,8 +531,10 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
     // 5) A backend WITHOUT the extension (no `_meta.loadedTurn.supported` advertisement):
     //    the terminal state is unobservable, so the seam rejects immediately with the
     //    NON-re-armable still-running class — the broker's degradation is guest-visible
-    //    and honest: never settle partial output (a quiet gap is only a progress gap)
-    //    and never re-issue (the turn may still be running). The replay-complete
+    //    and honest: never settle partial output (a quiet gap is only a progress gap),
+    //    and the call degrades through the doc's re-issue fallback for a
+    //    capability-omitting backend (phase-F review: the old keep-attached-and-pending
+    //    arm left re-attached calls pending until interrupt/reset). The replay-complete
     //    transcript is NOT settled (the round-1 defect: it used to be declared complete
     //    after the quiet grace).
     const { cwd: cwd5 } = harness.configure<LogEntry>({
@@ -555,6 +557,7 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
         );
         assert.equal((error as { rearmable?: unknown }).rearmable, false, "non-re-armable: nothing observable will ever arrive");
         assert.ok((error as Error).message.includes("does not advertise the _session/loaded_turn extension"), (error as Error).message);
+        assert.ok((error as Error).message.includes("re-issue is the honest fallback"), (error as Error).message);
         return true;
       },
     );

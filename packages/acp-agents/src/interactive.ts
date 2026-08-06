@@ -455,10 +455,14 @@ export class InteractiveSession {
    * established pattern for missing capabilities — never by settling
    * partial output and never by duplicate issue): the terminal state is
    * unobservable, so the seam rejects immediately with the
-   * `LoadedTurnStillRunningError` (non-re-armable) — the broker keeps the
-   * loaded session attached, leaves the call pending, and surfaces the
-   * condition guest-visibly (cancelable), never settling a quiet gap and
-   * never re-issuing a turn that may still be running. The same
+   * `LoadedTurnStillRunningError` (non-re-armable) — the broker then
+   * degrades through the doc's honest fallback for a capability-omitting
+   * backend: it releases the loaded session and re-issues the call under
+   * the same id, surfaced guest-visibly (phase-F review: the old
+   * keep-attached-and-pending arm left re-attached calls on seam-less
+   * backends pending until interrupt/reset and is deleted — every
+   * continuation must settle exactly once through one of the three
+   * reconciliation arms). The same
    * classification applies when the `_session/loaded_turn/query` wire
    * request itself fails (the capability gate or a wire error): the
    * answer is the one thing that makes completion observable, and its
@@ -493,17 +497,18 @@ export class InteractiveSession {
     // The terminal-state gate: a backend without the `_session/loaded_turn`
     // extension cannot answer the one question that makes the founding
     // turn's completion observable. Degrade guest-visibly — never settle
-    // partial output (a quiet gap is only a progress gap) and never
-    // re-issue (the backend turn may still be running) — by rejecting
-    // with the non-re-armable still-running class: the broker keeps the
-    // loaded session attached and the call pending, surfaced.
+    // partial output (a quiet gap is only a progress gap) — by rejecting
+    // with the non-re-armable still-running class: the broker then
+    // releases the loaded session and re-issues the call under the same
+    // id (the doc's honest fallback for a capability-omitting backend,
+    // surfaced guest-visibly).
     const capabilities = this.connection.capabilities;
     if (capabilities?.supportsLoadedTurnTerminalState !== true) {
       throw new LoadedTurnStillRunningError(
         `the loaded session's founding-turn terminal state is unobservable: ${this.backendId} does not ` +
           `advertise the _session/loaded_turn extension — the turn may still be running at the backend, and ` +
-          `its completion has no ACP v1 terminal marker; the call is left pending (never settled from a quiet ` +
-          `gap, never re-issued)`,
+          `its completion has no ACP v1 terminal marker; re-issue is the honest fallback (surfaced ` +
+          `guest-visibly)`,
         false,
       );
     }
@@ -517,11 +522,11 @@ export class InteractiveSession {
       // The wire query failed (the capability gate or a wire error): the
       // authoritative answer is unavailable, so the terminal state is
       // unobservable — the same degradation as a backend without the
-      // extension (never settle, never re-issue).
+      // extension (never settle a quiet gap; the broker re-issues).
       throw new LoadedTurnStillRunningError(
         `the loaded session's founding-turn terminal state is unobservable: _session/loaded_turn/query ` +
-          `failed (${thrownMessageOf(error)}) — the turn may still be running at the backend; the call is left ` +
-          `pending (never settled from a quiet gap, never re-issued)`,
+          `failed (${thrownMessageOf(error)}) — the turn may still be running at the backend; re-issue is the ` +
+          `honest fallback (surfaced guest-visibly)`,
         false,
       );
     }
@@ -572,14 +577,14 @@ export class InteractiveSession {
         // and its terminal notification has not arrived. Never settle a
         // quiet gap and never re-issue a possibly-running turn — reject
         // with the re-armable still-running class (the broker keeps the
-        // loaded session attached, leaves the call pending, warns
-        // guest-visibly, and re-arms the seam so a later notification —
-        // or a cancel — still settles the call).
+        // loaded session attached, warns guest-visibly, and re-arms the
+        // seam so a later notification — or a cancel — still settles the
+        // call).
         throw new LoadedTurnStillRunningError(
           `the loaded session's founding turn is still running at the backend, and its terminal notification ` +
             `has not arrived within ${maxWaitMs} ms of the query — settling a quiet gap could durably record ` +
-            `partial output, and re-issuing could duplicate the running turn; the call stays pending on the ` +
-            `attached session`,
+            `partial output, and re-issuing could duplicate the running turn; the broker re-arms the wait on ` +
+            `the attached session`,
           true,
         );
       }
@@ -735,8 +740,8 @@ export class InteractiveSession {
  *  `_session/loaded_turn/ended` notification — it may legitimately run
  *  for many minutes — then the seam rejects with the re-armable
  *  `LoadedTurnStillRunningError` (the broker keeps the loaded session
- *  attached and the call pending, and re-arms the wait so a later
- *  notification still settles it). Default 15 min;
+ *  attached and re-arms the wait on it so a later notification still
+ *  settles the call). Default 15 min;
  *  `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` overrides (clamped to
  *  >= 1 ms). */
 function loadedTurnMaxWaitMs(): number {
@@ -764,17 +769,21 @@ const LOADED_TURN_STOP_REASONS = new Set<StopReason>([
  *  state is unobservable — the backend does not advertise the
  *  `_session/loaded_turn` extension (or its query failed), or a turn
  *  classified `running` produced no terminal notification within the
- *  max-wait bound. The host must NOT settle partial output (a quiet gap
- *  is only a progress-stream gap) and must NOT re-issue (the backend
- *  turn may still be running — duplicated work); the honest degradation
- *  is to keep the loaded session attached, leave the call pending, and
- *  surface the condition guest-visibly (cancelable). `rearmable` is true
- *  only when a terminal notification may still arrive (a `running` turn
- *  past its max-wait bound): the broker then re-arms the seam on the
- *  still-attached session. It is false when nothing observable will ever
- *  arrive (the extension is absent) — re-arming would loop forever. The
- *  marker property is structural, so third-party adapter seams can throw
- *  the same class of rejection. */
+ *  max-wait bound. The host must NEVER settle partial output (a quiet
+ *  gap is only a progress-stream gap). `rearmable` is true only when a
+ *  terminal notification may still arrive (a `running` turn past its
+ *  max-wait bound): the broker then re-arms the seam on the still-
+ *  attached session — the doc's second reconciliation arm, re-attach to
+ *  a still-running task. It is false when nothing observable will ever
+ *  arrive (the extension is absent, or the query wire failed): the
+ *  broker degrades through the doc's honest fallback for a capability-
+ *  omitting backend — it releases the loaded session and re-issues the
+ *  call under the same id, surfaced guest-visibly (phase-F review: the
+ *  old keep-attached-and-pending arm left re-attached calls pending
+ *  until interrupt/reset; every continuation must settle exactly once
+ *  through one of the three reconciliation arms). The marker property is
+ *  structural, so third-party adapter seams can throw the same class of
+ *  rejection. */
 export class LoadedTurnStillRunningError extends Error {
   readonly loadedTurnStillRunning = true;
   constructor(
@@ -801,7 +810,7 @@ export class LoadedTurnFailedError extends WorkflowError {
 }
 
 /** Is this a loaded-turn still-running rejection (the broker's
- *  no-settle/no-re-issue classification)? Structural marker, so
+ *  never-settle-a-quiet-gap classification)? Structural marker, so
  *  third-party adapter seams can throw the same class. */
 export function isLoadedTurnStillRunningError(error: unknown): error is LoadedTurnStillRunningError {
   return (

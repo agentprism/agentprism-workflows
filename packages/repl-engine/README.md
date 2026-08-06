@@ -585,24 +585,27 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   progress-stream gap, never terminal evidence), absorbing the live update stream and
   settling with the turn's REAL accumulated text at the notification, bounded by
   `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` (default 15 min — the "never hang
-  unobserved" backstop). A backend WITHOUT the extension degrades guest-visibly through
-  the same strict advertisement gate (never by settling partial output, never by
-  re-issuing a possibly-running turn): the seam rejects immediately with the
-  non-re-armable `LoadedTurnStillRunningError`, and this broker keeps the loaded session
-  attached, leaves the call pending, and surfaces the condition guest-visibly
-  (cancelable). A `running` turn past the max-wait bound rejects with the RE-ARMABLE
-  form of the same error (the broker re-arms the seam on the still-attached session — a
-  later notification or a cancel still settles the call); a turn that failed at the
-  backend rejects with `LoadedTurnFailedError` (a definite outcome, settled as an
-  ordinary rejection, never re-issued); everything else (no user message in the
-  transcript, `interrupted`, a dead process) is the safe-re-issue class. A handle that
-  was never load-marked rejects immediately (without the boundary the completion is not
-  observable and the seam never guesses). The broker arms the re-attached call on the
-  seam WITHOUT blocking reconcile: reconcile returns immediately, the pump delivers the
-  completion through the same record → settle → consume path as a live call. A third-
-  party `BrokerSession` adapter WITHOUT the seam still re-attaches the session, then
-  degrades the same unobservable way (the call stays pending on the attached session,
-  surfaced guest-visibly) — never the old release-and-re-issue.
+  unobserved" backstop). A backend WITHOUT the extension degrades through the same
+  honest fallback the doc's restore path prescribes for a capability-omitting backend
+  (never by settling partial output): the seam rejects immediately with the
+  non-re-armable `LoadedTurnStillRunningError`, and this broker releases the loaded
+  session and re-issues the call under the same id, surfaced guest-visibly — never a
+  permanent hold (phase-F review: the old keep-attached-and-pending arm left
+  re-attached calls on seam-less backends — the built-in claude and opencode backends
+  today — pending until interrupt/reset; every continuation must settle exactly once
+  through one of the three reconciliation arms). A `running` turn past the max-wait
+  bound rejects with the RE-ARMABLE form of the same error (the broker re-arms the seam
+  on the still-attached session — a later notification or a cancel still settles the
+  call); a turn that failed at the backend rejects with `LoadedTurnFailedError` (a
+  definite outcome, settled as an ordinary rejection, never re-issued); everything else
+  (no user message in the transcript, `interrupted`, a dead process) is the safe-re-issue
+  class. A handle that was never load-marked rejects immediately (without the boundary
+  the completion is not observable and the seam never guesses). The broker arms the
+  re-attached call on the seam WITHOUT blocking reconcile: reconcile returns
+  immediately, the pump delivers the completion through the same record → settle →
+  consume path as a live call. A third-party `BrokerSession` adapter WITHOUT the seam
+  still re-attaches the session, then degrades through the SAME re-issue fallback — the
+  seam absence is a capability omission.
 - **Backend identity/pool routing is persisted** (phase-D review round 2): the store
   records the model spec VERBATIM (including the guest's `"default"` sentinel) AND the
   RESOLVED backend id at session open (`recordAttached` — a backend id doubles as a model

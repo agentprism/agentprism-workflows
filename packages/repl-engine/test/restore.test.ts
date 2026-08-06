@@ -1416,7 +1416,7 @@ test('cadence: a no-recorded-session re-issue refused by the cap settles the gue
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('cadence: an adapter without the completion seam degrades the UNOBSERVABLE way — the loaded sessions stay attached, the calls stay pending (never settled, never re-issued), surfaced guest-visibly', async () => {
+test('cadence: an adapter without the completion seam degrades through the doc\'s RE-ISSUE fallback — the loaded sessions are released, the calls are re-issued under the same ids (never settled from a quiet gap, never left pending), surfaced guest-visibly', async () => {
   const kinds: Array<'eval' | 'settlement'> = [];
   const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-noseam-'));
@@ -1435,29 +1435,42 @@ test('cadence: an adapter without the completion seam degrades the UNOBSERVABLE 
   const broker2 = await Broker.attach(ws2, {
     runner: runner2,
     store: JsonlCallStore.open(storePath),
-    maxConcurrentAgents: 1,
     snapshotSink: sink,
   });
   const report = await broker2.reconcile();
-  assert.deepEqual(report.reattached, ['c1', 'c2'], 'both calls stay attached on their loaded sessions');
-  assert.deepEqual(report.reissued, [], 'no re-issue: the backend turns may still be running (duplicate risk)');
+  assert.deepEqual(report.reattached, [], 'no call stays attached without the seam');
+  assert.deepEqual(report.reissued, ['c1', 'c2'], 'both calls degrade to re-issue — the doc\'s honest fallback for a capability-omitting backend');
   assert.deepEqual(report.failedLost, []);
   assert.equal(runner2.loadedWith.length, 2, 'both sessions loaded — the seam absence is discovered after a successful load');
-  assert.equal(runner2.sessions[0].releases, 0, 'the loaded sessions were NOT released (steer/cancel keep working)');
-  // The calls stay PENDING in the guest — never settled from a quiet gap,
-  // never re-issued — and the degradation is surfaced guest-visibly.
-  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1', 'c2']);
-  assert.deepEqual(kinds, [], 'nothing settled — no settlement boundary fired');
+  // The degradation is surfaced guest-visibly in the next tool result.
   const probe = await broker2.eval('"probe"');
   assert.ok(
     output(probe).filter((l) => l.startsWith('warn: ')).length >= 2 &&
       output(probe).some(
-        (l) => l.includes('c1') && l.includes('awaitCurrentTurn seam absent') && l.includes('stays pending'),
+        (l) => l.includes('c1') && l.includes('not observable') && l.includes('re-issued'),
       ),
     output(probe).join('\n'),
   );
-  // The attached sessions keep the calls cancelable (the honest way out).
-  assert.equal(await broker2.cancelCall('c1'), 'cancelled');
+  assert.equal(runner2.sessions[0].releases, 1, 'c1\'s seam-less loaded session was released before the re-issue');
+  assert.equal(runner2.sessions[2].releases, 1, 'c2\'s seam-less loaded session was released before the re-issue');
+  // The re-issue opened a FRESH session per call (the loaded ones are gone):
+  // [0] c1 loaded, [1] c1 fresh, [2] c2 loaded, [3] c2 fresh.
+  assert.equal(runner2.sessions.length, 4, '2 loaded + 2 fresh re-issue sessions');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 1, 'the reissue was recorded');
+  // The calls settle through the fresh dispatch exactly once (phase-F
+  // review: the old unobservable degradation left them pending until
+  // interrupt/reset).
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1', 'c2'], 'the re-issued calls are tracked pending on their fresh turns');
+  runner2.sessions[1].completeTurn('fresh outcome 1');
+  runner2.sessions[3].completeTurn('fresh outcome 2');
+  await tick();
+  await broker2.pump();
+  assert.equal((await broker2.eval('await p1')).result, '"fresh outcome 1"');
+  assert.equal((await broker2.eval('await p2')).result, '"fresh outcome 2"');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'both continuations settled exactly once');
+  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'fresh outcome 1');
+  assert.equal(broker2.store().lookup('c2')!.completion!.value, 'fresh outcome 2');
+  assert.ok(kinds.includes('settlement'), 'the settlements fired the state-changing boundary: ' + JSON.stringify(kinds));
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -1516,8 +1529,8 @@ test('a RE-ARMABLE still-running seam rejection keeps the call attached and pend
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a NON-re-armable still-running seam rejection (a backend without the _session/loaded_turn extension) holds the call pending on the attached session — never settled, never re-issued, cancelable — surfaced guest-visibly', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-hold-'));
+test('a NON-re-armable still-running seam rejection (a backend without the _session/loaded_turn extension — the built-in claude and opencode case) degrades to re-issue: the loaded session is released, the call is re-issued under the same id, and the fresh turn settles the SAME guest promise exactly once — surfaced guest-visibly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nonrearm-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
   const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
@@ -1541,17 +1554,28 @@ test('a NON-re-armable still-running seam rejection (a backend without the _sess
   );
   await tick();
   await tick();
-  assert.equal(runner2.sessions.length, 1, 'no re-issue');
-  assert.equal(runner2.sessions[0].releases, 0, 'the loaded session stays attached (steer/cancel keep working)');
-  assert.equal(broker2.store().lookup('c1')!.reissues, 0);
-  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call stays pending — partial output is never settled');
+  // Phase-F review: the doc's three reconciliation arms are exhaustive —
+  // the old permanent-hold degradation (pending until interrupt/reset) is
+  // deleted. The unobservable completion degrades through the doc's
+  // honest fallback for a capability-omitting backend: re-issue.
+  assert.equal(runner2.sessions[0].releases, 1, 'the loaded session was released');
+  assert.equal(runner2.sessions.length, 2, 'a fresh session opened for the re-issue');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 1, 'the reissue was recorded');
+  assert.equal(broker2.store().lookup('c1')!.sessionId, runner2.sessions[1].sessionId, 'the re-issue\'s session is the new attach key');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call is still pending — partial output is never settled');
   const probe = await broker2.eval('"probe"');
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('does not advertise the _session/loaded_turn extension')),
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('does not advertise the _session/loaded_turn extension') && l.includes('re-issued')),
     output(probe).join('\n'),
   );
-  // The honest way out: the attached session keeps the call cancelable.
-  assert.equal(await broker2.cancelCall('c1'), 'cancelled');
+  // The re-issued call's fresh turn completes and settles the SAME guest
+  // promise exactly once — the call never lingers pending.
+  runner2.sessions[1].completeTurn('fresh result');
+  await tick();
+  await broker2.pump();
+  assert.equal((await broker2.eval('await p')).result, '"fresh result"');
+  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'fresh result');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });

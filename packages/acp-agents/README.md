@@ -170,13 +170,15 @@ turn-terminal channel for loaded sessions advertised at initialize
   turn's REAL accumulated text at this authoritative terminal marker (a quiet gap is only a
   progress-stream gap, never terminal evidence), bounded by `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS`.
 
-Backends WITHOUT the extension degrade guest-visibly through the same strict advertisement gate
-(never by settling partial output, never by re-issuing a possibly-running turn): the seam rejects
+Backends WITHOUT the extension degrade through the same honest fallback the doc's restore path
+prescribes for a capability-omitting backend (never by settling partial output): the seam rejects
 immediately with `LoadedTurnStillRunningError` (`loadedTurnStillRunning` marker — non-re-armable),
-and the broker keeps the loaded session attached, leaves the call pending, and surfaces the
-condition guest-visibly (cancelable). A `running` turn whose notification does not arrive within
-the max-wait bound rejects with the RE-ARMABLE form of the same error (a later notification or a
-cancel still settles the call); a turn that ended by FAILING at the backend rejects with
+and the broker releases the loaded session and re-issues the call under the same id, surfaced
+guest-visibly — never a permanent hold (phase-F review: the old keep-attached-and-pending arm
+left re-attached calls on seam-less backends pending until interrupt/reset). A `running` turn
+whose notification does not arrive within the max-wait bound rejects with the RE-ARMABLE form of
+the same error (the broker re-arms the seam on the still-attached session — a later notification
+or a cancel still settles the call); a turn that ended by FAILING at the backend rejects with
 `LoadedTurnFailedError` (`loadedTurnFailed` marker — a definite outcome, settled as a rejection,
 never re-issued); everything else (no user message in the transcript, `interrupted`, a dead
 process) is the safe-re-issue class. The seam's rejection classes are structural, so third-party

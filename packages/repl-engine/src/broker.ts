@@ -175,24 +175,35 @@
  *    absent, session deleted, wire failure), an unmarked handle (the
  *    boundary was never recorded), a backend WITHOUT the extension
  *    (immediate non-re-armable `LoadedTurnStillRunningError` — the
- *    broker keeps the loaded session attached and the call pending,
- *    surfaced guest-visibly: NEVER settled from a quiet gap, NEVER
- *    re-issued while the turn may still be running), a `running` turn
+ *    broker RELEASES the loaded session and re-issues the call under the
+ *    same id, the doc's honest fallback for a capability-omitting
+ *    backend — phase-F review: the old keep-attached-and-pending arm,
+ *    which left re-attached calls on seam-less backends pending until
+ *    interrupt/reset, violated the doc's exactly-once reconciliation
+ *    contract and is deleted; surfaced guest-visibly, never settled
+ *    from a quiet gap, never left pending), a `running` turn
  *    past the max-wait bound (re-armable `LoadedTurnStillRunningError`
- *    — the broker re-arms the seam so a later notification or cancel
- *    still settles the call), or a turn that failed at the backend
+ *    — the broker re-arms the seam on the still-attached session so a
+ *    later notification or cancel still settles the call), or a turn
+ *    that failed at the backend
  *    (`LoadedTurnFailedError` — a definite outcome, settled as an
  *    ordinary rejection, never re-issued). While the broker is
- *    draining/disposing even safe-re-issue rejections hold (a fresh
- *    child must never open and run after the last client disconnected).
- *    A third-party `BrokerSession` adapter WITHOUT the seam still
- *    re-attaches the session, then degrades the same unobservable way
- *    (the call stays pending on the attached session). The outcome is
+ *    draining/disposing even safe-re-issue rejections resolve `hold` (a
+ *    fresh child must never open and run after the last client
+ *    disconnected — the drain's forced stop settles every still-pending
+ *    call DURABLY at its bound, so a drained call is never left
+ *    pending; a disposed broker's state is being torn down).
+ *    A third-party `BrokerSession` adapter WITHOUT the seam degrades
+ *    through the SAME re-issue fallback (the seam absence is a
+ *    capability omission). The outcome is
  *    delivered through the SAME record → settle → consume pump as a
  *    live call — exactly once, first-wins on both sides (a held call's
  *    `hold` outcome drops the pump entry without recording or
- *    settling). A re-attached call holds a concurrency token until it
- *    settles, like any other live call.
+ *    settling — the only `hold`s left are the drain/disposal fences,
+ *    where the call was already settled durably by the drain's forced
+ *    stop or the owning state is being torn down). A re-attached call
+ *    holds a concurrency token until it settles, like any other live
+ *    call.
  * 3. **Lost → re-issue.** A pending agent call with no recorded session
  *    (its session never opened, or a foreign snapshot), or whose
  *    re-attach failed, is re-issued under the SAME call id: the store
@@ -481,10 +492,14 @@ export interface BrokerSession {
    * backend rejects with `LoadedTurnFailedError` (a definite outcome,
    * settled as a rejection, never re-issued); everything else (no user
    * message, `interrupted`, a dead process) is the safe-re-issue class.
+   * A NON-re-armable rejection (backend without the extension, or a
+   * failed query wire) degrades through the broker's re-issue fallback —
+   * the doc's honest degradation for a capability-omitting backend
+   * (phase-F review: the old keep-attached-and-pending arm left
+   * re-attached calls pending until interrupt/reset and is deleted).
    * OPTIONAL for third-party `BrokerSession` adapters: an adapter
-   * without the seam still re-attaches the session, then degrades the
-   * same unobservable way — the call stays pending on the attached
-   * session, surfaced guest-visibly (never the old release-and-re-issue).
+   * without the seam still re-attaches the session, then degrades
+   * through the same re-issue fallback — never a permanent hold.
    */
   awaitCurrentTurn?(): Promise<BrokerTurn>;
 }
@@ -1526,16 +1541,24 @@ export class Broker {
       if (awaitTurn === undefined) {
         // A THIRD-PARTY BrokerSession adapter without the seam (the real
         // acp-agents adapter has it): the loaded session's founding-turn
-        // completion is unobservable to this host. The honest degradation
-        // (phase-D review round 3: this used to release the loaded session
-        // and re-issue — a turn that may still be running at the backend
-        // was duplicated) is to KEEP the loaded session attached, leave
-        // the call pending, and surface the condition guest-visibly —
-        // never settled from a quiet gap, never re-issued, cancelable
-        // through the attached session.
-        this.registerUnobservableReattach(entry, parsed, session, 'awaitCurrentTurn seam absent');
-        report.reattached.push(entry.id);
-        return false;
+        // completion is unobservable to this host. Phase-F review: the
+        // doc's three reconciliation arms are exhaustive — a call must
+        // settle exactly once through settle-from-the-store / re-attach /
+        // re-issue, never through an undocumented fourth arm that parks
+        // it until interrupt/reset. The seam absence is a capability
+        // omission, and the doc's rule for a capability-omitting backend
+        // is "re-issue is the honest fallback, surfaced guest-visibly":
+        // the catch arm below releases the loaded session (best-effort —
+        // the re-issue opens its own fresh session) and re-issues the
+        // call under the same id. The old keep-attached-and-pending arm
+        // (`registerUnobservableReattach`) is deleted: it left every
+        // re-attached call on a seam-less backend — including the
+        // built-in claude and opencode backends, which do not advertise
+        // `_session/loaded_turn` — permanently pending across a crash.
+        throw new Error(
+          'the loaded session exposes no awaitCurrentTurn seam — its founding-turn completion is ' +
+            'unobservable; re-issue is the honest fallback',
+        );
       }
       // The seam (REAL on acp-agents' InteractiveSession): an OBSERVING
       // wait — it resolves with the founding turn when the session/load
@@ -1623,7 +1646,16 @@ export class Broker {
    *  an in-flight task (reconcile does NOT block on a still-running
    *  turn), delivered by the same record → settle → consume pump as a
    *  live call. The call holds a concurrency token until the pump
-   *  delivers it, exactly like a live call. */
+   *  delivers it, exactly like a live call. A seam that can never
+   *  observe the founding turn (absent on a third-party adapter, or the
+   *  non-re-armable still-running rejection on a backend without the
+   *  `_session/loaded_turn` extension) degrades INSIDE the task to a
+   *  re-issue under the same call id — the doc's honest fallback for a
+   *  capability-omitting backend (phase-F review: the old
+   *  keep-attached-and-pending degradation left re-attached calls on
+   *  claude/opencode pending until interrupt/reset; every continuation
+   *  must settle exactly once through one of the three reconciliation
+   *  arms). */
   private registerReattached(entry: GuestSurfaceEntry, parsed: ParsedAgentOptions, session: BrokerSession): void {
     const sessionEntry: SessionEntry = {
       session,
@@ -1646,64 +1678,29 @@ export class Broker {
     this.trackInFlight(entry.id, 'agent', taskPromise);
   }
 
-  /** Register a successfully loaded session whose founding-turn completion
-   *  is UNOBSERVABLE to this host (a third-party adapter without the
-   *  `awaitCurrentTurn` seam): the session stays attached (steer/cancel
-   *  keep working), the call stays pending — never settled (partial
-   *  output risk), never re-issued (the backend turn may still be
-   *  running) — and the condition is surfaced guest-visibly. The task
-   *  resolves `hold`: the pump drops the in-flight entry without
-   *  recording or settling, and the session entry keeps the call
-   *  tracked (a repeated reconcile never re-attaches twice) and
-   *  cancelable. */
-  private registerUnobservableReattach(
-    entry: GuestSurfaceEntry,
-    parsed: ParsedAgentOptions,
-    session: BrokerSession,
-    reason: string,
-  ): void {
-    const sessionEntry: SessionEntry = {
-      session,
-      callId: entry.id,
-      modelSpec: entry.modelSpec ?? '',
-      task: entry.detail ?? '',
-      supportsSteering: session.capabilities?.supportsSteering === true,
-      busy: true,
-      delivering: false,
-      callSettled: false,
-      callCancelled: false,
-      queue: this.pendingSteers.get(entry.id) ?? [],
-    };
-    this.pendingSteers.delete(entry.id);
-    this.sessions.set(entry.id, sessionEntry);
-    this.agentSlots.add(entry.id);
-    this.drained = false; // children are warm again
-    this.warnLine(
-      'warn',
-      `call ${entry.id}: ${reason} — the founding turn's completion is not observable; the call stays ` +
-        `pending on the attached session (never settled from a quiet gap, never re-issued); cancel it with ` +
-        `interrupt or reset the workspace`, // eslint-disable-line max-len
-    );
-    const taskPromise = Promise.resolve({ outcome: 'hold' as const, value: undefined });
-    this.trackInFlight(entry.id, 'agent', taskPromise);
-  }
-
   /** The re-attached call's task: observe the loaded session's founding
    *  turn through the seam (the observing wait — a still-running turn is
    *  kept attached and settles from its authoritative terminal
    *  notification), then shape the result (schema ladder or the
    *  empty-output gate). A seam REJECTION is classified three ways
-   *  (phase-D review round 3):
+   *  (phase-D review round 3, amended phase-F review):
    *
    *  - the still-running class (`LoadedTurnStillRunningError`): the turn
    *    may still be running and its terminal state is unobservable —
-   *    NEVER settle a quiet gap and NEVER re-issue. Re-armable
-   *    rejections (a `running` turn past its max-wait bound) re-arm the
-   *    seam on the still-attached session (a later terminal
-   *    notification — or a cancel — still settles the call), warning
-   *    guest-visibly each time; non-re-armable rejections (a backend
-   *    without the `_session/loaded_turn` extension) resolve `hold`:
-   *    the call stays pending on the attached session.
+   *    NEVER settle a quiet gap. A RE-ARMABLE rejection (a `running`
+   *    turn past its max-wait bound on a backend that DOES carry the
+   *    extension) re-arms the seam on the still-attached session — a
+   *    later terminal notification — or a cancel — still settles the
+   *    call (the doc's second arm: re-attach to a still-running task).
+   *    A NON-re-armable rejection (a backend without the
+   *    `_session/loaded_turn` extension — the built-in claude and
+   *    opencode backends today — or the query wire failed) degrades
+   *    through the doc's honest fallback for a capability-omitting
+   *    backend: release the loaded session and RE-ISSUE the call under
+   *    the same id, surfaced guest-visibly (phase-F review: the old
+   *    `hold` arm left the call pending until interrupt/reset — every
+   *    continuation must settle exactly once through one of the three
+   *    reconciliation arms).
    *  - the failed-at-backend class (`LoadedTurnFailedError`): the turn
    *    RAN and failed — a definite outcome, settled as an ordinary
    *    rejection (never re-issued, never settled as success).
@@ -1712,7 +1709,9 @@ export class Broker {
    *    under the same id through the ordinary dispatch path. While the
    *    broker is draining/disposing, even these resolve `hold` — a
    *    fresh child must never open and run after the last client
-   *    disconnected (the drain defect).
+   *    disconnected (the drain's forced stop settles every still-pending
+   *    call DURABLY at its bound, so a drained call is never left
+   *    pending; a disposed broker's state is being torn down).
    *
    *  Result-shaping failures AFTER the turn resolved (stop-reason gate,
    *  empty output, schema ladder) settle as ordinary rejections, exactly
@@ -1728,31 +1727,42 @@ export class Broker {
       if (awaitTurn === undefined) {
         // Unreachable — `registerReattached` is only called after the seam
         // was checked — but a structural guard keeps the optional seam
-        // honest for third-party adapters: the unobservable degradation.
-        this.warnLine(
-          'warn',
-          `call ${callId}: the loaded session exposes no awaitCurrentTurn seam — the call stays pending ` +
-            `on the attached session (never settled from a quiet gap, never re-issued); cancel it with ` +
-            `interrupt or reset the workspace`, // eslint-disable-line max-len
+        // honest for third-party adapters: degrade to re-issue exactly
+        // like every other unobservable completion (phase-F review: a
+        // call must settle through one of the doc's three arms — never a
+        // permanent hold).
+        return this.reissueReattached(
+          callId,
+          entry,
+          parsed,
+          new Error('the loaded session exposes no awaitCurrentTurn seam — re-issue is the honest fallback'),
         );
-        return { outcome: 'hold', value: undefined };
       }
       try {
         turn = await awaitTurn.call(entry.session);
       } catch (error) {
         if (isLoadedTurnStillRunningError(error)) {
           // The turn may still be running at the backend and its terminal
-          // state is unobservable: never settle partial output, never
-          // re-issue a possibly-running turn. A re-armable rejection
-          // (a `running` turn past the max-wait bound) re-arms the seam
-          // on the still-attached session — a later terminal notification
-          // or a cancel still settles the call; a non-re-armable one (the
-          // backend lacks the extension) resolves `hold`.
+          // state is unobservable: never settle partial output. A
+          // re-armable rejection (a `running` turn past the max-wait
+          // bound — the backend DOES carry the extension, the turn is
+          // still executing, and the doc's second arm is "re-attach to a
+          // still-running task") re-arms the seam on the still-attached
+          // session — a later terminal notification or a cancel still
+          // settles the call. A NON-re-armable one (the backend lacks the
+          // `_session/loaded_turn` extension — the built-in claude and
+          // opencode backends today — or the query wire failed) degrades
+          // through the doc's honest fallback for a capability-omitting
+          // backend: release the loaded session and RE-ISSUE the call
+          // under the same id, surfaced guest-visibly (phase-F review:
+          // the old permanent-hold arm left re-attached calls pending
+          // until interrupt/reset — every continuation must settle
+          // exactly once through one of the three reconciliation arms).
           this.warnLine('warn', `call ${callId}: ${toRejectionValue(error).message}`);
           if (error.rearmable) {
             return this.runReattachedTask(callId, entry, parsed);
           }
-          return { outcome: 'hold', value: undefined };
+          return this.reissueReattached(callId, entry, parsed, error);
         }
         if (isLoadedTurnFailedError(error)) {
           // The founding turn RAN and failed at the backend: a definite
@@ -1763,8 +1773,11 @@ export class Broker {
         if (this.draining || this.disposed) {
           // The broker's own teardown released the session (or the seam
           // rejected mid-drain): re-issuing would open a fresh child after
-          // the last client disconnected. The call stays pending,
-          // surfaced guest-visibly.
+          // the last client disconnected. The call is NOT left pending
+          // forever: the drain's forced stop settles every still-pending
+          // call DURABLY at its bound (recorded AGENT_CANCELLED,
+          // guest-settled), and a disposed broker's state is being torn
+          // down. Surfaced guest-visibly.
           this.warnLine(
             'warn',
             `call ${callId}: ${toRejectionValue(error).message} — the broker is draining; the call stays ` +
@@ -4209,13 +4222,16 @@ export class Broker {
       for (const entry of ready) {
         const outcome: { outcome: 'resolve' | 'reject' | 'hold'; value: unknown } = await entry.promise;
         if (outcome.outcome === 'hold') {
-          // The re-attach arm's unobservable-turn degradation: the in-flight
-          // entry is dropped WITHOUT recording or settling — the call stays
-          // pending, the session stays attached (the `sessions` map keeps
-          // it tracked and cancelable), and the condition was surfaced
-          // guest-visibly by the task. The concurrency token stays held
-          // (the call is still live work until the orchestrator cancels it
-          // or resets the workspace).
+          // The drain/disposal fences only (phase-F review: the re-attach
+          // arm's unobservable-turn degradation was deleted — a
+          // non-re-armable seam rejection and a missing seam now re-issue
+          // under the same call id, the doc's honest fallback): the
+          // in-flight entry is dropped WITHOUT recording or settling —
+          // either the client-presence drain's forced stop already settled
+          // the call DURABLY (recorded + guest-settled at the bound), or
+          // the broker was disposed and the state owning the call is being
+          // torn down. The condition was surfaced guest-visibly by the
+          // task.
           this.inFlight.delete(entry.callId);
           continue;
         }
