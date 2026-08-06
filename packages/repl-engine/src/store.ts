@@ -71,6 +71,26 @@ export interface CallRecord {
   detail: string;
   /** Verbatim `optionsJson` string, or null. */
   optionsJson: string | null;
+  /**
+   * The agent call's backend-routing spec, VERBATIM including the guest's
+   * reserved `"default"` sentinel (agent calls only; null otherwise) —
+   * the phase-D review round-2 fix: backend identity/pool routing is
+   * persisted with the dispatch, so a restore (or a lazy re-attach of a
+   * settled handle) never routes by the CURRENT configured default and
+   * misses a still-resumable original session. `null` on legacy records
+   * (pre-attachment logs).
+   */
+  modelSpec: string | null;
+  /**
+   * The RESOLVED backend id the call's session opened under (agent calls
+   * whose session opened; recorded by `recordAttached` alongside the
+   * session id, overwritten by a re-issue's new session). The re-attach
+   * routing pin: `loadSession` routes by this id (a backend id doubles as
+   * a model routing spec) instead of re-resolving the model spec against
+   * the current default backend. `null` for checkpoint/steer records,
+   * agent records whose session never opened, and legacy logs.
+   */
+  backendId: string | null;
   dispatchedAtMs: number;
   /** Times this call was re-issued after being found lost (same call id). */
   reissues: number;
@@ -115,13 +135,16 @@ export interface CallStore {
   recordReissued(callId: string, atMs: number): void;
   /**
    * Record the backend ACP session id an agent call's session opened
-   * under — the restore path's re-attach key (`sessionId` on the record).
-   * OVERWRITES: the record carries the CURRENT session — a re-issued
-   * call's new session replaces the lost one (the log keeps the history
-   * as appended lines, and replay applies them in order). Throws for an
-   * id the store has never seen dispatched.
+   * under — the restore path's re-attach key (`sessionId` on the record) —
+   * plus the RESOLVED backend id that session belongs to (`backendId`, the
+   * re-attach routing pin: a restore or lazy re-attach routes by it
+   * instead of re-resolving the model spec against the current default
+   * backend). OVERWRITES: the record carries the CURRENT session — a
+   * re-issued call's new session replaces the lost one (the log keeps the
+   * history as appended lines, and replay applies them in order). Throws
+   * for an id the store has never seen dispatched.
    */
-  recordAttached(callId: string, sessionId: string, atMs: number): void;
+  recordAttached(callId: string, sessionId: string, atMs: number, backendId?: string | null): void;
   /**
    * Record a completion. Returns `true` iff the completion was newly
    * recorded; `false` when the call already had one (first-wins, no
@@ -159,6 +182,8 @@ export class InMemoryCallStore implements CallStore {
     this.records.set(record.callId, {
       ...record,
       sessionId: record.sessionId ?? null,
+      modelSpec: record.modelSpec ?? null,
+      backendId: record.backendId ?? null,
       deliveredAtMs: record.deliveredAtMs ?? null,
       droppedAtMs: record.droppedAtMs ?? null,
     });
@@ -171,10 +196,12 @@ export class InMemoryCallStore implements CallStore {
     record.dispatchedAtMs = atMs;
   }
 
-  recordAttached(callId: string, sessionId: string, _atMs: number): void {
+  recordAttached(callId: string, sessionId: string, atMs: number, backendId?: string | null): void {
     const record = this.records.get(callId);
     if (record === undefined) throw unknownCall(callId);
     record.sessionId = sessionId;
+    record.backendId = backendId ?? null;
+    void atMs;
   }
 
   recordCompleted(callId: string, outcome: CallOutcome): boolean {
@@ -214,7 +241,7 @@ export class InMemoryCallStore implements CallStore {
 type LogLine =
   | { event: 'dispatched'; record: CallRecord }
   | { event: 'reissued'; callId: string; atMs: number }
-  | { event: 'attached'; callId: string; sessionId: string; atMs: number }
+  | { event: 'attached'; callId: string; sessionId: string; atMs: number; backendId?: string | null }
   | { event: 'completed'; callId: string; outcome: CallOutcome }
   | { event: 'delivery'; callId: string; state: 'delivered' | 'dropped'; atMs: number };
 
@@ -241,8 +268,13 @@ function isLogLine(value: unknown): value is LogLine {
     );
   }
   if (v.event === 'attached') {
-    const a = value as { callId?: unknown; sessionId?: unknown; atMs?: unknown };
-    return typeof a.callId === 'string' && typeof a.sessionId === 'string' && typeof a.atMs === 'number';
+    const a = value as { callId?: unknown; sessionId?: unknown; atMs?: unknown; backendId?: unknown };
+    return (
+      typeof a.callId === 'string' &&
+      typeof a.sessionId === 'string' &&
+      typeof a.atMs === 'number' &&
+      (a.backendId === undefined || a.backendId === null || typeof a.backendId === 'string')
+    );
   }
   if (v.event === 'completed') {
     const o = (value as { outcome?: unknown }).outcome;
@@ -417,10 +449,10 @@ export class JsonlCallStore implements CallStore {
     this.index.recordReissued(callId, atMs);
   }
 
-  recordAttached(callId: string, sessionId: string, atMs: number): void {
+  recordAttached(callId: string, sessionId: string, atMs: number, backendId?: string | null): void {
     if (this.index.lookup(callId) === undefined) throw unknownCall(callId);
-    this.append({ event: 'attached', callId, sessionId, atMs });
-    this.index.recordAttached(callId, sessionId, atMs);
+    this.append({ event: 'attached', callId, sessionId, atMs, backendId: backendId ?? null });
+    this.index.recordAttached(callId, sessionId, atMs, backendId);
   }
 
   recordCompleted(callId: string, outcome: CallOutcome): boolean {
@@ -489,7 +521,7 @@ export class JsonlCallStore implements CallStore {
 function replay(index: InMemoryCallStore, line: LogLine): void {
   if (line.event === 'dispatched') index.recordDispatched(line.record);
   else if (line.event === 'reissued') index.recordReissued(line.callId, line.atMs);
-  else if (line.event === 'attached') index.recordAttached(line.callId, line.sessionId, line.atMs);
+  else if (line.event === 'attached') index.recordAttached(line.callId, line.sessionId, line.atMs, line.backendId ?? null);
   else if (line.event === 'completed') index.recordCompleted(line.callId, line.outcome);
   else index.recordDelivery(line.callId, line.state, line.atMs);
 }

@@ -945,18 +945,26 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
   }
 });
 
-test('restore through the REAL acp-agents adapter: a founding turn still in flight at the backend is KEPT ATTACHED and settles from its live completion (no re-issue)', async () => {
+test('restore through the REAL acp-agents adapter: a founding turn still in flight at the backend is KEPT ATTACHED, never settled from a quiet gap, and degrades to re-issue at the max-wait bound (partial output is never durable)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-run-'));
   const storePath = join(dir, 'calls.jsonl');
   const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
+  const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
   process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = '100';
+  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = '350';
   try {
     // The replay ends at the founding turn's user message, and the backend
     // CONTINUES streaming live chunks AFTER the session/load response —
     // the turn is still running at the backend when we reconnect. The
-    // seam keeps the loaded session attached and settles from the turn's
-    // authoritative completion (phase-D review: this case used to be
-    // released and re-issued, risking duplicated work).
+    // seam keeps the loaded session attached (phase-D review: this case
+    // used to be released and re-issued immediately, risking duplicated
+    // work) but NEVER settles from a quiet gap: a resumed turn's
+    // completion has no terminal marker over ACP v1, so after the
+    // max-wait bound it rejects and the broker re-issues under the same
+    // id — the honest fallback, surfaced guest-visibly. Partial output of
+    // the paused live turn is never durably settled (phase-D review round
+    // 2: a quiet period followed by a trailing assistant chunk used to be
+    // treated as authoritative completion).
     configureFakeAgent(
       {
         loadSessionSupport: true,
@@ -965,7 +973,7 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
           replay: [{ role: 'user', text: 'task' }],
           continue: [
             { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
-            { afterMs: 100, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'result' } } },
+            { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } },
           ],
         },
       },
@@ -990,7 +998,7 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
             replay: [{ role: 'user', text: 'task' }],
             continue: [
               { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
-              { afterMs: 100, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'result' } } },
+              { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } },
             ],
           },
         },
@@ -1002,44 +1010,64 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
       try {
         // Reconcile returns IMMEDIATELY (it arms the call on the seam
         // instead of blocking on the still-running turn) and reports the
-        // call as re-attached — never re-issued.
+        // call as re-attached — never re-issued while the turn may still
+        // be running.
         const report = await broker2.reconcile();
         assert.deepEqual(report.reattached, ['c1'], 'the still-running turn stays attached');
-        assert.deepEqual(report.reissued, [], 'no re-issue — the loaded session is kept');
+        assert.deepEqual(report.reissued, [], 'no re-issue while the seam waits');
         assert.deepEqual(report.failedLost, []);
         // Wire evidence: the restored process LOADED the recorded session
-        // and never opened a fresh session (no re-issue, no duplicated
-        // work).
+        // and has not opened a fresh session yet.
         const entries = readWireLog(join(dir, 'log2.jsonl'));
         assert.ok(
           entries.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
           JSON.stringify(entries),
         );
-        assert.ok(!entries.some((e) => e.method === 'newSession'), 'no fresh session — the call was NOT re-issued');
-        // The call settles with the turn's AUTHORITATIVE completion — the
-        // live stream's full accumulated text, delivered through the same
-        // pump as a live call (reconcile's arming does not block it; the
-        // seam settles once the stream goes quiet after the last chunk).
-        // The first poll eval also carries the re-attach info line (the
-        // guest-visible surfacing).
-        let resolved: string | undefined;
-        let sawReattachLine = false;
+        // The pause is LONGER than the settle grace (the live chunks stop
+        // at ~120 ms; the grace is 100 ms) — the round-2 regression this
+        // test pins: the old seam settled the pause as completion, durably
+        // recording "live partial" as the call's outcome. The new seam
+        // never settles a quiet gap: it waits out the max-wait bound and
+        // rejects, and the in-task degradation re-issues the call under
+        // the same id.
+        await waitFor(() =>
+          readWireLog(join(dir, 'log2.jsonl')).some((e) => e.method === 'newSession'),
+        );
+        const after = readWireLog(join(dir, 'log2.jsonl'));
+        assert.ok(
+          after.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
+          JSON.stringify(after),
+        );
+        assert.ok(after.some((e) => e.method === 'newSession'), 'the re-issue opened a fresh session');
+        // The degradation is surfaced guest-visibly, naming the condition.
+        const probe = await broker2.eval('"probe"');
+        assert.ok(
+          output(probe).some(
+            (l) =>
+              l.startsWith('warn: ') &&
+              l.includes('c1') &&
+              l.includes('kept streaming after the load response') &&
+              l.includes('re-issued'),
+          ),
+          output(probe).join('\n'),
+        );
+        // The re-issued call's fresh turn completes and settles the SAME
+        // guest promise exactly once.
+        await waitFor(() => broker2.store().lookup('c1')!.sessionId !== recordedId);
+        let result: string | undefined;
         for (let attempt = 0; attempt < 100; attempt++) {
+          await broker2.pump();
           const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
-          if (!sawReattachLine) {
-            sawReattachLine = output(got).some((l) => l.startsWith('info: ') && l.includes('c1') && l.includes('re-attached'));
-          }
           if (got.result !== undefined) {
-            resolved = got.result;
+            result = got.result;
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, 25));
+          await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(resolved, '"live result"');
-        assert.equal(broker2.store().lookup('c1')!.completion!.value, 'live result');
-        assert.equal(broker2.store().lookup('c1')!.reissues, 0, 're-attachment is not a re-issue');
-        assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the same backend session stays attached');
-        assert.ok(sawReattachLine, 'the re-attach info line surfaced guest-visibly');
+        assert.equal(result, '"fresh result"');
+        assert.equal(broker2.store().lookup('c1')!.reissues, 1);
+        // The guest promise never saw the partial live text as a result.
+        assert.notEqual(result, '"live partial"');
       } finally {
         await broker2.dispose();
         ws2.dispose();
@@ -1053,6 +1081,8 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
   } finally {
     if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
     else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
+    if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
     clearFakeEnv();
     rmSync(dir, { recursive: true, force: true });
   }

@@ -24,6 +24,16 @@ export interface SessionRecord {
 
 export class SessionRegistry {
   private readonly sessions = new Map<string, SessionRecord>();
+  /**
+   * Fired when a session's LAST open connection closed (or the session
+   * was deleted outright) — the daemon's client-presence signal. The
+   * daemon wires it to the REPL presence ledger, which drains projects
+   * whose client set became empty (the roadmap doc's last-client-
+   * disconnect drain; phase-D review round 2: the registry used to
+   * maintain connection counts without ever signaling project REPL
+   * lifecycle).
+   */
+  onLastConnectionClosed: ((sessionId: string) => void) | undefined;
 
   add(record: SessionRecord): void {
     this.sessions.set(record.sessionId, record);
@@ -35,6 +45,7 @@ export class SessionRegistry {
 
   delete(sessionId: string): void {
     this.sessions.delete(sessionId);
+    this.onLastConnectionClosed?.(sessionId);
   }
 
   touch(sessionId: string, now = Date.now()): void {
@@ -54,6 +65,12 @@ export class SessionRegistry {
     if (record === undefined) return;
     record.openConnections = Math.max(0, record.openConnections - 1);
     record.lastActivityAt = Date.now();
+    if (record.openConnections === 0) {
+      // The last connection closed: the client is gone (a live client
+      // always holds an open connection — the standalone GET stream or
+      // an in-flight POST). Signal the lifecycle hook.
+      this.onLastConnectionClosed?.(sessionId);
+    }
   }
 
   get size(): number {

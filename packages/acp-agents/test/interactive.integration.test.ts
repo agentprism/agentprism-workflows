@@ -395,16 +395,21 @@ test("openSession({ schema }) states the contract in-band for embedSchemaInPromp
   );
 });
 
-test("awaitCurrentTurn on a loaded session: completed-while-down resolves from the replay; a still-running turn is KEPT ATTACHED and settles from its live completion; a never-terminal stream rejects", async () => {
+test("awaitCurrentTurn on a loaded session: completed-while-down resolves from the replay; a live continuation is NEVER settled from a quiet gap — a paused resumed turn rejects at the max-wait bound (partial output is never durable)", async () => {
   // Phase D re-attach arm over the REAL adapter: `session/load` replays the persisted
-  // transcript and the seam OBSERVES the update stream — completion is a SETTLED stream
-  // (no updates for the loaded-turn settle grace) with a trailing assistant message, never
-  // a trailing chunk at an arbitrary instant (phase-D review: a trailing chunk used to be
-  // treated as proof of completion, so partial output of a still-streaming turn could be
-  // settled as success; and a still-running turn used to reject, releasing the loaded
-  // session and re-issuing — duplicated work).
+  // transcript and the runner marks the LOAD BOUNDARY at the response. Completion evidence
+  // is the boundary transcript ending with an assistant message AND no content update
+  // following the load (the grace absorbs only wire-flight chunks). A resumed turn that
+  // pauses LONGER than the settle grace with a trailing assistant chunk is only a
+  // progress-stream gap — never terminal evidence — so the seam must NOT settle partial
+  // output: it keeps the session attached and rejects at the max-wait bound, and the
+  // broker degrades to re-issue (phase-D review round 2: a quiet gap used to be treated
+  // as authoritative completion, durably settling partial output of a paused live turn;
+  // the old test covered only gaps SMALLER than the grace).
   const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
   process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = "100";
+  const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = "300";
   try {
     // 1) Completed while down: the replay carries the turn's final message; nothing more
     //    arrives after the load response. The seam resolves with the REAL outcome text
@@ -428,56 +433,59 @@ test("awaitCurrentTurn on a loaded session: completed-while-down resolves from t
     assert.equal(loaded.currentTurnText(), "result B (loaded)");
     await loaded.release();
 
-    // 2) Still in flight at load: the replay ends at the founding turn's user message, and
-    //    the backend CONTINUES streaming live chunks after the load response (a real agent
-    //    resumes the turn for the reconnected client). The seam must NOT reject and must NOT
-    //    settle partial output: it keeps the loaded session attached and resolves with the
-    //    turn's AUTHORITATIVE completion once the live stream settles.
+    // 2) A resumed turn that pauses LONGER than the settle grace: the replay ends at the
+    //    founding turn's user message, the backend continues streaming live chunks after
+    //    the load response (real streaming — gaps SMALLER than the grace), and then the
+    //    turn PAUSES with a trailing assistant chunk for LONGER than the grace (a long
+    //    tool execution, model-side latency). The seam must NOT settle the partial text:
+    //    the post-load content updates are live-continuation evidence, so it keeps the
+    //    loaded session attached, waits out the max-wait bound, and rejects with the
+    //    honest host-side error (the broker then re-issues — partial output is never
+    //    durably settled).
     const { cwd: cwd2 } = harness.configure<LogEntry>({
       loadSessionSupport: true,
       loadSession: {
         replay: [{ role: "user", text: "task" }],
-        // Live chunks stream at gaps SMALLER than the settle grace (real
-        // streaming), so the seam's quiet clock keeps resetting until the
-        // turn actually ends — then settles with the FULL accumulated text.
+        // Live chunks stream (real streaming — gaps under the grace), then the turn
+        // PAUSES for 600 ms — far longer than the 100 ms grace — with a trailing
+        // assistant chunk. The round-2 regression this test pins: the old seam settled
+        // the pause as completion, durably recording "partial result" as the call's
+        // outcome.
         continue: [
-          { afterMs: 60, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "live " } } },
-          { afterMs: 120, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "result" } } },
+          { afterMs: 40, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial " } } },
         ],
       },
     });
     const runner2 = harness.makeRunner();
     const loaded2 = await runner2.loadSession({ sessionId: "fake-session-any", cwd: cwd2, model: "claude" });
-    const turn2 = await loaded2.awaitCurrentTurn();
-    assert.deepEqual(turn2, { stopReason: "end_turn", text: "live result" });
-    assert.equal(loaded2.finalMessageText(), "live result");
+    await assert.rejects(
+      () => loaded2.awaitCurrentTurn(),
+      (error: unknown) =>
+        (error as Error).message.includes("kept streaming after the load response") ||
+        (error as Error).message.includes("not observable over the ACP protocol"),
+    );
     await loaded2.release();
 
     // 3) Never terminal: the replay ends at the user message and NOTHING ever continues
     //    (the turn died silently at the backend, or the backend never streams after load).
     //    The seam's max-wait backstop rejects with the honest host-side error so the broker
     //    can re-issue — a re-attached call can never hang unobserved.
-    const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
-    process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = "200";
-    try {
-      const { cwd: cwd3 } = harness.configure<LogEntry>({
-        loadSessionSupport: true,
-        loadSession: { replay: [{ role: "user", text: "task" }] },
-      });
-      const runner3 = harness.makeRunner();
-      const loaded3 = await runner3.loadSession({ sessionId: "fake-session-any", cwd: cwd3, model: "claude" });
-      await assert.rejects(
-        () => loaded3.awaitCurrentTurn(),
-        (error: unknown) =>
-          (error as Error).message.includes("never reached a terminal assistant message"),
-      );
-      await loaded3.release();
-    } finally {
-      if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
-      else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
-    }
+    const { cwd: cwd3 } = harness.configure<LogEntry>({
+      loadSessionSupport: true,
+      loadSession: { replay: [{ role: "user", text: "task" }] },
+    });
+    const runner3 = harness.makeRunner();
+    const loaded3 = await runner3.loadSession({ sessionId: "fake-session-any", cwd: cwd3, model: "claude" });
+    await assert.rejects(
+      () => loaded3.awaitCurrentTurn(),
+      (error: unknown) =>
+        (error as Error).message.includes("never reached a terminal assistant message"),
+    );
+    await loaded3.release();
   } finally {
     if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
     else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
+    if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
   }
 });

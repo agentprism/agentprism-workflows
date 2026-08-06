@@ -86,6 +86,7 @@ import {
   type SessionConfigSelectOptions,
   type SessionModeState,
   type SessionNotification,
+  type SessionUpdate,
   type SetProviderRequest,
   type SetProviderResponse,
   type SetSessionConfigOptionRequest,
@@ -357,6 +358,25 @@ class SessionState {
   private lastUpdateAt = Date.now();
   /** The re-attach arm's update watchers (woken by every session/update). */
   private readonly updateWatchers = new Set<() => void>();
+  /**
+   * The load boundary — the phase-D review round-2 fix for the re-attach
+   * arm's completion evidence. `session/load` obliges the agent to replay
+   * the ENTIRE persisted conversation and only then resolve the request,
+   * so the transcript is complete AT load resolution; anything applied
+   * after that instant is LIVE CONTINUATION evidence of a turn still
+   * running at the backend. `markLoadBoundary()` (called by the runner
+   * synchronously after the load response) snapshots the replay-complete
+   * state, and every CONTENT update applied after the mark flips
+   * `sawPostLoadContentUpdate` — the seam's "the turn may still be
+   * running" signal. Bookkeeping updates (usage, mode, available
+   * commands, session info) are NOT continuation evidence (claude's
+   * adapter emits an `available_commands_update` right after every
+   * load).
+   */
+  private loadBoundary:
+    | { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' }
+    | null = null;
+  private sawPostLoadContentUpdate = false;
 
   /** `label`/`runId`/`callIndex` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
@@ -407,6 +427,13 @@ class SessionState {
 
   applyUpdate(update: SessionNotification["update"]): void {
     this.lastUpdateAt = Date.now();
+    // A CONTENT update applied after the load boundary is live-continuation
+    // evidence (a turn still running at the backend). Bookkeeping update
+    // kinds never flip the flag — the seam must not mistake claude's
+    // post-load `available_commands_update` for a running turn.
+    if (this.loadBoundary !== null && isContentUpdate(update.sessionUpdate)) {
+      this.sawPostLoadContentUpdate = true;
+    }
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         this.trailingContentKind = 'assistant-message';
@@ -492,13 +519,13 @@ class SessionState {
     }
   }
 
-  /** The loaded-session founding-turn observability probe (the re-attach
-   *  arm's transcript check; see `InteractiveSession.awaitCurrentTurn`):
-   *  whether the transcript shows a turn ever started (a user message)
-   *  and the KIND of the trailing content event. The trailing kind is
-   *  PROGRESS evidence, not completion: the seam decides completion from
-   *  the stream SETTLING (no updates for the loaded-turn settle grace)
-   *  with a trailing assistant message — see `awaitCurrentTurn`. */
+  /** The loaded-session founding-turn observability probe: whether the
+   *  transcript shows a turn ever started (a user message) and the KIND of
+   *  the trailing content event. The trailing kind is PROGRESS evidence,
+   *  not completion by itself — the re-attach arm classifies completion
+   *  from the LOAD BOUNDARY (the transcript as of load resolution) plus
+   *  whether any content update followed the load (see
+   *  `loadBoundaryState` and `InteractiveSession.awaitCurrentTurn`). */
   loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
     return {
       hasUserMessage: this.sawUserMessage,
@@ -511,6 +538,45 @@ class SessionState {
    *  synchronously on the wire, so the timestamp is authoritative). */
   lastUpdateAtMs(): number {
     return this.lastUpdateAt;
+  }
+
+  /**
+   * Mark the load boundary (see the field docs): called by the runner
+   * synchronously after the `session/load` response, when the replay is
+   * complete and the transcript holds the entire persisted conversation.
+   * Idempotent: the FIRST mark wins (a re-load over the same handle keeps
+   * the original boundary).
+   */
+  markLoadBoundary(): void {
+    if (this.loadBoundary !== null) return;
+    this.loadBoundary = {
+      hasUserMessage: this.sawUserMessage,
+      trailingContentKind: this.trailingContentKind,
+    };
+    this.sawPostLoadContentUpdate = false;
+  }
+
+  /**
+   * The load-boundary probe (the re-attach arm's completion evidence;
+   * see `InteractiveSession.awaitCurrentTurn`): the replay-complete
+   * transcript state captured at load resolution, plus whether any
+   * CONTENT update arrived after the boundary (live-continuation
+   * evidence). `marked: false` when the handle was never load-marked (a
+   * session that did not come from the runner's `loadSession` path) —
+   * the seam refuses rather than guessing.
+   */
+  loadBoundaryState(): {
+    marked: boolean;
+    hasUserMessage: boolean;
+    trailingContentKind: 'assistant-message' | 'other';
+    sawPostLoadContentUpdate: boolean;
+  } {
+    return {
+      marked: this.loadBoundary !== null,
+      hasUserMessage: this.loadBoundary?.hasUserMessage ?? this.sawUserMessage,
+      trailingContentKind: this.loadBoundary?.trailingContentKind ?? this.trailingContentKind,
+      sawPostLoadContentUpdate: this.sawPostLoadContentUpdate,
+    };
   }
 
   /** Watch the session/update stream: the listener fires after every
@@ -2609,11 +2675,30 @@ export class SessionHandle implements StructuredSource {
    *  `InteractiveSession.awaitCurrentTurn`): whether the replayed transcript
    *  shows a turn ever started, and the KIND of the trailing content event.
    *  The trailing kind is PROGRESS evidence, never completion by itself —
-   *  the seam decides completion from the stream SETTLING with a trailing
-   *  assistant message. Added for the REPL broker's re-attach arm;
-   *  additive passthrough to `SessionState`. */
+   *  the seam classifies completion from the LOAD BOUNDARY plus whether
+   *  any content update followed the load (see `loadBoundaryState`).
+   *  Added for the REPL broker's re-attach arm; additive passthrough to
+   *  `SessionState`. */
   loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
     return this.state.loadedTurnState();
+  }
+
+  /** Mark the load boundary (see `markLoadBoundary` on `SessionState`):
+   *  the runner calls this synchronously after the `session/load` response
+   *  — the replay is complete at that instant, and any CONTENT update
+   *  applied afterwards is live-continuation evidence. */
+  markLoadBoundary(): void {
+    this.state.markLoadBoundary();
+  }
+
+  /** The load-boundary probe (see `loadBoundaryState` on `SessionState`). */
+  loadBoundaryState(): {
+    marked: boolean;
+    hasUserMessage: boolean;
+    trailingContentKind: 'assistant-message' | 'other';
+    sawPostLoadContentUpdate: boolean;
+  } {
+    return this.state.loadBoundaryState();
   }
 
   /** The most recent instant a session/update arrived for this session
@@ -2728,4 +2813,29 @@ function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfi
     else out.push(entry);
   }
   return out;
+}
+
+/** Is this update kind CONTENT (a live turn's progress) rather than
+ *  bookkeeping? The re-attach arm's load-boundary classification: only
+ *  content updates are continuation evidence (a resumed turn streams
+ *  chunks/thoughts/tool calls/plans; usage/mode/command/session-info
+ *  updates are ambient bookkeeping — claude's adapter emits an
+ *  `available_commands_update` right after every load, live turn or
+ *  not). */
+function isContentUpdate(
+  kind: SessionUpdate["sessionUpdate"],
+): boolean {
+  switch (kind) {
+    case "user_message_chunk":
+    case "agent_message_chunk":
+    case "agent_thought_chunk":
+    case "tool_call":
+    case "tool_call_update":
+    case "plan":
+    case "plan_update":
+    case "plan_removed":
+      return true;
+    default:
+      return false;
+  }
 }

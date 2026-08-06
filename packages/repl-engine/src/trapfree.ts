@@ -216,7 +216,14 @@ export function takeAndFreeException(e: QuickJSExports, vm: QuickJS): void {
 export function rawOwnKeys(handle: JSValueHandle): string[] {
   const vm = handle.vm;
   const e = vm._getExports();
-  const keysPtr = e.qjs_get_own_property_names(handle.ptr);
+  // ALL own string keys (enumerable or not) — the semantic equivalent of
+  // the guest's `Object.getOwnPropertyNames`: the provenance registry's
+  // maintenance pass and the manifest's user-binding diff must agree on
+  // the global key set, and the realm builtins (non-enumerable on
+  // globalThis) belong in it. The shim's plain names export is
+  // ENUM_ONLY (review probe: 16 keys on a fresh realm vs 70 for the
+  // guest's getOwnPropertyNames) — never use it for scope enumeration.
+  const keysPtr = e.qjs_get_own_property_names_all(handle.ptr);
   const keysHandle = new JSValueHandle(vm, keysPtr);
   if (e.qjs_is_exception(keysHandle.ptr) !== 0) {
     takeAndFreeException(e, vm);

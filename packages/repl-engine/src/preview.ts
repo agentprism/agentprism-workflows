@@ -1060,8 +1060,151 @@ export function inspectGlobal(vm: ReplVm, name: string): {
   }
 }
 
+/**
+ * One binding's manifest metadata (the workspace-manifest seam): a
+ * STRUCTURE-ONLY token plus the live-handle call id when the binding is
+ * an agent handle. Resolution is trap-free: the binding is read through
+ * its own property descriptor on globalThis, never a `[[Get]]` — an
+ * accessor-rebound binding renders the explicit sabotage marker and its
+ * getter is NEVER invoked (rendering the manifest must not execute guest
+ * code).
+ *
+ * The token NEVER embeds value content (the harness manifest's hygiene
+ * rule): type label plus shape count plus byte size — for strings the
+ * bare `string` label plus size, for arrays/buffers the structural
+ * `<Kind>(<len>)` description, for plain objects `{N keys}`, for every
+ * other brand the brand label alone. A live agent handle (an own
+ * non-enumerable marker property under the registered handle symbol,
+ * read through the descriptor machinery — a guest-rebound handle can
+ * never forge the read) reports `agent handle` plus its call id; the
+ * caller (the broker) appends the live-handle status from the call
+ * store.
+ *
+ * Returns null for an absent/unreadable slot.
+ */
+export function manifestBinding(vm: ReplVm, name: string): { token: string; handleCallId: string | null } | null {
+  const value = readSlotValue(vm, name);
+  if (value === undefined) {
+    const kind = readRealmSlotKind(vm, name);
+    if (kind === 'accessor') return { token: 'accessor (getter not invoked)', handleCallId: null };
+    return null;
+  }
+  try {
+    // The live-handle detector first: an own data property under the
+    // registered handle symbol, read through the raw descriptor export
+    // (never a [[Get]]; proxies are guarded before any descriptor read).
+    const handleCallId = agentHandleCallId(vm, value);
+    if (handleCallId !== null) {
+      return { token: 'agent handle', handleCallId };
+    }
+    const preview = previewHandle(value);
+    // The plain-object key count must be read BEFORE `estimateSize` (which
+    // consumes the handle — its established dispose contract; the preview
+    // is plain data, the key count is not).
+    const keyCount =
+      preview.type === 'object' && preview.subtype === undefined ? ownKeyCount(value) : null;
+    const size = estimateSize(value);
+    const token = describeManifest(preview, size, keyCount);
+    return { token, handleCallId: null };
+  } catch {
+    return { token: '?', handleCallId: null };
+  } finally {
+    value.dispose();
+  }
+}
+
+/** The structure-only token for a previewed value (see `manifestBinding`;
+ *  mirrors the harness manifest's `describe`). `keyCount` is the plain-
+ *  object own string-key count read before the size estimate consumed the
+ *  handle (`null` for non-plain-objects). */
+function describeManifest(
+  preview: ObjectPreview,
+  size: number,
+  keyCount: { count: number; corrupted: boolean } | null,
+): string {
+  switch (preview.type) {
+    case 'undefined':
+    case 'number':
+    case 'boolean':
+    case 'bigint':
+    case 'symbol':
+    case 'function':
+      return preview.type;
+    case 'string':
+      return `string \u00b7 ${formatByteSize(size)}`;
+    case 'object':
+      switch (preview.subtype) {
+        case 'null':
+          return 'null';
+        case 'array':
+        case 'typedarray':
+        case 'arraybuffer':
+          // Structural descriptions only (FORMAT.md §5.12–5.14): the
+          // description here is `<Kind>(<len>)` — never content.
+          return `${preview.description} \u00b7 ${formatByteSize(size)}`;
+        case 'map':
+          return `Map(?) \u00b7 ${formatByteSize(size)}`;
+        case 'set':
+          return `Set(?) \u00b7 ${formatByteSize(size)}`;
+        case 'promise':
+          // A promise WITHOUT the handle marker is not an agent handle
+          // (a plain guest promise): the brand label alone.
+          return 'Promise';
+        case 'proxy':
+          return `Proxy \u00b7 ${formatByteSize(size)}`;
+        default:
+          if (preview.subtype === undefined) {
+            // A plain object: the own string-key count (structure only;
+            // a corrupted key materialization degrades to `{? keys}`).
+            const count = keyCount === null || keyCount.corrupted ? '?' : String(keyCount.count);
+            const plural = keyCount === null || keyCount.count === 1 ? 'key' : 'keys';
+            return `{${count} ${plural}} \u00b7 ${formatByteSize(size)}`;
+          }
+          return `${preview.subtype} \u00b7 ${formatByteSize(size)}`;
+      }
+    default:
+      return `${preview.type} \u00b7 ${formatByteSize(size)}`;
+  }
+}
+
+/** The live-handle call id of a realm value, trap-free: an agent handle
+ *  is a promise carrying the library's own non-enumerable `id` (string)
+ *  and `followUp` (function) data properties — the shape the harness's
+ *  manifest detector uses. Own-property-descriptor reads only, never a
+ *  [[Get]] (an accessor-rebound property reads as absent — never
+ *  invoked); proxies are guarded before any descriptor read. A guest
+ *  could forge the shape, but the manifest is orientation metadata about
+ *  the orchestrator's own workspace — forging it is self-sabotage, the
+ *  same stance the harness takes (and the honest alternative — a per-
+ *  handle marker property — measurably grew every parked call's realm
+ *  footprint, tipping the bounded-memory suite's knife-edge). */
+function agentHandleCallId(vm: ReplVm, handle: JSValueHandle): string | null {
+  if (handle.isProxy || !handle.isPromise) return null;
+  const shim = getVmShim(vm) as QuickJS;
+  const idHandle = readOwnDataProperty(handle, 'id');
+  if (idHandle === undefined || !idHandle.isString) {
+    idHandle?.dispose();
+    return null;
+  }
+  const followUpHandle = readOwnDataProperty(handle, 'followUp');
+  if (followUpHandle === undefined || !followUpHandle.isFunction) {
+    idHandle.dispose();
+    followUpHandle?.dispose();
+    return null;
+  }
+  followUpHandle.dispose();
+  try {
+    return idHandle.toString();
+  } finally {
+    idHandle.dispose();
+  }
+}
+
 /** The slot kind for the sabotage distinction (reuses bridge's reader —
- *  kept local to avoid a cross-module dependency on bridge internals). */
+ *  kept local to avoid a cross-module dependency on bridge internals).
+ *  Own-descriptor read on globalThis, same discipline as bridge.ts's
+ *  readRealmSlot (which callers may use instead; this one only
+ *  distinguishes the accessor case for the marker line). */
 function readRealmSlotKind(vm: ReplVm, name: string): 'data' | 'accessor' | 'absent' {
   // Own-descriptor read on globalThis, same discipline as bridge.ts's
   // readRealmSlot (which callers may use instead; this one only

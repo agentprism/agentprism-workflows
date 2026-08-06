@@ -22,6 +22,7 @@ import {
 } from "@automatalabs/workflows";
 import type { ReplProjectState } from "./repl-project.js";
 import { disposeReplProjectState } from "./repl-project.js";
+import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 
 export const MAX_BACKGROUND_RUNS = 4;
 
@@ -201,12 +202,22 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
     return total;
   }
 
-  /** Dispose every context's REPL workspace (broker teardown — releasing
-   *  every held ACP session — plus the store close). Called by the daemon
-   *  at shutdown; the workflow managers' own lifecycle is untouched. */
+  /** Dispose every context's REPL workspace: each one DRAINS with the
+   *  shutdown bound first (in-flight subagent turns settle into the VM
+   *  and snapshot; the reviewer-mandated drain-then-close posture — the
+   *  old path cancelled busy sessions on disposal) — then the broker
+   *  teardown (releasing every held ACP session) and the store close.
+   *  Called by the daemon at shutdown; the workflow managers' own
+   *  lifecycle is untouched. */
   async disposeReplStates(): Promise<void> {
     for (const context of this.contexts.values()) {
-      if (context.repl !== undefined) await disposeReplProjectState(context.repl);
+      const state = context.repl;
+      if (state === undefined) continue;
+      const broker = state.broker;
+      if (broker !== null) {
+        await broker.drainForDisconnect(SHUTDOWN_DEADLINE_MS).catch(() => undefined);
+      }
+      await disposeReplProjectState(state);
     }
   }
 

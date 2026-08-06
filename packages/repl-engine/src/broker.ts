@@ -14,12 +14,19 @@
  *   per-call cwd are the runner's own; the broker passes the guest's
  *   options through — `schema` is validated by acp-agents' own
  *   structured-output ladder, see "The guest options surface" below).
- *   Sessions stay open for the workspace's lifetime — the live-handle
- *   contract (followUp/steer/cancel on a settled call) requires it; the
- *   daemon layer's client-presence drain policy lands in a later phase.
+ *   Sessions stay open while any MCP client is connected to the project;
+ *   on last-client disconnect the daemon drives the client-presence
+ *   DRAIN (`drainForDisconnect` — the doc's policy: in-flight turns
+ *   drain to completion, each settlement boundary snapshots, then idle
+ *   children close; the concrete bound reuses the daemon's
+ *   session-eviction TTL), and a later followUp/steer/cancel on a
+ *   settled handle RE-ATTACHES the subagent session lazily via the
+ *   capability matrix (`canLazyReattach`/`lazyReattach` — the doc's
+ *   "followUp re-attaches the subagent session lazily").
  *   They are opened with `keepSession: true`, so the ACP session persists
  *   on the backend for the restore path's lazy re-attach; the moment a
- *   session opens, its backend session id is recorded in the call store
+ *   session opens, its backend session id AND resolved backend id are
+ *   recorded in the call store
  *   (`recordAttached` — BEFORE the prompt is sent), so a crash with a
  *   turn in flight leaves a restore able to re-attach the session
  *   instead of re-issuing a call whose turn may still be running
@@ -132,33 +139,45 @@
  *    (`negotiateCapabilities().supportsLoadSession`; all four built-in
  *    backends advertise `loadSession: true` per docs/api.md, and a
  *    custom backend that omits it rejects the load before any wire
- *    request). On success the call's completion is the loaded session's
- *    founding turn, observed through `awaitCurrentTurn` — a REAL seam on
- *    the acp-agents adapter (phase-D review: the seam used to be absent
- *    from `InteractiveSession`, so every built-in backend loaded,
- *    released, and re-issued). Its protocol-bounded semantics: the
- *    `session/load` contract (the agent replays the entire persisted
- *    conversation and only then resolves the load) plus an OBSERVING
- *    wait — the seam waits for the update stream to SETTLE (no updates
- *    for the loaded-turn settle grace) and only then reads the
- *    transcript's trailing content. A turn that ended while the daemon
- *    was down has its final message in the replay, and the seam resolves
- *    with it (the real accumulated text; `stopReason` synthesized as
- *    `end_turn` — the protocol's replay carries none, and the broker's
- *    own result-shaping gates still apply). A turn still IN FLIGHT at
- *    the backend keeps streaming live chunks after the load response,
- *    so the seam KEEPS THE LOADED SESSION ATTACHED and waits for the
- *    turn's authoritative completion (phase-D review: a successfully
- *    loaded session with its founding turn still running used to be
- *    released and re-issued — duplicated work; now the same session
- *    settles the call when its turn completes). The seam degrades to a
- *    rejection — and the broker to re-issue — only on genuine failure:
- *    a transcript with no user message (the recorded session never
- *    received its prompt), a released/dead session, a stream that
- *    settled without a terminal assistant message within the max-wait
- *    bound (refusal, silent death, a never-ending turn — the
- *    "never hang unobserved" backstop), or a load failure (capability
- *    absent, session deleted, wire failure). A third-party
+ *    request). The load routes by the store's RECORDED backend id (a
+ *    backend id doubles as a model routing spec — never the current
+ *    configured default; phase-D review round 2). On success the call's
+ *    completion is the loaded session's founding turn, observed through
+ *    `awaitCurrentTurn` — a REAL seam on the acp-agents adapter (phase-D
+ *    review: the seam used to be absent from `InteractiveSession`, so
+ *    every built-in backend loaded, released, and re-issued). Its
+ *    protocol-bounded semantics: `session/load` obliges the agent to
+ *    replay the entire persisted conversation and only then resolve the
+ *    load; the runner marks the LOAD BOUNDARY at the response, and the
+ *    seam classifies the founding turn from that boundary plus what
+ *    follows it (phase-D review round 2: a quiet period followed by a
+ *    trailing assistant chunk used to be treated as authoritative
+ *    completion — a quiet gap is only a progress-stream gap, not
+ *    terminal evidence, so partial output of a paused live turn could
+ *    be durably settled). A turn that ended while the daemon was down
+ *    has its final message in the replay: the boundary transcript ends
+ *    with an assistant message and no content update follows within the
+ *    settle grace, and the seam resolves with it (the real accumulated
+ *    text; `stopReason` synthesized as `end_turn` — the protocol's
+ *    replay carries none, and the broker's own result-shaping gates
+ *    still apply). A turn still IN FLIGHT at the backend streams live
+ *    chunks after the load response: the seam KEEPS THE LOADED SESSION
+ *    ATTACHED (phase-D review: a successfully loaded session with its
+ *    founding turn still running used to be released and re-issued —
+ *    duplicated work) but NEVER settles a quiet gap in that state — a
+ *    resumed turn's completion has no terminal marker over ACP v1 — and
+ *    at the max-wait bound it rejects, so the broker re-issues, surfaced
+ *    guest-visibly (a turn that completes during the wait is not
+ *    settled: its completion is unobservable, and the alternative —
+ *    settling guessed partial output — is the durable-correctness
+ *    defect this posture exists to prevent). The seam degrades to a
+ *    rejection — and the broker to re-issue — on: a transcript with no
+ *    user message (the recorded session never received its prompt), a
+ *    released/dead session, a stream without a terminal assistant
+ *    message within the max-wait bound (refusal, silent death, a
+ *    never-ending turn — the "never hang unobserved" backstop), a load
+ *    failure (capability absent, session deleted, wire failure), or an
+ *    unmarked handle (the boundary was never recorded). A third-party
  *    `BrokerSession` adapter WITHOUT the seam still re-attaches the
  *    session, then degrades to re-issue the same way. The outcome is
  *    delivered through the SAME record → settle → consume pump as a
@@ -398,6 +417,14 @@ export interface BrokerLoadSessionOptions extends BrokerOpenSessionOptions {
  *  `InteractiveSession` — what the broker drives). */
 export interface BrokerSession {
   readonly sessionId: string;
+  /** The RESOLVED backend id this session belongs to (the re-attach
+   *  routing pin — a backend id doubles as a model routing spec, so a
+   *  restore or lazy re-attach routes by it instead of re-resolving the
+   *  model spec against the current default backend; phase-D review
+   *  round 2). Optional for third-party adapters: when absent, the
+   *  persisted backendId stays null and routing falls back to the
+   *  persisted model spec. */
+  readonly backendId?: string;
   /** The negotiated initialize capabilities; `undefined` degrades to
    *  "no steering" (the capability-gated honest fallback). */
   readonly capabilities?: { supportsSteering?: boolean };
@@ -555,6 +582,34 @@ export interface ReconcileReport {
  *  changed VM state). */
 export type SnapshotBoundaryKind = 'eval' | 'settlement';
 
+/** One manifest binding (the broker-enriched form; see
+ *  `Broker.workspaceManifest`). */
+export interface WorkspaceManifestBinding {
+  name: string;
+  /** Structure-only token — for an agent handle, `agent handle ·
+   *  pending|settled · call <id>` (the live-handle status appended from
+   *  the call store; the id maps to the task and timestamps). */
+  token: string;
+  /** The sanitized provenance label (`eval 3`, `worker c2`, `session
+   *  restore`), or null when untracked. */
+  provenance: string | null;
+  /** Wall clock of the provenance attribution (ms since epoch). */
+  provenanceAtMs: number | null;
+}
+
+/** The broker-enriched workspace manifest (`Broker.workspaceManifest`). */
+export interface WorkspaceManifestReport {
+  bindings: WorkspaceManifestBinding[];
+  /** The `$N` log-ref globals as a range. */
+  logs: { first: number | null; last: number | null; count: number };
+  /** The provenance registry's snapshot-durable eval counter. */
+  evalSeq: number;
+  /** In-flight host-task call ids (dispatch order). */
+  inFlight: string[];
+  /** Pending checkpoints (raw questions — the tool result previews). */
+  checkpoints: CheckpointInfo[];
+}
+
 /** The state-changing-boundary sink (see the module docs' "The
  *  state-changing-boundary sink" section): `boundary(kind)` fires at
  *  every doc-defined boundary; `flush()` fires at the end of each
@@ -592,8 +647,23 @@ export interface BrokerOptions {
   /** Per-eval and per-settlement-drain interrupt handler (a runaway
    *  guest continuation stays bounded). Also the DEFAULT interrupt
    *  handler for evals: a direct eval that runs away is interrupted
-   *  with this signal unless the caller passes a per-eval handler. */
+   *  with this signal unless the caller passes a per-eval handler. When
+   *  omitted, the broker's own wall-clock EVAL DEADLINE bounds every
+   *  eval and drain (the harness's eval guard — the doc's "break a
+   *  runaway eval (the quickjs interrupt handler)": a runaway eval is
+   *  interrupted by the quickjs interrupt handler once it exceeds the
+   *  budget, the VM stays usable, and the currently-running eval can
+   *  never hang the workspace forever — see `evalTimeoutMs`). */
   interruptHandler?: () => boolean;
+  /** The per-eval wall-clock deadline in ms (the harness's eval guard;
+   *  phase-D review round 2: the interrupt tool's armed signal alone
+   *  could only break the NEXT VM execution, because a synchronous
+   *  runaway eval blocks the event loop before a later MCP request can
+   *  arm it — the deadline makes the CURRENTLY running eval always
+   *  breakable through the quickjs interrupt handler). Applied to every
+   *  eval and every settlement drain; a `null`/`0` value disables the
+   *  deadline. Default `DEFAULT_EVAL_TIMEOUT_MS` (30 000). */
+  evalTimeoutMs?: number;
   /** The state-changing-boundary sink (see the module docs): the
    *  daemon wires it to `ReplWorkspaceStore.snapshotWriter(workspace,
    *  wasm)` so every doc-defined boundary — after each eval, after
@@ -704,6 +774,10 @@ const STEER_OPTION_KEYS = new Set(['promptMeta']);
 /** Default per-workspace concurrency cap (the doc-settled limit). */
 export const DEFAULT_MAX_CONCURRENT_AGENTS = 6;
 
+/** Default per-eval wall-clock deadline in ms (the harness's eval guard;
+ *  see `BrokerOptions.evalTimeoutMs`). */
+export const DEFAULT_EVAL_TIMEOUT_MS = 30_000;
+
 /** The guest library's reserved model-spec sentinel (`verify`/`judgePanel`
  *  route their spawned reviewers/graders through it — the DSL options have
  *  no per-call model, so the reviewers inherit "the run's default model").
@@ -746,12 +820,17 @@ export class Broker {
   private readonly ownsRunner: boolean;
   private readonly callStore: CallStore;
   private readonly interruptHandler: (() => boolean) | undefined;
+  private readonly evalTimeoutMs: number;
   private readonly sink: SnapshotSink | undefined;
   private readonly consoleBuffer: Array<{ level: string; refs: string[]; args: unknown[] }> = [];
   private readonly sessions = new Map<string, SessionEntry>();
   /** Steers that arrived before their session existed (the founding call
    *  was still opening) — merged into the session's queue at open. */
   private readonly pendingSteers = new Map<string, PendingSteer[]>();
+  /** Lazy re-attaches in flight (a settled handle's followUp/steer/cancel
+   *  loading its recorded backend session) — deduped per founding call id
+   *  so concurrent steers share one load. */
+  private readonly pendingReattaches = new Map<string, Promise<SessionEntry | undefined>>();
   private readonly checkpoints = new Map<string, PendingCheckpoint>();
   /** Live GuestCalls by call id — the pump's settlement targets. */
   private readonly deferreds = new Map<string, GuestCall>();
@@ -766,6 +845,11 @@ export class Broker {
   /** Call ids settled synchronously at dispatch (refusals) since the
    *  last eval result — reported in that eval's `completed`. */
   private readonly syncSettled: string[] = [];
+  /** True once the client-presence drain released every child (see
+   *  `drainForDisconnect`): the workspace stays live, and later
+   *  followUp/steer/cancel on a settled handle lazily re-attach the
+   *  recorded backend session. */
+  private drained = false;
   private disposed = false;
   private opChain: Promise<unknown> = Promise.resolve();
 
@@ -787,6 +871,7 @@ export class Broker {
     this.maxConcurrentAgents = Math.min(rawCap, DEFAULT_MAX_CONCURRENT_AGENTS);
     this.callStore = options.store ?? new InMemoryCallStore();
     this.interruptHandler = options.interruptHandler;
+    this.evalTimeoutMs = options.evalTimeoutMs ?? DEFAULT_EVAL_TIMEOUT_MS;
     this.sink = options.snapshotSink;
     this.ownsRunner = options.runner === undefined;
     this.runner = options.runner ?? new AcpAgentRunner();
@@ -855,6 +940,10 @@ export class Broker {
         pumpDrainErrorLine = errorLine(pumped.drainError.info);
       }
       const { outcome, completion } = this.runEval(code, options);
+      // The eval's own provenance pass: bindings this eval created or
+      // rebound (including the `$N` refs its console.logs froze) are
+      // attributed to `eval N` (the registry's snapshot-durable counter).
+      this.provenancePass('eval');
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
       completed = [...completed, ...this.syncSettled.splice(0)];
@@ -998,6 +1087,14 @@ export class Broker {
           if (error instanceof DrainJobError) drainError = error;
           else throw error;
         }
+        // The reconciliation's provenance pass: bindings the reconciled
+        // settlements' continuations created are attributed to the settled
+        // call ids (a pre-provenance restore's own sweep ran inside
+        // `Workspace.restore`).
+        this.provenancePass('settlement', [
+          ...report.settledFromStore,
+          ...report.failedLost,
+        ]);
         this.sink?.boundary('settlement');
         if (drainError !== undefined) throw drainError;
       }
@@ -1101,9 +1198,18 @@ export class Broker {
     }
     let loaded: BrokerSession | undefined;
     try {
+      // The re-attach routing: the store's RECORDED backend id pins the
+      // original backend (a backend id doubles as a model routing spec),
+      // falling back to the recorded model spec verbatim — never the
+      // current configured default (phase-D review round 2: a changed
+      // default across a restart used to load on the wrong backend and
+      // miss the still-resumable original session).
+      const model =
+        record?.backendId ??
+        (entry.modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : entry.modelSpec ?? undefined);
       const session = await this.runner.loadSession({
         sessionId,
-        model: entry.modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : entry.modelSpec ?? undefined,
+        model,
         schema: parsed.schema as never,
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
@@ -1209,6 +1315,7 @@ export class Broker {
     this.pendingSteers.delete(entry.id);
     this.sessions.set(entry.id, sessionEntry);
     this.agentSlots.add(entry.id);
+    this.drained = false; // children are warm again
     this.warnLine('info', `call ${entry.id}: re-attached to backend session ${session.sessionId}`);
     const taskPromise = this.runReattachedTask(entry.id, sessionEntry, parsed);
     this.trackInFlight(entry.id, 'agent', taskPromise);
@@ -1293,7 +1400,166 @@ export class Broker {
       'warn',
       `call ${callId}: re-attached session ${entry.session.sessionId} released (${toRejectionValue(error).message}) — re-issued`, // eslint-disable-line max-len
     );
-    return this.runAgentTask(callId, entry.modelSpec, entry.task, parsed);
+    return this.runAgentTask(callId, entry.modelSpec, entry.task, parsed, this.recordedBackendId(callId));
+  }
+
+  /** The recorded backend routing pin of a call, if any (the store's
+   *  `backendId` — recorded at session open). Re-issues and lazy
+   *  re-attaches route by it. */
+  private recordedBackendId(callId: string): string | null {
+    return this.callStore.lookup(callId)?.backendId ?? null;
+  }
+
+  /**
+   * Can this founding call id be lazily re-attached? A store record that
+   * is a SETTLED agent call (its completion is recorded — the handle's
+   * call is done, the session outlives it by the live-handle contract)
+   * with a recorded backend session id. A call still opening is handled
+   * by the queued-while-opening arm, a pending call by reconcile; this
+   * arm exists for the doc's lazy re-attach of settled handles after a
+   * drain (or a restore that left settled calls unattached).
+   */
+  private canLazyReattach(sessionId: string): boolean {
+    if (this.isTracked(sessionId)) return false;
+    const record = this.callStore.lookup(sessionId);
+    if (record === undefined || record.kind !== 'agent') return false;
+    if (record.completion === null || record.sessionId === null) return false;
+    return true;
+  }
+
+  /**
+   * The lazy re-attach (deduped per founding call id): load the store's
+   * recorded backend session for a SETTLED call through the runner's own
+   * `loadSession` — capability-gated exactly like the restore path's
+   * re-attach arm (a custom backend without `session/load` degrades
+   * through the same gate, surfaced guest-visibly as a warn line) — and
+   * register it as the call's live session (settled, idle, its pending
+   * steers merged). Returns undefined when the load failed or the record
+   * cannot serve one; the caller settles the honest `failed` outcome.
+   * Concurrent lazy re-attaches of one session share a single load.
+   */
+  private lazyReattach(sessionId: string): Promise<SessionEntry | undefined> {
+    const existing = this.pendingReattaches.get(sessionId);
+    if (existing !== undefined) return existing;
+    const promise = this.doLazyReattach(sessionId).finally(() => {
+      if (this.pendingReattaches.get(sessionId) === promise) this.pendingReattaches.delete(sessionId);
+    });
+    this.pendingReattaches.set(sessionId, promise);
+    return promise;
+  }
+
+  private async doLazyReattach(sessionId: string): Promise<SessionEntry | undefined> {
+    const record = this.callStore.lookup(sessionId);
+    if (record === undefined || record.kind !== 'agent' || record.completion === null || record.sessionId === null) {
+      return undefined;
+    }
+    let parsed: ParsedAgentOptions;
+    try {
+      parsed = this.parseAgentOptions(record.optionsJson);
+    } catch {
+      // A corrupt options bag: nothing was steered (the failed outcome).
+      return undefined;
+    }
+    try {
+      // The routing pin: the recorded backend id (a backend id doubles as
+      // a model routing spec), falling back to the recorded model spec
+      // verbatim — never the current configured default (phase-D review
+      // round 2).
+      const model =
+        record.backendId ??
+        (record.modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : record.modelSpec ?? undefined);
+      const session = await this.runner.loadSession({
+        sessionId: record.sessionId,
+        model,
+        schema: parsed.schema as never,
+        cwd: parsed.cwd ?? this.workspace.projectDir,
+        configOptions: parsed.configOptions,
+        mode: parsed.mode,
+        meta: parsed.meta,
+        tier: parsed.tier,
+        toolNames: parsed.toolNames,
+        disallowedToolNames: parsed.disallowedToolNames,
+        label: parsed.label ?? `repl:${sessionId}`,
+        runId: sessionId,
+        baseInstructions: parsed.baseInstructions,
+        developerInstructions: parsed.developerInstructions,
+        keepSession: true,
+        retainSessionLog: true,
+      });
+      const entry: SessionEntry = {
+        session,
+        callId: sessionId,
+        modelSpec: record.modelSpec ?? '',
+        task: record.detail,
+        supportsSteering: session.capabilities?.supportsSteering === true,
+        busy: false,
+        delivering: false,
+        callSettled: true,
+        callCancelled: false,
+        queue: this.pendingSteers.get(sessionId) ?? [],
+      };
+      this.pendingSteers.delete(sessionId);
+      this.sessions.set(sessionId, entry);
+      this.drained = false; // children are warm again
+      this.warnLine('info', `call ${sessionId}: lazily re-attached to backend session ${session.sessionId}`);
+      return entry;
+    } catch (error) {
+      this.warnLine(
+        'warn',
+        `call ${sessionId}: lazy re-attach of backend session ${record.sessionId} failed ` +
+          `(${toRejectionValue(error).message}) — nothing was steered`, // eslint-disable-line max-len
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * One steer's lazy-re-attach task: re-attach the settled handle's
+   * recorded session, then deliver the steering operation per the
+   * mechanism table against the loaded session (idle → new turn, busy →
+   * live injection or queued, cancel → cancel or the honest `idle`).
+   * The load runs OUTSIDE the broker's serialized ops (it is a runner
+   * wire call); the session registration and the delivery are ordered by
+   * the shared re-attach promise, and the outcome travels the same
+   * record → settle → consume pump as any steer.
+   */
+  private runLazyReattachSteerTask(
+    callId: string,
+    sessionId: string,
+    action: string,
+    prompt: string,
+    promptMeta: Record<string, unknown> | undefined,
+  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+    return (async () => {
+      const entry = await this.lazyReattach(sessionId);
+      if (entry === undefined) {
+        // Nothing was steered (the load failed through the capability
+        // gate or the session is lost).
+        return { outcome: 'resolve', value: 'failed' };
+      }
+      if (action === 'cancel') {
+        if (!entry.busy) return { outcome: 'resolve', value: 'idle' };
+        return this.runCancelTask(callId, entry);
+      }
+      if (action !== 'followUp' && action !== 'steer') {
+        return { outcome: 'resolve', value: 'failed' };
+      }
+      if (entry.busy) {
+        if (entry.supportsSteering) {
+          return this.runInjectTask(callId, entry, prompt, promptMeta);
+        }
+        entry.queue.push({ callId, prompt, promptMeta });
+        return { outcome: 'resolve', value: 'queued' };
+      }
+      // The session is idle: the content starts a new turn right now —
+      // unless the workspace cap is exhausted (the six-agent ceiling is
+      // absolute; a follow-up turn IS the subagent working).
+      if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
+        entry.queue.push({ callId, prompt, promptMeta });
+        return { outcome: 'resolve', value: 'queued' };
+      }
+      return this.runPromptTask(callId, entry, prompt, promptMeta);
+    })();
   }
 
   /** Re-issue a lost call under the SAME call id: the store records the
@@ -1329,7 +1595,13 @@ export class Broker {
     this.callStore.recordReissued(entry.id, now());
     this.agentSlots.add(entry.id);
     this.warnLine('warn', `call ${entry.id}: ${reason} — re-issued`);
-    const taskPromise = this.runAgentTask(entry.id, entry.modelSpec ?? '', entry.detail ?? '', parsed);
+    const taskPromise = this.runAgentTask(
+      entry.id,
+      entry.modelSpec ?? '',
+      entry.detail ?? '',
+      parsed,
+      this.recordedBackendId(entry.id),
+    );
     this.trackInFlight(entry.id, 'agent', taskPromise);
     report.reissued.push(entry.id);
     return false;
@@ -1399,14 +1671,17 @@ export class Broker {
 
   /** Adopt a registry entry the store has never seen (foreign snapshot /
    *  wiped store): record its dispatch from the entry's verbatim detail
-   *  + optionsJson, so the replay ledger stays complete (completions,
-   *  re-issues and attachment records can all be written against it). */
+   *  + optionsJson (+ modelSpec — the re-attach routing source), so the
+   *  replay ledger stays complete (completions, re-issues and attachment
+   *  records can all be written against it). */
   private adoptEntry(entry: GuestSurfaceEntry, kind: 'agent' | 'checkpoint' | 'steer'): void {
     this.callStore.recordDispatched({
       callId: entry.id,
       kind,
       detail: entry.detail ?? '',
       optionsJson: entry.optionsJson,
+      modelSpec: kind === 'agent' ? entry.modelSpec : null,
+      backendId: null,
       dispatchedAtMs: now(),
       reissues: 0,
       completion: null,
@@ -1435,14 +1710,32 @@ export class Broker {
    * through the same session cancel; it additionally settles the guest
    * steer call). A turn in flight is cancelled (the call then rejects
    * with the recoverable `CancelledError` at the next pump); an idle
-   * session is a no-op.
+   * session is a no-op. After the client-presence drain released every
+   * child, a SETTLED handle's recorded backend session is re-attached
+   * lazily (the doc: followUp/steer/cancel re-attach the subagent
+   * session lazily via the capability matrix) and cancelled if a turn
+   * is running there; an idle loaded session is the honest no-op.
+   * Returns the outcome the tool renders: `cancelled` | `idle` |
+   * `failed` | `none` (no session to act on).
    */
-  async cancelCall(callId: string): Promise<void> {
+  async cancelCall(callId: string): Promise<'cancelled' | 'idle' | 'failed' | 'none'> {
     return this.serialized(async () => {
       this.assertAlive();
       const entry = this.sessions.get(callId);
-      if (entry === undefined || !entry.busy) return;
-      await this.cancelSession(entry);
+      if (entry !== undefined) {
+        if (!entry.busy) return 'idle';
+        await this.cancelSession(entry);
+        return 'cancelled';
+      }
+      // No live entry: a drained broker (or a handle whose session never
+      // opened). A settled call with a recorded backend session is
+      // re-attached lazily; anything else has nothing to cancel.
+      if (!this.canLazyReattach(callId)) return 'none';
+      const loaded = await this.lazyReattach(callId);
+      if (loaded === undefined) return 'failed';
+      if (!loaded.busy) return 'idle';
+      await this.cancelSession(loaded);
+      return 'cancelled';
     });
   }
 
@@ -1488,6 +1781,207 @@ export class Broker {
     return this.callStore;
   }
 
+  /** True once the client-presence drain released every child (see
+   *  `drainForDisconnect`): the workspace stays live, and later
+   *  followUp/steer/cancel on a settled handle lazily re-attaches the
+   *  recorded backend session. */
+  get isDrained(): boolean {
+    return this.drained;
+  }
+
+  /** The number of sessions with a turn running (the drain's progress
+   *  probe). */
+  busySessionCount(): number {
+    let count = 0;
+    for (const entry of this.sessions.values()) {
+      if (entry.busy) count++;
+    }
+    return count;
+  }
+
+  /**
+   * The `wait` tool's engine-side seam: pump until the target call ids
+   * settle (or `timeoutMs` elapses — "still running" on timeout), then
+   * return the SAME tool-result shape as an eval — output lines included
+   * (the wait's pumps drain console events and restored-call warn lines
+   * into the buffer; the doc requires wait to return the same shape, and
+   * deferring output to the next eval would lose immediate guest-visible
+   * restored-call output and warnings — phase-D review round 2).
+   * `ids` omitted waits for every pending call. Returns the rendered
+   * result plus whether the target set drained within the bound.
+   */
+  async waitForCalls(
+    ids: string[] | undefined,
+    timeoutMs: number,
+  ): Promise<{ result: ReplEvalResult; drained: boolean }> {
+    return this.serialized(async () => {
+      this.assertAlive();
+      const deadline = Date.now() + Math.max(0, timeoutMs);
+      const targets = ids === undefined ? null : new Set(ids);
+      const completed: string[] = [];
+      const initialPending = new Set(this.pendingIds());
+      for (;;) {
+        const { settled } = await this.pumpUnlocked();
+        if (settled.length > 0) {
+          this.sink?.boundary('settlement');
+          completed.push(...settled);
+        }
+        const pending = new Set(this.pendingIds());
+        const drained =
+          targets === null ? pending.size === 0 : [...targets].every((id) => !pending.has(id));
+        if (drained) break;
+        if (Date.now() >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const drained = targets === null ? this.pendingIds().length === 0 : [...targets].every((id) => !this.pendingIds().includes(id));
+      const result = this.renderWaitResult(completed, initialPending);
+      return { result, drained };
+    });
+  }
+
+  /** Render the wait result in the eval-result shape (output lines from
+   *  the console buffer, pending ids, checkpoints, completed ids). */
+  private renderWaitResult(completed: string[], initialPending: Set<string>): ReplEvalResult {
+    const lines: string[] = [];
+    for (const event of this.consoleBuffer.splice(0)) {
+      lines.push(...this.renderConsoleEvent(event));
+    }
+    const capped = applyOutputCaps(lines);
+    return {
+      output: capped.lines,
+      outputTruncated: capped.truncated,
+      pending: this.pendingIds(),
+      checkpoints: this.checkpointSummaries(),
+      completed,
+    };
+  }
+
+  /**
+   * The doc's client-presence drain: on last-client disconnect the daemon
+   * calls this — in-flight subagent turns DRAIN TO COMPLETION (their
+   * results settle into the VM and each settlement boundary snapshots, so
+   * "close the laptop while two researchers run" ends with the findings
+   * durable in the workspace — never a cancel of running work), bounded
+   * by `boundMs` (the daemon reuses its session-eviction TTL — the
+   * spec-owed concrete drain bound; individual turns already run under
+   * the runner's runaway protections, so the bound is the outer ceiling),
+   * and then every idle child CLOSES (sessions released — `keepSession`
+   * keeps the backend sessions re-openable). The workspace and broker
+   * stay alive; on the next client connect `followUp` re-attaches the
+   * subagent session lazily via the capability matrix (see
+   * `canLazyReattach`/`lazyReattach`). Queued-but-undelivered steers are
+   * re-queued durably against their founding session ids (the same
+   * rebuild reconcile uses — their payloads live in the store), so the
+   * next lazy re-attach delivers them exactly once. Returns `true` when
+   * every turn drained within the bound, `false` when the bound forced
+   * the remainder to cancel (the honest bounded teardown — the cancel
+   * settles the calls as the recoverable `AGENT_CANCELLED`, recorded and
+   * snapshotted like any settlement).
+   */
+  async drainForDisconnect(boundMs: number): Promise<boolean> {
+    return this.serialized(async () => {
+      this.assertAlive();
+      if (this.drained) return true;
+      const deadline = Date.now() + Math.max(0, boundMs);
+      // Drain phase: pump until no session has a turn running (or the
+      // bound expires). Each pump settles into the VM and fires the
+      // settlement boundary — the daemon's snapshot sink persists each
+      // drain boundary, so a kill mid-drain loses nothing. An empty pump
+      // yields briefly (the turns complete asynchronously at the
+      // backends; a busy spin would starve the event loop).
+      for (;;) {
+        if (this.busySessionCount() === 0) break;
+        if (Date.now() >= deadline) break;
+        const { settled } = await this.pumpUnlocked();
+        if (settled.length > 0) this.sink?.boundary('settlement');
+        if (this.busySessionCount() > 0) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const drainedWithinBound = this.busySessionCount() === 0;
+      if (!drainedWithinBound) {
+        // The bound is the outer ceiling: cancel what it caught
+        // (best-effort; the cancellations settle the calls as the
+        // recoverable AGENT_CANCELLED), then one final pump settles the
+        // cancellations into the VM (each settlement boundary snapshots).
+        const cancels: Promise<unknown>[] = [];
+        for (const entry of this.sessions.values()) {
+          if (entry.busy) cancels.push(this.cancelSession(entry));
+        }
+        await Promise.allSettled(cancels);
+        const { settled } = await this.pumpUnlocked();
+        if (settled.length > 0) this.sink?.boundary('settlement');
+      }
+      // Release phase: every session's child closes (keepSession keeps
+      // the backend session re-openable). Queued-but-undelivered steers
+      // are re-queued against their founding session ids FIRST — the
+      // next lazy re-attach merges them into the fresh entry's queue.
+      const sessions = [...this.sessions.values()];
+      for (const entry of sessions) {
+        const pending = this.pendingSteers.get(entry.callId) ?? [];
+        if (entry.queue.length > 0) {
+          this.pendingSteers.set(entry.callId, [...pending, ...entry.queue]);
+          entry.queue = [];
+        } else if (pending.length === 0) {
+          this.pendingSteers.delete(entry.callId);
+        }
+      }
+      const releases = sessions.map((entry) =>
+        Promise.resolve(entry.session.release()).catch(() => undefined),
+      );
+      await Promise.allSettled(releases);
+      this.sessions.clear();
+      this.agentSlots.clear();
+      this.deliverySlots.clear();
+      this.pendingReattaches.clear();
+      this.drained = true;
+      return drainedWithinBound;
+    });
+  }
+
+  /**
+   * The broker-enriched workspace manifest — the `status` tool's bindings
+   * surface (the roadmap doc: "top-level bindings with name, type, size,
+   * provenance (which subagent produced the value, from what task, when),
+   * and live-handle status. Metadata, never content — ls for the data
+   * plane"). The engine enumerates the user bindings trap-free (fresh-
+   * realm baseline set difference) with structure-only tokens and
+   * provenance labels; this layer appends the LIVE-HANDLE STATUS from the
+   * call store (`pending` / `settled` — the call id maps to the task and
+   * timestamps in the store, so any claim audits back to the worker that
+   * made it), the in-flight call ids, and the pending checkpoints.
+   */
+  workspaceManifest(): WorkspaceManifestReport {
+    this.assertAlive();
+    const manifest = this.workspace.manifest();
+    const bindings = manifest.bindings.map((binding) => {
+      let token = binding.token;
+      if (binding.handleCallId !== null) {
+        const record = this.callStore.lookup(binding.handleCallId);
+        const status =
+          record === undefined || record.completion === null ? 'pending' : 'settled';
+        token = `agent handle \u00b7 ${status} \u00b7 call ${binding.handleCallId}`;
+      }
+      return {
+        name: binding.name,
+        token,
+        provenance: binding.provenance,
+        provenanceAtMs: binding.provenanceAtMs,
+      };
+    });
+    return {
+      bindings,
+      logs: manifest.logs,
+      evalSeq: manifest.evalSeq,
+      inFlight: this.inFlightIds(),
+      checkpoints: this.pendingCheckpoints(),
+    };
+  }
+
+  /** The in-flight host-task call ids, in dispatch order (the manifest's
+   *  in-flight seam; the harness's `in_flight_ids`). */
+  inFlightIds(): string[] {
+    return [...this.inFlight.keys()];
+  }
+
   /**
    * Teardown: cancel in-flight turns (best-effort), release EVERY
    * session the broker opened (whether or not it owns the runner — a
@@ -1513,6 +2007,7 @@ export class Broker {
       await Promise.allSettled(releases);
       this.sessions.clear();
       this.pendingSteers.clear();
+      this.pendingReattaches.clear();
       this.checkpoints.clear();
       this.deferreds.clear();
       this.inFlight.clear();
@@ -1553,7 +2048,7 @@ export class Broker {
       });
       return;
     }
-    this.recordDispatch(callId, 'agent', task, optionsJson);
+    this.recordDispatch(callId, 'agent', task, optionsJson, null, modelSpec);
     this.deferreds.set(callId, call);
     this.agentSlots.add(callId);
     const taskPromise = this.runAgentTask(callId, modelSpec, task, parsed);
@@ -1669,6 +2164,39 @@ export class Broker {
         this.settleSteerSync(call, callId, 'queued');
         return;
       }
+      if (this.canLazyReattach(sessionId)) {
+        // The doc's lazy re-attach: a SETTLED handle whose session was
+        // released (the client-presence drain, or a restore that left the
+        // settled call un-attached) re-attaches its recorded backend
+        // session on demand — `followUp re-attaches the subagent session
+        // lazily via the capability matrix above`. The load is
+        // capability-gated through the runner's own `loadSession`; a
+        // failure (no `session/load` on a custom backend, a lost
+        // session) degrades to the honest `failed` with a warn line —
+        // nothing was steered.
+        let prompt: string;
+        let promptMeta: Record<string, unknown> | undefined;
+        try {
+          if (action === 'cancel') {
+            prompt = '';
+          } else {
+            if (typeof payload?.prompt !== 'string') {
+              throw new TypeError(`handle.${action}(prompt, options?) needs a prompt string`);
+            }
+            prompt = payload.prompt;
+            const options =
+              payload.options === undefined ? undefined : this.parseSteerOptions(payload.options);
+            promptMeta = (options?.promptMeta as Record<string, unknown> | undefined) ?? undefined;
+          }
+        } catch (error) {
+          this.refuse(call, callId, 'steer', action, payloadJson, error);
+          return;
+        }
+        const task = this.runLazyReattachSteerTask(callId, sessionId, action, prompt, promptMeta);
+        this.deferreds.set(callId, call);
+        this.trackInFlight(callId, 'steer', task);
+        return;
+      }
       // No live session for the founding call (never opened, or lost
       // with the process): nothing was steered.
       this.settleSteerSync(call, callId, 'failed');
@@ -1749,19 +2277,25 @@ export class Broker {
   /** Record a dispatch (idempotent per id — a re-issue of a known id
    *  keeps the original record). Steer records carry the FOUNDING session
    *  id (`sessionId` — the restore path's queue rebuild keys on it);
-   *  agent/checkpoint records pass null. */
+   *  agent/checkpoint records pass null. Agent records ALSO persist the
+   *  model spec verbatim (`modelSpec` — the re-attach routing source; a
+   *  restore or lazy re-attach must not re-resolve the spec against the
+   *  current default backend, phase-D review round 2). */
   private recordDispatch(
     callId: string,
     kind: 'agent' | 'checkpoint' | 'steer',
     detail: string,
     optionsJson: string | null,
     sessionId: string | null = null,
+    modelSpec: string | null = null,
   ): void {
     this.callStore.recordDispatched({
       callId,
       kind,
       detail,
       optionsJson,
+      modelSpec,
+      backendId: null,
       dispatchedAtMs: now(),
       reissues: 0,
       completion: null,
@@ -1831,11 +2365,18 @@ export class Broker {
     modelSpec: string,
     task: string,
     parsed: ParsedAgentOptions,
+    backendIdOverride: string | null = null,
   ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
     let openedSession: BrokerSession | undefined;
     try {
       const session = await this.runner.openSession({
-        model: modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : modelSpec,
+        // The routing pin: a re-issue of a call that once had a backend
+        // re-routes to the ORIGINAL backend (a backend id doubles as a
+        // model routing spec), never to the current configured default
+        // (phase-D review round 2: routing by the current default across
+        // a restart could open the re-issued session on the wrong
+        // backend).
+        model: backendIdOverride ?? (modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : modelSpec),
         schema: parsed.schema as never,
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
@@ -1852,6 +2393,7 @@ export class Broker {
         retainSessionLog: true,
       });
       openedSession = session;
+      this.drained = false; // children are warm again
       const entry: SessionEntry = {
         session,
         callId,
@@ -1867,13 +2409,16 @@ export class Broker {
       this.pendingSteers.delete(callId);
       this.sessions.set(callId, entry);
       // Durable re-attach key (phase D): record the backend session id
-      // the moment the session opens — BEFORE the prompt is sent — so a
+      // (and the RESOLVED backend id — the re-attach routing pin) the
+      // moment the session opens — BEFORE the prompt is sent — so a
       // crash with a turn in flight leaves a restore able to re-attach
-      // this session (without the record, the restore would re-issue a
-      // call whose turn may still be running at the backend — duplicated
-      // work). A failing record is a host-side failure: the call rejects
-      // (the session stays open and tracked, so dispose releases it).
-      this.callStore.recordAttached(callId, session.sessionId, now());
+      // this session on the RIGHT backend (without the record, the
+      // restore would re-issue a call whose turn may still be running at
+      // the backend — duplicated work — or route the load by the current
+      // default backend and miss the original session). A failing record
+      // is a host-side failure: the call rejects (the session stays open
+      // and tracked, so dispose releases it).
+      this.callStore.recordAttached(callId, session.sessionId, now(), session.backendId ?? null);
       entry.busy = true;
       const turn = await session.prompt(task, { promptMeta: parsed.promptMeta });
       this.assertNormalStopReason(turn.stopReason, callId);
@@ -2210,6 +2755,10 @@ export class Broker {
     if (settled.length === 0) return { settled };
     try {
       this.drain();
+      // The settlement's provenance pass: bindings the settled calls'
+      // continuations created are attributed to `worker cN` (the call ids
+      // this drain settled).
+      this.provenancePass('settlement', settled);
       return { settled };
     } catch (error) {
       if (error instanceof DrainJobError) {
@@ -2300,9 +2849,39 @@ export class Broker {
   }
 
   /** One settlement drain with the broker's interrupt handler armed (a
-   *  continuation resumed by settlement cannot run away unguarded). */
+   *  continuation resumed by settlement cannot run away unguarded). The
+   *  drain also runs under the per-eval wall-clock deadline (a
+   *  settlement drain can itself resume a runaway continuation — it
+   *  gets the same bound). */
   private drain(): void {
-    this.workspace.drainJobs({ interruptHandler: this.interruptHandler });
+    this.workspace.drainJobs({
+      interruptHandler: this.composedInterrupt(this.interruptHandler),
+    });
+  }
+
+  /** The per-eval wall-clock deadline interrupt (the harness's eval
+   *  guard; see `BrokerOptions.evalTimeoutMs`): a fresh handler per
+   *  operation, interrupting once the operation exceeds the budget.
+   *  Returns `undefined` when the deadline is disabled (`0`/`null`), so
+   *  the caller falls back to no handler. */
+  private deadlineHandler(): (() => boolean) | undefined {
+    if (!(this.evalTimeoutMs > 0)) return undefined;
+    const deadline = Date.now() + this.evalTimeoutMs;
+    return () => Date.now() >= deadline;
+  }
+
+  /** One maintenance pass of the per-binding provenance registry after a
+   *  guest-entering operation (the workspace manifest's provenance seam;
+   *  see `provenance.ts`). Orientation metadata only — never throws. */
+  private provenancePass(origin: 'eval' | 'settlement', callIds: string[] = []): void {
+    try {
+      this.workspace.provenanceRecord(
+        origin === 'eval' ? { kind: 'eval' } : { kind: 'settlement', callIds },
+      );
+    } catch {
+      // Orientation metadata: a failing pass must never break the
+      // operation that triggered it.
+    }
   }
 
   // ── Eval + rendering ──────────────────────────────────────────────────
@@ -2313,13 +2892,39 @@ export class Broker {
    *  the caller supplies no per-eval handler (review regression: the
    *  configured handler used to apply only to settlement drains, so a
    *  runaway eval could hang the workspace indefinitely). A caller's
-   *  per-eval handler still overrides it. */
+   *  per-eval handler still overrides it. The per-eval wall-clock
+   *  deadline ALWAYS applies on top (phase-D review round 2: the
+   *  interrupt tool's armed signal alone could only break the NEXT
+   *  execution, because a synchronous runaway eval blocks the event loop
+   *  — the deadline makes the CURRENTLY running eval always breakable
+   *  through the quickjs interrupt handler, even when an explicit signal
+   *  handler is armed and unset). */
   private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown } {
     return this.workspace.evalWithCompletion(code, {
       ...options,
-      interruptHandler: options.interruptHandler ?? this.interruptHandler,
+      // The per-eval handler overrides the broker-level default (the
+      // documented contract); the per-eval wall-clock deadline ALWAYS
+      // composes on top (phase-D review round 2: a currently-running
+      // runaway eval is always breakable).
+      interruptHandler: this.composedInterrupt(options.interruptHandler ?? this.interruptHandler),
       rejectionBridge: true,
     });
+  }
+
+  /** Compose the per-operation interrupt handlers with the per-eval
+   *  wall-clock deadline: any handler returning true interrupts. The
+   *  deadline is the last resort — a runaway operation is ALWAYS
+   *  breakable (see `BrokerOptions.evalTimeoutMs`; `0`/`null` disables
+   *  it). */
+  private composedInterrupt(...handlers: Array<(() => boolean) | undefined>): () => boolean {
+    const live = handlers.filter((handler): handler is () => boolean => handler !== undefined);
+    const deadline = this.deadlineHandler();
+    return () => {
+      for (const handler of live) {
+        if (handler()) return true;
+      }
+      return deadline !== undefined && deadline();
+    };
   }
 
   /** Render the tool-result shape: output lines (console events drained

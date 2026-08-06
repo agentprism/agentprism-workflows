@@ -74,6 +74,9 @@ import { createAwaitProgressReporter, createProgressReporter, formatAgentProgres
 import type { AwaitProgressReporter } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { registerReplTool } from "./repl-tool.js";
+import { ReplPresenceLedger } from "./repl-presence.js";
+import { DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
+import { SESSION_IDLE_TTL_MS } from "./daemon/constants.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
 import {
   WorkflowScriptResources,
@@ -1128,6 +1131,17 @@ function formatAwaitSummary(result: WorkflowRunAwaitResult): string {
  * through manager.runSync or startInBackground. The returned McpServer is not yet connected — the caller attaches a
  * transport (see index.ts).
  */
+/** The per-eval wall-clock deadline (see `repl-project.ts`); the
+ *  `AGENTPRISM_REPL_EVAL_TIMEOUT_MS` env knob, clamped to >= 1 ms. */
+function replEvalTimeoutMs(): number {
+  const env = process.env.AGENTPRISM_REPL_EVAL_TIMEOUT_MS;
+  if (env !== undefined) {
+    const parsed = Number.parseInt(env, 10);
+    if (Number.isFinite(parsed) && parsed >= 1) return parsed;
+  }
+  return DEFAULT_REPL_EVAL_TIMEOUT_MS;
+}
+
 export interface CreateWorkflowServerOptions {
   /** Pin a pre-built manager as this server's own project (composition/back-compat seam). */
   manager?: WorkflowManager;
@@ -1149,6 +1163,25 @@ export interface CreateWorkflowServerOptions {
    * inject a fake and own its lifetime.
    */
   replRunner?: BrokerRunner;
+  /**
+   * The REPL client-presence ledger (daemon mode: one ledger per daemon, shared by every
+   * session; single-project mode: a private ledger). Drives the doc's last-client-
+   * disconnect drain. Omitted: a private ledger is created (the single-project mode's
+   * own client presence).
+   */
+  replPresence?: ReplPresenceLedger;
+  /**
+   * This server's MCP session id (daemon mode: the per-session transport's id, resolved
+   * per call; single-project mode: a fixed client id). The `repl` tool touches presence
+   * under it.
+   */
+  replClientId?: () => string | undefined;
+  /**
+   * The concrete client-presence drain bound — the daemon reuses its session-eviction
+   * TTL (the spec-owed decision; see `repl-presence.ts`). Defaults to
+   * `SESSION_IDLE_TTL_MS`.
+   */
+  replDrainBoundMs?: number;
 }
 
 export interface WorkflowServer extends McpServer, WorkflowServerControl {}
@@ -1215,6 +1248,9 @@ export function createWorkflowServer(
     wasm: loadShippedWasm(),
     requireProjectDir,
     runner: options.replRunner,
+    evalTimeoutMs: replEvalTimeoutMs(),
+    presence: options.replPresence ?? new ReplPresenceLedger(options.replDrainBoundMs ?? SESSION_IDLE_TTL_MS),
+    clientId: options.replClientId ?? (() => "single-project"),
     acceptingWork: () => acceptingWork,
   });
 

@@ -17,10 +17,12 @@ import { randomUUID } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { AgentRunner } from "@automatalabs/shared-types";
+import type { BrokerRunner } from "@automatalabs/repl-engine";
 
 import { createWorkflowServer, SERVER_VERSION } from "../server.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
-import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH } from "./constants.js";
+import { ReplPresenceLedger } from "../repl-presence.js";
+import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, SESSION_IDLE_TTL_MS } from "./constants.js";
 import { envFingerprint } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
 import { validateRequest } from "./middleware.js";
@@ -33,6 +35,20 @@ export interface CreateDaemonOptions {
   host?: string;
   env?: Record<string, string | undefined>;
   log?: (line: string) => void;
+  /**
+   * The REPL workspaces' ACP runner (the broker's structural seam;
+   * omitted: every workspace's broker owns its own `AcpAgentRunner`).
+   */
+  replRunner?: BrokerRunner;
+  /**
+   * The concrete REPL client-presence drain bound (the doc's spec-owed
+   * decision): the daemon REUSES its session-eviction TTL — a project
+   * whose last client disconnected drains its in-flight subagent turns
+   * up to this bound, then closes idle children. Defaults to
+   * `SESSION_IDLE_TTL_MS` (the same knob the session registry evicts
+   * dead clients with).
+   */
+  sessionTtlMs?: number;
 }
 
 export interface DaemonHandle {
@@ -67,6 +83,11 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   // ONE registry shared by every session: run calls select their project via the required
   // projectDir tool argument, and all sessions see all projects' runs.
   const projects = new WorkflowProjectRegistry(options.runner);
+  // The REPL client-presence ledger: every session touches the projects it addresses; on
+  // last-connection-closed a project with no clients left is drained (the doc's
+  // client-presence policy; the bound reuses the session-eviction TTL).
+  const replPresence = new ReplPresenceLedger(options.sessionTtlMs ?? SESSION_IDLE_TTL_MS);
+  sessions.onLastConnectionClosed = (sessionId) => replPresence.disconnect(sessionId);
   let boundPort = options.port;
 
   const handleMcpRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
@@ -108,6 +129,10 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     const server = createWorkflowServer(options.runner, {
       projects,
       requireProjectDir: true,
+      replRunner: options.replRunner,
+      replPresence,
+      replClientId: () => transport.sessionId,
+      replDrainBoundMs: options.sessionTtlMs ?? SESSION_IDLE_TTL_MS,
     });
     await server.connect(transport);
     // The SDK protocol layer takes ownership of transport.onclose during connect, so chain
@@ -190,7 +215,12 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       const closed = new Promise<void>((resolvePromise) => {
         httpServer.close(() => resolvePromise());
       });
+      // Shutdown drains each repl workspace with the shutdown bound
+      // before the broker teardown (the reviewer-mandated drain-then-
+      // close posture; the last-client-disconnect path uses the full
+      // session-eviction TTL instead).
       await projects.disposeReplStates();
+      replPresence.disconnectAll();
       await sessions.closeAll();
       httpServer.closeAllConnections();
       await closed;

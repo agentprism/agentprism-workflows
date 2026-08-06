@@ -242,6 +242,8 @@ function storeTyping(store: CallStore): void {
     kind: 'agent',
     detail: 'task',
     optionsJson: null,
+    modelSpec: 'pi/x',
+    backendId: 'pi',
     dispatchedAtMs: 1,
     reissues: 0,
     completion: null,
@@ -250,6 +252,7 @@ function storeTyping(store: CallStore): void {
     droppedAtMs: null,
   });
   store.recordReissued('c1', 2);
+  store.recordAttached('c1', 'backend-session-1', 5, 'pi');
   store.recordCompleted('c1', { outcome: 'resolve', value: { ok: true }, completedAtMs: 3 }) satisfies boolean;
   store.recordDelivery('c1', 'delivered', 4);
   store.lookup('c1') satisfies CallRecord | undefined;
@@ -262,6 +265,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
       async openSession(_opts: BrokerOpenSessionOptions): Promise<BrokerSession> {
         return {
           sessionId: 's1',
+          backendId: 'pi',
           capabilities: { supportsSteering: true },
           async prompt(_content: string, _opts?: BrokerPromptOptions): Promise<BrokerTurn> {
             return { stopReason: 'end_turn', text: 'ok' };
@@ -311,6 +315,12 @@ function brokerSurfaceTyping(ws: Workspace): void {
     },
     store: new InMemoryCallStore(),
     maxConcurrentAgents: 6,
+    evalTimeoutMs: 30_000,
+    interruptHandler: () => false,
+    snapshotSink: {
+      boundary: (_kind: SnapshotBoundaryKind) => {},
+      flush: () => {},
+    },
   } satisfies BrokerOptions;
   void brokerTyping(ws, options);
   DEFAULT_MAX_CONCURRENT_AGENTS satisfies number;
@@ -377,6 +387,14 @@ import {
   REPL_STORE_SUBDIR,
   SNAPSHOT_FILENAME,
   CALL_STORE_FILENAME,
+  GUEST_PROVENANCE_KEY,
+  manifestBinding,
+  baselineGlobalKeys,
+  provenanceBootstrap,
+  provenanceRecord,
+  provenanceView,
+  isValidOriginLabel,
+  DEFAULT_EVAL_TIMEOUT_MS,
   type SnapshotEnvelopeMeta,
   type SnapshotEnvelope,
   type SnapshotEnvelopeErrorCode,
@@ -386,14 +404,24 @@ import {
   type ReplStoreStats,
   type SnapshotSink,
   type SnapshotBoundaryKind,
+  type WorkspaceManifest,
+  type WorkspaceBinding,
+  type WorkspaceManifestReport,
+  type WorkspaceManifestBinding,
+  type ProvenanceOrigin,
+  type ProvenanceView,
+  type OriginRecord,
+  type BaselineKeys,
 } from '../../../dist/index.js';
 
-function phaseDSurfaceTyping(): void {
+async function phaseDSurfaceTyping(): Promise<void> {
   SNAPSHOT_FORMAT satisfies string;
   SNAPSHOT_FORMAT_VERSION satisfies number;
   REPL_STORE_SUBDIR satisfies string;
   SNAPSHOT_FILENAME satisfies string;
   CALL_STORE_FILENAME satisfies string;
+  GUEST_PROVENANCE_KEY satisfies string;
+  DEFAULT_EVAL_TIMEOUT_MS satisfies number;
 
   const storeOptions: ReplStoreOptions = {
     persistenceRoot: '/tmp/persist',
@@ -415,7 +443,12 @@ function phaseDSurfaceTyping(): void {
     },
     flush: () => {},
   };
-  const fromWriter: SnapshotSink = store.snapshotWriter(wsPlaceholder(), modulePlaceholder());
+  void sink;
+  // The snapshot writer is wired to a REAL workspace and wasm input — the
+  // phase-D review round-2 fixture rule: no placeholder stand-ins.
+  const realWorkspace = await Workspace.create('/tmp/project');
+  const realWasm: WasmInput = new Uint8Array([0, 97, 115, 109]);
+  const fromWriter: SnapshotSink = store.snapshotWriter(realWorkspace, realWasm);
   fromWriter.boundary('eval');
   store.stats() satisfies ReplStoreStats;
   store.close();
@@ -451,16 +484,64 @@ function phaseDSurfaceTyping(): void {
   });
   err.code satisfies SnapshotEnvelopeErrorCode;
   err.path satisfies string | undefined;
-  void sink;
+
+  // The manifest + provenance + drain surface (phase-D review round 2).
+  const manifest: WorkspaceManifest = realWorkspace.manifest();
+  manifest.evalSeq satisfies number;
+  manifest.logs satisfies { first: number | null; last: number | null; count: number };
+  const binding: WorkspaceBinding = manifest.bindings[0];
+  binding.name satisfies string;
+  binding.token satisfies string;
+  binding.handleCallId satisfies string | null;
+  binding.provenance satisfies string | null;
+  binding.provenanceAtMs satisfies number | null;
+  realWorkspace.provenanceRecord({ kind: 'eval' });
+  realWorkspace.provenanceRecord({ kind: 'settlement', callIds: ['c1'] });
+  realWorkspace.provenanceRecord({ kind: 'restore' });
+  const provView: ProvenanceView = realWorkspace.provenanceView();
+  provView.evalSeq satisfies number;
+  provView.origins satisfies Map<string, OriginRecord>;
+  const origin: ProvenanceOrigin = { kind: 'settlement', callIds: ['c1'] };
+  origin satisfies ProvenanceOrigin;
+  const baseline: Promise<BaselineKeys> = baselineGlobalKeys(realWasm);
+  baseline satisfies Promise<string[]>;
+  const freshVm = await ReplVm.create();
+  const bootstrapped: Promise<{ created: boolean; baseline: BaselineKeys }> = provenanceBootstrap(freshVm, realWasm);
+  void bootstrapped;
+  freshVm.dispose();
+  isValidOriginLabel('eval 1') satisfies boolean;
+  const bindingToken = manifestBinding(freshVm, 'x');
+  bindingToken?.token satisfies string | undefined;
+  bindingToken?.handleCallId satisfies string | null | undefined;
+  realWorkspace.dispose();
+
   void writeOptions;
+  void fromWriter;
+  void restored;
 }
 
-function wsPlaceholder(): Workspace {
-  return undefined as unknown as Workspace;
-}
-
-function modulePlaceholder(): WasmInput {
-  return new Uint8Array([0, 97, 115, 109]);
+// The broker's phase-D round-2 additions: the enriched manifest, the
+// client-presence drain, the eval deadline, and the cancel outcomes.
+async function brokerManifestAndDrainTyping(): Promise<void> {
+  const broker = await Broker.attach(await Workspace.create('/tmp/project'));
+  broker.isDrained satisfies boolean;
+  broker.busySessionCount() satisfies number;
+  broker.inFlightIds() satisfies string[];
+  const drained: Promise<boolean> = broker.drainForDisconnect(60_000);
+  drained satisfies Promise<boolean>;
+  const cancelOutcome: Promise<'cancelled' | 'idle' | 'failed' | 'none'> = broker.cancelCall('c1');
+  cancelOutcome satisfies Promise<string>;
+  const report: WorkspaceManifestReport = broker.workspaceManifest();
+  report.evalSeq satisfies number;
+  report.inFlight satisfies string[];
+  report.checkpoints satisfies CheckpointInfo[];
+  report.logs satisfies { first: number | null; last: number | null; count: number };
+  const manifestBindingEntry: WorkspaceManifestBinding = report.bindings[0];
+  manifestBindingEntry.name satisfies string;
+  manifestBindingEntry.token satisfies string;
+  manifestBindingEntry.provenance satisfies string | null;
+  manifestBindingEntry.provenanceAtMs satisfies number | null;
+  await broker.dispose();
 }
 
 // The self-contained snapshot stand-in round-trips as a type.

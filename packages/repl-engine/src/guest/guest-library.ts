@@ -66,6 +66,90 @@ export const GUEST_LIBRARY_VERSION = '0.1.0';
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
 export const GUEST_SURFACE_KEY = 'repl.guest';
 
+/** `Symbol.for` key of the per-binding provenance registry on
+ *  `globalThis` (the workspace manifest's provenance seam — which eval
+ *  created/rebound a binding, or which worker call's settlement produced
+ *  it; metadata only, travels inside snapshots). The registry is HOST
+ *  policy, not guest injection: the workspace layer's bootstrap installs
+ *  it (with the fresh-realm baseline as its `known` set) on fresh and
+ *  restored workspaces alike — the harness manifest's own placement — so
+ *  the library source itself never grows the realm's baseline.
+ */
+export const GUEST_PROVENANCE_KEY = 'repl.provenance';
+
+/**
+ * The provenance registry factory (see `provenance.ts`): evaluated by
+ * the host bootstrap on every workspace start (fresh installs and
+ * pre-provenance restores), so all installers produce a byte-identical
+ * registry. Captures its own intrinsics at evaluation time (install-time
+ * captures are pristine — the bootstrap runs before any guest code on a
+ * fresh workspace; a bootstrap over a hostile pre-provenance snapshot
+ * degrades to no provenance, never to content, via the record/read
+ * try/catch). `names` is the fresh-realm baseline key set (the 'known'
+ * skip set).
+ */
+export const PROVENANCE_FACTORY = `(function (names) {
+  var gOPN = Object.getOwnPropertyNames;
+  var gOPD = Object.getOwnPropertyDescriptor;
+  var hasOwnProp = Object.prototype.hasOwnProperty;
+  var reg = {
+    evalSeq: 0,
+    origins: Object.create(null),
+    prev: Object.create(null),
+    known: Object.create(null),
+  };
+  function record(label, atMs) {
+    try {
+      if (label === null || label === undefined) {
+        reg.evalSeq = (reg.evalSeq | 0) + 1;
+        label = 'eval ' + reg.evalSeq;
+      }
+      var names_ = gOPN(globalThis);
+      var seen = Object.create(null);
+      for (var i = 0; i < names_.length; i++) {
+        var k = names_[i];
+        if (reg.known[k]) continue;
+        seen[k] = true;
+        // Descriptor read, never a [[Get]]: a binding rebound to an
+        // accessor must not have its getter fired by host bookkeeping.
+        // The getter FUNCTION serves as the rebind-detection identity for
+        // accessor bindings.
+        var d = gOPD(globalThis, k);
+        var v = undefined;
+        if (d !== undefined) {
+          if (hasOwnProp.call(d, 'value')) v = d.value;
+          else if (hasOwnProp.call(d, 'get')) v = d.get;
+        }
+        var tracked = reg.origins[k] !== undefined;
+        var same = tracked && (reg.prev[k] === v || (reg.prev[k] !== reg.prev[k] && v !== v));
+        if (!same) {
+          reg.origins[k] = { via: label, at: atMs };
+          reg.prev[k] = v;
+        }
+      }
+      for (var gone in reg.origins) {
+        if (!seen[gone]) { delete reg.origins[gone]; delete reg.prev[gone]; }
+      }
+    } catch (e) {}
+  }
+  function read() {
+    try {
+      var out = Object.create(null);
+      for (var k in reg.origins) {
+        var o = reg.origins[k];
+        out[k] = { via: o.via, at: o.at };
+      }
+      return { evalSeq: reg.evalSeq, origins: out };
+    } catch (e) { return { evalSeq: 0, origins: Object.create(null) }; }
+  }
+  reg.record = record;
+  reg.read = read;
+  if (names !== undefined && names !== null) {
+    for (var n = 0; n < names.length; n++) reg.known[names[n]] = true;
+  }
+  return reg;
+})`;
+
 /** Name of the version-marker global the library installs. */
 export const GUEST_VERSION_GLOBAL = '__REPL_GUEST_VERSION';
 

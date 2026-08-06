@@ -15,7 +15,14 @@
 
 import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
-import { ReplVm, getVmShim, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
+import {
+  provenanceBootstrap,
+  provenanceRecord,
+  provenanceView,
+  type ProvenanceOrigin,
+  type ProvenanceView,
+} from './provenance.js';
+import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
 import type { ReplSnapshot, WasmInput } from './types.js';
 import {
   installGuestBridge,
@@ -26,7 +33,35 @@ import {
   type GuestCall,
   type GuestSurface,
 } from './bridge.js';
-import { inspectGlobal, renderGlobalLine } from './preview.js';
+import { inspectGlobal, manifestBinding, renderGlobalLine } from './preview.js';
+import { rawOwnKeys } from './trapfree.js';
+
+/** One user binding of the workspace manifest (see `Workspace.manifest`). */
+export interface WorkspaceBinding {
+  name: string;
+  /** Structure-only token (type/shape/size — never value content), or
+   *  `agent handle` for a live agent handle. */
+  token: string;
+  /** The stable call id when the binding is an agent handle (the broker
+   *  appends the live-handle status from the call store); null otherwise. */
+  handleCallId: string | null;
+  /** The sanitized provenance label (`eval 3`, `worker c2`, `session
+   *  restore`), or null when untracked. */
+  provenance: string | null;
+  /** Wall clock of the provenance attribution (ms since epoch). */
+  provenanceAtMs: number | null;
+}
+
+/** The workspace manifest — `ls` for the data plane (see `Workspace.manifest`). */
+export interface WorkspaceManifest {
+  /** Every user top-level binding, sorted by name. */
+  bindings: WorkspaceBinding[];
+  /** The `$N` log-ref globals as a range (mirroring the harness manifest's
+   *  logs breakdown). */
+  logs: { first: number | null; last: number | null; count: number };
+  /** The registry's snapshot-durable eval counter. */
+  evalSeq: number;
+}
 
 export type { ReplDrainOptions, ReplEvalOptions, ReplEvalOutcome } from './vm.js';
 export type { WasmInput, WasmModule } from './types.js';
@@ -80,6 +115,9 @@ export class Workspace {
   private readonly vm: ReplVm;
   private readonly consoleEventBuffer: ConsoleEvent[] = [];
   private readonly parkedCallsBuffer = new Map<string, GuestCall>();
+  /** The fresh-realm baseline key set (the manifest's user-binding
+   *  difference; captured once per process, see `provenance.ts`). */
+  private readonly baselineKeysSet: Set<string>;
   /** Parked CHECKPOINT calls only, by call id — the answer-delivery
    *  table of the parking bridge. Kept separate from `parkedCallsBuffer`
    *  so `checkpoint.answer` can settle a pending question first-wins
@@ -89,25 +127,33 @@ export class Workspace {
   private readonly parkedCheckpointCalls = new Map<string, GuestCall>();
   private disposed = false;
 
-  private constructor(projectDir: string, vm: ReplVm) {
+  private constructor(projectDir: string, vm: ReplVm, baseline: Set<string>) {
     this.projectDir = projectDir;
     this.vm = vm;
     this.memoryLimit = vm.memoryLimit;
+    this.baselineKeysSet = baseline;
   }
 
   /**
    * Create a workspace: instantiate its VM (defaulting to the shipped
-   * `quickjs.wasm` binary and the default memory limit) and install the
+   * `quickjs.wasm` binary and the default memory limit), install the
    * guest bridge — the version-marked library plus its `__host_*`
    * callbacks — so the DSL (`agent`, `checkpoint`, `console`, the
    * combinators) is live from the first eval on (the doc's injection
    * discipline; see `WorkspaceOptions.handlers` for the default parking
-   * bridge).
+   * bridge), and bootstrap the per-binding provenance registry (the
+   * workspace manifest's provenance seam; a fresh workspace starts with
+   * the baseline `known` set and no origins — the first eval's
+   * maintenance pass attributes its bindings to `eval 1`).
    */
   static async create(projectDir: string, options: WorkspaceOptions = {}): Promise<Workspace> {
-    const vm = await ReplVm.create(options);
-    const workspace = new Workspace(projectDir, vm);
+    const wasm = options.wasm ?? (await loadShippedWasm());
+    const vm = await ReplVm.create({ wasm, memoryLimit: options.memoryLimit });
+    const workspace = new Workspace(projectDir, vm, new Set());
     await installGuestBridge(vm, options.handlers ?? workspace.defaultHandlers());
+    const bootstrap = await provenanceBootstrap(vm, wasm);
+    workspace.baselineKeysSet.clear();
+    for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
     return workspace;
   }
 
@@ -115,16 +161,30 @@ export class Workspace {
    * Restore a workspace from a quickjs-wasi snapshot: the VM is restored
    * and the host callbacks are re-registered by name (`registerGuestHostCallbacks`
    * — the guest library, its pending-call registry and the `$N` store
-   * travel INSIDE the snapshot; the library is never re-evaluated). This
-   * is the restore-path constructor the daemon layer (a later phase) uses
-   * with the identity-enveloped snapshots; it exists now so the
-   * settlement machinery (store → guest exactly-once delivery across a
-   * simulated crash) is testable at the workspace boundary.
+   * travel INSIDE the snapshot; the library is never re-evaluated). The
+   * provenance registry travels with the snapshot too; a PRE-PROVENANCE
+   * snapshot (whose library predates the registry) gets the registry
+   * installed by the host bootstrap and its pre-existing bindings are
+   * swept as `session restore` — "first seen at restore", never a
+   * guessed origin. This is the restore-path constructor the daemon
+   * layer (a later phase) uses with the identity-enveloped snapshots; it
+   * exists now so the settlement machinery (store → guest exactly-once
+   * delivery across a simulated crash) is testable at the workspace
+   * boundary.
    */
   static async restore(projectDir: string, snapshot: ReplSnapshot, options: WorkspaceOptions = {}): Promise<Workspace> {
-    const vm = await ReplVm.restore(snapshot, options);
-    const workspace = new Workspace(projectDir, vm);
+    const wasm = options.wasm ?? (await loadShippedWasm());
+    const vm = await ReplVm.restore(snapshot, { wasm, memoryLimit: options.memoryLimit });
+    const workspace = new Workspace(projectDir, vm, new Set());
     registerGuestHostCallbacks(vm, options.handlers ?? workspace.defaultHandlers());
+    const bootstrap = await provenanceBootstrap(vm, wasm);
+    workspace.baselineKeysSet.clear();
+    for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
+    if (bootstrap.created) {
+      // The pre-provenance restore sweep: attribute bindings that existed
+      // before this host started tracking.
+      provenanceRecord(vm, { kind: 'restore' });
+    }
     return workspace;
   }
 
@@ -280,6 +340,83 @@ export class Workspace {
     return inspectGlobal(this.vm, name);
   }
 
+  /**
+   * One maintenance pass of the per-binding provenance registry (the
+   * workspace manifest's provenance seam): attribute new/rebound user
+   * bindings to the operation that created them. The broker drives this
+   * after each eval and each settlement drain; `Workspace.restore` sweeps
+   * pre-provenance snapshots itself. Orientation metadata only — never
+   * errors upward.
+   */
+  provenanceRecord(origin: ProvenanceOrigin): void {
+    this.assertAlive();
+    provenanceRecord(this.vm, origin);
+  }
+
+  /**
+   * The sanitized provenance registry (see `provenance.ts`): which eval
+   * or worker settlement created/rebound each user binding, with the
+   * registry's eval counter. The manifest renderer's provenance seam.
+   */
+  provenanceView(): ProvenanceView {
+    this.assertAlive();
+    return provenanceView(this.vm);
+  }
+
+  /**
+   * The workspace manifest — `ls` for the data plane (the roadmap doc's
+   * `status` manifest): every user top-level binding (fresh-realm
+   * baseline set difference — the guest library's own globals and the
+   * realm builtins are never listed) with its structure-only token
+   * (type/shape/size — metadata, never content), its provenance label
+   * (`via eval N` / `via worker cN` — null when untracked), and the
+   * live-handle call id when the binding is an agent handle (the caller
+   * — the broker — appends the handle status from the call store). The
+   * `$N` log-ref globals are listed separately as a range, mirroring the
+   * harness manifest's logs breakdown. Trap-free throughout: descriptor
+   * reads only, accessors never invoked.
+   */
+  manifest(): WorkspaceManifest {
+    this.assertAlive();
+    const baseline = this.baselineKeys();
+    const names = rawGlobalStringKeys(this.vm);    const user = names.filter((name) => !baseline.has(name));
+    const view = provenanceView(this.vm);
+    const bindings: WorkspaceBinding[] = [];
+    const logRefs: number[] = [];
+    for (const name of user) {
+      const ref = /^\$(\d+)$/.exec(name)?.[1];
+      if (ref !== undefined) {
+        logRefs.push(Number(ref));
+        continue;
+      }
+      const info = manifestBinding(this.vm, name);
+      if (info === null) continue;
+      const origin = view.origins.get(name);
+      bindings.push({
+        name,
+        token: info.token,
+        handleCallId: info.handleCallId,
+        provenance: origin === undefined ? null : origin.via,
+        provenanceAtMs: origin === undefined ? null : origin.at,
+      });
+    }
+    bindings.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    logRefs.sort((a, b) => a - b);
+    return {
+      bindings,
+      logs: {
+        first: logRefs.length > 0 ? logRefs[0] : null,
+        last: logRefs.length > 0 ? logRefs[logRefs.length - 1] : null,
+        count: logRefs.length,
+      },
+      evalSeq: view.evalSeq,
+    };
+  }
+
+  private baselineKeys(): Set<string> {
+    return this.baselineKeysSet;
+  }
+
   private defaultHandlers(): GuestBridgeHandlers {
     const events = this.consoleEventBuffer;
     const parked = this.parkedCallsBuffer;
@@ -339,6 +476,12 @@ export class Workspace {
       throw new Error(`Workspace ${this.projectDir}: operation on a disposed workspace`);
     }
   }
+}
+
+/** The realm global's string-key set, trap-free (raw own-key read). */
+function rawGlobalStringKeys(vm: ReplVm): string[] {
+  const shim = getVmShim(vm) as QuickJS;
+  return rawOwnKeys(shim.global);
 }
 
 /** Options for a `WorkspaceRegistry`. */

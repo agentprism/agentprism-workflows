@@ -59,6 +59,7 @@ export {
   resetReplProjectState,
 } from "./repl-project.js";
 export type { ReplProjectState, ReplInterruptSignal } from "./repl-project.js";
+export { ReplPresenceLedger } from "./repl-presence.js";
 export {
   RUN_MONITOR_RESOURCE_URI,
   WORKFLOW_EVENTS_TOOL_NAME,

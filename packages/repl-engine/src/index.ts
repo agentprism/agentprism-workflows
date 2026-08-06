@@ -21,7 +21,25 @@ export {
   type ReplDrainOptions,
   type ReplEvalOutcome,
 } from './vm.js';
-export { Workspace, WorkspaceRegistry, type WorkspaceOptions, type WorkspaceRegistryOptions } from './workspace.js';
+export {
+  Workspace,
+  WorkspaceRegistry,
+  type WorkspaceOptions,
+  type WorkspaceRegistryOptions,
+  type WorkspaceManifest,
+  type WorkspaceBinding,
+} from './workspace.js';
+export {
+  baselineGlobalKeys,
+  provenanceBootstrap,
+  provenanceRecord,
+  provenanceView,
+  isValidOriginLabel,
+  type ProvenanceOrigin,
+  type ProvenanceView,
+  type OriginRecord,
+  type BaselineKeys,
+} from './provenance.js';
 export type { EvalErrorInfo } from './errors.js';
 export type { WasmInput, WasmModule, ReplSnapshot, ReplSnapshotExtension } from './types.js';
 
@@ -31,6 +49,7 @@ export {
   GUEST_LIBRARY_VERSION,
   GUEST_SURFACE_KEY,
   GUEST_VERSION_GLOBAL,
+  GUEST_PROVENANCE_KEY,
   HOST_AGENT,
   HOST_CHECKPOINT,
   HOST_CONSOLE,
@@ -57,6 +76,7 @@ export {
   renderGlobalLine,
   previewGlobal,
   inspectGlobal,
+  manifestBinding,
   formatByteSize,
   formatNumber,
   escapeString,
@@ -87,6 +107,7 @@ export { applyOutputCaps, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResu
 export {
   Broker,
   DEFAULT_MAX_CONCURRENT_AGENTS,
+  DEFAULT_EVAL_TIMEOUT_MS,
   type BrokerOptions,
   type BrokerRunner,
   type BrokerSession,
@@ -102,6 +123,8 @@ export {
   type ReconcileReport,
   type SnapshotSink,
   type SnapshotBoundaryKind,
+  type WorkspaceManifestReport,
+  type WorkspaceManifestBinding,
 } from './broker.js';
 export {
   InMemoryCallStore,

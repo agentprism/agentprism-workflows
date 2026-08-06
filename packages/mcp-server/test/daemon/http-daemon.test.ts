@@ -10,6 +10,7 @@ import { test } from "node:test";
 
 import { okRunner, structured, textOf, persistedRunFile, NO_AGENT_SCRIPT, ONE_AGENT_SCRIPT, TEST_HOME } from "../_harness.js";
 import { connectHttp, gatedRunner, makeProjectDir, startDaemon } from "../_http-harness.js";
+import { createDaemon } from "../../src/daemon/http-daemon.js";
 import { SESSION_IDLE_TTL_MS } from "../../src/daemon/constants.js";
 
 test("initialize + foreground workflow call over real Streamable HTTP", async () => {
@@ -272,6 +273,91 @@ test("middleware rejects bad Origin over real HTTP; unknown paths 404", async ()
     assert.equal(evil.status, 403);
     const missing = await fetch(`http://127.0.0.1:${daemon.port}/nope`);
     assert.equal(missing.status, 404);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("the session registry signals last-connection-closed and the repl presence drain closes idle children", async () => {
+  // Phase-D review round 2: the daemon's session registry measures
+  // liveness by connection presence and SIGNALS project repl lifecycle —
+  // a client whose last connection closed leaves its projects' workspaces
+  // drained (in-flight turns complete — each settlement boundary
+  // snapshots — then idle children close; the next connect re-attaches
+  // lazily). The drain itself is pinned in repl-review2.test.ts; this
+  // test pins the daemon wiring: registry signal → presence ledger →
+  // drain over a real HTTP session.
+  type Turn = { resolve: (turn: import("@automatalabs/repl-engine").BrokerTurn) => void };
+  let pendingTurn: Turn | undefined;
+  const releases: number[] = [];
+  const fakeSession = {
+    sessionId: "fake-s1",
+    backendId: "pi",
+    capabilities: { supportsSteering: true },
+    async prompt(): Promise<import("@automatalabs/repl-engine").BrokerTurn> {
+      return new Promise((resolve) => {
+        pendingTurn = { resolve };
+      });
+    },
+    async steer(): Promise<string> {
+      return "injected";
+    },
+    async cancel(): Promise<void> {},
+    async release(): Promise<void> {
+      releases.push(1);
+    },
+    currentTurnText(): string {
+      return "done text";
+    },
+    finalMessageText(): string {
+      return "done text";
+    },
+    rawStructuredOutput(): unknown {
+      return undefined;
+    },
+  } as import("@automatalabs/repl-engine").BrokerSession;
+  const runner = {
+    sessions: 0,
+    async openSession(): Promise<import("@automatalabs/repl-engine").BrokerSession> {
+      this.sessions++;
+      return fakeSession;
+    },
+    async loadSession(): Promise<never> {
+      throw new Error("no load");
+    },
+    async dispose(): Promise<void> {},
+  } as unknown as import("@automatalabs/repl-engine").BrokerRunner;
+
+  const daemon = await createDaemon({
+    runner: okRunner(),
+    port: 0,
+    env: {},
+    log: () => undefined,
+    replRunner: runner,
+    sessionTtlMs: 60_000,
+  } as never);
+  const project = makeProjectDir("repl-drain");
+  const a = await connectHttp(daemon.url);
+  try {
+    const started = await a.client.callTool({
+      name: "repl",
+      arguments: { action: "eval", projectDir: project, code: 'const p = agent("pi/x", "task"); "started"' },
+    });
+    assert.ok(!(started as { isError?: boolean }).isError, textOf(started));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(runner.sessions, 1, "the session opened");
+    // The client disconnects: the session's connections close, the
+    // registry signals, and the project's workspace starts draining —
+    // the in-flight turn is WAITED OUT, not cancelled.
+    await a.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(releases.length, 0, "the drain waits for the in-flight turn (never cancels it)");
+    assert.ok(pendingTurn !== undefined, "the founding turn is still in flight");
+    pendingTurn!.resolve({ stopReason: "end_turn", text: "done text" });
+    for (let attempt = 0; attempt < 100 && releases.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(releases.length, 1, "the idle child closed after the drain completed the turn");
   } finally {
     await daemon.close();
   }

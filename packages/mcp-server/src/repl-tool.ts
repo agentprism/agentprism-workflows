@@ -11,19 +11,29 @@
  *   raised checkpoints, and the settled call ids.
  * - `wait { projectDir, ids?, timeoutMs }` → a bounded server-side wait:
  *   pumps until the target calls settle (or `timeoutMs` elapses — "still
- *   running" on timeout), then renders the same shape. Absorbs client
- *   tool-call timeouts.
+ *   running" on timeout), then renders the SAME eval-result shape —
+ *   console output included (phase-D review round 2: the wait used to
+ *   return only pending/checkpoint/completion metadata and defer the
+ *   console output drained by its pumps to the next eval, losing
+ *   immediate guest-visible restored-call output and warnings).
  * - `status { projectDir? }` → workspaces (source, reconcile summary, or
- *   a refused snapshot's contained error), live agents, and pending ops.
+ *   a refused snapshot's contained error) plus the WORKSPACE MANIFEST
+ *   (the doc: "top-level bindings with name, type, size, provenance
+ *   (which subagent produced the value, from what task, when), and
+ *   live-handle status. Metadata, never content — ls for the data
+ *   plane"), live agents, pending ops, and the `$N` log-ref range.
  *   Without `projectDir` every known project context is listed (daemon
  *   mode). Status never CREATES a workspace — an untouched project
  *   reports as such.
  * - `interrupt { projectDir, id? }` → cancel one subagent call (ACP
- *   `session/cancel` downward); without an id, arm the project's
- *   eval-break signal (see `src/repl-project.ts` — the daemon is
- *   single-threaded, so a currently-executing runaway eval cannot
- *   observe a later request; the signal breaks the next VM execution
- *   that runs with it armed).
+ *   `session/cancel` downward; a drained handle's recorded session is
+ *   re-attached lazily first); without an id, arm the project's eval-
+ *   break signal. The daemon is single-threaded, so a request cannot be
+ *   PROCESSED while an eval is executing — but every eval and settlement
+ *   drain runs under a per-eval wall-clock deadline enforced by the
+ *   quickjs interrupt handler, so a currently-running runaway eval is
+ *   ALWAYS breakable (bounded), and the armed signal breaks the next VM
+ *   execution immediately (see `src/repl-project.ts`).
  * - `reset { projectDir }` → teardown (cancels in-flight ACP sessions,
  *   drops the VM and the whole `repl/` store), clearing any contained
  *   snapshot refusal.
@@ -48,14 +58,16 @@ import {
   resetReplProjectState,
   type ReplProjectState,
 } from "./repl-project.js";
+import type { ReplPresenceLedger } from "./repl-presence.js";
 
 export const replToolInputShape = {
   action: z
     .enum(["eval", "wait", "status", "interrupt", "reset"])
     .describe(
       "Operation. eval runs a script in the workspace's VM (persistent between calls); wait pumps server-side " +
-        "until the target calls settle or the timeout elapses; status reports workspaces, live agents, and pending " +
-        "ops; interrupt cancels one subagent call or arms the eval-break signal; reset drops the VM and its stored state.",
+        "until the target calls settle or the timeout elapses; status reports workspaces, the workspace manifest, " +
+        "live agents, and pending ops; interrupt cancels one subagent call or arms the eval-break signal; reset " +
+        "drops the VM and its stored state.",
     ),
   projectDir: z
     .string()
@@ -97,8 +109,20 @@ export interface ReplToolOptions {
   /** The workspaces' ACP runner (optional: each workspace's broker owns
    *  its own when omitted — tests inject a fake). */
   runner?: BrokerRunner;
+  /** The per-eval wall-clock deadline in ms (the harness's eval guard;
+   *  a currently-running runaway eval is always breakable through the
+   *  quickjs interrupt handler — see `src/repl-project.ts`). Read from
+   *  `AGENTPRISM_REPL_EVAL_TIMEOUT_MS`, default
+   *  `DEFAULT_REPL_EVAL_TIMEOUT_MS`. */
+  evalTimeoutMs: number;
   /** Mirrors the workflow tool's daemon-mode projectDir requirement. */
   requireProjectDir: boolean;
+  /** The client-presence ledger (the doc's last-client-disconnect drain;
+   *  see `repl-presence.ts`). */
+  presence: ReplPresenceLedger;
+  /** This server's client id (the MCP session id in daemon mode), used
+   *  to touch presence. */
+  clientId: () => string | undefined;
   /** When true, the server is shutting down and rejects new calls. */
   acceptingWork: () => boolean;
 }
@@ -137,7 +161,8 @@ function refusedResult(state: ReplProjectState): {
   };
 }
 
-/** Render the broker's eval result shape as text (the tool's output). */
+/** Render the broker's eval-result shape as text (the tool's output; the
+ *  same renderer serves eval AND wait — the doc's same-shape rule). */
 function renderEvalResult(result: ReplEvalResult): string {
   const lines: string[] = [];
   if (result.output.length > 0) lines.push(...result.output);
@@ -148,42 +173,6 @@ function renderEvalResult(result: ReplEvalResult): string {
   }
   if (result.completed.length > 0) lines.push(`completed: ${result.completed.join(", ")}`);
   return lines.length > 0 ? lines.join("\n") : "(no output)";
-}
-
-/** One `wait` action's result: the current broker state rendered in the
- *  tool-result shape (pending ids, re-surfaced checkpoints, and the ids
- *  that settled during the wait). Console lines drained by the wait's
- *  pumps surface in the next eval's output (the broker's buffer). */
-async function renderWaitResult(
-  broker: { pendingCalls(): Array<{ id: string }>; pendingCheckpoints(): Array<{ id: string; question: string }> },
-  initialPending: string[],
-): Promise<string> {
-  const pending = broker.pendingCalls().map((entry) => entry.id);
-  const completed = initialPending.filter((id) => !pending.includes(id));
-  const lines: string[] = [];
-  if (pending.length > 0) lines.push(`pending: ${pending.join(", ")}`);
-  for (const checkpoint of broker.pendingCheckpoints()) {
-    lines.push(`checkpoint ${checkpoint.id}: ${checkpoint.question}`);
-  }
-  if (completed.length > 0) lines.push(`completed: ${completed.join(", ")}`);
-  return lines.length > 0 ? lines.join("\n") : "(no pending calls)";
-}
-
-/** One `wait` action: pump until the target ids settle or the deadline. */
-async function waitForCalls(
-  broker: { pump(): Promise<string[]>; pendingCalls(): Array<{ id: string }> },
-  ids: string[] | undefined,
-  timeoutMs: number,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  const targets = ids === undefined ? null : new Set(ids);
-  for (;;) {
-    await broker.pump();
-    const pending = new Set(broker.pendingCalls().map((entry) => entry.id));
-    if (targets === null ? pending.size === 0 : [...targets].every((id) => !pending.has(id))) return true;
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
 }
 
 function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectState }>): string {
@@ -217,6 +206,31 @@ function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectSt
     }
     const broker = state.broker;
     if (broker === null) continue;
+    // The workspace manifest (the doc's status surface): top-level
+    // bindings with name, structure-only type/size token, provenance,
+    // and live-handle status. Metadata, never content.
+    const manifest = broker.workspaceManifest();
+    if (manifest.bindings.length === 0) {
+      lines.push("bindings: (none)");
+    } else {
+      lines.push("bindings:");
+      for (const binding of manifest.bindings) {
+        lines.push(
+          `  ${binding.name} = ${binding.token}` +
+            (binding.provenance !== null ? ` · via ${binding.provenance}` : ""),
+        );
+      }
+    }
+    const logs = manifest.logs;
+    lines.push(
+      logs.first === null
+        ? "logs: (none)"
+        : `logs: $${logs.first}…$${logs.last} (${logs.count} values)`,
+    );
+    if (manifest.inFlight.length > 0) {
+      lines.push(`in-flight calls: ${manifest.inFlight.join(", ")}`);
+    }
+    if (state.drained) lines.push("children: closed (client-presence drain; re-attach on demand)");
     for (const agent of broker.liveAgents()) {
       lines.push(
         `agent ${agent.callId}: ${agent.state} (${agent.modelSpec}; steering: ${agent.supportsSteering ? "yes" : "no"}; queued: ${agent.queuedSteers})`,
@@ -244,7 +258,9 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       "every outstanding call (settle from the store / re-attach via ACP session/load / re-issue). A stored snapshot " +
       "that refuses (corrupt, a format upgrade, or a wasm-binary mismatch) is surfaced loudly and never silently " +
       "discarded — reset drops it and starts fresh. Subagents are ACP sessions via acp-agents (6 concurrent per " +
-      "workspace); console output is captured and previewed.",
+      "workspace); console output is captured and previewed. On last-client disconnect the workspace drains " +
+      "in-flight subagent turns to completion (each settlement boundary snapshots) and closes idle children; " +
+      "followUp re-attaches the subagent session lazily on the next connect.",
     replToolInputShape,
     async (rawArgs) => {
       if (!options.acceptingWork()) {
@@ -277,9 +293,12 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         };
       }
 
-      // All stateful actions touch (or reset) the workspace.
+      // All stateful actions touch (or reset) the workspace: the session
+      // is marked present on the project (the client-presence ledger —
+      // its last-connection-closed signal drives the doc's drain).
       context.repl ??= createReplProjectState(context.projectDir);
       const state = context.repl;
+      options.presence.touch(state, options.clientId() ?? "unknown");
 
       if (action === "reset") {
         await resetReplProjectState(state);
@@ -292,7 +311,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
 
       if (state.restoreError !== null) return refusedResult(state);
 
-      await ensureReplWorkspace(state, await wasm, options.runner);
+      await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
       if (state.restoreError !== null) return refusedResult(state);
 
       const broker = state.broker!;
@@ -307,12 +326,14 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       if (action === "wait") {
         const timeoutMs = replToolInputShape.timeoutMs.parse(args.timeoutMs ?? 30_000) ?? 30_000;
         const ids = args.ids === undefined ? undefined : replToolInputShape.ids.parse(args.ids);
-        const initialPending = broker.pendingCalls().map((entry) => entry.id);
-        const settled = await waitForCalls(broker, ids, timeoutMs);
-        const text = await renderWaitResult(broker, initialPending);
+        // The wait returns the SAME shape as an eval — console output
+        // included (phase-D review round 2: the wait used to drop the
+        // output drained by its pumps and defer it to the next eval).
+        const { result, drained } = await broker.waitForCalls(ids, timeoutMs);
+        const text = renderEvalResult(result);
         return {
           content: [
-            { type: "text", text: settled ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)` },
+            { type: "text", text: drained ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)` },
           ],
         };
       }
@@ -323,14 +344,24 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           content: [
             {
               type: "text",
-              text: `workspace ${context.projectDir}: eval-break signal armed — the next VM execution will be interrupted`,
+              text:
+                `workspace ${context.projectDir}: eval-break signal armed — the next VM execution will be ` +
+                `interrupted (a currently-running eval is bounded by the per-eval deadline and cannot run away)`,
             },
           ],
         };
       }
       const id = replToolInputShape.id.parse(args.id) ?? "";
-      await broker.cancelCall(id);
-      return { content: [{ type: "text", text: `interrupt ${id}: ACP session/cancel sent` }] };
+      const outcome = await broker.cancelCall(id);
+      const text =
+        outcome === "cancelled"
+          ? `interrupt ${id}: ACP session/cancel sent`
+          : outcome === "idle"
+            ? `interrupt ${id}: the session was idle — nothing to cancel`
+            : outcome === "failed"
+              ? `interrupt ${id}: could not reach the backend session (lazy re-attach failed)`
+              : `interrupt ${id}: no live session to cancel`;
+      return { content: [{ type: "text", text }] };
     },
   );
 }

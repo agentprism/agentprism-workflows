@@ -50,8 +50,9 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
   const runner = createAcpRunner();
 
   let daemon;
+  const sessionTtlMs = envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS);
   try {
-    daemon = await createDaemon({ runner, port, log });
+    daemon = await createDaemon({ runner, port, log, sessionTtlMs });
   } catch (error) {
     if (!(error instanceof DaemonPortInUseError)) throw error;
     if (await ownDaemonAlreadyRunning()) {
@@ -61,7 +62,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     // A foreign process owns the default port. Discovery goes through daemon.json, never a
     // blind dial of the default port, so an ephemeral port is fully functional.
     log(`[${DAEMON_NAME}] port ${port} is taken by another process; falling back to an ephemeral port`);
-    daemon = await createDaemon({ runner, port: 0, log });
+    daemon = await createDaemon({ runner, port: 0, log, sessionTtlMs });
   }
 
   writeDaemonInfo({
