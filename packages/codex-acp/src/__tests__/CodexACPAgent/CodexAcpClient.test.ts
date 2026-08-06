@@ -405,6 +405,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 upgrade: null,
                 upgradeInfo: null,
                 availabilityNux: null,
+                modelSpecialty: null,
                 displayName: "gpt-5",
                 description: "test model",
                 hidden: false,
@@ -1904,15 +1905,15 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 update: {
                     sessionUpdate: "session_info_update",
                     _meta: {
-                        codex: {
-                            goal: {
+                        goal: {
                             objective: "Ship the migration and keep tests green",
                             status: "active",
                             tokenBudget: null,
+                            tokensUsed: 0,
                             timeUsedSeconds: 0,
-                            createdAt: 1710000000,
-                            controlMethod: "_codex/session/goal_control",
-                            },
+                            createdAt: 1710000000000,
+                            updatedAt: 1710000100000,
+                            controlMethod: "_session/goal",
                         },
                     },
                 },
@@ -2661,14 +2662,14 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             expect.objectContaining({
                 args: [expect.objectContaining({
                     update: expect.objectContaining({
-                        _meta: {codex: {goal: expect.objectContaining({status: "paused"})}},
+                        _meta: {goal: expect.objectContaining({status: "paused"})},
                     }),
                 })],
             }),
             expect.objectContaining({
                 args: [expect.objectContaining({
                     update: expect.objectContaining({
-                        _meta: {codex: {goal: null}},
+                        _meta: {goal: null},
                     }),
                 })],
             }),
@@ -2699,14 +2700,14 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         staleResponse.resolve(staleGoal);
         await stalePublish;
 
-        expect(sessionState.currentGoal).toMatchObject({objective: "current", createdAt: 200});
+        expect(sessionState.currentGoal).toMatchObject({objective: "current", createdAt: 200000});
         const goalUpdates = mockFixture.getAcpConnectionEvents([]).filter(event =>
             event.method === "sessionUpdate"
             && event.args[0]?.update?.sessionUpdate === "session_info_update"
         );
         expect(goalUpdates).toHaveLength(1);
         expect(goalUpdates[0]?.args[0]?.update?._meta).toEqual({
-            codex: {goal: expect.objectContaining({objective: "current", createdAt: 200})},
+            goal: expect.objectContaining({objective: "current", createdAt: 200000}),
         });
     });
 
@@ -3233,6 +3234,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
             displayName: 'Codex 5.2',
             description: 'Coding model',
             hidden: false,
@@ -3254,6 +3256,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
             displayName: 'Standard 5.1',
             description: 'Standard model',
             hidden: false,

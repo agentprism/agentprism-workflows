@@ -422,6 +422,7 @@ export function createTestModel(overrides?: Partial<Model>): Model {
         upgrade: null,
         upgradeInfo: null,
         availabilityNux: null,
+        modelSpecialty: null,
         displayName: id,
         description: `${id} model`,
         hidden: false,
