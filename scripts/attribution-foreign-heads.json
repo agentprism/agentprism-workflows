@@ -15,6 +15,11 @@
       "sha": "0ff2d55f29fb4d2bd50482c5324ddb27b8570e8a",
       "imported": "2026-08-10",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main"
+    },
+    {
+      "sha": "5d40f745bdfa210c314783c320167d1a13c88224",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (device-code auth)"
     }
   ]
 }
