@@ -358,12 +358,16 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       const badAction = await repl(session, { action: "snapshot", projectDir: PROJECT, code: "1" });
       assert.ok(isErrorResult(badAction), textOf(badAction));
       assert.ok(textOf(badAction).includes("Input validation error"), textOf(badAction));
-      // eval requires a non-empty code string (the stateful call touches
-      // the workspace — the documented first-touch semantics — but the
-      // empty script is refused).
+      // An empty script is VALID JavaScript (the doc's `eval { projectDir,
+      // code }` has no non-empty restriction — phase-E review round 5:
+      // the tool used to invent one): it resolves with `undefined` and
+      // returns the normal resolved eval shape.
       const emptyCode = await repl(session, { action: "eval", projectDir: PROJECT, code: "" });
-      assert.ok(isErrorResult(emptyCode), textOf(emptyCode));
-      assert.ok(textOf(emptyCode).includes("eval requires a non-empty code string"), textOf(emptyCode));
+      assert.ok(!isErrorResult(emptyCode), textOf(emptyCode));
+      assert.ok(textOf(emptyCode).includes("result: undefined"), textOf(emptyCode));
+      const structuredEmpty = (emptyCode as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
+      assert.deepEqual(structuredEmpty.output, []);
+      assert.deepEqual(structuredEmpty.pending, []);
       // eval round trip.
       const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: "var answer = 40 + 2; answer" });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
@@ -1010,10 +1014,12 @@ test("review round 4: the input is action-discriminated — every action's EXACT
     const session = await connectHttp(daemon.url);
     try {
       const PROJECT = makeProjectDir("repl-shapes");
-      // Missing required fields.
+      // Missing required fields: eval WITHOUT the code field is still
+      // rejected (the absent field fails the exact-shape boundary — only
+      // the present-but-empty string is valid).
       const noCode = await repl(session, { action: "eval", projectDir: PROJECT });
       assert.ok(isErrorResult(noCode), textOf(noCode));
-      assert.ok(textOf(noCode).includes("eval requires a non-empty code string"), textOf(noCode));
+      assert.ok(textOf(noCode).includes("eval requires a code string"), textOf(noCode));
       // Extraneous known fields per action (the carried defect: the
       // flat optional-field bag silently accepted them and deferred the
       // semantics to late handler checks).

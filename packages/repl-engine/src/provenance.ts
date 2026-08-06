@@ -55,7 +55,7 @@
 
 import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
-import { installGuestBridge, type GuestBridgeHandlers } from './bridge.js';
+import { installGuestBridge, readRealmSlotTypeToken, type GuestBridgeHandlers } from './bridge.js';
 import { GUEST_PROVENANCE_KEY, PROVENANCE_FACTORY } from './guest/guest-library.js';
 import { rawLexicalKeys, readLexicalSlotValue } from './global-lexical.js';
 import { wasmSha256Of } from './snapshot-envelope.js';import {
@@ -96,21 +96,27 @@ export interface ProvenanceView {
 /** A fresh-realm baseline key set (see the module docs). */
 export type BaselineKeys = string[];
 
+/** The fresh-realm baseline TYPE TOKENS (name → trap-free `typeof`
+ *  token of the pristine value — see `readRealmSlotTypeToken`): the
+ *  manifest's changed-binding detector and the provenance registry's
+ *  rebinding detector for KNOWN (baseline) names. */
+export type BaselineTypeTokens = Map<string, string>;
+
+/** One wasm binary's cached baseline computation. */
+interface BaselineCapture {
+  keys: BaselineKeys;
+  types: BaselineTypeTokens;
+}
+
 // The baseline is computed once per process per wasm binary (a throwaway
 // VM instantiation); the shipped binary dominates, and a custom wasm
 // input hashes directly.
-const baselineCache = new Map<string, Promise<BaselineKeys>>();
-const baselineCacheByModule = new WeakMap<object, Promise<BaselineKeys>>();
+const baselineCache = new Map<string, Promise<BaselineCapture>>();
+const baselineCacheByModule = new WeakMap<object, Promise<BaselineCapture>>();
 
-/**
- * The fresh-realm global key set for a wasm binary: a throwaway VM is
- * provisioned exactly like a real workspace (same binary, same
- * structured-clone extension, same host functions, same guest library)
- * and its string-key set is captured trap-free. Cached per process per
- * binary. Used both as the manifest's user-binding baseline and as the
- * provenance registry's `known` set.
- */
-export function baselineGlobalKeys(wasm: WasmInput): Promise<BaselineKeys> {
+/** The fresh-realm baseline capture for a wasm binary (see
+ *  `computeBaseline`). Cached per process per binary. */
+function baselineCapture(wasm: WasmInput): Promise<BaselineCapture> {
   let key: string | undefined;
   try {
     key = wasmSha256Of(wasm);
@@ -130,13 +136,45 @@ export function baselineGlobalKeys(wasm: WasmInput): Promise<BaselineKeys> {
   return promise;
 }
 
-/** The throwaway-VM baseline computation (see `baselineGlobalKeys`). */
-async function computeBaseline(wasm: WasmInput): Promise<BaselineKeys> {
+/**
+ * The fresh-realm global key set for a wasm binary: a throwaway VM is
+ * provisioned exactly like a real workspace (same binary, same
+ * structured-clone extension, same host functions, same guest library)
+ * and its string-key set is captured trap-free. Cached per process per
+ * binary. Used both as the manifest's user-binding baseline and as the
+ * provenance registry's `known` set.
+ */
+export function baselineGlobalKeys(wasm: WasmInput): Promise<BaselineKeys> {
+  return baselineCapture(wasm).then((capture) => capture.keys);
+}
+
+/**
+ * The fresh-realm baseline TYPE TOKENS for a wasm binary (see
+ * `BaselineTypeTokens`): the pristine value of every baseline name is
+ * typed trap-free in the throwaway VM. Cached with the key set. The
+ * manifest's changed-binding detector and the provenance registry's
+ * known-name rebinding detector read these.
+ */
+export function baselineGlobalTypeTokens(wasm: WasmInput): Promise<BaselineTypeTokens> {
+  return baselineCapture(wasm).then((capture) => capture.types);
+}
+
+/** The throwaway-VM baseline computation (see `baselineGlobalKeys`):
+ *  the key set AND the per-name type token (the pristine value's
+ *  trap-free `typeof` — `readRealmSlotTypeToken`, the same helper the
+ *  manifest's changed-binding detector uses, so the two computations
+ *  can never drift). */
+async function computeBaseline(wasm: WasmInput): Promise<BaselineCapture> {
   const vm = await ReplVm.create({ wasm });
   try {
     await installGuestBridge(vm, NOOP_HANDLERS);
     const shim = getVmShim(vm) as QuickJS;
-    return rawOwnKeys(shim.global);
+    const keys = rawOwnKeys(shim.global);
+    const types = new Map<string, string>();
+    for (const name of keys) {
+      types.set(name, readRealmSlotTypeToken(vm, name));
+    }
+    return { keys, types };
   } finally {
     vm.dispose();
   }
@@ -209,47 +247,66 @@ const NOOP_HANDLERS: GuestBridgeHandlers = {
  * pre-provenance restore). Returns whether the registry was created by
  * this call (the caller then runs the `session restore` sweep so
  * pre-existing bindings are attributed as "first seen at restore", never
- * guessed) plus the baseline key set (the manifest's user-binding
- * baseline). Never errors upward: provenance is orientation metadata; a
- * realm hostile enough to break the bootstrap simply has none.
+ * guessed) plus the baseline key set and the baseline TYPE TOKENS (the
+ * manifest's changed-binding detector). Never errors upward: provenance
+ * is orientation metadata; a realm hostile enough to break the bootstrap
+ * simply has none.
  */
 export async function provenanceBootstrap(
   vm: ReplVm,
   wasm: WasmInput,
-): Promise<{ created: boolean; baseline: BaselineKeys }> {
-  const baseline = await baselineGlobalKeys(wasm);
+): Promise<{ created: boolean; baseline: BaselineKeys; baselineTypes: BaselineTypeTokens }> {
+  const [baseline, baselineTypes, lexBaseline] = await Promise.all([
+    baselineGlobalKeys(wasm),
+    baselineGlobalTypeTokens(wasm),
+    baselineLexicalKeys(wasm),
+  ]);
   const shim = getVmShim(vm) as QuickJS;
   const symbol = shim.newSymbolFor(GUEST_PROVENANCE_KEY);
   let existing: JSValueHandle | undefined;
   try {
     existing = shim.getProp(shim.global, symbol);
+    // The factory arguments are embedded as JSON literals (a JSON object
+    // is a valid JS object literal): the baseline key array (the known
+    // set), the baseline TYPE TOKENS object (the known-name rebinding
+    // detector), and the LEXICAL baseline array (the lexical pass's own
+    // skip set — a lexical declaration shadows a same-named baseline
+    // global and is always the user's).
     const namesJson = JSON.stringify(baseline);
+    const typeTokensJson = JSON.stringify(Object.fromEntries(baselineTypes));
+    const lexKnownJson = JSON.stringify(lexBaseline);
     if (existing.isUndefined || !existing.isObject) {
       // A pre-provenance snapshot: install the byte-identical registry
       // (the same factory the library evaluates at install time) with the
-      // baseline as its `known` set.
+      // baseline as its `known` set, the baseline type tokens, and the
+      // lexical baseline as the lexical pass's own skip set.
       const source =
         `(function () { try { var KEY = Symbol.for(${JSON.stringify(GUEST_PROVENANCE_KEY)}); ` +
-        `var reg = (${PROVENANCE_FACTORY})(${namesJson}); ` +
+        `var reg = (${PROVENANCE_FACTORY})(${namesJson}, ${typeTokensJson}, ${lexKnownJson}); ` +
         `Object.defineProperty(globalThis, KEY, { value: reg, writable: false, enumerable: false, ` +
         `configurable: false }); return 1; } catch (e) { return 0; } })()`;
       const outcome = await vm.evalCode(source, { filename: '<provenance-bootstrap>' });
-      return { created: outcome.kind !== 'error', baseline };
+      return { created: outcome.kind !== 'error', baseline, baselineTypes };
     }
     // The registry already exists (a fresh install, or a post-feature
     // snapshot whose registry travels with the workspace): fill the
-    // `known` set from the current baseline (a same-version snapshot's
-    // set is already identical — this is a no-op; an older-library
-    // snapshot's known set legitimately reflects the older library and is
-    // left alone except for names the current baseline adds).
+    // `known` set and the baseline type tokens from the current
+    // baseline (a same-version snapshot's sets are already identical —
+    // this is a no-op; an older-library snapshot's known set
+    // legitimately reflects the older library and is left alone except
+    // for names the current baseline adds).
     const source =
       `(function () { try { var KEY = Symbol.for(${JSON.stringify(GUEST_PROVENANCE_KEY)}); ` +
       `var reg = globalThis[KEY]; if (!reg || typeof reg !== 'object') return 0; ` +
       `var names = ${namesJson}; for (var i = 0; i < names.length; i++) reg.known[names[i]] = true; ` +
+      `if (!reg.baseTok) reg.baseTok = {}; var toks = ${typeTokensJson}; ` +
+      `for (var t in toks) reg.baseTok[t] = toks[t]; ` +
+      `if (!reg.lexKnown) reg.lexKnown = {}; var lk = ${lexKnownJson}; ` +
+      `for (var li = 0; li < lk.length; li++) reg.lexKnown[lk[li]] = true; ` +
       `return 1; } catch (e) { return 0; } })()`;
     const outcome = await vm.evalCode(source, { filename: '<provenance-bootstrap>' });
     void outcome;
-    return { created: false, baseline };
+    return { created: false, baseline, baselineTypes };
   } finally {
     existing?.dispose();
     symbol.dispose();

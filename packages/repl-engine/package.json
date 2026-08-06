@@ -39,7 +39,8 @@
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test \"test/**/*.test.ts\"",
-    "prepublishOnly": "tsc -b"
+    "prepublishOnly": "tsc -b",
+    "generate:steering-table": "tsx scripts/generate-steering-table.ts"
   },
   "dependencies": {
     "@automatalabs/acp-agents": "workspace:*",

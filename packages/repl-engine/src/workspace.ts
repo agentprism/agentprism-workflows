@@ -27,8 +27,12 @@ import { SnapshotRestoreError } from './snapshot-envelope.js';
 import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
 import type { ReplSnapshot, WasmInput } from './types.js';
 import {
+  GUEST_LEASE_GLOBAL,
+  clearContinuationLease,
   installGuestBridge,
+  readContinuationLease,
   readGuestSurface,
+  readRealmSlotTypeToken,
   registerGuestHostCallbacks,
   type ConsoleEvent,
   type GuestBridgeHandlers,
@@ -135,6 +139,13 @@ export class Workspace {
    *  `let`/`const`/`class` bindings the library itself carries — empty
    *  on the shipped library; see `provenance.ts`'s `baselineLexicalKeys`). */
   private readonly baselineLexicalKeysSet: Set<string>;
+  /** The fresh-realm baseline TYPE TOKENS (name → trap-free `typeof`
+   *  token of the pristine value): the manifest's changed-binding
+   *  detector — a user REBINDING of a baseline global (`Math = 42`)
+   *  changes the token, so the binding is listed with its provenance
+   *  (phase-E review rejection: the baseline filter hid overwritten
+   *  built-ins entirely). */
+  private readonly baselineTypes = new Map<string, string>();
   /** Parked CHECKPOINT calls only, by call id — the answer-delivery
    *  table of the parking bridge. Kept separate from `parkedCallsBuffer`
    *  so `checkpoint.answer` can settle a pending question first-wins
@@ -173,6 +184,7 @@ export class Workspace {
     workspace.baselineKeysSet.clear();
     for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
     for (const key of lexicalBaseline) workspace.baselineLexicalKeysSet.add(key);
+    for (const [name, token] of bootstrap.baselineTypes) workspace.baselineTypes.set(name, token);
     return workspace;
   }
 
@@ -230,6 +242,7 @@ export class Workspace {
       workspace.baselineKeysSet.clear();
       for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
       for (const key of lexicalBaseline) workspace.baselineLexicalKeysSet.add(key);
+      for (const [name, token] of bootstrap.baselineTypes) workspace.baselineTypes.set(name, token);
       if (bootstrap.created) {
         // The pre-provenance restore sweep: attribute bindings that existed
         // before this host started tracking.
@@ -344,6 +357,27 @@ export class Workspace {
   }
 
   /**
+   * @internal The continuation-lease READ seam (the broker's eval-break
+   * targeting identity — see `ReplJobLease` in vm.ts): reads the guest
+   * library's `__replLease` accessor between VM operations. Best-effort
+   * (a missing/broken accessor reads as `undefined`).
+   */
+  readContinuationLease(): string | undefined {
+    this.assertAlive();
+    return readContinuationLease(this.vm);
+  }
+
+  /**
+   * @internal The continuation-lease CLEAR seam (see
+   * `readContinuationLease`): the drain loop clears the lease at drain
+   * start and after every lease-carrying job.
+   */
+  clearContinuationLease(): void {
+    this.assertAlive();
+    clearContinuationLease(this.vm);
+  }
+
+  /**
    * The console events accumulated by the default parking bridge, in
    * order (only populated when `options.handlers` was omitted — custom
    * handlers own their events). The tool layer renders each event's
@@ -431,7 +465,13 @@ export class Workspace {
    * The workspace manifest — `ls` for the data plane (the roadmap doc's
    * `status` manifest): every user top-level binding (fresh-realm
    * baseline set difference — the guest library's own globals and the
-   * realm builtins are never listed), with its structure-only token
+   * realm builtins are never listed — plus user bindings that SHADOW or
+   * OVERWRITE baseline globals: a lexical declaration always wins over
+   * the baseline (a user `const Math = 42` is listed with the lexical
+   * value's metadata), and a baseline global whose value's type token
+   * changed from the fresh-realm baseline has been rebinding by user
+   * code and is listed too — phase-E review round 5: the baseline
+   * filter used to remove both), with its structure-only token
    * (type/shape/size — metadata, never content), its provenance label
    * (`via eval N` / `via worker cN` — null when untracked), and the
    * live-handle call id when the binding is an agent handle (the caller
@@ -451,8 +491,25 @@ export class Workspace {
     this.assertAlive();
     const baseline = this.baselineKeys();
     const lexicalBaseline = this.baselineLexicalKeys();
+    const lexicalKeys = new Set(rawLexicalStringKeys(this.vm));
     const names = unionNames(rawGlobalStringKeys(this.vm), rawLexicalStringKeys(this.vm));
-    const user = names.filter((name) => !baseline.has(name) && !lexicalBaseline.has(name));
+    const user = names.filter((name) => {
+      if (!baseline.has(name) && !lexicalBaseline.has(name)) return true;
+      // A GLOBAL LEXICAL binding SHADOWS a same-named baseline global
+      // for identifier resolution (a user `const Math = 42`): the
+      // binding the orchestrator's code sees is the user's, so the
+      // manifest lists it — the lexical view, the same rule as the
+      // one-binding-per-name union (phase-E review rejection: the
+      // baseline filter removed shadowing bindings entirely).
+      if (lexicalKeys.has(name) && !lexicalBaseline.has(name)) return true;
+      // A baseline GLOBAL REBINDING (a `Math = 42` assignment): the
+      // value's trap-free type token changed from the fresh-realm
+      // baseline — the user overwrote the built-in, and the manifest
+      // lists the overwrite like any other user binding (phase-E
+      // review rejection: overwritten built-ins were hidden).
+      if (this.baselineChanged(name)) return true;
+      return false;
+    });
     const view = provenanceView(this.vm);
     const bindings: WorkspaceBinding[] = [];
     const logRefs: number[] = [];
@@ -494,6 +551,19 @@ export class Workspace {
 
   private baselineLexicalKeys(): Set<string> {
     return this.baselineLexicalKeysSet;
+  }
+
+  /** Whether a baseline name's current type token differs from the
+   *  fresh-realm baseline's (a user rebinding of the built-in). Trap-
+   *  free: descriptor read only, never a `[[Get]]`. */
+  private baselineChanged(name: string): boolean {
+    const baselineType = this.baselineTypes.get(name);
+    if (baselineType === undefined) return false;
+    try {
+      return readRealmSlotTypeToken(this.vm, name) !== baselineType;
+    } catch {
+      return false;
+    }
   }
 
   private defaultHandlers(): GuestBridgeHandlers {

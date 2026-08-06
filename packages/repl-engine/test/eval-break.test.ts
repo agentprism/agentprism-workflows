@@ -40,6 +40,26 @@
  *    `timeoutMs` returns in that budget, never a fixed 50 ms poll
  *    overshoot (~51 ms for every sub-50 ms timeout).
  *
+ * Round 5 (the carried review's defects) adds:
+ * 7. The signal is keyed to the armed eval's CONTINUATION, not to
+ *    settled call ids: an unawaited sibling `.then` registered BEFORE
+ *    the target's await runs FIRST in the settlement drain (before the
+ *    lease-setting reaction) — it can neither fire nor consume the
+ *    signal, and the target's own continuation (the job after the
+ *    reaction) is the execution broken mid-run.
+ * 8. Indirect waits are targetable: `await Promise.all([q])` arms and
+ *    the continuation breaks when q settles (the identity is the
+ *    promise graph, not a logged call-id list).
+ * 9. A zero `timeoutMs` wait still performs ONE immediately available
+ *    state read: an idle workspace drains (`drained: true`), and a
+ *    pending call's surface reads as pending (the old code returned
+ *    unacquired with the deadline already past).
+ * 10. The instrumenter is HYGIENIC: a guest lexical `__replAwait`
+ *    shadow cannot change the program's semantics (the injected seam
+ *    is `this["__replAwait"]` — the keyword base is unshadowable, and
+ *    no helper binding is injected into the persistent global lexical
+ *    record).
+ *
  * All suites disable the per-eval deadline (`evalTimeoutMs: 0`), so
  * the ONLY thing that can break a runaway here is the armed signal —
  * a regression hangs the operation and the test's watchdog fails it.
@@ -541,6 +561,117 @@ test('review round 4: waitForCalls\'s chain acquisition is bounded by the wait d
   await new Promise((resolve) => setTimeout(resolve, 150));
   runner.sessions[0].completeTurn('slow-done');
   assert.equal(await bounded('drain completion', draining), true, 'the drain drained the turn to completion');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 9. Round 5: the armed identity is the continuation, not settled ids ─
+
+test('review round 5: an UNAWAITED SIBLING reaction registered BEFORE the target\'s await runs FIRST in the settlement drain — it can neither fire nor consume the eval-break signal, and the target\'s OWN continuation (the job after the lease-setting reaction) is the execution broken mid-run (the carried defect: settling q interrupted the sibling job, cleared the arm, and let the target continuation run later unbroken)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // `q.then(sibling)` is registered BEFORE `await q`: the reactions on
+  // q are [sibling, lease-setting-reaction] in registration order, so
+  // the settlement drain runs the sibling's bytecode-heavy continuation
+  // FIRST — before any lease is set. The carried defect's signal was
+  // keyed to settled call ids: the drain "belonged" to the target, the
+  // FIRST poll fired on the sibling's job, the arm was consumed, and
+  // the target's own continuation ran later with no protection.
+  const a = await broker.eval(
+    'const q = agent("pi/x", "one"); const sibling = q.then((v) => { let x = 0; for (let i = 0; i < 200000; i++) x += i; return "sibling:" + v; }); await q; while (true) {}',
+  );
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'the running eval is targetable');
+  // The awaited call settles: the drain runs [sibling, the target's
+  // continuation]. The sibling job must COMPLETE (no lease is set yet —
+  // the lease-setting reaction runs after it), and the target's own
+  // continuation is the job broken mid-run.
+  runner.sessions[0].completeTurn('resumed');
+  await tick();
+  const probe = await bounded('probe after settling the awaited call', broker.eval('await sibling'));
+  assert.ok(
+    probe.result !== undefined && probe.result.includes('sibling:resumed'),
+    `the sibling continuation ran to completion, never interrupted: ${output(probe).join('\n')}`,
+  );
+  assert.ok(
+    output(probe).some((line) => line.includes('interrupted')),
+    `the target's own continuation was broken mid-run (not the sibling's job): ${output(probe).join('\n')}`,
+  );
+  // The broken eval was released (the interrupted job's continuation
+  // lease named it exactly): a later arm refuses.
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review round 5: an INDIRECT wait is targetable — `await Promise.all([q]); while (true) {}` arms (the 0.2.0 log refused it: the awaited value is the combinator\'s promise, not a registry promise) and the armed signal breaks the continuation mid-run when q settles (the identity is the promise graph)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // The eval awaits Promise.all([q]) — an indirect chain whose
+  // settlement is q's. The continuation lease rides the combinator
+  // promise's settlement, exactly like a direct call's.
+  const a = await broker.eval('const q = agent("pi/x", "one"); await Promise.all([q]); while (true) {}');
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'an eval awaiting an indirect chain is targetable');
+  // Settling q resolves the Promise.all promise: the lease-setting
+  // reaction runs, then the target's continuation (the runaway loop) —
+  // broken mid-run by the armed signal.
+  runner.sessions[0].completeTurn('resumed');
+  await tick();
+  const probe = await bounded('probe after settling the indirect chain', broker.eval('"probe"'));
+  assert.ok(
+    output(probe).some((line) => line.includes('interrupted')),
+    `the indirect chain's continuation was broken mid-run: ${output(probe).join('\n')}`,
+  );
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  const after = await broker.eval('6 * 7');
+  assert.equal(after.result, '42', 'the workspace stays usable');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 10. Round 5: zero-timeout waits perform an immediate state read ───
+
+test('review round 5: a ZERO-timeout wait still performs ONE immediately available state read — an idle workspace reports drained (the carried defect: the chain acquisition returned unacquired with the deadline already past, so even an immediately readable state reported "still running")', async () => {
+  const { ws, broker } = await setup();
+  const { result, drained } = await bounded('zero-timeout idle wait', broker.waitForCalls(undefined, 0));
+  assert.equal(drained, true, 'an idle workspace drains immediately — the pending read was immediately available');
+  assert.deepEqual(result.pending, [], 'the empty pending surface was read');
+  assert.deepEqual(result.completed, []);
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review round 5: a ZERO-timeout wait on a workspace with a PENDING call reports the call as pending and "still running" (the carried defect: the unacquired acquisition reported an empty pending list)', async () => {
+  const { ws, broker } = await setup();
+  const raised = await broker.eval('const q = checkpoint("go?"); "raised"');
+  assert.ok(raised.pending.includes('c1'), `pending: ${raised.pending.join(', ')}`);
+  const { result, drained } = await bounded('zero-timeout pending wait', broker.waitForCalls(['c1'], 0));
+  assert.equal(drained, false, 'the parked checkpoint never settles — "still running"');
+  assert.deepEqual(result.pending, ['c1'], 'the pending surface was read immediately');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 11. Round 5: the instrumenter is hygienic ──────────────────────────
+
+test('review round 5: the top-level-await instrumenter is HYGIENIC — a guest lexical `__replAwait` shadow cannot change the program\'s semantics (the 0.2.0 transform inserted the guest-resolvable identifier `__replAwait`, so `{ const __replAwait = () => 7; globalThis.seen = await Promise.resolve(42); }` yielded 7 instead of 42; the injected seam is now `this["__replAwait"]` — the keyword base is unshadowable)', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('{ const __replAwait = () => 7; globalThis.seen = await Promise.resolve(42); } "done"');
+  assert.equal(r.result, '"done"', `the eval completed normally: ${output(r).join('\n')}`);
+  const seen = await broker.eval('seen');
+  assert.equal(seen.result, '42', 'the REAL library seam ran — the guest shadow changed nothing');
+  // The shadowing identifier stays usable as the guest declared it.
+  const shadow = await broker.eval('{ const __replAwait = () => 7; globalThis.seen2 = __replAwait(); } "s"');
+  assert.equal(shadow.result, '"s"');
+  const seen2 = await broker.eval('seen2');
+  assert.equal(seen2.result, '7', 'the guest\'s own shadowed identifier keeps its semantics');
+  // The transform injects NO persistent helper binding (a top-level
+  // const would redeclare on the loop idiom): the same code runs again.
+  const again = await broker.eval('{ const __replAwait = () => 7; globalThis.seen3 = await Promise.resolve(9); } "again"');
+  assert.equal(again.result, '"again"', `the loop idiom does not redeclare: ${output(again).join('\n')}`);
+  const seen3 = await broker.eval('seen3');
+  assert.equal(seen3.result, '9');
   await broker.dispose();
   ws.dispose();
 });

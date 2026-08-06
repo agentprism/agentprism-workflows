@@ -1,58 +1,94 @@
 /**
  * The top-level-await instrumenter — the guest-side half of the eval-break
- * targeting discipline (the `interrupt` tool's no-id arm, phase-E review
- * rejection round 4): the broker rewrites `await <expr>` into
- * `await __replAwait(<expr>)` for every TOP-LEVEL await of an eval, so the
- * guest library can record WHICH pending call's settlement queues the
- * eval's continuation. That record is the armed target's REAL resume-key
- * identity:
+ * targeting discipline (the `interrupt` tool's no-id arm): the broker
+ * rewrites `await <expr>` into `await this["__replAwait"](<expr>, TOKEN)`
+ * for every TOP-LEVEL await of an eval, where `TOKEN` is the eval's own
+ * continuation token.
+ *
+ * The guest library's `__replAwait(value, token)` WRAPS the awaited value
+ * in a fresh promise whose settling reaction — the job that runs
+ * IMMEDIATELY BEFORE the eval's continuation segment — sets the
+ * CONTINUATION LEASE to the eval's token (see `guest-library.ts`). The
+ * broker's drain loop reads the lease between jobs: a job that starts
+ * with a lease set IS the armed eval's continuation, so the eval-break
+ * interrupt fires only while THAT execution runs. This is the armed
+ * target's genuine CONTINUATION IDENTITY (phase-E review rejection round
+ * 5): not the calls the eval awaited, not the calls it created — the
+ * execution itself.
+ *
+ * Consequences, pinned by regressions:
  *
  * - an eval that awaits a call it created (`const c1 = agent(...); await
- *   c1`) logs c1 — the settlement that queues its continuation;
+ *   c1`) is targetable — the wrap's reaction is queued on c1's promise;
  * - an eval that awaits an EARLIER eval's binding (`await p` where `p`
- *   was created by a previous eval) logs that call too — "a running eval
- *   awaiting an earlier binding must also remain targetable" (the
- *   reviewer's requirement; the pre-instrumenter model attributed only
- *   the calls an eval CREATED, so both this and the sibling case were
- *   wrong);
- * - an UNAWAITED sibling call (`const c2 = agent(...); c2.then(heavy)`)
- *   is never logged — its settlement runs c2's own `.then` continuation,
- *   NOT the eval's continuation, so the armed signal must neither fire
- *   nor be consumed by it (the carried defect: every call an eval
- *   created was a resume key, so settling the unawaited sibling
- *   interrupted its unrelated heavy `.then`, left the awaited call
- *   pending, and made the next arm refuse).
+ *   was created by a previous eval) is targetable the same way — the
+ *   wrap does not care where the promise came from;
+ * - an UNAWAITED sibling reaction registered BEFORE the await
+ *   (`q.then(sibling)` then `await q`) runs FIRST in the settlement
+ *   drain — before the lease-setting reaction — so the sibling job can
+ *   neither fire the signal nor consume it; the armed state survives
+ *   and the target's own continuation (the job after the lease-setting
+ *   reaction) is the one broken mid-run (the carried review defect: the
+ *   signal was keyed to settled call ids, so the sibling job consumed
+ *   it and the target ran later unbroken);
+ * - INDIRECT awaits are targetable: `await Promise.all([q])` wraps the
+ *   combinator's promise, whose settlement queues the eval's
+ *   continuation exactly like a direct call's — the identity is the
+ *   promise graph, not a logged call-id list (the carried review
+ *   defect: the 0.2.0 log-based targeting refused indirect waits).
+ *
+ * ## Hygiene (phase-E review rejection round 5)
+ *
+ * The injected code must never change the guest program's semantics. The
+ * 0.2.0 instrumenter inserted the guest-resolvable identifier
+ * `__replAwait` at every site, so a guest lexical declaration shadowed
+ * it: `{ const __replAwait = () => 7; globalThis.seen = await
+ * Promise.resolve(42); }` yielded 7 instead of 42. The 0.3.0 transform
+ * is hygienic by construction:
+ *
+ * - the injected base is the `this` KEYWORD at the eval's top level —
+ *   the engine invokes the script's async wrapper with the realm's
+ *   global object as its `this` (verified against the shipped binary),
+ *   so `this["__replAwait"]` resolves the library's global without
+ *   naming any identifier the guest could shadow; `this` is a keyword —
+ *   no declaration, in any scope, can shadow it;
+ * - no capture line and no helper binding are injected: a top-level
+ *   `const` in an eval persists in the realm's global lexical record,
+ *   so a helper declaration would (a) redeclare on the loop idiom
+ *   (re-running identical code — `SyntaxError: redeclaration`) and (b)
+ *   leak a binding into the workspace manifest. The direct
+ *   `this["__replAwait"]` form injects nothing but the call sites.
  *
  * The rewrite is restricted to awaits in the eval'd script's TOP-LEVEL
- * body — the engine wraps the script in ONE async function
- * (`JS_EVAL_FLAG_ASYNC`, see vm.ts), so only awaits directly in that
- * body queue THE EVAL's continuation. Awaits inside NESTED function
- * bodies (a `.map(async x => await ...)` callback, a `parallel()` thunk,
- * a `for await` inside a helper) belong to their own continuations:
- * wrapping them would attribute the wrong execution and let the signal
- * break an unrelated one — the exact false positive the discipline
- * forbids. The library's own combinators are deliberately NOT wrapped:
- * an eval that awaits `parallel([...])` awaits the combinator's RESULT
- * promise, whose settlement is the LAST component call's — unknowable in
- * advance — so indirect awaits degrade honestly to "not targetable"
- * (the refusal) instead of risking a false positive.
+ * body — the engine evaluates the script with top-level-await semantics
+ * (see vm.ts), so only awaits directly in that body queue THE EVAL's
+ * continuation. Awaits inside NESTED function bodies (a `.map(async x =>
+ * await ...)` callback, a `parallel()` thunk, a `for await` inside a
+ * helper) belong to their own continuations: wrapping them would
+ * attribute the wrong execution and let the signal break an unrelated
+ * one — the exact false positive the discipline forbids. The library's
+ * own combinators are deliberately NOT wrapped: an eval that awaits
+ * `parallel([...])` awaits the combinator's RESULT promise, and the wrap
+ * rides that promise's settlement like any other — the combinator's
+ * internals need no special handling.
  *
  * The instrumenter is a pure source transform driven by acorn (already a
  * monorepo dependency — mcp-server and workflow-engine use it): parse the
  * script, walk the AST, collect `(argument.start, node.end)` pairs of
  * every top-level AwaitExpression (plus the iterable of every top-level
- * `for await`), and splice `__replAwait(` / `)` at those exact AST
- * boundaries. Boundaries are tokenization-safe by construction: the
- * original parse already resolved every `await` expression's extent, so
- * no token can be split. A parse failure returns the code UNCHANGED —
- * the VM reports the syntax error with the original source (positions
- * preserved; the instrumenter never shifts lines).
+ * `for await`), and splice the call at those exact AST boundaries.
+ * Boundaries are tokenization-safe by construction: the original parse
+ * already resolved every `await` expression's extent, so no token can be
+ * split. A parse failure returns the code UNCHANGED — the VM reports the
+ * syntax error with the original source (positions preserved; the
+ * instrumenter never shifts lines).
  *
  * The broker gates the instrumenter on the workspace's library carrying
- * the 0.2.0 tracking surface (`surface.supportsAwaitTracking`): a
- * restored snapshot with the 0.1.0 library is served as-is and simply
- * gets no attribution (the eval-break interrupt degrades to the honest
- * refusal).
+ * the 0.3.0 continuation-lease surface (`surface.supportsContinuation
+ * Lease`): a restored snapshot with the 0.1.0/0.2.0 library is served
+ * as-is and simply gets no instrumentation (the eval-break interrupt
+ * degrades to the honest refusal — the 0.2.0 log-only targeting is the
+ * rejected settled-call-ids identity).
  */
 
 import { parse } from 'acorn';
@@ -63,7 +99,23 @@ import { parse } from 'acorn';
  *  growing the cache unboundedly). */
 const INSTRUMENT_CACHE_MAX = 256;
 
-const cache = new Map<string, string>();
+/** One source's cached parse plan: the await sites are token- and
+ *  eval-independent — only the per-eval TOKEN varies, so the splice is
+ *  re-derived per call from this plan. */
+interface InstrumentPlan {
+  /** Insert `this["__replAwait"](` at each of these positions (the
+   *  awaited expression's start). */
+  opens: number[];
+  /** Insert `, "TOKEN")` at each of these positions (the awaited
+   *  expression's end). */
+  closes: number[];
+}
+
+const cache = new Map<string, InstrumentPlan | typeof MISS>();
+
+/** Cache sentinel for an un-instrumentable source (a parse failure, or a
+ *  script with no top-level await). */
+const MISS = Symbol('instrument-miss');
 
 /** Function-like AST nodes whose bodies own their continuations: the
  *  instrumenter never descends into them (an await inside one is not a
@@ -75,69 +127,71 @@ const FUNCTION_NODE_TYPES = new Set([
   'StaticBlock',
 ]);
 
-interface AwaitSite {
-  /** Where to insert `__replAwait(` (the awaited expression's start). */
-  start: number;
-  /** Where to insert `)` (the awaited expression's end). */
-  end: number;
-}
-
 /**
  * Rewrite every TOP-LEVEL `await <expr>` of the script into
- * `await __replAwait(<expr>)` (and every top-level `for await (... of
- * <iterable>)` into `for await (... of __replAwait(<iterable>))`).
- * Returns the original code unchanged when there is nothing to rewrite
- * or the code does not parse (the VM reports the syntax error).
+ * `await this["__replAwait"](<expr>, TOKEN)` (and every top-level
+ * `for await (... of <iterable>)` into
+ * `for await (... of this["__replAwait"](<iterable>, TOKEN))`). Returns
+ * the original code unchanged when there is nothing to rewrite or the
+ * code does not parse (the VM reports the syntax error).
  */
-export function instrumentTopLevelAwaits(code: string): string {
-  const cached = cache.get(code);
-  if (cached !== undefined) return cached;
+export function instrumentTopLevelAwaits(code: string, token: string): string {
+  const plan = planFor(code);
+  if (plan === undefined || plan.opens.length === 0) return code;
+  const tokenJson = JSON.stringify(token);
+  // All insertions, applied right-to-left by position: sites NEST (an
+  // outer await's range contains its argument's awaits — `await (await
+  // a, await b)`), so a range-splice of the outer site would cut
+  // through the already-shifted interior. Point insertions at exact AST
+  // boundaries are position-safe at any nesting depth (each site's
+  // `start` and `end` are distinct positions; when two sites share a
+  // position — `for await (const x of await y)` — the doubled
+  // insertion is harmless: both wrappers still surround their
+  // expression).
+  const insertions: Array<{ pos: number; text: string }> = [];
+  for (const pos of plan.opens) insertions.push({ pos, text: `this["__replAwait"](` });
+  for (const pos of plan.closes) insertions.push({ pos, text: `, ${tokenJson})` });
+  insertions.sort((a, b) => b.pos - a.pos);
+  let out = code;
+  for (const insertion of insertions) {
+    out = out.slice(0, insertion.pos) + insertion.text + out.slice(insertion.pos);
+  }
+  return out;
+}
 
-  let result = code;
+/** The cached parse plan for a source (see `InstrumentPlan`). Returns
+ *  undefined when the source does not parse or has no top-level await. */
+function planFor(code: string): InstrumentPlan | undefined {
+  const cached = cache.get(code);
+  if (cached !== undefined) return cached === MISS ? undefined : cached;
+
+  let plan: InstrumentPlan | undefined;
   try {
     const sites = findAwaitSites(code);
     if (sites.length > 0) {
-      // Flatten each site into its two insertions and apply them
-      // right-to-left by position: sites NEST (an outer await's range
-      // contains its argument's awaits — `await (await a, await b)`),
-      // so a range-splice of the outer site would cut through the
-      // already-shifted interior. Point insertions at exact AST
-      // boundaries are position-safe at any nesting depth (each site's
-      // `start` and `end` are distinct positions; when two sites share
-      // a position — `for await (const x of await y)` — the doubled
-      // insertion is harmless: both wrappers still surround their
-      // expression).
-      const insertions: Array<{ pos: number; text: string }> = [];
-      for (const site of sites) {
-        insertions.push({ pos: site.start, text: '__replAwait(' });
-        insertions.push({ pos: site.end, text: ')' });
-      }
-      insertions.sort((a, b) => b.pos - a.pos);
-      let out = code;
-      for (const insertion of insertions) {
-        out = out.slice(0, insertion.pos) + insertion.text + out.slice(insertion.pos);
-      }
-      result = out;
+      plan = {
+        opens: sites.map((site) => site.start),
+        closes: sites.map((site) => site.end),
+      };
     }
   } catch {
     // Parse failure — the engine reports the syntax error; never
     // instrument what we cannot parse (a half-rewritten script would
     // produce a confusing double error).
-    result = code;
+    plan = undefined;
   }
 
   if (cache.size >= INSTRUMENT_CACHE_MAX) cache.clear();
-  cache.set(code, result);
-  return result;
+  cache.set(code, plan === undefined ? MISS : plan);
+  return plan;
 }
 
 /** Parse the script and collect every top-level await site (see the
  *  module docs for the top-level rule). */
 function findAwaitSites(code: string): AwaitSite[] {
-  // `allowAwaitOutsideFunction` matches the engine's async eval wrapper:
-  // `await` is the await OPERATOR everywhere in the script, exactly as
-  // the VM treats it (`JS_EVAL_FLAG_ASYNC` parses the whole script as an
-  // async function body).
+  // `allowAwaitOutsideFunction` matches the engine's top-level-await
+  // semantics: `await` is the await OPERATOR everywhere in the script,
+  // exactly as the VM treats it.
   const ast = parse(code, {
     ecmaVersion: 'latest',
     sourceType: 'script',
@@ -164,10 +218,8 @@ function visit(node: AcornNode | null | undefined, inFunction: boolean, sites: A
   }
   if (node.type === 'ForOfStatement') {
     // `for await (const x of y)`: the eval suspends on the ITERABLE's
-    // iterator — wrapping the iterable records the awaited calls the
-    // iteration resumes on (each `next()` is a continuation of the same
-    // top-level loop, so the first suspension's resume keys are the
-    // logged ones).
+    // iterator — wrapping the iterable rides the iteration's first
+    // suspension like any other awaited value.
     if (node.await === true && node.right !== null && typeof node.right === 'object') {
       sites.push({ start: node.right.start, end: node.right.end });
     }
@@ -188,6 +240,14 @@ function visit(node: AcornNode | null | undefined, inFunction: boolean, sites: A
       visit(child as AcornNode, inFunction, sites);
     }
   }
+}
+
+interface AwaitSite {
+  /** Where to insert `this["__replAwait"](` (the awaited expression's
+   *  start). */
+  start: number;
+  /** Where to insert `, "TOKEN")` (the awaited expression's end). */
+  end: number;
 }
 
 /** The acorn AST node shape the walker needs (a structural subset). */

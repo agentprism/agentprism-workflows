@@ -634,6 +634,103 @@ export interface GuestSurfaceEntry {
   modelSpec: string | null;
 }
 
+/** The name of the guest library's continuation-lease accessor global
+ *  (see `readContinuationLease`). */
+export const GUEST_LEASE_GLOBAL = '__replLease';
+
+/**
+ * Read the guest library's CONTINUATION LEASE token (a string) or
+ * `undefined` — the host side of the eval-break targeting seam (see
+ * `ReplJobLease` in vm.ts): the drain loop reads it between jobs, and a
+ * job that starts with a lease set IS the armed eval's continuation
+ * segment. The lease global is a NON-CONFIGURABLE accessor installed by
+ * the library itself; its getter is the library's frozen closure
+ * (trusted host-installed code, never guest-authored), so invoking it
+ * between VM operations is safe. Best-effort: any failure reads as
+ * `undefined` (the targeting degrades to the honest refusal).
+ */
+export function readContinuationLease(vm: ReplVm): string | undefined {
+  const shim = getVmShim(vm) as QuickJS;
+  let key: JSValueHandle | undefined;
+  let value: JSValueHandle | undefined;
+  try {
+    key = shim.newString(GUEST_LEASE_GLOBAL);
+    value = shim.getProp(shim.global, key);
+    if (value.isUndefined) return undefined;
+    if (!value.isString) return undefined;
+    return value.toString();
+  } catch {
+    return undefined;
+  } finally {
+    key?.dispose();
+    value?.dispose();
+  }
+}
+
+/** Clear the guest library's continuation lease (see
+ *  `readContinuationLease`). Called by the drain loop at drain start and
+ *  after every lease-carrying job; the library's setter is its own
+ *  frozen closure. Best-effort: a failing clear leaves a stale lease
+ *  that the next drain's start-clear retries. */
+export function clearContinuationLease(vm: ReplVm): void {
+  const shim = getVmShim(vm) as QuickJS;
+  let key: JSValueHandle | undefined;
+  try {
+    key = shim.newString(GUEST_LEASE_GLOBAL);
+    shim.setProp(shim.global, key, shim.undefined);
+  } catch {
+    // Best-effort (see the doc comment).
+  } finally {
+    key?.dispose();
+  }
+}
+
+/**
+ * The trap-free TYPE TOKEN of a realm global slot: the data value's
+ * `typeof` (read through the own property descriptor, never a `[[Get]]`
+ * — an accessor is never invoked), `'accessor'` for an accessor-rebound
+ * slot, `'absent'` for a missing one. The manifest's baseline-change
+ * detector: a user rebinding of a baseline global (`Math = 42`) changes
+ * the token from the fresh-realm baseline's, so the binding is listed
+ * (the phase-E review rejection: the baseline filter hid overwritten
+ * built-ins).
+ */
+export function readRealmSlotTypeToken(vm: ReplVm, name: string): string {
+  const shim = getVmShim(vm) as QuickJS;
+  const global = shim.global; // cached singleton — do not dispose
+  const e = shim._getExports();
+  const keyHandle = shim.newString(name);
+  let descPtr: number;
+  try {
+    descPtr = e.qjs_get_own_property_descriptor(global.ptr, keyHandle.ptr);
+  } finally {
+    keyHandle.dispose();
+  }
+  if (descPtr === 0) return 'absent';
+  const desc = new JSValueHandle(shim, descPtr);
+  try {
+    if (e.qjs_is_exception(desc.ptr) !== 0) {
+      const excPtr = e.qjs_get_exception();
+      if (excPtr !== 0) new JSValueHandle(shim, excPtr).dispose();
+      return 'absent';
+    }
+    if (!hasOwnRaw(e, shim, desc.ptr, 'value')) {
+      getPropRaw(e, shim, desc.ptr, 'get')?.dispose();
+      getPropRaw(e, shim, desc.ptr, 'set')?.dispose();
+      return 'accessor';
+    }
+    const valueProp = getPropRaw(e, shim, desc.ptr, 'value');
+    if (valueProp === undefined) return 'absent';
+    try {
+      return valueProp.typeof;
+    } finally {
+      valueProp.dispose();
+    }
+  } finally {
+    desc.dispose();
+  }
+}
+
 /**
  * The host's door back into the guest's pending-call registry — the
  * post-restore reconciliation surface
@@ -652,6 +749,15 @@ export interface GuestSurface {
    *  to the honest refusal (the doc's rule: the host serves snapshots
    *  carrying older library versions than the one it ships). */
   supportsAwaitTracking: boolean;
+  /** True when this library copy carries the 0.3.0 CONTINUATION-LEASE
+   *  surface (`__replAwait(value, token)` + the `__replLease` accessor
+   *  global): the eval-break interrupt's genuine per-eval identity — the
+   *  drain loop reads the lease between jobs, and the armed signal fires
+   *  only while the armed eval's continuation executes. False on a
+   *  0.1.0/0.2.0 snapshot: the host serves it as-is, skips the
+   *  instrumenter, and the interrupt refuses honestly (the 0.2.0
+   *  log-only targeting is the rejected settled-call-ids identity). */
+  supportsContinuationLease: boolean;
   /** Manifest of every pending host call, oldest first. */
   pending(): GuestSurfaceEntry[];
   /**
@@ -733,6 +839,19 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
         trackingHandle.dispose();
       }
     }
+    // The 0.3.0 continuation-lease seam: `supportsContinuationLease` (a
+    // static boolean). Absent on 0.1.0/0.2.0 copies — the host serves
+    // the snapshot as-is and the eval-break interrupt refuses honestly
+    // (no instrumentation on it).
+    const leaseHandle = readOwnDataProperty(surfaceHandle, 'supportsContinuationLease');
+    let supportsContinuationLease = false;
+    if (leaseHandle !== undefined) {
+      try {
+        supportsContinuationLease = leaseHandle.isBool && leaseHandle.toBoolean();
+      } finally {
+        leaseHandle.dispose();
+      }
+    }
     const awaitTakeHandle = readOwnDataProperty(surfaceHandle, 'awaitLogTake');
     const hasAwaitTake = awaitTakeHandle !== undefined && awaitTakeHandle.isFunction;
     awaitTakeHandle?.dispose();
@@ -740,6 +859,7 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
     return {
       version,
       supportsAwaitTracking,
+      supportsContinuationLease,
       pending: () => callSurfaceFunction(vm, 'pending') as GuestSurfaceEntry[],
       settle: (callId, outcome, value) => callSurfaceSettle(vm, callId, outcome, value),
       stats: () => callSurfaceFunction(vm, 'stats') as ReturnType<GuestSurface['stats']>,

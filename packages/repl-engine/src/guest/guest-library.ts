@@ -66,11 +66,29 @@
  *  entries' 'promise' field (which promise each pending call's
  *  settlement resolves — the await-attribution look-up), the 'awaitLog'
  *  (the chronological record of awaited call ids), and the surface's
- *  'supportsAwaitTracking'/'awaitLogTake' members. A snapshot
+ *  'supportsAwaitTracking'/'awaitLogTake' members.
+ *  0.3.0 replaces the LOG-based targeting with a genuine per-eval
+ *  CONTINUATION IDENTITY: '__replAwait(value, token)' now WRAPS the
+ *  awaited value in a fresh promise whose settling reaction — the job
+ *  that runs IMMEDIATELY BEFORE the eval's continuation segment — sets
+ *  the CONTINUATION LEASE to the eval's token (the writable
+ *  '__replLease' accessor global). The host's drain loop reads the
+ *  lease between jobs: a job that starts with a lease set IS the armed
+ *  eval's continuation, so the interrupt fires only while THAT
+ *  execution runs (an unawaited sibling `.then` job — which runs
+ *  before the lease-setting reaction — can neither fire nor consume
+ *  the signal), and the lease is cleared after the segment ends. The
+ *  wrap also makes INDIRECT awaits targetable: `await
+ *  Promise.all([q])` wraps the combinator promise, whose settlement
+ *  queues the eval's continuation exactly like a direct call's — the
+ *  eval's identity is the promise graph, not a logged call-id list.
+ *  The surface gains 'supportsContinuationLease'; the 0.2.0 log
+ *  surface stays (an older host may still drive it). A snapshot
  *  carrying 0.1.0 is served as-is (the doc's rule: the host serves
- *  snapshots carrying older library versions) — the host degrades by not
- *  instrumenting awaits on it (no eval-break targeting, honest refusal). */
-export const GUEST_LIBRARY_VERSION = '0.2.0';
+ *  snapshots carrying older library versions) — the host degrades by
+ *  not instrumenting awaits on it (no eval-break targeting, honest
+ *  refusal). */
+export const GUEST_LIBRARY_VERSION = '0.3.0';
 
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
 export const GUEST_SURFACE_KEY = 'repl.guest';
@@ -95,13 +113,30 @@ export const GUEST_PROVENANCE_KEY = 'repl.provenance';
  * fresh workspace; a bootstrap over a hostile pre-provenance snapshot
  * degrades to no provenance, never to content, via the record/read
  * try/catch). `names` is the fresh-realm baseline key set (the 'known'
- * skip set).
+ * skip set for GLOBAL-OBJECT properties), plus two newer optional
+ * arguments the bootstrap passes: the baseline TYPE TOKENS (name →
+ * fresh-realm typeof token — a known name whose token changes has been
+ * REBOUND by user code and is attributed like any other rebinding) and
+ * the LEXICAL baseline key set (the fresh realm's own top-level
+ * let/const/class bindings — the lexical pass skips THESE instead of
+ * the known set, because a lexical declaration shadows a same-named
+ * baseline global and is always the user's). A factory invoked without
+ * them (an older host) keeps the pure known-set skip.
  */
-export const PROVENANCE_FACTORY = `(function (names) {
+export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
   var gOPN = Object.getOwnPropertyNames;
   var gOPD = Object.getOwnPropertyDescriptor;
   var hasOwnProp = Object.prototype.hasOwnProperty;
   var jparse = JSON.parse;
+  // Captured at CREATION (the bootstrap runs before any user eval, so
+  // the realm is pristine): the pass's own code must keep working when
+  // user code SHADOWS a baseline global — 'const Math = 42' is a
+  // legitimate user program, and the lexical binding shadows the
+  // factory's free-variable Math/Object references at call time
+  // (phase-E review round 5: the pass threw on Math.max under a
+  // lexical Math shadow, swallowing every attribution).
+  var jmax = Math.max;
+  var jcreate = Object.create;
   var reg = {
     evalSeq: 0,
     origins: Object.create(null),
@@ -116,6 +151,46 @@ export const PROVENANCE_FACTORY = `(function (names) {
     lexPrev: Object.create(null),
     known: Object.create(null),
   };
+  // The fresh-realm BASELINE TYPE TOKENS (name -> typeof token of the
+  // pristine value, captured by the host in a throwaway realm): a KNOWN
+  // (baseline) name whose current token differs has been REBOUND by
+  // user code — 'Math = 42' overwrites the built-in — and is
+  // attributed like any other rebinding (phase-E review rejection: the
+  // known-set skip made overwritten built-ins invisible to the
+  // manifest). SameValue against the baseline VALUE is impossible (the
+  // baseline lives in a different realm), so the type token is the
+  // change detector; the token observed at each pass is remembered
+  // (reg.baseTok), so an untouched builtin is a no-op forever and a
+  // SECOND rebind re-attributes to its own eval. The tokens are
+  // CONSTANT per registry lifetime (the baseline never changes), so
+  // they arrive at factory creation.
+  reg.baseTok = Object.create(null);
+  if (typeof typeToks === 'string') {
+    try { typeToks = jparse(typeToks); } catch (e) { typeToks = null; }
+  }
+  if (typeToks !== null && typeToks !== undefined && typeof typeToks === 'object') {
+    for (var tk in typeToks) {
+      if (typeof typeToks[tk] === 'string') reg.baseTok[tk] = typeToks[tk];
+    }
+  }
+  // The LEXICAL baseline key set (the fresh realm's own top-level
+  // let/const/class bindings — empty on the shipped library; a future
+  // library that declared lexically would otherwise be attributed as
+  // user bindings). The lexical pass skips THESE names instead of the
+  // global baseline's: a lexical declaration SHADOWS a same-named
+  // baseline global, and the shadowing binding is the user's — it must
+  // be attributed (phase-E review rejection: the known-set skip made
+  // 'const Math = 42' invisible to the manifest). Also constant per
+  // registry lifetime.
+  reg.lexKnown = Object.create(null);
+  if (typeof lexKnownArr === 'string') {
+    try { lexKnownArr = jparse(lexKnownArr); } catch (e) { lexKnownArr = null; }
+  }
+  if (lexKnownArr !== null && lexKnownArr !== undefined && typeof lexKnownArr.length === 'number') {
+    for (var lk0 = 0; lk0 < lexKnownArr.length; lk0++) {
+      if (typeof lexKnownArr[lk0] === 'string') reg.lexKnown[lexKnownArr[lk0]] = true;
+    }
+  }
   function record(label, atMs) {
     try {
       if (label === null || label === undefined) {
@@ -158,8 +233,8 @@ export const PROVENANCE_FACTORY = `(function (names) {
           lexNames = jparse(arguments[2]);
         }
       } catch (e) { lexNames = null; }
-      var lexValueCount = Math.max(0, arguments.length - 3);
-      var lexSet = Object.create(null);
+      var lexValueCount = jmax(0, arguments.length - 3);
+      var lexSet = jcreate(null);
       if (lexNames !== null && typeof lexNames.length === 'number') {
         for (var li = 0; li < lexNames.length; li++) {
           var lk = lexNames[li];
@@ -167,12 +242,9 @@ export const PROVENANCE_FACTORY = `(function (names) {
         }
       }
       var names_ = gOPN(globalThis);
-      var seen = Object.create(null);
+      var seen = jcreate(null);
       for (var i = 0; i < names_.length; i++) {
         var k = names_[i];
-        if (reg.known[k]) continue;
-        if (lexSet[k]) { seen[k] = true; continue; }
-        seen[k] = true;
         // Descriptor read, never a [[Get]]: a binding rebound to an
         // accessor must not have its getter fired by host bookkeeping.
         // The getter FUNCTION serves as the rebind-detection identity for
@@ -183,6 +255,31 @@ export const PROVENANCE_FACTORY = `(function (names) {
           if (hasOwnProp.call(d, 'value')) v = d.value;
           else if (hasOwnProp.call(d, 'get')) v = d.get;
         }
+        if (reg.known[k]) {
+          // A KNOWN baseline name (a builtin or a library global):
+          // attribute only when user code REBOUND it — the current type
+          // token differs from the fresh-realm baseline token ('Math =
+          // 42', 'globalThis.JSON = "x"' — the phase-E review
+          // rejection: the baseline filter hid overwritten built-ins
+          // from the manifest). The token is remembered per pass
+          // (reg.baseTok), so an untouched builtin is a no-op forever
+          // and a SECOND rebind re-attributes to its own eval. The
+          // name is present (it is in the property list), so it is
+          // marked seen — an attributed rebinding must never be swept
+          // by the gone pass in the same sweep.
+          seen[k] = true;
+          if (reg.baseTok && typeof reg.baseTok[k] === 'string') {
+            var tok = hasOwnProp.call(d, 'value') ? typeof d.value : 'accessor';
+            if (tok !== reg.baseTok[k]) {
+              reg.origins[k] = { via: label, at: atMs };
+              reg.prev[k] = v;
+              reg.baseTok[k] = tok;
+            }
+          }
+          continue;
+        }
+        if (lexSet[k]) { seen[k] = true; continue; }
+        seen[k] = true;
         var tracked = reg.origins[k] !== undefined;
         var same = tracked && (reg.prev[k] === v || (reg.prev[k] !== reg.prev[k] && v !== v));
         if (!same) {
@@ -207,7 +304,12 @@ export const PROVENANCE_FACTORY = `(function (names) {
         for (var li2 = 0; li2 < lexNames.length; li2++) {
           var lk2 = lexNames[li2];
           if (typeof lk2 !== 'string') continue;
-          if (reg.known[lk2]) continue;
+          // Only the LEXICAL baseline is skipped: a lexical declaration
+          // always comes from user code, and it SHADOWS a same-named
+          // baseline global — 'const Math = 42' is a user binding even
+          // though the name is in the known set (phase-E review
+          // rejection: the known-set skip hid it from the manifest).
+          if (reg.lexKnown[lk2]) continue;
           seen[lk2] = true;
           if (lexValueCount > 0) {
             var cur = arguments[3 + li2];
@@ -233,7 +335,7 @@ export const PROVENANCE_FACTORY = `(function (names) {
   }
   function read() {
     try {
-      var out = Object.create(null);
+      var out = jcreate(null);
       for (var k in reg.origins) {
         var o = reg.origins[k];
         out[k] = { via: o.via, at: o.at };
@@ -325,17 +427,23 @@ const GUEST_LIBRARY_SOURCE = `/*
     // ids (the host's top-level-await instrumenter rewrites 'await x'
     // into 'await __replAwait(x)', and the library logs every awaited
     // value that IS one of its registry promises). The log is the
-    // host-side eval-break targeting seam: the broker reads and clears
-    // it at operation boundaries (surface.awaitLogTake) and attributes
-    // the entries to the suspended evals whose continuations the
-    // awaited calls resume — the armed target's REAL resume keys, as
-    // opposed to every call an eval merely created (phase-E review
-    // rejection: an unawaited sibling call's settlement used to consume
-    // the eval-break signal against its own unrelated '.then'
-    // continuation). Entries are plain call-id strings; the host takes
-    // them at every operation boundary, so the log never grows past one
-    // operation's awaits.
+    // 0.2.0-era targeting seam; the 0.3.0 library keeps it for older
+    // hosts (surface.awaitLogTake) while the broker's targeting rides
+    // the CONTINUATION LEASE (see '__replLease' below).
     awaitLog: [],
+    // The CONTINUATION LEASE (version 0.3.0): the token of the eval
+    // whose continuation is about to run (set by '__replAwait''s
+    // wrap-settling reaction — the job immediately before the eval's
+    // continuation segment — and cleared by the host's drain loop
+    // after the segment ends). The host reads it between jobs; a job
+    // that starts with a lease set IS the armed eval's continuation —
+    // the eval-break interrupt's genuine per-eval identity (phase-E
+    // review rejection round 5: the signal used to be keyed to settled
+    // call ids, so an unawaited sibling '.then' job running before the
+    // target's continuation consumed it). Exposed as the writable
+    // '__replLease' accessor global (its getter/setter are this
+    // closure's — trusted host-installed code, never guest-authored).
+    continuationLease: undefined,
   };
 
   // Captured intrinsics: the registry is the host's settlement table, so
@@ -1473,18 +1581,62 @@ const GUEST_LIBRARY_SOURCE = `/*
   // ────────────────────────────────────────────────────────────────────────
   // The eval-await tracking: '__replAwait' — the global the host's
   // top-level-await instrumenter inserts around every top-level 'await'
-  // ('await x' → 'await __replAwait(x)'). It records the awaited call id
-  // when the awaited value is one of this library's registry promises and
-  // otherwise passes the value through untouched. NEVER throws (it runs
-  // inside arbitrary guest code; a throw would break the eval). The log
-  // is consumed by the host at operation boundaries
-  // (surface.awaitLogTake) — the entries between two boundaries are
-  // exactly the awaits of the operations' own code plus the awaits of
-  // any continuations its drains resumed.
+  // ('await x' → 'await __replAwait(x, TOKEN)' — the 0.3.0 form; the
+  // 0.2.0 host inserted no token). With a TOKEN the awaited value is
+  // WRAPPED in a fresh promise: the wrap's settling reaction — the job
+  // that runs IMMEDIATELY BEFORE the eval's continuation segment (the
+  // reaction is registered at the await, so earlier-registered
+  // reactions — an unawaited sibling's '.then' — run first) — sets the
+  // CONTINUATION LEASE to the eval's token. The host's drain loop reads
+  // the lease between jobs: the segment starts with the lease set (the
+  // eval-break interrupt's genuine continuation identity — it can only
+  // fire while THIS eval's continuation executes) and the host clears
+  // it after the segment ends. The wrap also makes INDIRECT awaits
+  // targetable — 'await Promise.all([q])' wraps the combinator's
+  // promise, and its settlement queues the eval's continuation exactly
+  // like a direct call's: the identity is the promise graph, not a
+  // logged call-id list (phase-E review rejection round 5: the 0.2.0
+  // log refused indirect waits). The 0.2.0 no-token form passes the
+  // value through and logs registry promises (an older host still
+  // drives the log). NEVER throws: a wrap failure (guest promise
+  // sabotage) degrades to the unwrapped value, so guest semantics are
+  // preserved either way.
   // ────────────────────────────────────────────────────────────────────────
 
-  function replAwait(value) {
+  function setContinuationLease(token) {
+    state.continuationLease = token;
+  }
+
+  function replAwait(value, token) {
     try {
+      if (typeof token === 'string' && token.length > 0) {
+        // The 0.3.0 continuation-lease form: wrap the awaited value in
+        // a fresh promise whose settle reaction sets the lease (before
+        // resolving the wrapper — the eval's continuation is queued by
+        // the wrapper's settlement, so the lease is in place exactly
+        // when the segment starts). The wrapper mirrors the value
+        // (identity for the resolution value, same rejection value) —
+        // the async machinery sees exactly what it would have seen.
+        return new Promise(function (resolve, reject) {
+          Promise.resolve(value).then(
+            function (v) {
+              try {
+                setContinuationLease(token);
+              } catch (_e) {}
+              resolve(v);
+            },
+            function (e) {
+              try {
+                setContinuationLease(token);
+              } catch (_e) {}
+              reject(e);
+            },
+          );
+        });
+      }
+      // The 0.2.0 form (no token): record the awaited call id when the
+      // awaited value is one of this library's registry promises and
+      // otherwise pass the value through untouched.
       if (value !== null && (typeof value === 'object' || typeof value === 'function')) {
         // Identity scan of the registry (see the state note): the
         // awaited value is one of this library's promises iff it is
@@ -1499,7 +1651,8 @@ const GUEST_LIBRARY_SOURCE = `/*
       }
     } catch (_err) {
       // Never throws by contract: a broken value must not take down
-      // guest code (the bridge's stance, mirrored here).
+      // guest code (the bridge's stance, mirrored here); a wrap
+      // failure degrades to the unwrapped value below.
     }
     return value;
   }
@@ -1524,12 +1677,24 @@ const GUEST_LIBRARY_SOURCE = `/*
      *  older-library rule) and simply gets no await attribution — the
      *  eval-break interrupt degrades to the honest refusal. */
     supportsAwaitTracking: true,
+    /** True when this library copy carries the 0.3.0 continuation-lease
+     *  surface ('__replAwait(value, token)' + the '__replLease'
+     *  accessor global): the host's drain loop reads the lease between
+     *  jobs and the eval-break interrupt keys to the lease token — the
+     *  armed eval's genuine continuation identity. A snapshot carrying
+     *  the 0.2.0 library reports false and the host degrades: no
+     *  instrumentation (the 0.2.0 log-only targeting is the rejected
+     *  settled-call-ids identity), no eval-break targeting — the
+     *  interrupt refuses honestly. */
+    supportsContinuationLease: true,
     /** The awaits logged since the host last took them, oldest first
      *  (call-id strings only — the library's own registry ids; a
      *  pathologically large log is bounded by one operation's awaits
      *  because the host takes it at every operation boundary). The
      *  returned array is a fresh copy; the log is cleared in the same
-     *  call (take semantics — the host is the only consumer). */
+     *  call (take semantics — the host is the only consumer). Kept for
+     *  older hosts; the 0.3.0 broker's targeting rides the
+     *  continuation lease instead. */
     awaitLogTake: function () {
       var out = state.awaitLog;
       state.awaitLog = [];
@@ -1634,6 +1799,22 @@ const GUEST_LIBRARY_SOURCE = `/*
   // never has the instrumenter applied (the broker gates on
   // 'supportsAwaitTracking').
   installGlobal('__replAwait', replAwait);
+
+  // The continuation lease (version 0.3.0): a WRITABLE accessor whose
+  // getter/setter are this closure's own (the host's drain loop reads it
+  // between jobs and clears it after a lease-carrying job; the eval-break
+  // targeting identity). Non-configurable and non-enumerable: guest code
+  // can neither redefine the accessor nor observe it through the
+  // manifest's baseline difference (it IS part of the fresh-realm
+  // baseline). A guest that WRITES the lease (through the setter) is
+  // sabotaging only its own interrupt targeting — the same self-
+  // sabotage stance as the rest of the tracking surface.
+  Object.defineProperty(globalThis, '__replLease', {
+    get: function () { return state.continuationLease; },
+    set: function (v) { state.continuationLease = v; },
+    enumerable: false,
+    configurable: false,
+  });
 
   // Version marker (snapshot versioning: hosts read this — or
   // surface.version — to know which guest library a restored workspace

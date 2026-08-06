@@ -109,7 +109,8 @@ export const replToolInputShape = {
   code: z
     .string()
     .optional()
-    .describe("The JavaScript to eval (top-level await accepted; `return` is a syntax error; console output is captured)."),
+    .describe("The JavaScript to eval (top-level await accepted; `return` is a syntax error; console output is captured). " +
+      "An empty string is valid JavaScript and resolves with `undefined` (the normal resolved eval shape)."),
   ids: z
     .array(z.string())
     .optional()
@@ -213,9 +214,15 @@ export function parseReplToolInput(
   switch (action) {
     case "eval": {
       const code = replToolInputShape.code.parse(raw.code);
-      if (code === undefined || code.length === 0) {
-        invalidReplInput('eval requires a non-empty code string');
+      if (code === undefined) {
+        invalidReplInput('eval requires a code string');
       }
+      // An EMPTY script is valid JavaScript (the doc's `eval { projectDir,
+      // code }` has no non-empty restriction): it resolves with `undefined`
+      // and returns the normal resolved eval shape (phase-E review round
+      // 5: the tool invented a non-empty-code restriction absent from the
+      // doc). Only the ABSENT field is rejected, at the exact-shape
+      // boundary.
       return { action, projectDir, code };
     }
     case "wait": {
@@ -936,10 +943,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
               {
                 type: "text",
                 text: capToolResultText(
-                  `workspace ${context.projectDir}: no running eval to interrupt — no eval is in flight, or the ` +
-                    `in-flight eval awaits nothing this host can key an execution to (a local or never-settling ` +
-                    `promise, or an indirect chain like Promise.all of agent calls — its settlement is the LAST ` +
-                    `component's, unknowable in advance); nothing was armed`,
+                  `workspace ${context.projectDir}: no running eval to interrupt — no eval is in flight, the ` +
+                    `in-flight evals await nothing this host can key an execution to (a never-settling local ` +
+                    `promise — no pending host call's settlement can ever resume it), or the resident guest ` +
+                    `library predates the continuation-lease seam (a restored older snapshot); nothing was armed`,
                 ),
               },
             ],

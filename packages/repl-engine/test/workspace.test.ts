@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { DrainJobError, Workspace, WorkspaceRegistry, loadShippedWasm } from '../src/index.js';
+import { Broker, DrainJobError, Workspace, WorkspaceRegistry, loadShippedWasm } from '../src/index.js';
 
 async function workspace(options?: Parameters<typeof Workspace.create>[1]): Promise<Workspace> {
   return Workspace.create('/tmp/repl-test-project', options);
@@ -357,4 +357,61 @@ test('registry: default memory limit flows to created workspaces', async () => {
   assert.equal(outcome.kind, 'error');
   if (outcome.kind === 'error') assert.equal(outcome.error.outOfMemory, true);
   registry.disposeAll();
+});
+
+test('manifest: user bindings that SHADOW or OVERWRITE baseline globals are enumerated with complete metadata and provenance (phase-E review round 5: the baseline filter removed `const Math = 42` entirely and the provenance registry\'s known-set skip suppressed its origin)', async () => {
+  // The provenance pass is broker-driven (each eval's maintenance pass
+  // attributes new/rebound bindings), so the test drives the workspace
+  // through a broker, exactly like the review suites.
+  const ws = await Workspace.create('/tmp/repl-shadow-project');
+  const broker = await Broker.attach(ws, { evalTimeoutMs: 0 });
+  try {
+    // A LEXICAL shadow of a baseline global: `const Math = 42` — the
+    // binding the orchestrator's code sees is the user's (identifier
+    // resolution prefers the lexical binding), so the manifest lists it
+    // with the lexical value's metadata and the declaring eval's
+    // provenance.
+    const r = await broker.eval('const Math = 42; Math');
+    assert.equal(r.result, '42');
+    let manifest = broker.workspaceManifest();
+    let byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    const math = byName.get('Math');
+    assert.ok(math, `Math is listed: ${[...byName.keys()].join(', ')}`);
+    assert.equal(math!.token, 'number \u00b7 8B');
+    assert.equal(math!.type, 'number');
+    assert.equal(math!.sizeBytes, 8);
+    assert.equal(math!.provenance, 'eval 1', 'the shadowing binding is attributed to its declaring eval');
+    assert.ok(typeof math!.provenanceAtMs === 'number' && math!.provenanceAtMs! > 0);
+    assert.equal(math!.handleCallId, null);
+    assert.equal(math!.handleStatus, null);
+    // Exactly one Math binding (the lexical view wins over the global
+    // property — the same one-binding-per-name rule).
+    assert.equal(manifest.bindings.filter((b) => b.name === 'Math').length, 1);
+    // A GLOBAL PROPERTY overwrite of a baseline builtin: `JSON = "x"`
+    // (sloppy assignment rebinds the global property). The value's type
+    // token changed from the fresh-realm baseline — the manifest lists
+    // the overwrite with its provenance.
+    await broker.eval('JSON = "x"; 1');
+    manifest = broker.workspaceManifest();
+    byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    const json = byName.get('JSON');
+    assert.ok(json, `JSON is listed: ${[...byName.keys()].join(', ')}`);
+    assert.equal(json!.token, 'string \u00b7 1B');
+    assert.equal(json!.type, 'string');
+    assert.equal(json!.provenance, 'eval 2', 'the overwrite is attributed to its eval');
+    // Untouched baseline globals stay hidden (no noise), and the shadow
+    // survives later evals (a stable attribution).
+    await broker.eval('1 + 1');
+    manifest = broker.workspaceManifest();
+    byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    assert.ok(byName.has('Math') && !byName.has('Number'), 'shadow listed, untouched builtins still hidden');
+    assert.equal(byName.get('Math')!.provenance, 'eval 1', 'the shadow attribution is stable');
+    assert.equal(byName.get('JSON')!.provenance, 'eval 2', 'the overwrite attribution is stable');
+    // The workspace keeps working: the guest sees the shadowed values.
+    const live = await broker.eval('Math');
+    assert.equal(live.result, '42');
+  } finally {
+    await broker.dispose();
+    ws.dispose();
+  }
 });

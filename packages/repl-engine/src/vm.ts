@@ -118,6 +118,27 @@ export interface ReplVmOptions {
   memoryLimit?: number;
 }
 
+/** The per-job CONTINUATION-LEASE seam (the eval-break targeting
+ *  identity — see the broker and `guest-library.ts`): the drain loop
+ *  reads the guest library's continuation lease before each job (the VM
+ *  is idle between jobs) and clears it after a job that started with
+ *  one, so the lease is set exactly while a suspended eval's
+ *  continuation segment executes (and during the library's
+ *  lease-setting reaction that immediately precedes it). `cell.current`
+ *  is the host-side mirror of the CURRENT job's lease — an interrupt
+ *  handler consulted DURING the job reads it to learn which eval's
+ *  continuation (if any) is executing. */
+export interface ReplJobLease {
+  /** Read the current continuation-lease token (string) or undefined. */
+  read(): string | undefined;
+  /** Clear the continuation lease (drain start, and after a job that
+   *  started with one). */
+  clear(): void;
+  /** The host-side mirror of the current job's lease, set before each
+   *  job executes. */
+  cell: { current: string | undefined };
+}
+
 /** Options for a single eval. */
 export interface ReplEvalOptions {
   /** Filename used in guest stack traces. Defaults to `'<repl>'`. */
@@ -146,17 +167,20 @@ export interface ReplEvalOptions {
    */
   drainInterruptHandler?: () => boolean;
   /**
+   * The per-job continuation-lease plumbing (see `ReplJobLease`): the
+   * drain loop maintains the lease mirror so the drain-phase interrupt
+   * handler can tell WHICH eval's continuation is executing. The broker
+   * passes its lease; a bare workspace passes none (no tracking).
+   */
+  jobLease?: ReplJobLease;
+  /**
    * Called exactly once per eval, AFTER the script's synchronous code
-   * phase and BEFORE the job drain. The seam the broker's eval-await
-   * attribution uses: an eval's own code awaits (`__replAwait` calls)
-   * all execute synchronously in the code phase — the continuations a
-   * synchronous host-callback settlement (a checkpoint answer) queued
-   * run only in the drain phase — so this boundary splits the eval's
-   * OWN awaits from other evals' resumed continuations (phase-E review
-   * round 4: the eval-break targeting identity is the calls the eval
-   * AWAITS, and the eval's own awaits end here). The callback runs
-   * while the VM is idle (the code phase returned; no guest code is on
-   * the stack), so the caller may perform host-side VM reads.
+   * phase and BEFORE the job drain. The code-phase boundary: the
+   * script's synchronous execution — including every synchronous host
+   * callback it made — has finished, and the drain phase (which runs
+   * the continuations the code phase queued) is next. The callback
+   * runs while the VM is idle (the code phase returned; no guest code
+   * is on the stack), so the caller may perform host-side VM reads.
    */
   beforeDrain?: () => void;
   /**
@@ -190,6 +214,13 @@ export interface ReplDrainOptions {
    * `InternalError: interrupted` (surfaced as a `DrainJobError`).
    */
   interruptHandler?: () => boolean;
+  /**
+   * The per-job continuation-lease plumbing (see `ReplJobLease`): the
+   * drain loop maintains the lease mirror so the drain's interrupt
+   * handler can tell WHICH eval's continuation is executing. The broker
+   * passes its lease; a bare workspace passes none (no tracking).
+   */
+  jobLease?: ReplJobLease;
 }
 
 /**
@@ -495,7 +526,7 @@ export class ReplVm {
       // idle here, so the callback may touch the VM.
       options.beforeDrain?.();
       try {
-        this.runDrain();
+        this.runDrain(options.jobLease);
       } catch (e) {
         if (e instanceof DrainJobError) {
           // The drain was INTERRUPTED (the armed eval-break signal, or
@@ -550,7 +581,7 @@ export class ReplVm {
     this.interruptSlot.current = options.interruptHandler ?? null;
     this.opDepth++;
     try {
-      return this.runDrain();
+      return this.runDrain(options.jobLease);
     } finally {
       this.interruptSlot.current = previousInterrupt;
       this.opDepth--;
@@ -765,12 +796,34 @@ export class ReplVm {
    * failed job's exception is read trap-free and thrown as a
    * `DrainJobError`; the drain stops at the first failure, so jobs queued
    * after it remain pending for a later drain.
+   *
+   * With a `jobLease` (see `ReplJobLease`) the loop maintains the
+   * continuation-lease mirror: the guest lease is cleared at drain start
+   * (a stale lease left by an interrupted drain must never leak into this
+   * drain's first job), read before each job into `cell.current` (the
+   * interrupt handler consulted during the job reads the mirror), and
+   * cleared again after a job that started with one. The guest library's
+   * lease-setting reaction sets the lease DURING its own job, so the job
+   * AFTER it — the eval's continuation segment — starts with the lease
+   * set, and the segment's end (the next loop iteration) clears it: the
+   * lease is set exactly while the segment executes.
    */
-  private runDrain(): number {
+  private runDrain(lease?: ReplJobLease): number {
     const e = this.vm._getExports();
     let count = 0;
+    lease?.clear();
+    if (lease !== undefined) lease.cell.current = undefined;
     while (e.qjs_is_job_pending() !== 0) {
+      // The current job's lease, read between jobs (the VM is idle).
+      const jobLease = lease?.read();
+      if (lease !== undefined) lease.cell.current = jobLease;
       const result = e.qjs_execute_pending_job();
+      // The lease-carrying job ended: clear the guest lease so a later
+      // job (or a later drain) never starts under a stale lease. The
+      // mirror keeps the value until the next job's read — the only
+      // reader (the interrupted-drain release) runs right after the
+      // drain throws.
+      if (jobLease !== undefined) lease?.clear();
       if (result < 0) {
         // The failed job's exception is the runtime's current exception.
         // `qjs_get_exception` moves it out (the runtime's slot is cleared,

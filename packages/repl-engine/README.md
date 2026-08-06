@@ -202,23 +202,35 @@ registry lives in the library's closure and **travels inside snapshots**; on res
 host re-registers the four callbacks by name (`registerGuestHostCallbacks`) and
 reconciles — the library itself is never re-evaluated (idempotence guard).
 
-**Eval-await tracking (version 0.2.0)** — the eval-break targeting seam (the `interrupt`
-tool's no-id arm): the library defines `__replAwait(value)` — the global the host's
-`instrumentTopLevelAwaits` rewrite inserts around every TOP-LEVEL `await` of an eval
-(`await x` → `await __replAwait(x)`) — which records the awaited value's call id when it
-is one of the library's own registry promises (each registry entry carries its `promise`
-field; the look-up is a closure-private registry scan, forge-proof — a per-promise side
-table measurably grew every parked call's realm footprint and tipped the bounded-memory
-suite's knife-edge). The chronological `awaitLog` is consumed by the host at operation
-boundaries through the surface's `awaitLogTake()` (take semantics; `supportsAwaitTracking`
-reports the capability), and the entries are the broker's attribution of WHICH pending
-call's settlement queues WHICH suspended eval's continuation — the armed signal fires
-only on the target's own resume keys, never on an unawaited sibling call. A snapshot
-carrying the 0.1.0 library is served as-is (the version-compatibility rule below): the
-host skips the instrumenter on it and the eval-break interrupt degrades to the honest
-refusal. The transform is a pure source rewrite at exact AST boundaries (acorn; nested
-function bodies are never touched — an await inside a `.then` callback or a combinator
-thunk belongs to its own continuation, not the eval's).
+**Eval-await tracking — the continuation lease (version 0.3.0)** — the eval-break
+  targeting seam (the `interrupt` tool's no-id arm): the library defines
+  `__replAwait(value, token)` — the global the host's `instrumentTopLevelAwaits` rewrite
+  inserts around every TOP-LEVEL `await` of an eval (`await x` →
+  `await this["__replAwait"](x, TOKEN)`; the `this` base is the engine's global-object
+  binding for the script's async wrapper, so the injected expression names no
+  shadowable identifier — the phase-E review round-5 hygiene regression: the old
+  instrumenter's guest-resolvable `__replAwait` identifier was shadowable by a lexical
+  declaration, changing program semantics). With a token the awaited value is WRAPPED in
+  a fresh promise whose settling reaction — the job that runs IMMEDIATELY BEFORE the
+  eval's continuation segment — sets the CONTINUATION LEASE (the writable `__replLease`
+  accessor global) to the eval's token. The host's drain loop reads the lease between
+  jobs: a job that starts with a lease set IS the armed eval's continuation, and the
+  lease is cleared after the segment ends — the armed signal's genuine per-eval
+  identity. An unawaited sibling `.then` registered before the target's await runs
+  first in the settlement drain (before the lease-setting reaction) and can neither
+  fire nor consume the signal; an indirect wait (`await Promise.all([q])`) is
+  targetable through the promise graph (the 0.2.0 log-only targeting refused it); a
+  never-settling local promise is refused at arm time (no pending host call can ever
+  resume it). The surface's `supportsContinuationLease` reports the capability. A
+  snapshot carrying the 0.1.0/0.2.0 library is served as-is (the version-compatibility
+  rule below): the host skips the instrumenter on it and the eval-break interrupt
+  degrades to the honest refusal (the 0.2.0 log-only targeting is the rejected
+  settled-call-ids identity). The transform is a pure source rewrite at exact AST
+  boundaries (acorn; nested function bodies are never touched — an await inside a
+  `.then` callback or a combinator thunk belongs to its own continuation, not the
+  eval's) and injects nothing but the call sites (no helper binding — a top-level
+  `const` would persist in the realm's global lexical record and redeclare on the loop
+  idiom).
 
 **Version compatibility** (the doc's evolution disciplines): the library is versioned with the
 workspace, not the host — a host must serve any snapshot whose resident library is the same or
@@ -312,7 +324,8 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
 - **Steering resolves with what actually happened** (the doc's "nothing is hidden, nothing
   hard-errors"): `followUp`/`steer` settle with acp-agents' steering-outcome vocabulary where the
   backend advertises `_session/steering`, with the broker's honest `queued` marker where it does
-  not (the steering mechanism table is in `src/broker.ts`'s module docs). Steering calls NEVER
+  not (the per-backend steering mechanism table is the GENERATED artifact in
+  `docs/steering-mechanism-table.md` — see `src/steering-table.ts` and its gate test). Steering calls NEVER
   hard-error: backend/wire failures resolve `failed`; the only rejections are guest protocol
   violations. `cancel()` resolves `cancelled` (turn in flight), `idle` (nothing running) or
   `failed`; a cancelled call rejects with the RECOVERABLE `AGENT_CANCELLED` (one worker's
@@ -617,11 +630,12 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   stays complete. Re-issues respect the concurrency cap (over-cap re-issues refuse with the
   recoverable `ConcurrencyLimitError`).
 
-Phase E review round 3 decisions (the carried review's three defects):
+Phase E review round 3 decisions (the carried review's three defects, as re-verified in
+round 5):
 
-- **The eval-break signal is keyed to the armed target's CONTINUATION, not to whichever drain runs next.** The carried defect: the drain-phase interrupt handler was installed on every later eval's drain without checking whether that drain resumed an armed target — an unrelated finite eval B (or an unrelated settlement drain) consumed the signal and `noteInterruptedDrain` cleared the target's tracking while its checkpoint stayed pending and uninterruptible. The armed identity is now the union of the armed evals' OWN suspension-time calls (`evalSuspensionCalls`: pending at suspension MINUS pending at eval start — the calls the eval issued itself, the settlements that queue its continuation; a later eval's snapshot never inherits an earlier eval's still-pending calls, so a settlement of an unrelated call can never fire the signal), carried in `evalBreakDeps`. Every VM operation maintains a settlement accumulator (`opSettledCalls` — every settlement route appends: `settleIntoGuest`, `settleCheckpoint`, `refuse`, `settleSteerSync`; the pump/reconcile/disconnect drains seed it with the settlements that triggered them), and the signal fires only while that accumulator intersects the armed deps — the currently-executing drain BELONGS to the armed target. An unrelated drain neither fires nor consumes it; the armed state survives intact. The interrupted-drain release (`noteInterruptedDrain`) is gated the same way: exactly the tracked evals whose own resume keys the interrupted operation settled are released (a deadline-broken resumed runaway releases its tracked eval even when no signal was armed — a stale target would make a later arm target a dead eval); an unrelated interrupted drain leaves the armed state and every tracked eval intact. A no-id interrupt with NOTHING BREAKABLE — no eval in flight, or every in-flight eval suspended on no OWN pending call (a never-settling local promise, or an `await p` on an earlier eval's binding — that call belongs to the EARLIER eval, and breaking an unrelated continuation is exactly the leak the targeting discipline forbids) — REFUSES and arms nothing.
-- **The bounded wait sleeps only for the REMAINING budget**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches.
-- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array cap silently truncated the guest surface's `pending()` list, and its `[ArrayTruncated]` marker mapped to `undefined` in the broker's id lists (a hole in the tool's structured `pending`). `readValue` now takes an explicit array bound (default 256 — the preview read is unchanged); the surface read passes `SURFACE_READ_MAX_LEN` (16 384 — the pending registry is the host's own reconciliation metadata, bounded by VM memory; the bound keeps a pathological registry from making every `pending` read pathological).
+- **The eval-break signal is keyed to the armed target's CONTINUATION, not to whichever drain runs next.** The carried defect: the drain-phase interrupt handler was installed on every later eval's drain without checking whether that drain resumed an armed target — an unrelated finite eval B (or an unrelated settlement drain) consumed the signal and the interrupted-drain release cleared the target's tracking while its checkpoint stayed pending and uninterruptible. The armed identity is the target's CONTINUATION TOKEN (round 5): the guest library's `__replAwait(value, token)` wrap sets the continuation lease to the eval's token in the job immediately before the eval's continuation segment, the drain loop mirrors the lease per job, and the signal fires only while the executing JOB holds an armed token — the executing job IS the target's continuation. An unrelated drain — and an unrelated JOB inside a drain that settled a target's call (an unawaited sibling `.then` registered before the target's await runs first, before the lease-setting reaction: it can neither fire nor consume the signal) — leaves the armed state intact; an indirect wait (`await Promise.all([q])`) is targetable through the promise graph (round 5's regressions). The interrupted-drain release (`releaseInterruptedEval`) is exact the same way: the interrupted job's lease names the eval whose continuation was actually executing — exactly that eval is released (a deadline-broken resumed runaway releases its tracked eval even when no signal was armed — a stale target would make a later arm target a dead eval); an unrelated interrupted drain leaves the armed state and every tracked eval intact. A no-id interrupt with NOTHING BREAKABLE — no eval in flight, or every in-flight eval suspended with NO pending host call (a never-settling local promise — no execution can ever resume it; a suspended eval's continuation is always queued by a pending call's settlement, directly or through any promise chain) — REFUSES and arms nothing.
+- **The bounded wait sleeps only for the REMAINING budget**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches. A zero `timeoutMs` still performs ONE immediately available state read (round 5's regression: the chain acquisition used to return unacquired with the deadline already past, so an idle workspace reported `drained: false` and a pending call's surface read as empty).
+- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array cap silently truncated the guest surface's `pending()` list, and its `[ArrayTruncated]` marker mapped to `undefined` in the broker's id lists (a hole in the tool's structured `pending`). `readValue` still bounds the general preview read (default 256); the host-owned metadata surfaces (`readValueComplete` — the pending registry, the await log, the provenance registry's `read()` result) read with NO array-length or object-key cap: they are the frozen guest library's own metadata, bounded by the VM's memory like the metadata itself.
 
 Phase B decisions (the guest library, bridge, previewer):
 
@@ -844,11 +858,19 @@ Queued-but-undelivered steers survive the drain (re-queued durably against their
 session ids — the next re-attach delivers them exactly once). At daemon shutdown every
 workspace drains with the shutdown deadline before the broker teardown.
 
-## Out of scope for this phase (later phases, per the roadmap doc)
+## The generated steering mechanism table
 
-The per-backend steering mechanism table as GENERATED DOCUMENTATION (the mechanism is
-decided and documented in `src/broker.ts`'s module docs; the doc's generated table is the
-observability layer's artifact).
+The per-backend steering mechanism table (the doc's spec-owed decision: "the table is
+documentation generated from the capability probes") is a GENERATED ARTIFACT:
+[`docs/steering-mechanism-table.md`](docs/steering-mechanism-table.md) is produced from
+the live capability probes in `@automatalabs/acp-agents`'s
+`ACP_EXTENSION_SUPPORT_MATRIX` (see `src/steering-table.ts`), and
+`test/steering-table.test.ts` GATES it — the suite regenerates the document and fails
+when the checked-in file drifts from the probes. Regenerate with
+`pnpm --filter @automatalabs/repl-engine generate:steering-table`. The mechanism per
+backend follows directly from the probed disposition: `supported` → live injection via
+`session.steer()`; anything else → queued-for-next-turn delivery; a custom backend is
+capability-gated per session at open.
 
 ## Development
 
