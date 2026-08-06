@@ -30,6 +30,11 @@
       "sha": "2c1b2084a1e7348b3aaf58f855f6988da8e70ebb",
       "imported": "2026-08-06",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (lockfile dev-deps bump)"
+    },
+    {
+      "sha": "4bb290f5bd3d48d6b07338d3634cc13fe9c1b49e",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (goal resume fix)"
     }
   ]
 }
