@@ -1301,6 +1301,85 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
   assert.equal(runner.sessions[0].releases, 1, "the late child was closed without prompting");
 });
 
+test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY durable — the daemon can be killed right after the interrupt (NO eval or wait in between) and the restart restores the SETTLED workspace: the manifest provenance attributes the settlement's continuation to the cancelled worker, the registry is settled (nothing left for the store arm), and the guest promise rejects with the cancellation (the phase-E review rejection: the opening-cancel skipped the settlement boundary, so the daemon's snapshot writer never marked the workspace dirty and the kill restored the PRE-settlement snapshot with the call still pending — the round-8 regression masked it by performing another eval and wait before the restart)", async () => {
+  const runner = new DelayedOpenRunner();
+  runner.parkOpens();
+  const PROJECT = makeProjectDir("repl-interrupt-opening-immediate");
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      // The settlement drain's continuation creates a binding whose
+      // provenance must travel INSIDE the interrupt's own snapshot.
+      const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const p = agent("pi/x", "task"); p.catch(() => { globalThis.wasCancelled = true; }); "started"` });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      await tick();
+      const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c1" });
+      assert.ok(!isErrorResult(interrupted), textOf(interrupted));
+      const si = (interrupted as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal((si.interrupt as { outcome: string }).outcome, "cancelled", `honest outcome: ${JSON.stringify(si.interrupt)}`);
+      // NO further repl calls — the daemon dies immediately. The
+      // interrupt's own settlement boundary must already have persisted
+      // the settled workspace (the op-end flush writes before the tool
+      // call resolves).
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+  // The restart over the same home: the FIRST read is a status, and it
+  // must already see the settlement — the restored registry is settled
+  // (c1 not pending) and the continuation binding carries the
+  // settlement's provenance FROM THE SNAPSHOT (without the fix, the
+  // restored pre-settlement VM's continuation runs only at reconcile,
+  // with no provenance pass before the read — the manifest would show
+  // null provenance).
+  const daemon2 = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon2.url);
+    try {
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!isErrorResult(status), textOf(status));
+      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const w0 = (sc.workspaces as Array<Record<string, unknown>>)[0];
+      assert.ok(w0 !== undefined, `a workspace is reported: ${JSON.stringify(sc)}`);
+      assert.ok(!(w0.pending as string[]).includes("c1"), `the restored registry is settled: ${JSON.stringify(w0.pending)}`);
+      // The discriminator: the interrupt's OWN snapshot carried the
+      // settlement, so the restart's reconcile has NOTHING for the
+      // store arm (without the fix, the restore reconciles the
+      // pre-settlement snapshot and settles c1 from the store here).
+      const reconcile = w0.reconcile as { settledFromStore: string[] } | undefined;
+      assert.ok(reconcile !== undefined, "the restored workspace carries its reconcile summary");
+      assert.deepEqual(reconcile.settledFromStore, [], "the store arm had nothing to settle — the snapshot already carried the settlement");
+      const bindings = w0.bindings as Array<Record<string, unknown>>;
+      const wasCancelled = bindings.find((b) => b.name === "wasCancelled");
+      assert.ok(wasCancelled !== undefined, `the continuation binding survived the restart: ${JSON.stringify(bindings)}`);
+      assert.equal(wasCancelled.provenance, "worker c1", "the settlement provenance traveled inside the interrupt's snapshot");
+      // The guest promise rejects with the durable cancellation.
+      const read = await repl(session, { action: "eval", projectDir: PROJECT, code: `await p.catch((e) => "ERR:" + e.message)` });
+      assert.ok(!isErrorResult(read), textOf(read));
+      const sc1 = (read as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.ok(
+        String(sc1.result).includes("was cancelled by interrupt"),
+        `the restart settles the durable cancellation: ${sc1.result}`,
+      );
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon2.close();
+  }
+  // The LATE open lands after everything: the child is closed
+  // immediately — it never prompts — and nothing re-opened across the
+  // immediate restart.
+  runner.releaseOpens();
+  await tick();
+  assert.equal(runner.sessions.length, 1, "exactly one session ever opened");
+  assert.equal(runner.sessions[0].prompts.length, 0, "the stopped call never ran a turn");
+  assert.equal(runner.sessions[0].releases, 1, "the late child was closed without prompting");
+});
+
 test("review round 8: the aggregate structured-result cap bounds the eval/wait/status wire — 16 500 parked checkpoints cross the wire as an EXPLICITLY-FLAGGED head prefix (kept ids well-formed, never a silent undefined hole), the elided counts reconcile to the true totals, and the serialized structuredContent respects the doc's 10 KB cap; a daemon RESTART restores and reconciles the FULL registry in the VM while the wire stays bounded (the phase-E review rejection: 16 500 pending ids crossed the wire as an ~80 KB array — structuredContent was uncapped while only the text was)", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);

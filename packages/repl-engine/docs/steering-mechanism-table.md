@@ -36,11 +36,10 @@ the mechanism table for one session:
 | no live session for the founding call at all (never opened, or lost) | — | `failed` (nothing was steered) |
 | `cancel()` with a turn in flight | ACP `session/cancel` | `cancelled` (the cancelled call itself rejects with the recoverable `CancelledError`) |
 | `cancel()` with the session idle | no-op — the agent is already stopped | `idle` |
-| `cancel()` while the call is still opening | no-op — nothing was running to cancel (the call continues) | `failed` |
+| `cancel()` while the call is still opening | the opening call is fenced and settled durably as cancelled (an eventual late child is closed without prompting) | `cancelled` (the cancelled call rejects with the recoverable `AGENT_CANCELLED`) |
 
 The outcome surface therefore mirrors acp-agents' `SteeringOutcome` values (`injected` /
 `startedNewTurn` / `failed`) with one honest addition (`queued`) for the no-extension
 enqueue case, plus the cancel vocabulary (`cancelled` / `idle`) — the orchestrator can always
 tell urgency delivery (injected) from next-turn delivery (queued / startedNewTurn), which is the
 doc's stated requirement.
-

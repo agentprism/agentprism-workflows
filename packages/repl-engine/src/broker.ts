@@ -279,7 +279,7 @@
  * | no live session for the founding call at all (never opened, or lost) | — | `failed` (nothing was steered) |
  * | `cancel()` with a turn in flight | ACP `session/cancel` | `cancelled` (the cancelled call itself rejects with the recoverable `CancelledError`) |
  * | `cancel()` with the session idle | no-op — the agent is already stopped | `idle` |
- * | `cancel()` while the call is still opening | no-op — nothing was running to cancel (the call continues) | `failed` |
+ * | `cancel()` while the call is still opening | the opening call is fenced + settled durably as cancelled (a late child is closed without prompting) | `cancelled` (the call rejects with the recoverable `AGENT_CANCELLED`) |
  *
  * The outcome surface therefore mirrors acp-agents' `SteeringOutcome`
  * values (`injected` / `startedNewTurn` / `failed`) with one honest
@@ -2193,7 +2193,9 @@ export class Broker {
    *  the client-presence drain's bound force-stop exactly: the
    *  completion is recorded FIRST (durable — a kill after this returns
    *  settles the call from the store on restore), the guest settles
-   *  first-wins, the concurrency token is released, and the
+   *  first-wins, the concurrency token is released (with the global
+   *  queued-delivery kick — the freed slot starts any cap-pressure
+   *  follow-up immediately), and the
    *  `stoppedOpens` fence is set so an eventual late landing closes the
    *  child immediately WITHOUT prompting (its reject is a first-wins
    *  no-op against the recorded completion). Returns whether the call
@@ -2212,7 +2214,14 @@ export class Broker {
     );
     this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
     this.settleIntoGuest(callId, 'reject', value);
+    // The freed concurrency token starts any queued steers through the
+    // GLOBAL kick — the cancelled opening call's slot release is a
+    // slot-free transition like any other (phase-E review rejection: the
+    // release used to skip the kick, so a cap-pressure follow-up queued
+    // on an idle session stayed stuck even though capacity had become
+    // available).
     this.agentSlots.delete(callId);
+    this.kickQueuedDeliveries();
     this.warnLine('warn', `call ${callId}: ${value.message}`);
     return true;
   }
@@ -2266,9 +2275,26 @@ export class Broker {
         this.stopOpeningCall(callId, 'interrupt');
         try {
           this.drain();
+          // The opening-cancel is a settlement drain that changed VM
+          // state: it fires the SAME per-settlement provenance pass and
+          // state-changing boundary as the pump (phase-E review
+          // rejection: the cancelled opening call's settlement used to
+          // skip both — the manifest missed the settlement's
+          // provenance, and the daemon's sink never marked the
+          // workspace dirty, so a kill immediately after the interrupt
+          // restored the PRE-settlement snapshot with the call still
+          // pending; the round-8 daemon regression masked the defect by
+          // performing another eval and wait before the restart).
+          this.provenancePass('settlement', [callId]);
+          this.sink?.boundary('settlement');
         } catch (error) {
           if (error instanceof DrainJobError) {
             this.warnLine('warn', `settlement drain interrupted after cancelling opening call ${callId}: ${errorLine(error.info)}`);
+            // The settlement landed even though the continuation drain
+            // failed: the boundary still fires (mirrors the pump's
+            // drain-failure arm) so the operation-end flush persists
+            // the changed VM.
+            this.sink?.boundary('settlement');
           } else throw error;
         }
         return { kind: 'opening-cancelled' as const };

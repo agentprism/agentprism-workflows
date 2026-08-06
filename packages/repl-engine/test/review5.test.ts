@@ -22,11 +22,15 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
   Broker,
   InMemoryCallStore,
+  JsonlCallStore,
   Workspace,
   type BrokerLoadSessionOptions,
   type BrokerOpenSessionOptions,
@@ -34,6 +38,9 @@ import {
   type BrokerRunner,
   type BrokerSession,
   type BrokerTurn,
+  type CallStore,
+  type SnapshotBoundaryKind,
+  type SnapshotSink,
 } from '../src/index.js';
 
 const PROJECT = '/tmp/repl-review5-project';
@@ -150,15 +157,21 @@ class FakeRunner implements BrokerRunner {
   }
 }
 
-async function setup(options: { runner?: BrokerRunner; maxConcurrentAgents?: number } = {}): Promise<{
+async function setup(options: {
+  runner?: BrokerRunner;
+  maxConcurrentAgents?: number;
+  store?: CallStore;
+  sink?: SnapshotSink;
+} = {}): Promise<{
   ws: Workspace;
   broker: Broker;
 }> {
   const ws = await Workspace.create(PROJECT);
   const broker = await Broker.attach(ws, {
     runner: options.runner,
-    store: new InMemoryCallStore(),
+    store: options.store ?? new InMemoryCallStore(),
     evalTimeoutMs: 0, // tests drive interrupts explicitly
+    snapshotSink: options.sink,
     ...(options.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: options.maxConcurrentAgents } : {}),
   });
   return { ws, broker };
@@ -511,6 +524,140 @@ test('review 8/6b: the guest handle cancel() on a still-OPENING call is the same
   const after = broker.store().lookup('c1')!;
   assert.equal(after.completion!.outcome, 'reject');
   assert.equal(after.reissues, 0, 'never re-issued');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 9. The opening-cancel's settlement boundary + provenance, and the
+//        slot release's queued-delivery kick (phase-E review rejection
+//        round 9) ────────────────────────────────────────────────────
+
+test('review 9/1: cancelling a still-OPENING call is a settlement drain that fires the per-settlement provenance pass AND the state-changing boundary — the manifest immediately attributes the continuation\'s binding to the cancelled worker, and an IMMEDIATE snapshot/restart (no eval or wait in between) restores the settled registry with that provenance intact (the phase-E review rejection: the opening-cancel settled and drained the guest but skipped `provenancePass` and `sink.boundary`, so the manifest missed the settlement\'s provenance and a kill right after the interrupt restored the PRE-settlement snapshot with the call still pending — the round-8 daemon regression masked it by performing another eval and wait before the restart)', async () => {
+  const runner = new FakeRunner();
+  const boundaries: SnapshotBoundaryKind[] = [];
+  let flushes = 0;
+  const sink: SnapshotSink = {
+    boundary(kind) {
+      boundaries.push(kind);
+    },
+    flush() {
+      flushes++;
+    },
+  };
+  const dir = mkdtempSync(join(tmpdir(), 'repl-review9-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const { ws, broker } = await setup({ runner, store: JsonlCallStore.open(storePath), sink });
+  // Park the founding session's open.
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  // The settlement drain's continuation creates a binding: without the
+  // per-settlement provenance pass, `wasCancelled` would never be
+  // attributed to the worker that was cancelled.
+  await broker.eval('const p = agent("pi/x", "task"); p.catch(() => { globalThis.wasCancelled = true; }); "started"');
+  await tick();
+  boundaries.length = 0;
+  assert.equal(await broker.cancelCall('c1'), 'cancelled');
+  // THE SINK-BOUNDARY ASSERTION: the interrupt ITSELF fired the
+  // settlement boundary — no eval or wait in between — and the
+  // serialized operation flushed the burst (the daemon's writer would
+  // persist the settled workspace before the interrupt's promise
+  // resolves).
+  assert.deepEqual(boundaries, ['settlement'], `exactly the settlement boundary fired: ${boundaries.join(',')}`);
+  assert.ok(flushes >= 1, 'the operation-end burst flush ran');
+  // THE PROVENANCE ASSERTION: the continuation the settlement drain ran
+  // is attributed to the cancelled worker — not a later eval.
+  const view = ws.provenanceView();
+  assert.equal(view.origins.get('wasCancelled')?.via, 'worker c1', 'the settlement pass attributed the continuation binding');
+  const manifest = broker.workspaceManifest();
+  const binding = manifest.bindings.find((b) => b.name === 'wasCancelled');
+  assert.ok(binding !== undefined, 'the continuation binding is in the manifest');
+  assert.equal(binding.provenance, 'worker c1', 'the manifest carries the settlement provenance');
+  // THE IMMEDIATE RESTART REGRESSION: snapshot NOW — no eval or wait in
+  // between — and restore over the same store. The restored VM must
+  // already carry the settlement (the registry is empty — nothing left
+  // for the reconcile's store arm) with the provenance intact inside
+  // the snapshot.
+  const snapshot = ws.snapshot();
+  await broker.dispose();
+  ws.dispose();
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, {
+    runner: runner2,
+    store: JsonlCallStore.open(storePath),
+    evalTimeoutMs: 0,
+  });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.settledFromStore, [], 'the snapshot already carries the settlement — the store arm has nothing to settle');
+  assert.deepEqual(
+    broker2.pendingCalls().map((e) => e.id),
+    [],
+    'the restored registry is settled, not pending',
+  );
+  const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+  assert.ok(
+    (got.result ?? '').includes('was cancelled by interrupt'),
+    `the guest-visible settlement survives the immediate restart: ${got.result}`,
+  );
+  const view2 = ws2.provenanceView();
+  assert.equal(view2.origins.get('wasCancelled')?.via, 'worker c1', 'the provenance traveled INSIDE the snapshot');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('review 9/2: cancelling a still-OPENING call releases its concurrency slot THROUGH THE GLOBAL KICK — a cap-pressure follow-up queued on an idle session starts its delivery turn the moment the opening call is cancelled (the phase-E review rejection: the slot release skipped `kickQueuedDeliveries`, so under a cap of one the queued follow-up stayed stuck despite capacity becoming available)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner, maxConcurrentAgents: 1 });
+  // The founding call opens and settles: its session is IDLE with the
+  // slot free.
+  await broker.eval('const pi = agent("pi/x", "task"); "started"');
+  await tick();
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  // A second call dispatches (holding the only slot) with its open
+  // PARKED: the cap is exhausted while the first session sits idle.
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  await broker.eval('const q = agent("pi/x", "second"); "started"');
+  await tick();
+  assert.equal(runner.sessions.length, 1, 'the second call is still opening');
+  // The cap-pressure follow-up on the IDLE session queues with the
+  // honest `queued` outcome (a follow-up turn IS subagent work — the
+  // ceiling is absolute).
+  const queued = await broker.eval('const o = await pi.steer("go deeper"); "outcome:" + o');
+  assert.equal(queued.result, '"outcome:queued"', 'the cap-pressure follow-up queued');
+  assert.equal(runner.last().prompts.length, 0, 'no delivery turn can start while the cap is exhausted');
+  // Cancel the OPENING call: its slot frees, and the slot-release kick
+  // must start the queued follow-up as a delivery turn — the old code
+  // released the token without kicking, so the follow-up stayed queued
+  // forever.
+  assert.equal(await broker.cancelCall('c2'), 'cancelled');
+  await tick();
+  assert.equal(runner.last().prompts.length, 1, 'the queued follow-up started as a delivery turn');
+  assert.equal(runner.last().prompts[0].content, 'go deeper');
+  // The late landing of the cancelled open closes the child without
+  // prompting.
+  releaseOpen();
+  await waitFor(() => runner.sessions.length === 2);
+  const late = runner.sessions[1];
+  assert.equal(late.releases, 1, 'the stopped child was closed without ever prompting');
+  assert.equal(late.prompts.length, 0, 'the supposedly-interrupted call never ran a turn');
   await broker.dispose();
   ws.dispose();
 });

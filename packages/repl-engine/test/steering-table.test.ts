@@ -61,4 +61,27 @@ test('the generated table reflects the live probe dispositions (every built-in b
   const doc = generateSteeringMechanismTable();
   assert.ok(doc.includes('custom backend'), 'the capability-gated custom row is documented');
   assert.ok(doc.includes('queued'), 'the queued-for-next-turn fallback is documented');
+  // The CORRECTED cancel-during-opening case (phase-E review rejection:
+  // the table used to claim cancel() during opening is a no-op that
+  // returns `failed` while the call continues — broker.cancelCall now
+  // cancels the opening call, fences it, settles it durably as
+  // AGENT_CANCELLED, and returns `cancelled`; the generated table must
+  // pin the implemented behavior, never the stale prose).
+  assert.ok(
+    doc.includes('the opening call is fenced and settled durably as cancelled'),
+    'the table documents the fenced + durable opening-cancel',
+  );
+  assert.ok(
+    doc.includes('`cancelled` (the cancelled call rejects with the recoverable `AGENT_CANCELLED`)'),
+    'the opening-cancel outcome is the honest `cancelled`',
+  );
+  assert.ok(
+    !doc.includes('no-op — nothing was running to cancel'),
+    'the stale no-op claim is gone from the generated document',
+  );
+  // EXACTLY ONE terminal newline (phase-E review rejection: the
+  // generator emitted two, so `git diff --check` failed with "new blank
+  // line at EOF" on the checked-in artifact).
+  assert.ok(doc.endsWith('\n'), 'the document ends with a newline');
+  assert.ok(!doc.endsWith('\n\n'), 'exactly one terminal newline — no trailing blank line');
 });
