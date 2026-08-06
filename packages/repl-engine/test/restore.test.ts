@@ -26,7 +26,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
-import { AcpAgentRunner } from '@automatalabs/acp-agents';
+import { AcpAgentRunner, LoadedTurnStillRunningError } from '@automatalabs/acp-agents';
 
 import {
   Broker,
@@ -129,6 +129,11 @@ class FakeSession implements BrokerSession {
    *  from the session/load replay + stream settling). Null parks the seam
    *  (still running at load). */
   loadedTurnTextValue: string | null = null;
+  /** A hung cancel (the drain-bound regression: the post-deadline cancel
+   *  await must not block disconnect past the bound). */
+  hangCancel = false;
+  /** A hung release (same regression for the release phase). */
+  hangRelease = false;
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
@@ -164,6 +169,7 @@ class FakeSession implements BrokerSession {
   }
 
   cancel(): Promise<void> {
+    if (this.hangCancel) return new Promise(() => {});
     for (const pending of this.prompts.splice(0)) {
       pending.resolve({ stopReason: 'cancelled', text: '' });
     }
@@ -172,6 +178,7 @@ class FakeSession implements BrokerSession {
 
   release(): Promise<void> {
     this.releases++;
+    if (this.hangRelease) return new Promise(() => {});
     return Promise.resolve();
   }
 
@@ -857,6 +864,10 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
       loadSessionSupport: true,
       turns: [{ text: 'initial' }],
       loadSession: {
+        // The _session/loaded_turn extension's authoritative answer: the
+        // founding turn completed while down — the replay's trailing
+        // assistant message is its FINAL message.
+        loadedTurn: { status: 'completed' },
         replay: [
           { role: 'user', text: 'task' },
           { role: 'assistant', text: 'result B (loaded)' },
@@ -890,6 +901,7 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
         loadSessionSupport: true,
         turns: [{ text: 'initial' }],
         loadSession: {
+          loadedTurn: { status: 'completed' },
           replay: [
             { role: 'user', text: 'task' },
             { role: 'assistant', text: 'result B (loaded)' },
@@ -945,36 +957,38 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
   }
 });
 
-test('restore through the REAL acp-agents adapter: a founding turn still in flight at the backend is KEPT ATTACHED, never settled from a quiet gap, and degrades to re-issue at the max-wait bound (partial output is never durable)', async () => {
+test('restore through the REAL acp-agents adapter: a founding turn still in flight at the backend is KEPT ATTACHED and settles from the authoritative _session/loaded_turn/ended notification — partial output is never settled from a quiet gap, and the still-running turn is never re-issued (duplicated work)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-run-'));
   const storePath = join(dir, 'calls.jsonl');
-  const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
   const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
-  process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = '100';
-  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = '350';
+  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = '2000';
   try {
     // The replay ends at the founding turn's user message, and the backend
     // CONTINUES streaming live chunks AFTER the session/load response —
-    // the turn is still running at the backend when we reconnect. The
-    // seam keeps the loaded session attached (phase-D review: this case
-    // used to be released and re-issued immediately, risking duplicated
-    // work) but NEVER settles from a quiet gap: a resumed turn's
-    // completion has no terminal marker over ACP v1, so after the
-    // max-wait bound it rejects and the broker re-issues under the same
-    // id — the honest fallback, surfaced guest-visibly. Partial output of
-    // the paused live turn is never durably settled (phase-D review round
-    // 2: a quiet period followed by a trailing assistant chunk used to be
-    // treated as authoritative completion).
+    // the turn is still running at the backend when we reconnect (the
+    // extension's query answers `running`). The seam keeps the loaded
+    // session attached (phase-D review: this case used to be released and
+    // re-issued immediately, risking duplicated work) and NEVER settles
+    // from a quiet gap: the turn's completion is the AUTHORITATIVE
+    // `_session/loaded_turn/ended` notification (phase-D review round 3:
+    // the quiet-grace heuristic and the blind re-issue were both rejected
+    // — a restored transcript ending in an assistant partial used to be
+    // durably settled as a completed-while-down turn when the next live
+    // chunk arrived later, and a still-running backend turn used to be
+    // re-issued). The call settles with the turn's REAL accumulated text
+    // at the notification — never the partial, never a duplicate issue.
     configureFakeAgent(
       {
         loadSessionSupport: true,
         turns: [{ text: 'fresh result' }],
         loadSession: {
+          loadedTurn: { status: 'running' },
           replay: [{ role: 'user', text: 'task' }],
           continue: [
             { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
             { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } },
           ],
+          turnEnded: { afterMs: 250, stopReason: 'end_turn' },
         },
       },
       join(dir, 'log1.jsonl'),
@@ -995,11 +1009,13 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
           loadSessionSupport: true,
           turns: [{ text: 'fresh result' }],
           loadSession: {
+            loadedTurn: { status: 'running' },
             replay: [{ role: 'user', text: 'task' }],
             continue: [
               { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
               { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } },
             ],
+            turnEnded: { afterMs: 250, stopReason: 'end_turn' },
           },
         },
         join(dir, 'log2.jsonl'),
@@ -1017,43 +1033,25 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
         assert.deepEqual(report.reissued, [], 'no re-issue while the seam waits');
         assert.deepEqual(report.failedLost, []);
         // Wire evidence: the restored process LOADED the recorded session
-        // and has not opened a fresh session yet.
+        // and has not opened a fresh session — and never will (the live
+        // turn settles from its authoritative terminal notification).
         const entries = readWireLog(join(dir, 'log2.jsonl'));
         assert.ok(
           entries.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
           JSON.stringify(entries),
         );
-        // The pause is LONGER than the settle grace (the live chunks stop
-        // at ~120 ms; the grace is 100 ms) — the round-2 regression this
-        // test pins: the old seam settled the pause as completion, durably
-        // recording "live partial" as the call's outcome. The new seam
-        // never settles a quiet gap: it waits out the max-wait bound and
-        // rejects, and the in-task degradation re-issues the call under
-        // the same id.
+        // The seam's authoritative query fires asynchronously (reconcile
+        // arms the task and returns) — wait for it on the wire.
         await waitFor(() =>
-          readWireLog(join(dir, 'log2.jsonl')).some((e) => e.method === 'newSession'),
-        );
-        const after = readWireLog(join(dir, 'log2.jsonl'));
-        assert.ok(
-          after.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
-          JSON.stringify(after),
-        );
-        assert.ok(after.some((e) => e.method === 'newSession'), 'the re-issue opened a fresh session');
-        // The degradation is surfaced guest-visibly, naming the condition.
-        const probe = await broker2.eval('"probe"');
-        assert.ok(
-          output(probe).some(
-            (l) =>
-              l.startsWith('warn: ') &&
-              l.includes('c1') &&
-              l.includes('kept streaming after the load response') &&
-              l.includes('re-issued'),
+          readWireLog(join(dir, 'log2.jsonl')).some(
+            (e) => e.method === 'extensionRequest' && e.extensionMethod === '_session/loaded_turn/query',
           ),
-          output(probe).join('\n'),
         );
-        // The re-issued call's fresh turn completes and settles the SAME
-        // guest promise exactly once.
-        await waitFor(() => broker2.store().lookup('c1')!.sessionId !== recordedId);
+        // The turn's real accumulated text settles the call exactly once —
+        // from the authoritative ended notification (the round-3
+        // regression: the old seam settled the pause as completion,
+        // durably recording "live partial" as the call's outcome BEFORE
+        // the notification, or re-issued the still-running turn).
         let result: string | undefined;
         for (let attempt = 0; attempt < 100; attempt++) {
           await broker2.pump();
@@ -1064,10 +1062,15 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
           }
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(result, '"fresh result"');
-        assert.equal(broker2.store().lookup('c1')!.reissues, 1);
-        // The guest promise never saw the partial live text as a result.
-        assert.notEqual(result, '"live partial"');
+        assert.equal(result, '"live partial"', 'the authoritative completion is the turn\'s REAL accumulated text');
+        assert.equal(broker2.store().lookup('c1')!.completion!.value, 'live partial');
+        assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'the still-running turn was never re-issued');
+        assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the call settled on the SAME backend session');
+        const after = readWireLog(join(dir, 'log2.jsonl'));
+        assert.ok(
+          !after.some((e) => e.method === 'newSession'),
+          'no fresh session was ever opened — the still-running turn was kept attached, never duplicated: ' + JSON.stringify(after),
+        );
       } finally {
         await broker2.dispose();
         ws2.dispose();
@@ -1079,8 +1082,6 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
       await runner.dispose();
     }
   } finally {
-    if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
-    else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
     if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
     else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
     clearFakeEnv();
@@ -1088,25 +1089,25 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
   }
 });
 
-test('restore through the REAL acp-agents adapter: a still-attached turn whose completion never becomes observable degrades to re-issue, surfaced guest-visibly', async () => {
+test('restore through the REAL acp-agents adapter: a founding turn that ended without a terminal message (interrupted while down) degrades to re-issue IMMEDIATELY — the extension answer makes nothing-is-running authoritative', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-expire-'));
   const storePath = join(dir, 'calls.jsonl');
-  const prevGrace = process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
-  const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
-  process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = '50';
-  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = '150';
   try {
-    // The replay ends at the founding turn's user message and NOTHING
-    // continues after the load response (the turn died silently at the
-    // backend, or the backend never streams after load): the seam's
-    // max-wait backstop rejects, the loaded session is released, and the
-    // call is re-issued under the same id — the honest fallback for a
-    // genuinely unobservable outcome, surfaced guest-visibly.
+    // The replay ends at the founding turn's user message and the backend
+    // answers the extension's query `interrupted`: no turn is running at
+    // the backend, and the founding turn ended without a terminal
+    // assistant message while the host was down. Its outcome is not
+    // observable — but nothing is running, so the seam rejects with the
+    // SAFE-RE-ISSUE class immediately (no max-wait backstop needed) and
+    // the broker re-issues under the same id, surfaced guest-visibly.
     configureFakeAgent(
       {
         loadSessionSupport: true,
         turns: [{ text: 'fresh result' }],
-        loadSession: { replay: [{ role: 'user', text: 'task' }] },
+        loadSession: {
+          loadedTurn: { status: 'interrupted' },
+          replay: [{ role: 'user', text: 'task' }],
+        },
       },
       join(dir, 'log1.jsonl'),
     );
@@ -1125,7 +1126,10 @@ test('restore through the REAL acp-agents adapter: a still-attached turn whose c
         {
           loadSessionSupport: true,
           turns: [{ text: 'fresh result' }],
-          loadSession: { replay: [{ role: 'user', text: 'task' }] },
+          loadSession: {
+            loadedTurn: { status: 'interrupted' },
+            replay: [{ role: 'user', text: 'task' }],
+          },
         },
         join(dir, 'log2.jsonl'),
       );
@@ -1136,14 +1140,18 @@ test('restore through the REAL acp-agents adapter: a still-attached turn whose c
         const report = await broker2.reconcile();
         assert.deepEqual(report.reattached, ['c1'], 'the call is armed on the loaded session first');
         assert.deepEqual(report.reissued, [], 'the in-task degradation is not part of the reconcile report');
-        // The in-task re-issue opens a fresh session (the seam's max-wait
-        // expiry is bounded — wait for the fresh session to log).
+        // The in-task re-issue opens a fresh session immediately (the
+        // `interrupted` answer is authoritative — no max-wait).
         await waitFor(() =>
           readWireLog(join(dir, 'log2.jsonl')).some((e) => e.method === 'newSession'),
         );
         const entries = readWireLog(join(dir, 'log2.jsonl'));
         assert.ok(
           entries.some((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId),
+          JSON.stringify(entries),
+        );
+        assert.ok(
+          entries.some((e) => e.method === 'extensionRequest' && e.extensionMethod === '_session/loaded_turn/query'),
           JSON.stringify(entries),
         );
         assert.ok(entries.some((e) => e.method === 'newSession'), 'the re-issue opened a fresh session');
@@ -1154,7 +1162,7 @@ test('restore through the REAL acp-agents adapter: a still-attached turn whose c
             (l) =>
               l.startsWith('warn: ') &&
               l.includes('c1') &&
-              l.includes('never reached a terminal assistant message') &&
+              l.includes('ended without a terminal assistant message') &&
               l.includes('re-issued'),
           ),
           output(probe).join('\n'),
@@ -1185,10 +1193,6 @@ test('restore through the REAL acp-agents adapter: a still-attached turn whose c
       await runner.dispose();
     }
   } finally {
-    if (prevGrace === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS;
-    else process.env.AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS = prevGrace;
-    if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
-    else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
     clearFakeEnv();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1331,7 +1335,7 @@ test('cadence: a no-recorded-session re-issue refused by the cap settles the gue
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('cadence: an adapter-without-seam re-issue refused by the cap settles the guest and fires the settlement boundary', async () => {
+test('cadence: an adapter without the completion seam degrades the UNOBSERVABLE way — the loaded sessions stay attached, the calls stay pending (never settled, never re-issued), surfaced guest-visibly', async () => {
   const kinds: Array<'eval' | 'settlement'> = [];
   const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-noseam-'));
@@ -1354,16 +1358,175 @@ test('cadence: an adapter-without-seam re-issue refused by the cap settles the g
     snapshotSink: sink,
   });
   const report = await broker2.reconcile();
-  assert.deepEqual(report.reattached, []);
-  assert.deepEqual(report.reissued, ['c1']);
-  assert.deepEqual(report.failedLost, ['c2'], 'the over-cap re-issue was refused');
+  assert.deepEqual(report.reattached, ['c1', 'c2'], 'both calls stay attached on their loaded sessions');
+  assert.deepEqual(report.reissued, [], 'no re-issue: the backend turns may still be running (duplicate risk)');
+  assert.deepEqual(report.failedLost, []);
   assert.equal(runner2.loadedWith.length, 2, 'both sessions loaded — the seam absence is discovered after a successful load');
-  assert.equal(runner2.sessions[0].releases, 1, 'the loaded session was released before the re-issue');
-  assert.deepEqual(kinds, ['settlement'], 'the refusal settled the guest — its drain fired the boundary');
-  const record = broker2.store().lookup('c2')!;
-  assert.equal(record.completion!.outcome, 'reject');
-  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal(runner2.sessions[0].releases, 0, 'the loaded sessions were NOT released (steer/cancel keep working)');
+  // The calls stay PENDING in the guest — never settled from a quiet gap,
+  // never re-issued — and the degradation is surfaced guest-visibly.
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1', 'c2']);
+  assert.deepEqual(kinds, [], 'nothing settled — no settlement boundary fired');
+  const probe = await broker2.eval('"probe"');
+  assert.ok(
+    output(probe).filter((l) => l.startsWith('warn: ')).length >= 2 &&
+      output(probe).some(
+        (l) => l.includes('c1') && l.includes('awaitCurrentTurn seam absent') && l.includes('stays pending'),
+      ),
+    output(probe).join('\n'),
+  );
+  // The attached sessions keep the calls cancelable (the honest way out).
+  assert.equal(await broker2.cancelCall('c1'), 'cancelled');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// The re-attach arm's still-running degradation (phase-D review round 3)
+// ────────────────────────────────────────────────────────────────────────
+
+test('a RE-ARMABLE still-running seam rejection keeps the call attached and pending: the broker re-arms the seam on the SAME session, never settles a quiet gap, never re-issues — and a later authoritative completion settles the call exactly once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-rearm-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const recordedId = broker.store().lookup('c1')!.sessionId!;
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reattached, ['c1']);
+  // The seam rejects with the re-armable still-running class (a `running`
+  // turn whose terminal notification did not arrive within the max-wait
+  // bound): the broker warns, KEEPS the loaded session attached, and
+  // re-arms the seam — the call is never settled from a quiet gap and
+  // never re-issued while the backend turn may still be running.
+  const firstSeam = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(firstSeam, 'the seam is parked on the loaded session');
+  firstSeam.reject(new LoadedTurnStillRunningError('the loaded session\'s founding turn is still running at the backend', true));
+  await tick();
+  await tick();
+  assert.equal(runner2.sessions.length, 1, 'no fresh session — the still-running call was NOT re-issued');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'reissues counter untouched');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call stays pending');
+  const probe = await broker2.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('still running')),
+    output(probe).join('\n'),
+  );
+  // The seam was re-armed on the SAME loaded session: a later
+  // authoritative completion still settles the call exactly once.
+  const secondSeam = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(secondSeam, 'the seam was re-armed on the still-attached session');
+  secondSeam.resolve({ stopReason: 'end_turn', text: 'completed eventually' });
+  await tick();
+  await broker2.pump();
+  assert.equal((await broker2.eval('await p')).result, '"completed eventually"');
+  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'completed eventually');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'kept attached — no re-issue');
+  assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'settled on the SAME backend session');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a NON-re-armable still-running seam rejection (a backend without the _session/loaded_turn extension) holds the call pending on the attached session — never settled, never re-issued, cancelable — surfaced guest-visibly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-hold-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const recordedId = broker.store().lookup('c1')!.sessionId!;
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.reattached, ['c1']);
+  const seam = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(seam, 'the seam is parked on the loaded session');
+  seam.reject(
+    new LoadedTurnStillRunningError(
+      'the backend does not advertise the _session/loaded_turn extension — the terminal state is unobservable',
+      false,
+    ),
+  );
+  await tick();
+  await tick();
+  assert.equal(runner2.sessions.length, 1, 'no re-issue');
+  assert.equal(runner2.sessions[0].releases, 0, 'the loaded session stays attached (steer/cancel keep working)');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0);
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call stays pending — partial output is never settled');
+  const probe = await broker2.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('does not advertise the _session/loaded_turn extension')),
+    output(probe).join('\n'),
+  );
+  // The honest way out: the attached session keeps the call cancelable.
+  assert.equal(await broker2.cancelCall('c1'), 'cancelled');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a still-running seam rejection during the client-presence drain holds the call (never a re-issue after the last client disconnected); the drain bound catches the unobservable turn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-drainhold-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  await broker2.reconcile();
+  // The drain starts while the seam is parked (the turn is still running
+  // at the backend). The seam rejects with the plain released-class error
+  // mid-drain — and because the broker is draining, the rejection HOLDS
+  // the call (a re-issue would open a fresh child after the last client
+  // disconnected). The unobservable turn cannot drain, so the bound is
+  // the honest outcome: the drain cancels what it caught and returns
+  // false.
+  const seam = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(seam);
+  const draining = broker2.drainForDisconnect(400);
+  await tick();
+  seam.reject(new Error('InteractiveSession has been released while awaiting the loaded session\'s founding turn'));
+  assert.equal(await draining, false, 'the unobservable turn cannot drain — the bound is the honest outcome');
+  assert.ok(broker2.isDrained);
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call stays pending after the drain');
+  assert.equal(runner2.sessions[0].releases, 1, 'the child closed in the release phase');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'never re-issued');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('the drain bound is ABSOLUTE: a hung cancel/release cannot block disconnect past the deadline (the session-eviction TTL is the outer ceiling)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  // A backend whose cancel AND release hang forever (the worst case the
+  // review flagged: the post-deadline awaits used to block indefinitely).
+  const session = runner.sessions[0];
+  session.hangCancel = true;
+  session.hangRelease = true;
+  const started = Date.now();
+  const drained = await broker.drainForDisconnect(100);
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the bound expired with the turn still running');
+  assert.ok(elapsed < 3000, `the drain returned within the bound, not blocked by the hung backend: ${elapsed} ms`);
+  assert.ok(broker.isDrained);
+  await broker.dispose();
+  ws.dispose();
 });

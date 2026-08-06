@@ -27,9 +27,11 @@ import type {
     ThreadGoalClearedNotification,
     ThreadGoalUpdatedNotification,
     ThreadTokenUsageUpdatedNotification,
+    TurnCompletedNotification,
     TurnPlanUpdatedNotification,
     WarningNotification
 } from "./app-server/v2";
+import {LOADED_TURN_ENDED_METHOD, type LoadedTurnEndedNotification} from "./AcpExtensions";
 import type { McpStartupCompleteEvent } from "./app-server";
 import {toTokenCount} from "./TokenCount";
 import {
@@ -116,6 +118,43 @@ export class CodexEventHandler {
         this.session = new ACPSessionConnection(connection, sessionState.sessionId);
     }
 
+    /**
+     * The `_session/loaded_turn/ended` push (see `AcpExtensions.ts`): when
+     * a `_session/loaded_turn/query` answered `running` for this session,
+     * the client is waiting for that turn's authoritative end — this
+     * fires the ended notification when the turn completes, with the
+     * ACP stop reason for a completed/interrupted turn or the turn's
+     * error for a failed one, and clears the watch. Best-effort: a
+     * failing notification must not break turn processing.
+     */
+    private notifyLoadedTurnEnded(notification: TurnCompletedNotification): void {
+        if (!this.sessionState.loadedTurnReportedRunning) return;
+        this.sessionState.loadedTurnReportedRunning = false;
+        const turn = notification.turn;
+        let ended: LoadedTurnEndedNotification;
+        switch (turn.status) {
+            case "completed":
+                ended = {sessionId: this.sessionState.sessionId, stopReason: "end_turn"};
+                break;
+            case "interrupted":
+                ended = {sessionId: this.sessionState.sessionId, stopReason: "cancelled"};
+                break;
+            case "failed":
+                ended = {
+                    sessionId: this.sessionState.sessionId,
+                    error: {
+                        name: "TurnError",
+                        message: turn.error?.message ?? "the codex turn failed",
+                    },
+                };
+                break;
+            default:
+                ended = {sessionId: this.sessionState.sessionId, stopReason: "end_turn"};
+                break;
+        }
+        void this.session.notify(LOADED_TURN_ENDED_METHOD, ended).catch(() => undefined);
+    }
+
     getFailure(): RequestError | null {
         return this.failure;
     }
@@ -186,6 +225,7 @@ export class CodexEventHandler {
                 await this.flushPendingPlanUpdates();
                 this.clearPlanTurnState();
                 this.sessionState.currentTurnId = null;
+                this.notifyLoadedTurnEnded(notification.params);
                 return null;
             case "thread/tokenUsage/updated":
                 return this.createUsageUpdate(notification.params);

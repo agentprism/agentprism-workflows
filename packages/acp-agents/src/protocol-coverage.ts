@@ -7,7 +7,7 @@ import type {
   AuthMethodTerminal,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
-import { SESSION_STEERING_METHOD } from "./acp-client.js";
+import { LOADED_TURN_QUERY_METHOD, SESSION_STEERING_METHOD } from "./acp-client.js";
 
 type ValueOf<T> = T[keyof T];
 type ClientMethod = ValueOf<typeof CLIENT_METHODS>;
@@ -210,11 +210,14 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
 
 /** One executable disposition for a vendor extension that is intentionally absent from the
  *  standard SDK AGENT_METHODS table. `typed-unsupported` means the public wrapper exists and
- *  rejects from initialize negotiation before emitting a wire request. */
+ *  rejects from initialize negotiation before emitting a wire request. The loaded-turn
+ *  extension (turn-terminal state for loaded sessions) is only served by the two in-repo
+ *  servers (pi-acp, codex-acp); claude and opencode do not advertise it — a client seam
+ *  against them degrades guest-visibly through the same advertisement gate. */
 export interface AcpExtensionSupportMatrixRow {
   readonly agent: string;
-  readonly method: typeof SESSION_STEERING_METHOD;
-  readonly disposition: "supported" | "typed-unsupported";
+  readonly method: typeof SESSION_STEERING_METHOD | typeof LOADED_TURN_QUERY_METHOD;
+  readonly disposition: "supported" | "typed-unsupported" | "not-advertised";
   /** Installed distributions whose method + initialize advertisement are probed by the protocol
    *  coverage suite. Pi is workspace-owned and covered in its package tests instead. */
   readonly distProbe?: "claude" | "codex";
@@ -241,6 +244,28 @@ const ACP_EXTENSION_SUPPORT_MATRIX_ROWS = [
   {
     agent: "pi",
     method: SESSION_STEERING_METHOD,
+    disposition: "supported",
+  },
+  {
+    agent: "claude",
+    method: LOADED_TURN_QUERY_METHOD,
+    disposition: "not-advertised",
+    distProbe: "claude",
+  },
+  {
+    agent: "codex",
+    method: LOADED_TURN_QUERY_METHOD,
+    disposition: "supported",
+    distProbe: "codex",
+  },
+  {
+    agent: "opencode",
+    method: LOADED_TURN_QUERY_METHOD,
+    disposition: "not-advertised",
+  },
+  {
+    agent: "pi",
+    method: LOADED_TURN_QUERY_METHOD,
     disposition: "supported",
   },
 ] satisfies readonly AcpExtensionSupportMatrixRow[];

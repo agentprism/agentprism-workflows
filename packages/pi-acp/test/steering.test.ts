@@ -33,6 +33,11 @@ import {
   type SteeringResponse,
 } from "../src/steering.js";
 import {
+  LOADED_TURN_QUERY_METHOD,
+  type LoadedTurnQueryRequest,
+  type LoadedTurnQueryResponse,
+} from "../src/loaded-turn.js";
+import {
   context,
   fakeDeps,
   streamPair,
@@ -490,7 +495,7 @@ test("wire server advertises top-level steering, parses the extension, and route
     const initialized = await connection.agent.request(methods.agent.initialize, {
       protocolVersion: 1,
     });
-    assert.deepEqual(initialized._meta, { steering: { supported: true } });
+    assert.deepEqual(initialized._meta, { steering: { supported: true }, loadedTurn: { supported: true } });
     assert.equal(
       "_meta" in (initialized.agentCapabilities as Record<string, unknown>),
       false,
@@ -504,10 +509,18 @@ test("wire server advertises top-level steering, parses the extension, and route
       }),
       (error) => error instanceof RequestError && error.code === -32602,
     );
+    // The loaded-turn query parses strictly and routes through requireLive
+    // (the same -32602 invalid-params shape for a malformed request).
     await assert.rejects(
-      connection.agent.request<SteeringResponse, SteeringRequest>(
-        SESSION_STEERING_METHOD,
-        { sessionId: "missing", prompt: [{ type: "text", text: "missing" }] },
+      connection.agent.request(LOADED_TURN_QUERY_METHOD, {
+        sessionId: 123,
+      }),
+      (error) => error instanceof RequestError && error.code === -32602,
+    );
+    await assert.rejects(
+      connection.agent.request<LoadedTurnQueryResponse, LoadedTurnQueryRequest>(
+        LOADED_TURN_QUERY_METHOD,
+        { sessionId: "missing" },
       ),
       (error) => kind(error) === "unknown_session",
     );

@@ -146,44 +146,53 @@
  *    `awaitCurrentTurn` — a REAL seam on the acp-agents adapter (phase-D
  *    review: the seam used to be absent from `InteractiveSession`, so
  *    every built-in backend loaded, released, and re-issued). Its
- *    protocol-bounded semantics: `session/load` obliges the agent to
- *    replay the entire persisted conversation and only then resolve the
- *    load; the runner marks the LOAD BOUNDARY at the response, and the
- *    seam classifies the founding turn from that boundary plus what
- *    follows it (phase-D review round 2: a quiet period followed by a
- *    trailing assistant chunk used to be treated as authoritative
- *    completion — a quiet gap is only a progress-stream gap, not
- *    terminal evidence, so partial output of a paused live turn could
- *    be durably settled). A turn that ended while the daemon was down
- *    has its final message in the replay: the boundary transcript ends
- *    with an assistant message and no content update follows within the
- *    settle grace, and the seam resolves with it (the real accumulated
- *    text; `stopReason` synthesized as `end_turn` — the protocol's
- *    replay carries none, and the broker's own result-shaping gates
- *    still apply). A turn still IN FLIGHT at the backend streams live
- *    chunks after the load response: the seam KEEPS THE LOADED SESSION
- *    ATTACHED (phase-D review: a successfully loaded session with its
- *    founding turn still running used to be released and re-issued —
- *    duplicated work) but NEVER settles a quiet gap in that state — a
- *    resumed turn's completion has no terminal marker over ACP v1 — and
- *    at the max-wait bound it rejects, so the broker re-issues, surfaced
- *    guest-visibly (a turn that completes during the wait is not
- *    settled: its completion is unobservable, and the alternative —
- *    settling guessed partial output — is the durable-correctness
- *    defect this posture exists to prevent). The seam degrades to a
- *    rejection — and the broker to re-issue — on: a transcript with no
- *    user message (the recorded session never received its prompt), a
- *    released/dead session, a stream without a terminal assistant
- *    message within the max-wait bound (refusal, silent death, a
- *    never-ending turn — the "never hang unobserved" backstop), a load
- *    failure (capability absent, session deleted, wire failure), or an
- *    unmarked handle (the boundary was never recorded). A third-party
- *    `BrokerSession` adapter WITHOUT the seam still re-attaches the
- *    session, then degrades to re-issue the same way. The outcome is
+ *    completion evidence is the `_session/loaded_turn` vendor extension
+ *    (phase-D review round 3 — the AUTHORITATIVE terminal channel the
+ *    orchestrator required after rejecting both the quiet-grace
+ *    heuristic, which durably settled an assistant PARTIAL as a
+ *    completed-while-down turn when the next live chunk arrived later,
+ *    and the blind re-issue, which duplicated a still-running backend
+ *    turn): `session/load` obliges the agent to replay the entire
+ *    persisted conversation and only then resolve the load; the runner
+ *    marks the LOAD BOUNDARY at the response, and the seam asks
+ *    `_session/loaded_turn/query` whether the founding turn is still
+ *    running RIGHT NOW. `completed` — the turn observably ended while
+ *    the daemon was down: the replay's trailing assistant message is
+ *    its FINAL message, and the seam resolves immediately (the real
+ *    accumulated text; `stopReason` synthesized as `end_turn` — the
+ *    protocol's replay carries none, and the broker's own
+ *    result-shaping gates still apply). `interrupted` — it ended
+ *    without a terminal message and no turn is running: the SAFE-
+ *    RE-ISSUE rejection class. `running` — the turn is still executing:
+ *    the seam KEEPS THE LOADED SESSION ATTACHED and waits for the
+ *    authoritative `_session/loaded_turn/ended` notification (a quiet
+ *    gap is only a progress-stream gap, never terminal evidence),
+ *    bounded by the max-wait backstop. The seam degrades to a
+ *    rejection on: a transcript with no user message (the recorded
+ *    session never received its prompt — safe re-issue), a
+ *    released/dead session (safe re-issue — the process died with the
+ *    turn), `interrupted` (safe re-issue), a load failure (capability
+ *    absent, session deleted, wire failure), an unmarked handle (the
+ *    boundary was never recorded), a backend WITHOUT the extension
+ *    (immediate non-re-armable `LoadedTurnStillRunningError` — the
+ *    broker keeps the loaded session attached and the call pending,
+ *    surfaced guest-visibly: NEVER settled from a quiet gap, NEVER
+ *    re-issued while the turn may still be running), a `running` turn
+ *    past the max-wait bound (re-armable `LoadedTurnStillRunningError`
+ *    — the broker re-arms the seam so a later notification or cancel
+ *    still settles the call), or a turn that failed at the backend
+ *    (`LoadedTurnFailedError` — a definite outcome, settled as an
+ *    ordinary rejection, never re-issued). While the broker is
+ *    draining/disposing even safe-re-issue rejections hold (a fresh
+ *    child must never open and run after the last client disconnected).
+ *    A third-party `BrokerSession` adapter WITHOUT the seam still
+ *    re-attaches the session, then degrades the same unobservable way
+ *    (the call stays pending on the attached session). The outcome is
  *    delivered through the SAME record → settle → consume pump as a
- *    live call — exactly once, first-wins on both sides. A re-attached
- *    call holds a concurrency token until it settles, like any other
- *    live call.
+ *    live call — exactly once, first-wins on both sides (a held call's
+ *    `hold` outcome drops the pump entry without recording or
+ *    settling). A re-attached call holds a concurrency token until it
+ *    settles, like any other live call.
  * 3. **Lost → re-issue.** A pending agent call with no recorded session
  *    (its session never opened, or a foreign snapshot), or whose
  *    re-attach failed, is re-issued under the SAME call id: the store
@@ -314,6 +323,8 @@
 import type { JSValueHandle } from 'quickjs-wasi';
 import {
   AcpAgentRunner,
+  isLoadedTurnFailedError,
+  isLoadedTurnStillRunningError,
   parseFinalJson,
   resolveStructuredOutput,
   type StructuredSession,
@@ -447,23 +458,32 @@ export interface BrokerSession {
   /**
    * The loaded session's founding-turn completion — the re-attach arm's
    * task source. REAL on the acp-agents adapter
-   * (`InteractiveSession.awaitCurrentTurn`): an OBSERVING wait that
-   * resolves with the founding turn when the `session/load` replay's
-   * update stream settles with a trailing assistant message (a turn that
-   * completed while the daemon was down has its final message in the
-   * replay; a turn still running at the backend keeps streaming live
-   * chunks after the load response, so the wait absorbs them — the
-   * loaded session stays ATTACHED and settles from the turn's
-   * authoritative completion; `stopReason` is synthesized `end_turn`,
-   * the protocol's replay carries none), and REJECTS with a host-side
-   * error when the outcome is genuinely unobservable (no user message in
-   * the transcript, a released/dead session, or a stream that settled
-   * without a terminal assistant message within the max-wait bound);
-   * the broker degrades to re-issue only then, surfaced guest-visibly,
-   * so a re-attached call can never hang unobserved. OPTIONAL for
-   * third-party `BrokerSession` adapters: an adapter without the seam
-   * still re-attaches the session, then degrades to re-issue the same
-   * way.
+   * (`InteractiveSession.awaitCurrentTurn`), whose completion evidence is
+   * the `_session/loaded_turn` vendor extension (phase-D review round 3:
+   * an AUTHORITATIVE terminal channel — the quiet-grace heuristic and
+   * the blind re-issue were rejected): right after the `session/load`
+   * response the seam asks `_session/loaded_turn/query` whether the
+   * founding turn is still running, and the backend's answer is the
+   * classification — `completed` (the replay's trailing assistant message
+   * is the turn's FINAL message; resolves immediately with the real
+   * accumulated text, `stopReason` synthesized `end_turn`), `interrupted`
+   * (ended without a terminal message, nothing running — the
+   * SAFE-RE-ISSUE rejection class), or `running` (the loaded session
+   * stays ATTACHED and the seam waits for the authoritative
+   * `_session/loaded_turn/ended` notification — a quiet gap is only a
+   * progress-stream gap, never terminal evidence — bounded by the
+   * max-wait backstop). A backend WITHOUT the extension degrades
+   * guest-visibly: the seam rejects immediately with the non-re-armable
+   * `LoadedTurnStillRunningError` (never settle partial output, never
+   * re-issue a possibly-running turn); a `running` turn past the max-wait
+   * bound rejects with the RE-ARMABLE form; a turn that failed at the
+   * backend rejects with `LoadedTurnFailedError` (a definite outcome,
+   * settled as a rejection, never re-issued); everything else (no user
+   * message, `interrupted`, a dead process) is the safe-re-issue class.
+   * OPTIONAL for third-party `BrokerSession` adapters: an adapter
+   * without the seam still re-attaches the session, then degrades the
+   * same unobservable way — the call stays pending on the attached
+   * session, surfaced guest-visibly (never the old release-and-re-issue).
    */
   awaitCurrentTurn?(): Promise<BrokerTurn>;
 }
@@ -595,6 +615,13 @@ export interface WorkspaceManifestBinding {
   provenance: string | null;
   /** Wall clock of the provenance attribution (ms since epoch). */
   provenanceAtMs: number | null;
+  /** The task text behind a worker provenance (`worker c1` → the
+   *  founding agent() call's task, read from the call store) or an
+   *  agent-handle binding's founding call — the doc's "from what task"
+   *  provenance half. Null when the provenance is not worker-shaped or
+   *  the store record is missing. Capped at 200 chars (head+tail) so
+   *  the manifest stays bounded metadata. */
+  task: string | null;
 }
 
 /** The broker-enriched workspace manifest (`Broker.workspaceManifest`). */
@@ -686,7 +713,12 @@ interface InFlightTask {
    *  queued-steer delivery when the pump delivers them; `steer` tasks
    *  do not. */
   kind: 'agent' | 'steer';
-  promise: Promise<{ outcome: 'resolve' | 'reject'; value: unknown }>;
+  /** `resolve`/`reject` deliver a record → settle → consume outcome;
+   *  `hold` (the re-attach arm's unobservable-turn degradation) deletes
+   *  the in-flight entry WITHOUT recording or settling — the call stays
+   *  pending, the session stays attached (cancelable), and the broker
+   *  surfaces the condition guest-visibly. */
+  promise: Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }>;
   done: boolean;
 }
 
@@ -850,6 +882,28 @@ export class Broker {
    *  followUp/steer/cancel on a settled handle lazily re-attach the
    *  recorded backend session. */
   private drained = false;
+  /** True while a client-presence drain or a dispose is in progress (and
+   *  stays true after a drain — the drained broker owns no attached
+   *  sessions until a new open). The re-attach arm keys on it: a seam
+   *  rejection while the broker is draining/disposing must NOT re-issue
+   *  (a fresh child would open and run after the last client
+   *  disconnected — the drain defect); the call is left pending and
+   *  surfaced guest-visibly instead. */
+  private draining = false;
+  /** Agent calls whose `openSession` is still in flight (no session entry
+   *  exists yet — the session may appear at any moment). The client-
+   *  presence drain waits for these exactly like busy sessions: a call
+   *  blocked in openSession is still in flight, and draining past it
+   *  would let the child open and run after the last client
+   *  disconnected (phase-D review round 3). */
+  private readonly openingCalls = new Set<string>();
+  /** Opening calls the drain's bound forced to STOP (see
+   *  `drainForDisconnect`): when the parked `openSession` eventually
+   *  lands, the session is released immediately (never prompts), the
+   *  call settles as the recoverable `AGENT_CANCELLED`, and queued
+   *  steers are dropped with the durable `dropped` marker — the child
+   *  never runs after the drain. */
+  private readonly stoppedOpens = new Set<string>();
   private disposed = false;
   private opChain: Promise<unknown> = Promise.resolve();
 
@@ -1230,21 +1284,16 @@ export class Broker {
       if (awaitTurn === undefined) {
         // A THIRD-PARTY BrokerSession adapter without the seam (the real
         // acp-agents adapter has it): the loaded session's founding-turn
-        // completion is unobservable to this host. Release the loaded
-        // session (best-effort) and degrade to re-issue through the same
-        // honest gate — surfaced guest-visibly. The re-issue may itself
-        // refuse (the concurrency cap) — its newly-settled flag
-        // propagates into the changed-VM bookkeeping (review regression:
-        // this branch used to drop the flag, skipping the settlement
-        // drain and its snapshot boundary when the re-issue was
-        // refused).
-        await Promise.resolve(session.release()).catch(() => undefined);
-        return this.reissueCall(
-          entry,
-          parsed,
-          'backend session loaded but its turn completion is not observable (awaitCurrentTurn seam absent) — re-issued',
-          report,
-        );
+        // completion is unobservable to this host. The honest degradation
+        // (phase-D review round 3: this used to release the loaded session
+        // and re-issue — a turn that may still be running at the backend
+        // was duplicated) is to KEEP the loaded session attached, leave
+        // the call pending, and surface the condition guest-visibly —
+        // never settled from a quiet gap, never re-issued, cancelable
+        // through the attached session.
+        this.registerUnobservableReattach(entry, parsed, session, 'awaitCurrentTurn seam absent');
+        report.reattached.push(entry.id);
+        return false;
       }
       // The seam (REAL on acp-agents' InteractiveSession): an OBSERVING
       // wait — it resolves with the founding turn when the session/load
@@ -1321,42 +1370,132 @@ export class Broker {
     this.trackInFlight(entry.id, 'agent', taskPromise);
   }
 
+  /** Register a successfully loaded session whose founding-turn completion
+   *  is UNOBSERVABLE to this host (a third-party adapter without the
+   *  `awaitCurrentTurn` seam): the session stays attached (steer/cancel
+   *  keep working), the call stays pending — never settled (partial
+   *  output risk), never re-issued (the backend turn may still be
+   *  running) — and the condition is surfaced guest-visibly. The task
+   *  resolves `hold`: the pump drops the in-flight entry without
+   *  recording or settling, and the session entry keeps the call
+   *  tracked (a repeated reconcile never re-attaches twice) and
+   *  cancelable. */
+  private registerUnobservableReattach(
+    entry: GuestSurfaceEntry,
+    parsed: ParsedAgentOptions,
+    session: BrokerSession,
+    reason: string,
+  ): void {
+    const sessionEntry: SessionEntry = {
+      session,
+      callId: entry.id,
+      modelSpec: entry.modelSpec ?? '',
+      task: entry.detail ?? '',
+      supportsSteering: session.capabilities?.supportsSteering === true,
+      busy: true,
+      delivering: false,
+      callSettled: false,
+      callCancelled: false,
+      queue: this.pendingSteers.get(entry.id) ?? [],
+    };
+    this.pendingSteers.delete(entry.id);
+    this.sessions.set(entry.id, sessionEntry);
+    this.agentSlots.add(entry.id);
+    this.drained = false; // children are warm again
+    this.warnLine(
+      'warn',
+      `call ${entry.id}: ${reason} — the founding turn's completion is not observable; the call stays ` +
+        `pending on the attached session (never settled from a quiet gap, never re-issued); cancel it with ` +
+        `interrupt or reset the workspace`, // eslint-disable-line max-len
+    );
+    const taskPromise = Promise.resolve({ outcome: 'hold' as const, value: undefined });
+    this.trackInFlight(entry.id, 'agent', taskPromise);
+  }
+
   /** The re-attached call's task: observe the loaded session's founding
    *  turn through the seam (the observing wait — a still-running turn is
-   *  kept attached and settles from its authoritative completion), then
-   *  shape the result (schema ladder or the empty-output gate). A seam
-   *  REJECTION is a genuine failure to observe the turn (no user message
-   *  in the transcript, a released/dead session, or a stream settled
-   *  without a terminal assistant message within the max-wait bound):
-   *  the loaded session is released (best-effort) and the call is
-   *  RE-ISSUED under the same id through the ordinary dispatch path —
-   *  the honest fallback, surfaced guest-visibly. The re-issue reuses
-   *  the call's own concurrency token (the call never left its slot, so
-   *  no new slot is consumed); result-shaping failures AFTER the turn
-   *  resolved (stop-reason gate, empty output, schema ladder) settle as
-   *  ordinary rejections, exactly like a live call — never a re-issue. */
+   *  kept attached and settles from its authoritative terminal
+   *  notification), then shape the result (schema ladder or the
+   *  empty-output gate). A seam REJECTION is classified three ways
+   *  (phase-D review round 3):
+   *
+   *  - the still-running class (`LoadedTurnStillRunningError`): the turn
+   *    may still be running and its terminal state is unobservable —
+   *    NEVER settle a quiet gap and NEVER re-issue. Re-armable
+   *    rejections (a `running` turn past its max-wait bound) re-arm the
+   *    seam on the still-attached session (a later terminal
+   *    notification — or a cancel — still settles the call), warning
+   *    guest-visibly each time; non-re-armable rejections (a backend
+   *    without the `_session/loaded_turn` extension) resolve `hold`:
+   *    the call stays pending on the attached session.
+   *  - the failed-at-backend class (`LoadedTurnFailedError`): the turn
+   *    RAN and failed — a definite outcome, settled as an ordinary
+   *    rejection (never re-issued, never settled as success).
+   *  - the safe-re-issue class (anything else — no user message in the
+   *    transcript, an `interrupted` answer, a dead process): re-issued
+   *    under the same id through the ordinary dispatch path. While the
+   *    broker is draining/disposing, even these resolve `hold` — a
+   *    fresh child must never open and run after the last client
+   *    disconnected (the drain defect).
+   *
+   *  Result-shaping failures AFTER the turn resolved (stop-reason gate,
+   *  empty output, schema ladder) settle as ordinary rejections, exactly
+   *  like a live call — never a re-issue. */
   private runReattachedTask(
     callId: string,
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     return (async () => {
       let turn: BrokerTurn;
       const awaitTurn = entry.session.awaitCurrentTurn;
       if (awaitTurn === undefined) {
         // Unreachable — `registerReattached` is only called after the seam
         // was checked — but a structural guard keeps the optional seam
-        // honest for third-party adapters: degrade to re-issue.
-        return this.reissueReattached(
-          callId,
-          entry,
-          parsed,
-          new Error('the loaded session exposes no awaitCurrentTurn seam'),
+        // honest for third-party adapters: the unobservable degradation.
+        this.warnLine(
+          'warn',
+          `call ${callId}: the loaded session exposes no awaitCurrentTurn seam — the call stays pending ` +
+            `on the attached session (never settled from a quiet gap, never re-issued); cancel it with ` +
+            `interrupt or reset the workspace`, // eslint-disable-line max-len
         );
+        return { outcome: 'hold', value: undefined };
       }
       try {
         turn = await awaitTurn.call(entry.session);
       } catch (error) {
+        if (isLoadedTurnStillRunningError(error)) {
+          // The turn may still be running at the backend and its terminal
+          // state is unobservable: never settle partial output, never
+          // re-issue a possibly-running turn. A re-armable rejection
+          // (a `running` turn past the max-wait bound) re-arms the seam
+          // on the still-attached session — a later terminal notification
+          // or a cancel still settles the call; a non-re-armable one (the
+          // backend lacks the extension) resolves `hold`.
+          this.warnLine('warn', `call ${callId}: ${toRejectionValue(error).message}`);
+          if (error.rearmable) {
+            return this.runReattachedTask(callId, entry, parsed);
+          }
+          return { outcome: 'hold', value: undefined };
+        }
+        if (isLoadedTurnFailedError(error)) {
+          // The founding turn RAN and failed at the backend: a definite
+          // outcome — settle it as an ordinary rejection (record → settle
+          // → consume), never a re-issue and never a success.
+          return { outcome: 'reject', value: toRejectionValue(error) };
+        }
+        if (this.draining || this.disposed) {
+          // The broker's own teardown released the session (or the seam
+          // rejected mid-drain): re-issuing would open a fresh child after
+          // the last client disconnected. The call stays pending,
+          // surfaced guest-visibly.
+          this.warnLine(
+            'warn',
+            `call ${callId}: ${toRejectionValue(error).message} — the broker is draining; the call stays ` +
+              `pending (never re-issued after the last client disconnected)`, // eslint-disable-line max-len
+          );
+          return { outcome: 'hold', value: undefined };
+        }
         return this.reissueReattached(callId, entry, parsed, error);
       }
       try {
@@ -1388,7 +1527,7 @@ export class Broker {
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
     error: unknown,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     await Promise.resolve(entry.session.release()).catch(() => undefined);
     if (entry.queue.length > 0) {
       const pending = this.pendingSteers.get(callId) ?? [];
@@ -1400,6 +1539,9 @@ export class Broker {
       'warn',
       `call ${callId}: re-attached session ${entry.session.sessionId} released (${toRejectionValue(error).message}) — re-issued`, // eslint-disable-line max-len
     );
+    // The re-issue opens a fresh session: covered by the opening-call
+    // registry like any dispatch.
+    this.openingCalls.add(callId);
     return this.runAgentTask(callId, entry.modelSpec, entry.task, parsed, this.recordedBackendId(callId));
   }
 
@@ -1595,6 +1737,9 @@ export class Broker {
     this.callStore.recordReissued(entry.id, now());
     this.agentSlots.add(entry.id);
     this.warnLine('warn', `call ${entry.id}: ${reason} — re-issued`);
+    // The re-issue opens a fresh session: the opening-call registry covers
+    // it like any dispatch (the drain waits for opens, not just sessions).
+    this.openingCalls.add(entry.id);
     const taskPromise = this.runAgentTask(
       entry.id,
       entry.modelSpec ?? '',
@@ -1877,36 +2022,68 @@ export class Broker {
    * the remainder to cancel (the honest bounded teardown — the cancel
    * settles the calls as the recoverable `AGENT_CANCELLED`, recorded and
    * snapshotted like any settlement).
+   *
+   * **The drain covers OPENING calls too** (phase-D review round 3: a
+   * call blocked in `openSession` has no session entry yet, so a drain
+   * that considered only registered busy sessions returned `true`
+   * immediately, cleared its bookkeeping, and let the child open and run
+   * after the last client disconnected). The drain waits for opening
+   * calls and in-flight lazy re-attaches exactly like busy sessions;
+   * when the bound expires with an open still parked, the call is
+   * STOPPED — the child that eventually opens is closed immediately
+   * (never prompts), the call settles as the recoverable `AGENT_CANCELLED`,
+   * and queued steers are dropped durably.
+   *
+   * **The outer bound is absolute** (phase-D review round 3: the
+   * cancel/release phases used to await `cancelSession`/`release` with no
+   * remaining-time bound, so a hung backend could block disconnect/
+   * shutdown indefinitely past the eviction TTL): every post-deadline
+   * await races the remaining bound, and once it expires the drain
+   * returns without waiting — the best-effort cancellations and releases
+   * already issued keep running in the background (all promises carry
+   * catch handlers, so nothing can become an unhandled rejection).
    */
   async drainForDisconnect(boundMs: number): Promise<boolean> {
     return this.serialized(async () => {
       this.assertAlive();
       if (this.drained) return true;
+      this.draining = true;
       const deadline = Date.now() + Math.max(0, boundMs);
-      // Drain phase: pump until no session has a turn running (or the
+      // Drain phase: pump until no session has a turn running, no session
+      // is still opening, and no lazy re-attach is in flight (or the
       // bound expires). Each pump settles into the VM and fires the
       // settlement boundary — the daemon's snapshot sink persists each
       // drain boundary, so a kill mid-drain loses nothing. An empty pump
       // yields briefly (the turns complete asynchronously at the
       // backends; a busy spin would starve the event loop).
       for (;;) {
-        if (this.busySessionCount() === 0) break;
+        const outstandingOpens = this.openingCalls.size + this.pendingReattaches.size;
+        if (this.busySessionCount() === 0 && outstandingOpens === 0) break;
         if (Date.now() >= deadline) break;
         const { settled } = await this.pumpUnlocked();
         if (settled.length > 0) this.sink?.boundary('settlement');
-        if (this.busySessionCount() > 0) await new Promise((resolve) => setTimeout(resolve, 50));
+        if (this.busySessionCount() > 0 || this.openingCalls.size > 0 || this.pendingReattaches.size > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
       }
-      const drainedWithinBound = this.busySessionCount() === 0;
+      const drainedWithinBound =
+        this.busySessionCount() === 0 && this.openingCalls.size === 0 && this.pendingReattaches.size === 0;
       if (!drainedWithinBound) {
-        // The bound is the outer ceiling: cancel what it caught
+        // The bound is the outer ceiling: stop what it caught
         // (best-effort; the cancellations settle the calls as the
-        // recoverable AGENT_CANCELLED), then one final pump settles the
-        // cancellations into the VM (each settlement boundary snapshots).
+        // recoverable AGENT_CANCELLED, and a parked open's eventual
+        // landing is stopped the same way), then one final pump settles
+        // the cancellations into the VM (each settlement boundary
+        // snapshots). Every await below races the remaining bound — a
+        // hung cancel/release can never block past the eviction TTL.
+        for (const callId of [...this.openingCalls]) this.stoppedOpens.add(callId);
         const cancels: Promise<unknown>[] = [];
         for (const entry of this.sessions.values()) {
-          if (entry.busy) cancels.push(this.cancelSession(entry));
+          if (entry.busy) {
+            cancels.push(Promise.resolve(this.cancelSession(entry)).catch(() => undefined));
+          }
         }
-        await Promise.allSettled(cancels);
+        await boundedAll(cancels, deadline);
         const { settled } = await this.pumpUnlocked();
         if (settled.length > 0) this.sink?.boundary('settlement');
       }
@@ -1927,7 +2104,7 @@ export class Broker {
       const releases = sessions.map((entry) =>
         Promise.resolve(entry.session.release()).catch(() => undefined),
       );
-      await Promise.allSettled(releases);
+      await boundedAll(releases, deadline);
       this.sessions.clear();
       this.agentSlots.clear();
       this.deliverySlots.clear();
@@ -1954,6 +2131,7 @@ export class Broker {
     const manifest = this.workspace.manifest();
     const bindings = manifest.bindings.map((binding) => {
       let token = binding.token;
+      let handleCallId: string | null = binding.handleCallId;
       if (binding.handleCallId !== null) {
         const record = this.callStore.lookup(binding.handleCallId);
         const status =
@@ -1965,6 +2143,11 @@ export class Broker {
         token,
         provenance: binding.provenance,
         provenanceAtMs: binding.provenanceAtMs,
+        // The doc's "from what task" provenance half: the task text behind
+        // a worker provenance (`worker c1` → the founding agent() call's
+        // task from the call store) or an agent-handle binding's founding
+        // call. Capped so the manifest stays bounded metadata.
+        task: this.taskForBinding(binding.provenance, handleCallId),
       };
     });
     return {
@@ -1974,6 +2157,29 @@ export class Broker {
       inFlight: this.inFlightIds(),
       checkpoints: this.pendingCheckpoints(),
     };
+  }
+
+  /** Resolve a binding's task text ("from what task"): the founding
+   *  agent() call's detail for a `worker cN` provenance label, or the
+   *  handle's own call record for an agent-handle binding. Null when
+   *  neither applies or the record is missing; capped at 200 chars
+   *  (head+tail elision) so the manifest stays bounded metadata. */
+  private taskForBinding(provenance: string | null, handleCallId: string | null): string | null {
+    const ids: string[] = [];
+    if (provenance !== null && provenance.startsWith('worker ')) {
+      ids.push(...provenance.slice('worker '.length).split('+'));
+    }
+    if (handleCallId !== null && !ids.includes(handleCallId)) ids.push(handleCallId);
+    const tasks: string[] = [];
+    for (const id of ids) {
+      const record = this.callStore.lookup(id);
+      if (record !== undefined && record.kind === 'agent' && record.detail.length > 0) {
+        tasks.push(record.detail);
+      }
+    }
+    if (tasks.length === 0) return null;
+    const joined = tasks.join(' / ');
+    return joined.length > 200 ? headTail(joined, 200) : joined;
   }
 
   /** The in-flight host-task call ids, in dispatch order (the manifest's
@@ -1994,11 +2200,12 @@ export class Broker {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.draining = true;
     await this.serialized(async () => {
       const cancels: Promise<unknown>[] = [];
       const sessions = [...this.sessions.values()];
       for (const entry of sessions) {
-        if (entry.busy) cancels.push(this.cancelSession(entry));
+        if (entry.busy) cancels.push(Promise.resolve(this.cancelSession(entry)).catch(() => undefined));
       }
       await Promise.allSettled(cancels);
       const releases: Promise<unknown>[] = sessions.map((entry) =>
@@ -2013,6 +2220,8 @@ export class Broker {
       this.inFlight.clear();
       this.agentSlots.clear();
       this.deliverySlots.clear();
+      this.openingCalls.clear();
+      this.stoppedOpens.clear();
       if (this.ownsRunner) await this.runner.dispose();
     });
   }
@@ -2051,6 +2260,12 @@ export class Broker {
     this.recordDispatch(callId, 'agent', task, optionsJson, null, modelSpec);
     this.deferreds.set(callId, call);
     this.agentSlots.add(callId);
+    // The opening-call registry (the client-presence drain's in-flight
+    // probe): the session does not exist yet — the drain must wait for it
+    // exactly like a busy session (a call blocked in openSession is still
+    // in flight; draining past it would let the child open and run after
+    // the last client disconnected).
+    this.openingCalls.add(callId);
     const taskPromise = this.runAgentTask(callId, modelSpec, task, parsed);
     this.trackInFlight(callId, 'agent', taskPromise);
   }
@@ -2334,7 +2549,7 @@ export class Broker {
   private trackInFlight(
     callId: string,
     kind: 'agent' | 'steer',
-    promise: Promise<{ outcome: 'resolve' | 'reject'; value: unknown }>,
+    promise: Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }>,
   ): void {
     const entry: InFlightTask = { callId, kind, promise, done: false };
     promise.then(
@@ -2366,7 +2581,7 @@ export class Broker {
     task: string,
     parsed: ParsedAgentOptions,
     backendIdOverride: string | null = null,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     let openedSession: BrokerSession | undefined;
     try {
       const session = await this.runner.openSession({
@@ -2393,6 +2608,32 @@ export class Broker {
         retainSessionLog: true,
       });
       openedSession = session;
+      if (this.stoppedOpens.has(callId)) {
+        // The client-presence drain's bound expired while this open was in
+        // flight: the call is STOPPED — the child is closed immediately
+        // (it never prompts — nothing runs after the last client
+        // disconnected), queued steers are dropped durably, and the call
+        // settles as the recoverable AGENT_CANCELLED. The stopped marker
+        // is consumed here so a later reconcile re-issues normally.
+        this.stoppedOpens.delete(callId);
+        this.openingCalls.delete(callId);
+        this.dropPendingSteers(
+          callId,
+          new Error('the client-presence drain stopped this call while its session was still opening'),
+        );
+        await Promise.resolve(session.release()).catch(() => undefined);
+        return {
+          outcome: 'reject',
+          value: toRejectionValue(
+            new WorkflowError(
+              `call ${callId} was stopped by the client-presence drain while its session was still opening`,
+              CODE.AGENT_CANCELLED,
+              { recoverable: true },
+            ),
+          ),
+        };
+      }
+      this.openingCalls.delete(callId);
       this.drained = false; // children are warm again
       const entry: SessionEntry = {
         session,
@@ -2435,6 +2676,7 @@ export class Broker {
         // documented delivery warning in the next tool result — and the
         // undelivered state is recorded durably (dropped marker) so a
         // restore never resurrects a dead queue.
+        this.openingCalls.delete(callId);
         this.dropPendingSteers(callId, error);
       }
       return { outcome: 'reject', value: toRejectionValue(error) };
@@ -2735,9 +2977,22 @@ export class Broker {
       const ready = [...this.inFlight.values()].filter((t) => t.done);
       if (ready.length === 0) break;
       for (const entry of ready) {
-        const outcome = await entry.promise;
+        const outcome: { outcome: 'resolve' | 'reject' | 'hold'; value: unknown } = await entry.promise;
+        if (outcome.outcome === 'hold') {
+          // The re-attach arm's unobservable-turn degradation: the in-flight
+          // entry is dropped WITHOUT recording or settling — the call stays
+          // pending, the session stays attached (the `sessions` map keeps
+          // it tracked and cancelable), and the condition was surfaced
+          // guest-visibly by the task. The concurrency token stays held
+          // (the call is still live work until the orchestrator cancels it
+          // or resets the workspace).
+          this.inFlight.delete(entry.callId);
+          continue;
+        }
         try {
-          this.deliver(entry.callId, outcome);
+          // Narrowed past the `hold` branch above: the pump only ever
+          // delivers resolve/reject outcomes (hold drops the entry).
+          this.deliver(entry.callId, outcome as { outcome: 'resolve' | 'reject'; value: unknown });
         } catch (error) {
           // The outcome stays IN FLIGHT (its readiness flag is already
           // set) — the next pump retries. Both the store write and the
@@ -3120,6 +3375,32 @@ export class Broker {
 
 function now(): number {
   return Date.now();
+}
+
+/** Await a batch of best-effort teardown promises (cancels, releases)
+ *  ONLY until the drain deadline — the doc's outer drain bound (phase-D
+ *  review round 3: a hung cancel/release used to block disconnect/
+ *  shutdown indefinitely past the session-eviction TTL). After the
+ *  deadline the drain returns without waiting; every promise in the batch
+ *  already carries its own catch handler, so the fire-and-forget tail can
+ *  never become an unhandled rejection. */
+async function boundedAll(promises: Promise<unknown>[], deadline: number): Promise<void> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return;
+  await Promise.race([Promise.allSettled(promises), sleep(remaining)]);
+}
+
+/** Timer sleep (the drain's yield and bounded-wait primitive). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Head+tail elision at `max` chars (the manifest task cap). */
+function headTail(value: string, max: number): string {
+  if (value.length <= max) return value;
+  const keep = Math.max(0, max - 1);
+  const half = Math.floor(keep / 2);
+  return `${value.slice(0, half)}…${value.slice(value.length - (keep - half))}`;
 }
 
 function requireString(value: unknown, what: string): string {

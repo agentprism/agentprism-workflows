@@ -44,6 +44,10 @@ test("steering documentation stays aligned with the executable extension matrix"
       { agent: "codex", disposition: "supported" },
       { agent: "opencode", disposition: "typed-unsupported" },
       { agent: "pi", disposition: "supported" },
+      { agent: "claude", disposition: "not-advertised" },
+      { agent: "codex", disposition: "supported" },
+      { agent: "opencode", disposition: "not-advertised" },
+      { agent: "pi", disposition: "supported" },
     ],
   );
   for (const path of ["packages/acp-agents/README.md", "packages/workflows/README.md", "docs/api.md"]) {

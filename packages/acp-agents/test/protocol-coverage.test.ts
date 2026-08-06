@@ -183,6 +183,28 @@ test("the executable ACP extension matrix pins steering support and installed ad
       method: "_session/steering",
       disposition: "supported",
     },
+    {
+      agent: "claude",
+      method: "_session/loaded_turn/query",
+      disposition: "not-advertised",
+      distProbe: "claude",
+    },
+    {
+      agent: "codex",
+      method: "_session/loaded_turn/query",
+      disposition: "supported",
+      distProbe: "codex",
+    },
+    {
+      agent: "opencode",
+      method: "_session/loaded_turn/query",
+      disposition: "not-advertised",
+    },
+    {
+      agent: "pi",
+      method: "_session/loaded_turn/query",
+      disposition: "supported",
+    },
   ]);
 
   for (const row of ACP_EXTENSION_SUPPORT_MATRIX) {
@@ -193,12 +215,29 @@ test("the executable ACP extension matrix pins steering support and installed ad
           ? CODEX_DIST
           : undefined;
     if (!dist) continue;
-    assert.ok(dist.includes(row.method), `${row.agent} dist must implement ${row.method}`);
-    assert.match(
-      dist,
-      /_meta\s*:\s*\{\s*steering\s*:\s*\{\s*supported\s*:\s*true\s*,?\s*\}\s*,?\s*\}/,
-      `${row.agent} dist must advertise top-level steering support`,
-    );
+    // A `supported` disposition means the installed distribution implements the method
+    // AND advertises it at initialize. A `not-advertised` disposition means the method
+    // is absent from the distribution (the seam degrades guest-visibly) — the probe
+    // asserts the absence so a future dist that grows the extension must update the
+    // matrix.
+    if (row.disposition === "supported") {
+      assert.ok(dist.includes(row.method), `${row.agent} dist must implement ${row.method}`);
+      if (row.method === "_session/steering") {
+        assert.match(
+          dist,
+          /_meta\s*:\s*\{\s*steering\s*:\s*\{\s*supported\s*:\s*true/,
+          `${row.agent} dist must advertise top-level steering support`,
+        );
+      } else {
+        assert.match(
+          dist,
+          /_meta\s*:\s*\{[\s\S]*?loadedTurn\s*:\s*\{\s*supported\s*:\s*true/,
+          `${row.agent} dist must advertise top-level loaded-turn support`,
+        );
+      }
+    } else {
+      assert.ok(!dist.includes(row.method), `${row.agent} dist must NOT implement ${row.method} until the matrix is updated`);
+    }
   }
 });
 

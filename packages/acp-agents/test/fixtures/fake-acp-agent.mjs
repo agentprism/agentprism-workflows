@@ -37,6 +37,12 @@ const authOnceSentinel = process.env.AGENTPRISM_FAKE_AUTH_ONCE_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 const hasLifecycleSupport = scenario.lifecycleSupport === true;
 const hasLoadSessionSupport = scenario.loadSessionSupport ?? hasLifecycleSupport;
+const hasLoadedTurnSupport =
+  scenario.loadedTurnSupport === true ||
+  (scenario.loadSession !== undefined &&
+    scenario.loadSession !== null &&
+    typeof scenario.loadSession === "object" &&
+    (scenario.loadSession.loadedTurn !== undefined || scenario.loadSession.turnEnded !== undefined));
 const hasResumeSessionSupport = scenario.resumeSessionSupport ?? hasLifecycleSupport;
 const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
 const hasMcpHttpSupport = scenario.mcpHttpSupport === true;
@@ -277,6 +283,7 @@ class FakeAgent {
         ...(hasProviderSupport ? { providers: {} } : {}),
         ...(hasLogoutSupport ? { auth: { logout: {} } } : {}),
       },
+      ...(hasLoadedTurnSupport ? { _meta: { loadedTurn: { supported: true } } } : {}),
       ...(Array.isArray(scenario.authMethods) ? { authMethods: clone(scenario.authMethods) } : {}),
     };
   }
@@ -284,6 +291,16 @@ class FakeAgent {
   async extMethod(method, params) {
     const fixture = scenario.extensionRequest;
     record({ method: "extensionRequest", extensionMethod: method, params });
+    // The loaded-turn terminal-state query (the re-attach arm's
+    // authoritative founding-turn classification): answered from the
+    // scenario's scripted per-session loaded-turn state.
+    if (method === "_session/loaded_turn/query") {
+      if (hasLoadedTurnSupport) {
+        const loadedTurn = scenario.loadSession?.loadedTurn ?? {};
+        return { status: loadedTurn.status ?? "interrupted" };
+      }
+      throw new RequestError(-32601, "_session/loaded_turn/query was not advertised by this agent");
+    }
     if (fixture?.method === method) {
       if (typeof fixture.delayMs === "number" && fixture.delayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, fixture.delayMs));
@@ -421,6 +438,26 @@ class FakeAgent {
           }
         }, afterMs);
       }
+    }
+    // The loaded-turn TERMINAL notification (the `_session/loaded_turn`
+    // extension's authoritative completion evidence): a turn classified
+    // `running` at query time ends — scripted here as `load.turnEnded`
+    // `{ afterMs, stopReason? }` (or `{ afterMs, error }`), mirroring a
+    // real agent's turn-end push after the load response.
+    const turnEnded = load.turnEnded;
+    if (turnEnded) {
+      const afterMs = typeof turnEnded.afterMs === "number" ? turnEnded.afterMs : 0;
+      setTimeout(async () => {
+        try {
+          await this.conn.notify("_session/loaded_turn/ended", {
+            sessionId: params.sessionId,
+            ...(turnEnded.stopReason !== undefined ? { stopReason: turnEnded.stopReason } : {}),
+            ...(turnEnded.error !== undefined ? { error: clone(turnEnded.error) } : {}),
+          });
+        } catch {
+          // The client may have disconnected before the notification fired; best-effort.
+        }
+      }, afterMs);
     }
     return {
       configOptions,

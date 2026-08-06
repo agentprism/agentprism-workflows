@@ -407,6 +407,8 @@ export function createTestSessionState(overrides?: Partial<SessionState>): Sessi
         currentModelSupportsFast: false,
         terminalOutputMode: "terminal_output_delta",
         goalRevision: 0,
+        loadedLastTurnStatus: null,
+        loadedTurnReportedRunning: false,
         sessionTitle: null,
         sessionTitleSource: "unknown",
         ...overrides,

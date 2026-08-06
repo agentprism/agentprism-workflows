@@ -215,9 +215,16 @@ function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectSt
     } else {
       lines.push("bindings:");
       for (const binding of manifest.bindings) {
+        // The doc's provenance surface: which subagent produced the value
+        // (via), from what task (task), when (at) — metadata, never
+        // content.
         lines.push(
           `  ${binding.name} = ${binding.token}` +
-            (binding.provenance !== null ? ` · via ${binding.provenance}` : ""),
+            (binding.provenance !== null ? ` · via ${binding.provenance}` : "") +
+            (binding.task !== null ? ` · task ${JSON.stringify(binding.task)}` : "") +
+            (binding.provenanceAtMs !== null
+              ? ` · at ${new Date(binding.provenanceAtMs).toISOString()}`
+              : ""),
         );
       }
     }
@@ -232,8 +239,11 @@ function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectSt
     }
     if (state.drained) lines.push("children: closed (client-presence drain; re-attach on demand)");
     for (const agent of broker.liveAgents()) {
+      // The task is part of the agent's provenance surface (the doc:
+      // "from what task") — the renderer shows it alongside the state.
       lines.push(
-        `agent ${agent.callId}: ${agent.state} (${agent.modelSpec}; steering: ${agent.supportsSteering ? "yes" : "no"}; queued: ${agent.queuedSteers})`,
+        `agent ${agent.callId}: ${agent.state} — task: ${JSON.stringify(agent.task)} ` +
+          `(${agent.modelSpec}; steering: ${agent.supportsSteering ? "yes" : "no"}; queued: ${agent.queuedSteers})`,
       );
     }
     const pending = broker.pendingCalls();

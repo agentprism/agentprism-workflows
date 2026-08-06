@@ -14,6 +14,7 @@ import type {
     ReasoningEffortOption,
     Thread,
     ThreadItem,
+    TurnStatus,
     UserInput
 } from "./app-server/v2";
 import type {RateLimitsMap} from "./RateLimitsMap";
@@ -51,6 +52,9 @@ import {
     type LegacySetSessionModelResponse,
     type SessionSteerRequest,
     type SessionSteeringResponse,
+    type LoadedTurnQueryResponse,
+    type LoadedTurnQueryRequest,
+    LOADED_TURN_QUERY_METHOD,
     GOAL_CONTROL_METHOD,
     isExtMethodRequest,
     LEGACY_SET_SESSION_MODEL_METHOD,
@@ -125,6 +129,20 @@ export interface SessionState {
     goalRevision: number;
     sessionTitle: string | null;
     sessionTitleSource: "unset" | "fallback" | "explicit" | "unknown";
+    /** The loaded thread's LAST turn status (`loadedSession` only): the
+     *  `_session/loaded_turn/query` answer's authoritative source when no
+     *  turn is running in-process (a `completed` last turn means the
+     *  replayed thread's final message is the founding turn's final
+     *  message; `inProgress`/`interrupted`/`failed` mean it ended without
+     *  a terminal message — nothing is running, so re-issue is safe).
+     *  Null for sessions that did not come from `session/load`. */
+    loadedLastTurnStatus: TurnStatus | null;
+    /** The `_session/loaded_turn` extension's watch flag: set when a
+     *  query answered `running` (a client waits for that turn's
+     *  authoritative end), cleared — and the `_session/loaded_turn/ended`
+     *  notification sent — when the turn completes (see
+     *  `CodexEventHandler`). */
+    loadedTurnReportedRunning: boolean;
 }
 
 interface ActiveAuthState {
@@ -260,6 +278,9 @@ export class CodexAcpServer {
                 steering: {
                     supported: true,
                 },
+                loadedTurn: {
+                    supported: true,
+                },
             },
         };
     }
@@ -280,6 +301,8 @@ export class CodexAcpServer {
                 return await this.unstable_setSessionModel(this.parseLegacySetSessionModelParams(methodRequest.params));
             case SESSION_STEERING_METHOD:
                 return await this.executeOrQueueSteeringRequest(this.parseSessionSteerParams(methodRequest.params));
+            case LOADED_TURN_QUERY_METHOD:
+                return await this.loadedTurnQuery(methodRequest.params);
             case GOAL_CONTROL_METHOD: {
                 const sessionState = this.sessions.get(methodRequest.params.sessionId);
                 if (!sessionState) {
@@ -479,6 +502,8 @@ export class CodexAcpServer {
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: "sessionId" in request ? "unknown" : "unset",
+            loadedLastTurnStatus: null,
+            loadedTurnReportedRunning: false,
         };
         this.sessions.set(sessionId, sessionState);
         resumeSubscribed = false;
@@ -1118,6 +1143,29 @@ export class CodexAcpServer {
         };
     }
 
+    /** `_session/loaded_turn/query` (see `AcpExtensions.ts`): the loaded
+     *  session's authoritative founding-turn terminal classification. A
+     *  turn running in THIS process answers `running` (and arms the
+     *  ended-notification watch); otherwise the loaded thread's last turn
+     *  status is authoritative: `completed` means the replayed thread's
+     *  final message is the founding turn's final message (settle from
+     *  the replay); any other status means the founding turn ended
+     *  without a terminal message and no turn is running (re-issue is
+     *  safe). */
+    async loadedTurnQuery(params: LoadedTurnQueryRequest): Promise<LoadedTurnQueryResponse> {
+        const sessionState = this.sessions.get(params.sessionId);
+        if (!sessionState) {
+            throw RequestError.invalidParams(undefined, `Unknown session: ${params.sessionId}`);
+        }
+        if (sessionState.currentTurnId !== null) {
+            sessionState.loadedTurnReportedRunning = true;
+            return {status: "running"};
+        }
+        return {
+            status: sessionState.loadedLastTurnStatus === "completed" ? "completed" : "interrupted",
+        };
+    }
+
     private createSessionConfigOptions(sessionState: SessionState): Array<acp.SessionConfigOption> {
         const currentModelId = ModelId.fromString(sessionState.currentModelId);
         const configOptions = [
@@ -1321,6 +1369,8 @@ export class CodexAcpServer {
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: "unset",
+            loadedLastTurnStatus: thread.turns.at(-1)?.status ?? null,
+            loadedTurnReportedRunning: false,
         };
         this.sessions.set(sessionId, sessionState);
         subscribed = false;

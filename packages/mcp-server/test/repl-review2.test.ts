@@ -226,6 +226,14 @@ test("review2: status renders the workspace manifest — bindings with structure
     assert.ok(text.includes("findings = {2 keys}"), text);
     assert.ok(text.includes("research = agent handle · pending · call c1"), text);
     assert.ok(text.includes("via eval 1"), text);
+    // The doc's full provenance surface (phase-D review round 3): the
+    // binding renders "from what task, when" — the founding task text and
+    // the attribution wall clock.
+    assert.ok(text.includes('· task "investigate"'), text);
+    assert.ok(text.includes("· at "), text);
+    // The live agent line carries its task too (the renderer used to omit
+    // the task already available on LiveAgentInfo).
+    assert.ok(text.includes('agent c1: running — task: "investigate"'), text);
     // The intent-plane hygiene rule: NO value content in the manifest.
     assert.ok(!text.includes("MARKER"), `value content leaked: ${text}`);
     assert.ok(!text.includes("zekret"), `nested names leaked: ${text}`);

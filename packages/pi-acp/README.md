@@ -88,6 +88,21 @@ cleared synchronously before aborting so queued content never restarts generatio
 cancellation. Unexpected internal failures also resolve as `{ outcome: "failed" }` rather than a
 JSON-RPC error.
 
+### Loaded-session turn-terminal state (`_session/loaded_turn`)
+
+Pi also advertises the `_session/loaded_turn` extension at top-level initialize metadata as
+`_meta: { loadedTurn: { supported: true } }` — the re-attach arm's AUTHORITATIVE completion
+evidence for a session re-opened with `session/load` (the REPL broker's restore path).
+`_session/loaded_turn/query { sessionId }` answers whether the loaded session's founding turn is
+still running right now: `running` while a turn executes in this process (the client then waits
+for the `_session/loaded_turn/ended` push — sent with the turn's stop reason, or its error, when
+the turn finishes, arming and clearing a one-shot watch), `completed` when the session journal's
+last message entry is an assistant message (pi persists every complete LLM message atomically at
+`message_end`, so a completed turn always leaves an assistant leaf and the replay's trailing
+assistant message is the turn's FINAL message — authoritative, never a quiet-gap guess), and
+`interrupted` otherwise (the journal shows an interrupted/abandoned turn — nothing is running, so
+re-issue is safe). A query for an unknown session is the standard `unknown_session` error.
+
 ## Development
 
 The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` before the runtime test suite. This is a small deviation from the test-script example in the frozen specification and ensures the T2b public type-contract check is enforced in local and CI test runs.

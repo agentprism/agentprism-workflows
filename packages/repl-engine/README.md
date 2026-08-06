@@ -473,40 +473,45 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
 - **`BrokerSession.awaitCurrentTurn` is REAL on the acp-agents adapter** (the loaded
   session's founding-turn completion; `InteractiveSession.awaitCurrentTurn`, phase-D
   review round 1: the seam used to be absent, so every built-in backend loaded, released,
-  and re-issued). Its protocol-bounded semantics (phase-D review round 2: a quiet period
-  followed by a trailing assistant chunk used to be treated as authoritative completion —
-  a quiet gap is only a PROGRESS-stream gap, not terminal evidence, so partial output of
-  a paused live turn could be durably settled; and a successfully loaded session whose
-  founding turn was still running used to be released and re-issued, risking duplicated
-  work): `session/load` obliges the agent to replay the entire persisted conversation and
-  only then resolve the load; the runner marks the LOAD BOUNDARY synchronously after the
-  response (the transcript is complete at that instant), and every CONTENT update applied
-  after it is live-continuation evidence. The seam classifies the founding turn from the
-  boundary plus what follows it: (1) a transcript with no user message rejects
-  immediately (re-issue is safe — nothing reached the backend); (2) REPLAY-COMPLETE — the
-  boundary transcript ends with an assistant message (the turn's final message is the
-  replay's last item) AND no content update arrives within the settle grace (default
-  250 ms, `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS` — the grace absorbs only
-  wire-flight continuation chunks): resolves with the REAL accumulated text,
-  `stopReason` synthesized `end_turn` (the protocol's replay carries none; the broker's
-  result-shaping gates still apply); (3) LIVE/LOST — the boundary does NOT end with an
-  assistant message, or any content update followed the load: the turn may still be
-  running, so the seam KEEPS THE LOADED SESSION ATTACHED and waits, but NEVER settles a
-  quiet gap in this state (a resumed turn's completion has no terminal marker over ACP v1
-  — the v2 `state_update` proposal exists precisely because v1 lacks it — so settling
-  would be guessing), and at the max-wait bound (default 15 min,
-  `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` — the "never hang unobserved" backstop) it
-  rejects and the broker degrades to re-issue, surfaced guest-visibly. The trade-off is
-  bounded and documented: a turn that completes during the wait is not settled (its
-  completion is unobservable) and the re-issue re-runs the task — the alternative
-  (settling guessed partial output) is the durable-correctness defect this posture
-  exists to prevent. A handle that was never load-marked rejects immediately (without
-  the boundary the completion is not observable and the seam never guesses). The broker
-  arms the re-attached call on the seam WITHOUT blocking reconcile: reconcile returns
-  immediately, the pump delivers the completion through the same record → settle →
-  consume path as a live call, and a seam rejection re-issues inside the task (the call's
-  own concurrency token is reused). A third-party `BrokerSession` adapter without the
-  seam still re-attaches the session, then degrades to re-issue the same way.
+  and re-issued). Its completion evidence is the **`_session/loaded_turn` vendor
+  extension** (phase-D review round 3: the quiet-grace heuristic — a settled stream with
+  a trailing assistant chunk treated as completion, which durably settled an assistant
+  PARTIAL as a completed-while-down turn when the next live chunk arrived later — and the
+  blind re-issue fallback, which duplicated a still-running backend turn, were both
+  rejected; an AUTHORITATIVE terminal channel is required). `session/load` obliges the
+  agent to replay the entire persisted conversation and only then resolve the load; the
+  runner marks the LOAD BOUNDARY synchronously after the response, and the seam then
+  asks `_session/loaded_turn/query` whether the founding turn is still running RIGHT
+  NOW. The backend answers one of three terminal classifications: (1) `completed` — the
+  turn observably completed while the host was down, so the replay's trailing assistant
+  message is its FINAL message and the seam resolves immediately with the REAL
+  accumulated text (`stopReason` synthesized `end_turn` — the protocol's replay carries
+  none; the broker's result-shaping gates still apply); (2) `interrupted` — the turn
+  ended without a terminal assistant message and no turn is running, so the seam rejects
+  with the SAFE-RE-ISSUE class (nothing to duplicate); (3) `running` — the turn is still
+  executing at the backend, so the seam KEEPS THE LOADED SESSION ATTACHED and waits for
+  the authoritative `_session/loaded_turn/ended` notification (a quiet gap is only a
+  progress-stream gap, never terminal evidence), absorbing the live update stream and
+  settling with the turn's REAL accumulated text at the notification, bounded by
+  `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` (default 15 min — the "never hang
+  unobserved" backstop). A backend WITHOUT the extension degrades guest-visibly through
+  the same strict advertisement gate (never by settling partial output, never by
+  re-issuing a possibly-running turn): the seam rejects immediately with the
+  non-re-armable `LoadedTurnStillRunningError`, and this broker keeps the loaded session
+  attached, leaves the call pending, and surfaces the condition guest-visibly
+  (cancelable). A `running` turn past the max-wait bound rejects with the RE-ARMABLE
+  form of the same error (the broker re-arms the seam on the still-attached session — a
+  later notification or a cancel still settles the call); a turn that failed at the
+  backend rejects with `LoadedTurnFailedError` (a definite outcome, settled as an
+  ordinary rejection, never re-issued); everything else (no user message in the
+  transcript, `interrupted`, a dead process) is the safe-re-issue class. A handle that
+  was never load-marked rejects immediately (without the boundary the completion is not
+  observable and the seam never guesses). The broker arms the re-attached call on the
+  seam WITHOUT blocking reconcile: reconcile returns immediately, the pump delivers the
+  completion through the same record → settle → consume path as a live call. A third-
+  party `BrokerSession` adapter WITHOUT the seam still re-attaches the session, then
+  degrades the same unobservable way (the call stays pending on the attached session,
+  surfaced guest-visibly) — never the old release-and-re-issue.
 - **Backend identity/pool routing is persisted** (phase-D review round 2): the store
   records the model spec VERBATIM (including the guest's `"default"` sentinel) AND the
   RESOLVED backend id at session open (`recordAttached` — a backend id doubles as a model
@@ -532,7 +537,15 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   sessions re-openable; queued-but-undelivered steers are re-queued durably against
   their founding session ids and delivered by the next re-attach exactly once). The
   workspace and broker stay alive; the next client's followUp/steer/cancel lazily
-  re-attaches.
+  re-attaches. Phase-D review round 3 hardens both edges: the drain WAITS for calls
+  still OPENING (`openSession` parked — an opening call has no session entry yet, so a
+  drain that considered only registered busy sessions returned `true` immediately and
+  let the child open and run after the last client disconnected) and in-flight lazy
+  re-attaches, and a parked open that outlives the bound is STOPPED (the late child is
+  closed before it ever prompts, the call settles as the recoverable `AGENT_CANCELLED`,
+  queued steers are dropped durably); and the outer bound is ABSOLUTE — every
+  post-deadline cancel/release await races the remaining time, so a hung backend can
+  never block disconnect/shutdown past the eviction TTL.
 - **The per-eval wall-clock deadline** (`BrokerOptions.evalTimeoutMs`, default 30 s,
   `AGENTPRISM_REPL_EVAL_TIMEOUT_MS`; phase-D review round 2): every eval and settlement
   drain runs under a deadline enforced by the quickjs interrupt handler, COMPOSED with
@@ -552,7 +565,11 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   maintenance pass runs after every eval and settlement drain, trap-free descriptor
   reads only, sanitized at render), and live-handle status (`agent handle ·
   pending|settled · call cN` — the call id maps to the task and timestamps in the
-  store). The `$N` log-ref globals render as a range (`logs: $1…$4 (4 values)`).
+  store) and the doc's full provenance surface — `task` (the founding `agent()` call's
+  task text for `worker cN` and handle bindings, capped at 200 chars) and
+  `provenanceAtMs` (the attribution wall clock; phase-D review round 3: bindings used
+  to carry only the label and an internal timestamp). The `$N` log-ref globals render
+  as a range (`logs: $1…$4 (4 values)`).
 - **Pending steers whose wire call died with the process resolve `failed`** (recorded +
   settled + warned): their outcome is unknowable and re-injecting would duplicate; the one
   exception is queued-but-undelivered steers, whose payload is in the store (the phase-C
@@ -714,12 +731,13 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
   backend id (never the current configured default). A re-attached call's completion is
   the loaded session's founding turn, observed through the REAL
   `BrokerSession.awaitCurrentTurn` seam on acp-agents' `InteractiveSession` — the
-  load-boundary classification (replay-complete settles with the turn's real text; a
-  still-running turn is KEPT ATTACHED and never settled from a quiet gap — its completion
-  is unobservable over ACP v1, so at the max-wait bound the seam rejects and the broker
-  re-issues inside the armed task, surfaced guest-visibly, never a hanging call and
-  never a durable partial outcome; a third-party adapter without the seam degrades the
-  same way). Pending checkpoints re-surface (answerable
+  `_session/loaded_turn` extension's authoritative terminal classification (a `completed`
+  answer settles from the replay immediately; an `interrupted` answer re-issues safely;
+  a `running` turn is KEPT ATTACHED and settles only from the `_session/loaded_turn/ended`
+  notification — a quiet gap is never settled, a still-running turn is never re-issued,
+  and a backend without the extension degrades to the same pending-on-the-attached-
+  session posture, surfaced guest-visibly; a turn that failed at the backend settles as
+  a definite rejection). Pending checkpoints re-surface (answerable
   across a restore, through the reconciliation surface) and pending steers whose wire call
   died with the process resolve the honest `failed` with a warn line (their outcome is
   unknowable; re-injecting would duplicate; queued-but-undelivered steers are the one
@@ -897,11 +915,15 @@ reconcile-time refusal branches — invalid options and the over-cap re-issue �
 guest and fire the boundary too, and a changed-VM drain that FAILS still fires its
 boundary, on the reconcile and pump paths alike), the end-to-end debounce through the
 per-project store, and the re-attach arm through the REAL acp-agents adapter (a real
-`AcpAgentRunner` + `InteractiveSession` over the fake ACP agent: a completed-while-down
-call re-attaches and settles from the loaded session's replay with no re-issue, wire-log
-proven; a resumed turn that pauses LONGER than the settle grace is NEVER settled from the
-quiet gap — the seam keeps the loaded session attached and degrades to an honest,
-guest-visible re-issue at the max-wait bound, partial output never durable). Phase-D
+`AcpAgentRunner` + `InteractiveSession` over the fake ACP agent, driven by the
+`_session/loaded_turn` extension: a completed-while-down call re-attaches and settles
+from the loaded session's replay with no re-issue, wire-log proven — including the
+`_session/loaded_turn/query` on the wire; a still-running turn settles ONLY from the
+authoritative `_session/loaded_turn/ended` notification — an assistant PARTIAL whose next
+live chunk arrives later than any quiet grace is never durably settled, and the
+still-running turn is never re-issued (no fresh session ever opens); an `interrupted`
+turn re-issues immediately; a backend without the extension degrades to the pending-on-
+the-attached-session posture). Phase-D
 review round 2 adds `review2.test.ts` (the lazy re-attach of settled handles after the
 client-presence drain — followUp/steer/cancel re-attach the recorded backend session
 through the capability gate, and a gate failure degrades to the honest `failed` surfaced

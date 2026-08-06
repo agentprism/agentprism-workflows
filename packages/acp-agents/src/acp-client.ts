@@ -154,6 +154,36 @@ const CLIENT_INFO = {
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
 /** Cross-agent vendor extension for injecting content into a live prompt turn. */
 export const SESSION_STEERING_METHOD = "_session/steering" as const;
+/** Cross-agent vendor extension carrying turn-TERMINAL state for LOADED sessions (the re-attach
+ *  arm's authoritative completion evidence — see `InteractiveSession.awaitCurrentTurn`): the
+ *  `_session/loaded_turn/query` request answers whether the loaded session's founding turn is
+ *  still running at the backend ("running"), observably completed while the host was down
+ *  ("completed" — the replay's trailing assistant message is the turn's FINAL message), or ended
+ *  without a terminal message ("interrupted" — nothing is running, re-issue is safe), and the
+ *  `_session/loaded_turn/ended` notification fires when a turn that was "running" at query time
+ *  ends (with its stop reason, or its error). Backends without the extension degrade
+ *  guest-visibly through the same strict advertisement gate as steering. */
+export const LOADED_TURN_QUERY_METHOD = "_session/loaded_turn/query" as const;
+export const LOADED_TURN_ENDED_METHOD = "_session/loaded_turn/ended" as const;
+/** The founding-turn terminal classification a capable backend answers with (see the
+ *  `LOADED_TURN_QUERY_METHOD` docs). */
+export type LoadedTurnStatus = "completed" | "running" | "interrupted";
+/** Exact `_session/loaded_turn/query` wire request. */
+export interface LoadedTurnQueryRequest {
+  sessionId: string;
+}
+/** Exact `_session/loaded_turn/query` wire response. */
+export interface LoadedTurnQueryResponse {
+  status: LoadedTurnStatus;
+}
+/** Exact `_session/loaded_turn/ended` wire notification. `stopReason` is the ACP stop-reason
+ *  vocabulary for a turn that ended with a response; `error` replaces it for a turn that ended
+ *  by failing (the seam then rejects the founding call with the error instead of settling). */
+export interface LoadedTurnEndedNotification {
+  sessionId: string;
+  stopReason?: string;
+  error?: { name: string; message: string };
+}
 /** Every outcome an ACP steering agent can resolve with. */
 export type SteeringOutcome = "injected" | "startedNewTurn" | "failed";
 /** Exact `_session/steering` wire request. Optional `_meta` uses the same outgoing custom-meta
@@ -377,6 +407,13 @@ class SessionState {
     | { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' }
     | null = null;
   private sawPostLoadContentUpdate = false;
+  /** The loaded-turn TERMINAL state (the `_session/loaded_turn` extension's authoritative
+   *  completion evidence): the `_session/loaded_turn/ended` notification this session received
+   *  (a turn that was running at load ended), or null when no such notification arrived. The
+   *  seam's `awaitCurrentTurn` waits on this instead of guessing from a quiet gap. */
+  private loadedTurnEnded: { stopReason?: string; error?: { name: string; message: string } } | null = null;
+  /** The loaded-turn-ended watchers (woken by every ended notification). */
+  private readonly loadedTurnEndedWatchers = new Set<() => void>();
 
   /** `label`/`runId`/`callIndex` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
@@ -576,6 +613,41 @@ class SessionState {
       hasUserMessage: this.loadBoundary?.hasUserMessage ?? this.sawUserMessage,
       trailingContentKind: this.loadBoundary?.trailingContentKind ?? this.trailingContentKind,
       sawPostLoadContentUpdate: this.sawPostLoadContentUpdate,
+    };
+  }
+
+  /** Record the loaded-turn terminal notification (a turn that was
+   *  running at load ended — with its stop reason, or its error) and
+   *  wake the seam's watchers. Idempotent per session: the FIRST ended
+   *  notification wins (a re-sent notification after a reconnect cannot
+   *  overwrite the recorded terminal state). */
+  recordLoadedTurnEnded(notification: { stopReason?: string; error?: { name: string; message: string } }): void {
+    if (this.loadedTurnEnded !== null) return;
+    this.loadedTurnEnded = {
+      ...(notification.stopReason !== undefined ? { stopReason: notification.stopReason } : {}),
+      ...(notification.error !== undefined ? { error: notification.error } : {}),
+    };
+    for (const watcher of this.loadedTurnEndedWatchers) watcher();
+  }
+
+  /** The recorded loaded-turn terminal state, or null when the running
+   *  turn has not ended (yet). */
+  loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
+    return this.loadedTurnEnded;
+  }
+
+  /** Watch the loaded-turn-ended channel: the listener fires when the
+   *  `_session/loaded_turn/ended` notification arrives (and immediately
+   *  for a notification that already arrived). Returns the unsubscribe
+   *  thunk. The re-attach arm's authoritative terminal wait. */
+  subscribeLoadedTurnEnded(listener: () => void): () => void {
+    if (this.loadedTurnEnded !== null) {
+      queueMicrotask(listener);
+      return () => {};
+    }
+    this.loadedTurnEndedWatchers.add(listener);
+    return () => {
+      this.loadedTurnEndedWatchers.delete(listener);
     };
   }
 
@@ -998,6 +1070,32 @@ class MultiplexClient {
   }
 
   extNotification(method: string, params: Record<string, unknown>): void {
+    if (method === LOADED_TURN_ENDED_METHOD) {
+      // The loaded-turn terminal notification (the re-attach arm's
+      // authoritative completion evidence): route by sessionId and record
+      // the terminal state on the session (the seam's wait target).
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+      if (!sessionId) return;
+      const state = this.sessions.get(sessionId);
+      if (!state) return;
+      const raw = (params as { stopReason?: unknown; error?: unknown }).error;
+      const error =
+        raw !== undefined && typeof raw === "object" && raw !== null
+          ? ({
+              name: typeof (raw as { name?: unknown }).name === "string" ? (raw as { name: string }).name : "Error",
+              message:
+                typeof (raw as { message?: unknown }).message === "string"
+                  ? (raw as { message: string }).message
+                  : String((raw as { message?: unknown }).message),
+            } as const)
+          : undefined;
+      const stopReason =
+        typeof (params as { stopReason?: unknown }).stopReason === "string"
+          ? (params as { stopReason: string }).stopReason
+          : undefined;
+      state.recordLoadedTurnEnded({ ...(stopReason !== undefined ? { stopReason } : {}), ...(error !== undefined ? { error } : {}) });
+      return;
+    }
     if (method !== CLAUDE_RAW_MESSAGE_METHOD) return;
     // claude-agent-acp stamps the owning sessionId on every raw _claude/sdkMessage; route by it
     // so structured_output lands in the right session under concurrency.
@@ -1494,6 +1592,11 @@ export class PooledConnection {
         CLAUDE_RAW_MESSAGE_METHOD,
         (params: unknown) => (params ?? {}) as Record<string, unknown>,
         ({ params }) => this.client.extNotification(CLAUDE_RAW_MESSAGE_METHOD, params),
+      )
+      .onNotification(
+        LOADED_TURN_ENDED_METHOD,
+        (params: unknown) => (params ?? {}) as Record<string, unknown>,
+        ({ params }) => this.client.extNotification(LOADED_TURN_ENDED_METHOD, params),
       )
       .onNotification(CLIENT_METHODS.elicitation_complete, ({ params }) => this.client.elicitationComplete(params))
       .onRequest(CLIENT_METHODS.session_request_permission, ({ params }) => this.client.requestPermission(params))
@@ -2248,6 +2351,28 @@ export class PooledConnection {
     return response;
   }
 
+  /** Driven `_session/loaded_turn/query` extension request (the re-attach
+   *  arm's authoritative founding-turn classification): asks whether the
+   *  loaded session's founding turn is still running at the backend, or
+   *  ended while the host was down. Strictly capability-gated on the
+   *  initialize `_meta.loadedTurn.supported === true` advertisement — a
+   *  backend without the extension rejects before any wire request (the
+   *  "same gate" the seam's degradation keys on). */
+  async queryLoadedTurn(sessionId: string, label?: string): Promise<LoadedTurnQueryResponse> {
+    await this.ready;
+    if (this.negotiated?.supportsLoadedTurnTerminalState !== true) {
+      throw new WorkflowError(
+        `ACP agent (${this.backendId}) does not advertise ${LOADED_TURN_QUERY_METHOD}; ` +
+          "InitializeResponse._meta.loadedTurn.supported was not exactly true",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+    return this.rawAgentRequest<LoadedTurnQueryResponse, LoadedTurnQueryRequest>(LOADED_TURN_QUERY_METHOD, {
+      sessionId,
+    });
+  }
+
   /** session/set_config_option on this connection, raced against process death. */
   setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_set_config_option, request));
@@ -2720,6 +2845,23 @@ export class SessionHandle implements StructuredSource {
    *  arm; additive passthrough to `SessionState`. */
   loadedTurnText(): string {
     return this.state.loadedTurnText();
+  }
+
+  /** The recorded `_session/loaded_turn/ended` terminal state (the
+   *  re-attach arm's authoritative completion evidence), or null when a
+   *  running founding turn has not ended yet. Added for the REPL broker's
+   *  re-attach arm; additive passthrough to `SessionState`. */
+  loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
+    return this.state.loadedTurnEndedState();
+  }
+
+  /** Watch the loaded-turn-ended channel (fires when the
+   *  `_session/loaded_turn/ended` notification arrives — and immediately
+   *  when one already arrived). Returns the unsubscribe thunk. Added for
+   *  the REPL broker's re-attach arm; additive passthrough to
+   *  `SessionState`. */
+  subscribeLoadedTurnEnded(listener: () => void): () => void {
+    return this.state.subscribeLoadedTurnEnded(listener);
   }
 
   /** Cancel the active turn. A backend that does not settle within the grace window is closed and

@@ -148,6 +148,41 @@ auto-releases, session-scoped listeners see `session_close`, and an in-flight pr
 the normal connection-closed path. `backend_error` is connection-scoped observability on the runner
 bus only; it is not delivered through `session.on()`.
 
+### The re-attach arm: loaded-session founding-turn completion (`awaitCurrentTurn`)
+
+`runner.loadSession({ sessionId, … })` re-opens a persisted backend session; `session/load` obliges
+the agent to replay the entire persisted conversation before resolving (the runner marks the LOAD
+BOUNDARY synchronously after the response). `InteractiveSession.awaitCurrentTurn()` resolves with
+the founding turn (the turn that was in flight when the host died) so a re-attached call's
+continuation fires exactly once — the REPL broker's re-attach arm. Completion evidence is the
+vendor **`_session/loaded_turn` extension** (the `_session/steering` precedent), an AUTHORITATIVE
+turn-terminal channel for loaded sessions advertised at initialize
+(`InitializeResponse._meta.loadedTurn.supported === true`; pi-acp and codex-acp advertise it):
+
+- `_session/loaded_turn/query { sessionId }` → `{ status: "completed" | "running" | "interrupted" }`
+  — asked right after the load response. `running` = the founding turn is still executing at the
+  backend (its replay transcript is PARTIAL); `completed` = it observably completed while the host
+  was down (the replay's trailing assistant message is its FINAL message — the seam resolves with
+  it immediately); `interrupted` = it ended without a terminal assistant message and no turn is
+  running (re-issue is safe).
+- `_session/loaded_turn/ended { sessionId, stopReason? | error? }` — pushed when a turn that a
+  query classified `running` ends: the seam keeps the loaded session attached and settles with the
+  turn's REAL accumulated text at this authoritative terminal marker (a quiet gap is only a
+  progress-stream gap, never terminal evidence), bounded by `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS`.
+
+Backends WITHOUT the extension degrade guest-visibly through the same strict advertisement gate
+(never by settling partial output, never by re-issuing a possibly-running turn): the seam rejects
+immediately with `LoadedTurnStillRunningError` (`loadedTurnStillRunning` marker — non-re-armable),
+and the broker keeps the loaded session attached, leaves the call pending, and surfaces the
+condition guest-visibly (cancelable). A `running` turn whose notification does not arrive within
+the max-wait bound rejects with the RE-ARMABLE form of the same error (a later notification or a
+cancel still settles the call); a turn that ended by FAILING at the backend rejects with
+`LoadedTurnFailedError` (`loadedTurnFailed` marker — a definite outcome, settled as a rejection,
+never re-issued); everything else (no user message in the transcript, `interrupted`, a dead
+process) is the safe-re-issue class. The seam's rejection classes are structural, so third-party
+adapter seams can throw the same markers. `isLoadedTurnStillRunningError` /
+`isLoadedTurnFailedError` are exported for hosts that classify seam rejections.
+
 ```ts
 const runner = createAcpRunner();
 
@@ -271,8 +306,7 @@ Also exported: `AcpAgentPool` / `resolvePoolSize` (including the same deadline-o
 | `AGENTPRISM_CODEX_ACP_BIN` | Override only the resolved Codex ACP bin path (keeps the default node launcher). |
 | `AGENTPRISM_OPENCODE_ACP_CMD` / `AGENTPRISM_OPENCODE_ACP_ARGS` | Override the command (and args) used to spawn the OpenCode ACP server. |
 | `AGENTPRISM_OPENCODE_DATA_ROOT` | Override the opencode built-in's stable per-user XDG data/state/cache root (default: `<data home>/agentprism/opencode`) — the tree where agent-persisted sessions live so cross-process `session/load` re-attachment is real. |
-| `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS` | The loaded-session founding-turn stream-settled grace (`awaitCurrentTurn`, default `250` ms). |
-| `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` | The loaded-session founding-turn never-hang-unobserved backstop (`awaitCurrentTurn`, default `900000` = 15 min). |
+| `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` | The loaded-session founding-turn terminal-wait backstop (`awaitCurrentTurn`'s `running` arm — how long a turn classified `running` by the `_session/loaded_turn` extension is waited for its authoritative `_session/loaded_turn/ended` notification before the seam rejects with the re-armable still-running class; default `900000` = 15 min). |
 | `AGENTPRISM_PI_ACP_CMD` / `AGENTPRISM_PI_ACP_ARGS` | Override the command (and args) used to spawn the bundled pi ACP server. |
 
 ## License

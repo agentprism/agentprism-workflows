@@ -56,6 +56,15 @@ async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** Poll until `predicate` holds (the drain tests' async wait). */
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor: condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /** The fake held-open ACP session (see broker.test.ts). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
@@ -444,7 +453,7 @@ test('review 2/3b: the drain bound is the outer ceiling — an over-bound turn i
   ws.dispose();
 });
 
-test('review 2/3c: queued-but-undelivered steers survive the drain — the next re-attached session delivers them', async () => {
+test('review 2/3c: the drain WAITS for a call still opening (a parked openSession is in flight, not done), the opening call drains within the bound, and the queued-but-undelivered steer survives the drain — delivered by the drained session', async () => {
   const runner = new FakeRunner();
   const { ws, broker } = await setup({ runner });
   // The founding session's open is PARKED (the backend is slow): the call
@@ -465,24 +474,85 @@ test('review 2/3c: queued-but-undelivered steers survive the drain — the next 
   await tick();
   await broker.pump();
   assert.equal(broker.store().lookup('c2')!.completion!.value, 'queued', 'the steer queued');
-  // The drain with nothing busy releases every child; the undelivered
-  // steer is re-queued durably against the founding session id.
-  assert.equal(await broker.drainForDisconnect(5000), true);
-  assert.equal(runner.sessions.length, 0, 'no child was ever opened before the drain');
-  assert.ok(broker.isDrained);
-  // The slow open completes AFTER the drain: the session registers and
-  // merges the surviving steer into its queue (never lost).
+  // The drain must NOT return while the open is parked: the call is still
+  // in flight without a session entry, and draining past it would let the
+  // child open and run after the last client disconnected (phase-D review
+  // round 3: the drain used to consider only registered busy sessions and
+  // returned `true` immediately).
+  let drainReturned = false;
+  const draining = broker.drainForDisconnect(5000).then((drained) => {
+    drainReturned = true;
+    return drained;
+  });
+  await tick();
+  assert.equal(drainReturned, false, 'the drain waits for the parked open');
+  assert.equal(runner.sessions.length, 0, 'no child has opened yet');
+  // The slow open completes WITHIN the bound: the session registers, the
+  // founding turn runs and drains to completion (each settlement boundary
+  // snapshots), the undelivered steer's delivery turn starts and drains
+  // too — the steer survives the drain, delivered as the next turn on
+  // the drained session.
   releaseOpen();
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await waitFor(() => runner.sessions.length === 1);
   const session = runner.sessions[0];
   session.completeTurn('founding done');
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  // The founding settlement kicks the queued steer's delivery turn (the
+  // six-agent ceiling has a free slot); the drain waits for it like any
+  // in-flight turn.
+  await waitFor(() => session.prompts.length === 1);
+  session.completeTurn('delivered');
+  assert.equal(await draining, true, 'the opening call and its delivery turn drained within the bound');
+  assert.ok(broker.isDrained);
   await broker.pump();
-  // The surviving steer delivered as the next turn on the re-attached
+  // The surviving steer delivered as the next turn on the drained
   // session (the founding prompt was consumed by completeTurn).
-  assert.equal(session.prompts.length, 1, 'the surviving steer delivered as the next turn');
-  assert.equal(session.prompts[0].content, 'queued content');
+  assert.equal(session.texts[1], 'queued content', 'the surviving steer delivered as the next turn');
   assert.equal(broker.store().lookup('c2')!.deliveredAtMs !== null, true, 'the delivered marker recorded');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review 2/3c-2: a parked open that outlives the drain bound is STOPPED — the late child is closed before it ever prompts, and the call settles as the recoverable AGENT_CANCELLED (nothing runs after the last client disconnected)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  // The bound expires with the open still parked: the drain returns false
+  // (the honest bounded teardown) and marks the opening call STOPPED.
+  assert.equal(await broker.drainForDisconnect(50), false);
+  assert.ok(broker.isDrained);
+  // The parked open lands LATER: the child is closed immediately — it
+  // never prompts (nothing runs after the last client disconnected) —
+  // and the call settles as the recoverable AGENT_CANCELLED.
+  releaseOpen();
+  await waitFor(() => runner.sessions.length === 1);
+  const session = runner.sessions[0];
+  assert.equal(session.releases, 1, 'the stopped child was closed without ever prompting');
+  assert.equal(session.prompts.length, 0, 'the stopped call never ran a turn');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await broker.pump();
+    const got = await broker.eval('await p.catch((e) => "ERR:" + e.message)');
+    if (got.result !== undefined) {
+      assert.ok(
+        got.result.includes('cancelled') || got.result.includes('stopped'),
+        `the stopped call settles recoverably: ${got.result}`,
+      );
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const record = broker.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
   await broker.dispose();
   ws.dispose();
 });
@@ -518,6 +588,14 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
     assert.ok(!rendered.includes(leaked), `value content leaked (${leaked}): ${rendered}`);
   }
   assert.ok(!rendered.includes('zekret'), 'nested property names never leak');
+  // The doc's full provenance surface: "from what task, when" (phase-D
+  // review round 3: bindings used to carry only the `worker c1`-shaped
+  // label and an internal timestamp). The handle binding's task is its
+  // founding agent() call's task, and the attribution wall clock is
+  // exposed.
+  assert.equal(byName.get('research')!.task, 'investigate', 'the handle binding carries its founding task');
+  assert.equal(typeof byName.get('research')!.provenanceAtMs, 'number');
+  assert.ok(byName.get('research')!.provenanceAtMs! > 0, 'the provenance wall clock is real');
 
   // Settlement attributes continuation bindings to the worker call.
   runner.last().completeTurn('DUG-UP');
@@ -527,6 +605,11 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
   manifest = broker.workspaceManifest();
   const finding = manifest.bindings.find((b) => b.name === 'finding');
   assert.equal(finding?.token, 'agent handle \u00b7 settled \u00b7 call c1');
+  // The worker-produced binding carries the worker's TASK text (the "from
+  // what task" half) and the attribution wall clock (the "when" half).
+  assert.equal(finding?.task, 'investigate', 'the worker provenance carries its task');
+  assert.equal(typeof finding?.provenanceAtMs, 'number');
+  assert.ok(finding!.provenanceAtMs! > 0);
   assert.ok(!JSON.stringify(manifest).includes('DUG-UP'), 'worker result content never leaks');
   await broker.dispose();
   ws.dispose();

@@ -36,6 +36,7 @@ import { shutdownPiSession } from "./pi-shutdown.js";
 import { PiSession } from "./session.js";
 import { ChildProcessRegistrySlot, createTrackedBashOperations } from "./child-process-registry.js";
 import type { SteeringRequest, SteeringResponse } from "./steering.js";
+import type { LoadedTurnQueryRequest, LoadedTurnStatus } from "./loaded-turn.js";
 import { PKG_VERSION } from "./version.js";
 
 export { PKG_VERSION } from "./version.js";
@@ -192,7 +193,7 @@ export class PiAcpAgent {
         sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} },
       },
       authMethods: AUTH_METHODS,
-      _meta: { steering: { supported: true } },
+      _meta: { steering: { supported: true }, loadedTurn: { supported: true } },
     };
   }
 
@@ -719,6 +720,14 @@ export class PiAcpAgent {
         console.error("pi-acp steering failed:", error);
         return { outcome: "failed" as const };
       });
+  }
+
+  /** `_session/loaded_turn/query` (see `src/loaded-turn.ts`): the loaded
+   *  session's authoritative founding-turn terminal classification. */
+  loadedTurnQuery(context: AgentRequestContext<LoadedTurnQueryRequest>): {
+    status: LoadedTurnStatus;
+  } {
+    return { status: this.requireLive(context.params.sessionId).loadedTurnStatus() };
   }
 
   cancel(context: AgentNotificationContext<{ sessionId: string }>): void {

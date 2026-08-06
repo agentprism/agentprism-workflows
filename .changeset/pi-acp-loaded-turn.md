@@ -1,0 +1,5 @@
+---
+"@automatalabs/pi-acp": minor
+---
+
+The `_session/loaded_turn` vendor extension (the `_session/steering` precedent): turn-TERMINAL state for loaded sessions — the re-attach arm's authoritative completion evidence. Advertised at initialize as `_meta: { steering: { supported: true }, loadedTurn: { supported: true } }`; `_session/loaded_turn/query { sessionId }` answers whether the loaded session's founding turn is still running right now — `running` while a turn executes in this process (arming a one-shot watch that pushes `_session/loaded_turn/ended { sessionId, stopReason? | error? }` when that turn finishes), `completed` when the session journal's last message entry is an assistant message (pi persists every complete LLM message atomically at `message_end`, so a completed turn always leaves an assistant leaf and the replay's trailing assistant message is the turn's FINAL message — authoritative), and `interrupted` otherwise (an interrupted/abandoned turn — nothing is running, so re-issue is safe). Strict request parsing and `unknown_session` for unknown ids, mirroring the steering surface.

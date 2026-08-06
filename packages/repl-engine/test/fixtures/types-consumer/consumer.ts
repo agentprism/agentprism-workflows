@@ -445,7 +445,8 @@ async function phaseDSurfaceTyping(): Promise<void> {
   };
   void sink;
   // The snapshot writer is wired to a REAL workspace and wasm input — the
-  // phase-D review round-2 fixture rule: no placeholder stand-ins.
+  // phase-D review round-2 fixture rule: the writer's type surface must be
+  // exercised against real engine objects, never fake substitutes.
   const realWorkspace = await Workspace.create('/tmp/project');
   const realWasm: WasmInput = new Uint8Array([0, 97, 115, 109]);
   const fromWriter: SnapshotSink = store.snapshotWriter(realWorkspace, realWasm);
