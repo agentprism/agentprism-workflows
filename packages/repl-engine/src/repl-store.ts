@@ -47,9 +47,13 @@
  *   previous snapshot file is untouched) and a corrupt or truncated
  *   snapshot file refuses loudly on load (`SnapshotEnvelopeError`,
  *   naming the file and the problem) — a single-shot error, never a
- *   silent pass and never a retry loop. The store stays usable: a
- *   fresh `writeSnapshot` replaces the bad file, or `reset()` clears
- *   the whole `repl/` directory (the `reset` tool's engine-side).
+ *   silent pass and never a retry loop. A failed write also leaves the
+ *   writer's dirty boundary IN PLACE, so the next flush retries the
+ *   same state (phase-D review round 6: the boundary used to clear
+ *   before the write, silently dropping a failed last-disconnect
+ *   snapshot). The store stays usable: a fresh `writeSnapshot` replaces
+ *   the bad file, or `reset()` clears the whole `repl/` directory (the
+ *   `reset` tool's engine-side).
  * - **Config knobs** (decided names): `ReplStoreOptions.persistenceRoot`
  *   (overrides `workflowHomeDir` — tests and `AGENTPRISM_PERSISTENCE_ROOT`
  *   parity), `ReplStoreOptions.env` (workflow-path env overrides),
@@ -278,8 +282,16 @@ export class ReplWorkspaceStore {
       },
       flush: () => {
         if (!dirty) return;
-        dirty = false;
+        // The write happens BEFORE the boundary clears (phase-D review
+        // round 6): a failing write leaves the boundary dirty, so the
+        // next flush — the next drain burst, or the next disconnect's
+        // retried drain — retries the SAME state instead of silently
+        // dropping it (the old order cleared `dirty` first, so a failed
+        // last-disconnect snapshot was lost without a trace). The write's
+        // throw propagates to the broker's operation — the failure is
+        // loud at the surface that triggered the boundary.
         this.writeSnapshot(workspace.snapshot(), wasm);
+        dirty = false;
       },
     };
   }

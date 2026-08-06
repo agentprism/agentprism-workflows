@@ -281,13 +281,21 @@ export class PiSession {
     // client that was told this turn was `running` at query time gets the
     // ended notification now — with the turn's stop reason (response
     // outcome) or its error (failure), never both. Best-effort: a
-    // failing notification must not break the turn's settlement.
+    // failing notification must not break the turn's settlement. The
+    // push is ORDERED behind the turn's final update pump (review round
+    // 6): the last deltas were only enqueued (the pump delivers them
+    // asynchronously), and the re-attach seam settles with the
+    // accumulated text at the terminal marker — a marker delivered
+    // before the final chunk would durably settle PARTIAL text.
     if (this.loadedTurnReportedRunning) {
       this.loadedTurnReportedRunning = false;
       const notification: LoadedTurnEndedNotification = "response" in outcome
         ? { sessionId: this.sessionId, stopReason: outcome.response.stopReason }
         : { sessionId: this.sessionId, error: normalizeTurnError(outcome.error) };
-      void this.client.notify(LOADED_TURN_ENDED_METHOD, notification).catch(() => undefined);
+      void this.drain()
+        .catch(() => undefined)
+        .then(() => this.client.notify(LOADED_TURN_ENDED_METHOD, notification))
+        .catch(() => undefined);
     }
     const generation = this.cleanupGeneration;
     if (generation?.resumeRefreshesOnSettlement && generation.mode === "cancel-only") {

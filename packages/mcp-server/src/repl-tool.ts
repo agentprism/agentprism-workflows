@@ -161,6 +161,18 @@ function refusedResult(state: ReplProjectState): {
   };
 }
 
+/** The last client-presence drain's failure, rendered as a warn line
+ *  (phase-D review round 6: a failed drain — a snapshot-flush failure
+ *  mid-drain, for example — is never silent; it is surfaced in every
+ *  repl result until the next drain succeeds or reset clears it, and
+ *  the next disconnect retries it). */
+function drainErrorLine(state: ReplProjectState): string | null {
+  const error = state.drainError;
+  if (error === null) return null;
+  return `warn: ${error.name}: ${error.message} (the last client-presence drain failed — the workspace state was ` +
+    `not persisted; the next disconnect retries the drain)`;
+}
+
 /** Render the broker's eval-result shape as text (the tool's output; the
  *  same renderer serves eval AND wait — the doc's same-shape rule). */
 function renderEvalResult(result: ReplEvalResult): string {
@@ -203,6 +215,11 @@ function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectSt
       );
     } else {
       lines.push(`workspace ${context.projectDir}: fresh`);
+    }
+    // The last failed client-presence drain, surfaced loudly (phase-D
+    // review round 6: the failure used to be discarded silently).
+    if (state.drainError !== null) {
+      lines.push(`workspace ${context.projectDir}: LAST DRAIN FAILED — ${state.drainError.name}: ${state.drainError.message}`);
     }
     const broker = state.broker;
     if (broker === null) continue;
@@ -364,7 +381,9 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           throw new McpError(ErrorCode.InvalidParams, "Invalid repl tool input: eval requires a non-empty code string");
         }
         const result = await broker.eval(code);
-        return { content: [{ type: "text", text: renderEvalResult(result) }] };
+        const line = drainErrorLine(state);
+        const rendered = renderEvalResult(result);
+        return { content: [{ type: "text", text: line !== null ? `${line}\n${rendered}` : rendered }] };
       }
       if (action === "wait") {
         const timeoutMs = replToolInputShape.timeoutMs.parse(args.timeoutMs ?? 30_000) ?? 30_000;
@@ -374,10 +393,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         // output drained by its pumps and defer it to the next eval).
         const { result, drained } = await broker.waitForCalls(ids, timeoutMs);
         const text = renderEvalResult(result);
+        const line = drainErrorLine(state);
+        const body = drained ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)`;
         return {
-          content: [
-            { type: "text", text: drained ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)` },
-          ],
+          content: [{ type: "text", text: line !== null ? `${line}\n${body}` : body }],
         };
       }
       // interrupt

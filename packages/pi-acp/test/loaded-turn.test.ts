@@ -140,3 +140,71 @@ test("a turn executing in-process answers `running`, and its finish pushes the a
     await server.connection.close();
   }
 });
+
+test("THE REVIEW REGRESSION: a turn's final delta and its completion back-to-back deliver the delta FIRST — the ended push rides the update pump, so the re-attach seam never settles partial text", async () => {
+  const setup = fakeDeps("wedged");
+  const pair = streamPair();
+  // One ordered wire log: every session/update plus the ended
+  // notification, in arrival order.
+  const wire: Array<{ method: string; text?: string; stopReason?: string }> = [];
+  const app = client({ name: "pi-acp-loaded-turn-order-wire" })
+    .onNotification(
+      methods.client.session.update,
+      (params: unknown) => (params ?? {}) as Record<string, unknown>,
+      ({ params }) => {
+        const update = (params as { update?: { sessionUpdate?: string; content?: { type?: string; text?: string } } }).update;
+        if (update?.sessionUpdate === "agent_message_chunk") {
+          wire.push({ method: "agent_message_chunk", text: update.content?.text });
+        }
+      },
+    )
+    .onNotification(
+      LOADED_TURN_ENDED_METHOD,
+      (params: unknown) => (params ?? {}) as Record<string, unknown>,
+      ({ params }) => {
+        wire.push({ method: "loaded_turn_ended", stopReason: (params as { stopReason?: string }).stopReason });
+      },
+    );
+  const server = await runAcp({ deps: setup.deps, stream: pair.agent });
+  const connection = app.connect(pair.client);
+  try {
+    await connection.agent.request(methods.agent.initialize, { protocolVersion: 1 });
+    const opened = await connection.agent.request(methods.agent.session.new, {
+      cwd: setup.cwd,
+      mcpServers: [],
+    });
+    const prompt = connection.agent.request(methods.agent.session.prompt, {
+      sessionId: opened.sessionId,
+      prompt: [{ type: "text", text: "original" }],
+    });
+    await eventually(() => assert.ok(setup.controls[0]?.resolvePrompt));
+    // The turn is executing: the query arms the ended watch.
+    assert.deepEqual(
+      await connection.agent.request<LoadedTurnQueryResponse, LoadedTurnQueryRequest>(
+        LOADED_TURN_QUERY_METHOD,
+        { sessionId: opened.sessionId },
+      ),
+      { status: "running" },
+    );
+    // The final delta and the completion fire BACK-TO-BACK with no wait
+    // between them: the delta is only ENQUEUED (the update pump delivers
+    // asynchronously), so an immediate ended push would reach the client
+    // first and the re-attach seam would settle the accumulated text at
+    // the marker — partial output (review round 6).
+    setup.controls[0]?.emit?.({
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: "result C" }] },
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "result C", partial: { role: "assistant", content: [{ type: "text", text: "result C" }] } },
+    } as never);
+    setup.controls[0]?.resolvePrompt?.();
+    assert.equal((await prompt).stopReason, "end_turn");
+    await eventually(() =>
+      assert.deepEqual(wire, [
+        { method: "agent_message_chunk", text: "result C" },
+        { method: "loaded_turn_ended", stopReason: "end_turn" },
+      ]),
+    );
+  } finally {
+    await server.connection.close();
+  }
+});

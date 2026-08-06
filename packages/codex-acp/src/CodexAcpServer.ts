@@ -15,6 +15,7 @@ import type {
     ReasoningEffortOption,
     Thread,
     ThreadItem,
+    Turn,
     TurnCompletedNotification,
     TurnStatus,
     UserInput
@@ -1245,8 +1246,12 @@ export class CodexAcpServer {
                 sessionState.loadedActiveTurnIsAny = false;
                 // The helper owns the armed flag: it clears it when it
                 // pushes (the caller must NOT pre-clear — the push's gate
-                // reads it).
-                pushLoadedTurnEnded(this.connection, sessionState, recorded.turn);
+                // reads it). The push rides the session's update chain: a
+                // turn that completed in the load window may have trailing
+                // buffered deltas still being forwarded, and the terminal
+                // marker must never reach the client before the turn's
+                // final text (review round 6).
+                this.pushLoadedTurnEndedOrdered(sessionState, recorded.turn);
             }
             return {status: "running"};
         }
@@ -1315,13 +1320,37 @@ export class CodexAcpServer {
             sessionState.loadedActiveTurnIsAny = false;
             // The helper owns the armed flag: it clears it when it
             // pushes (the caller must NOT pre-clear — the push's gate
-            // reads it).
-            pushLoadedTurnEnded(this.connection, sessionState, event.params.turn);
+            // reads it). The push rides the session's update chain
+            // (review round 6): `forwardLoadedTurnDelta` delivers the
+            // turn's deltas asynchronously through that chain, and a
+            // `turn/completed` arriving back-to-back with the final
+            // delta must never deliver the terminal marker to the ACP
+            // client before the last chunk — the re-attach seam settles
+            // with the accumulated text at the marker and would
+            // durably settle PARTIAL text.
+            this.pushLoadedTurnEndedOrdered(sessionState, event.params.turn);
         } else {
             // Record the terminal marker (first-wins): a later query
             // answering `running` settles the ended push immediately.
             sessionState.loadedTurnEndedBeforeWatch = event.params;
         }
+    }
+
+    /** The `_session/loaded_turn/ended` push, ORDERED behind the session's
+     *  pending loaded-turn delta updates (see `forwardLoadedTurnDelta`):
+     *  the deltas travel the per-session update chain asynchronously, so
+     *  a synchronous push could deliver the terminal marker before the
+     *  turn's final text — and the re-attach seam settles with the
+     *  accumulated text at the marker, durably recording PARTIAL output
+     *  (review round 6: the push used to fire synchronously while final
+     *  deltas were still queued on the chain). The push therefore rides
+     *  the same chain: every delta enqueued before the turn's completion
+     *  reaches the client first. Best-effort — a failing push must never
+     *  break the watch. */
+    private pushLoadedTurnEndedOrdered(sessionState: SessionState, turn: Turn): void {
+        const chain = this.loadedTurnUpdateChains.get(sessionState.sessionId) ?? Promise.resolve();
+        const next = chain.then(() => pushLoadedTurnEnded(this.connection, sessionState, turn));
+        this.loadedTurnUpdateChains.set(sessionState.sessionId, next.catch(() => undefined));
     }
 
     /** Forward one loaded active turn's live text delta to the ACP client
@@ -2201,6 +2230,13 @@ export class CodexAcpServer {
                 clientSupportsPlanUpdates(this.clientCapabilities),
                 // Fork-owned (#282): thread the client-backed file reader into fileChange updates.
                 this.clientFileSystem.createFileReader(params.sessionId),
+                // The ended push scheduler: the handler's own per-event
+                // queue is ordered, but the LOAD-TIME watcher's delta
+                // chain may still hold undelivered chunks when the prompt
+                // subscription replaced it — the terminal marker rides
+                // the same chain so it can never reach the client before
+                // the turn's final text (review round 6).
+                (turn) => this.pushLoadedTurnEndedOrdered(sessionState, turn),
             );
             eventHandler = promptEventHandler;
             const approvalHandler = new CodexApprovalHandler(this.connection, sessionState, activePrompt.signal);

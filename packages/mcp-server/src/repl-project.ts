@@ -140,6 +140,15 @@ export interface ReplProjectState {
    *  broker's authoritative warmth — a second disconnect after a
    *  re-attach must drain again (phase-D review). */
   drained: boolean;
+  /** The last client-presence drain's failure (a snapshot-flush failure
+   *  mid-drain, for example), recorded LOUDLY by the presence ledger and
+   *  surfaced in every repl tool result until the next drain succeeds
+   *  (or `reset` clears it) — phase-D review round 6: a failed
+   *  last-disconnect drain was silently discarded, and a failed snapshot
+   *  write left the workspace's state unpersisted without any visible
+   *  trace or retry. The drain latch stays clear on failure, so the next
+   *  disconnect retries. */
+  drainError: { name: string; message: string } | null;
 }
 
 /** Open (and create, on first touch) the project's repl state. */
@@ -160,6 +169,7 @@ export function createReplProjectState(
     firstTouch: null,
     generation: 0,
     drained: false,
+    drainError: null,
   };
 }
 
@@ -286,8 +296,20 @@ export function disconnectReplProject(state: ReplProjectState, clientId: string)
  * then every idle child closes. The workspace and broker stay alive; the
  * next client's followUp/steer/cancel lazily re-attaches the recorded
  * backend sessions. A client that reconnected before the drain started
- * skips it (presence is re-checked); one that reconnects mid-drain
- * self-heals via the lazy re-attach (documented in `repl-presence.ts`).
+ * skips it (presence is re-checked); one that reconnects MID-DRAIN
+ * ABORTS it — the broker's `drainForDisconnect` consults this state's
+ * client set every iteration and before every destructive phase, so the
+ * children stay warm while any client is connected (phase-D review
+ * round 6: the drain used to run to its release phase and close every
+ * child regardless of presence).
+ *
+ * A failing drain — a snapshot-flush failure mid-drain, for example —
+ * is recorded on the state (`drainError`, surfaced loudly in every repl
+ * tool result) and the drain latch stays clear, so the next disconnect
+ * retries the drain (phase-D review round 6: the failure used to be
+ * discarded silently, and a failed snapshot write left the boundary
+ * clean — the dirty boundary is retained for retry by the store's
+ * writer).
  *
  * The latch is not a permanent skip: `touchReplProject` clears it on
  * every connect, and a stale latch (the broker reports warm children —
@@ -298,8 +320,26 @@ export function disconnectReplProject(state: ReplProjectState, clientId: string)
 export async function drainReplProject(state: ReplProjectState, boundMs: number): Promise<void> {
   if (state.broker === null || state.clients.size > 0) return;
   if (state.drained && state.broker.isDrained) return;
-  const drained = await state.broker.drainForDisconnect(boundMs);
-  if (state.broker !== null) state.drained = drained;
+  try {
+    // The mid-drain presence probe: the drain aborts the moment a
+    // client is connected again (children stay warm).
+    const drained = await state.broker.drainForDisconnect(boundMs, () => state.clients.size > 0);
+    if (state.broker !== null) {
+      state.drained = drained;
+      if (drained) state.drainError = null;
+    }
+  } catch (error) {
+    // Loud + retained: the ledger records the failure on the state and
+    // every repl tool result surfaces it; the drain latch stays clear
+    // so the next disconnect retries. The rethrow reaches the ledger's
+    // catch — the drain runs detached, so the state record IS the
+    // loudness.
+    state.drainError = {
+      name: error instanceof Error ? error.name : 'Error',
+      message: error instanceof Error ? error.message : String(error),
+    };
+    throw error;
+  }
 }
 
 /** Teardown the live workspace and broker (releasing every held ACP
@@ -332,4 +372,5 @@ export async function resetReplProjectState(state: ReplProjectState): Promise<vo
   state.restoreError = null;
   state.clients.clear();
   state.drained = false;
+  state.drainError = null;
 }

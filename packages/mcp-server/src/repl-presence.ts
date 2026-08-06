@@ -25,9 +25,19 @@
  * own runaway protections; the TTL is the outer ceiling). The workspace
  * and broker stay alive; the next client's followUp/steer/cancel
  * lazily re-attaches the recorded backend sessions (the broker's
- * capability-gated lazy re-attach), and a client reconnecting mid-drain
- * self-heals the same way (the drain's release may have closed the
- * children already — documented).
+ * capability-gated lazy re-attach), and a client reconnecting MID-drain
+ * ABORTS the drain — the broker consults the project's client set every
+ * iteration and before every destructive phase, so the children stay
+ * warm while any client is connected (phase-D review round 6: the drain
+ * used to run to its release phase and close every child regardless of
+ * presence).
+ *
+ * A drain that FAILS — a snapshot-flush failure mid-drain, for example
+ * — is never discarded silently (phase-D review round 6): the failure
+ * is recorded on the project state (`drainError`), surfaced loudly in
+ * every repl tool result, and the drain latch stays clear so the next
+ * disconnect retries the drain (the store's writer retains the failed
+ * boundary's dirty flag for that retry).
  *
  * Drains are single-flight per project (a second disconnect while a
  * drain runs is a no-op), and the ledger keeps the project's client set
@@ -116,7 +126,14 @@ export class ReplPresenceLedger {
     if (this.draining.has(state)) return;
     this.draining.add(state);
     void drainReplProject(state, this.boundMs)
-      .catch(() => undefined)
+      .catch(() => {
+        // The drain runs detached — there is no caller to propagate to.
+        // The failure is NOT silent: `drainReplProject` recorded it on
+        // the project state (`drainError`), every repl tool result
+        // surfaces it loudly, and the drain latch stayed clear so the
+        // next disconnect retries (phase-D review round 6: the failure
+        // used to vanish here).
+      })
       .finally(() => {
         this.draining.delete(state);
       });

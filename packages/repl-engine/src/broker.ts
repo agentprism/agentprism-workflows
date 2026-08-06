@@ -2087,7 +2087,14 @@ export class Broker {
    * every turn drained within the bound, `false` when the bound forced
    * the remainder to cancel (the honest bounded teardown — the cancel
    * settles the calls as the recoverable `AGENT_CANCELLED`, recorded and
-   * snapshotted like any settlement).
+   * snapshotted like any settlement) or when `shouldAbort` reported a
+   * reconnecting client (nothing was cancelled or released — the next
+   * disconnect drains again).
+   *
+   * `shouldAbort` is the daemon's mid-drain presence probe (phase-D
+   * review round 6): the drain consults it every iteration and before
+   * every destructive phase, and aborts — children stay warm, the drain
+   * latch stays clear — the moment a client is connected again.
    *
    * **The drain covers OPENING calls too** (phase-D review round 3: a
    * call blocked in `openSession` has no session entry yet, so a drain
@@ -2107,12 +2114,38 @@ export class Broker {
    * await races the remaining bound, and once it expires the drain
    * returns without waiting — the best-effort cancellations and releases
    * already issued keep running in the background (all promises carry
-   * catch handlers, so nothing can become an unhandled rejection).
+   * catch handlers, so nothing can become an unhandled rejection). The
+   * GUEST DRAINS the drain's pumps trigger are bounded by the same
+   * remaining bound (phase-D review round 6: a ready settlement resumes
+   * the guest continuation through `drainJobs`, which used to run under
+   * the per-eval deadline alone — a runaway continuation near the
+   * disconnect deadline could exceed the session-eviction TTL).
+   *
+   * **A client reconnecting mid-drain aborts the drain** (phase-D review
+   * round 6: the drain used to run to its release phase and close every
+   * child regardless of presence — the doc requires children to remain
+   * warm while any client is connected): the daemon passes
+   * `shouldAbort` (its presence check — `clients.size > 0`), which the
+   * drain consults every iteration and before every destructive phase.
+   * An abort leaves every child attached and running, clears the
+   * drain latch (`isDrained` stays false), and returns `false` — the
+   * NEXT disconnect drains again.
+   *
+   * **The bound's forced stop never orphans a pending call** (phase-D
+   * review round 6: a re-attached call whose seam rejected mid-drain
+   * used to resolve `hold`, then the release phase discarded its
+   * session — the call stayed pending forever, uncancelable except by
+   * reset, because reconcile never runs again on a live workspace):
+   * after the bound expires every call still pending on an attached
+   * session is settled with the recoverable `AGENT_CANCELLED` (recorded
+   * FIRST, settled into the guest, one bounded drain + settlement
+   * boundary) — the same forced-stop vocabulary as a stopped open.
    */
-  async drainForDisconnect(boundMs: number): Promise<boolean> {
+  async drainForDisconnect(boundMs: number, shouldAbort?: () => boolean): Promise<boolean> {
     return this.serialized(async () => {
       this.assertAlive();
       if (this.drained) return true;
+      if (shouldAbort?.()) return false;
       this.draining = true;
       const deadline = Date.now() + Math.max(0, boundMs);
       // Drain phase: pump until no session has a turn running, no session
@@ -2123,21 +2156,36 @@ export class Broker {
       // yields briefly (the turns complete asynchronously at the
       // backends; a busy spin would starve the event loop).
       for (;;) {
+        if (shouldAbort?.()) {
+          // A client reconnected mid-drain: the children stay warm —
+          // nothing is cancelled, nothing is released, and the drain
+          // latch stays clear so the next disconnect drains again.
+          this.draining = false;
+          return false;
+        }
         const outstandingOpens = this.openingCalls.size + this.pendingReattaches.size;
         if (this.busySessionCount() === 0 && outstandingOpens === 0) break;
         if (Date.now() >= deadline) break;
-        const { settled } = await this.pumpUnlocked();
+        const { drainError } = await this.pumpUnlocked(deadline);
         // The pump's per-call settlement boundaries already fired inside
         // `pumpUnlocked` (one per settled call's continuation drain —
         // the daemon's snapshot sink persists each drain boundary, so a
-        // kill mid-drain loses nothing).
+        // kill mid-drain loses nothing). A continuation the bound
+        // interrupted is honest output for the next tool result.
+        if (drainError !== undefined) {
+          this.warnLine('warn', `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`);
+        }
         if (this.busySessionCount() > 0 || this.openingCalls.size > 0 || this.pendingReattaches.size > 0) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
+          await sleep(50);
         }
       }
       const drainedWithinBound =
         this.busySessionCount() === 0 && this.openingCalls.size === 0 && this.pendingReattaches.size === 0;
       if (!drainedWithinBound) {
+        if (shouldAbort?.()) {
+          this.draining = false;
+          return false;
+        }
         // The bound is the outer ceiling: stop what it caught
         // (best-effort; the cancellations settle the calls as the
         // recoverable AGENT_CANCELLED, and a parked open's eventual
@@ -2162,8 +2210,66 @@ export class Broker {
         await boundedAll(cancels, deadline);
         // One final pump settles the cancellations into the VM; its
         // per-call settlement boundaries already fired inside
-        // `pumpUnlocked` (one per settled call's continuation drain).
-        await this.pumpUnlocked();
+        // `pumpUnlocked` (one per settled call's continuation drain) and
+        // its guest drain is bounded by the remaining bound (review
+        // round 6 — the outer bound is absolute).
+        const final = await this.pumpUnlocked(deadline);
+        if (final.drainError !== undefined) {
+          this.warnLine('warn', `settlement drain interrupted at the disconnect bound: ${errorLine(final.drainError.info)}`);
+        }
+        // The bound's forced stop settles EVERY call still pending on an
+        // attached session — a held re-attach (the seam rejected and the
+        // pump dropped its in-flight entry) or a seam the release phase
+        // is about to cut off — with the recoverable AGENT_CANCELLED,
+        // recorded FIRST, settled into the guest, one bounded drain +
+        // settlement boundary. A call left pending here would be
+        // ORPHANED: the release phase discards its session, no task
+        // tracks it, and (the workspace stays live — reconcile never
+        // runs again) it would be uncancelable except by reset
+        // (phase-D review round 6). A still-observing task's later
+        // outcome is a first-wins no-op against the recorded completion.
+        const stopped: Array<[string, SessionEntry]> = [];
+        for (const [callId, entry] of this.sessions) {
+          if (!entry.callSettled && !this.openingCalls.has(callId)) stopped.push([callId, entry]);
+        }
+        if (stopped.length > 0) {
+          const settledIds: string[] = [];
+          for (const [callId, entry] of stopped) {
+            const value = toRejectionValue(
+              new WorkflowError(
+                `call ${callId} was cancelled by the client-presence drain: its bound expired before the call's ` +
+                  `outcome became observable — the session is closing`,
+                CODE.AGENT_CANCELLED,
+                { recoverable: true },
+              ),
+            );
+            this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+            if (this.settleIntoGuest(callId, 'reject', value)) settledIds.push(callId);
+            entry.callSettled = true;
+            entry.busy = false;
+            this.warnLine('warn', `call ${callId}: ${value.message}`);
+          }
+          if (settledIds.length > 0) {
+            try {
+              this.drain(deadline);
+            } catch (drainError) {
+              if (drainError instanceof DrainJobError) {
+                this.warnLine(
+                  'warn',
+                  `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`,
+                );
+              } else {
+                throw drainError;
+              }
+            }
+            this.provenancePass('settlement', settledIds);
+            this.sink?.boundary('settlement');
+          }
+        }
+      }
+      if (shouldAbort?.()) {
+        this.draining = false;
+        return false;
       }
       // Release phase: every session's child closes (keepSession keeps
       // the backend session re-openable). Queued-but-undelivered steers
@@ -3073,7 +3179,7 @@ export class Broker {
 
   // ── The settlement pump ───────────────────────────────────────────────
 
-  private async pumpUnlocked(): Promise<{ settled: string[]; drainError?: DrainJobError }> {
+  private async pumpUnlocked(boundDeadlineMs?: number): Promise<{ settled: string[]; drainError?: DrainJobError }> {
     this.assertAlive();
     const settled: string[] = [];
     for (;;) {
@@ -3123,7 +3229,7 @@ export class Broker {
         // interrupted continuation used to erase every id the pump had
         // settled).
         try {
-          this.drain();
+          this.drain(boundDeadlineMs);
           this.provenancePass('settlement', [entry.callId]);
           this.sink?.boundary('settlement');
         } catch (error) {
@@ -3225,10 +3331,17 @@ export class Broker {
    *  continuation resumed by settlement cannot run away unguarded). The
    *  drain also runs under the per-eval wall-clock deadline (a
    *  settlement drain can itself resume a runaway continuation — it
-   *  gets the same bound). */
-  private drain(): void {
+   *  gets the same bound) and, when the drain is the client-presence
+   *  teardown's pump, under the REMAINING disconnect bound
+   *  (`boundDeadlineMs` — phase-D review round 6: the outer drain bound
+   *  is absolute, so a settlement that resumed a runaway continuation
+   *  near the disconnect deadline can never exceed the session-eviction
+   *  TTL). */
+  private drain(boundDeadlineMs?: number): void {
+    const boundHandler =
+      boundDeadlineMs === undefined ? undefined : () => Date.now() >= boundDeadlineMs;
     this.workspace.drainJobs({
-      interruptHandler: this.composedInterrupt(this.interruptHandler),
+      interruptHandler: this.composedInterrupt(this.interruptHandler, boundHandler),
     });
   }
 

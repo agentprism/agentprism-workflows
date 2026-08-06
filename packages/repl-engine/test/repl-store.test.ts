@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -328,6 +328,39 @@ test('debounceBursts: false writes synchronously at every boundary', async () =>
   sink.flush();
   assert.equal(store.stats().snapshotWrites, 2, 'every boundary writes when the debounce is off');
   ws.dispose();
+  teardown(dir);
+});
+
+test('THE REVIEW REGRESSION: a failed flush RETAINS the dirty boundary — the next flush retries the SAME state, never a silent drop (phase-D review round 6: the boundary used to clear before the write)', async () => {
+  const dir = root();
+  const module = await loadShippedWasm();
+  const store = ReplWorkspaceStore.open(PROJECT, { persistenceRoot: dir });
+  const ws = await Workspace.create(PROJECT, { wasm: module });
+  await ws.eval('globalThis.pending = "must survive";');
+  const sink = store.snapshotWriter(ws, module);
+  sink.boundary('eval');
+  // Sabotage the atomic write: a DIRECTORY at the tmp path makes the
+  // write's open fail (EISDIR) — the previous snapshot file, if any,
+  // is untouched.
+  mkdirSync(`${store.snapshotPath}.tmp`);
+  const error = captureThrows(() => sink.flush());
+  assert.ok(error instanceof Error, 'the failed write throws loudly');
+  assert.equal(store.stats().snapshotWrites, 0, 'the failed write is not counted');
+  assert.equal(existsSync(store.snapshotPath), false, 'no partial snapshot file');
+  // The boundary is STILL DIRTY: after the obstruction is removed, the
+  // next flush writes the same state (the failed boundary is retained
+  // for retry — a kill after the failure loses nothing that was
+  // acknowledged, and the next drain burst persists it).
+  rmSync(`${store.snapshotPath}.tmp`, { recursive: true, force: true });
+  sink.flush();
+  assert.equal(store.stats().snapshotWrites, 1, 'the retained boundary wrote on the retry');
+  const loaded = store.loadSnapshot(module);
+  const ws2 = await Workspace.restore(PROJECT, loaded.snapshot, { wasm: module });
+  const outcome = await ws2.eval('globalThis.pending');
+  assert.equal(outcome.kind, 'value');
+  assert.equal(outcome.value, 'must survive', 'the retried snapshot carries the SAME state the failed flush was asked to persist');
+  ws.dispose();
+  ws2.dispose();
   teardown(dir);
 });
 

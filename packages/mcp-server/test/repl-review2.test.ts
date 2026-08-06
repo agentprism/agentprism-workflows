@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -31,6 +31,7 @@ import type {
 import { createWorkflowServer } from "../src/index.js";
 import { ReplPresenceLedger } from "../src/repl-presence.js";
 import { okRunner, textOf, type Connected } from "./_harness.js";
+import { workflowProjectPaths } from "@automatalabs/workflows";
 
 /** The fake held-open ACP session (see repl-tool.test.ts). */
 class FakeSession implements BrokerSession {
@@ -39,6 +40,7 @@ class FakeSession implements BrokerSession {
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
   readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
+  cancelCalls = 0;
   stopReason = "end_turn";
   readonly completedTexts: string[] = [];
   /** The re-attach seam's scripted loaded-turn outcome (null parks it). */
@@ -72,6 +74,7 @@ class FakeSession implements BrokerSession {
   }
 
   cancel(): Promise<void> {
+    this.cancelCalls++;
     for (const pending of this.prompts.splice(0)) {
       pending.resolve({ stopReason: "cancelled", text: "" });
     }
@@ -383,5 +386,119 @@ test("review2: the per-eval deadline bounds a CURRENTLY running runaway eval thr
   } finally {
     if (prev === undefined) delete process.env.AGENTPRISM_REPL_EVAL_TIMEOUT_MS;
     else process.env.AGENTPRISM_REPL_EVAL_TIMEOUT_MS = prev;
+  }
+});
+
+test("review6: a client reconnecting mid-drain ABORTS the drain through the daemon wiring — the child stays warm while any client is connected, nothing is cancelled or released", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const presence = new ReplPresenceLedger(60_000);
+  const connected = await connectWithRepl(runner, { presence, clientId: () => "client-A" });
+  try {
+    const r = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "task"); "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    // The last client disconnects: the drain starts (the in-flight turn
+    // is still running).
+    presence.disconnect("client-A");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const session = runner.last();
+    assert.equal(session.releases, 0, "the drain is waiting for the in-flight turn — the child is still warm");
+    // A client RECONNECTS mid-drain (the next tool call touches
+    // presence): the drain must ABORT — the release phase must never
+    // close children while any client is connected (phase-D review
+    // round 6: the drain used to run to completion regardless of
+    // presence, and repl-presence.ts documented the contradictory
+    // behavior).
+    const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"back"' });
+    assert.ok(!isErrorResult(probe), textOf(probe));
+    assert.equal(session.releases, 0, "the drain aborted — the child was NOT released");
+    assert.equal(session.cancelCalls, 0, "nothing was cancelled");
+    // The still-running turn completes normally after the abort and
+    // settles into the live workspace.
+    session.completeTurn("warm result");
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const got = await repl(connected, { action: "eval", projectDir: PROJECT, code: "await p" });
+      if (textOf(got).includes("warm result")) break;
+      if (attempt === 99) assert.fail(`the turn never settled: ${textOf(got)}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const status = await repl(connected, { action: "status", projectDir: PROJECT });
+    assert.ok(!textOf(status).includes("children: closed"), "the workspace is warm (the drain aborted)");
+  } finally {
+    await connected.dispose();
+  }
+});
+
+test("review6: a failed client-presence drain is surfaced loudly and retained — the snapshot-flush failure is recorded on the state, the next tool result reports it, and the next disconnect retries the drain", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const presence = new ReplPresenceLedger(60_000);
+  const connected = await connectWithRepl(runner, { presence, clientId: () => "client-A" });
+  try {
+    const r = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "task"); "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    // Sabotage the snapshot write: a DIRECTORY at the tmp path makes the
+    // drain's atomic write fail (EISDIR).
+    const paths = workflowProjectPaths(PROJECT);
+    const tmpPath = join(paths.rootDir, "repl", "snapshot.bin.tmp");
+    mkdirSync(tmpPath);
+    // The last client disconnects: the drain runs, the in-flight turn
+    // completes, and the drain's settlement flush FAILS. The failure
+    // must not vanish (phase-D review round 6: the ledger used to
+    // swallow it) — it is recorded on the state and surfaced loudly.
+    presence.disconnect("client-A");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const session = runner.last();
+    session.completeTurn("drained but not persisted");
+    // Wait for the drain op to finish (single-flight ends in the
+    // finally), then remove the obstruction: the drain failed, the
+    // boundary stayed dirty, and the NEXT flush retries the SAME state.
+    for (let attempt = 0; attempt < 100 && presence.drainingCount() > 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(presence.drainingCount(), 0, "the drain op finished (and failed)");
+    assert.equal(session.releases, 1, "the release phase ran before the flush failure");
+    rmSync(tmpPath, { recursive: true, force: true });
+    // The next eval succeeds (its end-of-op flush retries the retained
+    // boundary — the retry, loud on failure, silent on success) and
+    // surfaces the recorded drain failure in its result; the call's
+    // settlement survived the failed flush in the live VM.
+    const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: "await p" });
+    assert.ok(!isErrorResult(probe), textOf(probe));
+    assert.ok(
+      textOf(probe).includes("drained but not persisted"),
+      `the drained settlement survived the failed flush in the live VM: ${textOf(probe)}`,
+    );
+    assert.ok(
+      textOf(probe).includes("client-presence drain failed"),
+      `the drain failure is surfaced guest-visibly: ${textOf(probe)}`,
+    );
+    const status = await repl(connected, { action: "status", projectDir: PROJECT });
+    assert.ok(
+      textOf(status).includes("LAST DRAIN FAILED"),
+      `status reports the failure: ${textOf(status)}`,
+    );
+    // The next disconnect retries the drain: the broker's latch says the
+    // release already completed, so the retry finishes the bookkeeping
+    // and clears the recorded failure.
+    presence.disconnect("client-A");
+    for (let attempt = 0; attempt < 100 && presence.drainingCount() > 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const status2 = await repl(connected, { action: "status", projectDir: PROJECT });
+    assert.ok(!textOf(status2).includes("LAST DRAIN FAILED"), `the retry cleared the failure: ${textOf(status2)}`);
+    assert.ok(textOf(status2).includes("children: closed"), textOf(status2));
+  } finally {
+    await connected.dispose();
   }
 });

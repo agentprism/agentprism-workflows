@@ -134,6 +134,9 @@ class FakeSession implements BrokerSession {
   hangCancel = false;
   /** A hung release (same regression for the release phase). */
   hangRelease = false;
+  /** Cancel invocations (the mid-drain-abort regression: an aborted
+   *  drain must never cancel anything). */
+  cancelCalls = 0;
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
@@ -169,6 +172,7 @@ class FakeSession implements BrokerSession {
   }
 
   cancel(): Promise<void> {
+    this.cancelCalls++;
     if (this.hangCancel) return new Promise(() => {});
     for (const pending of this.prompts.splice(0)) {
       pending.resolve({ stopReason: 'cancelled', text: '' });
@@ -284,6 +288,7 @@ async function setup(options: {
   runner?: FakeRunner;
   maxConcurrentAgents?: number;
   interruptHandler?: () => boolean;
+  evalTimeoutMs?: number;
 } = {}) {
   const ws = await Workspace.create(PROJECT);
   const runner = options.runner ?? new FakeRunner();
@@ -293,6 +298,7 @@ async function setup(options: {
     snapshotSink: options.snapshotSink,
     maxConcurrentAgents: options.maxConcurrentAgents,
     interruptHandler: options.interruptHandler,
+    evalTimeoutMs: options.evalTimeoutMs,
   });
   return { ws, broker, runner };
 }
@@ -1476,7 +1482,7 @@ test('a NON-re-armable still-running seam rejection (a backend without the _sess
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a still-running seam rejection during the client-presence drain holds the call (never a re-issue after the last client disconnected); the drain bound catches the unobservable turn', async () => {
+test('a still-running seam rejection during the client-presence drain is STOPPED at the bound — the call settles as the recoverable AGENT_CANCELLED (never a re-issue after the last client disconnected, and never an orphaned pending call)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-drainhold-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
@@ -1494,8 +1500,12 @@ test('a still-running seam rejection during the client-presence drain holds the 
   // mid-drain — and because the broker is draining, the rejection HOLDS
   // the call (a re-issue would open a fresh child after the last client
   // disconnected). The unobservable turn cannot drain, so the bound is
-  // the honest outcome: the drain cancels what it caught and returns
-  // false.
+  // the honest outcome: the drain cancels what it caught, then settles
+  // the still-pending call with the recoverable AGENT_CANCELLED (phase-D
+  // review round 6: the hold used to leave the call pending forever —
+  // orphaned by the release phase's bookkeeping clear, uncancelable
+  // except by reset, because reconcile never runs again on a live
+  // workspace).
   const seam = runner2.sessions[0].loadedTurns.shift();
   assert.ok(seam);
   const draining = broker2.drainForDisconnect(400);
@@ -1503,9 +1513,25 @@ test('a still-running seam rejection during the client-presence drain holds the 
   seam.reject(new Error('InteractiveSession has been released while awaiting the loaded session\'s founding turn'));
   assert.equal(await draining, false, 'the unobservable turn cannot drain — the bound is the honest outcome');
   assert.ok(broker2.isDrained);
-  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call stays pending after the drain');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the call is NOT orphaned — the bound\'s forced stop settled it');
+  const record = broker2.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED', 'the recoverable forced-stop code');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal(record.reissues, 0, 'never re-issued');
   assert.equal(runner2.sessions[0].releases, 1, 'the child closed in the release phase');
-  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'never re-issued');
+  // The guest promise settled with the recoverable error (a later eval
+  // reads it — the workspace stays live after the drain).
+  let result: string | undefined;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+    if (got.result !== undefined) {
+      result = got.result;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(result?.includes('cancelled by the client-presence drain'), `guest-visible settlement: ${result}`);
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -1527,6 +1553,67 @@ test('the drain bound is ABSOLUTE: a hung cancel/release cannot block disconnect
   assert.equal(drained, false, 'the bound expired with the turn still running');
   assert.ok(elapsed < 3000, `the drain returned within the bound, not blocked by the hung backend: ${elapsed} ms`);
   assert.ok(broker.isDrained);
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('the drain bound is ABSOLUTE for the GUEST DRAIN too: a settlement that resumes a runaway continuation near the deadline is interrupted at the remaining bound, never at the eval deadline (phase-D review round 6)', async () => {
+  const runner = new FakeRunner();
+  // The per-eval deadline is far beyond the drain bound: without the
+  // remaining-bound interrupt, the interrupted-continuation drain would
+  // run for the whole eval deadline and exceed the session-eviction TTL.
+  const { ws, broker } = await setup({ runner, evalTimeoutMs: 10_000 });
+  // A suspended eval whose continuation runs forever once the call
+  // settles (the guest drain resumes it — `drainJobs`).
+  await broker.eval('const p = agent("pi/x", "task"); const r = await p; while (true) {}');
+  await tick();
+  const started = Date.now();
+  const draining = broker.drainForDisconnect(300);
+  // The settlement lands mid-drain (the backend turn completes): the
+  // pump delivers it and the guest drain resumes the runaway
+  // continuation — which must be interrupted at the REMAINING disconnect
+  // bound, not run to the 10 s eval deadline.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  runner.last().completeTurn('done');
+  const drained = await draining;
+  const elapsed = Date.now() - started;
+  assert.equal(drained, true, 'the turn itself drained within the bound; the interrupted continuation is a bounded drain, not a drain failure');
+  assert.ok(elapsed < 3000, `the guest drain was bounded by the remaining disconnect bound, not the eval deadline: ${elapsed} ms`);
+  assert.ok(broker.isDrained);
+  // The interrupted continuation is honest output (a warn line in the
+  // next tool result — the settlement itself landed; only its
+  // continuation was bounded).
+  const probe = await broker.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('interrupted at the disconnect bound')),
+    output(probe).join('\n'),
+  );
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('a client reconnecting mid-drain ABORTS the drain: children stay warm — nothing is cancelled, nothing is released, and the next disconnect drains again (phase-D review round 6)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  // The drain starts with no clients; a client reconnects mid-drain (the
+  // daemon's presence probe flips to true).
+  let clientConnected = false;
+  const draining = broker.drainForDisconnect(2000, () => clientConnected);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(runner.sessions[0].releases, 0, 'the child is still warm while the drain waits for the in-flight turn');
+  clientConnected = true;
+  assert.equal(await draining, false, 'the drain aborted — it did not run to its release phase');
+  assert.equal(broker.isDrained, false, 'the drain latch stays clear — the next disconnect drains again');
+  assert.equal(runner.sessions[0].releases, 0, 'the child was NOT released: children stay warm while any client is connected');
+  assert.equal(runner.sessions[0].cancelCalls, 0, 'nothing was cancelled');
+  // The still-running turn completes normally after the abort and
+  // settles into the live workspace.
+  runner.last().completeTurn('warm result');
+  await broker.pump();
+  const got = await broker.eval('await p');
+  assert.equal(got.result, '"warm result"');
   await broker.dispose();
   ws.dispose();
 });

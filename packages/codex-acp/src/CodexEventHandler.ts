@@ -27,6 +27,7 @@ import type {
     ThreadGoalClearedNotification,
     ThreadGoalUpdatedNotification,
     ThreadTokenUsageUpdatedNotification,
+    Turn,
     TurnCompletedNotification,
     TurnPlanUpdatedNotification,
     WarningNotification
@@ -97,6 +98,7 @@ export class CodexEventHandler {
     private readonly session: ACPSessionConnection;
     private planUpdateTimer: ReturnType<typeof setTimeout> | null = null;
     private planUpdateChain: Promise<void> = Promise.resolve();
+    private readonly loadedTurnEndedScheduler: ((turn: Turn) => void) | undefined;
     private disposed = false;
     private readonly seenReasoningDeltaItemIds = new Set<string>();
     private readonly terminalCommandIds = new Set<string>();
@@ -111,10 +113,18 @@ export class CodexEventHandler {
         // Fork-owned parameter LAST so upstream call sites (and their tests) keep positional
         // compatibility with the canonical (connection, sessionState, supportsPlanUpdates) shape.
         readFileContent?: FileContentReader,
+        // The `_session/loaded_turn/ended` push scheduler (review round 6):
+        // when provided, the terminal marker is delivered through it — the
+        // server routes it onto the load-time watcher's per-session update
+        // chain so it can never reach the ACP client before the turn's
+        // final text deltas. Absent (tests, direct constructions): the
+        // direct push.
+        loadedTurnEndedScheduler?: (turn: Turn) => void,
     ) {
         this.sessionState = sessionState;
         this.supportsPlanUpdates = supportsPlanUpdates;
         this.readFileContent = readFileContent;
+        this.loadedTurnEndedScheduler = loadedTurnEndedScheduler;
         this.session = new ACPSessionConnection(connection, sessionState.sessionId);
     }
 
@@ -129,7 +139,11 @@ export class CodexEventHandler {
      * another turn's completion is not its terminal marker); otherwise
      * any completing turn settles it (the in-process arm — the watched
      * turn is the one `currentTurnId` tracks). Best-effort: a failing
-     * notification must not break turn processing.
+     * notification must not break turn processing. When the server
+     * supplied a scheduler, the push rides the load-time watcher's
+     * per-session update chain (review round 6) — the terminal marker
+     * must never reach the client before the turn's final text deltas,
+     * or the re-attach seam durably settles partial output.
      */
     private notifyLoadedTurnEnded(notification: TurnCompletedNotification): void {
         const loadedActiveTurnId = this.sessionState.loadedActiveTurnId;
@@ -155,6 +169,10 @@ export class CodexEventHandler {
             this.sessionState.loadedLastTurnStatus = notification.turn.status;
             this.sessionState.loadedActiveTurnId = null;
             this.sessionState.loadedActiveTurnIsAny = false;
+        }
+        if (this.loadedTurnEndedScheduler !== undefined) {
+            this.loadedTurnEndedScheduler(notification.turn);
+            return;
         }
         pushLoadedTurnEnded(this.session, this.sessionState, notification.turn);
     }

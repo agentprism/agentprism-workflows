@@ -182,9 +182,13 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
         // the loaded active turn's terminal marker arrives — end to end
         // through the server-notification path, no internal mutation.
         fixture.sendServerNotification(turnCompletedNotification("completed"));
-        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
-            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
-        ]);
+        // The push rides the session's update chain (review round 6) —
+        // delivered asynchronously, ordered after any trailing deltas.
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+            ]);
+        });
         // The watch is one-shot: a later turn completion for another turn
         // pushes nothing.
         fixture.clearAcpConnectionDump();
@@ -225,15 +229,19 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             sessionId: "session-1",
         });
         fixture.sendServerNotification(turnCompletedNotification("failed"));
-        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
-            {
-                method: LOADED_TURN_ENDED_METHOD,
-                params: {
-                    sessionId: "session-1",
-                    error: {name: "TurnError", message: "model blew up"},
+        // The push rides the session's update chain (review round 6) —
+        // delivered asynchronously.
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {
+                    method: LOADED_TURN_ENDED_METHOD,
+                    params: {
+                        sessionId: "session-1",
+                        error: {name: "TurnError", message: "model blew up"},
+                    },
                 },
-            },
-        ]);
+            ]);
+        });
     });
 
     it("settles a turn that ended BETWEEN load and query: the load-time watcher records the terminal marker, and the first `running` answer pushes the ended notification immediately (no missed completion, no stuck wait)", async () => {
@@ -246,14 +254,17 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
         expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([]);
 
         // The query answers `running` (the turn WAS active at load) and the
-        // recorded end settles immediately.
+        // recorded end settles immediately (the push rides the session's
+        // update chain — delivered asynchronously, review round 6).
         const response = await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {
             sessionId: "session-1",
         });
         expect(response).toEqual({status: "running"});
-        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
-            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
-        ]);
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+            ]);
+        });
     });
 
     it("answers `running` while a turn executes in-process (the `turn/started` set `currentTurnId`)", async () => {
@@ -326,9 +337,63 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
         // The turn's terminal marker then settles the wait — the client's
         // accumulated transcript at that point is the turn's REAL outcome.
         fixture.sendServerNotification(turnCompletedNotification("completed"));
-        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
-            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
-        ]);
+        // The push rides the session's update chain (review round 6) —
+        // delivered asynchronously, ordered after the delta.
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+            ]);
+        });
+        expect(accumulatedText(fixture)).toBe("partial result C");
+    });
+
+    it("THE REVIEW REGRESSION (round 6/1): a turn/completed arriving BACK-TO-BACK with the final live delta delivers the delta FIRST — the terminal marker rides the session's update chain, so the re-attach seam never settles partial text", async () => {
+        // The loaded thread's agent message is a PARTIAL answer (the
+        // founding turn is still running at the backend).
+        const thread = baseThread("inProgress");
+        thread.turns[0]!.items[1] = {
+            type: "agentMessage",
+            id: "item-agent-1",
+            text: "partial ",
+            phase: null,
+            memoryCitation: null,
+        };
+        const fixture = setupFixture(thread);
+        await load(fixture, "session-1");
+        expect(await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {sessionId: "session-1"})).toEqual({status: "running"});
+
+        // The turn's final delta and its terminal marker arrive
+        // BACK-TO-BACK, with NO wait between them — the old watcher
+        // pushed the ended notification SYNCHRONOUSLY while the delta
+        // was still queued on the async per-session update chain, so the
+        // ACP client received the terminal marker first and the re-attach
+        // seam durably settled the replay-time PARTIAL text.
+        fixture.sendServerNotification({
+            method: "item/agentMessage/delta",
+            params: {threadId: "session-1", turnId: "turn-1", itemId: "item-agent-1", delta: "result C"},
+        });
+        fixture.sendServerNotification(turnCompletedNotification("completed"));
+
+        // Both reach the ACP client; the delta MUST be recorded before
+        // the ended notification (the marker rides the same per-session
+        // update chain the delta forwarding uses).
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+            ]);
+        });
+        const events = fixture.getAcpConnectionEvents([]);
+        const updateOf = (event: MethodCallEvent): {sessionUpdate?: string; content?: {type?: string; text?: string}} | undefined =>
+            (event.args[0] as {update?: {sessionUpdate?: string; content?: {type?: string; text?: string}}}).update;
+        const deltaIndex = events.findIndex((event) =>
+            event.method === "sessionUpdate"
+            && updateOf(event)?.sessionUpdate === "agent_message_chunk"
+            && updateOf(event)?.content?.text === "result C");
+        const endedIndex = events.findIndex(
+            (event) => event.method === "notify" && event.args[0] === LOADED_TURN_ENDED_METHOD,
+        );
+        expect(deltaIndex).toBeGreaterThanOrEqual(0);
+        expect(endedIndex).toBeGreaterThan(deltaIndex);
         expect(accumulatedText(fixture)).toBe("partial result C");
     });
 
@@ -364,9 +429,13 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             sessionId: "session-1",
         });
         expect(response).toEqual({status: "running"});
-        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
-            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
-        ]);
+        // The push rides the session's update chain (review round 6) —
+        // delivered asynchronously.
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+            ]);
+        });
     });
 
     it("THE REVIEW REGRESSION (round 5/3): an `active` thread with a completed last turn answers `running`, and the ACTIVE turn's differently identified completion TERMINATES it (the old watcher matched the already-completed last turn's id and never fired — the running answer never ended)", async () => {
@@ -394,9 +463,13 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
                 },
             },
         });
-        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
-            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
-        ]);
+        // The push rides the session's update chain (review round 6) —
+        // delivered asynchronously, ordered after any trailing deltas.
+        await vi.waitFor(() => {
+            expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+                {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+            ]);
+        });
         // The detection cleared: a later query classifies from the ended
         // turn's status, and a second completion pushes nothing.
         expect(await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {sessionId: "session-1"})).toEqual({status: "completed"});
