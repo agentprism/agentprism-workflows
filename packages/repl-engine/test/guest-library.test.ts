@@ -1206,6 +1206,166 @@ test('a pending steer survives snapshot/restore with full correlation for re-iss
 // accumulate guest memory from settled host calls)
 // ────────────────────────────────────────────────────────────────────────
 
+test('round 7: __replAwaitIterable over a SYNC iterable preserves AsyncFromSyncIterator value unwrapping — `for await (const x of [Promise.resolve(1), 2])` yields the RESOLVED values `[1, 2]`, never the promise objects (the reviewer\'s repro: the result wrapper resolved with the RAW iterator result, and because the wrapper is an ASYNC iterable the machinery used the value as-is — the promise object leaked through)', async () => {
+  const { vm } = await createGuest();
+  try {
+    // Each eval body is BLOCK-scoped: the realm is shared across evals,
+    // and a top-level `const` would redeclare on the next eval. The
+    // top-level for-await keeps the script's completion a promise the
+    // engine awaits (like `await agent(...)` in the round-trip test).
+    const out = value(await vm.evalCode(`{
+      const got = [];
+      for await (const x of __replAwaitIterable([Promise.resolve(1), 2], 't1')) got.push(x);
+      JSON.stringify(got);
+    }`));
+    assert.equal(out, '[1,2]', 'sync-iterable values are awaited and unwrapped');
+    // The unwrap is faithful even when the value settles later (a
+    // thenable): the result promise waits for the value's settlement.
+    const later = value(await vm.evalCode(`{
+      const got = [];
+      let n = 0;
+      const iter = __replAwaitIterable({
+        [Symbol.iterator]: () => ({
+          next: () => (n++ === 0 ? { value: Promise.resolve(7), done: false } : { done: true }),
+          return: () => ({ value: undefined, done: true }),
+        }),
+      }, 't1');
+      for await (const x of iter) got.push(x);
+      JSON.stringify(got);
+    }`));
+    assert.equal(later, '[7]');
+  } finally {
+    vm.dispose();
+  }
+});
+
+test('round 7: __replAwaitIterable ACQUISITION failures propagate exactly once — an observable/throwing `Symbol.asyncIterator` getter runs a SINGLE time and the loop reports its ORIGINAL error (the reviewer\'s repro: the old degrade-to-unwrapped made the for-await machinery acquire the iterable a second time, so the getter ran twice and could report `boom2` instead of native `boom1`)', async () => {
+  const { vm } = await createGuest();
+  try {
+    const out = value(await vm.evalCode(`{
+      let n = 0;
+      const obj = {
+        get [Symbol.asyncIterator]() { n++; if (n === 1) throw new Error('boom1'); throw new Error('boom2'); },
+      };
+      let err = null;
+      try { for await (const x of __replAwaitIterable(obj, 't1')) {} }
+      catch (e) { err = e.message; }
+      JSON.stringify([err, n]);
+    }`));
+    assert.equal(out, JSON.stringify(['boom1', 1]), 'the acquisition error propagates, the getter runs once');
+    // A present-but-not-callable @@asyncIterator is a TypeError (GetMethod
+    // semantics), never a silent fallback to @@iterator.
+    const nonCallable = value(await vm.evalCode(`{
+      const obj = { [Symbol.asyncIterator]: 42, [Symbol.iterator]: () => ({ next: () => ({ done: true }) }) };
+      let err = null;
+      try { for await (const x of __replAwaitIterable(obj, 't1')) {} }
+      catch (e) { err = e.name + ':' + e.message; }
+      err;
+    }`));
+    assert.ok(String(nonCallable).startsWith('TypeError:'), 'non-callable @@asyncIterator is a TypeError');
+  } finally {
+    vm.dispose();
+  }
+});
+
+test('round 7: the await/iterable instrumentation runs on CAPTURED pristine Promise intrinsics — replacing `Promise.prototype.then`, overwriting `Promise.resolve`, or shadowing `Promise` lexically cannot change its semantics (the reviewer\'s repro: replacing `Promise.prototype.then` made the instrumented `await 40` return `99`; the native evaluation returned `40`) and the continuation lease is still set', async () => {
+  // Each sabotage case runs in its OWN VM: the mutations are
+  // irreversible guest-side (the originals survive only in the
+  // library's captured intrinsics), so one realm cannot host two cases.
+  // Replaced prototype: the guest-visible then is gone, the
+  // instrumentation still mirrors natively and sets the lease.
+  {
+    const { vm } = await createGuest();
+    try {
+      const mutated = value(await vm.evalCode(`{
+        Promise.prototype.then = function () { return 99; };
+        const out = await __replAwait(Promise.resolve(40), 't1');
+        JSON.stringify([out, __replLease]);
+      }`));
+      assert.equal(mutated, JSON.stringify([40, 't1']), 'replaced Promise.prototype.then cannot change the mirror or skip the lease');
+    } finally {
+      vm.dispose();
+    }
+  }
+  // Overwritten static: the value is minted BEFORE the sabotage (the
+  // guest's own later `Promise.resolve` call is guest semantics — the
+  // instrumentation's INTERNAL adoption must keep using the captured
+  // original), the mirror still resolves natively and the lease is
+  // still set.
+  {
+    const { vm } = await createGuest();
+    try {
+      const overwritten = value(await vm.evalCode(`{
+        const p = Promise.resolve(40);
+        Promise.resolve = function () { return 99; };
+        const out = await __replAwait(p, 't1');
+        JSON.stringify([out, __replLease]);
+      }`));
+      assert.equal(overwritten, JSON.stringify([40, 't1']), 'overwritten Promise.resolve cannot change the mirror or skip the lease');
+    } finally {
+      vm.dispose();
+    }
+  }
+  // Shadowed: a block-level lexical Promise (a legitimate user
+  // program) — the mirror still works and the lease is still set.
+  {
+    const { vm } = await createGuest();
+    try {
+      const shadowed = value(await vm.evalCode(`{
+        let out, lease;
+        {
+          const Promise = { resolve: (v) => v };
+          out = await __replAwait(Promise.resolve(40), 't1');
+          lease = __replLease;
+        }
+        JSON.stringify([out, lease]);
+      }`));
+      assert.equal(shadowed, JSON.stringify([40, 't1']), 'a lexical Promise shadow cannot change the mirror or skip the lease');
+    } finally {
+      vm.dispose();
+    }
+  }
+  // The iterable wrap is equally isolated: a replaced prototype must
+  // not break a for-await over a sync iterable.
+  {
+    const { vm } = await createGuest();
+    try {
+      const iterated = value(await vm.evalCode(`{
+        const p = Promise.resolve(1);
+        Promise.prototype.then = function () { return 99; };
+        const got = [];
+        for await (const x of __replAwaitIterable([p], 't1')) got.push(x);
+        JSON.stringify(got);
+      }`));
+      assert.equal(iterated, '[1]', 'the iterable wrap mirrors natively under a replaced prototype');
+    } finally {
+      vm.dispose();
+    }
+  }
+});
+
+test('round 7: __replAwaitIterable over an ASYNC iterable passes result objects through untouched (its value is used as-is — native async iteration semantics; the promise VALUES of async generators are NOT awaited by for-await)', async () => {
+  const { vm } = await createGuest();
+  try {
+    const out = value(await vm.evalCode(`
+      const iterable = {
+        [Symbol.asyncIterator]: () => {
+          let n = 0;
+          return {
+            next: () => Promise.resolve({ value: ++n, done: n > 2 }),
+          };
+        },
+      };
+      const got = [];
+      for await (const x of __replAwaitIterable(iterable, 't1')) got.push(x);
+      JSON.stringify(got);
+    `));
+    assert.equal(out, '[1,2]', 'async-iterator result objects pass through untouched');
+  } finally {
+    vm.dispose();
+  }
+});
+
 test('5,000 sequential resolved agent calls leave a 2 MiB VM healthy (no handle leak)', async () => {
   // Review regression: GuestCall never disposed its deferred promise
   // handle or the handles returned by marshalValue, so every settled call
@@ -1230,7 +1390,7 @@ test('5,000 sequential resolved agent calls leave a 2 MiB VM healthy (no handle 
 });
 
 test('unsettled parked calls do not leak either (promise handles are released after return)', async () => {
-  const vm = await ReplVm.create({ memoryLimit: 3 * 1024 * 1024 });
+  const vm = await ReplVm.create({ memoryLimit: 4 * 1024 * 1024 });
   const bridge = mockBridge();
   await installGuestBridge(vm, bridge.handlers);
   // 5,000 parked calls (never settled): each returned promise handle must
@@ -1241,10 +1401,14 @@ test('unsettled parked calls do not leak either (promise handles are released af
   // have an honest footprint of ~2.09 MB — 99.9% of a 2 MiB limit, a
   // knife-edge where any library-source evolution (even comment growth)
   // tipped the GC/malloc interplay into a hard failure at ~725 calls. The
-  // limit is 3 MiB here: the honest footprint is ~70% of it, while the
-  // leak class this test pins (an undisposed promise handle plus a
-  // marshalled value per call, ~400 B/call) still adds ~2 MB over 5,000
-  // calls and cannot hide in the headroom.
+  // limit is 4 MiB here: the honest footprint (library source + live
+  // registry entries) plateaus near ~3.15 MB under the GC even at 5,000
+  // parked calls, leaving the headroom the round-7 library growth (the
+  // iterable-wrap rewrite and the captured-intrinsic comments) needs —
+  // while the leak class this test pins (an undisposed promise handle
+  // plus a marshalled value per call, ~400 B/call) is GC-proof: it adds
+  // ~2 MB of PINNED guest memory over 5,000 calls, pushing the plateau to
+  // ~5.1 MB, and cannot hide in the headroom (the OOM surfaces mid-loop).
   for (let i = 0; i < 5000; i++) {
     const out = await vm.evalCode(`agent("pi/x", "task ${i}"); "started"`);
     assert.equal(out.kind, 'value');

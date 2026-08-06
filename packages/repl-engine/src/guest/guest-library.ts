@@ -102,7 +102,35 @@
  *  for-await sites are left unwrapped by the instrumenter (native
  *  semantics, no mid-loop targeting) while its awaits stay instrumented
  *  (the 0.3.0 lease-set defect is the older copy's own, never
- *  re-injected). */
+ *  re-injected).
+ *
+ *  The 0.3.1 copy also hardens the instrumentation surface (phase-E
+ *  review rejection round 7, same version — nothing shipped between):
+ *  the await/iterable helpers run on the CAPTURED pristine Promise
+ *  intrinsics (a guest that replaces 'Promise.prototype.then', overwrites
+ *  'Promise.resolve' or shadows 'Promise' lexically cannot change
+ *  instrumentation semantics — the instrumented 'await 40' stays '40'
+ *  and the continuation lease is still set); the for-await iterable wrap
+ *  propagates ACQUISITION errors exactly once (an observable/throwing
+ *  'Symbol.asyncIterator' getter runs a single time and reports its
+ *  original error — the old degrade-to-unwrapped made the machinery
+ *  acquire the iterable a second time and could surface 'boom2' instead
+ *  of native 'boom1'); and a SYNC iterator's results pass through
+ *  AsyncFromSyncIteratorContinuation semantics (the result VALUE is
+ *  awaited and unwrapped — 'for await (const x of
+ *  [Promise.resolve(1)])' yields '1', never the promise object).
+ *  The provenance registry reads descriptors off the CAPTURED global
+ *  object too (a top-level lexical 'const globalThis = 7' no longer
+ *  blanks every binding's provenance).
+ *
+ *  HOST GATE: the broker's continuation-lease availability check is
+ *  VERSION-GATED on >= 0.3.1 — a restored snapshot carrying the 0.3.0
+ *  library (whose lease-setting reaction still runs on the awaited
+ *  VALUE's settlement — the sibling-reaction interrupt-targeting defect)
+ *  reports 'supportsContinuationLease: true' but is served WITHOUT
+ *  instrumentation: no eval-break targeting, honest refusal (phase-E
+ *  review rejection round 7: the flag alone re-armed the original
+ *  defect on a supported older snapshot). */
 export const GUEST_LIBRARY_VERSION = '0.3.1';
 
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
@@ -309,8 +337,17 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
         // Descriptor read, never a [[Get]]: a binding rebound to an
         // accessor must not have its getter fired by host bookkeeping.
         // The getter FUNCTION serves as the rebind-detection identity for
-        // accessor bindings.
-        var d = gOPD(globalThis, k);
+        // accessor bindings. Read from the CAPTURED global object 'g' —
+        // never the free variable globalThis: a top-level lexical 'const
+        // globalThis = 7' is a legitimate user program, and the lexical
+        // binding shadows the factory's free-variable globalThis at call
+        // time, so gOPD(globalThis, k) read descriptors off the NUMBER
+        // (throwing in QuickJS) and the pass's catch swallowed the whole
+        // attribution — every subsequent binding reached the manifest
+        // with null provenance (phase-E review rejection round 7: 'var
+        // userValue = 42' appeared without producer/task/time metadata
+        // after a 'const globalThis' shadow).
+        var d = gOPD(g, k);
         var v = undefined;
         if (d !== undefined) {
           if (hasOwnProp.call(d, 'value')) v = d.value;
@@ -497,6 +534,18 @@ const GUEST_LIBRARY_SOURCE = `/*
 (function () {
   'use strict';
 
+  // The realm's REAL global object, captured when the library is
+  // evaluated (before any user code runs): the library's own code must
+  // keep working when user code SHADOWS a baseline global — a top-level
+  // lexical 'const globalThis = 7' is a legitimate user program, and the
+  // lexical binding shadows the library's free-variable globalThis at
+  // call time, breaking every internal reference (the provenance
+  // registry's descriptor reads, the host-function lookups, the $N
+  // store, the global installs). Everything below that means "the realm's
+  // global object" reads 'g' — the same discipline as the provenance
+  // factory's capture (phase-E review rejection round 7).
+  var g = globalThis;
+
   // ────────────────────────────────────────────────────────────────────────
   // Identity and idempotence
   // ────────────────────────────────────────────────────────────────────────
@@ -509,7 +558,7 @@ const GUEST_LIBRARY_SOURCE = `/*
   // re-injects it into a restored snapshot) must never wipe the live
   // registry or the $N counter. If the surface is already installed, this
   // evaluation is a no-op.
-  if (globalThis[Symbol.for(SURFACE_KEY)]) return;
+  if (g[Symbol.for(SURFACE_KEY)]) return;
 
   // ────────────────────────────────────────────────────────────────────────
   // Tunables (payload best-effort encoding; the $N store is never truncated)
@@ -588,8 +637,28 @@ const GUEST_LIBRARY_SOURCE = `/*
   //   console.* NEVER throws by contract (review regression, pinned by
   //   test). A bound function performs no property lookups at call time,
   //   so neither replacement can reach it.
-  var nativeStructuredClone = globalThis.structuredClone;
+  var nativeStructuredClone = g.structuredClone;
   var arraySlice = Function.prototype.call.bind(Array.prototype.slice);
+
+  // The continuation-lease instrumentation's pristine PROMISE intrinsics
+  // (phase-E review rejection round 7): \`__replAwait\` /
+  // \`__replAwaitIterable\` mirror the awaited value through the realm's
+  // ORIGINAL Promise machinery — the captured constructor, the captured
+  // bound statics, and the captured \`then\` function value — never the
+  // guest-resolvable \`Promise\` global / \`Promise.resolve\` / public
+  // \`.then\`. A guest that REPLACES \`Promise.prototype.then\` (the
+  // reviewer's repro: the instrumented \`await 40\` returned \`99\` where
+  // the native evaluation returned \`40\`) or overwrites \`Promise.resolve\`
+  // itself, or SHADOWS \`Promise\` with a top-level lexical, must not
+  // change the instrumentation's semantics: the wrapped value mirrors
+  // natively and the continuation lease is still set. \`P\` is the SAME
+  // object as the realm's \`globalThis.Promise\`, so the statics are bound
+  // and the instance method captured as the bare function value at
+  // installation — later property replacement cannot reach them.
+  var P = Promise;
+  var PResolve = P.resolve.bind(P);
+  var PReject = P.reject.bind(P);
+  var pThen = P.prototype.then;
 
   // ────────────────────────────────────────────────────────────────────────
   // Small utilities
@@ -682,7 +751,7 @@ const GUEST_LIBRARY_SOURCE = `/*
    * freshly minted id and returns the host result.
    */
   function issueCall(kind, hostFnName, detail, optionsJson, sessionId, modelSpec, hostArgs) {
-    var hostFn = globalThis[hostFnName];
+    var hostFn = g[hostFnName];
     if (typeof hostFn !== 'function') {
       throw new Error(
         hostFnName + ' is not installed — the host must register it before evaluating ' +
@@ -728,7 +797,18 @@ const GUEST_LIBRARY_SOURCE = `/*
       return { id: id, promise: promise };
     }
     if (returned && typeof returned.then === 'function') {
-      Promise.resolve(returned).then(
+      // Adopt the host-returned thenable (the quickjs-wasi Deferred
+      // idiom) through the CAPTURED pristine Promise surface
+      // ('PResolve'/'pThen' — phase-E review rejection round 7): the
+      // guest-visible 'Promise.resolve(returned).then(...)' broke under
+      // a replaced 'Promise.prototype.then' — the reactions were never
+      // registered, so a settled host call NEVER reached the registry
+      // and the awaiting eval stayed pending forever (the reviewer's
+      // repro: replacing 'Promise.prototype.then' made the
+      // instrumented 'await 40' return '99'; the SAME mutation also
+      // silently killed every settlement through this forwarding).
+      pThen.call(
+        PResolve(returned),
         function (value) { settleCall(id, 'resolve', value); },
         function (err) { settleCall(id, 'reject', err); },
       );
@@ -919,7 +999,7 @@ const GUEST_LIBRARY_SOURCE = `/*
     if (typeof callId !== 'string' || callId.length === 0) {
       throw new TypeError('checkpoint.answer(callId, value) needs a call id string (e.g. "c3")');
     }
-    if (typeof globalThis.__host_checkpoint !== 'function') {
+    if (typeof g.__host_checkpoint !== 'function') {
       throw new Error(
         '__host_checkpoint is not installed — the host must register it before evaluating ' +
           'guest code (and re-register it by name after every snapshot restore)',
@@ -936,7 +1016,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         'checkpoint.answer(callId, value): value must be JSON-serializable',
       );
     }
-    return !!globalThis.__host_checkpoint(callId, undefined, undefined, answerJson);
+    return !!g.__host_checkpoint(callId, undefined, undefined, answerJson);
   };
 
   // ────────────────────────────────────────────────────────────────────────
@@ -1655,7 +1735,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         var n = ++state.logSeq;
         // Real realm globals, writable: the $N store is the agent's own
         // workspace — it may slice, transform, or delete entries.
-        globalThis['$' + n] = frozen;
+        g['$' + n] = frozen;
         refs.push('$' + n);
         var encoded;
         try {
@@ -1665,8 +1745,8 @@ const GUEST_LIBRARY_SOURCE = `/*
         }
         payloadArgs.push(encoded);
       }
-      if (typeof globalThis.__host_console === 'function') {
-        globalThis.__host_console(level, JSON.stringify({ refs: refs, args: payloadArgs }));
+      if (typeof g.__host_console === 'function') {
+        g.__host_console(level, JSON.stringify({ refs: refs, args: payloadArgs }));
       }
     } catch (_err) {
       // Deliberately swallowed: the bridge is best-effort by contract.
@@ -1743,11 +1823,29 @@ const GUEST_LIBRARY_SOURCE = `/*
         // job, not with whichever job runs next). The wrapper mirrors
         // the value (identity for the resolution value, same rejection
         // value) — the async machinery sees exactly what it would have
-        // seen.
-        var wrapper = new Promise(function (resolve, reject) {
-          Promise.resolve(value).then(resolve, reject);
+        // seen. The mirroring machinery is the CAPTURED pristine
+        // Promise surface ('P'/'PResolve'/'pThen' — see the captures at
+        // the top of the library): a guest that replaces
+        // 'Promise.prototype.then' or overwrites 'Promise.resolve' (or
+        // shadows 'Promise' with a top-level lexical) must not change
+        // the instrumentation's semantics — the reviewer's repro:
+        // replacing 'Promise.prototype.then' made the instrumented
+        // 'await 40' return '99' while the native evaluation returned
+        // '40' (phase-E review rejection round 7). The wrapper is
+        // adopted by the guest's own await machinery through its
+        // INTERNAL promise reactions, so the guest-visible prototype
+        // cannot intercept the continuation either way; the lease-
+        // setting reaction rides the pristine 'then' function value, so
+        // a replaced prototype cannot skip it.
+        var wrapper = new P(function (resolve, reject) {
+          try {
+            pThen.call(PResolve(value), resolve, reject);
+          } catch (e) {
+            reject(e);
+          }
         });
-        wrapper.then(
+        pThen.call(
+          wrapper,
           function () {
             try {
               setContinuationLease(token);
@@ -1809,96 +1907,159 @@ const GUEST_LIBRARY_SOURCE = `/*
    * returns) — sets the continuation lease to the eval's token: the job
    * after the lease-setting reaction IS the loop segment's continuation,
    * so the eval-break interrupt can break a runaway for-await loop
-   * mid-iteration, exactly like any other awaited segment. Never throws:
-   * a broken iterable degrades to the UNWRAPPED iterable, so the
-   * for-await machinery reports the original TypeError (or runs the
-   * loop untouched).
+   * mid-iteration, exactly like any other awaited segment.
+   *
+   * ACQUISITION errors PROPAGATE (phase-E review rejection round 7):
+   * resolving the underlying iterator — the \`@@asyncIterator\`/
+   * \`@@iterator\` property reads (guest accessors can throw) and the
+   * method calls — must run exactly ONCE and report exactly what the
+   * un-instrumented loop reports. The old implementation caught
+   * acquisition failures and returned the UNWRAPPED iterable, so the
+   * for-await machinery acquired it a SECOND time: an observable or
+   * throwing \`Symbol.asyncIterator\` getter ran twice and could produce
+   * a different error (\`boom2\` instead of native \`boom1\`). The wrap
+   * also follows GetMethod semantics: a present-but-not-callable
+   * \`@@asyncIterator\` is a TypeError, never a silent fallback to
+   * \`@@iterator\`.
+   *
+   * A SYNC iterator's results pass through AsyncFromSyncIterator-
+   * CONTINUATION semantics (phase-E review rejection round 7): the raw
+   * result's VALUE is awaited and unwrapped, so \`for await (const x of
+   * [Promise.resolve(1)])\` yields \`1\`, never the promise object — the
+   * old wrapper resolved with the RAW iterator result, and because the
+   * wrapper is an ASYNC iterable, the machinery used the value as-is
+   * (the promise object leaked through). An ASYNC iterator's results
+   * pass through untouched (its \`value\` is used as-is — native async
+   * iteration semantics).
+   *
+   * Never throws AFTER acquisition: a broken iterator's per-step
+   * failures (a throwing \`next()\`, a non-object result, a hostile
+   * result value) surface as REJECTED result promises — the loop
+   * observes the same rejection it would have observed unwrapped. The
+   * mirroring machinery is the CAPTURED pristine Promise surface
+   * ('P'/'PResolve'/'PReject'/'pThen') like \`__replAwait\` — a guest
+   * that replaces 'Promise.prototype.then' or shadows 'Promise' must
+   * not change the wrap's semantics.
    */
   function replAwaitIterable(iterable, token) {
-    try {
-      if (typeof token !== 'string' || token.length === 0) return iterable;
-      // Resolve the underlying iterator exactly like \`for await\` does
-      // (GetMethod semantics): \`@@asyncIterator\` first, then
-      // \`@@iterator\`; both absent or not callable is the same TypeError
-      // the un-instrumented loop throws. Property reads and calls can
-      // throw (guest accessors) — the outer try/catch degrades to the
-      // unwrapped iterable, and the machinery then throws the original
-      // error.
-      var asyncIterMethod =
-        iterable === null || iterable === undefined ? undefined : iterable[Symbol.asyncIterator];
-      var syncIterMethod =
-        asyncIterMethod === undefined && iterable !== null && iterable !== undefined
-          ? iterable[Symbol.iterator]
-          : undefined;
-      var underlying;
-      if (typeof asyncIterMethod === 'function') {
-        underlying = asyncIterMethod.call(iterable);
-      } else if (typeof syncIterMethod === 'function') {
-        underlying = syncIterMethod.call(iterable);
-      } else {
+    if (typeof token !== 'string' || token.length === 0) return iterable;
+    // ACQUISITION (GetIterator/GetMethod semantics): \`@@asyncIterator\`
+    // first — present-but-not-callable is a TypeError, never a fallback
+    // to \`@@iterator\` — then \`@@iterator\`; both absent is the same
+    // TypeError the un-instrumented loop throws. Property reads and
+    // method calls can throw (guest accessors); they PROPAGATE — the
+    // machinery must observe the exact acquisition error native \`for
+    // await\` reports, and the iterable's methods must be touched
+    // EXACTLY ONCE (phase-E review rejection round 7: the old catch
+    // degraded to the unwrapped iterable, so an observable/throwing
+    // \`@@asyncIterator\` getter ran twice and could report a different
+    // error than native).
+    var asyncIterMethod =
+      iterable === null || iterable === undefined ? undefined : iterable[Symbol.asyncIterator];
+    var isAsync = typeof asyncIterMethod === 'function';
+    var syncIterMethod;
+    if (!isAsync) {
+      if (asyncIterMethod !== undefined) {
+        throw new TypeError('Symbol.asyncIterator is not callable');
+      }
+      syncIterMethod =
+        iterable === null || iterable === undefined ? undefined : iterable[Symbol.iterator];
+      if (typeof syncIterMethod !== 'function') {
         throw new TypeError('not async iterable');
       }
-      // One lease-wrapped iterator-result promise: the settle reaction
-      // is registered on the FRESH promise before the for-await
-      // machinery registers its own (the machinery awaits \`next()\`'s
-      // result), so the lease-setting job runs immediately before the
-      // loop segment's continuation job — the same ordering discipline
-      // as \`__replAwait\` (no job in between can run with the lease
-      // set). A synchronous throw from the underlying iterator is
-      // converted to a rejected promise — the loop observes the same
-      // rejection either way.
-      var wrapLease = function () {
-        try {
-          setContinuationLease(token);
-        } catch (_e) {}
-      };
-      var wrapResult = function (result) {
-        var p = new Promise(function (resolve, reject) {
-          Promise.resolve(result).then(resolve, reject);
-        });
-        p.then(wrapLease, wrapLease);
-        return p;
-      };
-      var wrapped = {};
-      wrapped[Symbol.asyncIterator] = function () {
-        return wrapped;
-      };
-      // Forward with the EXACT argument count the for-await machinery
-      // uses: \`next()\` is called with NO arguments (the loop's value
-      // travels through the iterator, never into \`next()\`), while
-      // \`return()\`/\`throw()\` receive the completion value even when it
-      // is undefined — an \`arguments.length\`-sensitive underlying
-      // iterator must observe the same calls it would have observed
-      // unwrapped.
-      var forward = function (method, hasArg, arg) {
-        var result;
-        try {
-          result = hasArg ? method.call(underlying, arg) : method.call(underlying);
-        } catch (e) {
-          return wrapResult(Promise.reject(e));
-        }
-        return wrapResult(result);
-      };
-      wrapped.next = function () {
-        return forward(underlying.next, false);
-      };
-      if (typeof underlying.return === 'function') {
-        wrapped.return = function (value) {
-          return forward(underlying.return, true, value);
-        };
-      }
-      if (typeof underlying.throw === 'function') {
-        wrapped.throw = function (value) {
-          return forward(underlying.throw, true, value);
-        };
-      }
-      return wrapped;
-    } catch (_err) {
-      // Never throws by contract: a broken iterable degrades to the
-      // unwrapped iterable (the for-await machinery then reports the
-      // original TypeError, exactly like the un-instrumented loop).
-      return iterable;
     }
+    var underlying = isAsync ? asyncIterMethod.call(iterable) : syncIterMethod.call(iterable);
+    // One lease-wrapped iterator-result promise: the settle reaction
+    // is registered on the FRESH promise before the for-await
+    // machinery registers its own (the machinery awaits \`next()\`'s
+    // result), so the lease-setting job runs immediately before the
+    // loop segment's continuation job — the same ordering discipline
+    // as \`__replAwait\` (no job in between can run with the lease
+    // set). A synchronous throw from the underlying iterator is
+    // converted to a rejected promise — the loop observes the same
+    // rejection either way.
+    var wrapLease = function () {
+      try {
+        setContinuationLease(token);
+      } catch (_e) {}
+    };
+    // The result wrapper (phase-E review rejection round 7): for an
+    // ASYNC underlying, the result (a promise of the iterator result)
+    // is adopted and the result object passes through untouched. For a
+    // SYNC underlying, the raw result object goes through the
+    // AsyncFromSyncIteratorContinuation transformation: a non-object
+    // result is a TypeError, and the result's VALUE is awaited and
+    // unwrapped into a fresh \`{ value, done }\` object — native \`for
+    // await\` over a sync iterable yields the RESOLVED value, never a
+    // promise object. The lease-setting reaction rides the pristine
+    // 'then' function value, so a replaced 'Promise.prototype.then'
+    // cannot skip it.
+    var wrapResult = isAsync
+      ? function (result) {
+          var p = new P(function (resolve, reject) {
+            try {
+              pThen.call(PResolve(result), resolve, reject);
+            } catch (e) {
+              reject(e);
+            }
+          });
+          pThen.call(p, wrapLease, wrapLease);
+          return p;
+        }
+      : function (result) {
+          var p = new P(function (resolve, reject) {
+            try {
+              if (result === null || typeof result !== 'object') {
+                throw new TypeError('iterator result is not an object');
+              }
+              pThen.call(
+                PResolve(result.value),
+                function (value) {
+                  resolve({ value: value, done: result.done });
+                },
+                reject,
+              );
+            } catch (e) {
+              reject(e);
+            }
+          });
+          pThen.call(p, wrapLease, wrapLease);
+          return p;
+        };
+    var wrapped = {};
+    wrapped[Symbol.asyncIterator] = function () {
+      return wrapped;
+    };
+    // Forward with the EXACT argument count the for-await machinery
+    // uses: \`next()\` is called with NO arguments (the loop's value
+    // travels through the iterator, never into \`next()\`), while
+    // \`return()\`/\`throw()\` receive the completion value even when it
+    // is undefined — an \`arguments.length\`-sensitive underlying
+    // iterator must observe the same calls it would have observed
+    // unwrapped.
+    var forward = function (method, hasArg, arg) {
+      var result;
+      try {
+        result = hasArg ? method.call(underlying, arg) : method.call(underlying);
+      } catch (e) {
+        return wrapResult(PReject(e));
+      }
+      return wrapResult(result);
+    };
+    wrapped.next = function () {
+      return forward(underlying.next, false);
+    };
+    if (typeof underlying.return === 'function') {
+      wrapped.return = function (value) {
+        return forward(underlying.return, true, value);
+      };
+    }
+    if (typeof underlying.throw === 'function') {
+      wrapped.throw = function (value) {
+        return forward(underlying.throw, true, value);
+      };
+    }
+    return wrapped;
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -2011,7 +2172,7 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   function installGlobal(name, value) {
     try {
-      Object.defineProperty(globalThis, name, {
+      Object.defineProperty(g, name, {
         value: value,
         writable: false,
         enumerable: true,
@@ -2020,7 +2181,7 @@ const GUEST_LIBRARY_SOURCE = `/*
     } catch (_err) {
       // The realm predefined the name non-configurably — fall back to
       // assignment so the DSL still works.
-      globalThis[name] = value;
+      g[name] = value;
     }
   }
 
@@ -2071,7 +2232,7 @@ const GUEST_LIBRARY_SOURCE = `/*
   // baseline). A guest that WRITES the lease (through the setter) is
   // sabotaging only its own interrupt targeting — the same self-
   // sabotage stance as the rest of the tracking surface.
-  Object.defineProperty(globalThis, '__replLease', {
+  Object.defineProperty(g, '__replLease', {
     get: function () { return state.continuationLease; },
     set: function (v) { state.continuationLease = v; },
     enumerable: false,
@@ -2081,14 +2242,14 @@ const GUEST_LIBRARY_SOURCE = `/*
   // Version marker (snapshot versioning: hosts read this — or
   // surface.version — to know which guest library a restored workspace
   // carries; see the README's version-compatibility rules).
-  Object.defineProperty(globalThis, VERSION_GLOBAL, {
+  Object.defineProperty(g, VERSION_GLOBAL, {
     value: VERSION,
     writable: false,
     enumerable: false,
     configurable: false,
   });
 
-  Object.defineProperty(globalThis, Symbol.for(SURFACE_KEY), {
+  Object.defineProperty(g, Symbol.for(SURFACE_KEY), {
     value: surface,
     writable: false,
     enumerable: false,

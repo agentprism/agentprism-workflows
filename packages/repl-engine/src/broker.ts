@@ -2310,11 +2310,14 @@ export class Broker {
       this.assertAlive();
       this.sweepActiveEvals();
       if (this.activeEvalCompletions.size === 0) return false;
-      // The 0.3.0 continuation-lease surface is the targeting seam: a
-      // workspace whose resident library predates it (a restored
-      // 0.1.0/0.2.0 snapshot) cannot key the signal to an eval's
-      // continuation — the 0.2.0 log-only targeting is the rejected
-      // settled-call-ids identity. Refuse honestly.
+      // The 0.3.1+ continuation-lease surface is the targeting seam
+      // (version-gated — a restored 0.3.0 snapshot reports the flag but
+      // its lease-setting reaction still runs on the awaited VALUE's
+      // settlement, the carried sibling-reaction defect; phase-E review
+      // rejection round 7): a workspace whose resident library predates
+      // it (a restored 0.1.0/0.2.0/0.3.0 snapshot) cannot key the signal
+      // to an eval's continuation — the 0.2.0 log-only targeting is the
+      // rejected settled-call-ids identity. Refuse honestly.
       if (!this.continuationLeaseAvailable()) return false;
       // The pending-call refusal (phase-E review round 3): a suspended
       // eval's continuation can only ever be resumed by the settlement
@@ -4357,11 +4360,13 @@ export class Broker {
     // rewrites the eval's top-level `await x` into
     // `await <hygienic helper>(x, TOKEN)` so the guest library can wrap
     // the awaited value — the continuation-lease seam (phase-E review
-    // round 5). Gated on the workspace's library carrying the 0.3.0
-    // lease surface: a restored snapshot with the 0.1.0/0.2.0 library
-    // is served as-is and simply gets no instrumentation (the interrupt
-    // degrades to the honest refusal — the 0.2.0 log-only targeting is
-    // the rejected settled-call-ids identity).
+    // round 5). Gated on the workspace's library carrying the 0.3.1+
+    // lease surface (version-gated — the 0.3.0 copy's lease-set
+    // ordering carries the sibling-reaction defect, phase-E review
+    // rejection round 7): a restored snapshot with the 0.1.0/0.2.0/0.3.0
+    // library is served as-is and simply gets no instrumentation (the
+    // interrupt degrades to the honest refusal — the 0.2.0 log-only
+    // targeting is the rejected settled-call-ids identity).
     const instrumented = this.continuationLeaseAvailable()
       ? instrumentTopLevelAwaits(code, token, { wrapIterables: this.iterableLeaseAvailable() })
       : code;
@@ -4394,20 +4399,34 @@ export class Broker {
     return result;
   }
 
-  /** Whether the workspace's guest library carries the 0.3.0
-   *  CONTINUATION-LEASE surface (the `__replLease` accessor + the
-   *  token form of `__replAwait` — the eval-break targeting seam). A
-   *  restored snapshot with the 0.1.0/0.2.0 library is served as-is —
-   *  the instrumenter is skipped and the eval-break interrupt degrades
-   *  to the honest refusal (the 0.2.0 log-only targeting is the
-   *  rejected settled-call-ids identity). Cached per check: the
-   *  library never changes within a broker's lifetime (restore keeps
-   *  the snapshot's copy). */
+  /** Whether the workspace's guest library carries the 0.3.1+
+   *  CONTINUATION-LEASE surface — the corrected lease ordering (the
+   *  eval-break targeting seam). VERSION-GATED (phase-E review
+   *  rejection round 7): the 0.3.0 copy reports 'supportsContinuationLease:
+   *  true' but its lease-setting reaction still runs on the awaited
+   *  VALUE's settlement — the carried sibling-reaction interrupt-
+   *  targeting defect (a sibling 'q.then' registered after the target's
+   *  await runs between the lease set and the continuation, consumes the
+   *  armed signal, and the target runs later unprotected). Accepting the
+   *  flag alone would re-arm the original defect on a restored 0.3.0
+   *  snapshot; the version gate refuses it: a restored 0.3.0 workspace is
+   *  served as-is, its awaits are left UNINSTRUMENTED (native semantics),
+   *  and the eval-break interrupt degrades to the honest refusal. 0.3.1
+   *  is the first copy with the corrected ordering (its wrapper reaction
+   *  rides the wrapper promise itself, immediately before the await
+   *  machinery's own — the lease is associated with the actual
+   *  continuation job), so it passes the gate. A restored snapshot with
+   *  the 0.1.0/0.2.0 library is refused by the flag itself (the 0.2.0
+   *  log-only targeting is the rejected settled-call-ids identity).
+   *  Cached per check: the library never changes within a broker's
+   *  lifetime (restore keeps the snapshot's copy). */
   private continuationLeaseAvailable(): boolean {
     if (this.leaseCapabilityCached !== undefined) return this.leaseCapabilityCached;
     try {
       const surface = this.workspace.surface();
-      this.leaseCapabilityCached = surface?.supportsContinuationLease === true;
+      this.leaseCapabilityCached =
+        surface?.supportsContinuationLease === true &&
+        guestVersionAtLeast(surface.version, '0.3.1');
     } catch {
       this.leaseCapabilityCached = false;
     }
@@ -4897,6 +4916,26 @@ async function boundedOne<T>(promise: Promise<T>, deadline: number): Promise<T |
 /** Timer sleep (the drain's yield and bounded-wait primitive). */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The guest-library version gate (phase-E review rejection round 7):
+ *  parse a surface version string ('0.3.1') into its numeric triple and
+ *  compare it against a minimum. Returns false for unparseable or
+ *  missing versions — an unknown library version can never pass a
+ *  capability gate. The gate exists for the corrected continuation-lease
+ *  ordering (0.3.1 is the first copy whose lease-setting reaction rides
+ *  the wrapper promise itself; see `continuationLeaseAvailable`). */
+function guestVersionAtLeast(version: string, atLeast: string): boolean {
+  const parsed = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  const minimum = /^(\d+)\.(\d+)\.(\d+)/.exec(atLeast);
+  if (parsed === null || minimum === null) return false;
+  for (let i = 1; i <= 3; i++) {
+    const a = Number(parsed[i]);
+    const b = Number(minimum[i]);
+    if (a > b) return true;
+    if (a < b) return false;
+  }
+  return true;
 }
 
 /** Head+tail elision at `max` chars (the manifest task cap). */

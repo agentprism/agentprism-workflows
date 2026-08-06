@@ -75,6 +75,23 @@
  *    `TypeError: not a function` — and a running loop remains
  *    breakable mid-iteration through the per-iteration lease.
  *
+ * Round 7 (the reviewer's rejection of the previous attempt) adds:
+ * 13. The for-await iterable wrap passes SYNC iterable values through
+ *    AsyncFromSyncIteratorContinuation semantics: `for await (const x
+ *    of [Promise.resolve(1), 2])` yields the RESOLVED `[1, 2]` through
+ *    the broker — never the promise objects.
+ * 14. The await instrumentation is semantically isolated from guest
+ *    Promise sabotage: replacing `Promise.prototype.then` does not
+ *    change the instrumented `await 40` (still `40`), and the
+ *    continuation-lease targeting keeps working under the mutation.
+ * 15. The continuation-lease availability check is VERSION-GATED: a
+ *    RESTORED 0.3.0 library (whose lease-setting reaction still runs
+ *    on the awaited VALUE's settlement — the carried sibling-reaction
+ *    interrupt-targeting defect) reports `supportsContinuationLease:
+ *    true` but is served WITHOUT instrumentation and the eval-break
+ *    interrupt refuses — the flag alone would have re-armed the
+ *    original defect on a supported older snapshot.
+ *
  * All suites disable the per-eval deadline (`evalTimeoutMs: 0`), so
  * the ONLY thing that can break a runaway here is the armed signal —
  * a regression hangs the operation and the test's watchdog fails it.
@@ -86,6 +103,7 @@ import { test } from 'node:test';
 import {
   Broker,
   Workspace,
+  ReplVm,
   type BrokerLoadSessionOptions,
   type BrokerOpenSessionOptions,
   type BrokerPromptOptions,
@@ -93,6 +111,9 @@ import {
   type BrokerSession,
   type BrokerTurn,
 } from '../src/index.js';
+import { buildGuestLibrarySource } from '../src/guest/guest-library.js';
+import { getVmShim } from '../src/vm.js';
+import type { JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 const PROJECT = '/tmp/repl-eval-break-project';
 
@@ -803,4 +824,191 @@ test('review round 6: a RUNNING for-await loop is breakable mid-iteration — th
   assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();
   ws.dispose();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Round 7 — the reviewer's rejection of the previous attempt
+// ────────────────────────────────────────────────────────────────────────
+
+test('review round 7: the instrumented for-await over a SYNC iterable yields the RESOLVED values through the broker — `for await (const x of [Promise.resolve(1), Promise.resolve(2)])` collects `[1, 2]`, never promise objects (the reviewer\'s repro: the result wrapper resolved with the RAW iterator result, and because the wrapper is an ASYNC iterable the machinery used the value as-is — the promise object leaked through Broker instead of `1`)', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval(
+    'globalThis.round7sync = []; for await (const x of [Promise.resolve(1), Promise.resolve(2)]) { globalThis.round7sync.push(x); } "iterated"',
+  );
+  assert.equal(r.result, '"iterated"', `the loop completed: ${output(r).join('\n')}`);
+  const kinds = await broker.eval('round7sync.map((x) => typeof x).join(",")');
+  assert.equal(kinds.result, '"number,number"', 'the loop saw the RESOLVED numbers, never promise objects');
+  const sum = await broker.eval('round7sync[0] + round7sync[1]');
+  assert.equal(sum.result, '3', 'the resolved values are `1` and `2`');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review round 7: the instrumented top-level await is semantically isolated from guest Promise sabotage — replacing `Promise.prototype.then` does not change `await 40` (the reviewer\'s repro: the instrumented await returned `99` where the native evaluation returned `40`), and the continuation-lease targeting keeps working under the mutation (the lease-setting reaction rides the captured pristine `then`)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // The reviewer's exact repro at the broker boundary: with the
+  // guest-resolvable `.then` in the mirroring machinery, the replaced
+  // prototype hijacked the instrumented await; the captured pristine
+  // `then` keeps the mirror native.
+  const r = await broker.eval(
+    'Promise.prototype.then = function () { return 99; }; const x = await Promise.resolve(40); globalThis.round7x = x; "done"',
+  );
+  assert.equal(r.result, '"done"', `the eval completed: ${output(r).join('\n')}`);
+  const x = await broker.eval('round7x');
+  assert.equal(x.result, '40', 'the instrumented await mirrors the native value under the replaced prototype');
+  // The lease plumbing still works under the mutation: an eval
+  // suspended on a call is targetable, and the armed signal breaks the
+  // continuation (the job after the lease-setting reaction) mid-run —
+  // the same end-to-end shape as the round-6 sibling regression, with
+  // the prototype replaced.
+  const a = await broker.eval(
+    'const q = agent("pi/x", "research"); const out = await q; let y = 0; for (let i = 0; i < 200000; i++) y += i; globalThis.round7out = out; "waiting"',
+  );
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'the suspended eval is targetable despite the replaced prototype');
+  runner.sessions[0].completeTurn('result');
+  await tick();
+  const probe = await bounded('probe after settling the mutated-prototype eval', broker.eval('"probe"'));
+  assert.ok(
+    output(probe).some((line) => line.includes('interrupted')),
+    `the continuation was broken mid-run under the mutation: ${output(probe).join('\n')}`,
+  );
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+/**
+ * The emulated 0.3.0 library copy (review round 7): the shipped source
+ * with the version marker at 0.3.0, the 0.3.0 LEASE-SET ORDERING (the
+ * lease-setting reaction runs on the awaited VALUE's settlement — the
+ * carried sibling-reaction interrupt-targeting defect: a sibling
+ * `q.then(...)` registered after the eval started awaiting `q` runs
+ * between the lease set and the continuation, consumes the armed
+ * signal, and the target's continuation runs later unprotected), and no
+ * iterable-lease capability. The broker's version gate must refuse to
+ * instrument/arm on this copy even though it reports
+ * `supportsContinuationLease: true` — the flag alone would have passed
+ * the pre-round-7 check.
+ */
+function guestLibrary030Source(): string {
+  const source = buildGuestLibrarySource('0.3.0');
+  // The 0.3.0 `__replAwait` wrapper (the exact form the round-6
+  // rejection described): the lease is set inside the job that resolves
+  // the wrapper, whose reactions are registered on the awaited VALUE.
+  const wrapper030 = `return new Promise(function (resolve, reject) {
+          Promise.resolve(value).then(
+            function (v) {
+              try {
+                setContinuationLease(token);
+              } catch (_e) {}
+              resolve(v);
+            },
+            function (e) {
+              try {
+                setContinuationLease(token);
+              } catch (_e) {}
+              reject(e);
+            },
+          );
+        });`;
+  // The 0.3.1 wrapper the shipped source carries (the lease-setting
+  // reaction rides the WRAPPER promise itself, registered before the
+  // await machinery's own reaction).
+  const wrapper031 = `var wrapper = new P(function (resolve, reject) {
+          try {
+            pThen.call(PResolve(value), resolve, reject);
+          } catch (e) {
+            reject(e);
+          }
+        });
+        pThen.call(
+          wrapper,
+          function () {
+            try {
+              setContinuationLease(token);
+            } catch (_e) {}
+          },
+          function () {
+            try {
+              setContinuationLease(token);
+            } catch (_e) {}
+          },
+        );
+        return wrapper;`;
+  const patched = source.replace(wrapper031, wrapper030);
+  if (patched === source) {
+    throw new Error('round-7 fixture: could not patch the 0.3.1 wrapper into the 0.3.0 ordering');
+  }
+  // The 0.3.0 copy has no iterable-lease capability.
+  const flagged = patched.replace('supportsIterableLease: true,', 'supportsIterableLease: false,');
+  if (flagged === patched) {
+    throw new Error('round-7 fixture: could not patch the iterable-lease flag');
+  }
+  return flagged;
+}
+
+test('review round 7: a RESTORED 0.3.0 library is served WITHOUT instrumentation and the eval-break interrupt REFUSES — the continuation-lease availability check is VERSION-GATED on 0.3.1 (the reviewer\'s finding: the 0.3.0 copy reports `supportsContinuationLease: true` but its helper still carries the sibling-reaction interrupt-targeting defect, so the flag alone re-armed the original defect on a supported older snapshot)', async () => {
+  const runner = new FakeRunner();
+  // Build an emulated 0.3.0 library copy, install it in a bare VM (with
+  // the four __host_* globals, exactly like the pre-snapshot host the
+  // fixture stands in for), snapshot it, and restore the workspace: the
+  // restored copy is served as-is (the doc's older-library rule — never
+  // re-injected).
+  const vm = await ReplVm.create();
+  const shim = getVmShim(vm) as QuickJS;
+  const noopHost = (_args: unknown[]): JSValueHandle | undefined => undefined;
+  for (const name of ['__host_agent', '__host_checkpoint', '__host_agent_steer', '__host_console']) {
+    const fnHandle = shim.newFunction(name, noopHost);
+    shim.setProp(shim.global, name, fnHandle);
+    fnHandle.dispose();
+  }
+  const installed = await vm.evalCode(guestLibrary030Source());
+  assert.equal(installed.kind, 'value', `the emulated 0.3.0 library installed: ${JSON.stringify(installed).slice(0, 200)}`);
+  // ReplVm does not expose snapshot(); the shim does (the workspace
+  // layer's own snapshot() is exactly this call).
+  const snapshot = shim.snapshot();
+  vm.dispose();
+  const ws = await Workspace.restore(PROJECT, snapshot);
+  const broker = await Broker.attach(ws, { runner, evalTimeoutMs: 0 });
+  try {
+    const surface = ws.surface()!;
+    assert.equal(surface.version, '0.3.0', 'the restored copy reports its own version');
+    assert.equal(surface.supportsContinuationLease, true, 'the 0.3.0 copy reports the flag — the OLD gate would have accepted it');
+    assert.equal(surface.supportsIterableLease, false, 'the 0.3.0 copy has no iterable-lease capability');
+    // An eval suspends on a call — in flight, and in principle
+    // targetable (the exact shape the pre-gate arm would have armed).
+    // The sibling `.then` is registered AFTER the await: with the 0.3.0
+    // lease-set ordering it would run between the lease set and the
+    // continuation (and consume the armed signal); with NO
+    // instrumentation it runs natively and never sees a lease.
+    const a = await broker.eval(
+      'globalThis.round7sibling = null; const q = agent("pi/x", "research"); const x = await q; q.then(() => { globalThis.round7sibling = __replLease; }); globalThis.round7done = x; "waiting"',
+    );
+    assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+    assert.equal(
+      await broker.armEvalBreak(),
+      false,
+      'the eval-break interrupt REFUSES on the restored 0.3.0 copy — nothing is armed (the version gate)',
+    );
+    // A no-id interrupt with nothing armed must not have armed anything:
+    // the target stays trackable and the workspace stays healthy.
+    const still = await broker.armEvalBreak();
+    assert.equal(still, false, 'still refused');
+    // The eval completes natively when the call settles — the sibling
+    // reaction and the continuation both run, exactly like an
+    // un-instrumented workspace.
+    runner.sessions[0].completeTurn('result');
+    await tick();
+    const probe = await bounded('probe after settling the 0.3.0-copy eval', broker.eval('"probe"'));
+    assert.equal(probe.result, '"probe"', `the workspace stays healthy: ${output(probe).join('\n')}`);
+    const sibling = await broker.eval('round7sibling === undefined ? "unset" : round7sibling');
+    assert.equal(sibling.result, '"unset"', 'no instrumentation ran — the sibling never observed a continuation lease (the 0.3.0 lease-set defect was never re-armed)');
+    const done = await broker.eval('round7done');
+    assert.equal(done.result, '"result"', 'the continuation settled natively with the turn text');
+  } finally {
+    await broker.dispose();
+    ws.dispose();
+  }
 });

@@ -416,6 +416,34 @@ test('manifest: user bindings that SHADOW or OVERWRITE baseline globals are enum
   }
 });
 
+test('manifest: a top-level LEXICAL `const globalThis = 7` (a legitimate user program) does not blank the provenance pass — a later `var userValue = 42` is enumerated with producer/task/time metadata (phase-E review rejection round 7: the pass read descriptors off the free variable globalThis, which the lexical binding shadows, so every descriptor read hit the NUMBER and the pass\'s catch swallowed the whole attribution — userValue appeared in the manifest with null provenance)', async () => {
+  const ws = await Workspace.create('/tmp/repl-globalthis-shadow-project');
+  const broker = await Broker.attach(ws, { evalTimeoutMs: 0 });
+  try {
+    // `const globalThis = 7` shadows the realm's global object for
+    // identifier resolution; `var userValue = 42` is a global-object
+    // property the manifest must attribute to this eval.
+    const r = await broker.eval('const globalThis = 7; var userValue = 42; userValue');
+    assert.equal(r.result, '42');
+    const manifest = broker.workspaceManifest();
+    const byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    const userValue = byName.get('userValue');
+    assert.ok(userValue, `userValue is listed: ${[...byName.keys()].join(', ')}`);
+    assert.equal(userValue!.token, 'number \u00b7 8B');
+    assert.equal(userValue!.type, 'number');
+    assert.equal(userValue!.provenance, 'eval 1', 'the pass read descriptors off the CAPTURED global object — provenance survives the lexical shadow');
+    assert.ok(typeof userValue!.provenanceAtMs === 'number' && userValue!.provenanceAtMs! > 0, 'the attribution carries its timestamp');
+    // The workspace keeps working after the shadow (the library's own
+    // internal references use the captured global too): a fresh eval
+    // still reaches host functions and the realm globals.
+    const live = await broker.eval('typeof console.log');
+    assert.equal(live.result, '"function"', 'the library internals are immune to the globalThis shadow');
+  } finally {
+    await broker.dispose();
+    ws.dispose();
+  }
+});
+
 test('manifest: a SAME-TYPE overwrite of a baseline global (`Math = { userOwned: true }`) is enumerated with complete metadata and provenance — the type token cannot see it (both values are objects), the value identity can (phase-E review rejection round 6: the token-only detector missed same-type replacements entirely, leaving them absent from the manifest with no provenance)', async () => {
   const ws = await Workspace.create('/tmp/repl-same-type-project');
   const broker = await Broker.attach(ws, { evalTimeoutMs: 0 });

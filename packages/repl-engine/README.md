@@ -239,7 +239,28 @@ reconciles — the library itself is never re-evaluated (idempotence guard).
   a function`, the round-6 rejection) and stays breakable mid-iteration. The surface's
   `supportsIterableLease` gates the for-await sites: a snapshot carrying the 0.3.0
   library is served as-is with its for-await sites left unwrapped (native semantics,
-  no mid-loop targeting — the honest degradation). A snapshot carrying the
+  no mid-loop targeting — the honest degradation). The broker's continuation-lease
+  availability check is VERSION-GATED on ≥ 0.3.1 (round-7 decision): a restored 0.3.0
+  copy reports `supportsContinuationLease: true` but its lease-setting reaction still
+  runs on the awaited VALUE's settlement — the sibling-reaction defect — so the host
+  serves it WITHOUT instrumentation and the eval-break interrupt refuses honestly
+  (the flag alone would re-arm the original defect on a supported older snapshot;
+  see `Broker.continuationLeaseAvailable`). The instrumentation surface is also
+  hardened against guest Promise sabotage (round-7 decision): `__replAwait` /
+  `__replAwaitIterable` (and the host-thenable forwarding in `issueHostCall` —
+  without it, a replaced `Promise.prototype.then` silently killed every settlement)
+  mirror values through CAPTURED pristine intrinsics (`P`/`PResolve`/`PReject`/`pThen`
+  — bound at installation, before any guest code runs), so replacing
+  `Promise.prototype.then`, overwriting `Promise.resolve`, or shadowing `Promise`
+  lexically cannot change the instrumentation's semantics (the instrumented
+  `await 40` stays `40`) or skip the continuation-lease setting. The for-await wrap
+  also follows GetIterator/GetMethod acquisition semantics exactly once (an
+  observable/throwing `@@asyncIterator` getter runs a single time and its ORIGINAL
+  error propagates — the old degrade-to-unwrapped made the machinery acquire a
+  second time) and passes SYNC-iterable results through
+  AsyncFromSyncIteratorContinuation (the result VALUE is awaited and unwrapped —
+  `for await (const x of [Promise.resolve(1)])` yields `1`, never the promise
+  object). A snapshot carrying the
   0.1.0/0.2.0 library is served as-is (the version-compatibility
   rule below): the host skips the instrumenter on it and the eval-break interrupt
   degrades to the honest refusal (the 0.2.0 log-only targeting is the rejected
