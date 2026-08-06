@@ -20,6 +20,16 @@
       "sha": "5d40f745bdfa210c314783c320167d1a13c88224",
       "imported": "2026-08-06",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (device-code auth)"
+    },
+    {
+      "sha": "61de42d70f20b191a505bf3bb8b6b21933272e93",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (goal extension + codex 0.146.1)"
+    },
+    {
+      "sha": "2c1b2084a1e7348b3aaf58f855f6988da8e70ebb",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (lockfile dev-deps bump)"
     }
   ]
 }

@@ -196,7 +196,10 @@ test("the executable ACP extension matrix pins steering support and installed ad
     assert.ok(dist.includes(row.method), `${row.agent} dist must implement ${row.method}`);
     assert.match(
       dist,
-      /_meta\s*:\s*\{\s*steering\s*:\s*\{\s*supported\s*:\s*true\s*,?\s*\}\s*,?\s*\}/,
+      // Anchor on the steering block's own opening braces; other `_meta` extension keys
+      // (e.g. the goal extension added upstream in #371) may follow it as siblings, so do
+      // not require `supported: true` to be the last key before the closing brace.
+      /_meta\s*:\s*\{\s*steering\s*:\s*\{\s*supported\s*:\s*true\s*,?\s*\}/,
       `${row.agent} dist must advertise top-level steering support`,
     );
   }
