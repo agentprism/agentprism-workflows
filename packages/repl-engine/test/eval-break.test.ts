@@ -25,8 +25,23 @@
  *    eval deadline instead of being broken by the interrupt. The
  *    interrupted drain releases the tracked eval (no stale arm target).
  *
- * All three suites disable the per-eval deadline (`evalTimeoutMs: 0`),
- * so the ONLY thing that can break a runaway here is the armed signal —
+ * Round 3 (the carried review's defects) adds:
+ * 4. The signal is keyed to the armed target's CONTINUATION, not to
+ *    whichever drain runs next: an unrelated finite eval whose own
+ *    drain executes real bytecode (polling the interrupt handler many
+ *    times) is neither broken nor consumes the signal, and an
+ *    unrelated settlement drain (a call no tracked eval awaits) does
+ *    not fire it either — the armed state survives unrelated drains
+ *    intact and breaks the target at its actual next execution.
+ * 5. A no-id interrupt with NOTHING BREAKABLE — every in-flight eval
+ *    suspended on no pending host call (a never-settling local
+ *    promise) — refuses without arming anything.
+ * 6. `waitForCalls` sleeps only for the REMAINING wait budget: a short
+ *    `timeoutMs` returns in that budget, never a fixed 50 ms poll
+ *    overshoot (~51 ms for every sub-50 ms timeout).
+ *
+ * All suites disable the per-eval deadline (`evalTimeoutMs: 0`), so
+ * the ONLY thing that can break a runaway here is the armed signal —
  * a regression hangs the operation and the test's watchdog fails it.
  */
 
@@ -298,6 +313,126 @@ test('review round 2: a suspended eval\'s continuation resumed by checkpoint.ans
     output(d).some((line) => line.includes('interrupted')),
     `the second runaway was broken by the second arm: ${output(d).join('\n')}`,
   );
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 4. The signal is keyed to the armed target's continuation ──────────
+
+test('review round 3: an UNRELATED finite eval whose own drain executes real bytecode neither consumes the eval-break signal nor is broken by it — the armed state survives and breaks the target at its actual next execution (the carried review defect: every later eval\'s drain installed the drainInterruptHandler, so an unrelated finite eval B was interrupted and noteInterruptedDrain cleared A\'s tracking while A\'s checkpoint stayed pending and uninterruptible)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // eval A suspends on a checkpoint; its continuation is a runaway loop.
+  const a = await broker.eval('const q = checkpoint("go?"); await q; while (true) {}');
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  // The interrupt arms against the running eval (its resume key: c1).
+  assert.equal(await broker.armEvalBreak(), true);
+  // Unrelated finite eval B whose DRAIN executes real bytecode — a
+  // microtask with a 200k-iteration loop polls the quickjs interrupt
+  // handler many times. The carried defect: B's own drain installed the
+  // armed drainInterruptHandler unconditionally, so the FIRST poll
+  // fired it — B was interrupted mid-run, and the interrupted-drain
+  // release cleared A's tracking (c1 stayed pending and UNINTERRUPTIBLE).
+  const b = await bounded(
+    'unrelated finite eval with a bytecode-heavy drain',
+    broker.eval('Promise.resolve().then(() => { let x = 0; for (let i = 0; i < 200000; i++) x += i; return "B-done"; });'),
+  );
+  assert.ok(
+    b.result !== undefined && b.result.includes('B-done'),
+    `the unrelated eval completed normally, never interrupted: ${output(b).join('\n')}`,
+  );
+  // The armed state SURVIVED B: answering c1 resumes A's runaway in the
+  // answering eval's own drain, and the still-armed signal breaks it
+  // MID-RUN — the exact execution the interrupt targeted.
+  const c = await bounded(
+    'eval C answering the checkpoint after the unrelated drain',
+    broker.eval('checkpoint.answer("c1", "go"); "answered"'),
+  );
+  assert.ok(
+    output(c).some((line) => line.includes('interrupted')),
+    `the armed signal survived the unrelated drain and broke the target: ${output(c).join('\n')}`,
+  );
+  // The broken target was released: a later arm refuses.
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review round 3: an UNRELATED settlement drain (a call no tracked eval awaits) neither fires nor consumes the eval-break signal — the armed state survives and breaks the target at its actual next execution', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // A RESOLVED eval leaves a pending agent call whose continuation does
+  // real bytecode when it settles (a .then with a 200k-iteration loop):
+  // its settlement drain polls the interrupt handler many times. NO
+  // tracked eval awaits c1 (the founding eval resolved).
+  await broker.eval('const p = agent("pi/x", "task").then((v) => { let x = 0; for (let i = 0; i < 200000; i++) x += i; return v; }); "started"');
+  await tick();
+  // eval A suspends on a checkpoint; its continuation is a runaway loop.
+  const a = await broker.eval('const q = checkpoint("go?"); await q; while (true) {}');
+  assert.ok(a.pending.includes('c2'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true)
+  // The unrelated call settles: the pump's drain runs c1's bytecode-
+  // heavy continuation, polling the armed handler — which must NOT fire
+  // (c1 is not one of the armed target's resume keys; the drain does
+  // not belong to the target). The carried defect fired on any drain.
+  runner.sessions[0].completeTurn('unrelated');
+  await tick();
+  const probe = await bounded('probe eval after the unrelated settlement', broker.eval('"probe"'));
+  assert.ok(
+    probe.result !== undefined && probe.result.includes('probe'),
+    `the unrelated settlement did not fire the signal: ${output(probe).join('\n')}`,
+  );
+  // The armed state SURVIVED the unrelated settlement: answering c2
+  // resumes A's runaway in the answering eval's own drain and the
+  // still-armed signal breaks it mid-run.
+  const c = await bounded('eval C answering the checkpoint', broker.eval('checkpoint.answer("c2", "go"); "answered"'));
+  assert.ok(
+    output(c).some((line) => line.includes('interrupted')),
+    `the armed signal survived the unrelated settlement drain: ${output(c).join('\n')}`,
+  );
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 5. Nothing breakable → refuse without arming ───────────────────────
+
+test('review round 3: a no-id interrupt with NOTHING BREAKABLE — an in-flight eval suspended on NO pending host call (a never-settling local promise, so no execution can ever resume it) — REFUSES and arms nothing', async () => {
+  const { ws, broker } = await setup();
+  // The eval suspends (its completion stays pending) with ZERO pending
+  // host calls: no settlement can ever queue its continuation, so there
+  // is no execution to break. Arming would be dead weight that lingers
+  // until reset — the guidance's refusal rule.
+  const a = await broker.eval('await new Promise(() => {}); "never"');
+  assert.equal(a.result, undefined, 'the eval suspended — no completion value');
+  assert.deepEqual(a.pending, [], 'no pending host call');
+  assert.equal(await broker.armEvalBreak(), false, 'nothing breakable — refused, nothing armed');
+  // Nothing was armed: a later eval runs normally.
+  const after = await broker.eval('6 * 7');
+  assert.equal(after.result, '42');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 6. The wait sleeps only for the remaining budget ───────────────────
+
+test('review round 3: waitForCalls respects the REMAINING wait budget — a 10 ms timeout returns in ~10 ms, never the fixed 50 ms poll overshoot (~51 ms for every sub-50 ms timeout: the carried review defect)', async () => {
+  const { ws, broker } = await setup();
+  // A parked checkpoint keeps c1 pending forever (no runner needed):
+  // the wait pumps (nothing ready), sleeps, and must return at its
+  // deadline.
+  const raised = await broker.eval('const q = checkpoint("go?"); "raised"');
+  assert.ok(raised.pending.includes('c1'), `pending: ${raised.pending.join(', ')}`);
+  const started = Date.now();
+  const { result, drained } = await bounded('bounded 10 ms wait', broker.waitForCalls(['c1'], 10));
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the parked checkpoint never settles — "still running"');
+  assert.deepEqual(result.pending, ['c1'], 'the pending ids are reported');
+  // The old code slept a fixed 50 ms per pump regardless of the budget
+  // (~51 ms total for a 10 ms wait). The remaining-budget sleep must
+  // return within the requested bound plus a generous scheduling
+  // margin — 45 ms is 4.5x the budget and far under the old overshoot.
+  assert.ok(elapsed < 45, `the 10 ms wait returned in ${elapsed} ms (the fixed 50 ms overshoot is gone)`);
   await broker.dispose();
   ws.dispose();
 });

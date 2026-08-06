@@ -612,6 +612,16 @@ export class GuestLibraryInstallError extends Error {
 // The reconciliation surface and realm-slot access
 // ────────────────────────────────────────────────────────────────────────
 
+/** The surface read's array bound: the pending-call registry is the
+ *  host's own reconciliation metadata (bounded by the VM's memory), so
+ *  the generic 256-element preview cap would silently truncate the
+ *  doc's `pending: [...]` surface. 16 384 pending calls is far beyond
+ *  any realistic orchestration (the doc caps concurrent SUBAGENTS at
+ *  6; parked checkpoints are the only piling kind) and keeps a
+ *  pathological guest's registry from making every `pending` read
+ *  pathological. */
+const SURFACE_READ_MAX_LEN = 16384;
+
 /** One entry of the guest's pending-call manifest. */
 export interface GuestSurfaceEntry {
   id: string;
@@ -775,7 +785,17 @@ function callSurfaceFunction(
         return undefined;
       }
       if (result.isUndefined) return undefined;
-      return readValue(result, 0, new Set());
+      // The pending-call registry is the host's own reconciliation
+      // metadata (call ids, kinds, verbatim options — created by the
+      // frozen guest library, never by guest code), not guest content:
+      // the read's array cap is lifted so `pending` reports the WHOLE
+      // registry (phase-E review round 3: the generic 256-element cap
+      // silently truncated the list, and its `[ArrayTruncated]` marker
+      // leaked into the broker's id lists as an `undefined` hole). The
+      // bound is still generous-but-finite — the registry is bounded by
+      // the VM's memory, and a pathological guest's registry must not
+      // make every `pending` read pathological.
+      return readValue(result, 0, new Set(), SURFACE_READ_MAX_LEN);
     } finally {
       result.dispose();
     }

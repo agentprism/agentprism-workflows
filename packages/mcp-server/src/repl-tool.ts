@@ -5,6 +5,19 @@
  *
  * Actions:
  *
+ * Every result carries the doc's MACHINE-READABLE shape as
+ * `structuredContent` alongside the bounded text (the published
+ * `outputSchema` — see `replToolOutputShape`): eval/wait return
+ * `{ output, result?, pending, checkpoints, completed }` (plus the
+ * wait-only `drained`/`timedOut` flags and `outputTruncated`), status
+ * returns the structured workspaces surface (workspace state, the
+ * reconcile summary, the workspace MANIFEST, live agents, pending
+ * ops), interrupt returns its honest outcome, reset the dropped
+ * acknowledgement, and the error paths a structured error string.
+ * Guest output and trusted orchestration metadata stay separate
+ * fields — never one flat string (phase-E review rejection: the
+ * text-only result mixed them).
+ *
  * - `eval { projectDir, code }` → the broker's tool-result shape rendered
  *   as text: console output lines, the previewed completion value when
  *   the eval resolved, the pending call ids when it suspended, the
@@ -156,13 +169,21 @@ function resolveContext(
   return options.projects.getOrCreate(resolution.projectDir);
 }
 
-/** The contained-refusal result (a refused snapshot, surfaced loudly). */
-function refusedResult(state: ReplProjectState): {
+/** The contained-refusal result (a refused snapshot, surfaced loudly):
+ *  the machine-readable error variant (keyed to the action that
+ *  touched the refused workspace) plus the bounded text. */
+function refusedResult(state: ReplProjectState, action: string): {
+  structuredContent: Record<string, unknown>;
   content: { type: "text"; text: string }[];
   isError: boolean;
 } {
   const error = state.restoreError!;
   return {
+    structuredContent: {
+      action,
+      projectDir: state.projectDir,
+      error: `${error.message} (the stored snapshot is not restorable with the running engine — run the repl tool with action "reset" to drop it and start a fresh workspace)`,
+    },
     content: [
       {
         type: "text",
@@ -187,6 +208,228 @@ function drainErrorLine(state: ReplProjectState): string | null {
   return `warn: ${error.name}: ${error.message} (the last client-presence drain failed — the workspace state was ` +
     `not persisted; the next disconnect retries the drain)`;
 }
+
+/** The top-level output fields across all variants (the oneOf
+ *  branches' forbidden-field vocabulary). */
+const replOutputFields = [
+  "action",
+  "projectDir",
+  "output",
+  "outputTruncated",
+  "result",
+  "pending",
+  "checkpoints",
+  "completed",
+  "drained",
+  "timedOut",
+  "workspaces",
+  "interrupt",
+  "dropped",
+  "error",
+] as const;
+
+/** JSON-Schema metadata: forbid every variant field outside the
+ *  allowed set (the workflow output shape's pattern). */
+function forbidsOutside(allowed: readonly string[]) {
+  const allowedFields = new Set(allowed);
+  return {
+    not: {
+      anyOf: replOutputFields
+        .filter((field) => !allowedFields.has(field))
+        .map((field) => ({ required: [field] })),
+    },
+  };
+}
+
+/** One raised checkpoint as the machine-readable surface carries it
+ *  (the question previewed — the same bounded form the text renders). */
+const checkpointSummaryShape = z.object({
+  id: z.string(),
+  question: z.string(),
+});
+
+/** The restore's three-way reconcile report (which arm each pending
+ *  call took — see the broker's `ReconcileReport`). */
+const reconcileReportShape = z.object({
+  settledFromStore: z.array(z.string()),
+  reattached: z.array(z.string()),
+  reissued: z.array(z.string()),
+  failedLost: z.array(z.string()),
+  requeuedCheckpoints: z.array(z.string()),
+  leftPending: z.array(z.string()),
+  reQueuedUndelivered: z.array(z.string()),
+});
+
+/** One workspace-manifest binding (the doc's manifest contract: name,
+ *  type token, size, provenance — metadata, never content). */
+const manifestBindingShape = z.object({
+  name: z.string(),
+  /** Structure-only token (type/shape/size, and the live-handle status
+   *  for agent handles) — never value content. */
+  token: z.string(),
+  sizeBytes: z.number().int().nonnegative(),
+  provenance: z.string().nullable(),
+  provenanceAtMs: z.number().int().nonnegative().nullable(),
+  task: z.string().nullable(),
+});
+
+/** The `$N` log-ref globals as a range (mirroring the harness
+ *  manifest's logs breakdown). */
+const logRefsShape = z.object({
+  first: z.number().int().nonnegative().nullable(),
+  last: z.number().int().nonnegative().nullable(),
+  count: z.number().int().nonnegative(),
+});
+
+/** One live subagent session as status carries it. */
+const liveAgentShape = z.object({
+  callId: z.string(),
+  modelSpec: z.string(),
+  task: z.string(),
+  state: z.enum(["opening", "running", "delivering", "idle"]),
+  supportsSteering: z.boolean(),
+  queuedSteers: z.number().int().nonnegative(),
+});
+
+/** One workspace's status entry (the doc's workspaces surface: the
+ *  workspace state, the reconcile summary, the workspace manifest, live
+ *  agents, and pending ops — everything bounded metadata, never guest
+ *  content beyond the previewed checkpoint questions). */
+const workspaceStatusShape = z.object({
+  projectDir: z.string(),
+  state: z.enum(["not-opened", "fresh", "restored", "refused"]),
+  restoreError: z.string().optional(),
+  reconcile: reconcileReportShape.optional(),
+  bindings: z.array(manifestBindingShape),
+  logs: logRefsShape,
+  evalSeq: z.number().int().nonnegative(),
+  inFlight: z.array(z.string()),
+  checkpoints: z.array(checkpointSummaryShape),
+  liveAgents: z.array(liveAgentShape),
+  pending: z.array(z.string()),
+  /** True when the client-presence drain closed every child (the
+   *  workspace stays live; re-attach on demand). */
+  childrenClosed: z.boolean(),
+  drainError: z.string().optional(),
+});
+
+/** The interrupt action's structured outcome. */
+const interruptOutcomeShape = z.object({
+  outcome: z.enum(["targeted", "refused-idle", "cancelled", "idle", "failed", "none"]),
+  callId: z.string().optional(),
+});
+
+/** The machine-readable output of the `repl` tool (published as the
+ *  tool's `outputSchema`, mirrored by every result's
+ *  `structuredContent`): the doc's public eval/wait shape
+ *  `{ output, result?, pending, checkpoints, completed }` plus the
+ *  wait-only drained/timedOut flags, the structured status fields
+ *  (workspaces with the manifest, live agents, pending ops), the
+ *  interrupt outcome, the reset acknowledgement, and the error
+ *  variant. Guest output (the `output` lines, the previewed `result`)
+ *  is kept strictly separate from the trusted orchestration metadata
+ *  (pending/checkpoints/completed, the manifest, the agent states) —
+ *  the phase-E review rejection: the old text-only result mixed them
+ *  into one flat string. Every structured field is bounded metadata:
+ *  the output lines are already capped by the broker, the checkpoint
+ *  questions are previewed, and the manifest binds structure-only
+ *  tokens — the structured surface never carries unbounded guest
+ *  content. The text content stays alongside (the bounded human
+ *  rendering, capped at 256 lines / 10 KB). */
+export const replToolOutputShape = z
+  .object({
+    action: z.enum(["eval", "wait", "status", "interrupt", "reset"]),
+    projectDir: z.string().optional(),
+    // eval/wait (the doc's `{ output, result?, pending, checkpoints,
+    // completed }`).
+    output: z.array(z.string()).optional(),
+    outputTruncated: z.boolean().optional(),
+    result: z.string().optional(),
+    pending: z.array(z.string()).optional(),
+    checkpoints: z.array(checkpointSummaryShape).optional(),
+    completed: z.array(z.string()).optional(),
+    // wait-only: whether the targets settled within the bound (false =
+    // the doc's "still running" timeout outcome).
+    drained: z.boolean().optional(),
+    timedOut: z.boolean().optional(),
+    // status: one entry per workspace context.
+    workspaces: z.array(workspaceStatusShape).optional(),
+    // interrupt: the honest outcome.
+    interrupt: interruptOutcomeShape.optional(),
+    // reset: the teardown acknowledgement.
+    dropped: z.boolean().optional(),
+    // The error variant (a refused snapshot, a missing project context).
+    error: z.string().optional(),
+  })
+  .superRefine((value, context) => {
+    const keys = new Set(Object.keys(value));
+    const has = (field: string) => keys.has(field);
+    const only = (...fields: string[]) =>
+      [...keys].every((key) => key === "action" || fields.includes(key));
+    const hasAll = (...fields: string[]) => fields.every(has);
+    let valid: boolean;
+    if (has("error")) {
+      valid = only("projectDir", "error");
+    } else if (value.action === "eval") {
+      valid =
+        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed") &&
+        hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed");
+    } else if (value.action === "wait") {
+      valid =
+        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut") &&
+        hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut");
+    } else if (value.action === "status") {
+      valid = only("projectDir", "workspaces") && has("workspaces");
+    } else if (value.action === "interrupt") {
+      valid = only("projectDir", "interrupt") && hasAll("projectDir", "interrupt");
+    } else if (value.action === "reset") {
+      valid = only("projectDir", "dropped") && hasAll("projectDir", "dropped");
+    } else {
+      valid = false;
+    }
+    if (!valid) {
+      context.addIssue({ code: "custom", message: "output does not match a repl result variant" });
+    }
+  })
+  .meta({
+    oneOf: [
+      {
+        title: "eval",
+        required: ["action", "projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed"],
+        properties: { action: { const: "eval" } },
+        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed"]),
+      },
+      {
+        title: "wait",
+        required: ["action", "projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut"],
+        properties: { action: { const: "wait" } },
+        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut"]),
+      },
+      {
+        title: "status",
+        required: ["action", "workspaces"],
+        properties: { action: { const: "status" } },
+        ...forbidsOutside(["action", "projectDir", "workspaces"]),
+      },
+      {
+        title: "interrupt",
+        required: ["action", "projectDir", "interrupt"],
+        properties: { action: { const: "interrupt" } },
+        ...forbidsOutside(["action", "projectDir", "interrupt"]),
+      },
+      {
+        title: "reset",
+        required: ["action", "projectDir", "dropped"],
+        properties: { action: { const: "reset" } },
+        ...forbidsOutside(["action", "projectDir", "dropped"]),
+      },
+      {
+        title: "error",
+        required: ["action", "error"],
+        ...forbidsOutside(["action", "projectDir", "error"]),
+      },
+    ],
+  });
 
 /** The truncation marker `capToolResultText` appends when the caps trip
  *  (its own budget is reserved inside the caps, so it always ships). */
@@ -302,30 +545,132 @@ function renderStatus(contexts: Array<{ projectDir: string; repl?: ReplProjectSt
     }
     const pending = broker.pendingCalls();
     if (pending.length > 0) lines.push(`pending: ${pending.map((entry) => entry.id).join(", ")}`);
-    const checkpoints = broker.pendingCheckpoints();
-    for (const checkpoint of checkpoints) {
+    // The PREVIEWED checkpoint summaries (the same bounded form the
+    // eval/wait surface carries and the structured status ships — the
+    // doc's rule: questions appear previewed, truncated, in the tool
+    // result; the raw question would be unbounded guest text).
+    for (const checkpoint of broker.checkpointSummaries()) {
       lines.push(`checkpoint ${checkpoint.id}: ${checkpoint.question}`);
     }
   }
   return lines.join("\n");
 }
 
+/** The structured eval/wait content (the doc's public shape
+ *  `{ output, result?, pending, checkpoints, completed }` plus the
+ *  wait-only drained/timedOut flags and the outputTruncated flag) —
+ *  served as `structuredContent` alongside the bounded text. Guest
+ *  output (the capped console lines, the previewed result) and the
+ *  orchestration metadata (pending/checkpoints/completed) stay
+ *  separate fields: never one flat string (phase-E review rejection:
+ *  the text-only result mixed them). */
+function structuredEvalWait(
+  action: "eval" | "wait",
+  projectDir: string,
+  result: ReplEvalResult,
+  drained?: boolean,
+): Record<string, unknown> {
+  const structured: Record<string, unknown> = {
+    action,
+    projectDir,
+    output: result.output,
+    outputTruncated: result.outputTruncated,
+    pending: result.pending,
+    checkpoints: result.checkpoints,
+    completed: result.completed,
+  };
+  if (result.result !== undefined) structured.result = result.result;
+  if (drained !== undefined) {
+    structured.drained = drained;
+    structured.timedOut = !drained;
+  }
+  return structured;
+}
+
+/** The structured status content — one entry per workspace context
+ *  (the doc's workspaces surface): the workspace state (fresh /
+ *  restored / refused / not opened), the restore's reconcile summary,
+ *  the workspace MANIFEST (bindings with name, structure-only token,
+ *  size, provenance and task — metadata, never content), the `$N`
+ *  log-ref range, the live agents, the pending ops (in-flight calls,
+ *  pending ids, previewed checkpoints), the child-warmth state, and a
+ *  retained drain failure. Everything bounded: the checkpoint
+ *  questions are previewed like the eval/wait surface, and the
+ *  manifest tokens are structure-only — the structured surface never
+ *  carries unbounded guest content. */
+function structuredStatus(
+  contexts: Array<{ projectDir: string; repl?: ReplProjectState }>,
+  projectDir?: string,
+): Record<string, unknown> {
+  const structured: Record<string, unknown> = {
+    action: "status",
+    workspaces: contexts.map((context) => {
+      const entry: Record<string, unknown> = {
+        projectDir: context.projectDir,
+        state: "not-opened",
+        bindings: [],
+        logs: { first: null, last: null, count: 0 },
+        evalSeq: 0,
+        inFlight: [],
+        checkpoints: [],
+        liveAgents: [],
+        pending: [],
+        childrenClosed: false,
+      };
+      const state = context.repl;
+      if (state === undefined) return entry;
+      if (state.restoreError !== null) {
+        entry.state = "refused";
+        entry.restoreError = state.restoreError.message;
+        return entry;
+      }
+      if (state.source === null) return entry;
+      entry.state = state.source;
+      if (state.source === "restored" && state.reconcileReport !== null) {
+        entry.reconcile = state.reconcileReport;
+      }
+      if (state.drainError !== null) {
+        entry.drainError = `${state.drainError.name}: ${state.drainError.message}`;
+      }
+      const broker = state.broker;
+      if (broker === null) return entry;
+      const manifest = broker.workspaceManifest();
+      entry.bindings = manifest.bindings;
+      entry.logs = manifest.logs;
+      entry.evalSeq = manifest.evalSeq;
+      entry.inFlight = manifest.inFlight;
+      entry.checkpoints = broker.checkpointSummaries();
+      entry.liveAgents = broker.liveAgents();
+      entry.pending = broker.pendingCalls().map((call) => call.id);
+      entry.childrenClosed = broker.isDrained;
+      return entry;
+    }),
+  };
+  if (projectDir !== undefined) structured.projectDir = projectDir;
+  return structured;
+}
+
 /** Register the `repl` tool on the server. */
 export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void {
   const { projects, wasm, requireProjectDir } = options;
-  mcp.tool(
+  mcp.registerTool(
     "repl",
-    "One persistent QuickJS-in-WASM VM per projectDir, addressed by the same project model as the workflow tool. " +
-      "State (bindings, pending subagent calls, checkpoints) lives in the VM between calls and survives MCP-session " +
-      "churn and daemon restarts: every eval and every settlement drain that changed state persists the workspace " +
-      "to the daemon's per-project repl store, and the first touch of a stored workspace restores it and reconciles " +
-      "every outstanding call (settle from the store / re-attach via ACP session/load / re-issue). A stored snapshot " +
-      "that refuses (corrupt, a format upgrade, or a wasm-binary mismatch) is surfaced loudly and never silently " +
-      "discarded — reset drops it and starts fresh. Subagents are ACP sessions via acp-agents (6 concurrent per " +
-      "workspace); console output is captured and previewed. On last-client disconnect the workspace drains " +
-      "in-flight subagent turns to completion (each settlement boundary snapshots) and closes idle children; " +
-      "followUp re-attaches the subagent session lazily on the next connect.",
-    replToolInputShape,
+    {
+      description:
+        "One persistent QuickJS-in-WASM VM per projectDir, addressed by the same project model as the workflow tool. " +
+        "State (bindings, pending subagent calls, checkpoints) lives in the VM between calls and survives MCP-session " +
+        "churn and daemon restarts: every eval and every settlement drain that changed state persists the workspace " +
+        "to the daemon's per-project repl store, and the first touch of a stored workspace restores it and reconciles " +
+        "every outstanding call (settle from the store / re-attach via ACP session/load / re-issue). A stored snapshot " +
+        "that refuses (corrupt, a format upgrade, or a wasm-binary mismatch) is surfaced loudly and never silently " +
+        "discarded — reset drops it and starts fresh. Subagents are ACP sessions via acp-agents (6 concurrent per " +
+        "workspace); console output is captured and previewed. On last-client disconnect the workspace drains " +
+        "in-flight subagent turns to completion (each settlement boundary snapshots) and closes idle children; " +
+        "followUp re-attaches the subagent session lazily on the next connect. Every result carries the machine- " +
+        "readable shape (see the output schema) as structuredContent alongside the bounded text.",
+      inputSchema: replToolInputShape,
+      outputSchema: replToolOutputShape,
+    },
     async (rawArgs) => {
       if (!options.acceptingWork()) {
         throw new McpError(
@@ -348,7 +693,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       if (action === "status") {
         if (projectDir === undefined) {
           const contexts = projects.stores();
-          return { content: [{ type: "text", text: capToolResultText(renderStatus(contexts)) }] };
+          return {
+            structuredContent: structuredStatus(contexts),
+            content: [{ type: "text", text: capToolResultText(renderStatus(contexts)) }],
+          };
         }
         // A NAMED status is a first touch exactly like the other stateful
         // actions (phase-D review round 5: it used to return before
@@ -361,6 +709,11 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const context = resolveContext(options, projectDir);
         if (context === undefined) {
           return {
+            structuredContent: {
+              action: "status",
+              projectDir: projectDir as string,
+              error: `No project context is available for projectDir "${String(projectDir)}".`,
+            },
             content: [
               {
                 type: "text",
@@ -376,11 +729,19 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         if (state.restoreError === null) {
           await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
         }
-        return { content: [{ type: "text", text: capToolResultText(renderStatus([context])) }] };
+        return {
+          structuredContent: structuredStatus([context], context.projectDir),
+          content: [{ type: "text", text: capToolResultText(renderStatus([context])) }],
+        };
       }
       const context = resolveContext(options, projectDir);
       if (context === undefined) {
         return {
+          structuredContent: {
+            action,
+            projectDir: projectDir as string,
+            error: `No project context is available for projectDir "${String(projectDir)}".`,
+          },
           content: [{ type: "text", text: capToolResultText(`No project context is available for projectDir "${String(projectDir)}".`) }],
           isError: true,
         };
@@ -396,6 +757,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       if (action === "reset") {
         await resetReplProjectState(state);
         return {
+          structuredContent: { action: "reset", projectDir: context.projectDir, dropped: true },
           content: [
             {
               type: "text",
@@ -407,10 +769,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         };
       }
 
-      if (state.restoreError !== null) return refusedResult(state);
+      if (state.restoreError !== null) return refusedResult(state, action);
 
       await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
-      if (state.restoreError !== null) return refusedResult(state);
+      if (state.restoreError !== null) return refusedResult(state, action);
 
       const broker = state.broker!;
       if (action === "eval") {
@@ -422,7 +784,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const line = drainErrorLine(state);
         const rendered = renderEvalResult(result);
         const text = line !== null ? `${line}\n${rendered}` : rendered;
-        return { content: [{ type: "text", text: capToolResultText(text) }] };
+        return {
+          structuredContent: structuredEvalWait("eval", context.projectDir, result),
+          content: [{ type: "text", text: capToolResultText(text) }],
+        };
       }
       if (action === "wait") {
         const timeoutMs = replToolInputShape.timeoutMs.parse(args.timeoutMs ?? 30_000) ?? 30_000;
@@ -436,6 +801,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const body = drained ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)`;
         const waitText = line !== null ? `${line}\n${body}` : body;
         return {
+          structuredContent: structuredEvalWait("wait", context.projectDir, result, drained),
           content: [{ type: "text", text: capToolResultText(waitText) }],
         };
       }
@@ -467,18 +833,30 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const targeted = await broker.armEvalBreak();
         if (!targeted) {
           return {
+            structuredContent: {
+              action: "interrupt",
+              projectDir: context.projectDir,
+              interrupt: { outcome: "refused-idle" },
+            },
             content: [
               {
                 type: "text",
                 text: capToolResultText(
-                  `workspace ${context.projectDir}: no running eval to interrupt — the workspace is idle ` +
-                    `(no eval is in flight) and nothing was armed`,
+                  `workspace ${context.projectDir}: no running eval to interrupt — no eval is in flight, or the ` +
+                    `in-flight eval's continuation is not attributable to any pending call it owns (it awaits only ` +
+                    `earlier bindings or a never-settling promise, so no execution can ever be keyed to it); ` +
+                    `nothing was armed`,
                 ),
               },
             ],
           };
         }
         return {
+          structuredContent: {
+            action: "interrupt",
+            projectDir: context.projectDir,
+            interrupt: { outcome: "targeted" },
+          },
           content: [
             {
               type: "text",
@@ -501,7 +879,14 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
             : outcome === "failed"
               ? `interrupt ${id}: could not reach the backend session (lazy re-attach failed)`
               : `interrupt ${id}: no live session to cancel`;
-      return { content: [{ type: "text", text: capToolResultText(text) }] };
+      return {
+        structuredContent: {
+          action: "interrupt",
+          projectDir: context.projectDir,
+          interrupt: { outcome, callId: id },
+        },
+        content: [{ type: "text", text: capToolResultText(text) }],
+      };
     },
   );
 }

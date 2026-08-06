@@ -50,7 +50,7 @@ export type {
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
-export { replToolInputShape } from "./repl-tool.js";
+export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
 export type { ReplToolOptions } from "./repl-tool.js";
 export {
   createReplProjectState,

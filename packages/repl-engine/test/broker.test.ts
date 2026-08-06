@@ -1419,3 +1419,16 @@ test('review 10: dispose releases every session the broker opened, even with a h
   assert.equal(runner.disposeCalls, 0, 'the injected runner itself is the host\'s to dispose');
   await ws.dispose();
 });
+
+test('review round 3: the eval result\'s pending list reports the WHOLE guest registry — 300 parked checkpoints list all 300 ids, dense and in order (phase-E review round 3: the trap-free surface read capped arrays at 256 elements and its [ArrayTruncated] marker leaked into the id list as an undefined hole — the structured tool output\'s pending field silently truncated)', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('for (let i = 0; i < 300; i++) checkpoint("q-" + i); "asked"');
+  assert.equal(r.pending.length, 300, 'every pending call id is listed');
+  assert.equal(r.pending[0], 'c1');
+  assert.equal(r.pending[255], 'c256');
+  assert.equal(r.pending[256], 'c257', 'no cap truncation at the 256th entry');
+  assert.equal(r.pending[299], 'c300');
+  assert.ok(r.pending.every((id, index) => id === `c${index + 1}`), 'dense, in registry order, no holes');
+  assert.equal(r.pending.length, r.checkpoints.length);
+  await ws.dispose();
+});

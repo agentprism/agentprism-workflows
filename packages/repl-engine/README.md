@@ -599,6 +599,12 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   stays complete. Re-issues respect the concurrency cap (over-cap re-issues refuse with the
   recoverable `ConcurrencyLimitError`).
 
+Phase E review round 3 decisions (the carried review's three defects):
+
+- **The eval-break signal is keyed to the armed target's CONTINUATION, not to whichever drain runs next.** The carried defect: the drain-phase interrupt handler was installed on every later eval's drain without checking whether that drain resumed an armed target — an unrelated finite eval B (or an unrelated settlement drain) consumed the signal and `noteInterruptedDrain` cleared the target's tracking while its checkpoint stayed pending and uninterruptible. The armed identity is now the union of the armed evals' OWN suspension-time calls (`evalSuspensionCalls`: pending at suspension MINUS pending at eval start — the calls the eval issued itself, the settlements that queue its continuation; a later eval's snapshot never inherits an earlier eval's still-pending calls, so a settlement of an unrelated call can never fire the signal), carried in `evalBreakDeps`. Every VM operation maintains a settlement accumulator (`opSettledCalls` — every settlement route appends: `settleIntoGuest`, `settleCheckpoint`, `refuse`, `settleSteerSync`; the pump/reconcile/disconnect drains seed it with the settlements that triggered them), and the signal fires only while that accumulator intersects the armed deps — the currently-executing drain BELONGS to the armed target. An unrelated drain neither fires nor consumes it; the armed state survives intact. The interrupted-drain release (`noteInterruptedDrain`) is gated the same way: exactly the tracked evals whose own resume keys the interrupted operation settled are released (a deadline-broken resumed runaway releases its tracked eval even when no signal was armed — a stale target would make a later arm target a dead eval); an unrelated interrupted drain leaves the armed state and every tracked eval intact. A no-id interrupt with NOTHING BREAKABLE — no eval in flight, or every in-flight eval suspended on no OWN pending call (a never-settling local promise, or an `await p` on an earlier eval's binding — that call belongs to the EARLIER eval, and breaking an unrelated continuation is exactly the leak the targeting discipline forbids) — REFUSES and arms nothing.
+- **The bounded wait sleeps only for the REMAINING budget**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches.
+- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array cap silently truncated the guest surface's `pending()` list, and its `[ArrayTruncated]` marker mapped to `undefined` in the broker's id lists (a hole in the tool's structured `pending`). `readValue` now takes an explicit array bound (default 256 — the preview read is unchanged); the surface read passes `SURFACE_READ_MAX_LEN` (16 384 — the pending registry is the host's own reconciliation metadata, bounded by VM memory; the bound keeps a pathological registry from making every `pending` read pathological).
+
 Phase B decisions (the guest library, bridge, previewer):
 
 - **`repl.guest` as the surface key** (`Symbol.for("repl.guest")`, marker global
@@ -782,6 +788,21 @@ CONTAINED: the refusal is surfaced loudly in every `repl` result and `reset` cle
 store — the daemon never crash-loops and never silently discards the data. The workspace
 therefore survives daemon restarts: this is the production wiring the phase-D review
 demanded (`ReplWorkspaceStore` used to be exported/tested only).
+
+Every `repl` result also carries the doc's MACHINE-READABLE shape as
+`structuredContent` (phase-E review round 3 — the tool used to flatten
+everything into text): the published `outputSchema` (the workflow tool's
+oneOf-branch pattern) mirrors eval/wait as `{ output, result?, pending,
+checkpoints, completed }` plus the wait-only `drained`/`timedOut` flags,
+status as structured workspaces (state, the reconcile summary, the
+workspace manifest with name/token/size/provenance/task per binding, the
+live agents, the pending ops), interrupt as its honest outcome, reset as
+the dropped acknowledgement, and the error variant for refusals. Guest
+output (the capped console lines, the previewed result) stays in
+separate fields from the trusted orchestration metadata — never one
+flat string — and every structured field is bounded metadata (output
+capped by the broker, checkpoint questions previewed, manifest tokens
+structure-only). The bounded text stays alongside for human reading.
 
 ## Client presence and the drain (phase D, in `mcp-server`)
 

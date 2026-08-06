@@ -331,6 +331,14 @@ test("a corrupted stored snapshot is CONTAINED: loud refusal in the tool result,
     assert.ok(isErrorResult(r), textOf(r));
     assert.ok(textOf(r).includes("REPL workspace refused"), textOf(r));
     assert.ok(textOf(r).includes(snapshotPath), `names the file: ${textOf(r)}`);
+    // The machine-readable error variant rides the error result too
+    // (phase-E review round 3): the structured `error` field names the
+    // refusal and the reset remedy.
+    const sc = (r as { structuredContent?: Record<string, unknown> }).structuredContent;
+    assert.ok(sc !== undefined && typeof sc.error === "string", "the structured error variant");
+    assert.ok(sc!.error!.includes("not restorable"), (sc!.error as string).slice(0, 120));
+    assert.equal(sc!.action, "eval");
+    assert.equal(sc!.projectDir, PROJECT);
     const status = await repl(second, { action: "status", projectDir: PROJECT });
     assert.ok(textOf(status).includes("REFUSED"), textOf(status));
     // The daemon is still fully alive and the refusal is idempotent.

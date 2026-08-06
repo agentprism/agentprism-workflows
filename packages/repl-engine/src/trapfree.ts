@@ -449,11 +449,21 @@ export function readProxyTarget(handle: JSValueHandle): JSValueHandle | undefine
  * object kinds (markers), depth/property caps and a cycle guard so
  * adversarial shapes stay bounded.
  *
+ * `maxLen` bounds the ARRAY read (default 256): the general preview read
+ * (a completion value, a provenance registry) truncates arrays past the
+ * cap with a `'[ArrayTruncated]'` marker. The guest-surface read (the
+ * pending-call registry — the host's OWN reconciliation metadata, not
+ * guest content) passes a far larger bound so `pending` lists the WHOLE
+ * registry (the broker's documented contract) instead of silently
+ * truncating at 256 entries with a marker that maps to `undefined` in
+ * the broker's id lists (phase-E review round 3: the marker leaked into
+ * the tool's structured `pending` array as a hole).
+ *
  * This is the conservative seed of the ObjectPreview rendering the tool
  * result eventually carries (the full CDP-style previewer is
  * `preview.ts`); everything read here is trap-free and bounded.
  */
-export function readValue(handle: JSValueHandle, depth: number, seen: Set<number>): unknown {
+export function readValue(handle: JSValueHandle, depth: number, seen: Set<number>, maxLen = 256): unknown {
   if (handle.isUndefined) return undefined;
   if (handle.isNull) return null;
 
@@ -501,17 +511,17 @@ export function readValue(handle: JSValueHandle, depth: number, seen: Set<number
       const length = lengthHandle === undefined ? 0 : lengthHandle.toNumber();
       lengthHandle?.dispose();
       const out: unknown[] = [];
-      const count = Math.min(length, 256);
+      const count = Math.min(length, maxLen);
       for (let i = 0; i < count; i++) {
         const v = readOwnDataProperty(handle, String(i));
         if (v === undefined) continue; // sparse hole
         try {
-          out.push(readValue(v, depth + 1, seen));
+          out.push(readValue(v, depth + 1, seen, maxLen));
         } finally {
           v.dispose();
         }
       }
-      if (length > 256) out.push('[ArrayTruncated]');
+      if (length > maxLen) out.push('[ArrayTruncated]');
       return out;
     }
 

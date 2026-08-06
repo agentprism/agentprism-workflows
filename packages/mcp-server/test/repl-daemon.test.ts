@@ -45,6 +45,18 @@
  *   very next pump breaks the loop's next iteration MID-RUN via the
  *   quickjs interrupt handler; the signal is consumed by that
  *   execution (a later eval is unaffected).
+ * - the machine-readable output (phase-E review round 3): the tool
+ *   publishes an outputSchema and every result carries the doc's
+ *   shapes as structuredContent — eval/wait `{ output, result?,
+ *   pending, checkpoints, completed }` (plus the wait-only
+ *   drained/timedOut flags), the structured status workspaces surface
+ *   (workspace state, reconcile summary, the workspace manifest, live
+ *   agents, pending ops), the interrupt outcome, the reset
+ *   acknowledgement, and the error variant — guest output and trusted
+ *   orchestration metadata as separate fields, never one flat string;
+ *   and the pending surface reports the WHOLE guest registry (the
+ *   trap-free read cap that used to truncate it at 256 entries leaked
+ *   an undefined hole into the structured array).
  */
 
 import assert from "node:assert/strict";
@@ -64,7 +76,7 @@ import type {
 import { workflowProjectPaths } from "@automatalabs/workflows";
 import { z } from "zod";
 
-import { replToolInputShape } from "../src/index.js";
+import { replToolInputShape, replToolOutputShape } from "../src/index.js";
 import { createDaemon, type DaemonHandle } from "../src/daemon/http-daemon.js";
 import { connectHttp, makeProjectDir } from "./_http-harness.js";
 import { okRunner, textOf } from "./_harness.js";
@@ -232,6 +244,51 @@ test("the repl tool registers alongside workflow with the doc's exact action-enu
   assert.doesNotThrow(() => Schema.parse({ action: "wait", ids: [] }));
   assert.throws(() => Schema.parse({ action: "wait", ids: [7] }));
 
+  // The OUTPUT schema (phase-E review round 3): the published
+  // machine-readable shape parses the doc's eval/wait variant and
+  // refuses a malformed one (the superRefine mirrors the oneOf
+  // branches at runtime — the workflow output shape's pattern).
+  const OutputSchema = replToolOutputShape;
+  assert.doesNotThrow(() =>
+    OutputSchema.parse({
+      action: "eval",
+      projectDir: "/p",
+      output: [],
+      outputTruncated: false,
+      pending: [],
+      checkpoints: [],
+      completed: [],
+    }),
+  );
+  assert.doesNotThrow(() =>
+    OutputSchema.parse({
+      action: "wait",
+      projectDir: "/p",
+      output: [],
+      outputTruncated: false,
+      pending: ["c1"],
+      checkpoints: [],
+      completed: [],
+      drained: false,
+      timedOut: true,
+    }),
+  );
+  assert.doesNotThrow(() =>
+    OutputSchema.parse({ action: "status", projectDir: "/p", workspaces: [] }),
+  );
+  assert.throws(
+    () => OutputSchema.parse({ action: "eval", projectDir: "/p", output: [], pending: [] }),
+    /output does not match a repl result variant/,
+  );
+  assert.throws(
+    () => OutputSchema.parse({ action: "wait", projectDir: "/p", output: [], outputTruncated: false, pending: [], checkpoints: [], completed: [] }),
+    /output does not match a repl result variant/,
+  );
+  assert.throws(
+    () => OutputSchema.parse({ action: "reset", projectDir: "/p" }),
+    /output does not match a repl result variant/,
+  );
+
   // The WIRE schema of the real daemon advertises exactly that shape,
   // alongside the workflow tool.
   const daemon = await startReplDaemon(new FakeRunner());
@@ -253,6 +310,24 @@ test("the repl tool registers alongside workflow with the doc's exact action-enu
       const action = schema.properties.action as { enum?: string[] };
       assert.deepEqual(action.enum, ["eval", "wait", "status", "interrupt", "reset"]);
       assert.deepEqual(schema.required, ["action"], "action is the only required field");
+      // The OUTPUT schema is advertised on the wire too (phase-E review
+      // round 3: the tool used to register with no outputSchema at all):
+      // the doc's eval/wait fields plus the structured status, interrupt
+      // and reset surfaces, as six oneOf variants.
+      const wireOutput = wire.outputSchema as { properties?: Record<string, unknown>; oneOf?: Array<{ title?: string; required?: string[] }> };
+      assert.ok(wireOutput, "the output schema is published on the wire");
+      for (const field of ["action", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "workspaces", "interrupt", "dropped", "error"]) {
+        assert.ok(field in (wireOutput.properties ?? {}), `output schema field ${field}`);
+      }
+      assert.equal(wireOutput.oneOf?.length, 6, "the six output variants are published");
+      const evalBranch = wireOutput.oneOf?.find((b) => b.title === "eval");
+      assert.ok(
+        evalBranch?.required?.includes("output") &&
+          evalBranch.required.includes("pending") &&
+          evalBranch.required.includes("checkpoints") &&
+          evalBranch.required.includes("completed"),
+        "the eval branch requires the doc's shape",
+      );
     } finally {
       await session.dispose();
     }
@@ -714,6 +789,125 @@ test("workflow calls register project presence: a workflow-only client B keeps t
   }
 });
 
+test("every repl action returns the doc's machine-readable shape as structuredContent alongside the bounded text — eval/wait { output, result?, pending, checkpoints, completed } with the wait-only drained/timedOut flags, the structured status workspaces surface (state, reconcile, manifest, live agents, pending ops), the interrupt outcome, and the reset acknowledgement (phase-E review round 3: the text-only result mixed guest output and orchestration metadata into one flat string)", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const PROJECT = makeProjectDir("repl-structured");
+      // eval: the doc's shape, guest output and trusted orchestration
+      // metadata as separate fields.
+      const evaled = await repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: 'const research = agent("pi/x", "investigate"); globalThis.answer = 42; console.log("hello"); answer',
+      });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      const sc = (evaled as { structuredContent?: Record<string, unknown> }).structuredContent;
+      assert.ok(sc !== undefined, "structured content present");
+      assert.equal(sc.action, "eval");
+      assert.equal(sc.projectDir, PROJECT);
+      assert.equal((sc.output as string[]).length, 1);
+      assert.ok((sc.output as string[])[0].includes('"hello"'), `output line: ${(sc.output as string[])[0]}`);
+      assert.equal(sc.outputTruncated, false);
+      assert.equal(sc.result, "42");
+      assert.deepEqual(sc.pending, ["c1"]);
+      assert.deepEqual(sc.checkpoints, []);
+      assert.deepEqual(sc.completed, []);
+      assert.equal((sc as Record<string, unknown>).drained, undefined, "no wait-only flags on eval");
+      assert.ok(textOf(evaled).includes("result: 42"), "the bounded text stays alongside");
+
+      // status: the structured workspaces surface — state, the manifest
+      // (bindings with size and provenance, never value content), the
+      // live agents, the pending ops.
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!isErrorResult(status), textOf(status));
+      const scStatus = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal(scStatus.action, "status");
+      assert.equal(scStatus.projectDir, PROJECT);
+      const workspaces = scStatus.workspaces as Array<Record<string, unknown>>;
+      assert.equal(workspaces.length, 1);
+      const w = workspaces[0];
+      assert.equal(w.projectDir, PROJECT);
+      assert.equal(w.state, "fresh");
+      const bindings = w.bindings as Array<Record<string, unknown>>;
+      assert.ok(bindings.some((b) => b.name === "answer" && b.sizeBytes === 8), "manifest binding with its byte size");
+      assert.ok(bindings.some((b) => b.name === "research" && (b.token as string).includes("agent handle")), "the agent handle binding");
+      assert.ok(bindings.some((b) => b.name === "research" && (b.task as string) === "investigate"), "the task provenance");
+      assert.ok((w.liveAgents as Array<Record<string, unknown>>).some((a) => a.callId === "c1" && a.state === "running"), "the live agent with its state");
+      assert.deepEqual(w.pending, ["c1"]);
+      assert.deepEqual(w.checkpoints, []);
+      assert.equal(w.childrenClosed, false);
+      assert.equal(w.drainError, undefined);
+
+      // wait: the SAME eval/wait shape plus drained/timedOut (the doc's
+      // "still running on timeout" as a machine-readable flag), with the
+      // mid-wait settlement absorbed.
+      await tick();
+      const waiting = repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
+      await tick();
+      runner.last().completeTurn("waited result");
+      const waited = await waiting;
+      assert.ok(!isErrorResult(waited), textOf(waited));
+      const scWaited = (waited as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal(scWaited.action, "wait");
+      assert.equal(scWaited.drained, true);
+      assert.equal(scWaited.timedOut, false);
+      assert.deepEqual(scWaited.completed, ["c1"]);
+      assert.deepEqual(scWaited.pending, []);
+      assert.ok(textOf(waited).includes("completed: c1"), textOf(waited));
+      // The settled agent's RESULT text is worker content — it must not
+      // leak into the status manifest (metadata, never content).
+      const statusAfter = await repl(session, { action: "status", projectDir: PROJECT });
+      const scAfter = (statusAfter as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.ok(!JSON.stringify(scAfter).includes("waited result"), "worker content never enters the manifest");
+
+      // A timed-out wait reports drained: false / timedOut: true.
+      await repl(session, { action: "eval", projectDir: PROJECT, code: 'const q2 = agent("pi/x", "task2"); "started2"' });
+      const timedOut = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c2"], timeoutMs: 100 });
+      const scTimedOut = (timedOut as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal(scTimedOut.drained, false);
+      assert.equal(scTimedOut.timedOut, true);
+      assert.ok(textOf(timedOut).includes("still running"), textOf(timedOut));
+
+      // interrupt with an id: the honest outcome + the call id.
+      const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c2" });
+      assert.ok(!isErrorResult(interrupted), textOf(interrupted));
+      const scInterrupt = (interrupted as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.deepEqual(scInterrupt.interrupt, { outcome: "cancelled", callId: "c2" });
+      assert.ok(textOf(interrupted).includes("session/cancel sent"), textOf(interrupted));
+      // interrupt without an id on an idle workspace: the honest refusal.
+      const refused = await repl(session, { action: "interrupt", projectDir: PROJECT });
+      const scRefused = (refused as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.deepEqual(scRefused.interrupt, { outcome: "refused-idle" });
+      assert.ok(textOf(refused).includes("no running eval to interrupt"), textOf(refused));
+      // interrupt without an id on a RUNNING eval: outcome "targeted".
+      await repl(session, { action: "eval", projectDir: PROJECT, code: 'const q3 = agent("pi/x", "task3"); await q3; while (true) {}' });
+      const targeted = await repl(session, { action: "interrupt", projectDir: PROJECT });
+      const scTargeted = (targeted as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.deepEqual(scTargeted.interrupt, { outcome: "targeted" });
+      assert.ok(textOf(targeted).includes("interrupting the running eval"), textOf(targeted));
+      // The targeted runaway is broken at its next execution, then the
+      // reset acknowledgement.
+      await tick();
+      runner.last().completeTurn("resumed");
+      const broken = await repl(session, { action: "eval", projectDir: PROJECT, code: '"after"' });
+      assert.ok(textOf(broken).includes("interrupted"), `the armed target was broken: ${textOf(broken)}`);
+      const reset = await repl(session, { action: "reset", projectDir: PROJECT });
+      const scReset = (reset as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal(scReset.action, "reset");
+      assert.equal(scReset.projectDir, PROJECT);
+      assert.equal(scReset.dropped, true);
+      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("eval-through-MCP round trip applies the output caps to the FINAL result (256 lines / 10 KB, whichever trips first, marker included) and the $N refs reach the truncated values", async () => {
   const daemon = await startReplDaemon(new FakeRunner());
   try {
@@ -788,6 +982,17 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
       assert.ok(metaText.includes("pending:"), "the pending section is kept (head)");
       assert.ok(metaText.includes("checkpoint"), "the checkpoint section is kept (head)");
       assert.ok(!metaText.includes("completed:"), "the tail section is dropped");
+      // The STRUCTURED surface is complete even though the text is
+      // capped: the doc's pending contract is the WHOLE guest registry
+      // (phase-E review round 3: the trap-free surface read used to
+      // truncate at 256 entries and leak an undefined hole into the
+      // structured array).
+      const scMeta = (meta as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const scPending = scMeta.pending as string[];
+      assert.equal(scPending.length, 300, "the structured pending lists the whole registry");
+      assert.equal(scPending[256], "c257", "no cap truncation at the 256th entry");
+      assert.ok(scPending.every((id, index) => id === `c${index + 1}`), "dense and in order — no holes");
+      assert.equal((scMeta.checkpoints as unknown[]).length, 300, "the structured checkpoints are complete");
     } finally {
       await session.dispose();
     }

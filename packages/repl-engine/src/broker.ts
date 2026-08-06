@@ -895,6 +895,7 @@ export class Broker {
   /** Call ids settled synchronously at dispatch (refusals) since the
    *  last eval result — reported in that eval's `completed`. */
   private readonly syncSettled: string[] = [];
+
   /** Completion wrappers of SUSPENDED evals whose continuation is still
    *  in flight (see `eval`): the wrapper settles when the continuation
    *  completes or is broken — the broker's "an eval is running" probe.
@@ -922,6 +923,55 @@ export class Broker {
    *  a signal whose target no longer exists must never leak into a
    *  later execution. */
   private evalBreakTargets = new Set<JSValueHandle>();
+  /** The armed target's DEPENDENCY CALL IDS — the union of each armed
+   *  eval's OWN suspension-time calls (see `evalSuspensionCalls`: the
+   *  calls the eval issued itself, the settlements that queue its
+   *  continuation). A suspended eval's continuation is resumed EXACTLY
+   *  by the settlement of one of its own calls, so
+   *  this set is the armed-target identity the eval-break signal is
+   *  keyed to: a drain fires the signal only when the calls settled
+   *  within it intersect this set (phase-E review rejection: the signal
+   *  used to fire on WHICHEVER drain ran next, so an unrelated finite
+   *  eval's own drain — or an unrelated settlement drain — consumed it
+   *  and broke the wrong execution; the armed state must survive an
+   *  unrelated drain intact). */
+  private evalBreakDeps = new Set<string>();
+  /** Per tracked suspended eval, the call ids IT owns — the pending
+   *  calls added to the guest registry while that eval ran (its
+   *  suspension-time pending set MINUS the calls already pending when
+   *  the eval started, i.e. the calls it issued itself). These are the
+   *  eval's continuation resume keys: its continuation is queued
+   *  EXACTLY by the settlement of a call it awaits, and a fresh eval
+   *  can only await calls it issued itself (an `await p` on a binding
+   *  from an earlier eval awaits a call the EARLIER eval owns —
+   *  attributed to that eval, never to this one; phase-E review round
+   *  3: the naive suspension-time snapshot inherited earlier evals'
+   *  still-pending calls, so an unrelated settlement of one fired the
+   *  armed signal against the wrong eval — the exact leak the
+   *  targeting discipline forbids). Recorded at suspension time, NOT at
+   *  arming time: the interrupted-drain release decision (which tracked
+   *  eval's continuation was actually broken) is made from this
+   *  attribution even when no signal is armed (a per-eval-deadline
+   *  break of a resumed runaway continuation must still release the
+   *  tracked eval). An eval suspended with no own calls (it awaits only
+   *  earlier bindings, or a never-settling local promise) has no
+   *  attributable execution: the no-id interrupt refuses rather than
+   *  risk breaking an unrelated continuation. */
+  private readonly evalSuspensionCalls = new Map<JSValueHandle, Set<string>>();
+  /** The guest registry's pending call ids at the CURRENT eval's start
+   *  (after its settlement pump, before its code phase): the
+   *  suspension-time own-call attribution's baseline (see
+   *  `evalSuspensionCalls`). */
+  private evalStartPending = new Set<string>();
+  /** The call ids settled into the guest while the CURRENT VM operation
+   *  (an eval or a settlement drain) is active — the drain-context
+   *  accumulator. Reset at the start of each operation; every
+   *  settlement route (`settleIntoGuest`, `settleCheckpoint`, `refuse`,
+   *  `settleSteerSync`) appends. The eval-break signal fires only while
+   *  this set intersects the armed target's dependency calls (the
+   *  currently-executing drain belongs to the armed target), and the
+   *  interrupted-drain release decision reads it after a drain throws. */
+  private readonly opSettledCalls: string[] = [];
   /** True once the client-presence drain released every child (see
    *  `drainForDisconnect`): the workspace stays live, and later
    *  followUp/steer/cancel on a settled handle lazily re-attach the
@@ -1059,8 +1109,16 @@ export class Broker {
         // `noteInterruptedDrain` (phase-E review rejection round 2: the
         // old signal was consulted only by settlement drains, and
         // without this release a broken target stayed tracked forever,
-        // making a later eval-break arm target a dead eval).
-        this.noteInterruptedDrain();
+        // making a later eval-break arm target a dead eval). The
+        // release is SCOPED (phase-E review round 3): only an
+        // interrupted drain that ran a TRACKED eval's continuation
+        // (this op settled one of its suspension-time resume keys —
+        // `checkpoint.answer` in this eval resumed it) releases the
+        // tracked evals; an unrelated interrupted drain — THIS eval's
+        // own completion jobs bounded by the per-eval deadline, with
+        // no tracked continuation running — leaves the eval-break
+        // armed state and every tracked eval intact.
+        if (this.opResumedTrackedEval()) this.noteInterruptedDrain(this.opSettledCalls);
       }
       // The eval's own provenance pass: bindings this eval created or
       // rebound (including the `$N` refs its console.logs froze) are
@@ -1072,9 +1130,18 @@ export class Broker {
       // is in flight and settles when the continuation completes or is
       // broken — `sweepActiveEvals` releases it at the next operation.
       // A RESOLVED eval's completion handle is owned by `render` (it
-      // previews and disposes it); an error outcome carries none.
+      // previews and disposes it); an error outcome carries none. The
+      // eval's OWN suspension-time calls are recorded alongside — the
+      // calls added to the registry while this eval ran (pending at
+      // suspension minus the pre-eval baseline): the eval-break
+      // signal's armed-target identity (see `evalBreakDeps`).
       if (outcome.kind === 'pending' && completion !== undefined) {
         this.activeEvalCompletions.add(completion as JSValueHandle);
+        const ownCalls = new Set<string>();
+        for (const id of this.pendingIds()) {
+          if (!this.evalStartPending.has(id)) ownCalls.add(id);
+        }
+        this.evalSuspensionCalls.set(completion as JSValueHandle, ownCalls);
       }
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
@@ -1146,6 +1213,10 @@ export class Broker {
         reQueuedUndelivered: [],
       };
       let changedVm = false;
+      // The VM-changing settlement ids — the reconciliation drain's
+      // context (see `drain`): the calls whose settlement resumed
+      // snapshot-carried continuations.
+      const changedIds: string[] = [];
       for (const entry of surface.pending()) {
         const record = this.callStore.lookup(entry.id);
         const completion = record?.completion;
@@ -1154,6 +1225,7 @@ export class Broker {
           if (settled) {
             report.settledFromStore.push(entry.id);
             changedVm = true;
+            changedIds.push(entry.id);
           }
           continue;
         }
@@ -1171,7 +1243,10 @@ export class Broker {
           // the injection. The honest `failed`, durably recorded and
           // surfaced guest-visibly. (Queued-but-undelivered steers are
           // handled by the queue rebuild below, NOT here.)
-          if (this.settleSteerLost(entry)) changedVm = true;
+          if (this.settleSteerLost(entry)) {
+            changedVm = true;
+            changedIds.push(entry.id);
+          }
           report.failedLost.push(entry.id);
           continue;
         }
@@ -1181,7 +1256,10 @@ export class Broker {
           // mutates the VM and must participate in the changed-VM drain
           // and its settlement snapshot — review regression: refusals
           // used to settle the guest without the boundary).
-          if (await this.reconcileAgentCall(entry, record, report)) changedVm = true;
+          if (await this.reconcileAgentCall(entry, record, report)) {
+            changedVm = true;
+            changedIds.push(entry.id);
+          }
           continue;
         }
         // An unrecognized kind (a foreign snapshot from a library version
@@ -1196,6 +1274,7 @@ export class Broker {
           )
         ) {
           changedVm = true;
+          changedIds.push(entry.id);
         }
         report.failedLost.push(entry.id);
       }
@@ -1208,20 +1287,19 @@ export class Broker {
         // the operation-end flush must have a dirty boundary to persist
         // them (review regression: an interrupted drain used to skip the
         // boundary, so the operation-end flush had nothing to write and
-        // a kill lost the settlements). The DrainJobError still
+        // a kill lost the settlements). The drain's context is the
+        // reconcile's VM-changing settlement ids: a drain that resumes
+        // the armed target's continuation is exactly one triggered by
+        // those settlements (phase-E review round 3), and the drain
+        // itself performs the interrupted-drain release when it ran a
+        // tracked eval's continuation. The DrainJobError still
         // propagates — the caller reports it like the pump does.
         let drainError: DrainJobError | undefined;
         try {
-          this.drain();
+          this.drain(undefined, new Set(changedIds));
         } catch (error) {
           if (error instanceof DrainJobError) {
             drainError = error;
-            // The interrupted drain BROKE a suspended eval's continuation
-            // (see `noteInterruptedDrain`): the tracked running eval is
-            // no longer running — its engine wrapper never settles on an
-            // interrupt, so the tracking must be dropped here or a later
-            // eval-break arm would target a dead eval.
-            this.noteInterruptedDrain();
           } else throw error;
         }
         // The reconciliation's provenance pass: bindings the reconciled
@@ -2044,8 +2122,13 @@ export class Broker {
   /** Settle a checkpoint's answer: through its live `GuestCall` when it
    *  has one, through the reconciliation surface when it re-surfaced
    *  from a restore (`call` is null). The answering eval's own drain
-   *  fires the continuation either way. */
+   *  fires the continuation either way. The settlement appends to the
+   *  operation's settlement accumulator (the drain-context seam — a
+   *  continuation resumed by a synchronous answer executes inside the
+   *  answering eval's own drain, which must recognize itself as the
+   *  armed target's drain). */
   private settleCheckpoint(callId: string, call: GuestCall | null, outcome: 'resolve' | 'reject', value: unknown): void {
+    this.opSettledCalls.push(callId);
     if (call !== null) {
       if (outcome === 'resolve') call.resolve(value);
       else call.reject(value);
@@ -2170,6 +2253,10 @@ export class Broker {
    * is armed (phase-E review rejection: the old project-wide boolean
    * was armed regardless, so an idle workspace's next eval — or an
    * unrelated drain — consumed it before the intended continuation).
+   * Also refuses when every in-flight eval is suspended on NO pending
+   * host call (a never-settling local promise — no execution can ever
+   * resume it, so there is nothing breakable): the guidance's refusal
+   * rule, nothing is armed (phase-E review round 3).
    *
    * When an eval IS in flight (a suspended eval whose continuation will
    * run at a later execution — a settlement drain, or a direct eval's
@@ -2188,6 +2275,16 @@ export class Broker {
    * signal is cleared with them — it never leaks into a later
    * execution.
    *
+   * The signal is keyed to the armed target's CONTINUATION, not to
+   * whichever drain runs next (phase-E review round 3): the armed
+   * identity is the union of the targets' OWN suspension-time calls
+   * (`evalBreakDeps` — the resume keys whose settlement queues the
+   * target's continuation). A drain fires the signal only while the
+   * calls settled within it intersect that identity — an UNRELATED
+   * drain (a later finite eval's own drain, a settlement of a call the
+   * target is not waiting on) neither fires it nor consumes it: the
+   * armed state survives unrelated drains intact.
+   *
    * With MULTIPLE concurrently suspended evals (each suspension retains
    * its own completion), the first continuation execution after arming
    * is broken — honest ambiguity, the same stance as the provenance
@@ -2199,8 +2296,20 @@ export class Broker {
       this.assertAlive();
       this.sweepActiveEvals();
       if (this.activeEvalCompletions.size === 0) return false;
+      const deps = new Set<string>();
+      for (const completion of this.activeEvalCompletions) {
+        const calls = this.evalSuspensionCalls.get(completion);
+        if (calls !== undefined) {
+          for (const id of calls) deps.add(id);
+        }
+      }
+      // Nothing breakable: no armed eval awaits any pending host call,
+      // so no execution can ever resume a tracked continuation — arming
+      // would be dead weight that lingers until reset. Refuse.
+      if (deps.size === 0) return false;
       this.evalBreakArmed = true;
       this.evalBreakTargets = new Set(this.activeEvalCompletions);
+      this.evalBreakDeps = deps;
       return true;
     });
   }
@@ -2238,42 +2347,98 @@ export class Broker {
       if (!anyLive) {
         this.evalBreakArmed = false;
         this.evalBreakTargets = new Set();
+        this.evalBreakDeps = new Set();
       }
     }
     for (const completion of settled) {
       this.activeEvalCompletions.delete(completion);
+      this.evalSuspensionCalls.delete(completion);
       completion.dispose();
     }
   }
 
   /**
    * A guest execution that resumes a suspended eval's continuation was
-   * INTERRUPTED (the eval-break signal's
-   * consumption, or the per-eval deadline bounding a runaway
-   * continuation): the execution broke a suspended eval's continuation, and
-   * the interrupted continuation's engine wrapper NEVER settles (the
-   * quickjs interrupt aborts the async job without rejecting its
-   * promise — verified against the shipped binary), so the tracked
-   * "running eval" can only be released HERE. The callers are the
-   * pump path's drain-failure arm AND the direct-eval path (an eval's
-   * own drain interrupted — `runEval` reports `interruptedInDrain`;
-   * phase-E review rejection round 2). Every tracked eval is
-   * dropped and the eval-break signal is cleared: the interrupted
-   * drain's target — the arming-time active eval — is no longer
-   * running, and a stale entry would make a later eval-break arm
-   * target a dead eval (its signal would then fire at an unrelated
-   * continuation — the phase-E review rejection's leak). With multiple
-   * concurrently suspended evals, all are dropped — honest ambiguity
-   * (the broker cannot attribute which continuation the interrupted
-   * drain was running; refusing a later arm beats breaking the wrong
-   * eval). The released handles are disposed here (between
-   * operations — the drain's exception already unwound).
+   * INTERRUPTED (the eval-break signal's consumption, or the per-eval
+   * deadline bounding a runaway continuation): the execution broke a
+   * suspended eval's continuation, and the interrupted continuation's
+   * engine wrapper NEVER settles (the quickjs interrupt aborts the
+   * async job without rejecting its promise — verified against the
+   * shipped binary), so the tracked "running eval" can only be
+   * released HERE. The callers are the pump path's drain-failure arm
+   * AND the direct-eval path (an eval's own drain interrupted —
+   * `runEval` reports `interruptedInDrain`; phase-E review rejection
+   * round 2).
+   *
+   * The release is SCOPED to the interrupted drain's context (phase-E
+   * review round 3 — the carried review's defect): `context` is the
+   * set of call ids settled by the interrupted operation, and exactly
+   * the tracked evals whose OWN suspension-time resume keys intersect
+   * it are dropped — the evals whose continuation the interrupted
+   * drain could have been running (each call is owned by exactly the
+   * eval that issued it, so the attribution is precise: the drain
+   * settled those evals' calls, and only those evals' continuations
+   * could have been queued by the settlements).
+   *
+   * An interrupted drain that settled NO tracked eval's resume key —
+   * an unrelated drain (a later finite eval's own drain bounded by the
+   * deadline, a settlement of a call no tracked eval awaits) — must
+   * NOT release anything and must leave the eval-break armed state
+   * intact: the target's continuation was never running, so it is
+   * still breakable at its next execution (the carried review's
+   * defect: the old unconditional release cleared the armed signal
+   * while the target's checkpoint stayed pending and uninterruptible).
+   * The eval-break signal, the armed targets, and the released
+   * handles' suspension-call records are cleared together; the handles
+   * are disposed here (between operations — the drain's exception
+   * already unwound).
    */
-  private noteInterruptedDrain(): void {
+  private noteInterruptedDrain(context: Iterable<string>): void {
+    const contextSet = new Set(context);
     this.evalBreakArmed = false;
     this.evalBreakTargets = new Set();
-    for (const completion of this.activeEvalCompletions) completion.dispose();
-    this.activeEvalCompletions.clear();
+    this.evalBreakDeps = new Set();
+    for (const completion of [...this.activeEvalCompletions]) {
+      const calls = this.evalSuspensionCalls.get(completion);
+      if (calls === undefined) continue;
+      let intersects = false;
+      for (const id of contextSet) {
+        if (calls.has(id)) {
+          intersects = true;
+          break;
+        }
+      }
+      if (intersects) {
+        this.activeEvalCompletions.delete(completion);
+        this.evalSuspensionCalls.delete(completion);
+        completion.dispose();
+      }
+    }
+  }
+
+  /** Did the CURRENTLY-EXECUTING (or just-interrupted) VM operation run
+   *  a TRACKED suspended eval's continuation? True when a call settled
+   *  within the operation intersects a tracked eval's suspension-time
+   *  resume keys — the operation's drain could only have queued that
+   *  eval's continuation by settling one of its pending calls. This is
+   *  the eval-break signal's firing gate (an unrelated drain must
+   *  neither fire nor consume it) and the interrupted-drain release
+   *  gate (an unrelated interrupted drain must leave the armed state
+   *  and every tracked eval intact). Independent of the armed FLAG on
+   *  purpose: the signal's handler consumes the flag when it fires,
+   *  but the release decision made after the drain throws must still
+   *  recognize the drain as the target's, and a deadline break of a
+   *  resumed runaway continuation must release the tracked eval even
+   *  when no signal is armed (a stale target would make a later arm
+   *  target a dead eval). */
+  private opResumedTrackedEval(): boolean {
+    if (this.opSettledCalls.length === 0) return false;
+    for (const calls of this.evalSuspensionCalls.values()) {
+      for (const id of this.opSettledCalls) {
+        if (calls.has(id)) return true;
+      }
+    }
+    return false;
   }
 
   /** The eval-break signal's interrupt handler: consulted by the
@@ -2288,14 +2453,26 @@ export class Broker {
    *  signal nor be broken by it — the phase-E review rejection).
    *  Consumed on first observation: the quickjs interrupt polls it
    *  constantly, so the first continuation execution after arming
-   *  breaks mid-run. Returns `undefined` while nothing is armed (the
-   *  composition drops it). */
+   *  breaks mid-run. The signal fires ONLY while the currently-
+   *  executing drain BELONGS TO THE ARMED TARGET — the operation
+   *  settled one of the armed target's resume keys (phase-E review
+   *  round 3, the carried review's defect): an unrelated drain — a
+   *  later finite eval's own drain, a settlement of a call the target
+   *  is not waiting on — neither fires nor consumes it, and the armed
+   *  state stays intact for the target's next execution. Returns
+   *  `undefined` while nothing is armed (the composition drops it). */
   private evalBreakHandler(): (() => boolean) | undefined {
     if (!this.evalBreakArmed) return undefined;
     return () => {
       if (!this.evalBreakArmed) return false;
-      this.evalBreakArmed = false;
-      return true;
+      if (this.opSettledCalls.length === 0) return false;
+      for (const id of this.opSettledCalls) {
+        if (this.evalBreakDeps.has(id)) {
+          this.evalBreakArmed = false;
+          return true;
+        }
+      }
+      return false;
     };
   }
 
@@ -2419,8 +2596,17 @@ export class Broker {
         return [...targets].every((id) => !pending.has(id));
       });
       if (drained) break;
-      if (Date.now() >= deadline) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Sleep only for the REMAINING wait budget — never a fixed 50 ms
+      // past the deadline (phase-E review round 3's carried defect: the
+      // unconditional sleep made every bounded wait take ~51 ms, so a
+      // 5/10/20/30 ms timeout all reported ~51 ms, violating
+      // `timeoutMs`'s bounded-wait contract). The next pump still runs
+      // when the deadline is already passed (the deadline check above
+      // handles the terminal state; the pump itself is bounded by the
+      // remaining budget through `pumpUnlocked(deadline)`).
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
     }
     if (!drained) {
       // The deadline tripped between the last pump and the timeout
@@ -2839,13 +3025,16 @@ export class Broker {
           }
           if (settledIds.length > 0) {
             try {
-              this.drain(deadline);
+              // The drain's context is the forced-stop settlement ids
+              // (see `drain`); the interrupted-drain release — when the
+              // drain ran a tracked eval's continuation — happens
+              // inside `drain` itself.
+              this.drain(deadline, new Set(settledIds));
             } catch (drainError) {
               if (drainError instanceof DrainJobError) {
                 // The forced-stop settlements resumed a continuation that
-                // the disconnect bound interrupted — the tracked running
-                // eval is no longer running (see `noteInterruptedDrain`).
-                this.noteInterruptedDrain();
+                // the disconnect bound interrupted; the failure is
+                // surfaced loudly.
                 this.warnLine(
                   'warn',
                   `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`,
@@ -3045,7 +3234,9 @@ export class Broker {
       // VM is disposed by the caller).
       for (const completion of this.activeEvalCompletions) completion.dispose();
       this.activeEvalCompletions.clear();
+      this.evalSuspensionCalls.clear();
       this.evalBreakTargets = new Set();
+      this.evalBreakDeps = new Set();
       this.evalBreakArmed = false;
       if (this.ownsRunner) {
         // The owned runner's disposal races the remaining bound too
@@ -3377,6 +3568,10 @@ export class Broker {
     this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
     call.reject(value);
     this.syncSettled.push(callId);
+    // The settlement is part of the current operation's drain context
+    // too (a refusal inside a resumed continuation settles a call whose
+    // own continuation may execute in the same drain).
+    this.opSettledCalls.push(callId);
   }
 
   /** A synchronous steering settlement (no session, idle cancel, queued
@@ -3386,6 +3581,9 @@ export class Broker {
     this.recordCompletion(callId, { outcome: 'resolve', value: outcome, completedAtMs: now() });
     call.resolve(outcome);
     this.syncSettled.push(callId);
+    // The settlement is part of the current operation's drain context
+    // too (see `refuse`).
+    this.opSettledCalls.push(callId);
   }
 
   /** Track an in-flight host task with the poll-shaped readiness flag. */
@@ -3876,16 +4074,18 @@ export class Broker {
         // interrupted continuation used to erase every id the pump had
         // settled).
         try {
-          this.drain(boundDeadlineMs);
+          // The drain's context is the delivered call: a settlement
+          // drain that resumes the armed target's continuation is
+          // exactly one triggered by a call the target awaits (phase-E
+          // review round 3 — the signal is keyed to the target's resume
+          // keys, never to whichever drain runs next). The drain itself
+          // performs the interrupted-drain release when it ran a
+          // tracked eval's continuation.
+          this.drain(boundDeadlineMs, new Set([entry.callId]));
           this.provenancePass('settlement', [entry.callId]);
           this.sink?.boundary('settlement');
         } catch (error) {
           if (error instanceof DrainJobError) {
-            // The interrupted drain BROKE a suspended eval's continuation
-            // (the eval-break signal's target, or a runaway bounded by the
-            // per-eval deadline): the tracked running eval is no longer
-            // running — see `noteInterruptedDrain`.
-            this.noteInterruptedDrain();
             // The delivery happened; the continuation drain failed. The
             // settled call ids must NOT be lost with the error (review
             // regression: an interrupted continuation used to erase
@@ -3963,10 +4163,14 @@ export class Broker {
    *  (the restored-broker route). Both converge on the guest's
    *  idempotent first-wins settle. Returns whether the guest entry was
    *  newly settled (a no-op replay of an already-settled id reports
-   *  false — the changed-VM bookkeeping's source of truth). */
+   *  false — the changed-VM bookkeeping's source of truth). Every
+   *  settlement appends to the operation's settlement accumulator
+   *  (`opSettledCalls` — the drain-context seam the eval-break signal
+   *  and the interrupted-drain release read). */
   private settleIntoGuest(callId: string, outcome: 'resolve' | 'reject', value: unknown): boolean {
     const call = this.deferreds.get(callId);
     this.deferreds.delete(callId);
+    this.opSettledCalls.push(callId);
     if (call !== undefined) {
       if (outcome === 'resolve') call.resolve(value);
       else call.reject(value);
@@ -3988,22 +4192,56 @@ export class Broker {
    *  (`boundDeadlineMs` — phase-D review round 6: the outer drain bound
    *  is absolute, so a settlement that resumed a runaway continuation
    *  near the disconnect deadline can never exceed the session-eviction
-   *  TTL). */
-  private drain(boundDeadlineMs?: number): void {
+   *  TTL).
+   *
+   * `settledCalls` is the drain's CONTEXT — the call ids whose
+   *  settlements triggered it (the pump passes the delivered call id,
+   *  the reconcile the ids its settlements changed the VM with). It
+   *  seeds the operation's settlement accumulator (`opSettledCalls`),
+   *  which the eval-break signal's handler consults at poll time: the
+   *  signal fires only while the current drain belongs to the armed
+   *  target — its context intersects the target's resume keys (phase-E
+   *  review round 3: the carried defect's drainInterruptHandler used to
+   *  fire on every later drain regardless of which continuation it was
+   *  actually executing). A drain interrupted while running a TRACKED
+   *  eval's continuation releases exactly the intersecting tracked
+   *  evals here (the `noteInterruptedDrain` gate); an unrelated
+   *  interrupted drain releases nothing and leaves the eval-break armed
+   *  state intact. */
+  private drain(boundDeadlineMs?: number, settledCalls?: ReadonlySet<string>): void {
     const boundHandler =
       boundDeadlineMs === undefined ? undefined : () => Date.now() >= boundDeadlineMs;
-    this.workspace.drainJobs({
-      // The eval-break signal rides ONLY the settlement drains (see
-      // `evalBreakHandler`): a fresh eval's own code and its own job
-      // drain never consult it (phase-E review rejection — the armed
-      // signal used to be the broker's DEFAULT eval handler, so an
-      // unrelated eval consumed it before the intended continuation).
-      interruptHandler: this.composedInterrupt(
-        this.interruptHandler,
-        this.evalBreakHandler(),
-        boundHandler,
-      ),
-    });
+    // The drain-context accumulator: reset per operation and seeded with
+    // the settlements that triggered this drain; continuations that
+    // settle further calls while the drain runs append to it.
+    this.opSettledCalls.length = 0;
+    if (settledCalls !== undefined) this.opSettledCalls.push(...settledCalls);
+    try {
+      this.workspace.drainJobs({
+        // The eval-break signal rides ONLY the settlement drains (see
+        // `evalBreakHandler`): a fresh eval's own code and its own job
+        // drain never consult it (phase-E review rejection — the armed
+        // signal used to be the broker's DEFAULT eval handler, so an
+        // unrelated eval consumed it before the intended continuation).
+        interruptHandler: this.composedInterrupt(
+          this.interruptHandler,
+          this.evalBreakHandler(),
+          boundHandler,
+        ),
+      });
+    } catch (error) {
+      if (error instanceof DrainJobError && this.opResumedTrackedEval()) {
+        // The interrupted drain RAN a tracked suspended eval's
+        // continuation (its resume key settled in this operation): the
+        // continuation is broken and its wrapper never settles —
+        // release the intersecting tracked evals NOW (see
+        // `noteInterruptedDrain`). An unrelated interrupted drain
+        // releases nothing: the armed state and the tracked evals stay
+        // intact (phase-E review round 3's carried defect).
+        this.noteInterruptedDrain(this.opSettledCalls);
+      }
+      throw error;
+    }
   }
 
   /** The per-eval wall-clock deadline interrupt (the harness's eval
@@ -4047,6 +4285,17 @@ export class Broker {
    *  through the quickjs interrupt handler, even when an explicit signal
    *  handler is armed and unset). */
   private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
+    // The operation's settlement accumulator starts empty: settlements
+    // during the eval's code phase (dispatch-time refusals, sync steer
+    // settlements, checkpoint answers) append to it, and the eval's own
+    // drain — where a synchronously-resumed continuation executes —
+    // consults it via the drain-phase eval-break handler (the drain
+    // belongs to the armed target iff the eval settled one of its
+    // resume keys). The own-call attribution baseline is captured the
+    // same moment: the registry's pending set after the eval's
+    // settlement pump, before its code phase adds its own calls.
+    this.opSettledCalls.length = 0;
+    this.evalStartPending = new Set(this.pendingIds());
     return this.workspace.evalWithCompletion(code, {
       ...options,
       // The per-eval handler overrides the broker-level default (the
@@ -4138,8 +4387,11 @@ export class Broker {
     return this.workspace.surface()?.pending().map((entry) => entry.id) ?? [];
   }
 
-  /** The raised-checkpoint summaries, previewed. */
-  private checkpointSummaries(): CheckpointSummary[] {
+  /** The raised-checkpoint summaries, previewed — the `status` seam's
+   *  checkpoint surface (the same bounded form the eval/wait result's
+   *  `checkpoints` field carries: questions previewed through the
+   *  top-level string rule, never unbounded guest text). */
+  checkpointSummaries(): CheckpointSummary[] {
     return [...this.checkpoints.values()].map((c) => ({
       id: c.callId,
       question: stringDescription(c.question),
