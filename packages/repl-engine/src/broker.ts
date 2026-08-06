@@ -904,6 +904,14 @@ export class Broker {
    *  steers are dropped with the durable `dropped` marker — the child
    *  never runs after the drain. */
   private readonly stoppedOpens = new Set<string>();
+  /** The disposal/drain GENERATION (phase-D review round 5): bumped when
+   *  the client-presence drain's bound expires and when the broker is
+   *  disposed. In-flight `openSession` calls and lazy re-attaches capture
+   *  the generation when they START; when they land after a bump, the
+   *  child session is released immediately — it never registers and
+   *  never prompts (a child must never open or run after the last
+   *  client disconnected, nor after a reset/dispose). */
+  private generation = 0;
   private disposed = false;
   private opChain: Promise<unknown> = Promise.resolve();
 
@@ -979,10 +987,10 @@ export class Broker {
       let pumpDrainErrorLine: string | undefined;
       const pumped = await this.pumpUnlocked();
       completed = pumped.settled;
-      // The state-changing boundary of the pump's settlement drain (the
-      // sink's burst bookkeeping: the flush at the operation's end
-      // coalesces this with the eval's own boundary into one write).
-      if (pumped.settled.length > 0) this.sink?.boundary('settlement');
+      // The pump's per-call settlement boundaries already fired inside
+      // `pumpUnlocked` (one per settled call's continuation drain); the
+      // sink's burst bookkeeping coalesces them with the eval's own
+      // boundary into one write at the operation's flush.
       if (pumped.drainError !== undefined) {
         // The pump's drain ran PREVIOUS evals' continuations and one
         // failed. The current eval did not fail; the background
@@ -1024,10 +1032,8 @@ export class Broker {
   async pump(): Promise<string[]> {
     return this.serialized(async () => {
       const { settled, drainError } = await this.pumpUnlocked();
-      // The settlement drain ran and changed VM state: the doc's
-      // state-changing boundary (a pump that settled nothing drained
-      // nothing and fires nothing).
-      if (settled.length > 0) this.sink?.boundary('settlement');
+      // The per-call settlement boundaries fired inside `pumpUnlocked`
+      // (one per settled call's continuation drain).
       if (drainError !== undefined) throw drainError;
       return settled;
     });
@@ -1583,6 +1589,12 @@ export class Broker {
   private lazyReattach(sessionId: string): Promise<SessionEntry | undefined> {
     const existing = this.pendingReattaches.get(sessionId);
     if (existing !== undefined) return existing;
+    // A lazy re-attach warms a child again: the drain latch is stale the
+    // moment the load starts (phase-D review round 5: the latch used to
+    // stay set until the load RESOLVED, so a disconnect while the load
+    // was parked skipped the drain and the re-attached child could run
+    // after the last client disconnected).
+    this.drained = false;
     const promise = this.doLazyReattach(sessionId).finally(() => {
       if (this.pendingReattaches.get(sessionId) === promise) this.pendingReattaches.delete(sessionId);
     });
@@ -1595,6 +1607,14 @@ export class Broker {
     if (record === undefined || record.kind !== 'agent' || record.completion === null || record.sessionId === null) {
       return undefined;
     }
+    // The drain/disposal generation captured at START: when the load
+    // lands after the drain's bound expired (or after a dispose/reset),
+    // the loaded child is released immediately — it must never register
+    // or prompt (phase-D review round 5: the drain cleared
+    // `pendingReattaches` but the in-flight load resolved afterward and
+    // registered a warm child that could run after the last client
+    // disconnected).
+    const generation = this.generation;
     let parsed: ParsedAgentOptions;
     try {
       parsed = this.parseAgentOptions(record.optionsJson);
@@ -1628,6 +1648,20 @@ export class Broker {
         keepSession: true,
         retainSessionLog: true,
       });
+      if (this.disposed || this.generation !== generation) {
+        // The drain's bound expired (or the broker was disposed) while
+        // the load was in flight: the child is closed immediately — it
+        // never registers and never prompts (nothing runs after the last
+        // client disconnected / after disposal). The caller settles the
+        // honest `failed` outcome.
+        this.warnLine(
+          'info',
+          `call ${sessionId}: lazy re-attach of backend session ${record.sessionId} landed after the ` +
+            `client-presence drain (or disposal) — the child was closed without registering`, // eslint-disable-line max-len
+        );
+        await Promise.resolve(session.release()).catch(() => undefined);
+        return undefined;
+      }
       const entry: SessionEntry = {
         session,
         callId: sessionId,
@@ -1864,22 +1898,53 @@ export class Broker {
    * `failed` | `none` (no session to act on).
    */
   async cancelCall(callId: string): Promise<'cancelled' | 'idle' | 'failed' | 'none'> {
-    return this.serialized(async () => {
+    // Phase 1 — the DECISION under the serialized chain (no runner wire
+    // calls): the live entry, the lazy re-attach path, or nothing to
+    // act on. The wire work then runs OUTSIDE the chain (phase-D review
+    // round 5: the lazy `loadSession` used to run inside it, so a hung
+    // backend load held the operation chain — `drainForDisconnect`
+    // queues behind the chain and its deadline only starts when it
+    // enters, making the documented outer drain bound ineffective).
+    const decision = await this.serialized(async () => {
       this.assertAlive();
       const entry = this.sessions.get(callId);
       if (entry !== undefined) {
-        if (!entry.busy) return 'idle';
-        await this.cancelSession(entry);
-        return 'cancelled';
+        if (!entry.busy) return { kind: 'idle' as const };
+        return { kind: 'cancel-live' as const, entry };
       }
       // No live entry: a drained broker (or a handle whose session never
       // opened). A settled call with a recorded backend session is
       // re-attached lazily; anything else has nothing to cancel.
-      if (!this.canLazyReattach(callId)) return 'none';
-      const loaded = await this.lazyReattach(callId);
-      if (loaded === undefined) return 'failed';
-      if (!loaded.busy) return 'idle';
-      await this.cancelSession(loaded);
+      if (!this.canLazyReattach(callId)) return { kind: 'none' as const };
+      return { kind: 'lazy' as const };
+    });
+    if (decision.kind === 'none' || decision.kind === 'idle') return decision.kind;
+    // Phase 2 — the wire phase (outside the chain): the lazy re-attach
+    // (the doc: followUp/steer/cancel re-attach the subagent session
+    // lazily via the capability matrix) and the ACP session/cancel. A
+    // released/dead session makes the adapter's cancel the idempotent
+    // no-op, so racing a concurrent drain is harmless.
+    const entry =
+      decision.kind === 'cancel-live' ? decision.entry : await this.lazyReattach(callId);
+    if (entry === undefined) return 'failed';
+    await this.cancelSession(entry);
+    // Phase 3 — CONSUME under the chain: the call may have settled (or
+    // the session been released) while the wire cancel was in flight. A
+    // turn that settled is a settled turn: the cancel-no-op must not
+    // report `cancelled`, and the cancellation marker set by phase 2 is
+    // rolled back on an idle entry — marking an idle session cancelled
+    // would drop its queued steers. (The rollback window is one chain
+    // hop; the marker is only read by settlement/delivery bookkeeping,
+    // never by the guest.)
+    return this.serialized(async () => {
+      this.assertAlive();
+      const current = this.sessions.get(callId);
+      if (current !== entry) return 'idle';
+      if (!current.busy) {
+        current.callCancelled = false;
+        return 'idle';
+      }
+      current.callCancelled = true;
       return 'cancelled';
     });
   }
@@ -1968,7 +2033,8 @@ export class Broker {
       for (;;) {
         const { settled } = await this.pumpUnlocked();
         if (settled.length > 0) {
-          this.sink?.boundary('settlement');
+          // The per-call settlement boundaries fired inside
+          // `pumpUnlocked` (one per settled call's continuation drain).
           completed.push(...settled);
         }
         const pending = new Set(this.pendingIds());
@@ -2061,7 +2127,10 @@ export class Broker {
         if (this.busySessionCount() === 0 && outstandingOpens === 0) break;
         if (Date.now() >= deadline) break;
         const { settled } = await this.pumpUnlocked();
-        if (settled.length > 0) this.sink?.boundary('settlement');
+        // The pump's per-call settlement boundaries already fired inside
+        // `pumpUnlocked` (one per settled call's continuation drain —
+        // the daemon's snapshot sink persists each drain boundary, so a
+        // kill mid-drain loses nothing).
         if (this.busySessionCount() > 0 || this.openingCalls.size > 0 || this.pendingReattaches.size > 0) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
@@ -2076,6 +2145,13 @@ export class Broker {
         // the cancellations into the VM (each settlement boundary
         // snapshots). Every await below races the remaining bound — a
         // hung cancel/release can never block past the eviction TTL.
+        // The GENERATION bump fences every in-flight open and lazy
+        // re-attach that started before this moment: when it lands, the
+        // child is released immediately (never registers, never prompts
+        // — phase-D review round 5: the drain used to clear
+        // `pendingReattaches` without fencing the unresolved load, so a
+        // late landing ran a child after the disconnect).
+        this.generation++;
         for (const callId of [...this.openingCalls]) this.stoppedOpens.add(callId);
         const cancels: Promise<unknown>[] = [];
         for (const entry of this.sessions.values()) {
@@ -2084,8 +2160,10 @@ export class Broker {
           }
         }
         await boundedAll(cancels, deadline);
-        const { settled } = await this.pumpUnlocked();
-        if (settled.length > 0) this.sink?.boundary('settlement');
+        // One final pump settles the cancellations into the VM; its
+        // per-call settlement boundaries already fired inside
+        // `pumpUnlocked` (one per settled call's continuation drain).
+        await this.pumpUnlocked();
       }
       // Release phase: every session's child closes (keepSession keeps
       // the backend session re-openable). Queued-but-undelivered steers
@@ -2201,6 +2279,14 @@ export class Broker {
     if (this.disposed) return;
     this.disposed = true;
     this.draining = true;
+    // The disposal GENERATION bump fences every in-flight open and lazy
+    // re-attach started before disposal: when it lands, the child is
+    // released immediately — it never registers and never prompts after
+    // disposal/reset (phase-D review round 5: `openingCalls`,
+    // `stoppedOpens` and `pendingReattaches` used to be cleared without
+    // fencing their unresolved promises, so a late landing could
+    // re-register or run a child on a disposed broker).
+    this.generation++;
     await this.serialized(async () => {
       const cancels: Promise<unknown>[] = [];
       const sessions = [...this.sessions.values()];
@@ -2266,6 +2352,13 @@ export class Broker {
     // in flight; draining past it would let the child open and run after
     // the last client disconnected).
     this.openingCalls.add(callId);
+    // A fresh dispatch makes the workspace warmable again: the drain
+    // latch is STALE the moment a child may open (phase-D review round
+    // 5: it used to stay set until the open RESOLVED, so a second
+    // disconnect while the open was still parked skipped the drain
+    // entirely and the child could prompt after the last client
+    // disconnected). The latch re-sets when the drain runs.
+    this.drained = false;
     const taskPromise = this.runAgentTask(callId, modelSpec, task, parsed);
     this.trackInFlight(callId, 'agent', taskPromise);
   }
@@ -2583,6 +2676,14 @@ export class Broker {
     backendIdOverride: string | null = null,
   ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     let openedSession: BrokerSession | undefined;
+    // The drain/disposal generation captured at START: an `openSession`
+    // that lands after the drain's bound expired (or after a
+    // dispose/reset) is STOPPED exactly like a drain-stopped open — the
+    // child is released immediately and never prompts (phase-D review
+    // round 5: the disposal cleared `openingCalls`/`stoppedOpens`
+    // without fencing the unresolved open, so a late landing could
+    // re-register and prompt after disposal/reset).
+    const generation = this.generation;
     try {
       const session = await this.runner.openSession({
         // The routing pin: a re-issue of a call that once had a backend
@@ -2608,13 +2709,15 @@ export class Broker {
         retainSessionLog: true,
       });
       openedSession = session;
-      if (this.stoppedOpens.has(callId)) {
-        // The client-presence drain's bound expired while this open was in
-        // flight: the call is STOPPED — the child is closed immediately
-        // (it never prompts — nothing runs after the last client
-        // disconnected), queued steers are dropped durably, and the call
-        // settles as the recoverable AGENT_CANCELLED. The stopped marker
-        // is consumed here so a later reconcile re-issues normally.
+      if (this.stoppedOpens.has(callId) || this.disposed || this.generation !== generation) {
+        // The client-presence drain's bound expired (or the broker was
+        // disposed/reset) while this open was in flight: the call is
+        // STOPPED — the child is closed immediately (it never prompts —
+        // nothing runs after the last client disconnected, and nothing
+        // runs after disposal), queued steers are dropped durably, and
+        // the call settles as the recoverable AGENT_CANCELLED. The
+        // stopped marker is consumed here so a later reconcile re-issues
+        // normally.
         this.stoppedOpens.delete(callId);
         this.openingCalls.delete(callId);
         this.dropPendingSteers(
@@ -3005,27 +3108,42 @@ export class Broker {
         this.inFlight.delete(entry.callId);
         if (entry.kind === 'agent') this.onCallSettled(entry.callId);
         settled.push(entry.callId);
+        // ONE drain + ONE provenance pass PER SETTLED CALL (phase-D
+        // review round 5: the pump used to deliver every simultaneously
+        // ready call and then run one drain + one provenance pass
+        // labelled with all their ids — two independent continuations
+        // producing separate bindings were both attributed to both
+        // workers/tasks, violating the doc's per-value producer/task
+        // provenance). Each call's continuation drain is attributed to
+        // THAT call alone (`worker c1`, not `worker c1+c2`), and each
+        // drain that changed VM state fires the state-changing boundary
+        // (the sink's burst debounce coalesces the batch into one write
+        // at the operation's flush). A drain failure stops the pump with
+        // the already-settled ids still reported (review regression: an
+        // interrupted continuation used to erase every id the pump had
+        // settled).
+        try {
+          this.drain();
+          this.provenancePass('settlement', [entry.callId]);
+          this.sink?.boundary('settlement');
+        } catch (error) {
+          if (error instanceof DrainJobError) {
+            // The delivery happened; the continuation drain failed. The
+            // settled call ids must NOT be lost with the error (review
+            // regression: an interrupted continuation used to erase
+            // every id the pump had settled) — the caller reports them
+            // alongside the drain-failure line. The state-changing
+            // boundary still fires: the settlement landed (the VM
+            // changed) and the operation-end flush must have a dirty
+            // boundary to persist it.
+            this.sink?.boundary('settlement');
+            return { settled, drainError: error };
+          }
+          throw error;
+        }
       }
     }
-    if (settled.length === 0) return { settled };
-    try {
-      this.drain();
-      // The settlement's provenance pass: bindings the settled calls'
-      // continuations created are attributed to `worker cN` (the call ids
-      // this drain settled).
-      this.provenancePass('settlement', settled);
-      return { settled };
-    } catch (error) {
-      if (error instanceof DrainJobError) {
-        // The deliveries happened; the continuation drain failed. The
-        // settled call ids must NOT be lost with the error (review
-        // regression: an interrupted continuation used to erase every
-        // id the pump had settled) — the caller reports them alongside
-        // the drain-failure line.
-        return { settled, drainError: error };
-      }
-      throw error;
-    }
+    return { settled };
   }
 
   /** An agent call's settlement transition: the session is idle (its

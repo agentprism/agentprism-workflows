@@ -7,9 +7,10 @@ import {type CodexAuthRequest, getCodexAuthMethods, isCodexAuthRequest} from "./
 import {CodexAcpClient, type SessionMetadata, type SessionMetadataWithThread} from "./CodexAcpClient";
 import type {McpStartupResult} from "./CodexAppServerClient";
 import {ACPSessionConnection, type AcpClientConnection, type UpdateSessionEvent} from "./ACPSessionConnection";
-import type {InputModality, ReasoningEffort} from "./app-server";
+import type {InputModality, ReasoningEffort, ServerNotification} from "./app-server";
 import type {
     Account,
+    AgentMessageDeltaNotification,
     Model,
     ReasoningEffortOption,
     Thread,
@@ -148,6 +149,15 @@ export interface SessionState {
      *  turn ended, and for sessions that did not come from
      *  `session/load`. */
     loadedActiveTurnId: string | null;
+    /** True when the `running` classification came from the loaded thread's
+     *  RUNTIME status alone (`status.type === "active"` with a last turn
+     *  that reads `completed`/`interrupted` — phase-D review round 5): the
+     *  active turn's id is NOT in the loaded (stale) turns list, so its
+     *  completion is recognized by ANY `turn/completed` on the session
+     *  (only one turn runs per session at a time), never by id. False
+     *  when the loaded last turn itself was `inProgress` (its id IS the
+     *  active turn's id — the watch matches it exactly). */
+    loadedActiveTurnIsAny: boolean;
     /** The loaded thread's LAST turn status (`session/load` only): the
      *  `_session/loaded_turn/query` answer's authoritative source when
      *  NO turn is running in-process and the thread is idle (a
@@ -225,6 +235,22 @@ export class CodexAcpServer {
     private readonly closingSessions: Map<string, number>;
     private readonly sessionGenerations: Map<string, number>;
     private readonly sessionOpenGenerations: Map<string, number>;
+    /** The load-window notification buffer (phase-D review round 5):
+     *  `session/load`'s subscription becomes live at `thread/resume`, but
+     *  the load-time watcher installs only after the load/auth/state work
+     *  completes — a `turn/completed` (or a live `item/agentMessage/delta`)
+     *  arriving in that window would be DROPPED by the app-server client's
+     *  per-session handler dispatch, leaving a `running` query permanently
+     *  un-terminated. The buffering handler (installed before any load
+     *  work) records the window's events here, and `loadSession` replays
+     *  them through the watcher after the thread history streams. */
+    private readonly pendingLoadNotifications = new Map<string, ServerNotification[]>();
+    /** The per-session serialization chain for the load-time watcher's
+     *  forwarded `item/agentMessage/delta` updates: the running turn's
+     *  live text must reach the ACP client in wire order (each update is
+     *  a separate `session/update` notification, and a concurrent send
+     *  could scramble the accumulated text). */
+    private readonly loadedTurnUpdateChains = new Map<string, Promise<void>>();
 
     constructor(
         connection: AcpClientConnection,
@@ -530,6 +556,7 @@ export class CodexAcpServer {
             sessionTitle: null,
             sessionTitleSource: "sessionId" in request ? "unknown" : "unset",
             loadedActiveTurnId: null,
+            loadedActiveTurnIsAny: false,
             loadedLastTurnStatus: null,
             loadedTurnReportedRunning: false,
             loadedTurnEndedBeforeWatch: null,
@@ -597,6 +624,15 @@ export class CodexAcpServer {
         } = await this.getOrCreateSessionWithHistory(params);
 
         await this.streamThreadHistory(sessionId, thread);
+        // The load-window buffer replay AFTER the thread history streams:
+        // a `turn/completed` (or a live delta) that arrived between
+        // `thread/resume` and the watcher's installation is processed
+        // now — recorded for the next `running` query (or forwarded onto
+        // the client's transcript in the right place relative to the
+        // replay), never dropped (phase-D review round 5: a completion
+        // discarded in that window left the loaded call permanently
+        // classified as running).
+        this.flushPendingLoadNotifications(sessionId);
 
         logger.log("Session loaded", {
             sessionId: sessionId,
@@ -673,6 +709,8 @@ export class CodexAcpServer {
                 this.pendingTurnStarts.delete(params.sessionId);
                 this.activePrompts.delete(params.sessionId);
                 this.steeringQueues.delete(params.sessionId);
+                this.pendingLoadNotifications.delete(params.sessionId);
+                this.loadedTurnUpdateChains.delete(params.sessionId);
             }
             this.endSessionCloseFence(params.sessionId);
         }
@@ -1193,7 +1231,7 @@ export class CodexAcpServer {
         if (!sessionState) {
             throw RequestError.invalidParams(undefined, `Unknown session: ${params.sessionId}`);
         }
-        if (sessionState.currentTurnId !== null || sessionState.loadedActiveTurnId !== null) {
+        if (sessionState.currentTurnId !== null || sessionState.loadedActiveTurnId !== null || sessionState.loadedActiveTurnIsAny) {
             sessionState.loadedTurnReportedRunning = true;
             // The loaded active turn ALREADY completed before this query
             // (the load-time watcher recorded its `turn/completed`): the
@@ -1204,6 +1242,7 @@ export class CodexAcpServer {
             if (recorded !== null) {
                 sessionState.loadedTurnEndedBeforeWatch = null;
                 sessionState.loadedActiveTurnId = null;
+                sessionState.loadedActiveTurnIsAny = false;
                 // The helper owns the armed flag: it clears it when it
                 // pushes (the caller must NOT pre-clear — the push's gate
                 // reads it).
@@ -1220,35 +1259,100 @@ export class CodexAcpServer {
      *  authoritative load-time active-turn detection's subscription side):
      *  installed when `session/load` finds the loaded thread's founding
      *  turn may still be running at the backend. This persistent
-     *  per-session listener watches that turn's `turn/completed` terminal
-     *  marker: armed by a query answering `running`, it pushes the
-     *  `_session/loaded_turn/ended` notification; an unarmed arrival is
-     *  recorded on the session state (first-wins) so a LATER query
-     *  settling `running` pushes the ended notification immediately. The
-     *  listener is replaced by a prompt's own session-event subscription
-     *  when a turn runs in-process — that handler pushes the same ended
-     *  notification through `pushLoadedTurnEnded` (see
+     *  per-session listener:
+     *
+     *  - forwards the loaded active turn's LIVE `item/agentMessage/delta`
+     *    output to the ACP client as `agent_message_chunk` session
+     *    updates — exactly like the prompt handler forwards a running
+     *    turn's deltas — so the client's transcript accumulates the
+     *    turn's REAL post-load text and the seam settles with that
+     *    accumulated text at the ended notification, never the
+     *    replay-time partial (phase-D review round 5: the watcher used to
+     *    drop every delta, and the client durably settled a partial
+     *    answer when additional chunks arrived after load). The updates
+     *    are serialized per session (wire order); a failing update is
+     *    best-effort and never breaks the watch.
+     *  - watches the loaded active turn's `turn/completed` terminal
+     *    marker: armed by a query answering `running`, it pushes the
+     *    `_session/loaded_turn/ended` notification; an unarmed arrival is
+     *    recorded on the session state (first-wins) so a LATER query
+     *    settling `running` pushes the ended notification immediately.
+     *    The match is by id ONLY when the loaded last turn itself was
+     *    `inProgress` (its id IS the active turn's id); a thread whose
+     *    runtime status is `active` with an ended last turn has an active
+     *    turn whose id is NOT in the loaded turns list, so ANY completion
+     *    settles it (phase-D review round 5: the watcher used to record
+     *    the already-completed last turn's id and ignore the actual
+     *    active turn's differently identified completion, so the running
+     *    answer never terminated).
+     *
+     *  The listener is replaced by a prompt's own session-event
+     *  subscription when a turn runs in-process — that handler pushes the
+     *  same ended notification through `pushLoadedTurnEnded` (see
      *  `CodexEventHandler`), so the terminal marker is never unobserved. */
-    private watchLoadedTurn(sessionState: SessionState, loadedActiveTurnId: string): void {
+    private watchLoadedTurn(sessionState: SessionState, loadedActiveTurnId: string | null, loadedActiveTurnIsAny: boolean): void {
         this.codexAcpClient.onSessionNotification(sessionState.sessionId, (event) => {
-            if (event.method !== "turn/completed") return;
-            if (event.params.turn.id !== loadedActiveTurnId) return;
-            // The loaded active turn ended: its terminal status becomes
-            // the loaded thread's authoritative last-turn status (a later
-            // query classifies consistently).
-            sessionState.loadedLastTurnStatus = event.params.turn.status;
-            if (sessionState.loadedTurnReportedRunning) {
-                sessionState.loadedActiveTurnId = null;
-                // The helper owns the armed flag: it clears it when it
-                // pushes (the caller must NOT pre-clear — the push's gate
-                // reads it).
-                pushLoadedTurnEnded(this.connection, sessionState, event.params.turn);
-            } else {
-                // Record the terminal marker (first-wins): a later query
-                // answering `running` settles the ended push immediately.
-                sessionState.loadedTurnEndedBeforeWatch = event.params;
-            }
+            this.handleLoadedTurnNotification(sessionState, event);
         });
+    }
+
+    /** The load-time watcher's per-event processing (shared by the live
+     *  subscription and the load-window buffer replay — see
+     *  `pendingLoadNotifications`). */
+    private handleLoadedTurnNotification(sessionState: SessionState, event: ServerNotification): void {
+        if (event.method === "item/agentMessage/delta") {
+            this.forwardLoadedTurnDelta(sessionState, event.params);
+            return;
+        }
+        if (event.method !== "turn/completed") return;
+        if (!sessionState.loadedActiveTurnIsAny && event.params.turn.id !== sessionState.loadedActiveTurnId) return;
+        // The loaded active turn ended: its terminal status becomes
+        // the loaded thread's authoritative last-turn status (a later
+        // query classifies consistently).
+        sessionState.loadedLastTurnStatus = event.params.turn.status;
+        if (sessionState.loadedTurnReportedRunning) {
+            sessionState.loadedActiveTurnId = null;
+            sessionState.loadedActiveTurnIsAny = false;
+            // The helper owns the armed flag: it clears it when it
+            // pushes (the caller must NOT pre-clear — the push's gate
+            // reads it).
+            pushLoadedTurnEnded(this.connection, sessionState, event.params.turn);
+        } else {
+            // Record the terminal marker (first-wins): a later query
+            // answering `running` settles the ended push immediately.
+            sessionState.loadedTurnEndedBeforeWatch = event.params;
+        }
+    }
+
+    /** Forward one loaded active turn's live text delta to the ACP client
+     *  (see `watchLoadedTurn`). The update is serialized per session so
+     *  the client's accumulated transcript always reflects wire order;
+     *  best-effort — a failing update must never break the watch. */
+    private forwardLoadedTurnDelta(sessionState: SessionState, params: AgentMessageDeltaNotification): void {
+        const chain = this.loadedTurnUpdateChains.get(sessionState.sessionId) ?? Promise.resolve();
+        const next = chain.then(() =>
+            new ACPSessionConnection(this.connection, sessionState.sessionId).update(
+                createAgentTextMessageChunk(params.delta, params.itemId),
+            ),
+        );
+        this.loadedTurnUpdateChains.set(sessionState.sessionId, next.catch(() => undefined));
+    }
+
+    /** Replay the load-window buffer (see `pendingLoadNotifications`)
+     *  through the session's load-time watcher — called AFTER the thread
+     *  history streams, so a buffered live delta accumulates on the
+     *  client's transcript in the right place relative to the replay and
+     *  a buffered `turn/completed` is recorded (first-wins) for the next
+     *  `running` query. */
+    private flushPendingLoadNotifications(sessionId: string): void {
+        const pending = this.pendingLoadNotifications.get(sessionId);
+        this.pendingLoadNotifications.delete(sessionId);
+        if (pending === undefined) return;
+        const sessionState = this.sessions.get(sessionId);
+        if (sessionState === undefined) return;
+        for (const event of pending) {
+            this.handleLoadedTurnNotification(sessionState, event);
+        }
     }
 
     private createSessionConfigOptions(sessionState: SessionState): Array<acp.SessionConfigOption> {
@@ -1389,6 +1493,19 @@ export class CodexAcpServer {
         thread: Thread;
     }> {
         const requestedSessionGeneration = this.beginSessionOpen(request.sessionId);
+        // The load-window notification buffer (phase-D review round 5):
+        // the subscription becomes live at `thread/resume` inside
+        // `loadSession`, but the load-time watcher installs only after
+        // the load/auth/state work below — a `turn/completed` (or a live
+        // delta) arriving in that window must be BUFFERED, never dropped
+        // (a dropped completion would leave a `running` query permanently
+        // un-terminated). The buffering handler is replaced by the
+        // watcher on success (and becomes inert on failure — the buffer
+        // entry is deleted).
+        this.pendingLoadNotifications.set(request.sessionId, []);
+        this.codexAcpClient.onSessionNotification(request.sessionId, (event) => {
+            this.pendingLoadNotifications.get(request.sessionId)?.push(event);
+        });
         await this.checkAuthorization();
         const requestedMcpServers = request.mcpServers ?? [];
         const mcpServerStartupVersion = requestedMcpServers.length > 0
@@ -1405,6 +1522,11 @@ export class CodexAcpServer {
                 })
             );
         } catch (err) {
+            // The load failed: the buffering handler is now inert (the
+            // buffer entry is deleted) so a retry's fresh buffer — and a
+            // later successful load's watcher — are never shadowed by a
+            // stale window.
+            this.pendingLoadNotifications.delete(request.sessionId);
             if (subscribed) {
                 await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
             }
@@ -1417,12 +1539,14 @@ export class CodexAcpServer {
         try {
             authState = await this.getAuthStateForProvider(authProvider);
         } catch (err) {
+            this.pendingLoadNotifications.delete(request.sessionId);
             if (subscribed) {
                 await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
             }
             throw err;
         }
         if (!this.sessionOpenCanInstall(sessionId, requestedSessionGeneration)) {
+            this.pendingLoadNotifications.delete(request.sessionId);
             subscribed = false;
             await this.closeStaleSessionOpen(sessionId, requestedSessionGeneration);
         }
@@ -1444,10 +1568,22 @@ export class CodexAcpServer {
         // Defensive optional reads: a backend (or a test fixture) may
         // return a thread without the runtime status field — the
         // persisted last-turn status alone then drives the detection.
+        const lastTurnInProgress = lastLoadedTurn?.status === "inProgress";
+        const threadRuntimeActive = thread.status?.type === "active";
+        // The loaded active turn's id is authoritative ONLY when the
+        // loaded thread's last turn itself was `inProgress` (its id IS
+        // the active turn's id). A thread whose RUNTIME status is
+        // `active` with an ended last turn is ALSO running (the
+        // app-server's runtime status is the authoritative still-running
+        // signal), but the active turn's id is NOT in the loaded (stale)
+        // turns list — the watcher then matches ANY completion on the
+        // session (phase-D review round 5: recording the already-
+        // completed last turn's id made the watcher ignore the actual
+        // active turn's differently identified completion, so the
+        // `running` answer never terminated).
         const loadedActiveTurnId =
-            thread.status?.type === "active" || lastLoadedTurn?.status === "inProgress"
-                ? lastLoadedTurn?.id ?? null
-                : null;
+            threadRuntimeActive || lastTurnInProgress ? (lastLoadedTurn?.id ?? null) : null;
+        const loadedActiveTurnIsAny = threadRuntimeActive && !lastTurnInProgress;
         const sessionState: SessionState = {
             sessionId: sessionId,
             currentModelId: currentModelId,
@@ -1474,13 +1610,14 @@ export class CodexAcpServer {
             sessionTitle: null,
             sessionTitleSource: "unset",
             loadedActiveTurnId: loadedActiveTurnId,
+            loadedActiveTurnIsAny: loadedActiveTurnIsAny,
             loadedLastTurnStatus: lastLoadedTurn?.status ?? null,
             loadedTurnReportedRunning: false,
             loadedTurnEndedBeforeWatch: null,
         };
         this.sessions.set(sessionId, sessionState);
-        if (loadedActiveTurnId !== null) {
-            this.watchLoadedTurn(sessionState, loadedActiveTurnId);
+        if (loadedActiveTurnId !== null || loadedActiveTurnIsAny) {
+            this.watchLoadedTurn(sessionState, loadedActiveTurnId, loadedActiveTurnIsAny);
         }
         subscribed = false;
 

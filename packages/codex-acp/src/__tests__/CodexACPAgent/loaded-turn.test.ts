@@ -279,4 +279,144 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {sessionId: "nope"}),
         ).rejects.toMatchObject({code: -32602});
     });
+
+    // ── Phase-D review round 5 regressions ───────────────────────────────
+
+    /** The text chunks the ACP client would accumulate into its loaded-turn
+     *  transcript: every `agent_message_chunk` session update on the wire
+     *  (the replay's assistant messages plus the forwarded live deltas). */
+    function accumulatedText(fixture: CodexMockTestFixture): string {
+        return fixture
+            .getAcpConnectionEvents([])
+            .filter((event) => event.method === "sessionUpdate")
+            .map((event) => (event.args[0] as {update: {sessionUpdate?: string; content?: {type?: string; text?: string}}}).update)
+            .filter((update) => update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text")
+            .map((update) => update.content?.text ?? "")
+            .join("");
+    }
+
+    it("THE REVIEW REGRESSION (round 5/1): a loaded running turn's LIVE item/agentMessage/delta output is forwarded to the ACP client as agent_message_chunk updates — the seam's accumulated text is the replay partial PLUS the post-load deltas, never the replay-time partial", async () => {
+        // The loaded thread's agent message is a PARTIAL answer (the
+        // founding turn is still running at the backend).
+        const thread = baseThread("inProgress");
+        thread.turns[0]!.items[1] = {
+            type: "agentMessage",
+            id: "item-agent-1",
+            text: "partial ",
+            phase: null,
+            memoryCitation: null,
+        };
+        const fixture = setupFixture(thread);
+        await load(fixture, "session-1");
+        expect(await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {sessionId: "session-1"})).toEqual({status: "running"});
+
+        // The turn's live output streams at the backend AFTER the load.
+        // The old watcher dropped every notification except
+        // `turn/completed`, so the client settled the terminal
+        // notification with only the replay-time partial text.
+        fixture.sendServerNotification({
+            method: "item/agentMessage/delta",
+            params: {threadId: "session-1", turnId: "turn-1", itemId: "item-agent-1", delta: "result C"},
+        });
+        // The forwarding is async (the per-session update chain): wait for
+        // the delta to reach the recorded ACP connection.
+        await vi.waitFor(() => {
+            expect(accumulatedText(fixture)).toBe("partial result C");
+        });
+        // The turn's terminal marker then settles the wait — the client's
+        // accumulated transcript at that point is the turn's REAL outcome.
+        fixture.sendServerNotification(turnCompletedNotification("completed"));
+        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+        ]);
+        expect(accumulatedText(fixture)).toBe("partial result C");
+    });
+
+    it("THE REVIEW REGRESSION (round 5/2): a turn/completed arriving in the load WINDOW (after the stale threadRead response, before the watcher installs) is buffered and settles the first `running` answer immediately — never discarded, never permanently classified as running", async () => {
+        const fixture = setupFixture(baseThread("inProgress"));
+        // Park the load AFTER threadResume+threadRead have resolved (the
+        // stale thread snapshot) and BEFORE the watcher installs: the
+        // model-fetch gate below. The old code dropped the window's
+        // completion (the per-session handler dispatch found no handler).
+        let releaseModels!: () => void;
+        const parked = new Promise<void>((resolve) => {
+            releaseModels = resolve;
+        });
+        const appServerClient = fixture.getCodexAppServerClient();
+        const originalListModels = appServerClient.listModels;
+        appServerClient.listModels = vi.fn(async (params: Parameters<typeof originalListModels>[0]) => {
+            await parked;
+            return originalListModels(params);
+        });
+        const loadPromise = load(fixture, "session-1");
+        // Wait until the stale threadRead has resolved (the load is now
+        // parked at the model gate — the window is open).
+        await vi.waitFor(() => {
+            expect(appServerClient.threadRead).toHaveBeenCalled();
+        });
+        // The loaded active turn completes IN THE WINDOW.
+        fixture.sendServerNotification(turnCompletedNotification("completed"));
+        releaseModels();
+        await loadPromise;
+        // The buffered completion settles the first `running` answer
+        // immediately (the load-time watcher recorded it, first-wins).
+        const response = await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {
+            sessionId: "session-1",
+        });
+        expect(response).toEqual({status: "running"});
+        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+        ]);
+    });
+
+    it("THE REVIEW REGRESSION (round 5/3): an `active` thread with a completed last turn answers `running`, and the ACTIVE turn's differently identified completion TERMINATES it (the old watcher matched the already-completed last turn's id and never fired — the running answer never ended)", async () => {
+        const fixture = setupFixture(baseThread("completed", {type: "active", activeFlags: []}));
+        await load(fixture, "session-1");
+        const response = await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {
+            sessionId: "session-1",
+        });
+        expect(response).toEqual({status: "running"});
+        // The ACTUAL active turn's id differs from the loaded (stale) last
+        // turn's id — its completion must settle the running answer.
+        fixture.sendServerNotification({
+            method: "turn/completed",
+            params: {
+                threadId: "session-1",
+                turn: {
+                    id: "turn-active-9",
+                    itemsView: "full",
+                    status: "completed",
+                    error: null,
+                    startedAt: null,
+                    completedAt: null,
+                    durationMs: null,
+                    items: [],
+                },
+            },
+        });
+        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([
+            {method: LOADED_TURN_ENDED_METHOD, params: {sessionId: "session-1", stopReason: "end_turn"}},
+        ]);
+        // The detection cleared: a later query classifies from the ended
+        // turn's status, and a second completion pushes nothing.
+        expect(await fixture.getCodexAcpAgent().extMethod(LOADED_TURN_QUERY_METHOD, {sessionId: "session-1"})).toEqual({status: "completed"});
+        fixture.clearAcpConnectionDump();
+        fixture.sendServerNotification({
+            method: "turn/completed",
+            params: {
+                threadId: "session-1",
+                turn: {
+                    id: "turn-another",
+                    itemsView: "full",
+                    status: "completed",
+                    error: null,
+                    startedAt: null,
+                    completedAt: null,
+                    durationMs: null,
+                    items: [],
+                },
+            },
+        });
+        expect(endedNotifications(fixture.getAcpConnectionEvents([]))).toEqual([]);
+    });
 });

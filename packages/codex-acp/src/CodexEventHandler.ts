@@ -133,14 +133,28 @@ export class CodexEventHandler {
      */
     private notifyLoadedTurnEnded(notification: TurnCompletedNotification): void {
         const loadedActiveTurnId = this.sessionState.loadedActiveTurnId;
-        if (loadedActiveTurnId !== null && notification.turn.id !== loadedActiveTurnId) return;
-        if (loadedActiveTurnId !== null) {
+        // The match is by id ONLY when the loaded last turn itself was
+        // `inProgress` (its id IS the active turn's id). A thread whose
+        // runtime status is `active` with an ended last turn has an
+        // active turn whose id is NOT in the loaded turns list — ANY
+        // completion settles it (phase-D review round 5: the id filter
+        // used to ignore the actual active turn's differently identified
+        // completion, so the `running` answer never terminated).
+        if (
+            !this.sessionState.loadedActiveTurnIsAny &&
+            loadedActiveTurnId !== null &&
+            notification.turn.id !== loadedActiveTurnId
+        ) {
+            return;
+        }
+        if (loadedActiveTurnId !== null || this.sessionState.loadedActiveTurnIsAny) {
             // The loaded active turn ended: its terminal status becomes
             // the loaded thread's authoritative last-turn status, and the
             // active-turn detection clears (a later query classifies
             // consistently).
             this.sessionState.loadedLastTurnStatus = notification.turn.status;
             this.sessionState.loadedActiveTurnId = null;
+            this.sessionState.loadedActiveTurnIsAny = false;
         }
         pushLoadedTurnEnded(this.session, this.sessionState, notification.turn);
     }

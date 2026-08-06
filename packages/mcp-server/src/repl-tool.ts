@@ -296,8 +296,37 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       // status can list every known project context without naming one
       // (both modes); the stateful actions resolve a single context.
       if (action === "status") {
-        const contexts = projectDir === undefined ? projects.stores() : [resolveContext(options, projectDir)!];
-        return { content: [{ type: "text", text: renderStatus(contexts) }] };
+        if (projectDir === undefined) {
+          const contexts = projects.stores();
+          return { content: [{ type: "text", text: renderStatus(contexts) }] };
+        }
+        // A NAMED status is a first touch exactly like the other stateful
+        // actions (phase-D review round 5: it used to return before
+        // creating the REPL state, so on a fresh daemon whose project
+        // already has a snapshot `status {projectDir}` skipped the
+        // restore, the three-way reconciliation, the hash/version
+        // refusal surface, and the workspace manifest). The refusal
+        // (corrupt / version bump / wasm-hash mismatch) and the restore
+        // report are rendered by `renderStatus` from the state.
+        const context = resolveContext(options, projectDir);
+        if (context === undefined) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No project context is available for projectDir "${String(projectDir)}".`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        context.repl ??= createReplProjectState(context.projectDir);
+        const state = context.repl;
+        options.presence.touch(state, options.clientId() ?? "unknown");
+        if (state.restoreError === null) {
+          await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
+        }
+        return { content: [{ type: "text", text: renderStatus([context]) }] };
       }
       const context = resolveContext(options, projectDir);
       if (context === undefined) {

@@ -1,0 +1,391 @@
+/**
+ * Phase-D review round 5 regression suite: the reviewer's rejected items,
+ * pinned at the engine boundary.
+ *
+ * 1. The broker's drain latch must never skip in-flight work on a SECOND
+ *    disconnect: a reconnect's fresh dispatch (or a lazy re-attach)
+ *    clears the latch the moment a child may open, so drain → reconnect →
+ *    parked openSession → disconnect drains (and stops) the open instead
+ *    of returning immediately.
+ * 2. A lazy re-attach whose `loadSession` lands AFTER the drain deadline
+ *    (or after disposal) is released immediately — it never registers and
+ *    never prompts (the drain/disposal generation fence).
+ * 3. `cancelCall`'s lazy re-attach runs OUTSIDE the serialized operation
+ *    chain — a hung backend `loadSession` can never hold the chain, so
+ *    `drainForDisconnect` enters promptly and its deadline is effective.
+ * 4. An `openSession` that lands after `dispose` is released immediately
+ *    (never re-registers, never prompts on the disposed broker).
+ * 5. Simultaneously ready settlements drain ONE CALL AT A TIME, each
+ *    with its own provenance pass: two independent continuations
+ *    producing separate bindings are attributed to their OWN worker and
+ *    task (`worker c1` / `worker c2`), never a joined batch label.
+ */
+
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import {
+  Broker,
+  InMemoryCallStore,
+  Workspace,
+  type BrokerLoadSessionOptions,
+  type BrokerOpenSessionOptions,
+  type BrokerPromptOptions,
+  type BrokerRunner,
+  type BrokerSession,
+  type BrokerTurn,
+} from '../src/index.js';
+
+const PROJECT = '/tmp/repl-review5-project';
+
+async function tick(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Poll until `predicate` holds (the async-landing tests' wait). */
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor: condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** The fake held-open ACP session (see review2.test.ts). */
+class FakeSession implements BrokerSession {
+  readonly sessionId: string;
+  capabilities: { supportsSteering: boolean } | undefined;
+  readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
+  readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
+  releases = 0;
+  stopReason = 'end_turn';
+  readonly completedTexts: string[] = [];
+  backendId = 'pi';
+
+  constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
+    this.sessionId = `fake-session-${FakeSession.nextId++}`;
+    this.capabilities = { supportsSteering: true };
+  }
+
+  static nextId = 0;
+
+  prompt(content: string, opts: BrokerPromptOptions = {}): Promise<BrokerTurn> {
+    this.texts.push(content);
+    return new Promise((resolve, reject) => {
+      this.prompts.push({ content, resolve, reject });
+      opts.onHandoff?.();
+    });
+  }
+  readonly texts: string[] = [];
+
+  steer(content: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      this.steers.push({ content, resolve, reject });
+    });
+  }
+
+  awaitCurrentTurn(): Promise<BrokerTurn> {
+    return new Promise(() => {});
+  }
+
+  cancel(): Promise<void> {
+    for (const pending of this.prompts.splice(0)) {
+      pending.resolve({ stopReason: 'cancelled', text: '' });
+    }
+    return Promise.resolve();
+  }
+
+  release(): Promise<void> {
+    this.releases++;
+    return Promise.resolve();
+  }
+
+  currentTurnText(): string {
+    return this.completedTexts[this.completedTexts.length - 1] ?? '';
+  }
+
+  finalMessageText(): string {
+    return this.completedTexts[this.completedTexts.length - 1] ?? '';
+  }
+
+  rawStructuredOutput(): unknown {
+    return undefined;
+  }
+
+  completeTurn(text: string): void {
+    const pending = this.prompts.shift();
+    assert.ok(pending, 'a prompt turn must be in flight');
+    this.completedTexts.push(text);
+    pending.resolve({ stopReason: this.stopReason, text });
+  }
+}
+
+/** The fake runner (see review2.test.ts). */
+class FakeRunner implements BrokerRunner {
+  readonly sessions: FakeSession[] = [];
+  readonly openedWith: BrokerOpenSessionOptions[] = [];
+  readonly loadedWith: BrokerLoadSessionOptions[] = [];
+
+  async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
+    const session = new FakeSession(opts);
+    session.backendId = 'pi';
+    this.sessions.push(session);
+    this.openedWith.push(opts);
+    return session;
+  }
+
+  async loadSession(opts: BrokerLoadSessionOptions): Promise<FakeSession> {
+    const session = new FakeSession(opts);
+    session.backendId = 'pi';
+    this.sessions.push(session);
+    this.loadedWith.push(opts);
+    return session;
+  }
+
+  async dispose(): Promise<void> {}
+
+  last(): FakeSession {
+    assert.ok(this.sessions.length > 0, 'a session must exist');
+    return this.sessions[this.sessions.length - 1];
+  }
+}
+
+async function setup(options: { runner?: BrokerRunner } = {}): Promise<{
+  ws: Workspace;
+  broker: Broker;
+}> {
+  const ws = await Workspace.create(PROJECT);
+  const broker = await Broker.attach(ws, {
+    runner: options.runner,
+    store: new InMemoryCallStore(),
+    evalTimeoutMs: 0, // tests drive interrupts explicitly
+  });
+  return { ws, broker };
+}
+
+/** Settle a call end to end (complete its turn, pump, drain the latch). */
+async function settleAndDrain(broker: Broker, runner: FakeRunner, boundMs = 5000): Promise<void> {
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  runner.last().completeTurn('settled');
+  await tick();
+  await broker.pump();
+  assert.equal(await broker.drainForDisconnect(boundMs), true, 'the settled call drains immediately');
+  assert.ok(broker.isDrained);
+}
+
+// ── 1. The drain latch never skips in-flight work on a second disconnect ─
+
+test('review 5/1: a second disconnect after a reconnect with a PARKED open drains again — the fresh dispatch cleared the stale drain latch, and the parked open is stopped (never prompts after the last client disconnected)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await settleAndDrain(broker, runner);
+
+  // Reconnect: the next dispatch's openSession is PARKED (slow backend).
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  await broker.eval('const q = agent("pi/x", "task2"); "started"');
+  await tick();
+  // The old code kept the latch set until the open RESOLVED — the second
+  // disconnect then returned immediately and the child could open and
+  // prompt after the last client disconnected.
+  assert.ok(!broker.isDrained, 'the fresh dispatch cleared the stale drain latch');
+  assert.equal(await broker.drainForDisconnect(60), false, 'the second disconnect drains (and stops) the parked open');
+  assert.ok(broker.isDrained);
+  // The parked open lands later: the child is closed immediately — it
+  // never prompts (nothing runs after the last client disconnected).
+  releaseOpen();
+  await waitFor(() => runner.sessions.length === 2);
+  const late = runner.sessions[1];
+  assert.equal(late.releases, 1, 'the stopped child was closed without ever prompting');
+  assert.equal(late.prompts.length, 0, 'the stopped call never ran a turn');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review 5/1b: a lazy re-attach in flight at the second disconnect also clears the stale latch — the drain waits for it and its late landing is fenced', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await settleAndDrain(broker, runner);
+
+  // Reconnect: a followUp starts a lazy re-attach whose loadSession is
+  // PARKED.
+  let releaseLoad!: () => void;
+  const parkedLoad = new Promise<void>((resolve) => {
+    releaseLoad = resolve;
+  });
+  const originalLoad = runner.loadSession.bind(runner);
+  runner.loadSession = async (opts) => {
+    await parkedLoad;
+    return originalLoad(opts);
+  };
+  await broker.eval('p.followUp("continue"); "fired"');
+  await tick();
+  assert.ok(!broker.isDrained, 'the lazy re-attach start cleared the stale drain latch');
+  // The second disconnect: the drain waits for the parked load, then the
+  // bound stops it (the drain returns false — the honest bounded
+  // teardown).
+  assert.equal(await broker.drainForDisconnect(60), false);
+  assert.ok(broker.isDrained);
+  // The parked load lands after the deadline: the child is released
+  // immediately — never registered, never prompted.
+  releaseLoad();
+  await waitFor(() => runner.sessions.length === 2);
+  const late = runner.sessions[1];
+  assert.equal(late.releases, 1, 'the late re-attached child was closed without registering');
+  assert.equal(late.prompts.length, 0, 'the late re-attach never prompted');
+  // The steer settles the honest failed (nothing was steered).
+  await broker.pump();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await broker.pump();
+    const record = broker.store().lookup('c2')?.completion;
+    if (record !== undefined && record !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(broker.store().lookup('c2')!.completion!.value, 'failed');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 2. The parked-loadSession fence (late re-attachments never register) ─
+
+test('review 5/2: a lazy re-attach load that lands AFTER the drain deadline is released immediately — it never registers and never prompts (the generation fence)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await settleAndDrain(broker, runner);
+
+  // Park the lazy re-attach's loadSession BEFORE the drain deadline.
+  let releaseLoad!: () => void;
+  const parkedLoad = new Promise<void>((resolve) => {
+    releaseLoad = resolve;
+  });
+  const originalLoad = runner.loadSession.bind(runner);
+  runner.loadSession = async (opts) => {
+    await parkedLoad;
+    return originalLoad(opts);
+  };
+  await broker.eval('p.followUp("continue"); "fired"');
+  await tick();
+  assert.equal(runner.loadedWith.length, 0, 'the load is still parked');
+  // The drain's bound expires with the load still in flight.
+  assert.equal(await broker.drainForDisconnect(60), false);
+  assert.ok(broker.isDrained);
+  // The parked load lands AFTER the deadline: the loaded child is
+  // released immediately — it never registers and never prompts (the old
+  // code cleared `pendingReattaches` without fencing the unresolved
+  // load, so the landing ran a warm child after the disconnect).
+  releaseLoad();
+  await waitFor(() => runner.sessions.length === 2);
+  const late = runner.sessions[1];
+  assert.equal(late.releases, 1, 'the late re-attached child was closed without registering');
+  assert.equal(late.prompts.length, 0, 'the late re-attach never prompted');
+  assert.equal(broker.liveAgents().length, 0, 'no session entry was registered');
+  await broker.pump();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await broker.pump();
+    const record = broker.store().lookup('c2')?.completion;
+    if (record !== undefined && record !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(broker.store().lookup('c2')!.completion!.value, 'failed', 'nothing was steered — the honest failed');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 3. cancelCall never holds the chain on a hung loadSession ──────────
+
+test('review 5/3: a hung backend loadSession in cancelCall never blocks the client-presence drain (the lazy re-attach runs OUTSIDE the serialized chain — the drain\'s deadline starts when it enters)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await settleAndDrain(broker, runner);
+
+  // The backend loadSession hangs forever.
+  runner.loadSession = async () => new Promise(() => {});
+  const cancelling = broker.cancelCall('c1');
+  await tick();
+  const started = Date.now();
+  const drained = await broker.drainForDisconnect(200);
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the drain bound expired with the load still hung');
+  assert.ok(elapsed < 2000, `the drain returned within its bound: ${elapsed} ms`);
+  assert.ok(broker.isDrained);
+  void cancelling;
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 4. The disposal fence (late opens never register or prompt) ─────────
+
+test('review 5/4: an openSession that lands AFTER dispose is released immediately — it never registers and never prompts on the disposed broker', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // Park the founding session's open.
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  assert.equal(runner.sessions.length, 0, 'the open is still parked');
+  // Dispose while the open is still in flight (the reset path drives the
+  // same disposal).
+  await broker.dispose();
+  // The parked open lands LATER: the child is released immediately — it
+  // never registers and never prompts (the old code cleared
+  // `openingCalls`/`stoppedOpens` without fencing the unresolved open,
+  // so the landing re-registered the session and could prompt on the
+  // disposed broker).
+  releaseOpen();
+  await waitFor(() => runner.sessions.length === 1);
+  const late = runner.sessions[0];
+  assert.equal(late.releases, 1, 'the late child was closed without registering');
+  assert.equal(late.prompts.length, 0, 'the late open never prompted');
+  ws.dispose();
+});
+
+// ── 5. Per-call settlement provenance ──────────────────────────────────
+
+test('review 5/5: simultaneously ready settlements drain ONE CALL AT A TIME — each continuation binding is attributed to its OWN worker and task (never the joined batch label)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await broker.eval(
+    'const a = agent("pi/x", "task A").then((r) => { globalThis.fromA = r; });' +
+      'const b = agent("pi/x", "task B").then((r) => { globalThis.fromB = r; });' +
+      '"started"',
+  );
+  await tick();
+  assert.equal(runner.sessions.length, 2, 'two independent subagents');
+  // BOTH turns complete before the pump: both outcomes are ready
+  // simultaneously.
+  runner.sessions[0].completeTurn('A-result');
+  runner.sessions[1].completeTurn('B-result');
+  await tick();
+  await broker.pump();
+  // The per-value producer attribution: the old batch drain labelled
+  // every binding changed in the batch with ALL call ids (`worker
+  // c1+c2`) and joined both tasks — two independent continuations were
+  // falsely attributed to both workers.
+  const view = ws.provenanceView();
+  assert.equal(view.origins.get('fromA')?.via, 'worker c1', 'the A continuation is attributed to worker c1 alone');
+  assert.equal(view.origins.get('fromB')?.via, 'worker c2', 'the B continuation is attributed to worker c2 alone');
+  const manifest = broker.workspaceManifest();
+  const byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+  assert.equal(byName.get('fromA')?.provenance, 'worker c1');
+  assert.equal(byName.get('fromA')?.task, 'task A', 'the "from what task" half follows the same per-value split');
+  assert.equal(byName.get('fromB')?.provenance, 'worker c2');
+  assert.equal(byName.get('fromB')?.task, 'task B');
+  await broker.dispose();
+  ws.dispose();
+});

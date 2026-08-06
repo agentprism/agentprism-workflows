@@ -408,6 +408,7 @@ export function createTestSessionState(overrides?: Partial<SessionState>): Sessi
         terminalOutputMode: "terminal_output_delta",
         goalRevision: 0,
         loadedActiveTurnId: null,
+        loadedActiveTurnIsAny: false,
         loadedLastTurnStatus: null,
         loadedTurnReportedRunning: false,
         loadedTurnEndedBeforeWatch: null,

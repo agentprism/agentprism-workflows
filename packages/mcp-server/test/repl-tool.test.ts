@@ -260,6 +260,52 @@ test("a pending call with a recorded backend session re-attaches on restore thro
   }
 });
 
+test("THE REVIEW REGRESSION (round 5/8): on a fresh daemon whose project already has a snapshot, status {projectDir} as the FIRST repl call performs the first touch — restore, the three-way reconciliation, and the workspace manifest (the status action used to return before creating the REPL state)", async () => {
+  // An isolated project: the restore state must come from THIS server's
+  // own snapshot, never from the shared PROJECT chain's earlier tests.
+  const projectDir = mkdtempSync(join(tmpdir(), "repl-status-first-"));
+  const runner1 = new FakeRunner();
+  const first = await connectWithRepl(runner1);
+  try {
+    // Server 1: a pending call with a recorded backend session + a
+    // settled binding. The eval boundary persists the workspace.
+    const r = await repl(first, {
+      action: "eval",
+      projectDir,
+      code: 'const p = agent("pi/x", "research task"); globalThis.kept = 41; "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    assert.equal(runner1.sessions.length, 1, "the founding session opened");
+  } finally {
+    await first.dispose();
+  }
+
+  // "Daemon restart": the FIRST repl call on the fresh server is
+  // `status {projectDir}` — never an eval. It must restore the VM from
+  // the stored snapshot, run the three-way reconcile (the pending call
+  // re-attaches through loadSession), and return the workspace manifest
+  // with the bindings, provenance and agent lines.
+  const runner2 = new FakeRunner();
+  runner2.loadedTurnText = "loaded result";
+  const second = await connectWithRepl(runner2);
+  try {
+    const status = await repl(second, { action: "status", projectDir });
+    assert.ok(!isErrorResult(status), textOf(status));
+    const text = textOf(status);
+    assert.ok(text.includes("restored"), `restore happened at status: ${text}`);
+    assert.ok(text.includes("re-attached: 1"), `reconcile ran at status: ${text}`);
+    assert.ok(text.includes("kept"), `the workspace manifest lists the binding: ${text}`);
+    assert.ok(text.includes("research task"), `the manifest carries the task provenance: ${text}`);
+    assert.ok(text.includes("agent c1:"), `the manifest lists the live agent: ${text}`);
+    assert.equal(runner2.loadedWith.length, 1, "the recorded session was loaded at status");
+    assert.equal(runner2.openedWith.length, 0, "never a fresh session — no re-issue");
+  } finally {
+    await second.dispose();
+    rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test("a corrupted stored snapshot is CONTAINED: loud refusal in the tool result, no crash-loop, reset clears it", async () => {
   const first = await connectWithRepl(new FakeRunner());
   try {
