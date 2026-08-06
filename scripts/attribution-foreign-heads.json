@@ -10,6 +10,11 @@
       "sha": "efa3789c3909838590f2f7cf24682ec4a0e987e4",
       "imported": "2026-08-03",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main"
+    },
+    {
+      "sha": "0ff2d55f29fb4d2bd50482c5324ddb27b8570e8a",
+      "imported": "2026-08-10",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main"
     }
   ]
 }
