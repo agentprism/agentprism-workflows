@@ -233,10 +233,12 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
       // The teardown's own failures are contained here too: its op-end
       // flush retries a boundary the drain's failed flush retained, and
       // a second failure (the disk is still broken) must not abort the
-      // shutdown — the session releases and bookkeeping clear already
-      // ran inside `dispose`, the persistence failure was already loud
-      // (the drain's failure), and the process is exiting anyway. The
-      // state on disk keeps the last good snapshot.
+      // shutdown — the VM release and the store close already ran in
+      // `disposeReplProjectState`'s FINALLY path (phase-D review round
+      // 8: a disposal rejection used to skip them entirely), the
+      // persistence failure was already loud (the drain's failure), and
+      // the process is exiting anyway. The state on disk keeps the last
+      // good snapshot.
       await disposeReplProjectState(state, Math.max(0, deadline - Date.now())).catch(() => undefined);
     }
   }

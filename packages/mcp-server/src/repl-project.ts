@@ -363,9 +363,20 @@ export async function disposeReplProjectState(
   state.broker = null;
   state.workspace = null;
   state.generation++;
-  if (broker !== null) await broker.dispose(boundMs);
-  workspace?.dispose();
-  state.store.close();
+  try {
+    if (broker !== null) await broker.dispose(boundMs);
+  } finally {
+    // The VM release and the store close run in the FINALLY path
+    // (phase-D review round 8: a disposal rejection — its op-end flush
+    // retrying the retained dirty boundary from a failed drain and
+    // failing again, or an owned-runner teardown failure — used to skip
+    // both, leaving the actual VM and the call store open while the
+    // state already claimed to be torn down; the registry swallows the
+    // disposal's rejection at shutdown, so the cleanup must never
+    // depend on the disposal resolving).
+    workspace?.dispose();
+    state.store.close();
+  }
 }
 
 /** The `reset` tool's engine-side: teardown the workspace and delete the
@@ -380,9 +391,16 @@ export async function resetReplProjectState(
   state.broker = null;
   state.workspace = null;
   state.generation++;
-  if (broker !== null) await broker.dispose(boundMs);
-  workspace?.dispose();
-  state.store.reset();
+  try {
+    if (broker !== null) await broker.dispose(boundMs);
+  } finally {
+    // The VM release and the store reset run in the FINALLY path — a
+    // disposal rejection must never leave the VM or the `repl/` store
+    // behind while the state claims to be reset (see
+    // `disposeReplProjectState`).
+    workspace?.dispose();
+    state.store.reset();
+  }
   state.source = null;
   state.reconcileReport = null;
   state.restoreError = null;

@@ -516,7 +516,7 @@ test("review6: a failed client-presence drain is surfaced loudly and retained �
   }
 });
 
-test("review7: daemon shutdown is BOUNDED even when the client-presence drain FAILS and cancel/release HANG — the teardown races the remaining shutdown bound, so shutdown never hangs on the hung backend the drain already caught", async () => {
+test("review8: daemon shutdown cleanup runs in FINALLY paths — when broker.dispose REJECTS (its op-end flush retries the retained dirty boundary from the failed drain and fails again), the workspace VM is still disposed and the store still closed (phase-D review round 8)", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
   const presence = new ReplPresenceLedger(60_000);
@@ -531,20 +531,24 @@ test("review7: daemon shutdown is BOUNDED even when the client-presence drain FA
     });
     assert.ok(!isErrorResult(r), textOf(r));
     await tick();
-    // The worst case the review flagged: the in-flight turn never
-    // completes, cancel AND release hang forever, and the snapshot write
-    // FAILS (a directory at the tmp path — EISDIR) so the shutdown drain
-    // itself fails. phase-D review round 7: the disposal used to run
-    // UNBOUNDED after a failed/deadline-expired drain — it awaited the
-    // hung cancel/release forever, so daemon shutdown could hang on the
-    // exact hung backend the drain had already caught.
     const session = runner.last();
     session.hangCancel = true;
     session.hangRelease = true;
+    const projectContext = projects.stores().find((c) => c.projectDir === PROJECT)!;
+    const state = projectContext.repl!;
+    const workspace = state.workspace!;
+    const callStore = state.store.callStore();
+    // Obstruct the snapshot write: a DIRECTORY at the tmp path makes the
+    // atomic write fail (EISDIR). The shutdown drain's op-end flush
+    // fails → the drain rejects AND the dirty boundary is RETAINED; the
+    // disposal's own op-end flush RETRIES the same boundary and fails
+    // again → broker.dispose REJECTS (phase-D review round 8: a
+    // disposal rejection used to skip workspace.dispose() and
+    // state.store.close() — the actual VM and call store stayed open
+    // even though state.workspace was already nulled, and the registry
+    // swallows the rejection at shutdown, so the cleanup must not
+    // depend on the disposal resolving).
     mkdirSync(tmpPath);
-    // Daemon shutdown: the drain consumes (and fails within) the bound,
-    // then the teardown must NOT hang — the disposal races the REMAINING
-    // shutdown bound (one deadline spans the drain and the teardown).
     const started = Date.now();
     const teardown = projects.disposeReplStates(300);
     const result = await Promise.race([
@@ -552,20 +556,75 @@ test("review7: daemon shutdown is BOUNDED even when the client-presence drain FA
       new Promise<string>((resolve) => setTimeout(() => resolve("HUNG"), 3000)),
     ]);
     const elapsed = Date.now() - started;
-    assert.equal(result, "done", "daemon shutdown returned within the bound (never hung on cancel/release)");
+    assert.equal(result, "done", "daemon shutdown returned within the bound (never hung)");
     assert.ok(elapsed < 2000, `shutdown was bounded: ${elapsed} ms`);
-    // The state was fully torn down (the broker disposal's bookkeeping
-    // clear ran even though the wire calls hung).
-    const projectContext = projects.stores().find((c) => c.projectDir === PROJECT)!;
-    const state = projectContext.repl!;
+    // The cleanup ran in the FINALLY path despite the disposal
+    // rejection: the VM was ACTUALLY disposed and the store closed.
+    assert.equal(workspace.isDisposed, true, "the workspace VM was disposed even though broker.dispose rejected");
+    assert.equal(callStore.isClosed(), true, "the call store was closed even though broker.dispose rejected");
     assert.equal(state.broker, null, "the broker was disposed");
-    assert.equal(state.workspace, null, "the workspace was disposed");
+    assert.equal(state.workspace, null, "the workspace was nulled");
   } finally {
     try {
       rmSync(tmpPath, { recursive: true, force: true });
     } catch {
       // Best-effort cleanup.
     }
+    await connected.dispose();
+  }
+});
+
+test("review8: the shutdown drain FAILS BEFORE releasing sessions — the bounded disposal still sees the hung cancel/release and returns within the remaining bound (phase-D review round 8: the old regression's EISDIR failed only at the op-end flush, AFTER the release phase had already cleared this.sessions, so broker.dispose saw no hung backend and the old unbounded disposal passed)", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const presence = new ReplPresenceLedger(60_000);
+  const projects = new WorkflowProjectRegistry(okRunner());
+  const connected = await connectWithRepl(runner, { presence, projects });
+  try {
+    const r = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "task"); "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    const session = runner.last();
+    session.hangCancel = true;
+    session.hangRelease = true;
+    const projectContext = projects.stores().find((c) => c.projectDir === PROJECT)!;
+    const state = projectContext.repl!;
+    const workspace = state.workspace!;
+    // Sabotage the CALL STORE: the bound-expired drain's forced stop
+    // records the AGENT_CANCELLED completion FIRST (the exactly-once
+    // discipline) — with the log closed, that record throws (EBADF), so
+    // the drain FAILS at the forced stop, BEFORE the release phase has
+    // cleared this.sessions. The disposal therefore still holds the
+    // hung session and must cancel/release it BOUNDED — an unbounded
+    // disposal would hang on the exact hung backend the drain had
+    // already caught.
+    state.store.close();
+    const started = Date.now();
+    const teardown = projects.disposeReplStates(300);
+    const result = await Promise.race([
+      teardown.then(() => "done"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("HUNG"), 3000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.equal(result, "done", "daemon shutdown returned within the bound (never hung on the hung cancel/release)");
+    assert.ok(elapsed < 2000, `shutdown was bounded: ${elapsed} ms`);
+    // The disposal still held the busy session (the drain failed BEFORE
+    // its release phase) and issued its wire calls even though it could
+    // not await them (the deadline won the race): one cancel from the
+    // drain's forced stop, one from the disposal — and the release only
+    // from the disposal (the drain's release phase never ran).
+    assert.equal(session.cancelCalls, 2, "the forced stop and the bounded disposal each issued the cancel for the still-registered session");
+    assert.equal(session.releases, 1, "the bounded disposal issued the release for the still-registered session");
+    // The state was fully torn down — and the VM actually disposed
+    // (the finally-path cleanup).
+    assert.equal(workspace.isDisposed, true, "the workspace VM was disposed");
+    assert.equal(state.broker, null, "the broker was disposed");
+    assert.equal(state.workspace, null, "the workspace was nulled");
+  } finally {
     await connected.dispose();
   }
 });

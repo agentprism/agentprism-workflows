@@ -2178,14 +2178,23 @@ export class Broker {
    * and the loop's yield was a fixed 50 ms sleep that could land past
    * the deadline). A deadline already past at chain acquisition skips
    * straight to the forced stop; the loop's yield races the remaining
-   * bound. Everything below races the remaining bound — a hung
+   * bound. Everything below races the remaining bound — INCLUDING the
+   * chain acquisition itself (phase-D review round 8: the chain wait
+   * used to have no deadline race, so a YIELDFUL queued operation — a
+   * long `wait` op polling a pending call, an async op on a stuck
+   * backend — could delay the drain indefinitely past its bound; when
+   * the deadline expires while queued, the drain body runs WITHOUT the
+   * chain, and its forced-stop settlement is first-wins and
+   * generation-fenced against the stuck op's eventual landing, so an
+   * unlocked forced stop settles exactly like a chained one). A hung
    * cancel/release can never block disconnect past the eviction TTL.
    */
   async drainForDisconnect(boundMs: number, shouldAbort?: () => boolean): Promise<boolean> {
     // The ABSOLUTE bound: measured at METHOD ENTRY — before the
     // serialized-chain wait — so the queue wait counts against it and
     // the drain can never run a fresh full window after the chain
-    // finally freed (review round 7).
+    // finally freed (review round 7). The chain wait itself races the
+    // remaining bound (review round 8 — see `serialized`).
     const deadline = Date.now() + Math.max(0, boundMs);
     return this.serialized(async () => {
       this.assertAlive();
@@ -2393,7 +2402,7 @@ export class Broker {
       this.pendingReattaches.clear();
       this.drained = true;
       return drainedWithinBound;
-    });
+    }, deadline);
   }
 
   /**
@@ -2491,8 +2500,15 @@ export class Broker {
    * daemon's shutdown path, which shares ONE deadline across the drain
    * and this teardown — pass the remaining time). The bound is
    * ABSOLUTE, measured from method entry like the client-presence
-   * drain's: every await races the remaining bound, and once it expires
-   * the disposal returns without waiting — the best-effort
+   * drain's: every await races the remaining bound — INCLUDING the
+   * serialized-chain acquisition (phase-D review round 8: the chain
+   * wait used to have no deadline race, so a yieldful queued operation
+   * could delay disposal indefinitely; when the deadline expires while
+   * queued, the disposal body runs WITHOUT the chain, and its
+   * bookkeeping clear is safe unlocked — the stuck op's eventual
+   * landing is absorbed by the same first-wins/fenced paths as a
+   * disposal that ran chained) — and once it expires the disposal
+   * returns without waiting — the best-effort
    * cancellations, releases and the runner teardown already issued keep
    * running in the background (every promise carries a catch handler,
    * so nothing can become an unhandled rejection).
@@ -2511,7 +2527,7 @@ export class Broker {
     this.generation++;
     // The ABSOLUTE bound: measured at method entry — before the
     // serialized-chain wait — like the client-presence drain's (review
-    // round 7).
+    // round 7); the chain wait itself races it (review round 8).
     const deadline = Date.now() + Math.max(0, boundMs);
     await this.serialized(async () => {
       const cancels: Promise<unknown>[] = [];
@@ -2546,7 +2562,7 @@ export class Broker {
         runnerDispose.catch(() => undefined);
         await boundedOne(runnerDispose, deadline);
       }
-    });
+    }, deadline);
   }
 
   // ── Guest bridge handlers ─────────────────────────────────────────────
@@ -3700,17 +3716,70 @@ export class Broker {
 
   /** Serialize async broker operations (eval/pump/reconcile/dispose) —
    *  two overlapping tool calls must never interleave settlement
-   *  bookkeeping or the eval's pump-before-eval ordering. */
-  private async serialized<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.opChain.then(
-      () => this.runSerialized(fn),
-      () => this.runSerialized(fn),
-    );
-    this.opChain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+   *  bookkeeping or the eval's pump-before-eval ordering.
+   *
+   *  `deadline` (the client-presence drain's and the disposal's ABSOLUTE
+   *  bound) races the CHAIN WAIT itself (phase-D review round 8: the
+   *  chain acquisition used to be awaited with no deadline, so a
+   *  YIELDFUL queued operation — a long `wait` op polling a pending
+   *  call, anything async that never resolves — could delay the drain
+   *  and the teardown indefinitely past their bounds, exactly the
+   *  unbounded-wait family the outer bound exists to kill). When the
+   *  deadline expires while queued, `fn` runs WITHOUT the chain: the
+   *  chain is, by definition, stuck past the caller's absolute ceiling,
+   *  and the caller's body is safe unlocked because it is first-wins
+   *  (the store's first-completion authority) and generation-fenced
+   *  against the stuck op's eventual landing — the same protections the
+   *  drain's late-landing paths already rely on. A deadline already
+   *  past at call time skips straight to the unlocked run. When the
+   *  chain frees within the bound, `fn` runs INSIDE it exactly as
+   *  before (subsequent ops queue behind it). */
+  private async serialized<T>(fn: () => Promise<T>, deadline?: number): Promise<T> {
+    if (deadline === undefined) {
+      const run = this.opChain.then(
+        () => this.runSerialized(fn),
+        () => this.runSerialized(fn),
+      );
+      this.opChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      // The deadline is already past: run WITHOUT the chain — waiting
+      // for it would exceed the absolute bound.
+      return this.runSerialized(fn);
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const bound = new Promise<'bound'>((resolve) => {
+      timer = setTimeout(() => resolve('bound'), remaining);
+    });
+    const winner = await Promise.race([
+      this.opChain.then(
+        () => 'chain' as const,
+        () => 'chain' as const,
+      ),
+      bound,
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (winner === 'chain') {
+      const run = this.opChain.then(
+        () => this.runSerialized(fn),
+        () => this.runSerialized(fn),
+      );
+      this.opChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    }
+    // The bound won the race: the chain is stuck past the deadline —
+    // run WITHOUT it and return at the bound (the caller's body is
+    // first-wins/generation-fenced, so the stuck op's eventual landing
+    // cannot interleave into a double settlement).
+    return this.runSerialized(fn);
   }
 
   /** One serialized operation with the sink's end-of-burst flush: the

@@ -487,6 +487,14 @@ export class JsonlCallStore implements CallStore {
     this.fd = -1;
   }
 
+  /** True once `close()` ran (the log file is closed; any later write
+   *  throws). The teardown-completeness probe (phase-D review round 8:
+   *  a rejected disposal used to skip the store close — the daemon
+   *  shutdown regression asserts the store really closed). */
+  isClosed(): boolean {
+    return this.fd === -1;
+  }
+
   private append(line: LogLine): void {
     // Retry safety for the delivery loop (which retries a failed
     // completion write with the SAME outcome): a failed write can leave

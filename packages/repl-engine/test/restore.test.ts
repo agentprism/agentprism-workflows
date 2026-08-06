@@ -1592,6 +1592,87 @@ test('the drain bound is measured from METHOD ENTRY: a drain queued behind a lon
   ws.dispose();
 });
 
+test('the drain bound is ABSOLUTE against the CHAIN WAIT: a YIELDFUL queued operation (a long wait op polling a pending call — async, never blocking the event loop) cannot delay the drain past its deadline — the chain acquisition races the remaining bound (phase-D review round 8)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  // A hung backend: cancel AND release never resolve (the worst case).
+  const session = runner.sessions[0];
+  session.hangCancel = true;
+  session.hangRelease = true;
+  // A YIELDFUL op holds the serialized chain: a wait with a long timeout
+  // and a pending call loops (pump + sleep + re-poll) without blocking
+  // the event loop. The round-7 chain wait had NO deadline race — a
+  // stuck queued op of this kind delayed the drain until ITS OWN
+  // timeout (indefinitely for an op that never terminates), i.e. the
+  // 120 ms drain could return ~10 s later. The synchronous busy-loop
+  // regression above cannot exercise this: a synchronous eval blocks
+  // the event loop, so no timer can fire until it yields — the
+  // yieldful case is the one the absolute bound must actually win.
+  const waiting = broker.waitForCalls(undefined, 10_000);
+  await tick();
+  const started = Date.now();
+  const drained = await broker.drainForDisconnect(120);
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the bound expired with the turn still running');
+  // TIGHT: the drain returns AT its deadline — the old code returned
+  // only when the queued op freed the chain (~10 s) and the round-7
+  // regression permitted ~480 ms for a 120 ms drain.
+  assert.ok(elapsed < 400, `the drain returned at its deadline, not after the stuck chain op: ${elapsed} ms`);
+  assert.ok(broker.isDrained);
+  // The UNLOCKED forced stop still settled the pending call DURABLY at
+  // the bound — recorded first, settled into the guest, no pending
+  // registry entry left (the chain wait can shorten the drain, never
+  // its settlement discipline).
+  const record = broker.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    [],
+    'the opening call is not left pending in the guest registry',
+  );
+  assert.equal(session.cancelCalls, 1, 'the forced stop issued the cancel');
+  assert.equal(session.releases, 1, 'the release phase issued the release (bounded, never awaited past the bound)');
+  // The wait op sees the settled call and ends promptly (its next poll
+  // observes the guest registry empty — no 10 s wait).
+  await waiting;
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('Broker.dispose is bounded against the CHAIN WAIT too: a YIELDFUL queued operation cannot delay teardown past the bound — the disposal races the remaining bound like the drain (phase-D review round 8)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  const session = runner.sessions[0];
+  session.hangCancel = true;
+  session.hangRelease = true;
+  // A yieldful op holds the chain past the dispose bound (its own
+  // timeout is far beyond it — the still-pending call keeps it
+  // polling). The disposal must NOT queue behind it: the absolute
+  // bound is the outer ceiling for teardown exactly as for the drain
+  // (a stuck serialized op must not hang daemon shutdown / reset).
+  // The catch is attached IMMEDIATELY: `dispose` sets `disposed` at
+  // method entry, so the stuck op dies on its next poll while the test
+  // is still awaiting the disposal — its rejection must be handled
+  // from the start, never unhandled.
+  const waiting = broker.waitForCalls(undefined, 2_000).catch(() => undefined);
+  await tick();
+  const started = Date.now();
+  await broker.dispose(120);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 400, `dispose returned at its bound, not after the stuck chain op: ${elapsed} ms`);
+  assert.equal(session.cancelCalls, 1, 'the bounded disposal still issued the cancel');
+  assert.equal(session.releases, 1, 'the bounded disposal still issued the release');
+  // The stuck wait op's rejection is the chain's own — absorbed by the
+  // chain bookkeeping; the caught handle settles when the op dies.
+  await waiting;
+  ws.dispose();
+});
+
 test('the drain bound is ABSOLUTE for the GUEST DRAIN too: a settlement that resumes a runaway continuation near the deadline is interrupted at the remaining bound, never at the eval deadline (phase-D review round 6)', async () => {
   const runner = new FakeRunner();
   // The per-eval deadline is far beyond the drain bound: without the
