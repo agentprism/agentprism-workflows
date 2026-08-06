@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { AgentRunner } from "@automatalabs/shared-types";
-import type { BrokerRunner } from "@automatalabs/repl-engine";
+import type { BrokerRunner, EvalBreakChannel } from "@automatalabs/repl-engine";
 
 import { createWorkflowServer, SERVER_VERSION } from "../server.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
@@ -49,6 +49,13 @@ export interface CreateDaemonOptions {
    * dead clients with).
    */
   sessionTtlMs?: number;
+  /** The REPL eval-break relay (phase-F review round 2; see
+   *  repl-engine's `EvalBreakChannel`): the worker-thread channel whose
+   *  loopback endpoint the shim fires while the daemon's main thread is
+   *  blocked in a synchronous eval. Omitted in single-project mode
+   *  (there is no separate shim to fire it — the per-eval deadline
+   *  remains the bound). */
+  evalBreakChannel?: EvalBreakChannel;
 }
 
 export interface DaemonHandle {
@@ -151,6 +158,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       replPresence,
       replClientId: () => transport.sessionId,
       replDrainBoundMs: options.sessionTtlMs ?? SESSION_IDLE_TTL_MS,
+      replEvalBreakChannel: options.evalBreakChannel,
     });
     await server.connect(transport);
     // The SDK protocol layer takes ownership of transport.onclose during connect, so chain

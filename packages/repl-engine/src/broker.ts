@@ -167,24 +167,37 @@
  *    the seam KEEPS THE LOADED SESSION ATTACHED and waits for the
  *    authoritative `_session/loaded_turn/ended` notification (a quiet
  *    gap is only a progress-stream gap, never terminal evidence),
- *    bounded by the max-wait backstop. The seam degrades to a
+ *    bounded by the max-wait backstop. A backend WITHOUT the extension
+ *    (the built-in claude and opencode backends today) is classified by
+ *    the seam's OBSERVATION path instead (phase-F review round 2 — the
+ *    old degradation released the loaded session and re-issued the
+ *    call, which can duplicate a still-running backend turn; re-issue
+ *    is now reserved for the observably-dead classes): the post-load
+ *    continuation watch (any CONTENT update after the load boundary is
+ *    live continuation — the authoritative still-running signal, which
+ *    flips the classification to the keep-attached wait) plus the
+ *    replay probe under the CONNECTION-DEATH CONTRACT — the built-in
+ *    ACP servers terminate in-flight turns when the client connection
+ *    closes (live-verified) and their persisted transcripts hold only
+ *    completed messages, so at restore the founding turn is never still
+ *    running and the replay's trailing content is authoritative: an
+ *    assistant message is the turn's terminal message (completed-while-
+ *    down), anything else means it died mid-way (safe re-issue —
+ *    nothing running, no duplication possible). A query failure on an
+ *    extension backend falls through to the same observation path. The
+ *    seam degrades to a
  *    rejection on: a transcript with no user message (the recorded
  *    session never received its prompt — safe re-issue), a
  *    released/dead session (safe re-issue — the process died with the
  *    turn), `interrupted` (safe re-issue), a load failure (capability
  *    absent, session deleted, wire failure), an unmarked handle (the
- *    boundary was never recorded), a backend WITHOUT the extension
- *    (immediate non-re-armable `LoadedTurnStillRunningError` — the
- *    broker RELEASES the loaded session and re-issues the call under the
- *    same id, the doc's honest fallback for a capability-omitting
- *    backend — phase-F review: the old keep-attached-and-pending arm,
- *    which left re-attached calls on seam-less backends pending until
- *    interrupt/reset, violated the doc's exactly-once reconciliation
- *    contract and is deleted; surfaced guest-visibly, never settled
- *    from a quiet gap, never left pending), a `running` turn
+ *    boundary was never recorded), a `running` turn
  *    past the max-wait bound (re-armable `LoadedTurnStillRunningError`
  *    — the broker re-arms the seam on the still-attached session so a
- *    later notification or cancel still settles the call), or a turn
+ *    later notification or cancel still settles the call; the
+ *    NON-re-armable form from a third-party seam is treated the SAME
+ *    way — a possibly-running call is never re-issued, phase-F review
+ *    round 2), or a turn
  *    that failed at the backend
  *    (`LoadedTurnFailedError` — a definite outcome, settled as an
  *    ordinary rejection, never re-issued). While the broker is
@@ -195,7 +208,7 @@
  *    pending; a disposed broker's state is being torn down).
  *    A third-party `BrokerSession` adapter WITHOUT the seam degrades
  *    through the SAME re-issue fallback (the seam absence is a
- *    capability omission). The outcome is
+ *    capability omission — re-attachment itself is unavailable there). The outcome is
  *    delivered through the SAME record → settle → consume pump as a
  *    live call — exactly once, first-wins on both sides (a held call's
  *    `hold` outcome drops the pump entry without recording or
@@ -350,6 +363,7 @@ import { applyOutputCaps } from './caps.js';
 import { InMemoryCallStore, type CallOutcome, type CallRecord, type CallStore } from './store.js';
 import { DrainJobError, type ReplEvalOptions, type ReplEvalOutcome, type ReplJobLease } from './vm.js';
 import { Workspace } from './workspace.js';
+import type { EvalBreakChannel } from './eval-break-channel.js';
 import type { EvalErrorInfo } from './errors.js';
 
 // ────────────────────────────────────────────────────────────────────────
@@ -484,22 +498,22 @@ export interface BrokerSession {
    * stays ATTACHED and the seam waits for the authoritative
    * `_session/loaded_turn/ended` notification — a quiet gap is only a
    * progress-stream gap, never terminal evidence — bounded by the
-   * max-wait backstop). A backend WITHOUT the extension degrades
-   * guest-visibly: the seam rejects immediately with the non-re-armable
-   * `LoadedTurnStillRunningError` (never settle partial output, never
-   * re-issue a possibly-running turn); a `running` turn past the max-wait
-   * bound rejects with the RE-ARMABLE form; a turn that failed at the
-   * backend rejects with `LoadedTurnFailedError` (a definite outcome,
-   * settled as a rejection, never re-issued); everything else (no user
-   * message, `interrupted`, a dead process) is the safe-re-issue class.
-   * A NON-re-armable rejection (backend without the extension, or a
-   * failed query wire) degrades through the broker's re-issue fallback —
-   * the doc's honest degradation for a capability-omitting backend
-   * (phase-F review: the old keep-attached-and-pending arm left
-   * re-attached calls pending until interrupt/reset and is deleted).
-   * OPTIONAL for third-party `BrokerSession` adapters: an adapter
-   * without the seam still re-attaches the session, then degrades
-   * through the same re-issue fallback — never a permanent hold.
+   * max-wait backstop). A backend WITHOUT the extension (the built-in
+   * claude and opencode backends today) is classified by the seam's
+   * OBSERVATION path instead (phase-F review round 2): the post-load
+   * continuation watch plus the replay probe under the connection-death
+   * contract — never a possibly-running re-issue. A `running` turn past
+   * the max-wait bound rejects with the `LoadedTurnStillRunningError`
+   * (the broker re-arms the seam on the still-attached session for BOTH
+   * forms — a possibly-running call is never re-issued); a turn that
+   * failed at the backend rejects with `LoadedTurnFailedError` (a
+   * definite outcome, settled as a rejection, never re-issued);
+   * everything else (no user message, `interrupted`, a dead process) is
+   * the safe-re-issue class (observably dead — re-issue cannot
+   * duplicate). OPTIONAL for third-party `BrokerSession` adapters: an
+   * adapter without the seam still re-attaches the session, then
+   * degrades through the re-issue fallback — never a permanent hold
+   * (re-attachment itself is unavailable there).
    */
   awaitCurrentTurn?(): Promise<BrokerTurn>;
 }
@@ -735,6 +749,21 @@ export interface BrokerOptions {
    *  eval and every settlement drain; a `null`/`0` value disables the
    *  deadline. Default `DEFAULT_EVAL_TIMEOUT_MS` (30 000). */
   evalTimeoutMs?: number;
+  /** The OUT-OF-BAND eval-break channel (phase-F review round 2): the
+   *  interrupt tool's no-id path deliverable to a SYNCHRONOUSLY running
+   *  eval. A never-yielding eval blocks the daemon's single thread, so
+   *  the interrupt request itself cannot be processed — the channel's
+   *  worker thread receives the break (via its loopback HTTP endpoint)
+   *  and sets a shared-memory flag that every eval execution's quickjs
+   *  interrupt handler consumes mid-run (see `eval-break-channel.ts`).
+   *  The probe is composed into every execution — fresh evals AND
+   *  settlement drains — with the arm-after-start rule: a break armed
+   *  after the execution began breaks it; a stale break (armed while
+   *  the workspace was idle) is dropped on first observation and never
+   *  breaks a later eval. The daemon's interrupt handling clears the
+   *  flag once it processes the request (the continuation-targeted
+   *  signal owns the break from then on). */
+  evalBreakChannel?: EvalBreakChannel;
   /** The state-changing-boundary sink (see the module docs): the
    *  daemon wires it to `ReplWorkspaceStore.snapshotWriter(workspace,
    *  wasm)` so every doc-defined boundary — after each eval, after
@@ -905,6 +934,7 @@ export class Broker {
   private readonly callStore: CallStore;
   private readonly interruptHandler: (() => boolean) | undefined;
   private readonly evalTimeoutMs: number;
+  private readonly evalBreakChannel: EvalBreakChannel | undefined;
   private readonly sink: SnapshotSink | undefined;
   private readonly consoleBuffer: Array<{ level: string; refs: string[]; args: unknown[] }> = [];
   private readonly sessions = new Map<string, SessionEntry>();
@@ -992,6 +1022,19 @@ export class Broker {
    *  observation (the quickjs interrupt polls constantly, so the next
    *  target continuation execution after arming breaks mid-run). */
   private evalBreakArmed = false;
+  /** The OUT-OF-BAND break probe's execution clock (phase-F review
+   *  round 2, see `evalBreakProbe`): the wall-clock moment the CURRENT
+   *  execution began — a fresh eval's code phase or a settlement
+   *  drain. The probe consumes the channel's break flag only when it
+   *  was armed after this instant (the arm-after-start rule). */
+  private currentExecutionStartMs = 0;
+  /** How many out-of-band breaks were CONSUMED by an executing eval
+   *  (a break that actually broke a running eval). */
+  outOfBandBreakCount = 0;
+  /** The wall-clock moment of the most recent CONSUMED out-of-band
+   *  break (see `consumeOutOfBandBreakReport`): the honest outcome
+   *  record for the interrupt tool when the daemon was blocked. */
+  private lastOutOfBandBreakAtMs: number | null = null;
   /** The arming-time active-eval set the eval-break signal is scoped
    *  to: when every target settles (or is released), the signal is
    *  cleared with them — a signal whose target no longer exists must
@@ -1070,6 +1113,11 @@ export class Broker {
     this.callStore = options.store ?? new InMemoryCallStore();
     this.interruptHandler = options.interruptHandler;
     this.evalTimeoutMs = options.evalTimeoutMs ?? DEFAULT_EVAL_TIMEOUT_MS;
+    this.evalBreakChannel = options.evalBreakChannel;
+    // The workspace's slot is registered up front so the worker's HTTP
+    // endpoint knows the key before any eval can run (fire-and-forget:
+    // a break for an unregistered key is a 404 no-op).
+    options.evalBreakChannel?.register(this.workspace.projectDir);
     this.sink = options.snapshotSink;
     this.ownsRunner = options.runner === undefined;
     this.runner = options.runner ?? new AcpAgentRunner();
@@ -1647,15 +1695,14 @@ export class Broker {
    *  turn), delivered by the same record → settle → consume pump as a
    *  live call. The call holds a concurrency token until the pump
    *  delivers it, exactly like a live call. A seam that can never
-   *  observe the founding turn (absent on a third-party adapter, or the
-   *  non-re-armable still-running rejection on a backend without the
-   *  `_session/loaded_turn` extension) degrades INSIDE the task to a
-   *  re-issue under the same call id — the doc's honest fallback for a
-   *  capability-omitting backend (phase-F review: the old
-   *  keep-attached-and-pending degradation left re-attached calls on
-   *  claude/opencode pending until interrupt/reset; every continuation
-   *  must settle exactly once through one of the three reconciliation
-   *  arms). */
+   *  observe the founding turn (absent on a third-party adapter) degrades
+   *  INSIDE the task to a re-issue under the same call id — the honest
+   *  fallback when re-attachment itself is unavailable (phase-F review
+   *  round 2: the seam-less BUILT-INS no longer take this path — the
+   *  seam classifies their loaded turns authoritatively through the
+   *  observation path, and every possibly-running call stays attached;
+   *  this degradation is reserved for the observably-dead classes and
+   *  for third-party adapters whose sessions expose no seam at all). */
   private registerReattached(entry: GuestSurfaceEntry, parsed: ParsedAgentOptions, session: BrokerSession): void {
     const sessionEntry: SessionEntry = {
       session,
@@ -1687,20 +1734,18 @@ export class Broker {
    *
    *  - the still-running class (`LoadedTurnStillRunningError`): the turn
    *    may still be running and its terminal state is unobservable —
-   *    NEVER settle a quiet gap. A RE-ARMABLE rejection (a `running`
-   *    turn past its max-wait bound on a backend that DOES carry the
-   *    extension) re-arms the seam on the still-attached session — a
-   *    later terminal notification — or a cancel — still settles the
-   *    call (the doc's second arm: re-attach to a still-running task).
-   *    A NON-re-armable rejection (a backend without the
-   *    `_session/loaded_turn` extension — the built-in claude and
-   *    opencode backends today — or the query wire failed) degrades
-   *    through the doc's honest fallback for a capability-omitting
-   *    backend: release the loaded session and RE-ISSUE the call under
-   *    the same id, surfaced guest-visibly (phase-F review: the old
-   *    `hold` arm left the call pending until interrupt/reset — every
-   *    continuation must settle exactly once through one of the three
-   *    reconciliation arms).
+   *    NEVER settle a quiet gap and NEVER re-issue a possibly-running
+   *    call. The broker KEEPS THE LOADED SESSION ATTACHED and re-arms
+   *    the seam on it for BOTH the re-armable form (a `running` turn
+   *    past its max-wait bound on a backend that carries the extension)
+   *    and the non-re-armable form (a third-party seam that can never
+   *    observe the terminal state) — a later terminal notification — or
+   *    a cancel — still settles the call, and the drain's forced stop
+   *    settles it DURABLY at its bound (phase-F review round 2: the
+   *    non-re-armable form used to release the loaded session and
+   *    re-issue the call, which can duplicate a still-running backend
+   *    turn; re-issue is now reserved for the observably-dead classes
+   *    below).
    *  - the failed-at-backend class (`LoadedTurnFailedError`): the turn
    *    RAN and failed — a definite outcome, settled as an ordinary
    *    rejection (never re-issued, never settled as success).
@@ -1743,26 +1788,23 @@ export class Broker {
       } catch (error) {
         if (isLoadedTurnStillRunningError(error)) {
           // The turn may still be running at the backend and its terminal
-          // state is unobservable: never settle partial output. A
-          // re-armable rejection (a `running` turn past the max-wait
-          // bound — the backend DOES carry the extension, the turn is
-          // still executing, and the doc's second arm is "re-attach to a
-          // still-running task") re-arms the seam on the still-attached
-          // session — a later terminal notification or a cancel still
-          // settles the call. A NON-re-armable one (the backend lacks the
-          // `_session/loaded_turn` extension — the built-in claude and
-          // opencode backends today — or the query wire failed) degrades
-          // through the doc's honest fallback for a capability-omitting
-          // backend: release the loaded session and RE-ISSUE the call
-          // under the same id, surfaced guest-visibly (phase-F review:
-          // the old permanent-hold arm left re-attached calls pending
-          // until interrupt/reset — every continuation must settle
-          // exactly once through one of the three reconciliation arms).
-          this.warnLine('warn', `call ${callId}: ${toRejectionValue(error).message}`);
-          if (error.rearmable) {
-            return this.runReattachedTask(callId, entry, parsed);
-          }
-          return this.reissueReattached(callId, entry, parsed, error);
+          // state is unobservable: never settle partial output, and never
+          // re-issue a possibly-running call. The broker KEEPS THE LOADED
+          // SESSION ATTACHED and re-arms the seam on it — the doc's
+          // second reconciliation arm, re-attach to a still-running task —
+          // for both the re-armable form (a `running` turn past the
+          // max-wait bound on an extension-carrying backend) and the
+          // non-re-armable form (a third-party seam that can never
+          // observe the terminal state); a later terminal notification —
+          // or a cancel — still settles the call, and the drain's forced
+          // stop settles it durably at its bound (phase-F review round 2:
+          // the non-re-armable form used to release the loaded session
+          // and re-issue the call — a still-running backend turn would
+          // have been duplicated; the seam's own observation path now
+          // classifies the seam-less built-ins authoritatively, and
+          // re-issue is reserved for the observably-dead classes below).
+          this.warnLine('warn', `call ${callId}: ${toRejectionValue(error).message} — re-armed on the attached session`);
+          return this.runReattachedTask(callId, entry, parsed);
         }
         if (isLoadedTurnFailedError(error)) {
           // The founding turn RAN and failed at the backend: a definite
@@ -1800,15 +1842,22 @@ export class Broker {
     })();
   }
 
-  /** The seam-rejection degradation (inside the re-attached task):
-   *  release the loaded session (best-effort — the re-issue opens its
-   *  own fresh session), record the reissue (counter bumped), surface
-   *  the reason guest-visibly, and re-dispatch the SAME call id through
-   *  the ordinary dispatch path. The call's concurrency token is reused
-   *  (it was held for the re-attached wait and never left the slot), so
-   *  the workspace's concurrent-subagent total never grows; a
-   *  still-running backend turn is never duplicated by this path (the
-   *  seam only rejects on genuine unobservability). Steers queued
+  /** The safe-re-issue degradation (inside the re-attached task) — the
+   *  observably-dead classes ONLY (phase-F review round 2): a seam
+   *  rejection that proves nothing is running at the backend — the
+   *  interrupted classification (the replayed transcript's trailing
+   *  content is not an assistant message and no live continuation
+   *  followed the load), a transcript that never received its prompt, a
+   *  dead/released session, or a third-party adapter whose session
+   *  exposes no seam at all. A possibly-running call NEVER reaches this
+   *  path: the still-running class keeps the loaded session attached and
+   *  re-arms the seam. Release the loaded session (best-effort — the
+   *  re-issue opens its own fresh session), record the reissue (counter
+   *  bumped), surface the reason guest-visibly, and re-dispatch the SAME
+   *  call id through the ordinary dispatch path. The call's concurrency
+   *  token is reused (it was held for the re-attached wait and never
+   *  left the slot), so the workspace's concurrent-subagent total never
+   *  grows. Steers queued
    *  against the re-attached session are handed to the fresh session
    *  (the dispatch path merges `pendingSteers` into its entry's queue).
    *
@@ -4391,6 +4440,10 @@ export class Broker {
    * interrupted drain releases nothing and leaves the eval-break armed
    * state intact. */
   private drain(boundDeadlineMs?: number): void {
+    // The OUT-OF-BAND probe's execution clock: this drain began now (a
+    // break armed mid-drain breaks the running job — an interrupt lands
+    // promptly mid-wait).
+    this.currentExecutionStartMs = Date.now();
     const boundHandler =
       boundDeadlineMs === undefined ? undefined : () => Date.now() >= boundDeadlineMs;
     try {
@@ -4400,7 +4453,11 @@ export class Broker {
         // drain never consult it (phase-E review rejection — the armed
         // signal used to be the broker's DEFAULT eval handler, so an
         // unrelated eval consumed it before the intended continuation).
+        // The OUT-OF-BAND probe rides BOTH (see `evalBreakProbe`): a
+        // synchronously running eval OR drain is exactly the blocked-
+        // main-thread case the worker channel exists for.
         interruptHandler: this.composedInterrupt(
+          this.evalBreakProbe(),
           this.interruptHandler,
           this.evalBreakHandler(),
           boundHandler,
@@ -4468,6 +4525,10 @@ export class Broker {
    *  through the quickjs interrupt handler, even when an explicit signal
    *  handler is armed and unset). */
   private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
+    // The OUT-OF-BAND probe's execution clock: this eval's code phase
+    // began now — a break armed after this instant breaks THIS eval; a
+    // stale flag (armed before) is dropped on first observation.
+    this.currentExecutionStartMs = Date.now();
     // The eval's CONTINUATION TOKEN (phase-E review round 5): minted
     // per eval, embedded in the instrumented code's `__replAwait(value,
     // token)` calls (see `await-instrument.ts`), and attributed to the
@@ -4499,7 +4560,10 @@ export class Broker {
       // documented contract); the per-eval wall-clock deadline ALWAYS
       // composes on top (phase-D review round 2: a currently-running
       // runaway eval is always breakable).
-      interruptHandler: this.composedInterrupt(options.interruptHandler ?? this.interruptHandler),
+      interruptHandler: this.composedInterrupt(
+        this.evalBreakProbe(),
+        options.interruptHandler ?? this.interruptHandler,
+      ),
       // The eval-break signal rides the eval's OWN DRAIN as well
       // (phase-E review rejection round 2: the signal used to be
       // consulted only by settlement drains, but a suspended eval's
@@ -4592,6 +4656,45 @@ export class Broker {
       }
       return deadline !== undefined && deadline();
     };
+  }
+
+  /** The OUT-OF-BAND eval-break probe (phase-F review round 2; see
+   *  `BrokerOptions.evalBreakChannel` and `eval-break-channel.ts`):
+   *  consumes the channel's break flag for this workspace and breaks
+   *  the executing eval when the flag was armed after the execution
+   *  began (the arm-after-start rule — a stale flag never breaks a
+   *  later eval; it is consumed-and-dropped on first observation).
+   *  Composed into every execution: a fresh eval's own code (the
+   *  `while (true)` case — the daemon's main thread is blocked, the
+   *  worker armed the flag, and the quickjs interrupt handler breaks
+   *  the eval mid-run) and the settlement drains (an interrupt lands
+   *  promptly mid-wait). `undefined` when no channel is wired. */
+  private evalBreakProbe(): (() => boolean) | undefined {
+    const channel = this.evalBreakChannel;
+    if (channel === undefined) return undefined;
+    const projectDir = this.workspace.projectDir;
+    return () => {
+      if (channel.consumeBreak(projectDir, this.currentExecutionStartMs)) {
+        this.outOfBandBreakCount++;
+        this.lastOutOfBandBreakAtMs = Date.now();
+        return true;
+      }
+      return false;
+    };
+  }
+
+  /** The interrupt tool's honest-outcome record: the moment an
+   *  out-of-band break was CONSUMED by a running eval, consumed on
+   *  read (one request → one report — a later interrupt can never
+   *  inherit an earlier break's delivery record). Null when no
+   *  out-of-band break was delivered since the last read. The daemon
+   *  reads it AFTER `armEvalBreak` (the eval's chain hold releases
+   *  before the interrupt's processing — the break already happened
+   *  by then, which is exactly what the record reports). */
+  consumeOutOfBandBreakReport(): number | null {
+    const at = this.lastOutOfBandBreakAtMs;
+    this.lastOutOfBandBreakAtMs = null;
+    return at;
   }
 
   /** Render the tool-result shape: output lines (console events drained

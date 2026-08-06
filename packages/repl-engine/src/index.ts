@@ -104,6 +104,16 @@ export {
 } from './preview.js';
 export { applyOutputCaps, capFinalText, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResult } from './caps.js';
 
+// Phase F review round 2: the out-of-band eval-break channel (the
+// interrupt tool's no-id path deliverable to a synchronously running
+// eval — see the module docs).
+export {
+  EvalBreakChannelImpl,
+  createEvalBreakChannel,
+  EVAL_BREAK_CHANNEL_SLOTS,
+  type EvalBreakChannel,
+} from './eval-break-channel.js';
+
 // Phase C: the broker, the append-only call store, and the eval
 // tool-result semantics. See the package README's "The broker" section.
 export {

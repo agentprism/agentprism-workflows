@@ -395,13 +395,14 @@ test("openSession({ schema }) states the contract in-band for embedSchemaInPromp
   );
 });
 
-test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension makes the founding turn's terminal state authoritative — completed-while-down settles from the replay, a still-running turn settles ONLY from the ended notification (never a quiet gap, never a re-issue), interrupted re-issues, and a backend without the extension degrades guest-visibly (never partial output, never a duplicate issue)", async () => {
+test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension makes the founding turn's terminal state authoritative — completed-while-down settles from the replay, a still-running turn settles ONLY from the ended notification (never a quiet gap, never a re-issue), interrupted re-issues, and a backend WITHOUT the extension is classified authoritatively by the observation path (the post-load continuation watch + the replay probe under the connection-death contract — never a quiet-gap guess, never a possibly-running re-issue)", async () => {
   // The round-3 semantics: completion evidence is the _session/loaded_turn extension's
   // terminal state (the steering-extension precedent), NOT quiet-gap heuristics. The
   // backend answers whether the founding turn is still running at query time and pushes
   // the authoritative `_session/loaded_turn/ended` notification when a running turn ends.
   const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
   process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = "400";
+  const prevObserve = process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
   try {
     // 1) Completed while down: the backend's query answers `completed` (the replay's
     //    trailing assistant message is the turn's FINAL message — an authoritative
@@ -528,40 +529,121 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
     );
     await loaded4.release();
 
-    // 5) A backend WITHOUT the extension (no `_meta.loadedTurn.supported` advertisement):
-    //    the terminal state is unobservable, so the seam rejects immediately with the
-    //    NON-re-armable still-running class — the broker's degradation is guest-visible
-    //    and honest: never settle partial output (a quiet gap is only a progress gap),
-    //    and the call degrades through the doc's re-issue fallback for a
-    //    capability-omitting backend (phase-F review: the old keep-attached-and-pending
-    //    arm left re-attached calls pending until interrupt/reset). The replay-complete
-    //    transcript is NOT settled (the round-1 defect: it used to be declared complete
-    //    after the quiet grace).
-    const { cwd: cwd5 } = harness.configure<LogEntry>({
+    // 5) THE OBSERVATION PATH — a backend WITHOUT the extension (no
+    //    `_meta.loadedTurn.supported` advertisement; the built-in claude
+    //    and opencode backends today). The seam classifies the founding
+    //    turn's terminal state authoritatively instead of rejecting: the
+    //    post-load continuation watch (any CONTENT update after the load
+    //    boundary is live continuation — the still-running signal), then
+    //    the replay probe (an assistant trailing message is a COMPLETED,
+    //    persisted message — the turn observably completed while down;
+    //    anything else means the turn died mid-way — nothing running,
+    //    safe to re-issue). Phase-F review round 2: the old rejection-
+    //    and-re-issue degradation could duplicate a still-running turn;
+    //    the observation path never re-issues a possibly-running call.
+    //
+    // 5a) Replay ends with the turn's terminal assistant message and no
+    //     live continuation follows the load → completed-while-down,
+    //     resolved with the real accumulated text.
+    process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = "150";
+    const { cwd: cwd5a, readLog: readLog5a } = harness.configure<LogEntry>({
       loadSessionSupport: true,
       loadSession: {
         replay: [
           { role: "user", text: "task" },
-          { role: "assistant", text: "looks complete but may be partial" },
+          { role: "assistant", text: "result B (loaded)" },
         ],
       },
     });
-    const runner5 = harness.makeRunner();
-    const loaded5 = await runner5.loadSession({ sessionId: "fake-session-any", cwd: cwd5, model: "claude" });
+    const runner5a = harness.makeRunner();
+    const loaded5a = await runner5a.loadSession({ sessionId: "fake-session-any", cwd: cwd5a, model: "claude" });
+    const turn5a = await loaded5a.awaitCurrentTurn();
+    assert.deepEqual(turn5a, { stopReason: "end_turn", text: "result B (loaded)" });
+    assert.ok(
+      !readLog5a().some(
+        (e) => e.method === "extensionRequest" && e.extensionMethod === "_session/loaded_turn/query",
+      ),
+      "no query on the wire — the observation path needs no extension",
+    );
+    await loaded5a.release();
+
+    // 5b) Live continuation arrives WITHIN the observation window → the
+    //     turn is still running: the seam keeps the loaded session
+    //     attached, never settles the quiet gap, never re-issues, and
+    //     rejects with the RE-ARMABLE still-running class at the max-wait
+    //     bound (the broker re-arms the wait on the attached session).
+    const { cwd: cwd5b } = harness.configure<LogEntry>({
+      loadSessionSupport: true,
+      loadSession: {
+        replay: [
+          { role: "user", text: "task" },
+          { role: "assistant", text: "looks complete but is partial" },
+        ],
+        continue: [
+          { afterMs: 60, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " — live continuation" } } },
+        ],
+      },
+    });
+    const runner5b = harness.makeRunner();
+    const loaded5b = await runner5b.loadSession({ sessionId: "fake-session-any", cwd: cwd5b, model: "claude" });
     await assert.rejects(
-      () => loaded5.awaitCurrentTurn(),
+      () => loaded5b.awaitCurrentTurn(),
       (error: unknown) => {
         assert.ok(
           (error as { loadedTurnStillRunning?: unknown }).loadedTurnStillRunning === true,
           `the still-running marker: ${String((error as Error).message)}`,
         );
-        assert.equal((error as { rearmable?: unknown }).rearmable, false, "non-re-armable: nothing observable will ever arrive");
-        assert.ok((error as Error).message.includes("does not advertise the _session/loaded_turn extension"), (error as Error).message);
-        assert.ok((error as Error).message.includes("re-issue is the honest fallback"), (error as Error).message);
+        assert.equal((error as { rearmable?: unknown }).rearmable, true, "re-armable: the broker keeps the attached session and re-arms");
+        assert.ok((error as Error).message.includes("live content followed the load"), (error as Error).message);
         return true;
       },
     );
-    await loaded5.release();
+    await loaded5b.release();
+
+    // 5c) The replay's trailing content is NOT an assistant message (the
+    //     turn died mid-way — interrupted/failed/abandoned while down)
+    //     and no live continuation followed the load → the safe-re-issue
+    //     class: nothing is running at the backend (the connection-death
+    //     contract), so re-issue cannot duplicate.
+    const { cwd: cwd5c } = harness.configure<LogEntry>({
+      loadSessionSupport: true,
+      loadSession: {
+        replay: [{ role: "user", text: "task" }],
+      },
+    });
+    const runner5c = harness.makeRunner();
+    const loaded5c = await runner5c.loadSession({ sessionId: "fake-session-any", cwd: cwd5c, model: "claude" });
+    await assert.rejects(
+      () => loaded5c.awaitCurrentTurn(),
+      (error: unknown) =>
+        (error as Error).message.includes("without a terminal assistant message") &&
+        (error as Error).message.includes("re-issue is the honest fallback") &&
+        (error as Error).message.includes("no duplication possible"),
+    );
+    await loaded5c.release();
+
+    // 5d) An EXTENSION backend whose query FAILS falls through to the
+    //     observation path (phase-F review round 2: the query's failure
+    //     used to reject with the non-re-armable still-running class,
+    //     pushing the broker to release-and-re-issue a possibly-running
+    //     call). The replay ends with the terminal assistant message and
+    //     no live continuation → completed-while-down, resolved from the
+    //     transcript.
+    const { cwd: cwd5d } = harness.configure<LogEntry>({
+      loadSessionSupport: true,
+      loadSession: {
+        loadedTurnQueryError: "query exploded",
+        replay: [
+          { role: "user", text: "task" },
+          { role: "assistant", text: "result D (loaded)" },
+        ],
+      },
+    });
+    const runner5d = harness.makeRunner();
+    const loaded5d = await runner5d.loadSession({ sessionId: "fake-session-any", cwd: cwd5d, model: "claude" });
+    const turn5d = await loaded5d.awaitCurrentTurn();
+    assert.deepEqual(turn5d, { stopReason: "end_turn", text: "result D (loaded)" });
+    await loaded5d.release();
 
     // 6) The unconditional arm: a transcript with NO user message (the recorded session
     //    never received its prompt) rejects with the safe-re-issue class even when the
@@ -585,5 +667,7 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
   } finally {
     if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
     else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
+    if (prevObserve === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = prevObserve;
   }
 });

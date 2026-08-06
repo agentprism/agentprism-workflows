@@ -42,7 +42,9 @@ const hasLoadedTurnSupport =
   (scenario.loadSession !== undefined &&
     scenario.loadSession !== null &&
     typeof scenario.loadSession === "object" &&
-    (scenario.loadSession.loadedTurn !== undefined || scenario.loadSession.turnEnded !== undefined));
+    (scenario.loadSession.loadedTurn !== undefined ||
+      scenario.loadSession.turnEnded !== undefined ||
+      scenario.loadSession.loadedTurnQueryError !== undefined));
 const hasResumeSessionSupport = scenario.resumeSessionSupport ?? hasLifecycleSupport;
 const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
 const hasMcpHttpSupport = scenario.mcpHttpSupport === true;
@@ -296,6 +298,9 @@ class FakeAgent {
     // scenario's scripted per-session loaded-turn state.
     if (method === "_session/loaded_turn/query") {
       if (hasLoadedTurnSupport) {
+        if (scenario.loadSession?.loadedTurnQueryError !== undefined) {
+          throw new RequestError(-32603, String(scenario.loadSession.loadedTurnQueryError));
+        }
         const loadedTurn = scenario.loadSession?.loadedTurn ?? {};
         return { status: loadedTurn.status ?? "interrupted" };
       }

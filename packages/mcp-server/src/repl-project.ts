@@ -68,10 +68,14 @@
  * `checkpoint.answer` resumes it — phase-E review rejection round 2),
  * breaking it MID-RUN through the quickjs interrupt handler. The daemon
  * is single-threaded, so a request cannot be PROCESSED while a
- * fully synchronous (never-yielding) eval executes — that case is
- * bounded by the per-eval wall-clock deadline (the harness's eval
- * guard): every eval and settlement drain runs under
- * `BrokerOptions.evalTimeoutMs` enforced by the quickjs interrupt
+ * fully synchronous (never-yielding) eval executes — phase-F review
+ * round 2: the OUT-OF-BAND eval-break channel closes that gap (a
+ * worker-thread relay the MCP shim fires before forwarding; the
+ * running eval's quickjs interrupt handler consumes the shared-memory
+ * break flag mid-execution — see `repl-engine`'s `eval-break-channel.ts`),
+ * and the per-eval wall-clock deadline (the harness's eval guard)
+ * remains the last-resort bound: every eval and settlement drain runs
+ * under `BrokerOptions.evalTimeoutMs` enforced by the quickjs interrupt
  * handler, so a runaway eval can never hang the workspace forever. An
  * eval that YIELDS (suspends on a subagent call or a checkpoint) is
  * interruptible at its next execution; the wait tool's pumps release
@@ -114,12 +118,45 @@ import {
   SnapshotEnvelopeError,
   Workspace,
   type BrokerRunner,
+  type EvalBreakChannel,
   type ReconcileReport,
   type ReplStoreOptions,
   type WasmModule,
 } from "@automatalabs/repl-engine";
 
 import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
+
+/** The truncation-reference store's capacity (the most recent elided-
+ *  entries snapshots a workspace retains for the `refs` read-back — a
+ *  chained read pages through the cap with fresh refs, so old snapshots
+ *  are never needed). */
+const TRUNCATION_REF_LIMIT = 16;
+
+/** One workspace's truncation-reference store (phase-F review round 2):
+ *  the structured-output cap's elided entries, snapshotted under fresh
+ *  ref ids and read back through a later call's `refs` parameter. The
+ *  sequence is store-global, so chained reads never collide with
+ *  earlier ids (a re-capped read-back's fresh ref continues the chain). */
+export class TruncationRefStore {
+  private readonly refs = new Map<string, unknown[]>();
+  private seq = 0;
+
+  /** Snapshot the dropped entries under a fresh ref id (the bounded
+   *  ring: the most recent `TRUNCATION_REF_LIMIT` snapshots win). */
+  set(values: unknown[]): string {
+    const ref = `t${++this.seq}`;
+    this.refs.set(ref, values);
+    if (this.refs.size > TRUNCATION_REF_LIMIT) {
+      const oldest = this.refs.keys().next().value as string;
+      this.refs.delete(oldest);
+    }
+    return ref;
+  }
+
+  get(ref: string): unknown[] | undefined {
+    return this.refs.get(ref);
+  }
+}
 
 /** One project context's REPL workspace: the store plus the live
  *  workspace/broker pair, created on first touch. */
@@ -162,6 +199,20 @@ export interface ReplProjectState {
    *  trace or retry. The drain latch stays clear on failure, so the next
    *  disconnect retries. */
   drainError: { name: string; message: string } | null;
+  /** The truncation-reference store (phase-F review round 2 — the
+   *  structured output cap's addressable continuation): when the
+   *  aggregate 10 KB structured-result cap elides an array's tail
+   *  entries (pending ids, checkpoint questions, completion ids,
+   *  status metadata), the DROPPED entries are snapshotted here under a
+   *  fresh ref id (`t1`, `t2`, …) that the result's `truncated` record
+   *  carries, and a later eval/wait/status call's optional `refs`
+   *  parameter reads them back — the cap costs reads, never data
+   *  (the doc's `$N` principle extended to every omitted structured
+   *  field). Bounded: the most recent `TRUNCATION_REF_LIMIT` refs are
+   *  retained (a chained read pages through the cap with fresh refs);
+   *  the store is in-memory and per-workspace — a daemon restart
+   *  re-reads current state with fresh elisions and fresh refs. */
+  readonly truncationRefs: TruncationRefStore;
 }
 
 /** Open (and create, on first touch) the project's repl state. */
@@ -182,6 +233,7 @@ export function createReplProjectState(
     generation: 0,
     drained: false,
     drainError: null,
+    truncationRefs: new TruncationRefStore(),
   };
 }
 
@@ -205,6 +257,7 @@ export async function ensureReplWorkspace(
   wasm: WasmModule,
   runner?: BrokerRunner,
   evalTimeoutMs: number = DEFAULT_REPL_EVAL_TIMEOUT_MS,
+  evalBreakChannel?: EvalBreakChannel,
 ): Promise<void> {
   // The in-flight first-touch promise is awaited BEFORE the workspace
   // fast path (phase-D review rejection: the fast path used to check
@@ -225,7 +278,7 @@ export async function ensureReplWorkspace(
   // without re-running the restore; only `reset` (which clears
   // `restoreError`) makes a fresh touch attempt again.
   if (state.restoreError !== null) return;
-  const promise = doFirstTouch(state, wasm, runner, evalTimeoutMs);
+  const promise = doFirstTouch(state, wasm, runner, evalTimeoutMs, evalBreakChannel);
   state.firstTouch = promise;
   try {
     await promise;
@@ -240,6 +293,7 @@ async function doFirstTouch(
   wasm: WasmModule,
   runner: BrokerRunner | undefined,
   evalTimeoutMs: number,
+  evalBreakChannel: EvalBreakChannel | undefined,
 ): Promise<void> {
   const generation = state.generation;
   const attach = async (workspace: Workspace): Promise<void> => {
@@ -256,8 +310,11 @@ async function doFirstTouch(
       // (see `Broker.armEvalBreak`; phase-E review rejection: the
       // project-wide boolean used to be consumable by an unrelated eval
       // or drain). The per-eval wall-clock deadline still bounds every
-      // eval and drain.
+      // eval and drain, and the OUT-OF-BAND eval-break channel (phase-F
+      // review round 2) makes the interrupt tool's no-id path
+      // deliverable to a synchronously running eval.
       evalTimeoutMs,
+      evalBreakChannel,
     });
     if (state.generation !== generation) {
       await broker.dispose();

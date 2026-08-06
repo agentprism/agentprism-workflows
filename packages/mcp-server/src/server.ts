@@ -47,6 +47,7 @@ import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
 import {
   loadShippedWasm,
   type BrokerRunner,
+  type EvalBreakChannel,
 } from "@automatalabs/repl-engine";
 
 import { EXTENSION_ID, registerAppTool } from "@modelcontextprotocol/ext-apps/server";
@@ -1176,6 +1177,11 @@ export interface CreateWorkflowServerOptions {
    * under it.
    */
   replClientId?: () => string | undefined;
+  /** The REPL eval-break relay (phase-F review round 2; daemon mode
+   *  only — the shim fires it while the daemon's main thread is blocked
+   *  in a synchronous eval). Omitted in single-project mode: the per-
+   *  eval deadline remains the bound there (see `repl-tool.ts`). */
+  replEvalBreakChannel?: EvalBreakChannel;
   /**
    * The concrete client-presence drain bound — the daemon reuses its session-eviction
    * TTL (the spec-owed decision; see `repl-presence.ts`). Defaults to
@@ -1261,6 +1267,7 @@ export function createWorkflowServer(
     evalTimeoutMs: replEvalTimeoutMs(),
     presence: replPresence,
     clientId: options.replClientId ?? (() => "single-project"),
+    evalBreakChannel: options.replEvalBreakChannel,
     acceptingWork: () => acceptingWork,
   });
 

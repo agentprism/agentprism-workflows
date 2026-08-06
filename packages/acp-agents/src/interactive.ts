@@ -403,70 +403,104 @@ export class InteractiveSession {
    * call.
    *
    * **The authoritative-completion seam** (the spec-owed decision,
-   * documented here — phase-D review round 3: the quiet-grace heuristic
-   * (a settled stream with a trailing assistant chunk treated as
-   * completion) and the blind re-issue fallback were both rejected,
-   * because a restored transcript ending in an assistant PARTIAL was
-   * durably settled as a completed-while-down turn when the next live
-   * chunk arrived later, and a still-running backend turn was re-issued
-   * (duplicated work). Completion evidence is now the `_session/loaded_turn`
-   * vendor extension — an AUTHORITATIVE turn-terminal channel for loaded
-   * sessions, advertised at initialize (`_meta.loadedTurn.supported ===
-   * true`, the steering-extension precedent): `session/load` still obliges
-   * the agent to replay the entire persisted conversation before resolving
-   * (the runner marks the LOAD BOUNDARY synchronously after the response),
-   * and the seam then asks the backend `_session/loaded_turn/query`
-   * whether the founding turn is still running RIGHT NOW. The backend
-   * answers with one of three terminal classifications:
+   * documented here). Completion evidence comes from TWO channels, by
+   * backend class:
    *
-   * - **`running`** — the founding turn is still executing at the backend
-   *   (its replay transcript is PARTIAL, whatever its trailing content).
-   *   The seam KEEPS THE LOADED SESSION ATTACHED and waits for the
-   *   `_session/loaded_turn/ended` notification — the turn's authoritative
-   *   terminal marker (a quiet gap is only a progress-stream gap, never
-   *   terminal evidence; the notification fires when the turn ends,
-   *   carrying the stop reason or the error). It absorbs the turn's live
-   *   `session/update` stream meanwhile, so a completion settles with the
-   *   turn's REAL accumulated text. The wait is bounded by
-   *   `LOADED_TURN_MAX_WAIT_MS` (default 15 min;
-   *   `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` — the "never hang
-   *   unobserved" backstop); a bound expiry rejects with the
-   *   `LoadedTurnStillRunningError` (re-armable: the notification may
-   *   still arrive later).
-   * - **`completed`** — no turn is running, and the founding turn
-   *   observably completed while this host was down: the replay's
-   *   trailing assistant message is its FINAL message, so the seam
-   *   resolves with it IMMEDIATELY (`{ stopReason: "end_turn", text }` —
-   *   the stop reason is synthesized because the protocol's replay
-   *   carries none; the text is the turn's real accumulated outcome, and
-   *   the broker's result-shaping ladder reads the same transcript).
-   *   A backend that answers `completed` while the replay does NOT end
-   *   with an assistant message contradicts itself — the final message is
-   *   not in the replay, so the seam rejects with the safe-re-issue
-   *   class.
-   * - **`interrupted`** — no turn is running, and the founding turn ended
-   *   without a terminal assistant message (it was interrupted/failed/
-   *   abandoned while the host was down). Its outcome is not observable,
-   *   but nothing is running at the backend, so the seam rejects with the
-   *   SAFE-RE-ISSUE class (the broker re-issues under the same call id —
-   *   no duplication possible).
+   * 1. **The `_session/loaded_turn` vendor extension** (the steering-
+   *    extension precedent; advertised at initialize
+   *    (`_meta.loadedTurn.supported === true`), served by the in-repo
+   *    `@automatalabs/pi-acp` and `@automatalabs/codex-acp`):
+   *    `session/load` obliges the agent to replay the entire persisted
+   *    conversation before resolving (the runner marks the LOAD BOUNDARY
+   *    synchronously after the response), and the seam then asks the
+   *    backend `_session/loaded_turn/query` whether the founding turn is
+   *    still running RIGHT NOW. The backend answers with one of three
+   *    terminal classifications:
    *
-   * **Backends WITHOUT the extension degrade guest-visibly** (the doc's
-   * established pattern for missing capabilities — never by settling
-   * partial output and never by duplicate issue): the terminal state is
-   * unobservable, so the seam rejects immediately with the
-   * `LoadedTurnStillRunningError` (non-re-armable) — the broker then
-   * degrades through the doc's honest fallback for a capability-omitting
-   * backend: it releases the loaded session and re-issues the call under
-   * the same id, surfaced guest-visibly (phase-F review: the old
-   * keep-attached-and-pending arm left re-attached calls on seam-less
-   * backends pending until interrupt/reset and is deleted — every
-   * continuation must settle exactly once through one of the three
-   * reconciliation arms). The same
-   * classification applies when the `_session/loaded_turn/query` wire
-   * request itself fails (the capability gate or a wire error): the
-   * answer is the one thing that makes completion observable, and its
-   * absence is the missing extension.
+   *    - **`running`** — the founding turn is still executing at the
+   *      backend. The seam KEEPS THE LOADED SESSION ATTACHED and waits
+   *      for the `_session/loaded_turn/ended` notification — the turn's
+   *      authoritative terminal marker (a quiet gap is only a
+   *      progress-stream gap, never terminal evidence; the notification
+   *      fires when the turn ends, carrying the stop reason or the
+   *      error). It absorbs the turn's live `session/update` stream
+   *      meanwhile, so a completion settles with the turn's REAL
+   *      accumulated text. The wait is bounded by
+   *      `LOADED_TURN_MAX_WAIT_MS` (default 15 min;
+   *      `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` — the "never hang
+   *      unobserved" backstop); a bound expiry rejects with the
+   *      `LoadedTurnStillRunningError` (the broker re-arms the wait on
+   *      the still-attached session — the notification may still arrive
+   *      later).
+   *    - **`completed`** — no turn is running, and the founding turn
+   *      observably completed while this host was down: the replay's
+   *      trailing assistant message is its FINAL message, so the seam
+   *      resolves with it IMMEDIATELY (`{ stopReason: "end_turn", text }`
+   *      — the stop reason is synthesized because the protocol's replay
+   *      carries none; the text is the turn's real accumulated outcome,
+   *      and the broker's result-shaping ladder reads the same
+   *      transcript). A backend that answers `completed` while the
+   *      replay does NOT end with an assistant message contradicts
+   *      itself — the final message is not in the replay, so the seam
+   *      rejects with the safe-re-issue class.
+   *    - **`interrupted`** — no turn is running, and the founding turn
+   *      ended without a terminal assistant message (it was
+   *      interrupted/failed/abandoned while the host was down). Its
+   *      outcome is not observable, but nothing is running at the
+   *      backend, so the seam rejects with the SAFE-RE-ISSUE class (the
+   *      broker re-issues under the same call id — no duplication
+   *      possible).
+   *
+   *    A QUERY FAILURE (the capability gate or a wire error) is NOT the
+   *    missing extension: the seam falls THROUGH to the observation path
+   *    below instead of classifying unobservable (phase-F review round
+   *    2 — the loaded session may still be executing, and a
+   *    possibly-running call is never released-and-re-issued).
+   *
+   * 2. **The observation path — backends WITHOUT the extension (the
+   *    built-in claude and opencode backends today), and extension
+   *    backends whose query failed.** The authoritative observation is
+   *    the loaded session's OWN stream plus its replay, under the
+   *    CONNECTION-DEATH CONTRACT (live-verified against the current
+   *    built-in servers): every built-in ACP server terminates its
+   *    sessions' in-flight turns when the client connection closes —
+   *    claude-agent-acp and pi-acp exit on connection close and cancel
+   *    their turns (`connection.closed.then(shutdown)` → teardown →
+   *    cancel + kill), `opencode acp` exits on stdin EOF, and codex-acp
+   *    ends/kills the codex process — and their persisted transcripts
+   *    contain only COMPLETED messages. So after a daemon crash the
+   *    founding turn is NEVER still running at the backend, and the
+   *    replay's trailing content is authoritative: an assistant message
+   *    is the turn's terminal message (completed while down); anything
+   *    else means the turn died mid-way (interrupted — nothing running,
+   *    safe to re-issue). The one caveat is the in-flight-wire race —
+   *    content still streaming when the load response resolves — so the
+   *    seam first runs a bounded POST-LOAD CONTINUATION WATCH
+   *    (`LOADED_TURN_OBSERVE_MS`, default 1 s;
+   *    `AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS`): any CONTENT update
+   *    applied after the load boundary is LIVE CONTINUATION — the
+   *    authoritative still-running signal — and flips the classification
+   *    to the keep-attached wait (below). No content within the window
+   *    → classify from the replay (completed / interrupted). The window
+   *    is the spec-owed concrete decision replacing the rejected
+   *    quiet-grace heuristic: the grace is bounded AND the classification
+   *    rests on the connection-death contract, never on a quiet gap
+   *    alone (phase-D review round 3 rejected the unbounded settle-from-
+   *    trailing-chunk guess; a still-running turn's quiet parks are
+   *    never settled here — a park produces no content, but for the
+   *    built-ins no turn can be running at restore in the first place).
+   *
+   * **The keep-attached still-running wait** (both channels): the
+   * loaded session stays attached, the turn's live stream is absorbed,
+   * and the seam waits for the terminal state — the `_session/loaded_turn/ended`
+   * notification when the backend pushes one (an extension backend, or
+   * a seam-less backend that sends it anyway), the max-wait bound (the
+   * "never hang unobserved" backstop), or the session's release. A
+   * bound expiry rejects with the `LoadedTurnStillRunningError`, and
+   * the broker RE-ARMS the wait on the still-attached session (phase-F
+   * review round 2: a possibly-running call is never re-issued — the
+   * re-issue arm is reserved for observably-dead calls); a cancel or
+   * the broker's drain settles it.
    *
    * The unconditional arms stay: a handle that was never load-marked
    * (not produced by the runner's `loadSession` path), and a transcript
@@ -494,42 +528,25 @@ export class InteractiveSession {
           "(its outcome is unobservable; re-issue is the honest fallback)",
       );
     }
-    // The terminal-state gate: a backend without the `_session/loaded_turn`
-    // extension cannot answer the one question that makes the founding
-    // turn's completion observable. Degrade guest-visibly — never settle
-    // partial output (a quiet gap is only a progress gap) — by rejecting
-    // with the non-re-armable still-running class: the broker then
-    // releases the loaded session and re-issues the call under the same
-    // id (the doc's honest fallback for a capability-omitting backend,
-    // surfaced guest-visibly).
     const capabilities = this.connection.capabilities;
-    if (capabilities?.supportsLoadedTurnTerminalState !== true) {
-      throw new LoadedTurnStillRunningError(
-        `the loaded session's founding-turn terminal state is unobservable: ${this.backendId} does not ` +
-          `advertise the _session/loaded_turn extension — the turn may still be running at the backend, and ` +
-          `its completion has no ACP v1 terminal marker; re-issue is the honest fallback (surfaced ` +
-          `guest-visibly)`,
-        false,
-      );
-    }
-    // Subscribe to the ended channel BEFORE the query: a turn that ends
-    // between the query response and this wait must not be missed (the
-    // notification is recorded on the session state, first-wins).
-    let status: LoadedTurnStatus;
-    try {
-      status = (await this.connection.queryLoadedTurn(this.sessionId, this.label)).status;
-    } catch (error) {
-      // The wire query failed (the capability gate or a wire error): the
-      // authoritative answer is unavailable, so the terminal state is
-      // unobservable — the same degradation as a backend without the
-      // extension (never settle a quiet gap; the broker re-issues).
-      throw new LoadedTurnStillRunningError(
-        `the loaded session's founding-turn terminal state is unobservable: _session/loaded_turn/query ` +
-          `failed (${thrownMessageOf(error)}) — the turn may still be running at the backend; re-issue is the ` +
-          `honest fallback (surfaced guest-visibly)`,
-        false,
-      );
-    }
+    if (capabilities?.supportsLoadedTurnTerminalState === true) {
+      // Subscribe to the ended channel BEFORE the query: a turn that ends
+      // between the query response and this wait must not be missed (the
+      // notification is recorded on the session state, first-wins).
+      let status: LoadedTurnStatus;
+      try {
+        status = (await this.connection.queryLoadedTurn(this.sessionId, this.label)).status;
+      } catch (error) {
+        // The wire query failed (the capability gate or a wire error):
+        // the authoritative answer is unavailable, so the terminal state
+        // is classified by the OBSERVATION path instead (the same path a
+        // seam-less backend takes — the post-load continuation watch plus
+        // the replay probe under the connection-death contract). Phase-F
+        // review round 2: a query failure must NOT push the broker to
+        // release-and-re-issue — the loaded session may still be
+        // executing, and a possibly-running call is never re-issued.
+        return this.observeLoadedTurn(boundary, error);
+      }
     if (status === "completed") {
       if (boundary.trailingContentKind !== "assistant-message") {
         // The backend claims the founding turn completed, but its final
@@ -559,8 +576,128 @@ export class InteractiveSession {
     // and the seam waits for the `_session/loaded_turn/ended` notification
     // (absorbing the turn's live update stream — the settle text is the
     // accumulated transcript at the notification, the turn's REAL outcome).
+    return this.waitForRunningLoadedTurn(loadedTurnMaxWaitMs(), `the query classified the loaded session's founding turn running`);
+  }
+    // No extension (the built-in claude and opencode backends today) — or
+    // the query failed and the catch already fell through: the
+    // observation path classifies the founding turn's terminal state
+    // (see `observeLoadedTurn`).
+    return this.observeLoadedTurn(boundary, undefined);
+  }
+
+  /**
+   * The observation path — backends WITHOUT the `_session/loaded_turn`
+   * extension (the built-in claude and opencode backends today), and
+   * extension backends whose query failed (see `awaitCurrentTurn`'s
+   * doc for the full semantics — the connection-death contract, the
+   * post-load continuation watch, and the replay probe). Never settles
+   * a quiet gap, never re-issues a possibly-running turn: the
+   * classification is authoritative for the built-ins because their ACP
+   * servers terminate in-flight turns when the client connection closes
+   * (live-verified), and the replay holds only completed messages.
+   */
+  private async observeLoadedTurn(
+    boundary: {
+      hasUserMessage: boolean;
+      trailingContentKind: 'assistant-message' | 'other';
+      sawPostLoadContentUpdate: boolean;
+    },
+    queryFailure: unknown,
+  ): Promise<InteractiveTurn> {
+    // The post-load continuation watch: the load response resolves after
+    // the replay completes, so any CONTENT update applied after the
+    // boundary is live continuation — the authoritative still-running
+    // signal. A content update that ALREADY arrived (applied between the
+    // load response and this call) skips the window.
+    if (!boundary.sawPostLoadContentUpdate) {
+      const contentArrived = await this.waitForPostLoadContent(loadedTurnObserveMs());
+      if (this.releasePromise) {
+        throw new Error("InteractiveSession has been released");
+      }
+      if (!contentArrived) {
+        // The stream stayed quiet through the observation window: classify
+        // the founding turn's terminal state from the REPLAY (authoritative
+        // under the connection-death contract — the replay's trailing
+        // assistant message is a COMPLETED, persisted message, and no
+        // live continuation followed the load).
+        if (boundary.trailingContentKind === 'assistant-message') {
+          return { stopReason: "end_turn", text: this.session.loadedTurnText() };
+        }
+        throw new Error(
+          `the loaded session's founding turn ended without a terminal assistant message (its replayed ` +
+            `transcript's trailing content is not an assistant message) and no live continuation followed the ` +
+            `load — the turn was interrupted, failed, or abandoned while this host was down, and nothing is ` +
+            `running at the backend; re-issue is the honest fallback (no duplication possible)`,
+        );
+      }
+    }
+    // Live continuation was observed: the turn IS still running. Keep the
+    // loaded session attached and wait for the terminal state (see
+    // `waitForRunningLoadedTurn`).
+    return this.waitForRunningLoadedTurn(
+      loadedTurnMaxWaitMs(),
+      queryFailure === undefined
+        ? `live content followed the load response on ${this.backendId}`
+        : `live content followed the load response on ${this.backendId} (_session/loaded_turn/query failed: ` +
+          `${thrownMessageOf(queryFailure)})`,
+    );
+  }
+
+  /** The post-load continuation watch: resolve true on the first CONTENT
+   *  update applied after the load boundary (live-continuation evidence —
+   *  the authoritative still-running signal), false when the observation
+   *  window elapses without one (or the session is released — the caller
+   *  re-checks `releasePromise` before classifying). Bookkeeping updates
+   *  (usage, mode, available commands — claude emits an
+   *  `available_commands_update` right after every load) never count:
+   *  the flag flips only on content updates. */
+  private waitForPostLoadContent(observeMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (this.releasePromise) {
+        resolve(false);
+        return;
+      }
+      if (this.session.loadBoundaryState().sawPostLoadContentUpdate) {
+        resolve(true);
+        return;
+      }
+      let finished = false;
+      const finish = (result: boolean) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        offUpdate();
+        releaseWatcher();
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish(false), observeMs);
+      const offUpdate = this.session.subscribeUpdates(() => {
+        if (this.session.loadBoundaryState().sawPostLoadContentUpdate) finish(true);
+      });
+      const releaseWatcher = () => {
+        this.releaseWatchers.delete(releaseWatcher);
+        finish(false);
+      };
+      this.releaseWatchers.add(releaseWatcher);
+    });
+  }
+
+  /**
+   * The keep-attached still-running wait (the extension's `running` arm
+   * AND the observation path's live-continuation arm): the loaded
+   * session stays attached, the turn's live stream is absorbed, and the
+   * seam waits for the terminal state — the `_session/loaded_turn/ended`
+   * notification when the backend pushes one, the max-wait bound (the
+   * "never hang unobserved" backstop), or the session's release —
+   * whichever comes first (no polling: a long still-running turn is
+   * observed with zero busy work). A bound expiry rejects with the
+   * re-armable `LoadedTurnStillRunningError`: the broker re-arms the
+   * wait on the still-attached session — a later ended notification — or
+   * a cancel — still settles the call (phase-F review round 2: a
+   * possibly-running call is never re-issued).
+   */
+  private async waitForRunningLoadedTurn(maxWaitMs: number, context: string): Promise<InteractiveTurn> {
     const start = Date.now();
-    const maxWaitMs = loadedTurnMaxWaitMs();
     for (;;) {
       if (this.releasePromise) {
         throw new Error(
@@ -574,17 +711,16 @@ export class InteractiveSession {
       const elapsed = Date.now() - start;
       if (elapsed >= maxWaitMs) {
         // The "never hang unobserved" backstop: the turn is STILL running
-        // and its terminal notification has not arrived. Never settle a
+        // and its terminal state has not become observable. Never settle a
         // quiet gap and never re-issue a possibly-running turn — reject
-        // with the re-armable still-running class (the broker keeps the
-        // loaded session attached, warns guest-visibly, and re-arms the
-        // seam so a later notification — or a cancel — still settles the
-        // call).
+        // with the still-running class (the broker keeps the loaded
+        // session attached, warns guest-visibly, and re-arms the seam so
+        // a later notification — or a cancel — still settles the call).
         throw new LoadedTurnStillRunningError(
-          `the loaded session's founding turn is still running at the backend, and its terminal notification ` +
-            `has not arrived within ${maxWaitMs} ms of the query — settling a quiet gap could durably record ` +
-            `partial output, and re-issuing could duplicate the running turn; the broker re-arms the wait on ` +
-            `the attached session`,
+          `the loaded session's founding turn is still running at the backend (${context}), and its terminal ` +
+            `state has not become observable within ${maxWaitMs} ms of the load — settling a quiet gap could ` +
+            `durably record partial output, and re-issuing could duplicate the running turn; the broker keeps ` +
+            `the loaded session attached and re-arms the wait on it`,
           true,
         );
       }
@@ -736,11 +872,12 @@ export class InteractiveSession {
 
 /** The loaded-session founding-turn max wait: the re-attach arm's
  *  "never hang unobserved" backstop (see `awaitCurrentTurn`). A turn the
- *  backend classifies as `running` is waited out up to this bound for its
- *  `_session/loaded_turn/ended` notification — it may legitimately run
- *  for many minutes — then the seam rejects with the re-armable
+ *  backend classifies as `running` (or the observation path sees live
+ *  content from) is waited out up to this bound for its terminal state —
+ *  the `_session/loaded_turn/ended` notification, or the end of the
+ *  live stream — then the seam rejects with the
  *  `LoadedTurnStillRunningError` (the broker keeps the loaded session
- *  attached and re-arms the wait on it so a later notification still
+ *  attached and re-arms the wait on it, so a later notification still
  *  settles the call). Default 15 min;
  *  `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` overrides (clamped to
  *  >= 1 ms). */
@@ -751,6 +888,25 @@ function loadedTurnMaxWaitMs(): number {
     if (Number.isFinite(parsed) && parsed >= 1) return parsed;
   }
   return 15 * 60 * 1000;
+}
+
+/** The observation path's post-load continuation window (see
+ *  `observeLoadedTurn`): how long the seam watches the loaded session's
+ *  stream for live continuation before classifying the founding turn's
+ *  terminal state from the replay. The window absorbs content still in
+ *  flight when the load response resolved (the replay completes before
+ *  the response, so this is only the wire race and the first live chunk
+ *  of a turn that is running after all); under the connection-death
+ *  contract no built-in turn can be running at restore, so the window is
+ *  short. Default 1 s; `AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS`
+ *  overrides (clamped to >= 1 ms). */
+function loadedTurnObserveMs(): number {
+  const env = process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+  if (env !== undefined) {
+    const parsed = Number.parseInt(env, 10);
+    if (Number.isFinite(parsed) && parsed >= 1) return parsed;
+  }
+  return 1000;
 }
 
 /** The ACP stop-reason vocabulary the loaded-turn ended notification may
@@ -766,24 +922,21 @@ const LOADED_TURN_STOP_REASONS = new Set<StopReason>([
 
 /** The re-attach arm's duplicate-risk rejection: the loaded session's
  *  founding turn MAY STILL BE RUNNING at the backend and its terminal
- *  state is unobservable — the backend does not advertise the
- *  `_session/loaded_turn` extension (or its query failed), or a turn
- *  classified `running` produced no terminal notification within the
- *  max-wait bound. The host must NEVER settle partial output (a quiet
- *  gap is only a progress-stream gap). `rearmable` is true only when a
- *  terminal notification may still arrive (a `running` turn past its
- *  max-wait bound): the broker then re-arms the seam on the still-
- *  attached session — the doc's second reconciliation arm, re-attach to
- *  a still-running task. It is false when nothing observable will ever
- *  arrive (the extension is absent, or the query wire failed): the
- *  broker degrades through the doc's honest fallback for a capability-
- *  omitting backend — it releases the loaded session and re-issues the
- *  call under the same id, surfaced guest-visibly (phase-F review: the
- *  old keep-attached-and-pending arm left re-attached calls pending
- *  until interrupt/reset; every continuation must settle exactly once
- *  through one of the three reconciliation arms). The marker property is
- *  structural, so third-party adapter seams can throw the same class of
- *  rejection. */
+ *  state is unobservable — a `running`-classified turn produced no
+ *  terminal notification within the max-wait bound (the observation
+ *  path's live-continuation arm included). The host must NEVER settle
+ *  partial output (a quiet gap is only a progress-stream gap) and NEVER
+ *  re-issue a possibly-running call: the broker KEEPS THE LOADED SESSION
+ *  ATTACHED and re-arms the seam on it — the doc's second reconciliation
+ *  arm, re-attach to a still-running task — for every form of this
+ *  rejection (phase-F review round 2: the old non-re-armable form
+ *  pushed the broker to release the loaded session and re-issue the
+ *  call, which could duplicate a still-running backend turn; re-issue
+ *  is now reserved for the observably-dead classes). A later terminal
+ *  notification — or a cancel — still settles the call. The marker
+ *  property is structural, so third-party adapter seams can throw the
+ *  same class of rejection; `rearmable` is retained for compatibility
+ *  with those seams (the broker re-arms both forms). */
 export class LoadedTurnStillRunningError extends Error {
   readonly loadedTurnStillRunning = true;
   constructor(

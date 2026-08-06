@@ -233,7 +233,7 @@ class DelayedOpenRunner extends FakeRunner {
 /** Call the repl tool over HTTP (typed over the raw input). */
 function repl(
   session: { client: Client },
-  input: { action: string; projectDir?: string; code?: string; ids?: string[]; timeoutMs?: number; id?: string },
+  input: { action: string; projectDir?: string; code?: string; ids?: string[]; timeoutMs?: number; id?: string; refs?: string[] },
 ): ReturnType<Client["callTool"]> {
   return session.client.callTool({ name: "repl", arguments: input as Record<string, unknown> });
 }
@@ -249,7 +249,7 @@ async function tick(): Promise<void> {
 test("the repl tool registers alongside workflow with the doc's exact action-enum schema; snapshotting is implicit (no snapshot action)", async () => {
   const Schema = z.object(replToolInputShape);
   // The field set is exactly the doc's surface.
-  assert.deepEqual(Object.keys(replToolInputShape).sort(), ["action", "code", "id", "ids", "projectDir", "timeoutMs"]);
+  assert.deepEqual(Object.keys(replToolInputShape).sort(), ["action", "code", "id", "ids", "projectDir", "refs", "timeoutMs"]);
   // No user-facing snapshot action: snapshotting is implicit (the doc's
   // "Snapshotting is implicit — there is no user-facing snapshot action").
   assert.ok(!("snapshot" in replToolInputShape), "snapshot must not be a tool action");
@@ -336,7 +336,7 @@ test("the repl tool registers alongside workflow with the doc's exact action-enu
       const schema = wire.inputSchema as { properties: Record<string, unknown>; required?: string[] };
       assert.deepEqual(
         Object.keys(schema.properties).sort(),
-        ["action", "code", "id", "ids", "projectDir", "timeoutMs"],
+        ["action", "code", "id", "ids", "projectDir", "refs", "timeoutMs"],
       );
       const action = schema.properties.action as { enum?: string[] };
       assert.deepEqual(action.enum, ["eval", "wait", "status", "interrupt", "reset"]);
@@ -1030,16 +1030,68 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
         Buffer.byteLength(JSON.stringify(scMeta), "utf8") <= OUTPUT_MAX_BYTES,
         `the structured surface respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(scMeta), "utf8")} bytes`,
       );
-      const truncated = (scMeta.truncated ?? {}) as Record<string, number>;
+      const truncated = (scMeta.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
       const scPending = scMeta.pending as string[];
-      assert.equal(scPending.length + (truncated.pending ?? 0), 300, "the structured pending reconciles to the whole registry");
+      assert.equal(
+        scPending.length + (truncated.pending?.elided ?? 0),
+        300,
+        "the structured pending reconciles to the whole registry",
+      );
       assert.ok(scPending.every((id, index) => id === `c${index + 1}`), "dense and in order — no holes");
+      if (truncated.pending !== undefined) {
+        assert.ok(typeof truncated.pending.ref === "string", "an elided pending tail carries its continuation ref");
+      }
       const scCheckpoints = scMeta.checkpoints as unknown[];
       assert.equal(
-        scCheckpoints.length + (truncated.checkpoints ?? 0),
+        scCheckpoints.length + (truncated.checkpoints?.elided ?? 0),
         300,
         "the structured checkpoints reconcile to the whole registry",
       );
+      assert.ok(typeof truncated.checkpoints?.ref === "string", "the elided checkpoint tail carries its continuation ref");
+      // Phase-F review round 2: the omitted values are ADDRESSABLE — a
+      // later read with the refs parameter recovers the elided tails
+      // (the cap costs reads, never data). A referenced read is itself
+      // capped: when the read-back crosses the aggregate bound again,
+      // the response's own truncated record carries a FRESH continuation
+      // ref for the referenced field — chain the refs until the whole
+      // registry is recovered.
+      const recovered = new Set<string>((scMeta.pending as string[]) ?? []);
+      const questions = new Set<string>((scMeta.checkpoints as Array<{ question?: string }>)?.map((c) => c.question ?? ""));
+      let queue = [
+        truncated.checkpoints!.ref!,
+        ...(truncated.pending !== undefined ? [truncated.pending.ref!] : []),
+      ];
+      let hops = 0;
+      while (queue.length > 0 && hops < 8) {
+        const refRead = await repl(session, {
+          action: "status",
+          projectDir: PROJECT,
+          refs: queue,
+        });
+        assert.ok(!isErrorResult(refRead), textOf(refRead));
+        const refSc = (refRead as { structuredContent?: Record<string, unknown> }).structuredContent!;
+        const referenced = (refSc.referenced ?? {}) as Record<string, unknown[]>;
+        for (const ref of queue) {
+          for (const value of referenced[ref] ?? []) {
+            if (typeof value === "string" && /^c\d+$/.test(value)) recovered.add(value);
+            else if (typeof value === "object" && value !== null) {
+              questions.add((value as { question?: string }).question ?? "");
+            }
+          }
+        }
+        // The read-back's own elisions chain onward (a referenced read
+        // is capped like any other result).
+        const chained = (refSc.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
+        queue = Object.values(chained)
+          .filter((entry) => typeof entry.ref === "string")
+          .map((entry) => entry.ref as string)
+          .filter((ref) => !queue.includes(ref));
+        hops++;
+      }
+      if (truncated.pending !== undefined) {
+        assert.equal(recovered.size, 300, "every elided pending id was recovered through the ref chain");
+      }
+      assert.equal(questions.size, 300, "every elided checkpoint question was recovered through the ref chain");
     } finally {
       await session.dispose();
     }
@@ -1404,16 +1456,18 @@ test("review round 8: the aggregate structured-result cap bounds the eval/wait/s
       assert.ok(!isErrorResult(evaled), textOf(evaled));
       const sc = boundedSc(evaled);
       const pending = sc.pending as string[];
-      const truncated = (sc.truncated ?? {}) as Record<string, number>;
+      const truncated = (sc.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
       assert.ok(pending.length > 0, "the head prefix is non-empty");
       assert.ok(pending.length < CHECKPOINTS, "the wire is bounded, not the whole registry");
       assert.equal(pending[0], "c1", "the kept prefix starts at the head");
-      assert.equal(truncated.pending, CHECKPOINTS - pending.length, "the elided pending count reconciles");
+      assert.equal(truncated.pending?.elided, CHECKPOINTS - pending.length, "the elided pending count reconciles");
+      assert.ok(typeof truncated.pending?.ref === "string", "the elided pending tail carries its continuation ref");
       for (const id of pending) {
         assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no truncation/undefined hole: ${JSON.stringify(id)}`);
       }
       const checkpoints = sc.checkpoints as Array<{ id: string }>;
-      assert.equal(checkpoints.length + (truncated.checkpoints ?? 0), CHECKPOINTS, "the elided checkpoint count reconciles");
+      assert.equal(checkpoints.length + (truncated.checkpoints?.elided ?? 0), CHECKPOINTS, "the elided checkpoint count reconciles");
+      assert.ok(typeof truncated.checkpoints?.ref === "string", "the elided checkpoint tail carries its continuation ref");
       for (const checkpoint of checkpoints) {
         assert.ok(/^c\d+$/.test(checkpoint.id), `no checkpoint hole: ${JSON.stringify(checkpoint.id)}`);
       }
@@ -1436,21 +1490,22 @@ test("review round 8: the aggregate structured-result cap bounds the eval/wait/s
       const sc = boundedSc(status);
       const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
       assert.equal(w.state, "restored", "the workspace restored from the snapshot");
-      const truncated = (sc.truncated ?? {}) as Record<string, number>;
+      const truncated = (sc.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
       assert.ok(Object.keys(truncated).length > 0, "the wire elision is flagged");
       const pending = w.pending as string[];
       assert.ok(pending.length < CHECKPOINTS, "the status pending surface is bounded");
       assert.equal(
-        pending.length + (truncated["workspaces[0].pending"] ?? 0),
+        pending.length + (truncated["workspaces[0].pending"]?.elided ?? 0),
         CHECKPOINTS,
         "the status pending counts reconcile",
       );
+      assert.ok(typeof truncated["workspaces[0].pending"]?.ref === "string", "the status elision carries its continuation ref");
       for (const id of pending) {
         assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no hole after restore: ${JSON.stringify(id)}`);
       }
       const checkpoints = w.checkpoints as Array<{ id: string }>;
       assert.equal(
-        checkpoints.length + (truncated["workspaces[0].checkpoints"] ?? 0),
+        checkpoints.length + (truncated["workspaces[0].checkpoints"]?.elided ?? 0),
         CHECKPOINTS,
         "every checkpoint re-surfaced in the VM, wire-bounded",
       );
@@ -1459,7 +1514,7 @@ test("review round 8: the aggregate structured-result cap bounds the eval/wait/s
       const requeued = truncated["workspaces[0].reconcile.requeuedCheckpoints"];
       if (requeued !== undefined) {
         const kept = ((w.reconcile as Record<string, unknown>).requeuedCheckpoints as string[]).length;
-        assert.equal(kept + requeued, CHECKPOINTS, "the reconcile id list reconciles too");
+        assert.equal(kept + (requeued as { elided: number }).elided, CHECKPOINTS, "the reconcile id list reconciles too");
       }
     } finally {
       await session.dispose();

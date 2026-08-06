@@ -53,11 +53,16 @@
  *   first observation so a later eval is unaffected (see
  *   `src/repl-project.ts`). A fully synchronous (never-yielding)
  *   runaway blocks the single-threaded daemon's event loop, so the
- *   request itself cannot arrive mid-run — that case is bounded by the
- *   per-eval wall-clock deadline (the harness's eval guard); every
- *   eval that YIELDS (suspends on a call) is interruptible at its next
- *   execution, and the wait tool's pumps run with the broker chain
- *   released between them so an interrupt lands promptly mid-wait.
+ *   request itself cannot be PROCESSED mid-run — phase-F review round 2:
+ *   the out-of-band eval-break channel closes exactly that gap (the MCP
+ *   shim fires the relay — a worker thread — before forwarding, and the
+ *   running eval's quickjs interrupt handler consumes the break flag
+ *   mid-execution; see `src/eval-break-channel.ts` in repl-engine); the
+ *   per-eval wall-clock deadline (the harness's eval guard) remains the
+ *   last-resort bound. Every eval that YIELDS (suspends on a call) is
+ *   interruptible at its next execution, and the wait tool's pumps run
+ *   with the broker chain released between them so an interrupt lands
+ *   promptly mid-wait.
  * - `reset { projectDir }` → teardown (cancels in-flight ACP sessions,
  *   drops the VM and the whole `repl/` store), clearing any contained
  *   snapshot refusal.
@@ -70,7 +75,7 @@
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { BrokerRunner, WasmModule } from "@automatalabs/repl-engine";
+import type { BrokerRunner, EvalBreakChannel, WasmModule } from "@automatalabs/repl-engine";
 import type { ReplEvalResult } from "@automatalabs/repl-engine";
 import { capFinalText, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "@automatalabs/repl-engine";
 import { isAbsolute } from "node:path";
@@ -81,6 +86,7 @@ import {
   createReplProjectState,
   ensureReplWorkspace,
   resetReplProjectState,
+  TruncationRefStore,
   type ReplProjectState,
 } from "./repl-project.js";
 import type { ReplPresenceLedger } from "./repl-presence.js";
@@ -126,6 +132,15 @@ export const replToolInputShape = {
     .string()
     .optional()
     .describe("The call id to cancel (interrupt action). Omitted: break the running eval (honestly refused when no eval is in flight)."),
+  refs: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Continuation refs to read back (eval/wait/status): the truncated record's ref ids from an earlier result — " +
+        "the snapshot of the entries the structured-output cap elided (pending ids, checkpoint questions, " +
+        "completion ids, status metadata). The result carries them under `referenced` — the cap costs reads, " +
+        "never data.",
+    ),
 };
 
 export interface ReplToolOptions {
@@ -150,6 +165,14 @@ export interface ReplToolOptions {
   /** This server's client id (the MCP session id in daemon mode), used
    *  to touch presence. */
   clientId: () => string | undefined;
+  /** The OUT-OF-BAND eval-break channel (phase-F review round 2; see
+   *  repl-engine's `EvalBreakChannel`): the worker-thread relay the MCP
+   *  shim fires while the daemon's main thread is blocked in a
+   *  synchronous eval, so the interrupt tool's no-id path breaks the
+   *  eval mid-run instead of waiting for the per-eval deadline.
+   *  Omitted in single-project mode (no separate shim exists to fire
+   *  it). */
+  evalBreakChannel?: EvalBreakChannel;
   /** When true, the server is shutting down and rejects new calls. */
   acceptingWork: () => boolean;
 }
@@ -163,27 +186,73 @@ export interface ReplToolOptions {
  *  semantics deferred to late handler checks, so `reset` with `code`
  *  or `status` with `ids` was silently accepted). */
 export type ParsedReplToolInput =
-  | { action: "eval"; projectDir?: string; code: string }
-  | { action: "wait"; projectDir?: string; ids?: string[]; timeoutMs: number }
-  | { action: "status"; projectDir?: string }
+  | { action: "eval"; projectDir?: string; code: string; refs?: string[] }
+  | { action: "wait"; projectDir?: string; ids?: string[]; timeoutMs: number; refs?: string[] }
+  | { action: "status"; projectDir?: string; refs?: string[] }
   | { action: "interrupt"; projectDir?: string; id?: string }
   | { action: "reset"; projectDir?: string };
 
 /** Which fields belong to which action (the discriminator's exact-shape
  *  vocabulary). */
-const replInputFields = ["action", "projectDir", "code", "ids", "timeoutMs", "id"] as const;
+const replInputFields = ["action", "projectDir", "code", "ids", "timeoutMs", "id", "refs"] as const;
 type ReplInputField = (typeof replInputFields)[number];
 
 const REPL_ACTION_FIELDS: Record<string, ReadonlySet<ReplInputField>> = {
-  eval: new Set(["action", "projectDir", "code"]),
-  wait: new Set(["action", "projectDir", "ids", "timeoutMs"]),
-  status: new Set(["action", "projectDir"]),
+  eval: new Set(["action", "projectDir", "code", "refs"]),
+  wait: new Set(["action", "projectDir", "ids", "timeoutMs", "refs"]),
+  status: new Set(["action", "projectDir", "refs"]),
   interrupt: new Set(["action", "projectDir", "id"]),
   reset: new Set(["action", "projectDir"]),
 };
 
 function invalidReplInput(message: string): never {
   throw new McpError(ErrorCode.InvalidParams, `Invalid repl tool input: ${message}`);
+}
+
+/** The optional `refs` read-back list (eval/wait/status), validated
+ *  and deduplicated. */
+function parseRefs(raw: Record<string, unknown>): string[] | undefined {
+  if (raw.refs === undefined) return undefined;
+  const refs = replToolInputShape.refs.parse(raw.refs) ?? [];
+  return refs.length > 0 ? [...new Set(refs)] : undefined;
+}
+
+/** The tool handler's `refs` resolution: read each requested ref from
+ *  the given contexts' truncation-reference stores (the elided
+ *  entries' snapshots — see `capStructuredResult`). Unknown refs are
+ *  skipped (the store is bounded and per-workspace; a ref older than
+ *  the ring or from another workspace simply has nothing to read — the
+ *  caller re-reads current state and gets fresh refs). */
+function resolveRefs(
+  refs: string[] | undefined,
+  contexts: Array<{ projectDir: string; repl?: ReplProjectState }>,
+): Record<string, unknown[]> | undefined {
+  if (refs === undefined) return undefined;
+  const referenced: Record<string, unknown[]> = {};
+  for (const ref of refs) {
+    for (const context of contexts) {
+      const values = context.repl?.truncationRefs.get(ref);
+      if (values !== undefined) {
+        referenced[ref] = values;
+        break;
+      }
+    }
+  }
+  return Object.keys(referenced).length > 0 ? referenced : undefined;
+}
+
+/** The elision-capture store for a multi-context result (the
+ *  projectDir-less status): the FIRST workspace's store — its elided
+ *  entries' refs are found by the same `resolveRefs` search. When no
+ *  workspace state exists yet, the elisions degrade to plain counts
+ *  (nothing was ever readable anyway). */
+function stateRefStoreOf(
+  contexts: Array<{ projectDir: string; repl?: ReplProjectState }>,
+): TruncationRefStore | undefined {
+  for (const context of contexts) {
+    if (context.repl !== undefined) return context.repl.truncationRefs;
+  }
+  return undefined;
 }
 
 /** Apply the action discriminator after the MCP SDK has validated the
@@ -223,15 +292,15 @@ export function parseReplToolInput(
       // 5: the tool invented a non-empty-code restriction absent from the
       // doc). Only the ABSENT field is rejected, at the exact-shape
       // boundary.
-      return { action, projectDir, code };
+      return { action, projectDir, code, refs: parseRefs(raw) };
     }
     case "wait": {
       const ids = raw.ids === undefined ? undefined : replToolInputShape.ids.parse(raw.ids);
       const timeoutMs = replToolInputShape.timeoutMs.parse(raw.timeoutMs ?? 30_000) ?? 30_000;
-      return { action, projectDir, ids, timeoutMs };
+      return { action, projectDir, ids, timeoutMs, refs: parseRefs(raw) };
     }
     case "status":
-      return { action, projectDir };
+      return { action, projectDir, refs: parseRefs(raw) };
     case "interrupt": {
       const id = raw.id === undefined ? undefined : replToolInputShape.id.parse(raw.id);
       return { action, projectDir, id };
@@ -340,7 +409,18 @@ function forbidsOutside(allowed: readonly string[]) {
  *  string fields the backstop elided. Elision is never silent (the
  *  phase-E review round 4 registry-read defect was a silent undefined
  *  hole). */
-const truncatedShape = z.record(z.string(), z.number().int().positive());
+const truncatedShape = z.record(
+  z.string(),
+  z.union([
+    // The string backstop's elision count (`truncated.strings`).
+    z.number().int().positive(),
+    // An elided array's continuation reference (phase-F review round
+    // 2): the dropped tail's entry count plus the ref id that a later
+    // eval/wait/status call's `refs` parameter reads back — the cap
+    // costs reads, never data.
+    z.object({ elided: z.number().int().positive(), ref: z.string() }),
+  ]),
+);
 
 /** One raised checkpoint as the machine-readable surface carries it
  *  (the question previewed — the same bounded form the text renders). */
@@ -479,8 +559,17 @@ export const replToolOutputShape = z
     // a path-keyed record that serves every variant (`pending`,
     // `checkpoints`, `workspaces[0].reconcile.requeuedCheckpoints`, …)
     // with the elided entry counts — the kept head prefix plus the
-    // record always reconciles to the true totals.
+    // record always reconciles to the true totals — and each elided
+    // array's CONTINUATION REF (phase-F review round 2): the dropped
+    // tail's snapshot id, readable back through the `refs` parameter of
+    // a later eval/wait/status call (`referenced` in the result). The
+    // cap costs reads, never data.
     truncated: truncatedShape.optional(),
+    // The referenced continuation values (phase-F review round 2): the
+    // `refs` parameter's read-back — `{ [refId]: values }` for every
+    // requested ref the workspace's truncation-reference store holds
+    // (the dropped entries of an earlier elision, verbatim).
+    referenced: z.record(z.string(), z.array(z.unknown())).optional(),
     // wait-only: whether the targets settled within the bound (false =
     // the doc's "still running" timeout outcome).
     drained: z.boolean().optional(),
@@ -505,14 +594,14 @@ export const replToolOutputShape = z
       valid = only("projectDir", "error");
     } else if (value.action === "eval") {
       valid =
-        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "truncated") &&
+        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "truncated", "referenced") &&
         hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed");
     } else if (value.action === "wait") {
       valid =
         only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated") &&
         hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut");
     } else if (value.action === "status") {
-      valid = only("projectDir", "workspaces", "truncated") && has("workspaces");
+      valid = only("projectDir", "workspaces", "truncated", "referenced") && has("workspaces");
     } else if (value.action === "interrupt") {
       valid = only("projectDir", "interrupt") && hasAll("projectDir", "interrupt");
     } else if (value.action === "reset") {
@@ -530,19 +619,19 @@ export const replToolOutputShape = z
         title: "eval",
         required: ["action", "projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed"],
         properties: { action: { const: "eval" } },
-        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "truncated"]),
+        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "truncated", "referenced"]),
       },
       {
         title: "wait",
         required: ["action", "projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut"],
         properties: { action: { const: "wait" } },
-        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated"]),
+        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated", "referenced"]),
       },
       {
         title: "status",
         required: ["action", "workspaces"],
         properties: { action: { const: "status" } },
-        ...forbidsOutside(["action", "projectDir", "workspaces", "truncated"]),
+        ...forbidsOutside(["action", "projectDir", "workspaces", "truncated", "referenced"]),
       },
       {
         title: "interrupt",
@@ -568,7 +657,8 @@ export const replToolOutputShape = z
  *  (its own budget is reserved inside the caps, so it always ships). */
 const TOOL_RESULT_TRUNCATION_MARKER =
   `(tool result truncated — cap: ${OUTPUT_MAX_LINES} lines / ${OUTPUT_MAX_BYTES} bytes; the omitted console ` +
-  `values remain reachable through their $N refs)`;
+  `values remain reachable through their $N refs, and every elided structured field through its truncated ` +
+  `record's continuation ref — read it back with the refs parameter)`;
 
 /** The aggregate serialized-size bound for `structuredContent`: the
  *  doc's tool-result cap (10 KB) applies to the MACHINE-READABLE
@@ -578,6 +668,7 @@ const TOOL_RESULT_TRUNCATION_MARKER =
  *  pending ids crossed the wire as an ~80 KB array — while only the
  *  text content was capped). Same decimal 10 KB unit as the text cap. */
 const STRUCTURED_MAX_BYTES = OUTPUT_MAX_BYTES;
+
 
 /** The backstop string bound for the structured cap: head+tail elision
  *  at the manifest-task vocabulary (200 chars — the same bound the
@@ -705,34 +796,59 @@ function capStructuredStrings(node: unknown, max: number): number {
  *  absolute guarantee drop the remaining id-list entries (the arrays
  *  stay present, empty; the status `workspaces` container is never
  *  emptied). Every drop is recorded in the `truncated` record (field
- *  path → elided entry count; `strings` = the backstop's string-
- *  elision count) — elision is explicit, never a silent hole (the
+ *  path → `{ elided, ref }` — the elided entry count plus the
+ *  continuation ref that reads the dropped entries back, phase-F review
+ *  round 2: the old record kept only counts, so the omitted values had
+ *  no address and repeated reads could never recover them; the doc's
+ *  "the cap costs reads, never data" now holds for every omitted
+ *  field; `truncated.strings` stays a plain count for the string
+ *  backstop) — elision is explicit, never a silent hole (the
  *  phase-E review round 4 registry-read defect was a silent undefined
  *  hole). Results that fit the bound are returned untouched. Applied to
  *  the eval / wait / status variants (the output-bearing surfaces); the
  *  interrupt / reset / error variants carry only broker-authored
  *  scalar fields and are left as-is. */
-function capStructuredResult(result: Record<string, unknown>): Record<string, unknown> {
+function capStructuredResult(
+  result: Record<string, unknown>,
+  truncationRefs?: TruncationRefStore,
+): Record<string, unknown> {
   // Deep-clone first: the structured trees share broker-owned objects
   // (the reconcile report, the manifest) — elision must never mutate
   // broker state.
   result = JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
-  const truncated: Record<string, number> = {};
+  const truncated: Record<string, unknown> = {};
   const fits = () => structuredBytes({ ...result, truncated }) <= STRUCTURED_MAX_BYTES;
   if (fits()) return result;
+  // The dropped entries' snapshot under a store-global ref id (the
+  // sequence never resets, so a chained read's fresh refs never
+  // collide with earlier ids; see `TruncationRefStore`).
+  const capture = (dropped: unknown[]): string =>
+    truncationRefs === undefined ? '' : truncationRefs.set(dropped);
   // Pass 1 — the halving pass: elide the largest list with ≥ 2
   // entries (a one-entry list cannot be halved; the container lists
   // like `workspaces` hold the payload and are never preferred over
-  // the lists inside them).
+  // the lists inside them). The dropped TAIL is snapshotted under the
+  // continuation ref.
+  const recordElision = (key: string, dropped: unknown[]): void => {
+    const ref = capture(dropped);
+    const prior = truncated[key];
+    const priorElided =
+      typeof prior === 'object' && prior !== null
+        ? (prior as { elided: number }).elided
+        : typeof prior === 'number'
+          ? prior
+          : 0;
+    truncated[key] =
+      ref === '' ? priorElided + dropped.length : { elided: priorElided + dropped.length, ref };
+  };
   for (;;) {
     if (fits()) break;
     const largest = largestStructuredArray(result, [], null, (_path, length) => length >= 2);
     if (largest === null) break;
     const kept = Math.floor(largest.value.length / 2);
-    const elided = largest.value.length - kept;
+    const dropped = largest.value.slice(kept);
     setStructuredPath(result, largest.path, largest.value.slice(0, kept));
-    const key = structuredPathKey(largest.path);
-    truncated[key] = (truncated[key] ?? 0) + elided;
+    recordElision(structuredPathKey(largest.path), dropped);
   }
   // Pass 2 — the string backstop: a single array element that is
   // itself over the aggregate bound (a pathological guest string that
@@ -742,9 +858,10 @@ function capStructuredResult(result: Record<string, unknown>): Record<string, un
     if (stringElisions > 0) truncated.strings = stringElisions;
   }
   // Pass 3 — the absolute guarantee: drop the remaining list entries
-  // (the arrays stay present — empty — and every drop is counted).
-  // The status `workspaces` container is never emptied: its entries
-  // are the payload, and their internal lists were already dropped.
+  // (the arrays stay present — empty — and every drop is counted and
+  // referenced). The status `workspaces` container is never emptied:
+  // its entries are the payload, and their internal lists were already
+  // dropped.
   if (!fits()) {
     for (;;) {
       const largest = largestStructuredArray(
@@ -754,10 +871,9 @@ function capStructuredResult(result: Record<string, unknown>): Record<string, un
         (path) => !(path.length === 1 && path[0] === 'workspaces'),
       );
       if (largest === null) break;
-      const elided = largest.value.length;
+      const dropped = largest.value;
       setStructuredPath(result, largest.path, []);
-      const key = structuredPathKey(largest.path);
-      truncated[key] = (truncated[key] ?? 0) + elided;
+      recordElision(structuredPathKey(largest.path), dropped);
       if (fits()) break;
     }
   }
@@ -1020,8 +1136,11 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       if (action === "status") {
         if (projectDir === undefined) {
           const contexts = projects.stores();
+          const structured = structuredStatus(contexts);
+          const referenced = resolveRefs(input.refs, contexts);
+          if (referenced !== undefined) structured.referenced = referenced;
           return {
-            structuredContent: capStructuredResult(structuredStatus(contexts)),
+            structuredContent: capStructuredResult(structured, stateRefStoreOf(contexts)),
             content: [{ type: "text", text: capToolResultText(renderStatus(contexts)) }],
           };
         }
@@ -1054,10 +1173,18 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const state = context.repl;
         options.presence.touch(state, options.clientId() ?? "unknown");
         if (state.restoreError === null) {
-          await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
+          await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs, options.evalBreakChannel);
         }
         return {
-          structuredContent: capStructuredResult(structuredStatus([context], projectDir)),
+          structuredContent: capStructuredResult(
+            (() => {
+              const structured = structuredStatus([context], projectDir);
+              const referenced = resolveRefs(input.refs, [context]);
+              if (referenced !== undefined) structured.referenced = referenced;
+              return structured;
+            })(),
+            state.truncationRefs,
+          ),
           content: [{ type: "text", text: capToolResultText(renderStatus([context])) }],
         };
       }
@@ -1082,6 +1209,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       options.presence.touch(state, options.clientId() ?? "unknown");
 
       if (action === "reset") {
+        // A stale out-of-band break flag must not survive into the fresh
+        // workspace (a pipelined interrupt + reset could otherwise break
+        // the reset's first eval).
+        options.evalBreakChannel?.clearBreak(context.projectDir);
         await resetReplProjectState(state);
         return {
           structuredContent: { action: "reset", projectDir: context.projectDir, dropped: true },
@@ -1098,7 +1229,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
 
       if (state.restoreError !== null) return refusedResult(state, action);
 
-      await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
+      await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs, options.evalBreakChannel);
       if (state.restoreError !== null) return refusedResult(state, action);
 
       const broker = state.broker!;
@@ -1107,8 +1238,11 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const line = drainErrorLine(state);
         const rendered = renderEvalResult(result);
         const text = line !== null ? `${line}\n${rendered}` : rendered;
+        const structured = structuredEvalWait("eval", context.projectDir, result);
+        const referenced = resolveRefs(input.refs, [context]);
+        if (referenced !== undefined) structured.referenced = referenced;
         return {
-          structuredContent: capStructuredResult(structuredEvalWait("eval", context.projectDir, result)),
+          structuredContent: capStructuredResult(structured, state.truncationRefs),
           content: [{ type: "text", text: capToolResultText(text) }],
         };
       }
@@ -1121,8 +1255,11 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const line = drainErrorLine(state);
         const body = drained ? text : `${text}\n(still running — wait timed out after ${input.timeoutMs} ms)`;
         const waitText = line !== null ? `${line}\n${body}` : body;
+        const structured = structuredEvalWait("wait", context.projectDir, result, drained);
+        const referenced = resolveRefs(input.refs, [context]);
+        if (referenced !== undefined) structured.referenced = referenced;
         return {
-          structuredContent: capStructuredResult(structuredEvalWait("wait", context.projectDir, result, drained)),
+          structuredContent: capStructuredResult(structured, state.truncationRefs),
           content: [{ type: "text", text: capToolResultText(waitText) }],
         };
       }
@@ -1144,14 +1281,50 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       // phase-E review rejection round 2: the old settlement-drain-only
       // signal was blind there). The quickjs interrupt handler breaks
       // it MID-RUN, and the signal is consumed on first observation — a
-      // later eval's own code is never broken by it. A fully
-      // synchronous (never-yielding) runaway blocks the single-threaded
-      // daemon's event loop, so the request itself cannot arrive
-      // mid-run — that case is bounded by the per-eval wall-clock
-      // deadline (the harness's eval guard); every eval that YIELDS is
-      // interruptible at its next execution.
+      // later eval's own code is never broken by it.
+      //
+      // A fully synchronous (never-yielding) runaway blocks the
+      // single-threaded daemon's event loop, so the request itself
+      // cannot arrive mid-run — phase-F review round 2: the OUT-OF-BAND
+      // eval-break channel closes exactly that gap. The MCP shim fires
+      // the channel's relay (a worker thread — reachable while the main
+      // thread is wedged) BEFORE forwarding this request; the relay
+      // arms a shared-memory flag that the running eval's quickjs
+      // interrupt handler consumes mid-execution (the arm-after-start
+      // rule: a stale break never touches a later eval). By the time
+      // this handler runs (the daemon unblocked — the eval either broke
+      // or finished), the flag is cleared here (the continuation-
+      // targeted signal owns the break from now on) and the broker's
+      // out-of-band break counter reports whether the relay actually
+      // broke the running eval.
       if (input.id === undefined) {
         const targeted = await broker.armEvalBreak();
+        options.evalBreakChannel?.clearBreak(context.projectDir);
+        // The honest out-of-band outcome: the running eval broke via
+        // the relay while the daemon was blocked (the break's delivery
+        // record — the `armEvalBreak` refusal above is expected for a
+        // SYNC eval, which is never continuation-tracked). The record
+        // is consumed on read, so a later interrupt never inherits an
+        // earlier break's delivery.
+        if (!targeted && broker.consumeOutOfBandBreakReport() !== null) {
+          return {
+            structuredContent: {
+              action: "interrupt",
+              projectDir: context.projectDir,
+              interrupt: { outcome: "targeted" },
+            },
+            content: [
+              {
+                type: "text",
+                text: capToolResultText(
+                  `workspace ${context.projectDir}: the running eval was broken OUT OF BAND — the relay delivered ` +
+                    `the break while the daemon's main thread was blocked in the eval, and the quickjs interrupt ` +
+                    `handler broke it mid-run`,
+                ),
+              },
+            ],
+          };
+        }
         if (!targeted) {
           return {
             structuredContent: {

@@ -1204,6 +1204,313 @@ test('restore through the REAL acp-agents adapter: a founding turn that ended wi
   }
 });
 
+test('restore through the REAL acp-agents adapter WITHOUT the _session/loaded_turn extension: the observation path classifies a completed-while-down turn from the replay (trailing assistant message, no live continuation) and settles from the loaded session — never a re-issue (phase-F review round 2: the seam-less built-ins\' terminal state is authoritative under the connection-death contract — their ACP servers terminate in-flight turns when the client connection closes, and the replay holds only completed messages)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-seamless-completed-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const prevObserve = process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = '120';
+  try {
+    configureFakeAgent(
+      {
+        loadSessionSupport: true,
+        turns: [{ text: 'initial' }],
+        loadSession: {
+          // NO `loadedTurn` / `turnEnded` / `loadedTurnQueryError`: the
+          // backend does NOT advertise the extension — the seam-less
+          // observation path classifies the founding turn.
+          replay: [
+            { role: 'user', text: 'task' },
+            { role: 'assistant', text: 'result B (loaded)' },
+          ],
+        },
+      },
+      join(dir, 'log1.jsonl'),
+    );
+    const runner = new AcpAgentRunner();
+    const ws = await Workspace.create(PROJECT);
+    const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
+    try {
+      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
+      const recordedId = broker.store().lookup('c1')!.sessionId!;
+      const snapshot = ws.snapshot();
+      await broker.dispose();
+      ws.dispose();
+
+      configureFakeAgent(
+        {
+          loadSessionSupport: true,
+          turns: [{ text: 'initial' }],
+          loadSession: {
+            replay: [
+              { role: 'user', text: 'task' },
+              { role: 'assistant', text: 'result B (loaded)' },
+            ],
+          },
+        },
+        join(dir, 'log2.jsonl'),
+      );
+      const runner2 = new AcpAgentRunner();
+      const ws2 = await Workspace.restore(PROJECT, snapshot);
+      const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+      try {
+        const report = await broker2.reconcile();
+        assert.deepEqual(report.reattached, ['c1'], 'the call re-attached through the real adapter');
+        assert.deepEqual(report.reissued, []);
+        // The observation path never asks the extension query on the wire
+        // (there is nothing to ask — the backend did not advertise it).
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.ok(
+          !readWireLog(join(dir, 'log2.jsonl')).some(
+            (e) => e.method === 'extensionRequest' && e.extensionMethod === '_session/loaded_turn/query',
+          ),
+          'no extension query — the observation path classifies from the replay + stream',
+        );
+        // The completed-while-down classification settles the call with
+        // the loaded turn's real outcome (after the observation window),
+        // exactly once — never a re-issue.
+        let settled: string | undefined;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+          if (got.result !== undefined) {
+            settled = got.result;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(settled, '"result B (loaded)"');
+        assert.equal(broker2.store().lookup('c1')!.completion!.value, 'result B (loaded)');
+        assert.equal(broker2.store().lookup('c1')!.reissues, 0, 're-attachment is not a re-issue');
+        assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'settled on the SAME loaded session');
+        const entries = readWireLog(join(dir, 'log2.jsonl'));
+        assert.ok(!entries.some((e) => e.method === 'newSession'), 'no fresh session — the call was NOT re-issued');
+      } finally {
+        await broker2.dispose();
+        ws2.dispose();
+        await runner2.dispose();
+      }
+    } finally {
+      await broker.dispose();
+      ws.dispose();
+      await runner.dispose();
+    }
+  } finally {
+    if (prevObserve === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = prevObserve;
+    clearFakeEnv();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('restore through the REAL acp-agents adapter WITHOUT the extension: a replay that ends without a terminal assistant message (the turn died mid-way while down) is the INTERRUPTED classification — nothing is running at the backend (the connection-death contract), so the in-task degradation re-issues under the same id, surfaced guest-visibly, and no duplication is possible', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-seamless-interrupted-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const prevObserve = process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = '120';
+  try {
+    configureFakeAgent(
+      {
+        loadSessionSupport: true,
+        turns: [{ text: 'fresh result' }],
+        loadSession: {
+          replay: [{ role: 'user', text: 'task' }],
+        },
+      },
+      join(dir, 'log1.jsonl'),
+    );
+    const runner = new AcpAgentRunner();
+    const ws = await Workspace.create(PROJECT);
+    const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
+    try {
+      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
+      const recordedId = broker.store().lookup('c1')!.sessionId!;
+      const snapshot = ws.snapshot();
+      await broker.dispose();
+      ws.dispose();
+
+      configureFakeAgent(
+        {
+          loadSessionSupport: true,
+          turns: [{ text: 'fresh result' }],
+          loadSession: {
+            replay: [{ role: 'user', text: 'task' }],
+          },
+        },
+        join(dir, 'log2.jsonl'),
+      );
+      const runner2 = new AcpAgentRunner();
+      const ws2 = await Workspace.restore(PROJECT, snapshot);
+      const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+      try {
+        const report = await broker2.reconcile();
+        assert.deepEqual(report.reattached, ['c1'], 'the call is armed on the loaded session first');
+        assert.deepEqual(report.reissued, [], 'the in-task degradation is not part of the reconcile report');
+        // The interrupted classification (nothing running) degrades to a
+        // re-issue after the observation window — surfaced guest-visibly.
+        await waitFor(() =>
+          readWireLog(join(dir, 'log2.jsonl')).some((e) => e.method === 'newSession'),
+        );
+        assert.ok(
+          !readWireLog(join(dir, 'log2.jsonl')).some(
+            (e) => e.method === 'extensionRequest' && e.extensionMethod === '_session/loaded_turn/query',
+          ),
+          'no extension query — the observation path classifies from the replay + stream',
+        );
+        const probe = await broker2.eval('"probe"');
+        assert.ok(
+          output(probe).some(
+            (l) =>
+              l.startsWith('warn: ') &&
+              l.includes('c1') &&
+              l.includes('without a terminal assistant message') &&
+              l.includes('re-issue'),
+          ),
+          output(probe).join('\n'),
+        );
+        // The re-issued call's fresh turn completes and settles the SAME
+        // guest promise exactly once.
+        await waitFor(() => broker2.store().lookup('c1')!.sessionId !== recordedId);
+        let result: string | undefined;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          await broker2.pump();
+          const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+          if (got.result !== undefined) {
+            result = got.result;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(result, '"fresh result"');
+        assert.equal(broker2.store().lookup('c1')!.reissues, 1);
+      } finally {
+        await broker2.dispose();
+        ws2.dispose();
+        await runner2.dispose();
+      }
+    } finally {
+      await broker.dispose();
+      ws.dispose();
+      await runner.dispose();
+    }
+  } finally {
+    if (prevObserve === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = prevObserve;
+    clearFakeEnv();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('restore through the REAL acp-agents adapter WITHOUT the extension: live continuation within the observation window classifies the founding turn STILL RUNNING — the loaded session stays attached and the call is never re-issued, across the re-armable bound (phase-F review round 2: a possibly-running call is never duplicated)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-real-seamless-running-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const prevObserve = process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+  const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = '120';
+  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = '200';
+  try {
+    configureFakeAgent(
+      {
+        loadSessionSupport: true,
+        turns: [{ text: 'fresh result' }],
+        loadSession: {
+          // The replay ends at an assistant PARTIAL, and the backend
+          // CONTINUES streaming live chunks after the session/load
+          // response — the turn is still running at the backend when we
+          // reconnect. WITHOUT the extension, the observation path sees
+          // the live continuation within its window and classifies the
+          // turn STILL RUNNING: the seam keeps the loaded session
+          // attached (never settles the quiet gap, never re-issues), and
+          // the re-armable bound keeps the wait live.
+          replay: [
+            { role: 'user', text: 'task' },
+            { role: 'assistant', text: 'partial ' },
+          ],
+          continue: [
+            { afterMs: 40, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
+            { afterMs: 90, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'continuation' } } },
+          ],
+        },
+      },
+      join(dir, 'log1.jsonl'),
+    );
+    const runner = new AcpAgentRunner();
+    const ws = await Workspace.create(PROJECT);
+    const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
+    try {
+      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
+      const recordedId = broker.store().lookup('c1')!.sessionId!;
+      const snapshot = ws.snapshot();
+      await broker.dispose();
+      ws.dispose();
+
+      configureFakeAgent(
+        {
+          loadSessionSupport: true,
+          turns: [{ text: 'fresh result' }],
+          loadSession: {
+            replay: [
+              { role: 'user', text: 'task' },
+              { role: 'assistant', text: 'partial ' },
+            ],
+            continue: [
+              { afterMs: 40, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
+              { afterMs: 90, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'continuation' } } },
+            ],
+          },
+        },
+        join(dir, 'log2.jsonl'),
+      );
+      const runner2 = new AcpAgentRunner();
+      const ws2 = await Workspace.restore(PROJECT, snapshot);
+      const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+      try {
+        const report = await broker2.reconcile();
+        assert.deepEqual(report.reattached, ['c1'], 'the still-running call is re-attached and KEPT attached');
+        assert.deepEqual(report.reissued, [], 'never a re-issue while the loaded session is attached');
+        assert.deepEqual(report.failedLost, []);
+        // Across the observation window AND two max-wait re-arm cycles:
+        // the call stays pending on the SAME loaded session — no fresh
+        // session is ever opened, and the partial is never settled.
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call is still pending — the partial was never settled');
+        const entries = readWireLog(join(dir, 'log2.jsonl'));
+        assert.ok(
+          !entries.some((e) => e.method === 'newSession'),
+          'no fresh session across the re-arm cycles — a possibly-running call is never duplicated: ' + JSON.stringify(entries),
+        );
+        assert.equal(
+          entries.filter((e) => e.method === 'loadSession' && e.params?.sessionId === recordedId).length,
+          1,
+          'the recorded session was loaded exactly once — the re-arms ride the SAME attached session',
+        );
+        assert.ok(
+          !readWireLog(join(dir, 'log2.jsonl')).some(
+            (e) => e.method === 'extensionRequest' && e.extensionMethod === '_session/loaded_turn/query',
+          ),
+          'no extension query — the observation path classifies from the replay + stream',
+        );
+      } finally {
+        await broker2.dispose();
+        ws2.dispose();
+        await runner2.dispose();
+      }
+    } finally {
+      await broker.dispose();
+      ws.dispose();
+      await runner.dispose();
+    }
+  } finally {
+    if (prevObserve === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = prevObserve;
+    if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
+    clearFakeEnv();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a still-running-at-load call stays attached: reconcile arms it on the parked seam and the call settles from the turn\'s later completion (never a re-issue)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-still-'));
   const storePath = join(dir, 'calls.jsonl');
@@ -1529,7 +1836,7 @@ test('a RE-ARMABLE still-running seam rejection keeps the call attached and pend
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a NON-re-armable still-running seam rejection (a backend without the _session/loaded_turn extension — the built-in claude and opencode case) degrades to re-issue: the loaded session is released, the call is re-issued under the same id, and the fresh turn settles the SAME guest promise exactly once — surfaced guest-visibly', async () => {
+test('a NON-re-armable still-running seam rejection keeps the loaded session ATTACHED and re-arms the seam — a possibly-running call is never re-issued (phase-F review round 2: the old degradation released the loaded session and re-issued the call, which can duplicate a still-running backend turn), and the later seam resolution settles the SAME guest promise exactly once', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nonrearm-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
@@ -1548,33 +1855,39 @@ test('a NON-re-armable still-running seam rejection (a backend without the _sess
   assert.ok(seam, 'the seam is parked on the loaded session');
   seam.reject(
     new LoadedTurnStillRunningError(
-      'the backend does not advertise the _session/loaded_turn extension — the terminal state is unobservable',
+      'a third-party seam that can never observe the terminal state',
       false,
     ),
   );
   await tick();
   await tick();
-  // Phase-F review: the doc's three reconciliation arms are exhaustive —
-  // the old permanent-hold degradation (pending until interrupt/reset) is
-  // deleted. The unobservable completion degrades through the doc's
-  // honest fallback for a capability-omitting backend: re-issue.
-  assert.equal(runner2.sessions[0].releases, 1, 'the loaded session was released');
-  assert.equal(runner2.sessions.length, 2, 'a fresh session opened for the re-issue');
-  assert.equal(broker2.store().lookup('c1')!.reissues, 1, 'the reissue was recorded');
-  assert.equal(broker2.store().lookup('c1')!.sessionId, runner2.sessions[1].sessionId, 'the re-issue\'s session is the new attach key');
+  // Phase-F review round 2: a possibly-running call is NEVER re-issued —
+  // the broker keeps the loaded session attached and re-arms the seam on
+  // it for BOTH the re-armable and the non-re-armable forms (the doc's
+  // second reconciliation arm, re-attach to a still-running task). No
+  // release, no fresh session, no reissue record.
+  assert.equal(runner2.sessions[0].releases, 0, 'the loaded session stays attached');
+  assert.equal(runner2.sessions.length, 1, 'no fresh session — no re-issue');
+  assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'no reissue was recorded');
+  assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the attach key is unchanged');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call is still pending — partial output is never settled');
-  const probe = await broker2.eval('"probe"');
-  assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('does not advertise the _session/loaded_turn extension') && l.includes('re-issued')),
-    output(probe).join('\n'),
-  );
-  // The re-issued call's fresh turn completes and settles the SAME guest
-  // promise exactly once — the call never lingers pending.
-  runner2.sessions[1].completeTurn('fresh result');
+  // The RE-ARMED seam is consulted again (the broker re-ran the
+  // re-attached task on the same session); when it resolves, the call
+  // settles with the turn's real outcome exactly once.
+  const rearmed = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(rearmed, 'the seam was re-armed on the attached session');
+  rearmed.resolve({ stopReason: 'end_turn', text: 'the turn eventually completed' });
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await p')).result, '"fresh result"');
-  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'fresh result');
+  // The re-arm's warn line is drained by the settlement eval itself (the
+  // console buffer ships with the eval that pumps the settlement).
+  const settleProbe = await broker2.eval('await p');
+  assert.ok(
+    output(settleProbe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('re-armed')),
+    output(settleProbe).join('\n'),
+  );
+  assert.equal(settleProbe.result, '"the turn eventually completed"');
+  assert.equal(broker2.store().lookup('c1')!.completion!.value, 'the turn eventually completed');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
   await broker2.dispose();
   ws2.dispose();
