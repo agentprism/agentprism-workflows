@@ -88,6 +88,26 @@ test('state persists across evals: bindings live in the VM, not in a transcript'
   assert.equal(value(await v.evalCode('globalThis.hoisted')), 7);
 });
 
+test('determinism is intact: Date.now() and Math.random() work natively in the realm (the doc exclusion list — no stubbing, no journal)', async () => {
+  using v = await vm();
+  // Date.now(): a REAL timestamp, not a frozen/zeroed stub — two calls
+  // in one eval observe real time passing, and the value round-trips.
+  const stamp = value(await v.evalCode('Date.now()'));
+  assert.equal(typeof stamp, 'number');
+  assert.ok(stamp > 1_500_000_000_000, 'a plausible 2020+ epoch millis value');
+  assert.ok(value(await v.evalCode('Date.now()')) >= stamp, 'time never runs backwards');
+  // Math.random(): a REAL [0,1) value, not a deterministic stub — a
+  // fresh draw differs from the previous one (a fixed-seed stub would
+  // make the assert fail; a per-call counter is astronomically unlikely
+  // to collide once).
+  const first = value(await v.evalCode('Math.random()'));
+  const second = value(await v.evalCode('Math.random()'));
+  assert.equal(typeof first, 'number');
+  assert.ok(first >= 0 && first < 1);
+  assert.ok(second >= 0 && second < 1);
+  assert.notEqual(first, second);
+});
+
 test('top-level await is accepted; microtask-only awaits resolve in-eval', async () => {
   using v = await vm();
   assert.equal(value(await v.evalCode('await Promise.resolve(42)')), 42);
