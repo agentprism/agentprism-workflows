@@ -2184,13 +2184,49 @@ export class Broker {
     this.consoleBuffer.push({ level, refs: [], args: [message] });
   }
 
+  /** Fence + durably settle an opening call as cancelled — the
+   *  `interrupt` tool's id path (and the guest handle's `cancel()`) on
+   *  a call whose `openSession` is still pending (phase-E review
+   *  rejection round 7: the old `cancelCall` decision skipped opening
+   *  calls entirely — it returned `none`, and the eventual open
+   *  resolved into a PROMPTED, supposedly-interrupted call). Mirrors
+   *  the client-presence drain's bound force-stop exactly: the
+   *  completion is recorded FIRST (durable — a kill after this returns
+   *  settles the call from the store on restore), the guest settles
+   *  first-wins, the concurrency token is released, and the
+   *  `stoppedOpens` fence is set so an eventual late landing closes the
+   *  child immediately WITHOUT prompting (its reject is a first-wins
+   *  no-op against the recorded completion). Returns whether the call
+   *  was still opening (false — already open, settled, or unknown —
+   *  leaves everything untouched). */
+  private stopOpeningCall(callId: string, source: string): boolean {
+    if (!this.openingCalls.has(callId)) return false;
+    this.stoppedOpens.add(callId);
+    const value = toRejectionValue(
+      new WorkflowError(
+        `call ${callId} was cancelled by ${source} while its session was still opening — the call is ` +
+          `settled, and a late child, if any, is closed without prompting`,
+        CODE.AGENT_CANCELLED,
+        { recoverable: true },
+      ),
+    );
+    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+    this.settleIntoGuest(callId, 'reject', value);
+    this.agentSlots.delete(callId);
+    this.warnLine('warn', `call ${callId}: ${value.message}`);
+    return true;
+  }
+
   /**
    * Cancel one subagent call by its founding call id — the `interrupt`
    * tool's engine-side path (the guest handle's `cancel()` funnels
    * through the same session cancel; it additionally settles the guest
    * steer call). A turn in flight is cancelled (the call then rejects
    * with the recoverable `CancelledError` at the next pump); an idle
-   * session is a no-op. After the client-presence drain released every
+   * session is a no-op. A call whose session is still OPENING (the
+   * `openSession` is in flight — a delayed backend, a parked open) is
+   * fenced and settled DURABLY as cancelled right here (see
+   * `stopOpeningCall`). After the client-presence drain released every
    * child, a SETTLED handle's recorded backend session is re-attached
    * lazily (the doc: followUp/steer/cancel re-attach the subagent
    * session lazily via the capability matrix) and cancelled if a turn
@@ -2200,18 +2236,42 @@ export class Broker {
    */
   async cancelCall(callId: string): Promise<'cancelled' | 'idle' | 'failed' | 'none'> {
     // Phase 1 — the DECISION under the serialized chain (no runner wire
-    // calls): the live entry, the lazy re-attach path, or nothing to
-    // act on. The wire work then runs OUTSIDE the chain (phase-D review
-    // round 5: the lazy `loadSession` used to run inside it, so a hung
-    // backend load held the operation chain — `drainForDisconnect`
-    // queues behind the chain and its deadline only starts when it
-    // enters, making the documented outer drain bound ineffective).
+    // calls): the live entry, the still-opening call, the lazy
+    // re-attach path, or nothing to act on. The wire work then runs
+    // OUTSIDE the chain (phase-D review round 5: the lazy
+    // `loadSession` used to run inside it, so a hung backend load held
+    // the operation chain — `drainForDisconnect` queues behind the
+    // chain and its deadline only starts when it enters, making the
+    // documented outer drain bound ineffective).
     const decision = await this.serialized(async () => {
       this.assertAlive();
       const entry = this.sessions.get(callId);
       if (entry !== undefined) {
         if (!entry.busy) return { kind: 'idle' as const };
         return { kind: 'cancel-live' as const, entry };
+      }
+      // A call whose session is still OPENING (its `openSession` has
+      // not resolved — the phase-E review rejection round 7 defect:
+      // the decision used to skip it, return `none`, and let the
+      // eventual open prompt a supposedly-interrupted call): fence +
+      // settle it durably as cancelled — under the chain, exactly like
+      // the drain's bound force-stop. The guest promise rejects now;
+      // the late landing (if any) closes the child without prompting.
+      // ONE drain fires the settlement's guest reactions (the registry
+      // bookkeeping — the same post-settle drain the pump runs per
+      // settled call), so a subsequent status read reports the call
+      // settled, not still pending. A failed continuation drain is
+      // honest output, never a cancel failure.
+      if (this.openingCalls.has(callId)) {
+        this.stopOpeningCall(callId, 'interrupt');
+        try {
+          this.drain();
+        } catch (error) {
+          if (error instanceof DrainJobError) {
+            this.warnLine('warn', `settlement drain interrupted after cancelling opening call ${callId}: ${errorLine(error.info)}`);
+          } else throw error;
+        }
+        return { kind: 'opening-cancelled' as const };
       }
       // No live entry: a drained broker (or a handle whose session never
       // opened). A settled call with a recorded backend session is
@@ -2220,6 +2280,9 @@ export class Broker {
       return { kind: 'lazy' as const };
     });
     if (decision.kind === 'none' || decision.kind === 'idle') return decision.kind;
+    // The opening-cancel settled everything under the chain: no wire
+    // phase, no re-check — the outcome is `cancelled` as reported.
+    if (decision.kind === 'opening-cancelled') return 'cancelled';
     // Phase 2 — the wire phase (outside the chain): the lazy re-attach
     // (the doc: followUp/steer/cancel re-attach the subagent session
     // lazily via the capability matrix) and the ACP session/cancel. A
@@ -2509,7 +2572,13 @@ export class Broker {
   liveAgents(): LiveAgentInfo[] {
     return [...this.sessions.values()].map((entry) => ({
       callId: entry.callId,
-      modelSpec: entry.modelSpec,
+      // The modelSpec is GUEST-DERIVED (the `agent(modelSpec, …)`
+      // argument): previewed at the engine seam like the task — the
+      // phase-E review rejection round 7 finding (a 20,000-character
+      // model spec crossed status as a >20KB structured entry while
+      // only the text was capped). The same head+tail 200-char bound
+      // as the task surface.
+      modelSpec: entry.modelSpec.length > 200 ? headTail(entry.modelSpec, 200) : entry.modelSpec,
       task: entry.task.length > 200 ? headTail(entry.task, 200) : entry.task,
       state: !entry.callSettled
         ? entry.busy
@@ -3465,6 +3534,18 @@ export class Broker {
 
     const entry = this.sessions.get(sessionId);
     if (entry === undefined) {
+      if (action === 'cancel' && this.openingCalls.has(sessionId)) {
+        // The founding call's session is still OPENING: the handle's
+        // cancel() is the same cancellation as the interrupt tool's id
+        // path (phase-E review rejection round 7: it used to fall
+        // through to `failed` — "nothing was steered" — while the
+        // eventual open went on to prompt a supposedly-cancelled
+        // call). Fence + settle the call durably as cancelled, and the
+        // steer resolves with what actually happened: `cancelled`.
+        this.stopOpeningCall(sessionId, 'handle cancel');
+        this.settleSteerSync(call, callId, 'cancelled');
+        return;
+      }
       if (this.agentSlots.has(sessionId) && action !== 'cancel') {
         // The founding call is still opening (its session does not exist
         // yet — a steer in the same eval as the dispatch lands here).

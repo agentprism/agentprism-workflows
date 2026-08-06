@@ -56,7 +56,11 @@
  *   orchestration metadata as separate fields, never one flat string;
  *   and the pending surface reports the WHOLE guest registry (the
  *   trap-free read cap that used to truncate it at 256 entries leaked
- *   an undefined hole into the structured array).
+ *   an undefined hole into the structured array) — bounded on the wire
+ *   by the aggregate structured-result cap (phase-E review round 8:
+ *   the serialized structuredContent respects the doc's 10 KB bound
+ *   with every elision flagged in the `truncated` record, so kept
+ *   prefix + elided count always reconcile to the true totals).
  */
 
 import assert from "node:assert/strict";
@@ -73,6 +77,7 @@ import type {
   BrokerSession,
   BrokerTurn,
 } from "@automatalabs/repl-engine";
+import { OUTPUT_MAX_BYTES } from "@automatalabs/repl-engine";
 import { workflowProjectPaths } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -197,6 +202,32 @@ async function startReplDaemon(replRunner: BrokerRunner): Promise<DaemonHandle> 
     replRunner,
     sessionTtlMs: 60_000,
   });
+}
+
+/** The runner whose openSession is PARKED until released manually — the
+ *  delayed-open regression seam (phase-E review rejection round 7:
+ *  `interrupt { id }` must cancel a call whose `openSession()` is still
+ *  pending, and the eventual late child must be closed without ever
+ *  prompting). */
+class DelayedOpenRunner extends FakeRunner {
+  private gate: Promise<void> = Promise.resolve();
+  private releaseGate: () => void = () => {};
+
+  /** Park every openSession until `releaseOpens()`. */
+  parkOpens(): void {
+    this.gate = new Promise<void>((resolve) => {
+      this.releaseGate = resolve;
+    });
+  }
+
+  releaseOpens(): void {
+    this.releaseGate();
+  }
+
+  async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
+    await this.gate;
+    return super.openSession(opts);
+  }
 }
 
 /** Call the repl tool over HTTP (typed over the raw input). */
@@ -986,17 +1017,29 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
       assert.ok(metaText.includes("pending:"), "the pending section is kept (head)");
       assert.ok(metaText.includes("checkpoint"), "the checkpoint section is kept (head)");
       assert.ok(!metaText.includes("completed:"), "the tail section is dropped");
-      // The STRUCTURED surface is complete even though the text is
-      // capped: the doc's pending contract is the WHOLE guest registry
+      // The STRUCTURED surface is bounded by the aggregate result cap
+      // too (phase-E review round 8: structuredContent used to cross
+      // the wire uncapped while only the text was capped) — every
+      // elision is FLAGGED with its elided count, so the kept head
+      // prefix plus the record always reconciles to the whole registry
       // (phase-E review round 3: the trap-free surface read used to
       // truncate at 256 entries and leak an undefined hole into the
-      // structured array).
+      // structured array — a silent hole stays impossible).
       const scMeta = (meta as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(scMeta), "utf8") <= OUTPUT_MAX_BYTES,
+        `the structured surface respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(scMeta), "utf8")} bytes`,
+      );
+      const truncated = (scMeta.truncated ?? {}) as Record<string, number>;
       const scPending = scMeta.pending as string[];
-      assert.equal(scPending.length, 300, "the structured pending lists the whole registry");
-      assert.equal(scPending[256], "c257", "no cap truncation at the 256th entry");
+      assert.equal(scPending.length + (truncated.pending ?? 0), 300, "the structured pending reconciles to the whole registry");
       assert.ok(scPending.every((id, index) => id === `c${index + 1}`), "dense and in order — no holes");
-      assert.equal((scMeta.checkpoints as unknown[]).length, 300, "the structured checkpoints are complete");
+      const scCheckpoints = scMeta.checkpoints as unknown[];
+      assert.equal(
+        scCheckpoints.length + (truncated.checkpoints ?? 0),
+        300,
+        "the structured checkpoints reconcile to the whole registry",
+      );
     } finally {
       await session.dispose();
     }
@@ -1143,11 +1186,134 @@ test("review round 4: the structured status respects the output limits for guest
   }
 });
 
-test("review round 4: eval-through-MCP output above the former registry-read cap — 16 500 parked checkpoints report ALL 16 500 ids in the structured result (no truncation hole), and a daemon RESTART restores and reconciles the full registry (the carried defect: 16 400 checkpoints returned 16 384 ids plus an undefined hole)", async () => {
+test("review round 8: the structured status bounds the modelSpec at the ENGINE seam like the task — a 20,000-character model spec produces a head+tail-elided live-agent entry, never a >20KB structured field (the phase-E review rejection: modelSpec crossed status uncapped while only the text was capped), and the serialized structuredContent respects the aggregate 10 KB cap", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const PROJECT = makeProjectDir("repl-bounded-modelspec");
+      const hugeSpec = "model-" + "X".repeat(20_000);
+      const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const big = agent(${JSON.stringify(hugeSpec)}, "task"); "started"` });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      await tick();
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!isErrorResult(status), textOf(status));
+      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
+      const agent = (w.liveAgents as Array<Record<string, unknown>>)[0];
+      assert.equal(agent.callId, "c1");
+      assert.ok(typeof agent.modelSpec === "string", "the modelSpec is a string");
+      assert.ok(agent.modelSpec.length <= 200, `the wire modelSpec respects the engine-seam cap: ${agent.modelSpec.length}`);
+      assert.ok(agent.modelSpec.startsWith("model-XXXX"), "head+tail elision keeps the head");
+      assert.ok(agent.modelSpec.includes("…"), "the elision marker is present");
+      // The raw spec never reaches the wire in ANY structured field or
+      // the text, and the WHOLE serialized structured result respects
+      // the aggregate cap.
+      assert.ok(!JSON.stringify(sc).includes(hugeSpec), "the unbounded modelSpec never crosses the wire");
+      assert.ok(!textOf(status).includes(hugeSpec), "the text rendering is bounded too");
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(sc), "utf8") <= OUTPUT_MAX_BYTES,
+        `the serialized structured result respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(sc), "utf8")} bytes`,
+      );
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("review round 8: interrupt { id } cancels a call whose openSession is still pending — the call settles durably as the recoverable AGENT_CANCELLED (the guest promise rejects now, a later wait reports it completed, and a daemon RESTART settles it from the store), and the LATE child is closed without ever prompting (the phase-E review rejection: cancelCall ignored openingCalls and returned 'none', and the eventual open resolved into a prompted, supposedly-interrupted call)", async () => {
+  const runner = new DelayedOpenRunner();
+  runner.parkOpens();
+  const PROJECT = makeProjectDir("repl-interrupt-opening");
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const p = agent("pi/x", "task"); "started"` });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      const sc0 = (evaled as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.ok((sc0.pending as string[]).includes("c1"), `the opening call is pending: ${JSON.stringify(sc0.pending)}`);
+      await tick();
+      // The interrupt lands while openSession is STILL parked: the
+      // old decision returned 'none' (no live session, no lazy
+      // re-attach record) and the eventual open went on to prompt a
+      // supposedly-interrupted call.
+      const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c1" });
+      assert.ok(!isErrorResult(interrupted), textOf(interrupted));
+      const si = (interrupted as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal((si.interrupt as { outcome: string }).outcome, "cancelled", `honest outcome: ${JSON.stringify(si.interrupt)}`);
+      // The guest promise settled NOW with the recoverable error — not
+      // when the open eventually lands.
+      const read = await repl(session, { action: "eval", projectDir: PROJECT, code: `await p.catch((e) => "ERR:" + e.message)` });
+      assert.ok(!isErrorResult(read), textOf(read));
+      const sc1 = (read as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.ok(
+        String(sc1.result).includes("was cancelled by interrupt while its session was still opening"),
+        `guest-visible settlement: ${sc1.result}`,
+      );
+      // A later wait sees the cancelled call as no longer pending (the
+      // settled call is gone from the pending registry — the wait
+      // drains at its first pump; it observed nothing settle, so
+      // `completed` stays empty and `pending` no longer lists c1).
+      const waited = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
+      assert.ok(!isErrorResult(waited), textOf(waited));
+      const sw = (waited as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal(sw.drained, true, `the cancelled call drains the wait: ${JSON.stringify(sw)}`);
+      assert.ok(!(sw.pending as string[]).includes("c1"), `no longer pending: ${JSON.stringify(sw.pending)}`);
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+  // DURABILITY: a daemon restart over the same store restores the
+  // snapshot (the rejected promise is part of it) and the recorded
+  // completion — the cancellation is durable, never re-issued, never
+  // re-opened (a fresh daemon must not open a session for a settled
+  // call).
+  const daemon2 = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon2.url);
+    try {
+      const read = await repl(session, { action: "eval", projectDir: PROJECT, code: `await p.catch((e) => "ERR:" + e.message)` });
+      assert.ok(!isErrorResult(read), textOf(read));
+      const sc = (read as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.ok(
+        String(sc.result).includes("was cancelled by interrupt"),
+        `the restart settles the durable cancellation: ${sc.result}`,
+      );
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon2.close();
+  }
+  // The LATE open lands after everything: the child is closed
+  // immediately — it never prompts (a supposedly-interrupted call must
+  // not run a turn), and nothing re-opened across the restart.
+  runner.releaseOpens();
+  await tick();
+  assert.equal(runner.sessions.length, 1, "exactly one session ever opened");
+  assert.equal(runner.sessions[0].prompts.length, 0, "the stopped call never ran a turn");
+  assert.equal(runner.sessions[0].releases, 1, "the late child was closed without prompting");
+});
+
+test("review round 8: the aggregate structured-result cap bounds the eval/wait/status wire — 16 500 parked checkpoints cross the wire as an EXPLICITLY-FLAGGED head prefix (kept ids well-formed, never a silent undefined hole), the elided counts reconcile to the true totals, and the serialized structuredContent respects the doc's 10 KB cap; a daemon RESTART restores and reconciles the FULL registry in the VM while the wire stays bounded (the phase-E review rejection: 16 500 pending ids crossed the wire as an ~80 KB array — structuredContent was uncapped while only the text was)", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   const PROJECT = makeProjectDir("repl-whole-registry");
   const CHECKPOINTS = 16_500;
+  const boundedSc = (res: unknown): Record<string, unknown> => {
+    const sc = (res as { structuredContent?: Record<string, unknown> }).structuredContent!;
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(sc), "utf8") <= OUTPUT_MAX_BYTES,
+      `the serialized structuredContent respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(sc), "utf8")} bytes`,
+    );
+    return sc;
+  };
   try {
     const session = await connectHttp(daemon.url);
     try {
@@ -1157,13 +1323,20 @@ test("review round 4: eval-through-MCP output above the former registry-read cap
         code: `for (let i = 0; i < ${CHECKPOINTS}; i++) checkpoint("q" + i); "raised"`,
       });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
-      const sc = (evaled as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const sc = boundedSc(evaled);
       const pending = sc.pending as string[];
-      assert.equal(pending.length, CHECKPOINTS, `the whole registry crosses the wire: ${pending.length}`);
-      assert.equal(pending[0], "c1");
-      assert.equal(pending[pending.length - 1], `c${CHECKPOINTS}`);
+      const truncated = (sc.truncated ?? {}) as Record<string, number>;
+      assert.ok(pending.length > 0, "the head prefix is non-empty");
+      assert.ok(pending.length < CHECKPOINTS, "the wire is bounded, not the whole registry");
+      assert.equal(pending[0], "c1", "the kept prefix starts at the head");
+      assert.equal(truncated.pending, CHECKPOINTS - pending.length, "the elided pending count reconciles");
       for (const id of pending) {
         assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no truncation/undefined hole: ${JSON.stringify(id)}`);
+      }
+      const checkpoints = sc.checkpoints as Array<{ id: string }>;
+      assert.equal(checkpoints.length + (truncated.checkpoints ?? 0), CHECKPOINTS, "the elided checkpoint count reconciles");
+      for (const checkpoint of checkpoints) {
+        assert.ok(/^c\d+$/.test(checkpoint.id), `no checkpoint hole: ${JSON.stringify(checkpoint.id)}`);
       }
     } finally {
       await session.dispose();
@@ -1172,24 +1345,43 @@ test("review round 4: eval-through-MCP output above the former registry-read cap
     await daemon.close();
   }
   // A daemon RESTART over the same store: the first touch restores the
-  // snapshot and reconciles the in-VM pending-call registry — the full
-  // registry must survive (the same complete read serves the restore
-  // path).
+  // snapshot and reconciles the in-VM pending-call registry — the FULL
+  // registry survives in the VM (the same complete read serves the
+  // restore path) while the wire stays bounded and flagged.
   const daemon2 = await startReplDaemon(runner);
   try {
     const session = await connectHttp(daemon2.url);
     try {
       const status = await repl(session, { action: "status", projectDir: PROJECT });
       assert.ok(!isErrorResult(status), textOf(status));
-      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const sc = boundedSc(status);
       const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
       assert.equal(w.state, "restored", "the workspace restored from the snapshot");
+      const truncated = (sc.truncated ?? {}) as Record<string, number>;
+      assert.ok(Object.keys(truncated).length > 0, "the wire elision is flagged");
       const pending = w.pending as string[];
-      assert.equal(pending.length, CHECKPOINTS, `the whole registry survives the restart: ${pending.length}`);
+      assert.ok(pending.length < CHECKPOINTS, "the status pending surface is bounded");
+      assert.equal(
+        pending.length + (truncated["workspaces[0].pending"] ?? 0),
+        CHECKPOINTS,
+        "the status pending counts reconcile",
+      );
       for (const id of pending) {
         assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no hole after restore: ${JSON.stringify(id)}`);
       }
-      assert.equal((w.checkpoints as unknown[]).length, CHECKPOINTS, "every checkpoint re-surfaced");
+      const checkpoints = w.checkpoints as Array<{ id: string }>;
+      assert.equal(
+        checkpoints.length + (truncated["workspaces[0].checkpoints"] ?? 0),
+        CHECKPOINTS,
+        "every checkpoint re-surfaced in the VM, wire-bounded",
+      );
+      // The restore's reconcile report rides the same cap (the
+      // re-surfaced checkpoint ids are an id list like any other).
+      const requeued = truncated["workspaces[0].reconcile.requeuedCheckpoints"];
+      if (requeued !== undefined) {
+        const kept = ((w.reconcile as Record<string, unknown>).requeuedCheckpoints as string[]).length;
+        assert.equal(kept + requeued, CHECKPOINTS, "the reconcile id list reconciles too");
+      }
     } finally {
       await session.dispose();
     }

@@ -313,6 +313,7 @@ const replOutputFields = [
   "workspaces",
   "interrupt",
   "dropped",
+  "truncated",
   "error",
 ] as const;
 
@@ -328,6 +329,18 @@ function forbidsOutside(allowed: readonly string[]) {
     },
   };
 }
+
+/** Which structured fields the aggregate result cap elided, with the
+ *  ELIDED entry counts (present only when elision happened): each key
+ *  is the elided field's path in the structured shape (`pending`,
+ *  `completed`, `checkpoints`, `output`, `bindings`, `liveAgents`,
+ *  `inFlight`, `workspaces[0].reconcile.requeuedCheckpoints`, …) and
+ *  its value the number of entries dropped — the kept HEAD prefix
+ *  remains, so the true totals are kept + elided. `strings` counts
+ *  string fields the backstop elided. Elision is never silent (the
+ *  phase-E review round 4 registry-read defect was a silent undefined
+ *  hole). */
+const truncatedShape = z.record(z.string(), z.number().int().positive());
 
 /** One raised checkpoint as the machine-readable surface carries it
  *  (the question previewed — the same bounded form the text renders). */
@@ -441,9 +454,14 @@ const interruptOutcomeShape = z.object({
  *  into one flat string. Every structured field is bounded metadata:
  *  the output lines are already capped by the broker, the checkpoint
  *  questions are previewed, and the manifest binds structure-only
- *  tokens — the structured surface never carries unbounded guest
- *  content. The text content stays alongside (the bounded human
- *  rendering, capped at 256 lines / 10 KB). */
+ *  tokens — and the whole structured result is bounded AGAIN at the
+ *  tool seam by the aggregate serialized-size cap (10 KB, the same
+ *  bound as the text; every elision flagged in the `truncated`
+ *  record, phase-E review round 8: the structured surface used to
+ *  cross the wire uncapped — a 20,000-character modelSpec, 16,500
+ *  pending ids — while only the text was capped). The text content
+ *  stays alongside (the bounded human rendering, capped at 256 lines /
+ *  10 KB). */
 export const replToolOutputShape = z
   .object({
     action: z.enum(["eval", "wait", "status", "interrupt", "reset"]),
@@ -456,6 +474,13 @@ export const replToolOutputShape = z
     pending: z.array(z.string()).optional(),
     checkpoints: z.array(checkpointSummaryShape).optional(),
     completed: z.array(z.string()).optional(),
+    // The aggregate structured-result cap's elision record (present
+    // only when the serialized result crossed the doc's 10 KB bound):
+    // a path-keyed record that serves every variant (`pending`,
+    // `checkpoints`, `workspaces[0].reconcile.requeuedCheckpoints`, …)
+    // with the elided entry counts — the kept head prefix plus the
+    // record always reconciles to the true totals.
+    truncated: truncatedShape.optional(),
     // wait-only: whether the targets settled within the bound (false =
     // the doc's "still running" timeout outcome).
     drained: z.boolean().optional(),
@@ -480,14 +505,14 @@ export const replToolOutputShape = z
       valid = only("projectDir", "error");
     } else if (value.action === "eval") {
       valid =
-        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed") &&
+        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "truncated") &&
         hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed");
     } else if (value.action === "wait") {
       valid =
-        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut") &&
+        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated") &&
         hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut");
     } else if (value.action === "status") {
-      valid = only("projectDir", "workspaces") && has("workspaces");
+      valid = only("projectDir", "workspaces", "truncated") && has("workspaces");
     } else if (value.action === "interrupt") {
       valid = only("projectDir", "interrupt") && hasAll("projectDir", "interrupt");
     } else if (value.action === "reset") {
@@ -505,19 +530,19 @@ export const replToolOutputShape = z
         title: "eval",
         required: ["action", "projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed"],
         properties: { action: { const: "eval" } },
-        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed"]),
+        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "truncated"]),
       },
       {
         title: "wait",
         required: ["action", "projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut"],
         properties: { action: { const: "wait" } },
-        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut"]),
+        ...forbidsOutside(["action", "projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated"]),
       },
       {
         title: "status",
         required: ["action", "workspaces"],
         properties: { action: { const: "status" } },
-        ...forbidsOutside(["action", "projectDir", "workspaces"]),
+        ...forbidsOutside(["action", "projectDir", "workspaces", "truncated"]),
       },
       {
         title: "interrupt",
@@ -544,6 +569,201 @@ export const replToolOutputShape = z
 const TOOL_RESULT_TRUNCATION_MARKER =
   `(tool result truncated — cap: ${OUTPUT_MAX_LINES} lines / ${OUTPUT_MAX_BYTES} bytes; the omitted console ` +
   `values remain reachable through their $N refs)`;
+
+/** The aggregate serialized-size bound for `structuredContent`: the
+ *  doc's tool-result cap (10 KB) applies to the MACHINE-READABLE
+ *  surface too, not only the bounded text (phase-E review rejection
+ *  round 7: the structured results were uncapped — a 20,000-character
+ *  modelSpec crossed status as a >20 KB live-agent entry and 16,500
+ *  pending ids crossed the wire as an ~80 KB array — while only the
+ *  text content was capped). Same decimal 10 KB unit as the text cap. */
+const STRUCTURED_MAX_BYTES = OUTPUT_MAX_BYTES;
+
+/** The backstop string bound for the structured cap: head+tail elision
+ *  at the manifest-task vocabulary (200 chars — the same bound the
+ *  engine seam applies to task/modelSpec). Only reachable when a
+ *  single array ELEMENT is itself over the aggregate bound (a
+ *  pathological guest-controlled string that survives the array
+ *  elision, since a one-element array cannot be halved). */
+const STRUCTURED_STRING_MAX = 200;
+
+/** The serialized UTF-8 size of a JSON-able structured value. */
+function structuredBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+/** The largest ELIGIBLE array in a structured result tree (by
+ *  serialized bytes), with its path. `eligible` decides which arrays
+ *  the current pass may elide (the halving pass: lists with ≥ 2
+ *  entries; the absolute-guarantee pass: any list except the status
+ *  `workspaces` container). Descends into array ELEMENTS too: the
+ *  nested id lists inside a workspace entry are separate elidable
+ *  arrays — without the descent, a single-element CONTAINER list
+ *  (the status `workspaces` entry holds every other list) would be
+ *  the largest candidate, unhaleable, and block the pass (phase-E
+ *  review round 8: the cap used to give up and then EMPTY the
+ *  workspaces container in the guarantee pass, shipping a status
+ *  with zero workspace entries). */
+function largestStructuredArray(
+  node: unknown,
+  path: (string | number)[],
+  best: { path: (string | number)[]; value: unknown[]; bytes: number } | null,
+  eligible: (path: (string | number)[], length: number) => boolean,
+): { path: (string | number)[]; value: unknown[]; bytes: number } | null {
+  if (Array.isArray(node)) {
+    if (eligible(path, node.length)) {
+      const bytes = structuredBytes(node);
+      if (best === null || bytes > best.bytes) best = { path, value: node, bytes };
+    }
+    for (let i = 0; i < node.length; i++) {
+      best = largestStructuredArray(node[i], [...path, i], best, eligible);
+    }
+    return best;
+  }
+  if (typeof node === 'object' && node !== null) {
+    for (const [key, value] of Object.entries(node)) {
+      best = largestStructuredArray(value, [...path, key], best, eligible);
+    }
+  }
+  return best;
+}
+
+/** Replace the value at a path inside a structured result. */
+function setStructuredPath(node: unknown, path: (string | number)[], value: unknown): void {
+  let cursor = node as Record<string, unknown>;
+  for (let i = 0; i < path.length - 1; i++) {
+    cursor = cursor[path[i] as string] as Record<string, unknown>;
+  }
+  cursor[path[path.length - 1] as string] = value;
+}
+
+/** A structured path's flag key: `workspaces[0].pending` style. */
+function structuredPathKey(path: (string | number)[]): string {
+  let key = '';
+  for (const part of path) {
+    if (typeof part === 'number') key += `[${part}]`;
+    else key += key === '' ? part : `.${part}`;
+  }
+  return key;
+}
+
+/** Head+tail string elision with the ellipsis marker (the preview
+ *  format's shape). */
+function structuredHeadTail(value: string, max: number): string {
+  if (value.length <= max) return value;
+  if (max <= 1) return '…';
+  const keep = max - 1;
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+}
+
+/** Cap every string in a structured result head+tail at `max` chars —
+ *  the backstop for a single array element that is itself over the
+ *  aggregate bound. Strings are immutable, so the walk mutates the
+ *  CONTAINERS (array slots / object properties) in place. Returns the
+ *  number of strings elided (recorded under `truncated.strings`). */
+function capStructuredStrings(node: unknown, max: number): number {
+  let elided = 0;
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      const item = node[i];
+      if (typeof item === 'string') {
+        if (item.length > max) {
+          node[i] = structuredHeadTail(item, max);
+          elided++;
+        }
+      } else {
+        elided += capStructuredStrings(item, max);
+      }
+    }
+    return elided;
+  }
+  if (typeof node === 'object' && node !== null) {
+    const record = node as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      const value = record[key];
+      if (typeof value === 'string') {
+        if (value.length > max) {
+          record[key] = structuredHeadTail(value, max);
+          elided++;
+        }
+      } else {
+        elided += capStructuredStrings(value, max);
+      }
+    }
+  }
+  return elided;
+}
+
+/** Apply the aggregate structured-result cap (see
+ *  `STRUCTURED_MAX_BYTES`): while the serialized result exceeds the
+ *  bound, elide the largest halvable array field (head prefix kept),
+ *  then — only when a single oversized ELEMENT still crosses the bound
+ *  (a pathological guest string that cannot be halved away) — cap every
+ *  remaining string head+tail at the manifest-task bound, and as the
+ *  absolute guarantee drop the remaining id-list entries (the arrays
+ *  stay present, empty; the status `workspaces` container is never
+ *  emptied). Every drop is recorded in the `truncated` record (field
+ *  path → elided entry count; `strings` = the backstop's string-
+ *  elision count) — elision is explicit, never a silent hole (the
+ *  phase-E review round 4 registry-read defect was a silent undefined
+ *  hole). Results that fit the bound are returned untouched. Applied to
+ *  the eval / wait / status variants (the output-bearing surfaces); the
+ *  interrupt / reset / error variants carry only broker-authored
+ *  scalar fields and are left as-is. */
+function capStructuredResult(result: Record<string, unknown>): Record<string, unknown> {
+  // Deep-clone first: the structured trees share broker-owned objects
+  // (the reconcile report, the manifest) — elision must never mutate
+  // broker state.
+  result = JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
+  const truncated: Record<string, number> = {};
+  const fits = () => structuredBytes({ ...result, truncated }) <= STRUCTURED_MAX_BYTES;
+  if (fits()) return result;
+  // Pass 1 — the halving pass: elide the largest list with ≥ 2
+  // entries (a one-entry list cannot be halved; the container lists
+  // like `workspaces` hold the payload and are never preferred over
+  // the lists inside them).
+  for (;;) {
+    if (fits()) break;
+    const largest = largestStructuredArray(result, [], null, (_path, length) => length >= 2);
+    if (largest === null) break;
+    const kept = Math.floor(largest.value.length / 2);
+    const elided = largest.value.length - kept;
+    setStructuredPath(result, largest.path, largest.value.slice(0, kept));
+    const key = structuredPathKey(largest.path);
+    truncated[key] = (truncated[key] ?? 0) + elided;
+  }
+  // Pass 2 — the string backstop: a single array element that is
+  // itself over the aggregate bound (a pathological guest string that
+  // survives the halving pass).
+  if (!fits()) {
+    const stringElisions = capStructuredStrings(result, STRUCTURED_STRING_MAX);
+    if (stringElisions > 0) truncated.strings = stringElisions;
+  }
+  // Pass 3 — the absolute guarantee: drop the remaining list entries
+  // (the arrays stay present — empty — and every drop is counted).
+  // The status `workspaces` container is never emptied: its entries
+  // are the payload, and their internal lists were already dropped.
+  if (!fits()) {
+    for (;;) {
+      const largest = largestStructuredArray(
+        result,
+        [],
+        null,
+        (path) => !(path.length === 1 && path[0] === 'workspaces'),
+      );
+      if (largest === null) break;
+      const elided = largest.value.length;
+      setStructuredPath(result, largest.path, []);
+      const key = structuredPathKey(largest.path);
+      truncated[key] = (truncated[key] ?? 0) + elided;
+      if (fits()) break;
+    }
+  }
+  if (Object.keys(truncated).length > 0) result.truncated = truncated;
+  return result;
+}
 
 /** Apply the doc's output caps (256 lines / 10 KB, whichever trips
  *  first) to a repl tool result's FINAL text — the wire guarantee
@@ -801,7 +1021,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         if (projectDir === undefined) {
           const contexts = projects.stores();
           return {
-            structuredContent: structuredStatus(contexts),
+            structuredContent: capStructuredResult(structuredStatus(contexts)),
             content: [{ type: "text", text: capToolResultText(renderStatus(contexts)) }],
           };
         }
@@ -837,7 +1057,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
         }
         return {
-          structuredContent: structuredStatus([context], projectDir),
+          structuredContent: capStructuredResult(structuredStatus([context], projectDir)),
           content: [{ type: "text", text: capToolResultText(renderStatus([context])) }],
         };
       }
@@ -888,7 +1108,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const rendered = renderEvalResult(result);
         const text = line !== null ? `${line}\n${rendered}` : rendered;
         return {
-          structuredContent: structuredEvalWait("eval", context.projectDir, result),
+          structuredContent: capStructuredResult(structuredEvalWait("eval", context.projectDir, result)),
           content: [{ type: "text", text: capToolResultText(text) }],
         };
       }
@@ -902,7 +1122,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const body = drained ? text : `${text}\n(still running — wait timed out after ${input.timeoutMs} ms)`;
         const waitText = line !== null ? `${line}\n${body}` : body;
         return {
-          structuredContent: structuredEvalWait("wait", context.projectDir, result, drained),
+          structuredContent: capStructuredResult(structuredEvalWait("wait", context.projectDir, result, drained)),
           content: [{ type: "text", text: capToolResultText(waitText) }],
         };
       }

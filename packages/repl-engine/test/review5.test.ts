@@ -150,7 +150,7 @@ class FakeRunner implements BrokerRunner {
   }
 }
 
-async function setup(options: { runner?: BrokerRunner } = {}): Promise<{
+async function setup(options: { runner?: BrokerRunner; maxConcurrentAgents?: number } = {}): Promise<{
   ws: Workspace;
   broker: Broker;
 }> {
@@ -159,6 +159,7 @@ async function setup(options: { runner?: BrokerRunner } = {}): Promise<{
     runner: options.runner,
     store: new InMemoryCallStore(),
     evalTimeoutMs: 0, // tests drive interrupts explicitly
+    ...(options.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: options.maxConcurrentAgents } : {}),
   });
   return { ws, broker };
 }
@@ -386,6 +387,130 @@ test('review 5/5: simultaneously ready settlements drain ONE CALL AT A TIME — 
   assert.equal(byName.get('fromA')?.task, 'task A', 'the "from what task" half follows the same per-value split');
   assert.equal(byName.get('fromB')?.provenance, 'worker c2');
   assert.equal(byName.get('fromB')?.task, 'task B');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 6. interrupt { id } / handle.cancel() on a still-OPENING call ──────
+
+test('review 8/6a: cancelCall cancels a call whose openSession is still pending — the decision\'s opening arm fences + settles it DURABLY (recorded AGENT_CANCELLED, guest-settled first-wins, concurrency token released), and the LATE child is closed without ever prompting (the phase-E review rejection: cancelCall ignored openingCalls, returned `none`, and the eventual open resolved into a prompted, supposedly-interrupted call)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner, maxConcurrentAgents: 1 });
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    ['c1'],
+    'the opening call is pending while the open is in flight',
+  );
+  // The interrupt lands with the open STILL parked.
+  assert.equal(await broker.cancelCall('c1'), 'cancelled', 'the opening call reports cancelled');
+  // The settlement is DURABLE at the interrupt, not deferred to the
+  // landing: recorded (AGENT_CANCELLED, recoverable), the guest
+  // promise already rejected, the registry no longer pending.
+  const record = broker.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    [],
+    'the cancelled opening call is not left pending',
+  );
+  assert.deepEqual(broker.liveAgents(), [], 'no live session was ever registered');
+  const got = await broker.eval('await p.catch((e) => "ERR:" + e.message)');
+  assert.ok(
+    (got.result ?? '').includes('was cancelled by interrupt while its session was still opening'),
+    `guest-visible settlement: ${got.result}`,
+  );
+  // The concurrency token was released: under a cap of ONE, a fresh
+  // dispatch must not be refused.
+  runner.openSession = originalOpen;
+  await broker.eval('const q = agent("pi/x", "again"); "started"');
+  await tick();
+  assert.equal(runner.sessions.length, 1, 'the fresh dispatch opened (the cancelled call freed its slot)');
+  runner.sessions[0].completeTurn('ok');
+  await tick();
+  await broker.pump();
+  // The LATE landing of the cancelled open: the child is closed
+  // immediately — it never prompts (a supposedly-interrupted call must
+  // not run a turn) — and the late reject is a first-wins no-op
+  // against the interrupt's recorded completion.
+  releaseOpen();
+  await waitFor(() => runner.sessions.length === 2);
+  const session = runner.sessions[1];
+  assert.equal(session.releases, 1, 'the stopped child was closed without ever prompting');
+  assert.equal(session.prompts.length, 0, 'the supposedly-interrupted call never ran a turn');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await broker.pump();
+    const check = await broker.eval('await p.catch((e) => "ERR:" + e.message)');
+    if (check.result !== undefined) {
+      assert.ok((check.result as string).includes('was cancelled by interrupt'), 'the late landing settled nothing new');
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const after = broker.store().lookup('c1')!;
+  assert.equal(after.completion!.outcome, 'reject');
+  assert.equal((after.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal(after.reissues, 0, 'never re-issued');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review 8/6b: the guest handle cancel() on a still-OPENING call is the same cancellation as the interrupt tool\'s id path — fenced + settled durably as cancelled, and the steer resolves `cancelled` (the phase-E review rejection: the handle cancel fell through to `failed` — "nothing was steered" — while the eventual open went on to prompt a supposedly-cancelled call)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  let releaseOpen!: () => void;
+  const parkedOpen = new Promise<void>((resolve) => {
+    releaseOpen = resolve;
+  });
+  const originalOpen = runner.openSession.bind(runner);
+  runner.openSession = async (opts) => {
+    await parkedOpen;
+    return originalOpen(opts);
+  };
+  await broker.eval('const pi = agent("pi/x", "task"); "started"');
+  await tick();
+  const outcome = await broker.eval('await pi.cancel()');
+  assert.ok(
+    String(outcome.result).includes('cancelled'),
+    `the handle cancel resolves with what actually happened: ${outcome.result}`,
+  );
+  const record = broker.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((broker.store().lookup('c2')!.completion!.value as string), 'cancelled', 'the steer recorded its outcome');
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    [],
+    'the cancelled opening call is not left pending',
+  );
+  const got = await broker.eval('await pi.catch((e) => "ERR:" + e.message)');
+  assert.ok(
+    (got.result ?? '').includes('was cancelled by handle cancel while its session was still opening'),
+    `guest-visible settlement: ${got.result}`,
+  );
+  // The LATE landing closes the child without prompting.
+  releaseOpen();
+  await waitFor(() => runner.sessions.length === 1);
+  const session = runner.sessions[0];
+  assert.equal(session.releases, 1, 'the stopped child was closed without ever prompting');
+  assert.equal(session.prompts.length, 0, 'the supposedly-cancelled call never ran a turn');
+  await broker.pump();
+  const after = broker.store().lookup('c1')!;
+  assert.equal(after.completion!.outcome, 'reject');
+  assert.equal(after.reissues, 0, 'never re-issued');
   await broker.dispose();
   ws.dispose();
 });
