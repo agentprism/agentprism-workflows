@@ -810,6 +810,14 @@ export const DEFAULT_MAX_CONCURRENT_AGENTS = 6;
  *  see `BrokerOptions.evalTimeoutMs`). */
 export const DEFAULT_EVAL_TIMEOUT_MS = 30_000;
 
+/** Default teardown ceiling in ms for `Broker.dispose` (spec-owed
+ *  decision: the daemon's shutdown deadline is 5 s — the engine's own
+ *  default mirrors it, so a hung backend can never block reset/shutdown
+ *  past this bound even when the caller passes no explicit bound; the
+ *  daemon's shutdown path shares ONE deadline across the drain and the
+ *  disposal and passes the remaining time instead). */
+export const DEFAULT_DISPOSE_BOUND_MS = 5_000;
+
 /** The guest library's reserved model-spec sentinel (`verify`/`judgePanel`
  *  route their spawned reviewers/graders through it — the DSL options have
  *  no per-call model, so the reviewers inherit "the run's default model").
@@ -2139,15 +2147,51 @@ export class Broker {
    * after the bound expires every call still pending on an attached
    * session is settled with the recoverable `AGENT_CANCELLED` (recorded
    * FIRST, settled into the guest, one bounded drain + settlement
-   * boundary) — the same forced-stop vocabulary as a stopped open.
+   * boundary) — the same forced-stop vocabulary as a stopped open. A
+   * still-observing task's later outcome is a first-wins no-op against
+   * the recorded completion.
+   *
+   * **The bound's forced stop settles a still-OPENING call DURABLY at
+   * the bound, not when its openSession eventually lands** (phase-D
+   * review round 7: a bound-expired openSession used to be only flagged
+   * in `stoppedOpens` — its call was not recorded, guest-settled,
+   * drained or snapshotted until `openSession` resolved, so a parked
+   * open that NEVER resolves left the broker reporting drained with
+   * the call pending and uncancelable). The opening call is settled
+   * with the recoverable `AGENT_CANCELLED` at the bound — recorded
+   * FIRST, settled into the guest, one bounded drain + settlement
+   * boundary — while the `stoppedOpens` fence is RETAINED: an eventual
+   * landing still closes the child immediately without prompting, and
+   * the late task's reject is a first-wins no-op against the recorded
+   * completion. The same pass settles in-flight STEER wire calls the
+   * bound cut off (a lazy re-attach whose load never lands, an
+   * injection/delivery the release phase is about to cut) with the
+   * honest `failed` — exactly what their fenced late landing would
+   * have settled — so the drain never reports drained with a pending
+   * call of any kind.
+   *
+   * **The outer bound is measured from METHOD ENTRY, before the
+   * serialized-chain wait** (phase-D review round 7: the clock used to
+   * start inside the serialized closure, so a drain queued behind a
+   * long operation ran its whole window AFTER the queue wait — the
+   * total could exceed the session-eviction TTL by the queue wait —
+   * and the loop's yield was a fixed 50 ms sleep that could land past
+   * the deadline). A deadline already past at chain acquisition skips
+   * straight to the forced stop; the loop's yield races the remaining
+   * bound. Everything below races the remaining bound — a hung
+   * cancel/release can never block disconnect past the eviction TTL.
    */
   async drainForDisconnect(boundMs: number, shouldAbort?: () => boolean): Promise<boolean> {
+    // The ABSOLUTE bound: measured at METHOD ENTRY — before the
+    // serialized-chain wait — so the queue wait counts against it and
+    // the drain can never run a fresh full window after the chain
+    // finally freed (review round 7).
+    const deadline = Date.now() + Math.max(0, boundMs);
     return this.serialized(async () => {
       this.assertAlive();
       if (this.drained) return true;
       if (shouldAbort?.()) return false;
       this.draining = true;
-      const deadline = Date.now() + Math.max(0, boundMs);
       // Drain phase: pump until no session has a turn running, no session
       // is still opening, and no lazy re-attach is in flight (or the
       // bound expires). Each pump settles into the VM and fires the
@@ -2176,7 +2220,11 @@ export class Broker {
           this.warnLine('warn', `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`);
         }
         if (this.busySessionCount() > 0 || this.openingCalls.size > 0 || this.pendingReattaches.size > 0) {
-          await sleep(50);
+          // The yield is bounded by the REMAINING bound — never a fixed
+          // sleep past the deadline (review round 7: a deadline that
+          // expired during the pump used to add a full 50 ms overshoot).
+          const remaining = deadline - Date.now();
+          if (remaining > 0) await sleep(Math.min(50, remaining));
         }
       }
       const drainedWithinBound =
@@ -2217,23 +2265,52 @@ export class Broker {
         if (final.drainError !== undefined) {
           this.warnLine('warn', `settlement drain interrupted at the disconnect bound: ${errorLine(final.drainError.info)}`);
         }
-        // The bound's forced stop settles EVERY call still pending on an
-        // attached session — a held re-attach (the seam rejected and the
-        // pump dropped its in-flight entry) or a seam the release phase
-        // is about to cut off — with the recoverable AGENT_CANCELLED,
-        // recorded FIRST, settled into the guest, one bounded drain +
-        // settlement boundary. A call left pending here would be
-        // ORPHANED: the release phase discards its session, no task
-        // tracks it, and (the workspace stays live — reconcile never
-        // runs again) it would be uncancelable except by reset
-        // (phase-D review round 6). A still-observing task's later
-        // outcome is a first-wins no-op against the recorded completion.
+        // The bound's forced stop settles EVERY call still pending at
+        // the bound — recorded FIRST, settled into the guest, one
+        // bounded drain + settlement boundary — so the drain never
+        // reports drained with a pending, uncancelable call (review
+        // round 7): (a) calls still OPENING (a parked openSession whose
+        // child never landed — the settlement is DURABLE at the bound,
+        // not deferred until the open resolves; the `stoppedOpens`
+        // fence stays so an eventual landing still closes the child
+        // immediately without prompting, and the late task's reject is
+        // a first-wins no-op against the recorded completion), (b) calls
+        // still pending on an attached session (a held re-attach (the
+        // seam rejected and the pump dropped its in-flight entry) or a
+        // seam the release phase is about to cut off — a call left
+        // pending here would be ORPHANED: the release phase discards its
+        // session, no task tracks it, and (the workspace stays live —
+        // reconcile never runs again) it would be uncancelable except
+        // by reset (phase-D review round 6); a still-observing task's
+        // later outcome is a first-wins no-op against the recorded
+        // completion), and (c) in-flight STEER wire calls the bound cut
+        // off (a lazy re-attach whose load never lands, an
+        // injection/delivery turn the release phase is about to cut) —
+        // settled with the honest `failed`, exactly what their fenced
+        // late landing would have settled.
         const stopped: Array<[string, SessionEntry]> = [];
         for (const [callId, entry] of this.sessions) {
           if (!entry.callSettled && !this.openingCalls.has(callId)) stopped.push([callId, entry]);
         }
-        if (stopped.length > 0) {
+        const stoppedSteers = [...this.inFlight.values()].filter((task) => task.kind === 'steer' && !task.done);
+        if (stopped.length > 0 || this.openingCalls.size > 0 || stoppedSteers.length > 0) {
           const settledIds: string[] = [];
+          for (const callId of [...this.openingCalls]) {
+            const value = toRejectionValue(
+              new WorkflowError(
+                `call ${callId} was cancelled by the client-presence drain: its bound expired while the session ` +
+                  `was still opening — the call is settled, and a late child, if any, is closed without prompting`,
+                CODE.AGENT_CANCELLED,
+                { recoverable: true },
+              ),
+            );
+            this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+            if (this.settleIntoGuest(callId, 'reject', value)) settledIds.push(callId);
+            // The settled opening call's concurrency token is released
+            // at the bound (its parked task is never pumped).
+            this.agentSlots.delete(callId);
+            this.warnLine('warn', `call ${callId}: ${value.message}`);
+          }
           for (const [callId, entry] of stopped) {
             const value = toRejectionValue(
               new WorkflowError(
@@ -2248,6 +2325,27 @@ export class Broker {
             entry.callSettled = true;
             entry.busy = false;
             this.warnLine('warn', `call ${callId}: ${value.message}`);
+          }
+          for (const task of stoppedSteers) {
+            // The deliver() discipline: the store write first, and when
+            // the store ALREADY holds a first completion the guest
+            // settles with the STORE's completion (the store's first
+            // completion is the authority — the guest must never see a
+            // different value than the store records).
+            if (this.recordCompletion(task.callId, { outcome: 'resolve', value: 'failed', completedAtMs: now() })) {
+              if (this.settleIntoGuest(task.callId, 'resolve', 'failed')) settledIds.push(task.callId);
+            } else {
+              const record = this.callStore.lookup(task.callId);
+              const completion = record?.completion;
+              if (completion === null || completion === undefined) {
+                throw new Error(`Broker: store lost the recorded completion for ${task.callId}`);
+              }
+              if (this.settleIntoGuest(task.callId, completion.outcome, completion.value)) settledIds.push(task.callId);
+            }
+            this.warnLine(
+              'warn',
+              `steer ${task.callId}: cut off by the client-presence drain — nothing was delivered`,
+            );
           }
           if (settledIds.length > 0) {
             try {
@@ -2380,8 +2478,26 @@ export class Broker {
    * injected-runner disposal used to leak every session), then dispose
    * the runner when this broker owns it, and drop the broker's state.
    * The workspace (and its VM) is the caller's to dispose.
+   *
+   * The teardown is BOUNDED (phase-D review round 7: it used to await
+   * `cancelSession`, `session.release` and the owned runner's dispose
+   * with NO deadline — a hung backend could block daemon shutdown and
+   * the reset tool indefinitely, and the daemon's shutdown path entered
+   * this unbounded disposal right after a failed or deadline-expired
+   * drain, hanging on the exact hung backend the drain had already
+   * caught). `boundMs` defaults to `DEFAULT_DISPOSE_BOUND_MS` (5 s —
+   * the spec-owed decision: the engine's own default mirrors the
+   * daemon's shutdown deadline; callers with a stricter budget — the
+   * daemon's shutdown path, which shares ONE deadline across the drain
+   * and this teardown — pass the remaining time). The bound is
+   * ABSOLUTE, measured from method entry like the client-presence
+   * drain's: every await races the remaining bound, and once it expires
+   * the disposal returns without waiting — the best-effort
+   * cancellations, releases and the runner teardown already issued keep
+   * running in the background (every promise carries a catch handler,
+   * so nothing can become an unhandled rejection).
    */
-  async dispose(): Promise<void> {
+  async dispose(boundMs: number = DEFAULT_DISPOSE_BOUND_MS): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     this.draining = true;
@@ -2393,17 +2509,21 @@ export class Broker {
     // fencing their unresolved promises, so a late landing could
     // re-register or run a child on a disposed broker).
     this.generation++;
+    // The ABSOLUTE bound: measured at method entry — before the
+    // serialized-chain wait — like the client-presence drain's (review
+    // round 7).
+    const deadline = Date.now() + Math.max(0, boundMs);
     await this.serialized(async () => {
       const cancels: Promise<unknown>[] = [];
       const sessions = [...this.sessions.values()];
       for (const entry of sessions) {
         if (entry.busy) cancels.push(Promise.resolve(this.cancelSession(entry)).catch(() => undefined));
       }
-      await Promise.allSettled(cancels);
+      await boundedAll(cancels, deadline);
       const releases: Promise<unknown>[] = sessions.map((entry) =>
         Promise.resolve(entry.session.release()).catch(() => undefined),
       );
-      await Promise.allSettled(releases);
+      await boundedAll(releases, deadline);
       this.sessions.clear();
       this.pendingSteers.clear();
       this.pendingReattaches.clear();
@@ -2414,7 +2534,18 @@ export class Broker {
       this.deliverySlots.clear();
       this.openingCalls.clear();
       this.stoppedOpens.clear();
-      if (this.ownsRunner) await this.runner.dispose();
+      if (this.ownsRunner) {
+        // The owned runner's disposal races the remaining bound too
+        // (review round 7: it used to be awaited without any deadline).
+        // Its rejection still propagates when it wins the race — a
+        // failing runner teardown is a host-side failure; a deadline
+        // that wins leaves the runner's own best-effort teardown (its
+        // internal allSettled releases) running in the background, and
+        // the tail catch below absorbs a later rejection.
+        const runnerDispose = Promise.resolve(this.runner.dispose());
+        runnerDispose.catch(() => undefined);
+        await boundedOne(runnerDispose, deadline);
+      }
     });
   }
 
@@ -3627,6 +3758,29 @@ async function boundedAll(promises: Promise<unknown>[], deadline: number): Promi
   });
   await Promise.race([Promise.allSettled(promises), bound]);
   if (timer !== undefined) clearTimeout(timer);
+}
+
+/** Await ONE teardown promise (the owned runner's dispose) only until
+ *  `deadline` — the same absolute-bound discipline as `boundedAll`. A
+ *  rejection still propagates when the promise wins the race; a deadline
+ *  that wins returns `undefined` and the promise keeps running in the
+ *  background (callers must attach their own tail catch — the broker's
+ *  dispose does — so the abandoned tail can never become an unhandled
+ *  rejection). The bound timer is CLEARED when the promise wins, so a
+ *  satisfied teardown must not leave a timer pending for the whole
+ *  remaining bound. */
+async function boundedOne<T>(promise: Promise<T>, deadline: number): Promise<T | undefined> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return undefined;
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), remaining);
+  });
+  try {
+    return await Promise.race([promise, bound]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Timer sleep (the drain's yield and bounded-wait primitive). */

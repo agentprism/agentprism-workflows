@@ -101,6 +101,8 @@ import {
   type WasmModule,
 } from "@automatalabs/repl-engine";
 
+import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
+
 /** The per-project interrupt signal (see module docs). */
 export interface ReplInterruptSignal {
   armed: boolean;
@@ -346,25 +348,39 @@ export async function drainReplProject(state: ReplProjectState, boundMs: number)
  *  session) and close the store. The `repl/` directory is kept (a later
  *  touch restores from it). The broker's disposal drains what it can
  *  with the shutdown bound before cancelling (the daemon's shutdown
- *  path; the last-client-disconnect path uses the full drain bound). */
-export async function disposeReplProjectState(state: ReplProjectState): Promise<void> {
+ *  path; the last-client-disconnect path uses the full drain bound).
+ *  `boundMs` defaults to the daemon's shutdown deadline; the shutdown
+ *  path passes the REMAINING time after its drain (phase-D review round
+ *  7: the teardown used to run unbounded — a failed or deadline-expired
+ *  drain was followed by a disposal that awaited hung cancel/release
+ *  forever, so daemon shutdown could hang on the exact hung backend the
+ *  drain had already caught). */
+export async function disposeReplProjectState(
+  state: ReplProjectState,
+  boundMs: number = SHUTDOWN_DEADLINE_MS,
+): Promise<void> {
   const { broker, workspace } = state;
   state.broker = null;
   state.workspace = null;
   state.generation++;
-  if (broker !== null) await broker.dispose();
+  if (broker !== null) await broker.dispose(boundMs);
   workspace?.dispose();
   state.store.close();
 }
 
 /** The `reset` tool's engine-side: teardown the workspace and delete the
- *  whole `repl/` directory, clearing any contained refusal. */
-export async function resetReplProjectState(state: ReplProjectState): Promise<void> {
+ *  whole `repl/` directory, clearing any contained refusal. The broker
+ *  teardown is bounded like the shutdown path's (a hung backend must
+ *  not hang `reset` either). */
+export async function resetReplProjectState(
+  state: ReplProjectState,
+  boundMs: number = SHUTDOWN_DEADLINE_MS,
+): Promise<void> {
   const { broker, workspace } = state;
   state.broker = null;
   state.workspace = null;
   state.generation++;
-  if (broker !== null) await broker.dispose();
+  if (broker !== null) await broker.dispose(boundMs);
   workspace?.dispose();
   state.store.reset();
   state.source = null;

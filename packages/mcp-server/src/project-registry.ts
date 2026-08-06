@@ -208,16 +208,36 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
    *  old path cancelled busy sessions on disposal) — then the broker
    *  teardown (releasing every held ACP session) and the store close.
    *  Called by the daemon at shutdown; the workflow managers' own
-   *  lifecycle is untouched. */
-  async disposeReplStates(): Promise<void> {
+   *  lifecycle is untouched.
+   *
+   *  ONE deadline spans the drain AND the teardown (phase-D review
+   *  round 7: the disposal used to run unbounded — a drain that failed
+   *  or consumed the whole bound then entered a teardown that awaited
+   *  hung cancel/release forever, so daemon shutdown could hang on the
+   *  exact hung backend the drain had already caught). A drain that
+   *  fails or times out leaves the teardown only the remaining bound;
+   *  an expired deadline skips straight to the disposal's bookkeeping
+   *  clear. `boundMs` defaults to the daemon's shutdown deadline (the
+   *  engine's own dispose default mirrors it). */
+  async disposeReplStates(boundMs: number = SHUTDOWN_DEADLINE_MS): Promise<void> {
+    const deadline = Date.now() + Math.max(0, boundMs);
     for (const context of this.contexts.values()) {
       const state = context.repl;
       if (state === undefined) continue;
       const broker = state.broker;
       if (broker !== null) {
-        await broker.drainForDisconnect(SHUTDOWN_DEADLINE_MS).catch(() => undefined);
+        await broker
+          .drainForDisconnect(Math.max(0, deadline - Date.now()))
+          .catch(() => undefined);
       }
-      await disposeReplProjectState(state);
+      // The teardown's own failures are contained here too: its op-end
+      // flush retries a boundary the drain's failed flush retained, and
+      // a second failure (the disk is still broken) must not abort the
+      // shutdown — the session releases and bookkeeping clear already
+      // ran inside `dispose`, the persistence failure was already loud
+      // (the drain's failure), and the process is exiting anyway. The
+      // state on disk keeps the last good snapshot.
+      await disposeReplProjectState(state, Math.max(0, deadline - Date.now())).catch(() => undefined);
     }
   }
 

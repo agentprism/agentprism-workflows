@@ -29,6 +29,7 @@ import type {
 } from "@automatalabs/repl-engine";
 
 import { createWorkflowServer } from "../src/index.js";
+import { WorkflowProjectRegistry } from "../src/project-registry.js";
 import { ReplPresenceLedger } from "../src/repl-presence.js";
 import { okRunner, textOf, type Connected } from "./_harness.js";
 import { workflowProjectPaths } from "@automatalabs/workflows";
@@ -45,6 +46,11 @@ class FakeSession implements BrokerSession {
   readonly completedTexts: string[] = [];
   /** The re-attach seam's scripted loaded-turn outcome (null parks it). */
   loadedTurnTextValue: string | null = null;
+  /** A hung cancel (the bounded-teardown regression: the shutdown
+   *  disposal must not await a hung cancel past its bound). */
+  hangCancel = false;
+  /** A hung release (same regression for the release phase). */
+  hangRelease = false;
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
@@ -75,6 +81,7 @@ class FakeSession implements BrokerSession {
 
   cancel(): Promise<void> {
     this.cancelCalls++;
+    if (this.hangCancel) return new Promise(() => {});
     for (const pending of this.prompts.splice(0)) {
       pending.resolve({ stopReason: "cancelled", text: "" });
     }
@@ -83,6 +90,7 @@ class FakeSession implements BrokerSession {
 
   release(): Promise<void> {
     this.releases++;
+    if (this.hangRelease) return new Promise(() => {});
     return Promise.resolve();
   }
 
@@ -145,12 +153,17 @@ function freshProject(): string {
 /** Connect a workflow server with an injected repl runner + presence. */
 async function connectWithRepl(
   replRunner: BrokerRunner,
-  options: { presence?: ReplPresenceLedger; clientId?: () => string | undefined } = {},
+  options: {
+    presence?: ReplPresenceLedger;
+    clientId?: () => string | undefined;
+    projects?: WorkflowProjectRegistry;
+  } = {},
 ): Promise<Connected & { runner: FakeRunner }> {
   const server = createWorkflowServer(okRunner(), {
     replRunner,
     replPresence: options.presence,
     replClientId: options.clientId ?? (() => "test-client"),
+    projects: options.projects,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "mcp-repl-review2", version: "0.0.0" }, { capabilities: {} });
@@ -499,6 +512,60 @@ test("review6: a failed client-presence drain is surfaced loudly and retained �
     assert.ok(!textOf(status2).includes("LAST DRAIN FAILED"), `the retry cleared the failure: ${textOf(status2)}`);
     assert.ok(textOf(status2).includes("children: closed"), textOf(status2));
   } finally {
+    await connected.dispose();
+  }
+});
+
+test("review7: daemon shutdown is BOUNDED even when the client-presence drain FAILS and cancel/release HANG — the teardown races the remaining shutdown bound, so shutdown never hangs on the hung backend the drain already caught", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const presence = new ReplPresenceLedger(60_000);
+  const projects = new WorkflowProjectRegistry(okRunner());
+  const connected = await connectWithRepl(runner, { presence, projects });
+  const tmpPath = join(workflowProjectPaths(PROJECT).rootDir, "repl", "snapshot.bin.tmp");
+  try {
+    const r = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "task"); "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    // The worst case the review flagged: the in-flight turn never
+    // completes, cancel AND release hang forever, and the snapshot write
+    // FAILS (a directory at the tmp path — EISDIR) so the shutdown drain
+    // itself fails. phase-D review round 7: the disposal used to run
+    // UNBOUNDED after a failed/deadline-expired drain — it awaited the
+    // hung cancel/release forever, so daemon shutdown could hang on the
+    // exact hung backend the drain had already caught.
+    const session = runner.last();
+    session.hangCancel = true;
+    session.hangRelease = true;
+    mkdirSync(tmpPath);
+    // Daemon shutdown: the drain consumes (and fails within) the bound,
+    // then the teardown must NOT hang — the disposal races the REMAINING
+    // shutdown bound (one deadline spans the drain and the teardown).
+    const started = Date.now();
+    const teardown = projects.disposeReplStates(300);
+    const result = await Promise.race([
+      teardown.then(() => "done"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("HUNG"), 3000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.equal(result, "done", "daemon shutdown returned within the bound (never hung on cancel/release)");
+    assert.ok(elapsed < 2000, `shutdown was bounded: ${elapsed} ms`);
+    // The state was fully torn down (the broker disposal's bookkeeping
+    // clear ran even though the wire calls hung).
+    const projectContext = projects.stores().find((c) => c.projectDir === PROJECT)!;
+    const state = projectContext.repl!;
+    assert.equal(state.broker, null, "the broker was disposed");
+    assert.equal(state.workspace, null, "the workspace was disposed");
+  } finally {
+    try {
+      rmSync(tmpPath, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
     await connected.dispose();
   }
 });

@@ -530,9 +530,24 @@ test('review 2/3c-2: a parked open that outlives the drain bound is STOPPED — 
   // (the honest bounded teardown) and marks the opening call STOPPED.
   assert.equal(await broker.drainForDisconnect(50), false);
   assert.ok(broker.isDrained);
+  // The bound settlement is DURABLE AT THE BOUND (phase-D review round
+  // 7): the opening call is recorded, guest-settled, drained and
+  // snapshotted while the open is STILL parked — the broker does not
+  // report drained with the call pending and uncancelable even though
+  // the openSession has not resolved (it may never resolve).
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    [],
+    'the opening call is not left pending in the guest registry at the bound',
+  );
+  const boundRecord = broker.store().lookup('c1')!;
+  assert.equal(boundRecord.completion!.outcome, 'reject');
+  assert.equal((boundRecord.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.equal((boundRecord.completion!.value as { recoverable?: boolean }).recoverable, true);
   // The parked open lands LATER: the child is closed immediately — it
   // never prompts (nothing runs after the last client disconnected) —
-  // and the call settles as the recoverable AGENT_CANCELLED.
+  // and the late reject is a first-wins no-op against the bound's
+  // recorded completion.
   releaseOpen();
   await waitFor(() => runner.sessions.length === 1);
   const session = runner.sessions[0];
@@ -553,7 +568,60 @@ test('review 2/3c-2: a parked open that outlives the drain bound is STOPPED — 
   const record = broker.store().lookup('c1')!;
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal(record.reissues, 0, 'never re-issued');
   await broker.dispose();
+  ws.dispose();
+});
+
+test('review 7/3c-3: an openSession that NEVER resolves is settled DURABLY at the bound — recorded, guest-settled, drained and snapshotted, so the drain never reports drained with the call pending and uncancelable', async () => {
+  const runner = new FakeRunner();
+  const boundaries: string[] = [];
+  const sink: SnapshotSink = {
+    boundary: (kind) => boundaries.push(kind),
+    flush: () => undefined,
+  };
+  const { ws, broker } = await setup({ runner, sink });
+  // The open is parked FOREVER (a backend that accepts the session
+  // request but never answers it — the never-resolving openSession).
+  runner.openSession = async () => new Promise(() => {});
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  // The bound expires with the open still parked. The forced stop must
+  // settle the call AT THE BOUND — recorded FIRST (durable), settled
+  // into the guest, one bounded drain + settlement boundary — without
+  // waiting for the openSession, which NEVER resolves (review round 7:
+  // the settlement used to be deferred to the landing, leaving the
+  // broker reporting drained with the call pending and uncancelable).
+  const before = boundaries.length;
+  assert.equal(
+    await broker.drainForDisconnect(50),
+    false,
+    'the never-resolving open cannot drain — the bound is the honest outcome',
+  );
+  assert.ok(broker.isDrained);
+  const record = broker.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    [],
+    'the opening call is not left pending in the guest registry',
+  );
+  assert.ok(
+    boundaries.slice(before).includes('settlement'),
+    `the bound settlement fired a settlement boundary (snapshot): ${boundaries.join(',')}`,
+  );
+  // The guest promise settled with the recoverable error (a later eval
+  // reads it — the workspace stays live after the drain).
+  const got = await broker.eval('await p.catch((e) => "ERR:" + e.message)');
+  assert.ok(
+    (got.result ?? '').includes('cancelled by the client-presence drain'),
+    `guest-visible settlement: ${got.result}`,
+  );
+  // The parked open never lands; the broker is fully teardown-able (the
+  // parked task cannot block disposal, which is bounded).
+  await broker.dispose(500);
   ws.dispose();
 });
 

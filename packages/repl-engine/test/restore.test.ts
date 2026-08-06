@@ -1551,8 +1551,43 @@ test('the drain bound is ABSOLUTE: a hung cancel/release cannot block disconnect
   const drained = await broker.drainForDisconnect(100);
   const elapsed = Date.now() - started;
   assert.equal(drained, false, 'the bound expired with the turn still running');
-  assert.ok(elapsed < 3000, `the drain returned within the bound, not blocked by the hung backend: ${elapsed} ms`);
+  // TIGHT ceiling (phase-D review round 7: this used to permit a 100 ms
+  // drain to take nearly 3 seconds — it did not enforce the required
+  // ceiling). The bound is absolute: the drain returns at the deadline
+  // plus timer slop, never a fresh window after it.
+  assert.ok(elapsed < 500, `the drain returned within the bound, not blocked by the hung backend: ${elapsed} ms`);
   assert.ok(broker.isDrained);
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('the drain bound is measured from METHOD ENTRY: a drain queued behind a long serialized operation skips straight to the forced stop instead of running a fresh window after the queue wait (phase-D review round 7)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  await broker.eval('const p = agent("pi/x", "task"); "started"');
+  await tick();
+  // A hung backend: cancel AND release never resolve (the worst case).
+  const session = runner.sessions[0];
+  session.hangCancel = true;
+  session.hangRelease = true;
+  // Hold the broker's serialized chain with a guest busy-loop eval for
+  // ~400 ms (the eval's op runs synchronously, so the drain queued
+  // behind it cannot start until the loop exits). The drain's bound
+  // must be measured from METHOD ENTRY — a deadline already past at
+  // chain acquisition skips straight to the forced stop. The old code
+  // started the clock inside the serialized closure: the drain then ran
+  // a fresh ~120 ms window AFTER the 400 ms queue wait (~520 ms total).
+  const started = Date.now();
+  const evalP = broker.eval('const t = Date.now(); while (Date.now() - t < 400) {} "slow"');
+  const drainP = broker.drainForDisconnect(120);
+  await evalP;
+  const drained = await drainP;
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the turn never completed — the bound is the honest outcome');
+  assert.ok(broker.isDrained);
+  // 400 ms queue wait + a margin: a drain that ran a fresh full window
+  // after the queue wait would land well past this.
+  assert.ok(elapsed < 480, `the bound was measured from method entry, not after the queue wait: ${elapsed} ms`);
   await broker.dispose();
   ws.dispose();
 });

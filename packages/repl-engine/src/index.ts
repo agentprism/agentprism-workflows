@@ -108,6 +108,7 @@ export {
   Broker,
   DEFAULT_MAX_CONCURRENT_AGENTS,
   DEFAULT_EVAL_TIMEOUT_MS,
+  DEFAULT_DISPOSE_BOUND_MS,
   type BrokerOptions,
   type BrokerRunner,
   type BrokerSession,
