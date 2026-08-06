@@ -3964,7 +3964,24 @@ export class Broker {
    *  drain's late-landing paths already rely on. A deadline already
    *  past at call time skips straight to the unlocked run. When the
    *  chain frees within the bound, `fn` runs INSIDE it exactly as
-   *  before (subsequent ops queue behind it). */
+   *  before (subsequent ops queue behind it).
+   *
+   *  The enqueue is ATOMIC with a changed-chain re-check: the race
+   *  resolves when the chain promise captured AT RACE TIME settles, but
+   *  other microtasks run between that resolution and this continuation
+   *  — an op enqueued in that window chains onto the just-released
+   *  chain and REPLACES `this.opChain` (the no-deadline path enqueues
+   *  synchronously, so it can land exactly there). Re-reading the
+   *  mutable field after the await would enqueue behind the NEW chain
+   *  with no deadline race on it (the review-rejected round-8 code did
+   *  exactly this: a 20 ms drain took 307 ms behind an op queued as the
+   *  prior chain released). So the post-race path re-checks the field
+   *  and, when it changed, re-races the new chain against the REMAINING
+   *  time — each loop pass only consumes remaining budget, so the total
+   *  wait can never exceed the deadline plus timer slop no matter how
+   *  many ops enqueue around a release; and the check-and-assign when
+   *  the field is unchanged run in ONE synchronous block, so no op can
+   *  interleave between them. */
   private async serialized<T>(fn: () => Promise<T>, deadline?: number): Promise<T> {
     if (deadline === undefined) {
       const run = this.opChain.then(
@@ -3977,40 +3994,52 @@ export class Broker {
       );
       return run;
     }
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      // The deadline is already past: run WITHOUT the chain — waiting
-      // for it would exceed the absolute bound.
-      return this.runSerialized(fn);
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        // The deadline is already past: run WITHOUT the chain — waiting
+        // for it would exceed the absolute bound.
+        return this.runSerialized(fn);
+      }
+      const raced = this.opChain;
+      let timer: NodeJS.Timeout | undefined;
+      const bound = new Promise<'bound'>((resolve) => {
+        timer = setTimeout(() => resolve('bound'), remaining);
+      });
+      const winner = await Promise.race([
+        raced.then(
+          () => 'chain' as const,
+          () => 'chain' as const,
+        ),
+        bound,
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (winner === 'bound') {
+        // The bound won the race: the chain is stuck past the deadline
+        // — run WITHOUT it and return at the bound (the caller's body
+        // is first-wins/generation-fenced, so the stuck op's eventual
+        // landing cannot interleave into a double settlement).
+        return this.runSerialized(fn);
+      }
+      if (this.opChain === raced) {
+        // The chain we raced is still the current one — enqueue onto it
+        // atomically (the check and the replacement share one
+        // synchronous block, so no operation can interleave between
+        // them).
+        const run = raced.then(
+          () => this.runSerialized(fn),
+          () => this.runSerialized(fn),
+        );
+        this.opChain = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return run;
+      }
+      // The chain CHANGED while we awaited the race (an op enqueued in
+      // the microtasks between the chain's release and this continuation
+      // replaced it): re-race the new chain with the remaining time.
     }
-    let timer: NodeJS.Timeout | undefined;
-    const bound = new Promise<'bound'>((resolve) => {
-      timer = setTimeout(() => resolve('bound'), remaining);
-    });
-    const winner = await Promise.race([
-      this.opChain.then(
-        () => 'chain' as const,
-        () => 'chain' as const,
-      ),
-      bound,
-    ]);
-    if (timer !== undefined) clearTimeout(timer);
-    if (winner === 'chain') {
-      const run = this.opChain.then(
-        () => this.runSerialized(fn),
-        () => this.runSerialized(fn),
-      );
-      this.opChain = run.then(
-        () => undefined,
-        () => undefined,
-      );
-      return run;
-    }
-    // The bound won the race: the chain is stuck past the deadline —
-    // run WITHOUT it and return at the bound (the caller's body is
-    // first-wins/generation-fenced, so the stuck op's eventual landing
-    // cannot interleave into a double settlement).
-    return this.runSerialized(fn);
   }
 
   /** One serialized operation with the sink's end-of-burst flush: the

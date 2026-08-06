@@ -1717,6 +1717,77 @@ test('the drain bound is ABSOLUTE against the CHAIN WAIT: a YIELDFUL queued oper
   ws.dispose();
 });
 
+test('the drain bound is ABSOLUTE against a chain REPLACED mid-wait: an op enqueued precisely as the prior chain releases (in the drain\'s race window) must not become the chain the drain waits behind with no deadline race (review rejection)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // Two pending calls: c1 drives the FIRST chain holder's release (the
+  // race fires when its wait completes); c2 keeps the SECOND op — the
+  // one enqueued DURING the drain's chain wait — alive past the bound
+  // (a replacement that resolved quickly would let the re-read bug
+  // pass unnoticed).
+  await broker.eval('const p1 = agent("pi/x", "task1"); const p2 = agent("pi/x", "task2"); "started"');
+  await tick();
+  // A hung backend: cancel AND release never resolve (the worst case).
+  for (const session of runner.sessions) {
+    session.hangCancel = true;
+    session.hangRelease = true;
+  }
+  // op1 holds the serialized chain waiting on c1 (yieldful — its poll
+  // loop never blocks the event loop, so the drain's bound timer fires
+  // normally).
+  const waiting1 = broker.waitForCalls(['c1'], 10_000);
+  await tick();
+  const started = Date.now();
+  // The drain races the chain — op1's — with the remaining bound.
+  const drainedP = broker.drainForDisconnect(120);
+  await tick();
+  // op2 enqueues WHILE the drain awaits: it chains onto op1's chain and
+  // REPLACES `this.opChain`. The review-rejected code raced one chain,
+  // then re-read the mutable field after its race won — the microtasks
+  // between the chain's release and that re-read let op2's replacement
+  // win, so the drain queued behind op2 with no deadline race on it (a
+  // 20 ms drain took 307 ms; here op2 polls c2 for 10 s, so the old
+  // code returned only at ITS timeout).
+  const waiting2 = broker.waitForCalls(['c2'], 10_000);
+  // Release the raced chain: c1's turn completes, op1's wait ends, the
+  // drain's race fires 'chain' — with op2 already the current chain.
+  runner.sessions[0].completeTurn('done');
+  const drained = await drainedP;
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the bound expired with c2 still running');
+  // TIGHT: the drain returns AT its deadline — the old code returned
+  // only when the replacement op freed the chain (~10 s later).
+  assert.ok(elapsed < 500, `the drain re-raced the replaced chain instead of waiting behind it: ${elapsed} ms`);
+  assert.ok(broker.isDrained);
+  // c1 completed normally (its turn finished before the bound) — the
+  // unlocked forced stop never touched it.
+  const record1 = broker.store().lookup('c1')!;
+  assert.equal(record1.completion!.outcome, 'resolve');
+  // c2 — still pending at the bound — was settled DURABLY by the
+  // unlocked forced stop (recorded first, settled into the guest, no
+  // pending registry entry left — the chain wait can shorten the
+  // drain, never its settlement discipline).
+  const record2 = broker.store().lookup('c2')!;
+  assert.equal(record2.completion!.outcome, 'reject');
+  assert.equal((record2.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.deepEqual(
+    broker.pendingCalls().map((e) => e.id),
+    [],
+    'neither call is left pending in the guest registry',
+  );
+  assert.equal(runner.sessions[0].cancelCalls, 0, 'the completed turn was not cancelled');
+  assert.equal(runner.sessions[1].cancelCalls, 1, 'the forced stop issued the cancel for the still-running turn');
+  assert.equal(runner.sessions[0].releases, 1, 'the release phase released the completed session (bounded, never awaited past the bound)');
+  assert.equal(runner.sessions[1].releases, 1, 'the release phase released the hung session (bounded, never awaited past the bound)');
+  // Both wait ops observe their calls settled and end promptly (no 10 s
+  // wait: op1 saw c1 settle; op2 sees the registry empty on its next
+  // poll).
+  await waiting1;
+  await waiting2;
+  await broker.dispose();
+  ws.dispose();
+});
+
 test('Broker.dispose is bounded against the CHAIN WAIT too: a YIELDFUL queued operation cannot delay teardown past the bound — the disposal races the remaining bound like the drain (phase-D review round 8)', async () => {
   const runner = new FakeRunner();
   const { ws, broker } = await setup({ runner });
