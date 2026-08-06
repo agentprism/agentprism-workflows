@@ -1733,3 +1733,63 @@ test('a client reconnecting mid-drain ABORTS the drain: children stay warm — n
   await broker.dispose();
   ws.dispose();
 });
+
+test('a restore-time loadSession that lands AFTER a bounded dispose is released exactly once — never registered, never re-issued (phase-D review rejection: the parked restore load used to register its session on the disposed broker, leaking it and repopulating liveAgents)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-late-load-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  // Restore: fresh workspace over the snapshot, fresh broker + runner
+  // over the same store. The re-attach loadSession PARKS (never resolves
+  // on its own — the reviewer's focused probe scenario).
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  let loadCalls = 0;
+  let resolveLoad: (() => void) | undefined;
+  const parkedLoad = new Promise<void>((resolve) => {
+    resolveLoad = resolve;
+  });
+  const originalLoad = runner2.loadSession.bind(runner2);
+  runner2.loadSession = async (opts) => {
+    loadCalls++;
+    await parkedLoad;
+    return originalLoad(opts);
+  };
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  const reconcilePromise = broker2.reconcile();
+  await tick();
+  assert.equal(loadCalls, 1, 'the re-attach load is in flight (parked)');
+
+  // A BOUNDED dispose completes while the load is parked (the daemon
+  // shutdown path): the serialized chain is held by the parked reconcile,
+  // so the disposal runs unlocked at its deadline — it must return
+  // within the bound, never after the parked load.
+  const started = Date.now();
+  await broker2.dispose(150);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1500, `dispose was bounded while the reconcile held the chain: ${elapsed} ms`);
+  assert.equal(broker2.liveAgents().length, 0, 'no live agent after the dispose');
+
+  // The parked load lands LATER: the child is released exactly once,
+  // never registered, never re-issued (no fresh openSession, no prompt —
+  // a disposed broker must never open a child), and the call is never
+  // settled from a quiet gap.
+  resolveLoad!();
+  const report = await reconcilePromise;
+  assert.deepEqual(report.reattached, [], 'the call was never re-attached');
+  assert.deepEqual(report.reissued, [], 'the call was never re-issued');
+  assert.deepEqual(report.failedLost, []);
+  assert.deepEqual(report.leftPending, ['c1'], 'the call stays pending — the state owning it was torn down');
+  assert.equal(runner2.sessions.length, 1, 'only the loaded session exists');
+  const loaded = runner2.sessions[0];
+  assert.equal(loaded.releases, 1, 'the late-loaded session was released exactly once');
+  assert.equal(loaded.prompts.length, 0, 'the late-loaded session never prompted');
+  assert.equal(broker2.liveAgents().length, 0, 'no live agent — the session never registered');
+  assert.equal(runner2.openedWith.length, 0, 'no re-issue — no fresh session was opened');
+  assert.equal(broker2.store().lookup('c1')!.completion, null, 'the call was not settled from a quiet gap');
+  ws2.dispose();
+});

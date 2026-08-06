@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -626,5 +626,124 @@ test("review8: the shutdown drain FAILS BEFORE releasing sessions — the bounde
     assert.equal(state.workspace, null, "the workspace was nulled");
   } finally {
     await connected.dispose();
+  }
+});
+
+/** A small bounded poll (this file's tests park promises by hand). */
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor: condition not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test("review8b: a concurrent first touch during a parked restore-time loadSession AWAITS the in-flight reconcile (never bypasses to partially restored state), and daemon teardown during the parked load releases the late session with no stale restore report (phase-D review rejection: ensureReplWorkspace checked state.workspace before state.firstTouch, and doFirstTouch published source/reconcileReport without generation-checking reconcile completion)", async () => {
+  const PROJECT = freshProject();
+  // Phase 1 — seed a stored snapshot with a pending call whose backend
+  // session is recorded (the restore's re-attach key).
+  const runner1 = new FakeRunner();
+  const first = await connectWithRepl(runner1);
+  try {
+    const r = await repl(first, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "task"); "started"',
+    });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    assert.equal(runner1.sessions.length, 1, "the founding session opened");
+    assert.ok(existsSync(join(workflowProjectPaths(PROJECT).rootDir, "repl", "snapshot.bin")), "the eval boundary snapshot exists");
+  } finally {
+    await first.dispose();
+  }
+
+  // Phase 2 — a fresh daemon: the first touch restores the workspace and
+  // the restore-time loadSession PARKS (never resolves on its own).
+  const runner2 = new FakeRunner();
+  const presence = new ReplPresenceLedger(60_000);
+  const projects = new WorkflowProjectRegistry(okRunner());
+  const second = await connectWithRepl(runner2, { presence, projects });
+  let loadCalls = 0;
+  let resolveLoad!: () => void;
+  const parkedLoad = new Promise<void>((resolve) => {
+    resolveLoad = resolve;
+  });
+  const loadedSessions: FakeSession[] = [];
+  const originalLoad = runner2.loadSession.bind(runner2);
+  runner2.loadSession = async (opts) => {
+    loadCalls++;
+    await parkedLoad;
+    const session = await originalLoad(opts);
+    loadedSessions.push(session);
+    return session;
+  };
+  try {
+    // The first touch: restore + reconcile, parked in the re-attach load.
+    const touch1 = repl(second, { action: "eval", projectDir: PROJECT, code: '"probe 1"' });
+    await waitFor(() => loadCalls === 1);
+    const projectContext = projects.stores().find((c) => c.projectDir === PROJECT)!;
+    const state = projectContext.repl!;
+
+    // A CONCURRENT first touch must AWAIT the in-flight first-touch
+    // promise — it must NOT return early through the workspace fast path
+    // (the old ordering checked state.workspace before state.firstTouch,
+    // so the concurrent call observed the partially restored workspace
+    // and evaluated against it).
+    let touch2Settled = false;
+    void repl(second, { action: "eval", projectDir: PROJECT, code: '"probe 2"' }).then(
+      () => {
+        touch2Settled = true;
+      },
+      () => {
+        touch2Settled = true;
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(touch2Settled, false, "the concurrent first touch awaited the in-flight restore reconcile (never bypassed to the partially restored workspace)");
+
+    // Daemon teardown WHILE the restore-time load is parked: the
+    // shutdown drain force-stops the opening re-attach (the call settles
+    // durably as AGENT_CANCELLED — it is in the opening-call registry
+    // now, so the bound's forced stop covers it exactly like an
+    // openSession), and the bounded disposal runs unlocked at its
+    // deadline — shutdown returns within the bound.
+    const started = Date.now();
+    await projects.disposeReplStates(300);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 2500, `daemon shutdown was bounded while the restore load was parked: ${elapsed} ms`);
+    assert.equal(state.workspace, null, "the workspace was torn down");
+    assert.equal(state.broker, null, "the broker was torn down");
+    assert.equal(state.source, null, "no source was published before the reconciliation completed");
+
+    // The parked load lands AFTER the teardown: the child is released
+    // exactly once — never registered, never re-issued — and the
+    // first-touch continuation must NOT write a stale source/report onto
+    // the torn-down state (the generation check aborts the touch; the
+    // broker's own disposal fence released the session).
+    resolveLoad();
+    await waitFor(() => loadedSessions.length === 1);
+    assert.equal(loadedSessions[0].releases, 1, "the late-loaded session was released exactly once");
+    assert.equal(loadedSessions[0].prompts.length, 0, "the late-loaded session never prompted");
+    assert.equal(runner2.openedWith.length, 0, "no re-issue — no fresh session was opened");
+    assert.equal(state.workspace, null, "the workspace stayed torn down");
+    assert.equal(state.broker, null, "the broker stayed torn down");
+    assert.equal(state.source, null, "no stale restore source on the torn-down state");
+    assert.equal(state.reconcileReport, null, "no stale reconcile report on the torn-down state");
+
+    // The first touch settles LOUDLY (aborted by the teardown) — never a
+    // successful eval against torn-down state.
+    const [touch1Result] = await Promise.allSettled([touch1]);
+    assert.equal(touch1Result.status, "fulfilled", "the abort is surfaced as an error result");
+    assert.ok(
+      isErrorResult((touch1Result as PromiseFulfilledResult<unknown>).value),
+      "the aborted first touch is an error result",
+    );
+    assert.ok(
+      textOf((touch1Result as PromiseFulfilledResult<{ content: unknown[] }>).value).includes("aborted by reset/dispose"),
+      "the abort names the teardown loudly",
+    );
+  } finally {
+    await second.dispose();
   }
 });

@@ -206,9 +206,17 @@ export async function ensureReplWorkspace(
   runner?: BrokerRunner,
   evalTimeoutMs: number = DEFAULT_REPL_EVAL_TIMEOUT_MS,
 ): Promise<void> {
-  if (state.workspace !== null) return;
+  // The in-flight first-touch promise is awaited BEFORE the workspace
+  // fast path (phase-D review rejection: the fast path used to check
+  // `state.workspace` first, while `doFirstTouch` publishes the
+  // workspace/broker before awaiting the restore's reconcile — a
+  // concurrent request could bypass an in-progress restore
+  // reconciliation and observe or use partially restored state). While
+  // `firstTouch` is non-null the touch (reconcile included) is not
+  // complete, so every concurrent toucher shares it.
   const flight = state.firstTouch;
   if (flight !== null) return flight;
+  if (state.workspace !== null) return;
   const promise = doFirstTouch(state, wasm, runner, evalTimeoutMs);
   state.firstTouch = promise;
   try {
@@ -252,8 +260,25 @@ async function doFirstTouch(
       const restored = state.store.loadSnapshot(wasm);
       const workspace = await Workspace.restore(state.projectDir, restored.snapshot, { wasm });
       await attach(workspace);
+      // The restore's source/report are published only AFTER the
+      // reconciliation completes, and its completion is
+      // GENERATION-CHECKED (phase-D review rejection: the old code wrote
+      // `source` before awaiting the reconcile and wrote the report
+      // after it with no generation check, so a reset/dispose during a
+      // parked restore-time loadSession left a stale "restored" report
+      // on the torn-down state — the broker's own disposal fences
+      // released the late-loaded sessions, and the report of a reconcile
+      // that outlived the state it describes must not be published).
+      const broker = state.broker!;
+      const report = await broker.reconcile();
+      if (state.generation !== generation) {
+        // reset/dispose won while the reconciliation was in flight: the
+        // report belongs to a torn-down state — it is dropped, and the
+        // touch aborts loudly exactly like the attach race.
+        throw new Error("repl workspace touch aborted by reset/dispose");
+      }
       state.source = "restored";
-      state.reconcileReport = await state.broker!.reconcile();
+      state.reconcileReport = report;
       return;
     } catch (error) {
       if (error instanceof SnapshotEnvelopeError) {

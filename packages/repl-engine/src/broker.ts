@@ -1264,6 +1264,21 @@ export class Broker {
       // snapshot boundary when the re-issue was refused).
       return this.reissueCall(entry, parsed, 'no resumable backend session was recorded', report);
     }
+    // The restore-time re-attach is covered by the OPENING-CALL registry
+    // (phase-D review rejection: a parked restore-time loadSession used to
+    // be invisible to the client-presence drain and to dispose). The drain
+    // now WAITS for the load exactly like an openSession (a parked restore
+    // load is in-flight work — the child may open and run after the last
+    // client disconnected) and force-stops it DURABLY at the bound
+    // (recorded AGENT_CANCELLED, guest-settled, drained, snapshotted —
+    // never an orphaned pending call), while the GENERATION captured at
+    // START fences the late landing: a load that resolves after the
+    // broker was disposed (or after the drain force-stopped) is released
+    // immediately — never registered (a late landing must not leak the
+    // session or repopulate liveAgents on a torn-down broker) and never
+    // re-issued (a fresh child must not open or prompt after disposal).
+    const generation = this.generation;
+    this.openingCalls.add(entry.id);
     let loaded: BrokerSession | undefined;
     try {
       // The re-attach routing: the store's RECORDED backend id pins the
@@ -1294,6 +1309,29 @@ export class Broker {
         retainSessionLog: true,
       });
       loaded = session;
+      this.openingCalls.delete(entry.id);
+      // The disposed/drain fence (see above): the drain's force-stop
+      // marked the call stopped (and settled it durably) when the bound
+      // expired with the load parked; disposal bumped the generation.
+      const stoppedByDrain = this.stoppedOpens.delete(entry.id);
+      if (stoppedByDrain || this.disposed || this.generation !== generation) {
+        if (!stoppedByDrain) {
+          // Not already settled by the drain's force-stop: the broker was
+          // disposed while the load was parked. The child is closed
+          // immediately, and the call stays pending in the guest
+          // (leftPending — the state owning it is being torn down anyway;
+          // it is never settled from a quiet gap and never re-issued).
+          this.warnLine(
+            'info',
+            `call ${entry.id}: restore re-attach of backend session ${sessionId} landed after the broker ` +
+              `was disposed — the child was closed without registering`, // eslint-disable-line max-len
+          );
+          report.leftPending.push(entry.id);
+        }
+        await Promise.resolve(session.release()).catch(() => undefined);
+        loaded = undefined;
+        return false;
+      }
       const awaitTurn = session.awaitCurrentTurn;
       if (awaitTurn === undefined) {
         // A THIRD-PARTY BrokerSession adapter without the seam (the real
@@ -1332,6 +1370,20 @@ export class Broker {
       report.reattached.push(entry.id);
       return false;
     } catch (error) {
+      this.openingCalls.delete(entry.id);
+      // The disposed/drain fence for a load that FAILED while parked
+      // (mirrors the try arm): a force-stopped call was already settled
+      // by the drain; on a disposed broker the call stays pending — never
+      // a re-issue (a fresh child must not open after disposal).
+      const stoppedByDrain = this.stoppedOpens.delete(entry.id);
+      if (stoppedByDrain || this.disposed || this.generation !== generation) {
+        if (loaded !== undefined) {
+          await Promise.resolve(loaded.release()).catch(() => undefined);
+          loaded = undefined;
+        }
+        if (!stoppedByDrain) report.leftPending.push(entry.id);
+        return false;
+      }
       // The capability gate (a backend without session/load), a
       // lost/deleted session, a wire failure, or the seam's rejection
       // (founding-turn outcome unobservable): release the loaded session

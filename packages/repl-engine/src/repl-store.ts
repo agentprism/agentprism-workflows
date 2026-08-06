@@ -274,6 +274,9 @@ export class ReplWorkspaceStore {
     let dirty = false;
     return {
       boundary: () => {
+        // A workspace torn down mid-operation cannot be snapshotted —
+        // its VM is gone (see `flush`).
+        if (workspace.isDisposed) return;
         if (!debounce) {
           this.writeSnapshot(workspace.snapshot(), wasm);
           return;
@@ -282,6 +285,20 @@ export class ReplWorkspaceStore {
       },
       flush: () => {
         if (!dirty) return;
+        // A workspace torn down mid-operation (a reset/dispose racing a
+        // parked restore-time loadSession whose reconcile lands late, for
+        // example) cannot be snapshotted — the VM is gone, and the state
+        // that owns this writer is being discarded anyway. The skip is a
+        // deliberate TEARDOWN no-op, not the retained-dirty failure
+        // posture below: the daemon's shutdown drain persists its
+        // settlements BEFORE the workspace is disposed, so the state's
+        // last good snapshot on disk is the persistence story (a
+        // late-landing op must not throw "operation on a disposed
+        // workspace" from inside the broker's end-of-op flush).
+        if (workspace.isDisposed) {
+          dirty = false;
+          return;
+        }
         // The write happens BEFORE the boundary clears (phase-D review
         // round 6): a failing write leaves the boundary dirty, so the
         // next flush — the next drain burst, or the next disconnect's
