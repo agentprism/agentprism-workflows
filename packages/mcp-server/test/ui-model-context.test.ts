@@ -29,13 +29,15 @@ function fold(model: ReturnType<typeof createRunModel>, event: Record<string, un
   } as unknown as RunEventLogRecord);
 }
 
-test("transcript and progress churn does not change the push signature", () => {
+test("only agent settlement, phase starts, and terminal/paused run state push", () => {
   const model = createRunModel("run-1");
   model.status = "running";
   fold(model, { type: "phase", title: "Scan" });
   fold(model, { type: "agentStart", callIndex: 0, label: "finder", scope: "run-1" });
   const before = modelContextSignature(model);
 
+  // None of this is a milestone: progress rows, transcript tokens, narrator logs, and
+  // additional agent STARTS are all live-view detail.
   fold(model, {
     type: "agentProgress",
     callIndex: 0,
@@ -51,27 +53,50 @@ test("transcript and progress churn does not change the push signature", () => {
     entry: { kind: "text", text: "hello" },
   });
   fold(model, { type: "log", message: "narrator line" });
-
+  fold(model, { type: "agentStart", callIndex: 1, label: "checker", scope: "run-1" });
   assert.equal(modelContextSignature(model), before);
   assert.equal(isUrgentStatus(model), false);
+
+  // A new phase IS a milestone — it is the workflow's own structural checkpoint.
+  fold(model, { type: "phase", title: "Verify" });
+  const verifying = modelContextSignature(model);
+  assert.notEqual(verifying, before);
+
+  // A re-announced identical title is the SAME phase: the reducer collapses it, so no push.
+  fold(model, { type: "phase", title: "Verify" });
+  assert.equal(modelContextSignature(model), verifying);
+
+  // An agent going terminal IS a milestone — once per settled agent, success or failure.
+  fold(model, { type: "agentEnd", callIndex: 0, tokens: 1200 });
+  const oneSettled = modelContextSignature(model);
+  assert.notEqual(oneSettled, verifying);
+
+  fold(model, { type: "agentEnd", callIndex: 1, error: "boom" });
+  assert.notEqual(modelContextSignature(model), oneSettled);
 });
 
-test("phase transitions and agent settlement change the signature", () => {
+test("workflow completion is a milestone; token and cost churn is not", () => {
   const model = createRunModel("run-2");
   model.status = "running";
-  fold(model, { type: "phase", title: "Scan" });
   fold(model, { type: "agentStart", callIndex: 0, label: "finder", scope: "run-2" });
-  const scanning = modelContextSignature(model);
+  fold(model, { type: "agentEnd", callIndex: 0, tokens: 10 });
+  const running = modelContextSignature(model);
 
-  fold(model, { type: "agentEnd", callIndex: 0, tokens: 1200 });
-  const settled = modelContextSignature(model);
-  assert.notEqual(settled, scanning);
+  fold(model, { type: "paused", reason: "usage_limit", resetHint: "resets 5pm" });
+  const paused = modelContextSignature(model);
+  assert.notEqual(paused, running);
 
-  fold(model, { type: "phase", title: "Verify" });
-  assert.notEqual(modelContextSignature(model), settled);
+  fold(model, { type: "resumed" });
+  assert.equal(modelContextSignature(model), running);
+
+  fold(model, {
+    type: "complete",
+    summary: { workflowName: "wf", agentCount: 1, tokenUsage: { total: 999, cost: 0.5 } },
+  });
+  assert.notEqual(modelContextSignature(model), running);
 });
 
-test("failures are counted, listed with a snippet, and capped", () => {
+test("failures are counted and summarized to the first failure", () => {
   const model = createRunModel("run-3");
   model.status = "running";
   model.name = "review-changes";
@@ -90,10 +115,18 @@ test("failures are counted, listed with a snippet, and capped", () => {
 
   const text = formatModelContextText(model);
   assert.match(text, /review-changes/);
+  // Frontmatter carries the parseable fields, per the ext-apps context pattern.
+  assert.match(text, /^---\n/);
+  assert.match(text, /\nrun-id: run-3\n/);
+  assert.match(text, /\nstatus: running\n/);
+  assert.match(text, /\nagents-failed: 5\n/);
+  assert.match(text, /\n---\n/);
   assert.match(text, /5 failed/);
-  assert.match(text, /Failed agent "verify:0": boom 0/);
+  // Failure detail is summarized to one entry, not enumerated as a log feed.
+  assert.match(text, /First failure — agent "verify:0": boom 0/);
   assert.match(text, /…/); // long error text is truncated
-  assert.match(text, /\(\+2 more failed agents\)/); // only 3 listed
+  assert.match(text, /\(\+4 more failed\)/);
+  assert.doesNotMatch(text, /verify:1/);
 });
 
 test("paused and terminal states are urgent and produce final wording", () => {
@@ -113,11 +146,28 @@ test("paused and terminal states are urgent and produce final wording", () => {
   });
   assert.equal(isUrgentStatus(model), true);
   const text = formatModelContextText(model);
-  assert.match(text, /is completed/);
+  assert.match(text, /\nstatus: completed\n/);
   assert.match(text, /This status is final/);
   const snapshot = buildModelContextSnapshot(model);
   assert.equal(snapshot.finalized, true);
   assert.equal(snapshot.totalTokens, 999);
+});
+
+test("a phase push carries the phase title and its ordinal", () => {
+  const model = createRunModel("run-6");
+  model.status = "running";
+  fold(model, { type: "phase", title: "Scan" });
+  fold(model, { type: "phase", title: "Verify: deep" });
+
+  const text = formatModelContextText(model);
+  // Frontmatter carries the title (quoted, since the colon would break YAML) and the ordinal.
+  assert.match(text, /^current-phase: "Verify: deep"$/m);
+  assert.match(text, /^phase-number: 2$/m);
+  // The prose names it too, so a model reading only the sentence still learns the phase.
+  assert.match(text, /phase 2 "Verify: deep"/);
+
+  assert.equal(buildModelContextSnapshot(model).currentPhase, "Verify: deep");
+  assert.equal(buildModelContextSnapshot(model).phasesSeen, 2);
 });
 
 test("live pushes tell the agent not to poll inspect", () => {

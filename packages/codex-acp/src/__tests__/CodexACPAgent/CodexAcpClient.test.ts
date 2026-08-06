@@ -203,6 +203,84 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         expect(accountLoginSpy).not.toHaveBeenCalled();
     });
 
+    function createDeviceCodeFixture() {
+        const deviceFixture = createCodexMockTestFixture();
+        const codexAppServerClient = deviceFixture.getCodexAppServerClient();
+        vi.spyOn(codexAppServerClient, "accountRead").mockResolvedValue({
+            account: null,
+            requiresOpenaiAuth: true,
+        });
+        vi.spyOn(codexAppServerClient, "accountLogin").mockResolvedValue({
+            type: "chatgptDeviceCode",
+            loginId: "login-1",
+            verificationUrl: "https://example.com/device",
+            userCode: "ABCD-1234",
+        });
+        let loginCompleted: ((event: unknown) => void) | undefined;
+        vi.spyOn(codexAppServerClient.connection, "onNotification").mockImplementation(((method: unknown, handler: (event: unknown) => void) => {
+            if (method === "account/login/completed") {
+                loginCompleted = handler;
+            }
+            return { dispose: () => {} };
+        }) as never);
+        return {
+            deviceFixture,
+            codexAppServerClient,
+            completeLogin: (success: boolean) => loginCompleted?.({ loginId: "login-1", success, error: null }),
+            loginCompletedSubscribed: () => loginCompleted !== undefined,
+        };
+    }
+
+    it('should authenticate with ChatGPT device code via URL elicitation', async () => {
+        const { deviceFixture, completeLogin, loginCompletedSubscribed } = createDeviceCodeFixture();
+        const codexAcpAgent = deviceFixture.getCodexAcpAgent();
+        await codexAcpAgent.initialize({
+            protocolVersion: 1,
+            clientCapabilities: { elicitation: { url: {} } },
+        });
+        deviceFixture.setElicitationResponse({ action: "accept" });
+
+        const authPromise = codexAcpAgent.authenticate({ methodId: "chat-gpt-device-code" }, 42);
+        await vi.waitFor(() => expect(loginCompletedSubscribed()).toBe(true));
+        completeLogin(true);
+        await expect(authPromise).resolves.toEqual({});
+
+        const elicitationRequest = deviceFixture.getAcpConnectionEvents([])
+            .find(event => event.method === "createElicitation");
+        expect(elicitationRequest?.args[0]).toEqual({
+            mode: "url",
+            requestId: 42,
+            elicitationId: "login-1",
+            url: "https://example.com/device",
+            message: expect.stringContaining("ABCD-1234"),
+        });
+    });
+
+    it('should cancel ChatGPT device code login when URL elicitation is declined', async () => {
+        const { deviceFixture, codexAppServerClient } = createDeviceCodeFixture();
+        const codexAcpAgent = deviceFixture.getCodexAcpAgent();
+        await codexAcpAgent.initialize({
+            protocolVersion: 1,
+            clientCapabilities: { elicitation: { url: {} } },
+        });
+        const cancelSpy = vi.spyOn(codexAppServerClient, "accountLoginCancel")
+            .mockResolvedValue({ status: "canceled" });
+        deviceFixture.setElicitationResponse({ action: "decline" });
+
+        await expect(codexAcpAgent.authenticate({ methodId: "chat-gpt-device-code" }, 42))
+            .rejects.toThrow();
+        expect(cancelSpy).toHaveBeenCalledWith({ loginId: "login-1" });
+    });
+
+    it('should reject ChatGPT device code auth when the client lacks URL elicitation', async () => {
+        const { deviceFixture } = createDeviceCodeFixture();
+        const codexAcpAgent = deviceFixture.getCodexAcpAgent();
+        await codexAcpAgent.initialize({ protocolVersion: 1 });
+
+        await expect(codexAcpAgent.authenticate({ methodId: "chat-gpt-device-code" }, 42))
+            .rejects.toThrow("Device code authentication requires URL elicitation support");
+    });
+
     it('should authenticate with a gateway', async () => {
         const gatewayFixture = createTestFixture();
         const codexAcpAgent = gatewayFixture.getCodexAcpAgent();
@@ -327,6 +405,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 upgrade: null,
                 upgradeInfo: null,
                 availabilityNux: null,
+                modelSpecialty: null,
                 displayName: "gpt-5",
                 description: "test model",
                 hidden: false,
@@ -1826,15 +1905,15 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 update: {
                     sessionUpdate: "session_info_update",
                     _meta: {
-                        codex: {
-                            goal: {
+                        goal: {
                             objective: "Ship the migration and keep tests green",
                             status: "active",
                             tokenBudget: null,
+                            tokensUsed: 0,
                             timeUsedSeconds: 0,
-                            createdAt: 1710000000,
-                            controlMethod: "_codex/session/goal_control",
-                            },
+                            createdAt: 1710000000000,
+                            updatedAt: 1710000100000,
+                            controlMethod: "_session/goal",
                         },
                     },
                 },
@@ -2583,14 +2662,14 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             expect.objectContaining({
                 args: [expect.objectContaining({
                     update: expect.objectContaining({
-                        _meta: {codex: {goal: expect.objectContaining({status: "paused"})}},
+                        _meta: {goal: expect.objectContaining({status: "paused"})},
                     }),
                 })],
             }),
             expect.objectContaining({
                 args: [expect.objectContaining({
                     update: expect.objectContaining({
-                        _meta: {codex: {goal: null}},
+                        _meta: {goal: null},
                     }),
                 })],
             }),
@@ -2621,14 +2700,14 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         staleResponse.resolve(staleGoal);
         await stalePublish;
 
-        expect(sessionState.currentGoal).toMatchObject({objective: "current", createdAt: 200});
+        expect(sessionState.currentGoal).toMatchObject({objective: "current", createdAt: 200000});
         const goalUpdates = mockFixture.getAcpConnectionEvents([]).filter(event =>
             event.method === "sessionUpdate"
             && event.args[0]?.update?.sessionUpdate === "session_info_update"
         );
         expect(goalUpdates).toHaveLength(1);
         expect(goalUpdates[0]?.args[0]?.update?._meta).toEqual({
-            codex: {goal: expect.objectContaining({objective: "current", createdAt: 200})},
+            goal: expect.objectContaining({objective: "current", createdAt: 200000}),
         });
     });
 
@@ -2958,7 +3037,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 
         await codexAcpAgent.authenticate({methodId: "api-key"});
 
-        expect(authenticateSpy).toHaveBeenCalledWith({methodId: "api-key"});
+        expect(authenticateSpy).toHaveBeenCalledWith({methodId: "api-key"}, undefined);
         expect(getAccountSpy).toHaveBeenCalledTimes(4);
         expect(codexAcpAgent.getSessionState(session1.sessionId)).toMatchObject({
             account: { type: "apiKey" },
@@ -3014,7 +3093,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         };
         await codexAcpAgent.authenticate(gatewayAuthRequest);
 
-        expect(authenticateSpy).toHaveBeenCalledWith(gatewayAuthRequest);
+        expect(authenticateSpy).toHaveBeenCalledWith(gatewayAuthRequest, undefined);
         expect(getAccountSpy).toHaveBeenCalledTimes(1);
         expect(codexAcpAgent.getSessionState(session.sessionId)).toMatchObject({
             account: { type: "apiKey" },
@@ -3155,6 +3234,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
             displayName: 'Codex 5.2',
             description: 'Coding model',
             hidden: false,
@@ -3176,6 +3256,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
             displayName: 'Standard 5.1',
             description: 'Standard model',
             hidden: false,

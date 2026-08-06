@@ -7,10 +7,26 @@ import type {
     SessionId,
 } from "@agentclientprotocol/sdk";
 import type { Turn } from "./app-server/v2";
+import {
+    GOAL_CONTROL_METHOD,
+    LEGACY_GOAL_CONTROL_METHOD,
+    type GoalControlRequest,
+} from "./GoalExtension";
+
+export {
+    GOAL_CONTROL_ACTIONS,
+    GOAL_CONTROL_METHOD,
+    GOAL_EXTENSION_VERSION,
+    LEGACY_GOAL_CONTROL_METHOD,
+    type GoalCapability,
+    type GoalControlAction,
+    type GoalControlRequest,
+    type GoalSnapshot,
+    type GoalStatus,
+} from "./GoalExtension";
 
 export const LEGACY_SET_SESSION_MODEL_METHOD = "session/set_model";
 export const SESSION_STEERING_METHOD = "_session/steering";
-export const GOAL_CONTROL_METHOD = "_codex/session/goal_control";
 export const LOADED_TURN_QUERY_METHOD = "_session/loaded_turn/query";
 export const LOADED_TURN_ENDED_METHOD = "_session/loaded_turn/ended";
 
@@ -57,6 +73,7 @@ export function isExtMethodRequest(request: { method: string, params: Record<str
         || request.method === "authentication/logout"
         || request.method === LEGACY_SET_SESSION_MODEL_METHOD
         || request.method === GOAL_CONTROL_METHOD
+        || request.method === LEGACY_GOAL_CONTROL_METHOD
         || request.method === SESSION_STEERING_METHOD
         || request.method === LOADED_TURN_QUERY_METHOD;
 }
@@ -72,13 +89,8 @@ export type LegacySetSessionModelExtRequest = {
     params: LegacySetSessionModelRequest;
 }
 
-export type GoalControlRequest = {
-    sessionId: SessionId;
-    action: "pause" | "clear";
-}
-
 export type GoalControlExtRequest = {
-    method: typeof GOAL_CONTROL_METHOD;
+    method: typeof GOAL_CONTROL_METHOD | typeof LEGACY_GOAL_CONTROL_METHOD;
     params: GoalControlRequest;
 }
 

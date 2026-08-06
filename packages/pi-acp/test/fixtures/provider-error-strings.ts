@@ -1,4 +1,10 @@
-export const FIXTURE_PI_PIN = "0.83.0";
+export const FIXTURE_PI_PIN = "0.84.0";
+// 2026-08-06 bump 0.83.0 -> 0.84.0: re-verified against the installed pi v0.84.0 dists. Three
+// auth strings moved from literal `"anthropic"` forms to `${provider}` template literals
+// (dist/core/agent-session.js, auth-guidance.js), but the classifier matches the stable
+// substrings those templates resolve to ("no api key found", "authentication failed for",
+// "run '/login") — captured at errors.ts — so E1's classification expectations are unchanged.
+// Only the pin moves; E1's prose fixtures remain the regression baseline for our classifier.
 // 2026-08-03 bump 0.82.1 -> 0.83.0: every fixture string below was re-verified byte-identical
 // against the installed pi v0.83.0 dists — dist/core/auth-guidance.js diffs clean against the
 // 0.82.1 tarball, the auth strings still span the concatenated template literals at

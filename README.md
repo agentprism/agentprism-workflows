@@ -280,9 +280,13 @@ and a Stop control. The panel derives the runId from the call's arguments (inspe
 or from the execute result (immediately for `background: true` admissions), then keeps itself
 current by polling the app-only `workflow-events` tool (`visibility: ["app"]`, outside the
 model's tool loop) — no model tokens are spent while it is visible. The panel also mirrors
-run status into the host's model context (`ui/update-model-context`, last push wins) on
-phase transitions, agent failures, pauses, and the terminal state, so the agent learns how a
-run is doing without re-calling the tool; `inspect`/`await` text summaries carry
+run status into the host's model context (`ui/update-model-context`, last push wins) at
+**milestones only** — an agent call going terminal (done or error), a phase start, and the
+run reaching a paused or terminal state — so the agent learns how a run is doing without
+re-calling the tool. Live-view churn (agent *starts*, banners, progress rows, token/cost
+tallies) never pushes on its own: it is panel detail the agent can read on demand, and in
+hosts that treat a context update as conversational input, pushing it would wake the agent
+repeatedly; `inspect`/`await` text summaries carry
 `annotations.audience: ["assistant"]`, and blocking `run`/`await` calls report
 `notifications/progress` when the client sends `_meta.progressToken`. Hosts without MCP Apps
 support ignore the UI metadata and get the same text/structured output as before. To try it
