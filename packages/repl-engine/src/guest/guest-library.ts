@@ -92,6 +92,7 @@ export const PROVENANCE_FACTORY = `(function (names) {
   var gOPN = Object.getOwnPropertyNames;
   var gOPD = Object.getOwnPropertyDescriptor;
   var hasOwnProp = Object.prototype.hasOwnProperty;
+  var jparse = JSON.parse;
   var reg = {
     evalSeq: 0,
     origins: Object.create(null),
@@ -104,11 +105,39 @@ export const PROVENANCE_FACTORY = `(function (names) {
         reg.evalSeq = (reg.evalSeq | 0) + 1;
         label = 'eval ' + reg.evalSeq;
       }
+      // The global LEXICAL bindings first (top-level let/const/class —
+      // the roadmap's canonical 'const research = agent(...)' state):
+      // they are not global-object properties and cannot be enumerated
+      // guest-side (ECMAScript's global declarative record is
+      // non-reflectable), so the HOST enumerates them through the
+      // engine's internal global-var object (see global-lexical.ts) and
+      // passes the names as this pass's THIRD argument (a JSON array
+      // string). A lexical binding SHADOWS a same-named global-object
+      // property for identifier resolution, and the manifest displays
+      // the binding code sees — the lexical one — so names in the
+      // lexical set are SKIPPED by the property pass below (one binding
+      // per name, the lexical view authoritative). A pass without the
+      // argument (an older host, or a registry snapshot whose record
+      // closure predates the feature) skips the merge.
+      var lexNames = null;
+      try {
+        if (arguments.length >= 3 && typeof arguments[2] === 'string' && arguments[2].length > 0) {
+          lexNames = jparse(arguments[2]);
+        }
+      } catch (e) { lexNames = null; }
+      var lexSet = Object.create(null);
+      if (lexNames !== null && typeof lexNames.length === 'number') {
+        for (var li = 0; li < lexNames.length; li++) {
+          var lk = lexNames[li];
+          if (typeof lk === 'string') lexSet[lk] = true;
+        }
+      }
       var names_ = gOPN(globalThis);
       var seen = Object.create(null);
       for (var i = 0; i < names_.length; i++) {
         var k = names_[i];
         if (reg.known[k]) continue;
+        if (lexSet[k]) { seen[k] = true; continue; }
         seen[k] = true;
         // Descriptor read, never a [[Get]]: a binding rebound to an
         // accessor must not have its getter fired by host bookkeeping.
@@ -125,6 +154,24 @@ export const PROVENANCE_FACTORY = `(function (names) {
         if (!same) {
           reg.origins[k] = { via: label, at: atMs };
           reg.prev[k] = v;
+        }
+      }
+      // The lexical pass: attribute on first sight. A lexical binding
+      // can only be CREATED (never redeclared or removed), so name
+      // presence IS the event; the entry is stable afterwards. A name
+      // first attributed as a global PROPERTY and later shadowed by a
+      // lexical declaration is re-attributed when the lexical binding
+      // appears — the property path stored the property VALUE in
+      // prev[k], and a stored value is the pass's marker that the name
+      // predates the lexical binding (after re-attribution prev[k] is
+      // undefined and stays; the corner where the property value itself
+      // was literally undefined is accepted — orientation metadata).
+      for (var lk2 in lexSet) {
+        if (reg.known[lk2]) continue;
+        seen[lk2] = true;
+        if (reg.origins[lk2] === undefined || reg.prev[lk2] !== undefined) {
+          reg.origins[lk2] = { via: label, at: atMs };
+          reg.prev[lk2] = undefined;
         }
       }
       for (var gone in reg.origins) {

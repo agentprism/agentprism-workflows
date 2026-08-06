@@ -683,6 +683,112 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
   ws.dispose();
 });
 
+test('review 2/4b: the manifest lists GLOBAL LEXICAL bindings — top-level let/const/class, the roadmap\'s canonical `const research = agent(...)` state — with tokens, provenance, and live-handle status (phase-E review rejection: only global-object keys were enumerated, so lexical workspace state was invisible to status)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // The roadmap's canonical form: `const research = agent(...)` — a
+  // global LEXICAL binding (top-level let/const/class are NOT
+  // global-object properties; ECMAScript's global declarative record is
+  // non-reflectable, and the engine reaches it through the internal
+  // global-var object — see global-lexical.ts).
+  await broker.eval(
+    'let x = 1; const y = { a: 1 }; class Z {}; var w = 3; globalThis.g = 9; ' +
+      'const research = agent("pi/x", "investigate"); "started"',
+  );
+  await tick();
+  const manifest = broker.workspaceManifest();
+  const byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+  // EVERY declaration kind is listed: let/const/class (lexical) and
+  // var/function/globalThis-assignment (object-record).
+  assert.ok(byName.has('x'), [...byName.keys()].join(','));
+  assert.ok(byName.has('y'), [...byName.keys()].join(','));
+  assert.ok(byName.has('Z'), [...byName.keys()].join(','));
+  assert.ok(byName.has('w'), [...byName.keys()].join(','));
+  assert.ok(byName.has('g'), [...byName.keys()].join(','));
+  assert.equal(byName.get('x')!.token, 'number');
+  assert.ok(byName.get('y')!.token.startsWith('{1 key}'), byName.get('y')!.token);
+  assert.equal(byName.get('Z')!.token, 'function');
+  assert.equal(byName.get('w')!.token, 'number');
+  // The roadmap's handle: live-handle status AND the full provenance
+  // surface (eval label, task, wall clock) — exactly what the reviewer
+  // required for `const research = agent(...)`.
+  assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1');
+  assert.equal(byName.get('research')!.provenance, 'eval 1');
+  assert.equal(byName.get('research')!.task, 'investigate');
+  assert.equal(typeof byName.get('research')!.provenanceAtMs, 'number');
+  assert.ok(byName.get('research')!.provenanceAtMs! > 0);
+  // The intent-plane hygiene rule holds for lexical bindings too: no
+  // fragment of any bound value at ANY length appears in the manifest.
+  const rendered = JSON.stringify(manifest);
+  assert.ok(!rendered.includes('a: 1'), 'lexical object content never leaks');
+  // Settlement + a continuation-created lexical binding: the declaration
+  // instantiates in ITS eval (top-level let/const exist in TDZ from the
+  // script's instantiation), so the binding is attributed to the
+  // declaring eval — the handle's task field carries the worker half
+  // ("from what task").
+  await broker.eval('const finding = await research; "waited"');
+  await tick();
+  runner.last().completeTurn('DUG-UP');
+  await tick();
+  await broker.pump();
+  const m2 = broker.workspaceManifest();
+  const finding = new Map(m2.bindings.map((b) => [b.name, b])).get('finding');
+  assert.ok(finding, 'the continuation-created lexical binding is listed');
+  assert.equal(finding!.token, 'string \u00b7 6B');
+  assert.equal(finding!.provenance, 'eval 2');
+  assert.ok(!JSON.stringify(m2).includes('DUG-UP'), 'worker result content never leaks');
+  // A LEXICAL binding SHADOWS a same-named global-object property for
+  // identifier resolution, so the manifest lists ONE binding per name —
+  // the lexical view (what the orchestrator's code sees). A name first
+  // attributed as a property and later shadowed by a lexical declaration
+  // is RE-attributed to the eval that created the lexical binding, and
+  // stays stable afterwards.
+  await broker.eval('globalThis.n = 1; "p"');
+  const n1 = new Map(broker.workspaceManifest().bindings.map((b) => [b.name, b])).get('n');
+  assert.equal(n1!.provenance, 'eval 3', 'the property binding is attributed first');
+  await broker.eval('let n = 2; "l"');
+  const n2 = new Map(broker.workspaceManifest().bindings.map((b) => [b.name, b])).get('n');
+  assert.equal(n2!.provenance, 'eval 4', 'the lexical shadow re-attributes to its creating eval');
+  assert.equal(n2!.token, 'number');
+  assert.equal(
+    broker.workspaceManifest().bindings.filter((b) => b.name === 'n').length,
+    1,
+    'one binding per name — the lexical view wins',
+  );
+  await broker.eval('1 + 1');
+  const n3 = new Map(broker.workspaceManifest().bindings.map((b) => [b.name, b])).get('n');
+  assert.equal(n3!.provenance, 'eval 4', 'the lexical attribution is stable across later evals');
+  // The restore path: lexical bindings travel inside the snapshot (the
+  // internal global-var object is part of the VM memory), the re-registered
+  // bridge leaves them untouched, and the restored workspace's manifest
+  // lists them WITH their provenance (the registry travels too).
+  const snapshot = ws.snapshot();
+  const restored = await Workspace.restore(PROJECT, snapshot);
+  try {
+    const preRestore = ws.manifest();
+    const restoredManifest = restored.manifest();
+    assert.deepEqual(
+      restoredManifest.bindings.map((b) => b.name).sort(),
+      preRestore.bindings.map((b) => b.name).sort(),
+      'the restored manifest lists exactly the same bindings (lexical included)',
+    );
+    const restoredByName = new Map(restoredManifest.bindings.map((b) => [b.name, b]));
+    assert.equal(restoredByName.get('research')!.token, 'agent handle');
+    assert.equal(restoredByName.get('research')!.provenance, 'eval 1');
+    assert.equal(restoredByName.get('n')!.provenance, 'eval 4');
+    assert.equal(restoredByName.get('finding')!.token, 'string \u00b7 6B');
+    // The restored realm's lexical bindings are live: the workspace keeps
+    // working with them.
+    const live = await restored.eval('x + 1');
+    assert.equal(live.kind, 'value');
+    if (live.kind === 'value') assert.equal(live.value, 2);
+  } finally {
+    restored.dispose();
+  }
+  await broker.dispose();
+  ws.dispose();
+});
+
 // ── 5. The per-eval wall-clock deadline ────────────────────────────────
 
 test('review 2/5: the per-eval deadline makes a CURRENTLY running runaway eval breakable through the quickjs interrupt handler; the VM stays usable', async () => {

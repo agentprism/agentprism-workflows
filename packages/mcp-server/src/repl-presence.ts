@@ -32,6 +32,17 @@
  * used to run to its release phase and close every child regardless of
  * presence).
  *
+ * **Disconnect retains the session's project AFFINITY** (which projects
+ * the session touched), so a reconnect of the SAME live session — a
+ * transient standalone-GET drop, then the client reconnects without a
+ * new MCP session — restores its presence from `reconnect(clientId)`
+ * WITHOUT requiring a new tool call (phase-E review rejection: the
+ * session registry wired only disconnects, so a transient drop left the
+ * session's presence gone — the already-scheduled drain could close
+ * children while that client was connected). Only a session DELETION
+ * (`forget`) drops the affinity: a deleted session can never reconnect,
+ * and a re-initialized client carries a new session id.
+ *
  * A drain that FAILS — a snapshot-flush failure mid-drain, for example
  * — is never discarded silently (phase-D review round 6): the failure
  * is recorded on the project state (`drainError`), surfaced loudly in
@@ -50,7 +61,9 @@ import { drainReplProject, disconnectReplProject, touchReplProject } from "./rep
 
 /** One MCP session's presence on the projects' repl workspaces. */
 export class ReplPresenceLedger {
-  /** sessionId → the repl states that session has touched. */
+  /** sessionId → the repl states that session has touched (RETAINED
+   *  across disconnects — the session's project affinity; dropped only
+   *  by `forget` when the session is deleted, see the module docs). */
   private readonly bySession = new Map<string, Set<ReplProjectState>>();
   /** repl state → the sessions currently present on it. */
   private readonly byProject = new Map<ReplProjectState, Set<string>>();
@@ -89,20 +102,56 @@ export class ReplPresenceLedger {
    * Run when an MCP session's last connection closed (or the session was
    * deleted): remove its presence from every project it touched; a
    * project whose client set became EMPTY is drained (single-flight).
+   * The session's project AFFINITY is retained (see the module docs) so
+   * a reconnect of the same live session can restore its presence; the
+   * drain decision reads the ledger's own per-project set (the
+   * authoritative presence — the same set `touch`/`reconnect` maintain),
+   * never a snapshot of the projects' `clients` sets.
    */
   disconnect(clientId: string): void {
     const projects = this.bySession.get(clientId);
-    this.bySession.delete(clientId);
     if (projects === undefined) return;
     for (const state of projects) {
       const sessions = this.byProject.get(state);
+      let last = false;
       if (sessions !== undefined) {
         sessions.delete(clientId);
-        if (sessions.size === 0) this.byProject.delete(state);
+        if (sessions.size === 0) {
+          this.byProject.delete(state);
+          last = true;
+        }
       }
       disconnectReplProject(state, clientId);
-      if (state.clients.size === 0) this.scheduleDrain(state);
+      if (last) this.scheduleDrain(state);
     }
+  }
+
+  /**
+   * Run when a connection OPENS on a live session (the daemon's session
+   * registry signals it — a reconnect of the SAME session after a
+   * transient drop): restore the session's presence on every project it
+   * retains affinity with (see the module docs). A project whose drain
+   * was already scheduled or is mid-flight sees the re-added client and
+   * skips/aborts it — children stay warm while any client is connected.
+   */
+  reconnect(clientId: string): void {
+    const projects = this.bySession.get(clientId);
+    if (projects === undefined) return;
+    for (const state of projects) {
+      this.touch(state, clientId);
+    }
+  }
+
+  /**
+   * Run when a session record is deleted (DELETE, transport close,
+   * eviction): drop the session's retained project affinity. The
+   * session can never reconnect; a re-initialized client carries a new
+   * session id and re-touches projects through its tool calls. (The
+   * registry fires `disconnect` BEFORE this — the presence removal and
+   * drain evaluation walk the affinity.)
+   */
+  forget(clientId: string): void {
+    this.bySession.delete(clientId);
   }
 
   /** Every project currently drained or draining (the status seam). */

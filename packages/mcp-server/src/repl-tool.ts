@@ -27,13 +27,16 @@
  *   reports as such.
  * - `interrupt { projectDir, id? }` → cancel one subagent call (ACP
  *   `session/cancel` downward; a drained handle's recorded session is
- *   re-attached lazily first); without an id, arm the project's eval-
- *   break signal. The daemon is single-threaded, so a request cannot be
- *   PROCESSED while an eval is executing — but every eval and settlement
+ *   re-attached lazily first); without an id, BREAK THE RUNNING EVAL:
+ *   the armed signal is consumed by the in-flight eval's execution — a
+ *   suspended eval's continuation is broken by the quickjs interrupt
+ *   handler when it runs (a later eval is unaffected). The daemon is
+ *   single-threaded, so a request cannot be PROCESSED while a
+ *   synchronous top-level runaway executes — every eval and settlement
  *   drain runs under a per-eval wall-clock deadline enforced by the
- *   quickjs interrupt handler, so a currently-running runaway eval is
- *   ALWAYS breakable (bounded), and the armed signal breaks the next VM
- *   execution immediately (see `src/repl-project.ts`).
+ *   quickjs interrupt handler, so a currently-running runaway is ALWAYS
+ *   breakable (bounded) even without the signal (see
+ *   `src/repl-project.ts`).
  * - `reset { projectDir }` → teardown (cancels in-flight ACP sessions,
  *   drops the VM and the whole `repl/` store), clearing any contained
  *   snapshot refusal.
@@ -48,6 +51,7 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BrokerRunner, WasmModule } from "@automatalabs/repl-engine";
 import type { ReplEvalResult } from "@automatalabs/repl-engine";
+import { capFinalText, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "@automatalabs/repl-engine";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
@@ -153,8 +157,10 @@ function refusedResult(state: ReplProjectState): {
     content: [
       {
         type: "text",
-        text: `REPL workspace refused: ${error.message}\nThe stored snapshot is not restorable with the running engine. ` +
-          `Run the repl tool with action "reset" to drop it and start a fresh workspace.`,
+        text: capToolResultText(
+          `REPL workspace refused: ${error.message}\nThe stored snapshot is not restorable with the running engine. ` +
+            `Run the repl tool with action "reset" to drop it and start a fresh workspace.`,
+        ),
       },
     ],
     isError: true,
@@ -171,6 +177,24 @@ function drainErrorLine(state: ReplProjectState): string | null {
   if (error === null) return null;
   return `warn: ${error.name}: ${error.message} (the last client-presence drain failed — the workspace state was ` +
     `not persisted; the next disconnect retries the drain)`;
+}
+
+/** The truncation marker `capToolResultText` appends when the caps trip
+ *  (its own budget is reserved inside the caps, so it always ships). */
+const TOOL_RESULT_TRUNCATION_MARKER =
+  `(tool result truncated — cap: ${OUTPUT_MAX_LINES} lines / ${OUTPUT_MAX_BYTES} bytes; the omitted console ` +
+  `values remain reachable through their $N refs)`;
+
+/** Apply the doc's output caps (256 lines / 10 KB, whichever trips
+ *  first) to a repl tool result's FINAL text — the wire guarantee
+ *  (phase-E review rejection: the caps used to apply only to the
+ *  broker's console lines, so the result line, pending ids,
+ *  checkpoints, completed ids, the wait timeout note, and status output
+ *  were appended UNcapped). Every section is capped together, in order;
+ *  when the caps trip, the truncation marker ships instead of the
+ *  dropped tail. */
+function capToolResultText(text: string): string {
+  return capFinalText(text, TOOL_RESULT_TRUNCATION_MARKER);
 }
 
 /** Render the broker's eval-result shape as text (the tool's output; the
@@ -315,7 +339,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       if (action === "status") {
         if (projectDir === undefined) {
           const contexts = projects.stores();
-          return { content: [{ type: "text", text: renderStatus(contexts) }] };
+          return { content: [{ type: "text", text: capToolResultText(renderStatus(contexts)) }] };
         }
         // A NAMED status is a first touch exactly like the other stateful
         // actions (phase-D review round 5: it used to return before
@@ -343,12 +367,12 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         if (state.restoreError === null) {
           await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
         }
-        return { content: [{ type: "text", text: renderStatus([context]) }] };
+        return { content: [{ type: "text", text: capToolResultText(renderStatus([context])) }] };
       }
       const context = resolveContext(options, projectDir);
       if (context === undefined) {
         return {
-          content: [{ type: "text", text: `No project context is available for projectDir "${String(projectDir)}".` }],
+          content: [{ type: "text", text: capToolResultText(`No project context is available for projectDir "${String(projectDir)}".`) }],
           isError: true,
         };
       }
@@ -364,7 +388,12 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         await resetReplProjectState(state);
         return {
           content: [
-            { type: "text", text: `workspace ${context.projectDir}: dropped — the VM and its stored state were reset` },
+            {
+              type: "text",
+              text: capToolResultText(
+                `workspace ${context.projectDir}: dropped — the VM and its stored state were reset`,
+              ),
+            },
           ],
         };
       }
@@ -383,7 +412,8 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const result = await broker.eval(code);
         const line = drainErrorLine(state);
         const rendered = renderEvalResult(result);
-        return { content: [{ type: "text", text: line !== null ? `${line}\n${rendered}` : rendered }] };
+        const text = line !== null ? `${line}\n${rendered}` : rendered;
+        return { content: [{ type: "text", text: capToolResultText(text) }] };
       }
       if (action === "wait") {
         const timeoutMs = replToolInputShape.timeoutMs.parse(args.timeoutMs ?? 30_000) ?? 30_000;
@@ -395,20 +425,36 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         const text = renderEvalResult(result);
         const line = drainErrorLine(state);
         const body = drained ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)`;
+        const waitText = line !== null ? `${line}\n${body}` : body;
         return {
-          content: [{ type: "text", text: line !== null ? `${line}\n${body}` : body }],
+          content: [{ type: "text", text: capToolResultText(waitText) }],
         };
       }
-      // interrupt
+      // interrupt without an id: BREAK THE RUNNING EVAL. The daemon is
+      // single-threaded, so a request cannot be PROCESSED while a
+      // synchronous top-level runaway executes (the per-eval wall-clock
+      // deadline bounds that case independently) — but an eval that is
+      // in flight (suspended on a subagent call) has its continuation
+      // executed by later settlement drains, and the armed signal is
+      // consumed by THE RUNNING EVAL'S execution: when its continuation
+      // (a runaway loop, say) runs, the quickjs interrupt handler fires
+      // MID-RUN and breaks it (phase-E review rejection: the signal
+      // used to be described as merely arming "the next VM execution",
+      // and the test pre-armed it before the eval even started — the
+      // required ability to interrupt a RUNNING eval was never
+      // exercised). A later eval is unaffected: the signal is consumed
+      // by the running eval's execution, not by arbitrary later ones.
       if (args.id === undefined) {
         state.interrupt.armed = true;
         return {
           content: [
             {
               type: "text",
-              text:
-                `workspace ${context.projectDir}: eval-break signal armed — the next VM execution will be ` +
-                `interrupted (a currently-running eval is bounded by the per-eval deadline and cannot run away)`,
+              text: capToolResultText(
+                `workspace ${context.projectDir}: interrupting the running eval — the eval-break signal is set for ` +
+                  `the quickjs interrupt handler; a suspended eval's continuation is broken when it resumes, and a ` +
+                  `currently-executing synchronous runaway is already bounded by the per-eval deadline (it cannot run away)`,
+              ),
             },
           ],
         };
@@ -423,7 +469,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
             : outcome === "failed"
               ? `interrupt ${id}: could not reach the backend session (lazy re-attach failed)`
               : `interrupt ${id}: no live session to cancel`;
-      return { content: [{ type: "text", text }] };
+      return { content: [{ type: "text", text: capToolResultText(text) }] };
     },
   );
 }

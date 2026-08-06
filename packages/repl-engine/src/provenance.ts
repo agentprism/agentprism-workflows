@@ -48,8 +48,8 @@ import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
 import { installGuestBridge, type GuestBridgeHandlers } from './bridge.js';
 import { GUEST_PROVENANCE_KEY, PROVENANCE_FACTORY } from './guest/guest-library.js';
-import { wasmSha256Of } from './snapshot-envelope.js';
-import {
+import { rawLexicalKeys } from './global-lexical.js';
+import { wasmSha256Of } from './snapshot-envelope.js';import {
   getPropRaw,
   hasOwnRaw,
   rawOwnKeys,
@@ -133,6 +133,57 @@ async function computeBaseline(wasm: WasmInput): Promise<BaselineKeys> {
   }
 }
 
+// The fresh-realm LEXICAL baseline: top-level `let`/`const`/`class`
+// bindings a provisioned realm carries before any user eval. The guest
+// library deliberately declares only `var`s inside its IIFE, so the set
+// is EMPTY on the shipped library — but a future library that used
+// lexical declarations would otherwise leak its internals into the
+// manifest's user bindings, so the baseline is computed, cached and
+// subtracted exactly like the global one.
+const lexicalBaselineCache = new Map<string, Promise<string[]>>();
+const lexicalBaselineCacheByModule = new WeakMap<object, Promise<string[]>>();
+
+/**
+ * The fresh-realm GLOBAL LEXICAL key set for a wasm binary (top-level
+ * `let`/`const`/`class` bindings — see `global-lexical.ts`): a throwaway
+ * VM is provisioned exactly like a real workspace and its lexical key
+ * set is captured through the internal global-var object. Cached per
+ * process per binary, mirroring `baselineGlobalKeys`. The workspace
+ * manifest subtracts this set (alongside the global baseline) from its
+ * user-binding enumeration.
+ */
+export function baselineLexicalKeys(wasm: WasmInput): Promise<string[]> {
+  let key: string | undefined;
+  try {
+    key = wasmSha256Of(wasm);
+  } catch {
+    key = undefined;
+  }
+  if (key !== undefined) {
+    const cached = lexicalBaselineCache.get(key);
+    if (cached !== undefined) return cached;
+  } else if (typeof wasm === 'object' && wasm !== null) {
+    const cached = lexicalBaselineCacheByModule.get(wasm as object);
+    if (cached !== undefined) return cached;
+  }
+  const promise = computeLexicalBaseline(wasm);
+  if (key !== undefined) lexicalBaselineCache.set(key, promise);
+  else if (typeof wasm === 'object' && wasm !== null) lexicalBaselineCacheByModule.set(wasm as object, promise);
+  return promise;
+}
+
+/** The throwaway-VM lexical baseline computation (see
+ *  `baselineLexicalKeys`). */
+async function computeLexicalBaseline(wasm: WasmInput): Promise<string[]> {
+  const vm = await ReplVm.create({ wasm });
+  try {
+    await installGuestBridge(vm, NOOP_HANDLERS);
+    return rawLexicalKeys(vm);
+  } finally {
+    vm.dispose();
+  }
+}
+
 /** The parking-bridge stand-in for the throwaway baseline VM: the four
  *  host functions exist (the library only needs the names). */
 const NOOP_HANDLERS: GuestBridgeHandlers = {
@@ -210,6 +261,7 @@ export function provenanceRecord(vm: ReplVm, origin: ProvenanceOrigin): void {
   let labelHandle: JSValueHandle | undefined;
   let ownsLabel = false;
   let atHandle: JSValueHandle | undefined;
+  let lexHandle: JSValueHandle | undefined;
   try {
     registryHandle = shim.getProp(shim.global, symbol);
     if (registryHandle.isUndefined || !registryHandle.isObject) return;
@@ -227,7 +279,20 @@ export function provenanceRecord(vm: ReplVm, origin: ProvenanceOrigin): void {
       ownsLabel = true;
     }
     atHandle = shim.newNumber(Date.now());
-    const result = new JSValueHandle(shim, callRaw(e, shim, recordFn.ptr, [labelHandle, atHandle]));
+    // The pass's THIRD argument: the realm's global LEXICAL binding
+    // names as a JSON array string (see the factory in
+    // `guest-library.ts`). Lexical bindings cannot be enumerated
+    // guest-side; the host reaches them through the engine's internal
+    // global-var object (see `global-lexical.ts`) and hands the names
+    // over here — the same host-driven channel as every other aspect of
+    // the pass (no guest-visible surface grows for it). A registry whose
+    // record closure predates the feature (an older snapshot) simply
+    // ignores the argument.
+    lexHandle = shim.newString(JSON.stringify(rawLexicalKeys(vm)));
+    const result = new JSValueHandle(
+      shim,
+      callRaw(e, shim, recordFn.ptr, [labelHandle, atHandle, lexHandle]),
+    );
     try {
       if (e.qjs_is_exception(result.ptr) !== 0) takeAndFreeException(e, shim);
     } finally {
@@ -236,6 +301,7 @@ export function provenanceRecord(vm: ReplVm, origin: ProvenanceOrigin): void {
   } finally {
     if (ownsLabel) labelHandle?.dispose();
     atHandle?.dispose();
+    lexHandle?.dispose();
     recordFn?.dispose();
     registryHandle?.dispose();
     symbol.dispose();

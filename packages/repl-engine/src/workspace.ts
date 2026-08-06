@@ -19,6 +19,7 @@ import {
   provenanceBootstrap,
   provenanceRecord,
   provenanceView,
+  baselineLexicalKeys,
   type ProvenanceOrigin,
   type ProvenanceView,
 } from './provenance.js';
@@ -34,6 +35,7 @@ import {
   type GuestCall,
   type GuestSurface,
 } from './bridge.js';
+import { rawLexicalKeys } from './global-lexical.js';
 import { inspectGlobal, manifestBinding, renderGlobalLine } from './preview.js';
 import { rawOwnKeys } from './trapfree.js';
 
@@ -119,6 +121,10 @@ export class Workspace {
   /** The fresh-realm baseline key set (the manifest's user-binding
    *  difference; captured once per process, see `provenance.ts`). */
   private readonly baselineKeysSet: Set<string>;
+  /** The fresh-realm baseline GLOBAL LEXICAL key set (top-level
+   *  `let`/`const`/`class` bindings the library itself carries — empty
+   *  on the shipped library; see `provenance.ts`'s `baselineLexicalKeys`). */
+  private readonly baselineLexicalKeysSet: Set<string>;
   /** Parked CHECKPOINT calls only, by call id — the answer-delivery
    *  table of the parking bridge. Kept separate from `parkedCallsBuffer`
    *  so `checkpoint.answer` can settle a pending question first-wins
@@ -133,6 +139,7 @@ export class Workspace {
     this.vm = vm;
     this.memoryLimit = vm.memoryLimit;
     this.baselineKeysSet = baseline;
+    this.baselineLexicalKeysSet = new Set();
   }
 
   /**
@@ -152,9 +159,10 @@ export class Workspace {
     const vm = await ReplVm.create({ wasm, memoryLimit: options.memoryLimit });
     const workspace = new Workspace(projectDir, vm, new Set());
     await installGuestBridge(vm, options.handlers ?? workspace.defaultHandlers());
-    const bootstrap = await provenanceBootstrap(vm, wasm);
+    const [bootstrap, lexicalBaseline] = await Promise.all([provenanceBootstrap(vm, wasm), baselineLexicalKeys(wasm)]);
     workspace.baselineKeysSet.clear();
     for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
+    for (const key of lexicalBaseline) workspace.baselineLexicalKeysSet.add(key);
     return workspace;
   }
 
@@ -208,9 +216,10 @@ export class Workspace {
     const workspace = new Workspace(projectDir, vm, new Set());
     try {
       registerGuestHostCallbacks(vm, options.handlers ?? workspace.defaultHandlers());
-      const bootstrap = await provenanceBootstrap(vm, wasm);
+      const [bootstrap, lexicalBaseline] = await Promise.all([provenanceBootstrap(vm, wasm), baselineLexicalKeys(wasm)]);
       workspace.baselineKeysSet.clear();
       for (const key of bootstrap.baseline) workspace.baselineKeysSet.add(key);
+      for (const key of lexicalBaseline) workspace.baselineLexicalKeysSet.add(key);
       if (bootstrap.created) {
         // The pre-provenance restore sweep: attribute bindings that existed
         // before this host started tracking.
@@ -408,11 +417,18 @@ export class Workspace {
    * The workspace manifest — `ls` for the data plane (the roadmap doc's
    * `status` manifest): every user top-level binding (fresh-realm
    * baseline set difference — the guest library's own globals and the
-   * realm builtins are never listed) with its structure-only token
+   * realm builtins are never listed), with its structure-only token
    * (type/shape/size — metadata, never content), its provenance label
    * (`via eval N` / `via worker cN` — null when untracked), and the
    * live-handle call id when the binding is an agent handle (the caller
    * — the broker — appends the handle status from the call store). The
+   * GLOBAL LEXICAL bindings (top-level `let`/`const`/`class` — the
+   * roadmap's canonical `const research = agent(...)` state) are
+   * enumerated too, through the engine's internal global-var object
+   * (see `global-lexical.ts`): lexical bindings are not global-object
+   * properties, and they SHADOW a same-named global-object property for
+   * identifier resolution, so a name present in both lists yields ONE
+   * binding — the lexical view (what the orchestrator's code sees). The
    * `$N` log-ref globals are listed separately as a range, mirroring the
    * harness manifest's logs breakdown. Trap-free throughout: descriptor
    * reads only, accessors never invoked.
@@ -420,7 +436,9 @@ export class Workspace {
   manifest(): WorkspaceManifest {
     this.assertAlive();
     const baseline = this.baselineKeys();
-    const names = rawGlobalStringKeys(this.vm);    const user = names.filter((name) => !baseline.has(name));
+    const lexicalBaseline = this.baselineLexicalKeys();
+    const names = unionNames(rawGlobalStringKeys(this.vm), rawLexicalStringKeys(this.vm));
+    const user = names.filter((name) => !baseline.has(name) && !lexicalBaseline.has(name));
     const view = provenanceView(this.vm);
     const bindings: WorkspaceBinding[] = [];
     const logRefs: number[] = [];
@@ -456,6 +474,10 @@ export class Workspace {
 
   private baselineKeys(): Set<string> {
     return this.baselineKeysSet;
+  }
+
+  private baselineLexicalKeys(): Set<string> {
+    return this.baselineLexicalKeysSet;
   }
 
   private defaultHandlers(): GuestBridgeHandlers {
@@ -523,6 +545,27 @@ export class Workspace {
 function rawGlobalStringKeys(vm: ReplVm): string[] {
   const shim = getVmShim(vm) as QuickJS;
   return rawOwnKeys(shim.global);
+}
+
+/** The realm's GLOBAL LEXICAL string-key set, trap-free (the internal
+ *  global-var object's own keys — top-level `let`/`const`/`class`
+ *  declarations; see `global-lexical.ts`). */
+function rawLexicalStringKeys(vm: ReplVm): string[] {
+  return rawLexicalKeys(vm);
+}
+
+/** The union of two name lists, first-seen order (the manifest's
+ *  binding namespace: global-object keys plus global lexical keys). */
+function unionNames(a: string[], b: string[]): string[] {
+  const seen = new Set<string>(a);
+  const out = [...a];
+  for (const name of b) {
+    if (!seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+  }
+  return out;
 }
 
 /** Options for a `WorkspaceRegistry`. */

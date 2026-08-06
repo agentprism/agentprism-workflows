@@ -87,7 +87,17 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   // last-connection-closed a project with no clients left is drained (the doc's
   // client-presence policy; the bound reuses the session-eviction TTL).
   const replPresence = new ReplPresenceLedger(options.sessionTtlMs ?? SESSION_IDLE_TTL_MS);
+  // The three presence signals (phase-E review rejection: only the
+  // disconnect was wired — a transient standalone-GET drop followed by a
+  // reconnect of the SAME live session used to leave the session's
+  // projects draining while the client was connected, because the
+  // reconnect never re-added its presence). A connection OPEN re-adds
+  // the session's project presence from its retained affinity; the
+  // last-connection-closed removes presence and schedules the drain; a
+  // session DELETE drops the retained affinity.
+  sessions.onConnectionOpened = (sessionId) => replPresence.reconnect(sessionId);
   sessions.onLastConnectionClosed = (sessionId) => replPresence.disconnect(sessionId);
+  sessions.onSessionDeleted = (sessionId) => replPresence.forget(sessionId);
   let boundPort = options.port;
 
   const handleMcpRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {

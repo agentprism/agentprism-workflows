@@ -31,6 +31,7 @@
 import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
 
 import { getVmShim, type ReplVm } from './vm.js';
+import { readLexicalSlotValue } from './global-lexical.js';
 import {
   arrayBufferByteLength,
   getPropRaw,
@@ -1043,6 +1044,23 @@ export function inspectGlobal(vm: ReplVm, name: string): {
   label: string;
   sizeBytes: number;
 } {
+  // The lexical view first: a global lexical binding (top-level
+  // let/const/class) shadows a same-named global-object property for
+  // identifier resolution, so the binding metadata is the lexical
+  // binding's.
+  const lexicalValue = readLexicalSlotValue(vm, name);
+  if (lexicalValue !== undefined) {
+    try {
+      const preview = previewHandle(lexicalValue);
+      return {
+        kind: 'data',
+        label: preview.subtype ?? preview.type,
+        sizeBytes: estimateSize(lexicalValue),
+      };
+    } finally {
+      lexicalValue.dispose();
+    }
+  }
   const value = readSlotValue(vm, name);
   if (value === undefined) {
     const kind = readRealmSlotKind(vm, name);
@@ -1083,12 +1101,37 @@ export function inspectGlobal(vm: ReplVm, name: string): {
  * Returns null for an absent/unreadable slot.
  */
 export function manifestBinding(vm: ReplVm, name: string): { token: string; handleCallId: string | null } | null {
+  // The lexical view first (see `inspectGlobal`): a global lexical
+  // binding shadows a same-named global-object property, so the
+  // manifest's binding is the lexical one. Lexical bindings are always
+  // data (let/const/class — never accessors), so no sabotage marker
+  // applies on this path.
+  const lexicalValue = readLexicalSlotValue(vm, name);
+  if (lexicalValue !== undefined) {
+    try {
+      return describeBindingValue(vm, lexicalValue);
+    } finally {
+      lexicalValue.dispose();
+    }
+  }
   const value = readSlotValue(vm, name);
   if (value === undefined) {
     const kind = readRealmSlotKind(vm, name);
     if (kind === 'accessor') return { token: 'accessor (getter not invoked)', handleCallId: null };
     return null;
   }
+  try {
+    return describeBindingValue(vm, value);
+  } finally {
+    value.dispose();
+  }
+}
+
+/** The shared manifest-token logic over one resolved binding value (see
+ *  `manifestBinding`): the live-handle detector first, then the
+ *  structure-only token. Trap-free throughout (see `manifestBinding`); a
+ *  preview failure degrades to the `?` token, never a throw. */
+function describeBindingValue(vm: ReplVm, value: JSValueHandle): { token: string; handleCallId: string | null } {
   try {
     // The live-handle detector first: an own data property under the
     // registered handle symbol, read through the raw descriptor export
@@ -1108,8 +1151,6 @@ export function manifestBinding(vm: ReplVm, name: string): { token: string; hand
     return { token, handleCallId: null };
   } catch {
     return { token: '?', handleCallId: null };
-  } finally {
-    value.dispose();
   }
 }
 

@@ -11,6 +11,7 @@ import {
   OUTPUT_MAX_BYTES,
   OUTPUT_MAX_LINES,
   applyOutputCaps,
+  capFinalText,
 } from '../src/index.js';
 
 test('under the caps: every line is kept and nothing is truncated', () => {
@@ -123,4 +124,53 @@ test('embedded-newline bytes count toward the 10 KB cap (UTF-8)', () => {
 test('the constants match the doc: 256 lines, 10 KB', () => {
   assert.equal(OUTPUT_MAX_LINES, 256);
   assert.equal(OUTPUT_MAX_BYTES, 10 * 1000);
+});
+
+test('capFinalText: under the caps the text returns unchanged, no marker', () => {
+  const text = ['a', 'b', 'c'].join('\n');
+  assert.equal(capFinalText(text, '(truncated)'), text);
+});
+
+test('capFinalText: an over-cap text is capped with the marker ALWAYS shipping, and the capped result never exceeds the caps (the tool result wire guarantee)', () => {
+  const marker = '(tool result truncated — cap: 256 lines / 10000 bytes)'; // length ~57
+  const lines = Array.from({ length: 300 }, (_, i) => `line ${i}`);
+  const capped = capFinalText(lines.join('\n'), marker);
+  const cappedLines = capped.split('\n');
+  // The marker's own budget (1 line + its bytes) is reserved inside the
+  // caps, so the marker ships and the total stays at the cap.
+  assert.equal(cappedLines.length, OUTPUT_MAX_LINES, 'marker + 255 content lines');
+  assert.equal(cappedLines[cappedLines.length - 1], marker, 'the marker is the last line');
+  assert.equal(cappedLines[0], 'line 0', 'the head is kept');
+  assert.ok(!capped.includes('line 256'), 'the tail beyond the cap is dropped');
+  assert.ok(Buffer.byteLength(capped, 'utf8') <= OUTPUT_MAX_BYTES, 'the byte cap holds');
+});
+
+test('capFinalText: the byte cap reserves the marker\'s bytes — the marker ships even when content fills the byte budget', () => {
+  const marker = '(truncated)'; // 11 bytes + 1 separator
+  // 100 lines of 100 bytes each: 10099 bytes serialized — over the cap.
+  const lines = Array.from({ length: 100 }, () => 'x'.repeat(100));
+  const capped = capFinalText(lines.join('\n'), marker);
+  assert.ok(capped.endsWith(marker), `the marker ships: ${capped.slice(-40)}`);
+  assert.ok(Buffer.byteLength(capped, 'utf8') <= OUTPUT_MAX_BYTES);
+  // The content kept is bounded by the marker's reserved budget.
+  assert.ok(capped.split('\n').length <= OUTPUT_MAX_LINES);
+});
+
+test('capFinalText: a metadata-heavy text (many sections) is capped as ONE result — the wire guarantee the tool layer relies on', () => {
+  const marker = '(truncated)'; // 11 bytes
+  // Simulates the assembled tool result: console lines + result line +
+  // one pending line + many checkpoint lines (metadata sections were the
+  // phase-E review rejection — they used to be appended UNcapped).
+  const sections: string[] = [];
+  sections.push('result: 42');
+  sections.push('pending: c1, c2, c3');
+  for (let i = 0; i < 300; i++) sections.push(`checkpoint c${i}: question ${i}`);
+  sections.push('completed: c1, c2');
+  const capped = capFinalText(sections.join('\n'), marker);
+  const cappedLines = capped.split('\n');
+  assert.equal(cappedLines.length, OUTPUT_MAX_LINES);
+  assert.equal(cappedLines[cappedLines.length - 1], marker);
+  assert.equal(cappedLines[0], 'result: 42', 'the head sections are kept in order');
+  assert.equal(cappedLines[1], 'pending: c1, c2, c3');
+  assert.ok(!capped.includes('completed:'), 'the tail section is dropped');
 });

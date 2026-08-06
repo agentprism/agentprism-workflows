@@ -454,14 +454,27 @@ test("wait absorbs a still-running call until the backend settles it; interrupt 
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
 
-    // The eval-break signal (interrupt without an id) breaks the NEXT VM
-    // execution — the single-threaded daemon cannot observe a request
-    // while an eval is executing, so the signal is consumed by the next
-    // drain/eval that runs with it armed (documented semantics).
-    await repl(connected, { action: "interrupt", projectDir: PROJECT });
-    const runaway = await repl(connected, { action: "eval", projectDir: PROJECT, code: "while (true) {}" });
-    assert.ok(textOf(runaway).includes("interrupted"), `the armed signal broke the eval: ${textOf(runaway)}`);
-    // The VM stays usable.
+    // The eval-break signal (interrupt without an id) breaks the RUNNING
+    // eval (phase-E review rejection: the test used to pre-arm the signal
+    // before the eval started, never exercising the required ability to
+    // interrupt a RUNNING eval). The eval is started first — it suspends
+    // on an in-flight call, so it IS running (its continuation is
+    // registered and will execute); the interrupt lands while it is in
+    // flight; and when the continuation (a runaway loop) executes, the
+    // quickjs interrupt handler breaks it MID-RUN. The signal is consumed
+    // by the running eval's execution — a later eval is unaffected.
+    const eval3 = await repl(connected, { action: "eval", projectDir: PROJECT, code: 'const p3 = agent("pi/x", "task3"); await p3; while (true) {}' });
+    assert.ok(!isErrorResult(eval3), textOf(eval3));
+    assert.ok(textOf(eval3).includes("pending: c3"), textOf(eval3));
+    const armed = await repl(connected, { action: "interrupt", projectDir: PROJECT });
+    assert.ok(!isErrorResult(armed), textOf(armed));
+    assert.ok(textOf(armed).includes("interrupting the running eval"), textOf(armed));
+    await tick();
+    runner.last().completeTurn("resumed");
+    const runaway = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"after"' });
+    assert.ok(textOf(runaway).includes("interrupted"), `the running eval was broken: ${textOf(runaway)}`);
+    // The signal was consumed by the running eval: the NEXT eval runs
+    // normally, and the VM stays usable.
     const after = await repl(connected, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
     assert.ok(textOf(after).includes("result: 42"), textOf(after));
   } finally {

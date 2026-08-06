@@ -452,7 +452,21 @@ export async function disposeReplProjectState(
  *  not hang `reset` either). The stale first-touch flight is detached
  *  like the shutdown path's (see `disposeReplProjectState`): a reset
  *  during a parked restore-time reconcile must not leave every
- *  subsequent touch awaiting the never-resolving promise forever. */
+ *  subsequent touch awaiting the never-resolving promise forever.
+ *
+ * The client PRESENCE is deliberately NOT reset: `state.clients` (and
+ * the presence ledger's maps — they are always in sync) track
+ * CONNECTION liveness, not workspace state. The workspace is dropped,
+ * but the clients that are connected to the project stay connected —
+ * clearing the set here would desync it from the ledger, and a later
+ * disconnect of the reset-issuing client would drain work started
+ * after the reset while another project client is still connected
+ * (phase-E review rejection: reset used to clear `state.clients`, so
+ * the drain decision — which the ledger derives from its own maps —
+ * could fire against a project that still had a connected client).
+ * The `drained` latch resets (the next disconnect must re-evaluate
+ * whatever the fresh workspace warmed) and `drainError` clears (the
+ * dropped state's stale failure is gone with it). */
 export async function resetReplProjectState(
   state: ReplProjectState,
   boundMs: number = SHUTDOWN_DEADLINE_MS,
@@ -475,7 +489,10 @@ export async function resetReplProjectState(
   state.source = null;
   state.reconcileReport = null;
   state.restoreError = null;
-  state.clients.clear();
+  // Presence survives the reset: the connected clients remain present
+  // (see the module docs above) — the next touch re-establishes the
+  // workspace under the SAME presence, and the drain policy keeps
+  // working against the ledger's authoritative per-project set.
   state.drained = false;
   state.drainError = null;
 }

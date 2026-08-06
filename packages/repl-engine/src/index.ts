@@ -31,6 +31,7 @@ export {
 } from './workspace.js';
 export {
   baselineGlobalKeys,
+  baselineLexicalKeys,
   provenanceBootstrap,
   provenanceRecord,
   provenanceView,
@@ -40,6 +41,7 @@ export {
   type OriginRecord,
   type BaselineKeys,
 } from './provenance.js';
+export { LexicalEnumerationError } from './errors.js';
 export type { EvalErrorInfo } from './errors.js';
 export type { WasmInput, WasmModule, ReplSnapshot, ReplSnapshotExtension } from './types.js';
 
@@ -100,7 +102,7 @@ export {
   type PropertyPreview,
   type ObjectPreview,
 } from './preview.js';
-export { applyOutputCaps, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResult } from './caps.js';
+export { applyOutputCaps, capFinalText, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResult } from './caps.js';
 
 // Phase C: the broker, the append-only call store, and the eval
 // tool-result semantics. See the package README's "The broker" section.

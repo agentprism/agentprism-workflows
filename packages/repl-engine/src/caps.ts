@@ -75,3 +75,37 @@ export function applyOutputCaps(lines: string[]): OutputCapResult {
   }
   return { lines: out, truncated: false };
 }
+
+/**
+ * Apply the doc's caps to a tool result's FINAL text (the wire
+ * guarantee — the MCP tool layer caps its assembled result: console
+ * output, the result line, pending/checkpoint/completed sections, the
+ * wait timeout note, status output, everything). `text` is the
+ * canonical serialization (lines joined with `\n`, no trailing
+ * newline). When the caps trip, `marker` — a short truncation note —
+ * is appended INSTEAD of the dropped tail: the marker's own budget (one
+ * physical line plus its bytes) is reserved inside the caps before the
+ * content is capped, so the marker always ships and the capped result
+ * never exceeds the limits.
+ */
+export function capFinalText(text: string, marker: string): string {
+  const lines = text.split('\n');
+  const capped = applyOutputCaps(lines);
+  if (!capped.truncated) return text;
+  const markerBytes = Buffer.byteLength(marker, 'utf8') + 1; // + the '\n' separator
+  const kept: string[] = [];
+  let bytes = 0;
+  let physicalLines = 0;
+  for (const line of lines) {
+    const lineCount = countPhysicalLines(line);
+    const separatorBytes = kept.length > 0 ? 1 : 0;
+    const lineBytes = Buffer.byteLength(line, 'utf8') + separatorBytes;
+    if (physicalLines + lineCount > OUTPUT_MAX_LINES - 1 || bytes + lineBytes > OUTPUT_MAX_BYTES - markerBytes) {
+      return [...kept, marker].join('\n');
+    }
+    physicalLines += lineCount;
+    bytes += lineBytes;
+    kept.push(line);
+  }
+  return [...kept, marker].join('\n');
+}

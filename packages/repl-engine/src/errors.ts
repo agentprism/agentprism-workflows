@@ -7,6 +7,27 @@
  */
 
 /**
+ * A coded refusal: the global lexical binding enumeration could not be
+ * established for this VM (the running binary's `JSContext` layout or
+ * value encoding does not match the adjacency invariant the scan in
+ * `global-lexical.ts` calibrates against). Thrown from
+ * `globalVarObjectHandle` — and thereby from every manifest/provenance
+ * read that needs lexical bindings — so a layout regression surfaces
+ * loudly instead of silently dropping the workspace's
+ * `let`/`const`/`class` state. Defined here (not in `global-lexical.ts`)
+ * so the published type graph stays free of quickjs-wasi imports: the
+ * package index re-exports this class, and the consumer-facing
+ * declaration of `global-lexical.ts` must never be pulled into a
+ * non-DOM program.
+ */
+export class LexicalEnumerationError extends Error {
+  constructor(detail: string) {
+    super(`global lexical binding enumeration is unavailable: ${detail}`);
+    this.name = 'LexicalEnumerationError';
+  }
+}
+
+/**
  * Structured information about a failed eval, safe to ship to an MCP client.
  *
  * `name`/`message`/`stack` are read from the guest error **trap-free**

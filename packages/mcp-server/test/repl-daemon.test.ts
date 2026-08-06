@@ -20,15 +20,27 @@
  *   one never touches the other),
  * - MCP-session churn never touches the workspace: bindings survive a
  *   client disconnect and a fresh client's reconnect,
+ * - a TRANSIENT connection drop of the same live session restores its
+ *   project presence on reconnect (the registry's connection-open
+ *   signal re-adds it from the ledger's retained affinity), so the
+ *   scheduled drain aborts and children stay warm,
+ * - reset does NOT clear client presence (connection liveness, not
+ *   workspace state): with a second client connected, the resetting
+ *   client's disconnect never drains the post-reset workspace,
  * - the lifecycle drain driven by the daemon's session registry (the
  *   doc's client-presence policy): last-client disconnect drains the
  *   in-flight subagent turn to completion (mock runner), closes the
  *   idle child, and the next connect's followUp lazily re-attaches the
  *   recorded backend session,
  * - the eval-through-MCP round trip applies the doc's output caps
- *   (256 lines / 10 KB, whichever trips first) — and the `$N` refs the
+ *   (256 lines / 10 KB, whichever trips first) to the FINAL tool
+ *   result — console lines, the result line, and the metadata sections
+ *   alike, with the truncation marker shipping — and the `$N` refs the
  *   kept lines carry reach the truncated values (the cap costs reads,
- *   never data).
+ *   never data),
+ * - interrupt without an id breaks a RUNNING eval: an eval suspended
+ *   in flight is interrupted when its continuation (a runaway loop)
+ *   executes, and the signal is consumed by that execution.
  */
 
 import assert from "node:assert/strict";
@@ -310,11 +322,32 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c3" });
       assert.ok(!isErrorResult(interrupted), textOf(interrupted));
       assert.ok(textOf(interrupted).includes("session/cancel sent"), textOf(interrupted));
-      // interrupt without an id arms the eval-break signal: the next VM
-      // execution is broken (the quickjs interrupt handler).
-      await repl(session, { action: "interrupt", projectDir: PROJECT });
-      const runaway = await repl(session, { action: "eval", projectDir: PROJECT, code: "while (true) {}" });
-      assert.ok(textOf(runaway).includes("interrupted"), textOf(runaway));
+      // interrupt without an id BREAKS THE RUNNING EVAL (phase-E review
+      // rejection: the old test pre-armed the signal before the eval
+      // started, so it never exercised the required ability to interrupt
+      // a RUNNING eval). The eval is started first — it suspends on an
+      // in-flight call, so it IS running (its continuation is registered
+      // and will execute); the interrupt lands while it is in flight;
+      // when the continuation (a runaway loop) executes, the quickjs
+      // interrupt handler breaks it MID-RUN. The signal is consumed by
+      // the running eval's execution — a later eval is unaffected.
+      const inFlight = await repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: 'const s = agent("pi/x", "task4"); await s; while (true) {}',
+      });
+      assert.ok(!isErrorResult(inFlight), textOf(inFlight));
+      assert.ok(textOf(inFlight).includes("pending: c1, c4"), textOf(inFlight));
+      const armed = await repl(session, { action: "interrupt", projectDir: PROJECT });
+      assert.ok(!isErrorResult(armed), textOf(armed));
+      assert.ok(textOf(armed).includes("interrupting the running eval"), textOf(armed));
+      runner.last().completeTurn("resumed");
+      const runaway = await repl(session, { action: "eval", projectDir: PROJECT, code: '"after"' });
+      assert.ok(textOf(runaway).includes("interrupted"), `the running eval was broken: ${textOf(runaway)}`);
+      // The signal was consumed by the running eval: the next eval is
+      // NOT broken, and the VM stays usable.
+      const afterInterrupt = await repl(session, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+      assert.ok(textOf(afterInterrupt).includes("result: 42"), textOf(afterInterrupt));
       // reset: teardown — the VM and its stored state are dropped; the
       // next eval starts a fresh workspace.
       const reset = await repl(session, { action: "reset", projectDir: PROJECT });
@@ -323,6 +356,19 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       const gone = await repl(session, { action: "eval", projectDir: PROJECT, code: "typeof answer" });
       assert.ok(!isErrorResult(gone), textOf(gone));
       assert.ok(textOf(gone).includes('"undefined"'), textOf(gone));
+      // A GLOBAL LEXICAL binding (top-level let/const/class — the
+      // roadmap's canonical `const research = agent(...)` state) is
+      // listed by status with its full provenance surface (phase-E
+      // review rejection: only global-object keys were enumerated, so
+      // lexical workspace state was invisible to status).
+      const lexed = await repl(session, { action: "eval", projectDir: PROJECT, code: 'const research = agent("pi/x", "task"); "started"' });
+      assert.ok(!isErrorResult(lexed), textOf(lexed));
+      assert.ok(textOf(lexed).includes("pending: c1"), textOf(lexed));
+      const statusLex = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(
+        textOf(statusLex).includes("research = agent handle · pending · call c1 · via eval 2 · task \"task\""),
+        `lexical binding in status: ${textOf(statusLex)}`,
+      );
     } finally {
       await session.dispose();
     }
@@ -475,15 +521,124 @@ test("the session registry drives the client-presence drain on the real daemon: 
   }
 });
 
-test("eval-through-MCP round trip applies the output caps (256 lines / 10 KB, whichever trips first) and the $N refs reach the truncated values", async () => {
+test("a transient connection drop of the SAME live session restores its project presence on reconnect — the scheduled drain aborts and children stay warm", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const PROJECT = makeProjectDir("repl-reconnect");
+    const session = await connectHttp(daemon.url);
+    try {
+      const started = await repl(session, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
+      assert.ok(!isErrorResult(started), textOf(started));
+      assert.ok(textOf(started).includes("pending: c1"), textOf(started));
+      await tick();
+      const record = daemon.sessions.values()[0];
+      assert.ok(record, "the session is registered");
+      // The transient drop: the session's LAST connection closes (a
+      // standalone-GET blip — the session itself stays alive). The
+      // registry signals the presence ledger, which removes the session's
+      // presence and schedules the project drain.
+      daemon.sessions.connectionClosed(record.sessionId);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const child = runner.last();
+      assert.equal(child.releases, 0, "the drain is waiting on the in-flight turn");
+      // The SAME live session reconnects (no new MCP session, no tool
+      // call): the registry's connection-open signal re-adds the
+      // session's project presence from its retained affinity, and the
+      // scheduled drain aborts — the child stays warm (phase-E review
+      // rejection: only disconnects were wired, so the reconnect used to
+      // leave the presence gone and the already-scheduled drain could
+      // close children while the client was connected).
+      daemon.sessions.connectionOpened(record.sessionId);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(child.releases, 0, "the reconnect aborted the drain — the child stays warm");
+      assert.equal(child.cancelCalls, 0, "nothing was cancelled");
+      // The turn completes normally and settles into the live workspace;
+      // the workspace stays warm (children not closed).
+      child.completeTurn("warm after reconnect");
+      const got = await repl(session, { action: "eval", projectDir: PROJECT, code: "await p" });
+      assert.ok(!isErrorResult(got), textOf(got));
+      assert.ok(textOf(got).includes("warm after reconnect"), textOf(got));
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!textOf(status).includes("children: closed"), textOf(status));
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("reset does not clear client presence: with a second client still connected, the resetting client's disconnect does NOT drain the post-reset workspace", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const PROJECT = makeProjectDir("repl-reset-presence");
+    const sessionA = await connectHttp(daemon.url);
+    const sessionB = await connectHttp(daemon.url);
+    try {
+      // Both clients are present on the project.
+      const start = await repl(sessionA, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
+      assert.ok(!isErrorResult(start), textOf(start));
+      assert.ok(textOf(start).includes("pending: c1"), textOf(start));
+      await repl(sessionB, { action: "eval", projectDir: PROJECT, code: '"b present"' });
+      await tick();
+      // A resets: the workspace is dropped, but the CONNECTIONS stay —
+      // presence is connection liveness, not workspace state (phase-E
+      // review rejection: reset used to clear state.clients while the
+      // presence ledger kept its maps, so the two desynced and a later
+      // disconnect of A could drain work started after the reset even
+      // though B was still connected).
+      const reset = await repl(sessionA, { action: "reset", projectDir: PROJECT });
+      assert.ok(!isErrorResult(reset), textOf(reset));
+      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
+      // A starts NEW work on the fresh workspace.
+      const restarted = await repl(sessionA, { action: "eval", projectDir: PROJECT, code: 'const q = agent("pi/x", "task2"); "started2"' });
+      assert.ok(!isErrorResult(restarted), textOf(restarted));
+      assert.ok(textOf(restarted).includes("pending: c1"), textOf(restarted));
+      await tick();
+      const child = runner.last();
+      // A's connection drops while B is still connected: NO drain may
+      // fire — the post-reset child stays warm (the drain decision sees
+      // B's presence).
+      await sessionA.dispose();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(child.releases, 0, "no drain while B is connected");
+      assert.equal(child.cancelCalls, 0, "nothing was cancelled");
+      // The in-flight turn completes and settles into the live
+      // workspace; B can see the result.
+      child.completeTurn("post-reset result");
+      const got = await repl(sessionB, { action: "eval", projectDir: PROJECT, code: "await q" });
+      assert.ok(!isErrorResult(got), textOf(got));
+      assert.ok(textOf(got).includes("post-reset result"), textOf(got));
+      // B's disconnect is the LAST client: NOW the drain runs and closes
+      // the idle child.
+      await sessionB.dispose();
+      for (let attempt = 0; attempt < 200 && child.releases === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(child.releases, 1, "the last-client disconnect drains and closes the idle child");
+    } finally {
+      await sessionA.dispose().catch(() => undefined);
+      await sessionB.dispose().catch(() => undefined);
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("eval-through-MCP round trip applies the output caps to the FINAL result (256 lines / 10 KB, whichever trips first, marker included) and the $N refs reach the truncated values", async () => {
   const daemon = await startReplDaemon(new FakeRunner());
   try {
     const session = await connectHttp(daemon.url);
     try {
       const PROJECT = makeProjectDir("repl-caps");
-      // The LINE cap: 300 console.log calls render 300 preview lines; the
-      // tool result keeps exactly the first 256 (the doc: "tool-result
-      // output capped at 256 lines or 10 KB, whichever trips first").
+      // The LINE cap: 300 console.log calls render 300 preview lines. The
+      // caps apply to the FINAL assembled tool result (phase-E review
+      // rejection: the completion line and the metadata sections used to
+      // be appended UNcapped, shipping 257 wire lines) — at most 256
+      // lines reach the wire, and a truncation marker ships instead of
+      // the dropped tail (its own budget is reserved inside the caps).
       const big = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
@@ -491,17 +646,13 @@ test("eval-through-MCP round trip applies the output caps (256 lines / 10 KB, wh
       });
       assert.ok(!isErrorResult(big), textOf(big));
       const text = textOf(big);
-      // A loop-only script completes with undefined, so the tool result
-      // is exactly the 256 capped output lines plus the completion line
-      // ("result: undefined") — the doc's 256-line cap, applied to the
-      // OUTPUT, holds on the wire.
       const lines = text.split("\n");
-      assert.equal(lines.length, 257, "the 256-line cap (output + completion line)");
-      assert.equal(lines[256], "result: undefined", "the completion line is the only extra line");
+      assert.ok(lines.length <= 256, `the 256-line cap holds on the wire: ${lines.length}`);
+      assert.ok(text.includes("tool result truncated"), `the truncation marker ships: ${text.slice(0, 120)}`);
       // The kept lines carry their $N addresses (the doc's "output is
       // addressed, not just truncated").
       assert.ok(text.startsWith('[$1 · string · 6B] "line-0"'), text.slice(0, 80));
-      assert.ok(text.includes('"line-255"'), "the last kept line");
+      assert.ok(text.includes('"line-2'), "the kept head lines are the earliest lines");
       assert.ok(!text.includes("line-299"), "the tail beyond the cap is never shipped");
       // The truncated values stay reachable through the $N refs the kept
       // lines carry (the cap costs reads, never data).
@@ -509,7 +660,8 @@ test("eval-through-MCP round trip applies the output caps (256 lines / 10 KB, wh
       assert.ok(!isErrorResult(sliced), textOf(sliced));
       assert.ok(textOf(sliced).includes('"line-299"'), textOf(sliced));
       // The BYTE cap: 100 two-kilobyte strings trip the 10 KB cap long
-      // before the 256-line cap; only the lines that fit are emitted.
+      // before the 256-line cap; only the lines that fit are emitted,
+      // and the marker ships.
       const heavy = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
@@ -519,11 +671,36 @@ test("eval-through-MCP round trip applies the output caps (256 lines / 10 KB, wh
       const heavyText = textOf(heavy);
       assert.ok(heavyText.split("\n").length < 100, "the byte cap tripped before the line cap");
       assert.ok(Buffer.byteLength(heavyText) <= 10_000, `the 10 KB cap: ${Buffer.byteLength(heavyText)} bytes`);
+      // (The broker already capped the console lines, so the final text
+      // fits without a marker; the marker-on-byte-cap path is pinned by
+      // capFinalText's unit tests.)
       // The full value behind a capped line is one global: addressable by
-      // its ref in a later eval (the 100th 2 KB value survived intact).
+      // its ref in a later eval. The 300 prior logs created $1..$300, the
+      // sliced eval's log created $301, and the heavy loop created
+      // $302..$401 — the last one is "B" × 2000 + "99" (length 2002),
+      // intact.
       const length = await repl(session, { action: "eval", projectDir: PROJECT, code: "$401.length" });
       assert.ok(!isErrorResult(length), textOf(length));
       assert.ok(textOf(length).includes("result: 2002"), textOf(length));
+      // METADATA-heavy results are capped too (phase-E review rejection:
+      // pending ids, checkpoints, completed ids, and timeout text were
+      // appended uncapped): 300 parked checkpoints render 300 checkpoint
+      // lines plus the result/pending sections — the final text is
+      // capped at 256 lines with the marker, head sections kept in
+      // order.
+      const meta = await repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: 'for (let i = 0; i < 300; i++) checkpoint("q-" + i); "asked"',
+      });
+      assert.ok(!isErrorResult(meta), textOf(meta));
+      const metaText = textOf(meta);
+      const metaLines = metaText.split("\n");
+      assert.ok(metaLines.length <= 256, `metadata-heavy result capped: ${metaLines.length}`);
+      assert.ok(metaText.includes("tool result truncated"), "the metadata cap marker ships");
+      assert.ok(metaText.includes("pending:"), "the pending section is kept (head)");
+      assert.ok(metaText.includes("checkpoint"), "the checkpoint section is kept (head)");
+      assert.ok(!metaText.includes("completed:"), "the tail section is dropped");
     } finally {
       await session.dispose();
     }
@@ -531,5 +708,3 @@ test("eval-through-MCP round trip applies the output caps (256 lines / 10 KB, wh
     await daemon.close();
   }
 });
-
-
