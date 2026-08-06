@@ -15,7 +15,9 @@ jobs:
     # check matches this string exactly — renaming it wedges every merge until
     # the ruleset context is updated to match.
     name: Build & test
-    runs-on: ubuntu-latest
+    # Self-hosted agentprism runners first (fast, warm cache, outage-proof); the
+    # `agentprism` label is what selects them. Keep `self-hosted` so any of our runners match.
+    runs-on: [self-hosted, agentprism]
     steps:
       - name: Checkout
         uses: actions/checkout@v7

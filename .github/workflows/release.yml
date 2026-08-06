@@ -44,7 +44,7 @@ concurrency:
 jobs:
   release:
     name: Version / publish (@automatalabs)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, agentprism]
     timeout-minutes: 30
     # Secrets are not readable inside step `if:` expressions — surface presence via env.
     env:
