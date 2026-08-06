@@ -45,6 +45,12 @@ export interface WorkspaceBinding {
   /** Structure-only token (type/shape/size — never value content), or
    *  `agent handle` for a live agent handle. */
   token: string;
+  /** The machine-readable structure-only type label (see preview.ts's
+   *  `manifestTypeLabel`): `string`, `number`, `object`, `array`,
+   *  `agent handle`, … — the structured manifest's type field, so a
+   *  structured consumer never has to parse the token (phase-E review
+   *  round 4: the type used to live only inside the formatted token). */
+  type: string;
   /** The trap-free byte-size estimate of the binding's value (the doc's
    *  manifest contract: every top-level binding reports name, type, AND
    *  size; 0 only for the unreadable accessor/sabotage cases). */
@@ -462,6 +468,7 @@ export class Workspace {
       bindings.push({
         name,
         token: info.token,
+        type: info.type,
         sizeBytes: info.sizeBytes,
         handleCallId: info.handleCallId,
         provenance: origin === undefined ? null : origin.via,

@@ -333,6 +333,7 @@ import { isWorkflowError, WorkflowError, WorkflowErrorCode } from '@automatalabs
 import { isAbsolute } from 'node:path';
 
 import type { GuestBridgeHandlers, GuestCall, GuestSurfaceEntry } from './bridge.js';
+import { instrumentTopLevelAwaits } from './await-instrument.js';
 import { formatByteSize, headTailDescription, renderCompletionLine, stringDescription } from './preview.js';
 import { applyOutputCaps } from './caps.js';
 import { InMemoryCallStore, type CallOutcome, type CallRecord, type CallStore } from './store.js';
@@ -613,6 +614,12 @@ export interface WorkspaceManifestBinding {
    *  review rejection: the token used to omit size for primitives,
    *  null, functions and plain promises). */
   token: string;
+  /** The machine-readable structure-only type label (`string`,
+   *  `number`, `object`, `array`, `agent handle`, … — see preview.ts's
+   *  `manifestTypeLabel`): the structured manifest's type field, so a
+   *  structured consumer never has to parse the token (phase-E review
+   *  round 4: the type used to live only inside the formatted token). */
+  type: string;
   /** The trap-free byte-size estimate of the binding's value — the
    *  doc's manifest contract is name, type, AND size for every
    *  top-level binding; exposed as its own field so a structured
@@ -620,6 +627,18 @@ export interface WorkspaceManifestBinding {
    *  the broker exposed no separate size field). 0 only for the
    *  unreadable accessor/sabotage cases. */
   sizeBytes: number;
+  /** The stable call id when the binding is an agent handle; null
+   *  otherwise (the engine reports it — the broker no longer embeds
+   *  the call id only inside the token string; phase-E review round
+   *  4: the call id used to be discarded from the structured
+   *  surface). */
+  handleCallId: string | null;
+  /** The LIVE-HANDLE STATUS of an agent-handle binding, read from the
+   *  call store: `pending` while the founding call is unsettled,
+   *  `settled` once it completed (phase-E review round 4: the status
+   *  used to be embedded only in the human token and was absent from
+   *  the structured surface). Null for non-handle bindings. */
+  handleStatus: 'pending' | 'settled' | null;
   /** The sanitized provenance label (`eval 3`, `worker c2`, `session
    *  restore`), or null when untracked. */
   provenance: string | null;
@@ -924,45 +943,55 @@ export class Broker {
    *  later execution. */
   private evalBreakTargets = new Set<JSValueHandle>();
   /** The armed target's DEPENDENCY CALL IDS — the union of each armed
-   *  eval's OWN suspension-time calls (see `evalSuspensionCalls`: the
-   *  calls the eval issued itself, the settlements that queue its
-   *  continuation). A suspended eval's continuation is resumed EXACTLY
-   *  by the settlement of one of its own calls, so
-   *  this set is the armed-target identity the eval-break signal is
-   *  keyed to: a drain fires the signal only when the calls settled
-   *  within it intersect this set (phase-E review rejection: the signal
-   *  used to fire on WHICHEVER drain ran next, so an unrelated finite
-   *  eval's own drain — or an unrelated settlement drain — consumed it
-   *  and broke the wrong execution; the armed state must survive an
-   *  unrelated drain intact). */
+   *  eval's OWN awaited-call set (see `evalDeps`: the calls whose
+   *  settlement queues the eval's continuation — recorded by the guest
+   *  library's `__replAwait` at the eval's top-level awaits, phase-E
+   *  review round 4). A suspended eval's continuation is resumed EXACTLY
+   *  by the settlement of a call it awaits, so this set is the
+   *  armed-target identity the eval-break signal is keyed to: a drain
+   *  fires the signal only when the calls settled within it intersect
+   *  this set (phase-E review rejections: the signal used to fire on
+   *  WHICHEVER drain ran next, and the pre-round-4 identity — every call
+   *  an eval CREATED — let an unawaited sibling call's settlement fire
+   *  it against the sibling's own unrelated `.then` continuation; the
+   *  armed state must survive an unrelated drain intact). */
   private evalBreakDeps = new Set<string>();
-  /** Per tracked suspended eval, the call ids IT owns — the pending
-   *  calls added to the guest registry while that eval ran (its
-   *  suspension-time pending set MINUS the calls already pending when
-   *  the eval started, i.e. the calls it issued itself). These are the
-   *  eval's continuation resume keys: its continuation is queued
-   *  EXACTLY by the settlement of a call it awaits, and a fresh eval
-   *  can only await calls it issued itself (an `await p` on a binding
-   *  from an earlier eval awaits a call the EARLIER eval owns —
-   *  attributed to that eval, never to this one; phase-E review round
-   *  3: the naive suspension-time snapshot inherited earlier evals'
-   *  still-pending calls, so an unrelated settlement of one fired the
-   *  armed signal against the wrong eval — the exact leak the
-   *  targeting discipline forbids). Recorded at suspension time, NOT at
-   *  arming time: the interrupted-drain release decision (which tracked
-   *  eval's continuation was actually broken) is made from this
+  /** Per tracked suspended eval, the call ids IT AWAITS — the calls
+   *  whose settlement queues ITS continuation (the eval's top-level
+   *  awaits, recorded by the guest library's `__replAwait` at
+   *  execution time — see `await-instrument.ts`). These are the eval's
+   *  continuation resume keys: its continuation is queued EXACTLY by
+   *  the settlement of a call it awaits, whether that call was created
+   *  by this eval (`const c1 = agent(...); await c1`) or by an EARLIER
+   *  eval (`await p` on an earlier binding — the phase-E review round-4
+   *  requirement: a running eval awaiting an earlier binding must
+   *  remain targetable). An eval's code-phase awaits end at the
+   *  `beforeDrain` boundary; awaits executed later by OTHER evals'
+   *  continuations inside this eval's drain are attributed transitively
+   *  to those evals, never to this one (see
+   *  `attributeContinuationAwaits`). An eval suspended with NO awaited
+   *  library call (a never-settling local promise, a `Promise.all` of
+   *  library promises — its settlement is the LAST component's,
+   *  unknowable in advance — or an indirect chain) has no attributable
+   *  execution: the no-id interrupt refuses rather than risk breaking
+   *  an unrelated continuation. Recorded at suspension time from the
+   *  code-phase log: the interrupted-drain release decision (which
+   *  tracked eval's continuation was actually broken) is made from this
    *  attribution even when no signal is armed (a per-eval-deadline
    *  break of a resumed runaway continuation must still release the
-   *  tracked eval). An eval suspended with no own calls (it awaits only
-   *  earlier bindings, or a never-settling local promise) has no
-   *  attributable execution: the no-id interrupt refuses rather than
-   *  risk breaking an unrelated continuation. */
-  private readonly evalSuspensionCalls = new Map<JSValueHandle, Set<string>>();
-  /** The guest registry's pending call ids at the CURRENT eval's start
-   *  (after its settlement pump, before its code phase): the
-   *  suspension-time own-call attribution's baseline (see
-   *  `evalSuspensionCalls`). */
-  private evalStartPending = new Set<string>();
+   *  tracked eval). */
+  private readonly evalDeps = new Map<JSValueHandle, Set<string>>();
+  /** The CURRENT eval's code-phase await entries (see `runEval`): the
+   *  `__replAwait` records its own code executed synchronously — the
+   *  resume-key identity attributed to the eval when it suspends. Held
+   *  here because `eval()` performs the attribution AFTER `runEval`
+   *  returns (the suspension outcome is only known then). */
+  private codePhaseAwaits: string[] = [];
+  /** The cached await-tracking capability probe (see `awaitTracking`):
+   *  whether the workspace's guest library carries the 0.2.0 tracking
+   *  surface. Cached — the library never changes within a broker's
+   *  lifetime; `undefined` until first probed. */
+  private awaitTrackingCached: boolean | undefined;
   /** The call ids settled into the guest while the CURRENT VM operation
    *  (an eval or a settlement drain) is active — the drain-context
    *  accumulator. Reset at the start of each operation; every
@@ -1110,9 +1139,9 @@ export class Broker {
         // old signal was consulted only by settlement drains, and
         // without this release a broken target stayed tracked forever,
         // making a later eval-break arm target a dead eval). The
-        // release is SCOPED (phase-E review round 3): only an
+        // release is SCOPED (phase-E review round 3/4): only an
         // interrupted drain that ran a TRACKED eval's continuation
-        // (this op settled one of its suspension-time resume keys —
+        // (this op settled one of its AWAITED-call resume keys —
         // `checkpoint.answer` in this eval resumed it) releases the
         // tracked evals; an unrelated interrupted drain — THIS eval's
         // own completion jobs bounded by the per-eval deadline, with
@@ -1131,17 +1160,17 @@ export class Broker {
       // broken — `sweepActiveEvals` releases it at the next operation.
       // A RESOLVED eval's completion handle is owned by `render` (it
       // previews and disposes it); an error outcome carries none. The
-      // eval's OWN suspension-time calls are recorded alongside — the
-      // calls added to the registry while this eval ran (pending at
-      // suspension minus the pre-eval baseline): the eval-break
-      // signal's armed-target identity (see `evalBreakDeps`).
+      // eval's OWN AWAITED calls are recorded alongside — the calls
+      // its code phase awaited (the guest library's `__replAwait`
+      // log, captured at the `beforeDrain` boundary): the eval-break
+      // signal's armed-target identity (see `evalDeps`). An eval that
+      // awaited nothing the library knows (a never-settling local
+      // promise, an indirect `Promise.all` chain) is tracked with an
+      // EMPTY set — `armEvalBreak` refuses on it (no execution can
+      // ever be keyed to it).
       if (outcome.kind === 'pending' && completion !== undefined) {
         this.activeEvalCompletions.add(completion as JSValueHandle);
-        const ownCalls = new Set<string>();
-        for (const id of this.pendingIds()) {
-          if (!this.evalStartPending.has(id)) ownCalls.add(id);
-        }
-        this.evalSuspensionCalls.set(completion as JSValueHandle, ownCalls);
+        this.evalDeps.set(completion as JSValueHandle, new Set(this.codePhaseAwaits));
       }
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
@@ -2298,7 +2327,7 @@ export class Broker {
       if (this.activeEvalCompletions.size === 0) return false;
       const deps = new Set<string>();
       for (const completion of this.activeEvalCompletions) {
-        const calls = this.evalSuspensionCalls.get(completion);
+        const calls = this.evalDeps.get(completion);
         if (calls !== undefined) {
           for (const id of calls) deps.add(id);
         }
@@ -2352,7 +2381,7 @@ export class Broker {
     }
     for (const completion of settled) {
       this.activeEvalCompletions.delete(completion);
-      this.evalSuspensionCalls.delete(completion);
+      this.evalDeps.delete(completion);
       completion.dispose();
     }
   }
@@ -2373,12 +2402,15 @@ export class Broker {
    * The release is SCOPED to the interrupted drain's context (phase-E
    * review round 3 — the carried review's defect): `context` is the
    * set of call ids settled by the interrupted operation, and exactly
-   * the tracked evals whose OWN suspension-time resume keys intersect
-   * it are dropped — the evals whose continuation the interrupted
-   * drain could have been running (each call is owned by exactly the
-   * eval that issued it, so the attribution is precise: the drain
-   * settled those evals' calls, and only those evals' continuations
-   * could have been queued by the settlements).
+   * the tracked evals whose OWN awaited-call resume keys intersect it
+   * are dropped — the evals whose continuation the interrupted drain
+   * could have been running (each awaited call's settlement queues
+   * exactly the continuations of the evals awaiting it, so the
+   * attribution is precise: the drain settled those evals' awaited
+   * calls, and only those evals' continuations could have been queued
+   * by the settlements — an unawaited sibling call is never in any
+   * tracked eval's set, so its drain releases nothing; phase-E review
+   * round 4's carried defect).
    *
    * An interrupted drain that settled NO tracked eval's resume key —
    * an unrelated drain (a later finite eval's own drain bounded by the
@@ -2399,7 +2431,7 @@ export class Broker {
     this.evalBreakTargets = new Set();
     this.evalBreakDeps = new Set();
     for (const completion of [...this.activeEvalCompletions]) {
-      const calls = this.evalSuspensionCalls.get(completion);
+      const calls = this.evalDeps.get(completion);
       if (calls === undefined) continue;
       let intersects = false;
       for (const id of contextSet) {
@@ -2410,7 +2442,7 @@ export class Broker {
       }
       if (intersects) {
         this.activeEvalCompletions.delete(completion);
-        this.evalSuspensionCalls.delete(completion);
+        this.evalDeps.delete(completion);
         completion.dispose();
       }
     }
@@ -2433,7 +2465,7 @@ export class Broker {
    *  target a dead eval). */
   private opResumedTrackedEval(): boolean {
     if (this.opSettledCalls.length === 0) return false;
-    for (const calls of this.evalSuspensionCalls.values()) {
+    for (const calls of this.evalDeps.values()) {
       for (const id of this.opSettledCalls) {
         if (calls.has(id)) return true;
       }
@@ -2487,12 +2519,20 @@ export class Broker {
     }));
   }
 
-  /** Every live subagent session — the `status` seam. */
+  /** Every live subagent session — the `status` seam. The guest-derived
+   *  `task` is previewed (head+tail capped at 200 chars, the same bound
+   *  as the manifest's task surface) at the ENGINE seam so EVERY
+   *  consumer — the bounded text renderer AND the structured status —
+   *  is bounded: the tool's structuredContent must respect the doc's
+   *  output limits (phase-E review rejection: the structured status
+   *  used to copy the raw task, so a guest could push an unbounded
+   *  task string through `structuredContent` while only the text
+   *  content was capped). */
   liveAgents(): LiveAgentInfo[] {
     return [...this.sessions.values()].map((entry) => ({
       callId: entry.callId,
       modelSpec: entry.modelSpec,
-      task: entry.task,
+      task: entry.task.length > 200 ? headTail(entry.task, 200) : entry.task,
       state: !entry.callSettled
         ? entry.busy
           ? 'running'
@@ -2549,30 +2589,64 @@ export class Broker {
     timeoutMs: number,
   ): Promise<{ result: ReplEvalResult; drained: boolean }> {
     const deadline = Date.now() + Math.max(0, timeoutMs);
-    // The target set is captured at ENTRY under the chain (phase-E
-    // review rejection round 2: the wait used to run its whole bounded
-    // poll inside ONE serialized op, so a concurrent interrupt —
-    // `cancelCall` / `armEvalBreak` — queued behind it and could not
-    // cancel or break until the wait finished or timed out, up to 120 s,
-    // by which point the target could already have completed). The wait
-    // now runs each PUMP as its own serialized unit and RELEASES the
-    // chain between pumps, so other operations — interrupts, other
-    // waits, the client-presence drain — interleave mid-wait: an
-    // interrupt landing mid-wait arms the eval-break signal against the
-    // eval the wait is pumping, and the wait's very next pump breaks it
-    // mid-run. With other operations interleaving, "wait for every
-    // pending call" can only mean "the calls pending when the wait
-    // started" — a call a concurrent eval dispatches after entry is not
-    // waited on (the wait stays bounded and deterministic).
-    const targets = await this.serialized(async () => {
-      this.assertAlive();
-      return ids === undefined ? new Set(this.pendingIds()) : new Set(ids);
-    });
+    // The target set is captured at ENTRY (phase-E review rejection
+    // round 2: the wait used to run its whole bounded poll inside ONE
+    // serialized op, so a concurrent interrupt — `cancelCall` /
+    // `armEvalBreak` — queued behind it and could not cancel or break
+    // until the wait finished or timed out, up to 120 s, by which point
+    // the target could already have completed). The wait now runs each
+    // PUMP as its own serialized unit and RELEASES the chain between
+    // pumps, so other operations — interrupts, other waits, the
+    // client-presence drain — interleave mid-wait: an interrupt landing
+    // mid-wait arms the eval-break signal against the eval the wait is
+    // pumping, and the wait's very next pump breaks it mid-run. With
+    // other operations interleaving, "wait for every pending call" can
+    // only mean "the calls pending when the wait started" — a call a
+    // concurrent eval dispatches after entry is not waited on (the wait
+    // stays bounded and deterministic).
+    //
+    // The CHAIN ACQUISITION itself is bounded by the wait's absolute
+    // deadline (phase-E review round 4's carried defect: the entry
+    // capture, every pump, and the final re-check used to enqueue onto
+    // the serialization chain with NO deadline, so a wait queued behind
+    // a long eval — 20 ms behind a 250 ms eval — took the eval's whole
+    // remaining run (~253 ms) instead of returning at its bound; the
+    // absolute deadline must bound chain contention as well as polling
+    // sleep and guest drains). A pump that cannot acquire the chain
+    // within the remaining budget reports "still running" — it
+    // observed nothing settle — and never touches the VM while another
+    // operation is mid-flight.
+    let targets: Set<string>;
+    // The last pending read taken UNDER the chain (rendered in the
+    // result). Initialized to the explicit ids when given — the wait's
+    // own target set, none of which was observed to settle before any
+    // read — and empty until the entry capture for the ids-omitted
+    // form (the pending surface is unreadable while another operation
+    // holds the chain).
+    let lastPending: string[] = ids ?? [];
+    if (ids !== undefined) {
+      // Explicit ids need no chain read — the target set is the input.
+      targets = new Set(ids);
+    } else {
+      const captured = await this.trySerialized(async () => {
+        this.assertAlive();
+        const pending = this.pendingIds();
+        lastPending = pending;
+        return new Set(pending);
+      }, deadline);
+      if (!captured.acquired) {
+        // The chain was busy for the whole budget: no pending read was
+        // possible, nothing was observed to settle — the honest
+        // "still running" with an empty (unreadable) pending surface.
+        return { result: this.renderWaitResult([], undefined, []), drained: false };
+      }
+      targets = captured.value!;
+    }
     const completed: string[] = [];
     let drainErrorLine: string | undefined;
     let drained = false;
     for (;;) {
-      drained = await this.serialized(async () => {
+      const pumped = await this.trySerialized(async () => {
         this.assertAlive();
         // Each pump runs under the REMAINING wait time: a settlement
         // drain that resumes a runaway continuation near the deadline is
@@ -2592,9 +2666,18 @@ export class Broker {
           // eval's pump-drain error line.
           drainErrorLine = errorLine(drainError.info);
         }
-        const pending = new Set(this.pendingIds());
-        return [...targets].every((id) => !pending.has(id));
-      });
+        const pending = this.pendingIds();
+        lastPending = pending;
+        return [...targets].every((id) => !pending.includes(id));
+      }, deadline);
+      if (!pumped.acquired) {
+        // The chain was held past the deadline (a long eval): the wait
+        // reports "still running" at its bound instead of queueing
+        // behind the stuck operation (the round-4 carried defect).
+        drained = false;
+        break;
+      }
+      drained = pumped.value!;
       if (drained) break;
       // Sleep only for the REMAINING wait budget — never a fixed 50 ms
       // past the deadline (phase-E review round 3's carried defect: the
@@ -2612,22 +2695,31 @@ export class Broker {
       // The deadline tripped between the last pump and the timeout
       // check — an interleaved operation (an interrupt's cancel, or
       // another pump) may have settled the targets in that window:
-      // re-check once under the chain so the result is not a stale
-      // "still running".
-      drained = await this.serialized(async () => {
+      // re-check once so the result is not a stale "still running"
+      // (the re-check's acquisition is bounded by the REMAINING budget
+      // — it may itself report the chain still busy, which is the
+      // honest not-drained).
+      const recheck = await this.trySerialized(async () => {
         this.assertAlive();
-        const pending = new Set(this.pendingIds());
-        return [...targets].every((id) => !pending.has(id));
-      });
+        const pending = this.pendingIds();
+        lastPending = pending;
+        return [...targets].every((id) => !pending.includes(id));
+      }, deadline);
+      if (recheck.acquired) drained = recheck.value!;
     }
-    const result = this.renderWaitResult(completed, drainErrorLine);
+    const result = this.renderWaitResult(completed, drainErrorLine, lastPending);
     return { result, drained };
   }
 
   /** Render the wait result in the eval-result shape (output lines from
    *  the console buffer, the pump-drain error line when one occurred,
-   *  pending ids, checkpoints, completed ids). */
-  private renderWaitResult(completed: string[], drainErrorLine?: string): ReplEvalResult {
+   *  pending ids, checkpoints, completed ids). `pending` is the last
+   *  pending read taken UNDER the chain (the wait's pumps capture it;
+   *  a wait that could never acquire the chain passes the empty
+   *  unreadable surface) — the renderer never re-enters the VM outside
+   *  the chain.
+   */
+  private renderWaitResult(completed: string[], drainErrorLine: string | undefined, pending: string[]): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {
       lines.push(...this.renderConsoleEvent(event));
@@ -2637,7 +2729,7 @@ export class Broker {
     return {
       output: capped.lines,
       outputTruncated: capped.truncated,
-      pending: this.pendingIds(),
+      pending,
       checkpoints: this.checkpointSummaries(),
       completed,
     };
@@ -3096,28 +3188,33 @@ export class Broker {
     const manifest = this.workspace.manifest();
     const bindings = manifest.bindings.map((binding) => {
       let token = binding.token;
-      let handleCallId: string | null = binding.handleCallId;
+      let handleStatus: 'pending' | 'settled' | null = null;
       if (binding.handleCallId !== null) {
         const record = this.callStore.lookup(binding.handleCallId);
-        const status =
-          record === undefined || record.completion === null ? 'pending' : 'settled';
+        handleStatus = record === undefined || record.completion === null ? 'pending' : 'settled';
         // The size travels with the handle token too (phase-E review
         // rejection: the manifest's size surface used to stop at the
         // handle marker). `formatByteSize` is the previewer's decimal
-        // formatter — the same one the structure tokens use.
-        token = `agent handle \u00b7 ${status} \u00b7 call ${binding.handleCallId} \u00b7 ${formatByteSize(binding.sizeBytes)}`;
+        // formatter — the same one the structure tokens use. The
+        // status and call id are ALSO reported as their own structured
+        // fields (phase-E review round 4: they used to live only in
+        // this string).
+        token = `agent handle \u00b7 ${handleStatus} \u00b7 call ${binding.handleCallId} \u00b7 ${formatByteSize(binding.sizeBytes)}`;
       }
       return {
         name: binding.name,
         token,
+        type: binding.type,
         sizeBytes: binding.sizeBytes,
+        handleCallId: binding.handleCallId,
+        handleStatus,
         provenance: binding.provenance,
         provenanceAtMs: binding.provenanceAtMs,
         // The doc's "from what task" provenance half: the task text behind
         // a worker provenance (`worker c1` → the founding agent() call's
         // task from the call store) or an agent-handle binding's founding
         // call. Capped so the manifest stays bounded metadata.
-        task: this.taskForBinding(binding.provenance, handleCallId),
+        task: this.taskForBinding(binding.provenance, binding.handleCallId),
       };
     });
     return {
@@ -3234,7 +3331,8 @@ export class Broker {
       // VM is disposed by the caller).
       for (const completion of this.activeEvalCompletions) completion.dispose();
       this.activeEvalCompletions.clear();
-      this.evalSuspensionCalls.clear();
+      this.evalDeps.clear();
+      this.codePhaseAwaits = [];
       this.evalBreakTargets = new Set();
       this.evalBreakDeps = new Set();
       this.evalBreakArmed = false;
@@ -4241,6 +4339,18 @@ export class Broker {
         this.noteInterruptedDrain(this.opSettledCalls);
       }
       throw error;
+    } finally {
+      // The drain's continuation awaits (phase-E review round 4): the
+      // continuations this drain resumed may have awaited further
+      // calls while they ran — those entries extend the TRACKED evals'
+      // resume keys (the ones whose deps intersect what this drain
+      // settled — exactly the evals whose continuations it could have
+      // run). The take runs even when the drain was interrupted: the
+      // part of a continuation that ran before the break may have
+      // logged awaits, and the interrupted-drain release above already
+      // decided what stays tracked.
+      const drainAwaits = this.takeAwaitLog();
+      if (drainAwaits.length > 0) this.attributeContinuationAwaits(drainAwaits, this.opSettledCalls);
     }
   }
 
@@ -4291,12 +4401,27 @@ export class Broker {
     // drain — where a synchronously-resumed continuation executes —
     // consults it via the drain-phase eval-break handler (the drain
     // belongs to the armed target iff the eval settled one of its
-    // resume keys). The own-call attribution baseline is captured the
-    // same moment: the registry's pending set after the eval's
-    // settlement pump, before its code phase adds its own calls.
+    // resume keys). The eval-await log is taken at the same moment
+    // (the last operation took it, so nothing should be left — a
+    // leftover can only be an unattributed corner; dropping it keeps
+    // every eval's window clean).
     this.opSettledCalls.length = 0;
-    this.evalStartPending = new Set(this.pendingIds());
-    return this.workspace.evalWithCompletion(code, {
+    this.takeAwaitLog();
+    // Reset the attribution carrier BEFORE the eval runs: a host-side
+    // failure inside `evalWithCompletion` must not leave the previous
+    // eval's awaits to be mis-attributed to a later suspension.
+    this.codePhaseAwaits = [];
+    const codePhaseAwaits: string[] = [];
+    // The top-level-await instrumenter (see `await-instrument.ts`):
+    // rewrites the eval's top-level `await x` into
+    // `await __replAwait(x)` so the guest library records WHICH calls
+    // this eval awaits — the eval-break signal's real resume-key
+    // identity (phase-E review round 4). Gated on the workspace's
+    // library carrying the 0.2.0 tracking surface: a restored snapshot
+    // with the 0.1.0 library is served as-is and simply gets no await
+    // attribution (the interrupt degrades to the honest refusal).
+    const instrumented = this.awaitTracking() ? instrumentTopLevelAwaits(code) : code;
+    const result = this.workspace.evalWithCompletion(instrumented, {
       ...options,
       // The per-eval handler overrides the broker-level default (the
       // documented contract); the per-eval wall-clock deadline ALWAYS
@@ -4316,7 +4441,95 @@ export class Broker {
       // targeting discipline).
       drainInterruptHandler: this.evalBreakHandler(),
       rejectionBridge: true,
+      // The code-phase boundary: every `__replAwait` executed
+      // synchronously by THIS eval's own code has logged by now — the
+      // entries are this eval's awaited calls, its continuation's
+      // resume keys (the drain phase runs only QUEUED continuations,
+      // which belong to other evals — or to this eval's own
+      // already-settled awaits, whose calls were logged in the code
+      // phase already). The entries are held for the suspension-time
+      // deps attribution (see `eval()`).
+      beforeDrain: () => {
+        codePhaseAwaits.push(...this.takeAwaitLog());
+      },
     });
+    // The drain phase's awaits: continuations THIS eval's settlements
+    // resumed (a checkpoint answer resuming a tracked eval's runaway
+    // continuation, which awaits further calls). They belong to the
+    // TRACKED evals whose resume keys the operation settled — the
+    // transitive attribution keeps a resumed eval targetable across
+    // its own subsequent awaits (each pump/checkpoint-answer drain
+    // extends the tracked eval's resume-key set by what its
+    // continuation awaited while it ran).
+    const drainPhaseAwaits = this.takeAwaitLog();
+    if (drainPhaseAwaits.length > 0) this.attributeContinuationAwaits(drainPhaseAwaits, this.opSettledCalls);
+    this.codePhaseAwaits = codePhaseAwaits;
+    return result;
+  }
+
+  /** Whether the workspace's guest library carries the 0.2.0 eval-await
+   *  tracking surface (the `__replAwait` global + the `awaitLogTake`
+   *  surface member). A restored snapshot with the 0.1.0 library is
+   *  served as-is — the instrumenter is skipped and the eval-break
+   *  interrupt degrades to the honest refusal. Cached per check: the
+   *  library never changes within a broker's lifetime (restore keeps
+   *  the snapshot's copy). */
+  private awaitTracking(): boolean {
+    if (this.awaitTrackingCached !== undefined) return this.awaitTrackingCached;
+    try {
+      const surface = this.workspace.surface();
+      this.awaitTrackingCached = surface?.supportsAwaitTracking === true;
+    } catch {
+      this.awaitTrackingCached = false;
+    }
+    return this.awaitTrackingCached;
+  }
+
+  /** Take the guest library's await log (the `__replAwait` records
+   *  since the last take) — the eval-break targeting seam (see
+   *  `await-instrument.ts`). Best-effort: a missing surface member (a
+   *  0.1.0 library copy) or a failed read degrades to an empty log.
+   *  The read is COMPLETE (no array cap): the log is library metadata,
+   *  bounded by one operation's awaits.
+   */
+  private takeAwaitLog(): string[] {
+    try {
+      const surface = this.workspace.surface();
+      if (surface === undefined || typeof surface.awaitLogTake !== 'function') return [];
+      const entries = surface.awaitLogTake();
+      return Array.isArray(entries) ? entries.filter((entry): entry is string => typeof entry === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** The transitive continuation-await attribution: `entries` were
+   *  awaited by continuations that ran inside an operation which
+   *  settled `settledIds`. Every tracked eval whose resume keys
+   *  intersect the settled ids had its continuation queued by those
+   *  settlements, so the entries extend ITS resume-key set — a resumed
+   *  eval stays targetable across its own subsequent awaits (the
+   *  running-eval loop idiom: each iteration's new call is attributed
+   *  to the eval whose continuation awaits it). The attribution is
+   *  one-way (never removing): an eval's deps only grow, which is
+   *  exactly the fire-decision's requirement (a drain settles a dep →
+   *  the target's continuation was queued → the signal fires). */
+  private attributeContinuationAwaits(entries: string[], settledIds: Iterable<string>): void {
+    if (entries.length === 0) return;
+    for (const completion of this.activeEvalCompletions) {
+      const deps = this.evalDeps.get(completion);
+      if (deps === undefined || deps.size === 0) continue;
+      let intersects = false;
+      for (const id of settledIds) {
+        if (deps.has(id)) {
+          intersects = true;
+          break;
+        }
+      }
+      if (intersects) {
+        for (const id of entries) deps.add(id);
+      }
+    }
   }
 
   /** Compose the per-operation interrupt handlers with the per-eval
@@ -4601,6 +4814,69 @@ export class Broker {
       return await fn();
     } finally {
       this.sink?.flush();
+    }
+  }
+
+  /**
+   * Race the serialization chain against an ABSOLUTE deadline: acquire
+   * the chain when it frees within the remaining budget, otherwise
+   * report `{ acquired: false }` — WITHOUT running the body (a
+   * VM-touching body must never execute while another operation is
+   * mid-flight: the chain is held by the operation itself, and running
+   * unlocked would re-enter the single-threaded engine). This is the
+   * `wait` tool's chain-contention bound (phase-E review round 4's
+   * carried defect: the wait enqueued onto the chain with no deadline,
+   * so a bounded wait queued behind a long eval took the eval's whole
+   * remaining run instead of returning at its bound). Unlike
+   * `serialized(fn, deadline)` — which runs the body WITHOUT the chain
+   * when the bound trips (the disconnect drain's choice, whose body is
+   * settlement-safe) — the caller here treats a failed acquisition as
+   * "the operation did not run": the wait reports still-running with
+   * the last observation it actually made.
+   */
+  private async trySerialized<T>(
+    fn: () => Promise<T>,
+    deadline: number,
+  ): Promise<{ acquired: boolean; value?: T }> {
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { acquired: false };
+      const raced = this.opChain;
+      let timer: NodeJS.Timeout | undefined;
+      const bound = new Promise<'bound'>((resolve) => {
+        timer = setTimeout(() => resolve('bound'), remaining);
+      });
+      const winner = await Promise.race([
+        raced.then(
+          () => 'chain' as const,
+          () => 'chain' as const,
+        ),
+        bound,
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (winner === 'bound') {
+        // The chain is stuck past the deadline: do NOT run the body (it
+        // would touch the VM while the stuck operation is mid-flight).
+        return { acquired: false };
+      }
+      if (this.opChain === raced) {
+        // The chain we raced is still the current one — enqueue onto it
+        // atomically (the check and the replacement share one
+        // synchronous block, so no operation can interleave between
+        // them).
+        const run = raced.then(
+          () => this.runSerialized(fn),
+          () => this.runSerialized(fn),
+        );
+        this.opChain = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return { acquired: true, value: await run };
+      }
+      // The chain CHANGED while we awaited the race (an op enqueued in
+      // the microtasks between the chain's release and this continuation
+      // replaced it): re-race the new chain with the remaining time.
     }
   }
 

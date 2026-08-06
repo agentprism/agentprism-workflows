@@ -45,7 +45,7 @@ import {
 } from './guest/guest-library.js';
 import { getVmShim, type ReplVm } from './vm.js';
 import type { EvalErrorInfo } from './errors.js';
-import { getPropRaw, hasOwnRaw, readOwnDataProperty, readValue, takeAndFreeException, type QuickJSExports } from './trapfree.js';
+import { getPropRaw, hasOwnRaw, readOwnDataProperty, readValue, readValueComplete, takeAndFreeException, type QuickJSExports } from './trapfree.js';
 
 /** The console levels the guest bridge emits. */
 export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug';
@@ -612,16 +612,6 @@ export class GuestLibraryInstallError extends Error {
 // The reconciliation surface and realm-slot access
 // ────────────────────────────────────────────────────────────────────────
 
-/** The surface read's array bound: the pending-call registry is the
- *  host's own reconciliation metadata (bounded by the VM's memory), so
- *  the generic 256-element preview cap would silently truncate the
- *  doc's `pending: [...]` surface. 16 384 pending calls is far beyond
- *  any realistic orchestration (the doc caps concurrent SUBAGENTS at
- *  6; parked checkpoints are the only piling kind) and keeps a
- *  pathological guest's registry from making every `pending` read
- *  pathological. */
-const SURFACE_READ_MAX_LEN = 16384;
-
 /** One entry of the guest's pending-call manifest. */
 export interface GuestSurfaceEntry {
   id: string;
@@ -655,6 +645,13 @@ export interface GuestSurfaceEntry {
 export interface GuestSurface {
   /** The resident guest library version (equals `__REPL_GUEST_VERSION`). */
   version: string;
+  /** True when this library copy carries the 0.2.0 eval-await tracking
+   *  surface (`__replAwait`/`awaitLog`/`promiseCallIds`). False for a
+   *  snapshot carrying an older library — the host then skips the
+   *  top-level-await instrumenter and the eval-break interrupt degrades
+   *  to the honest refusal (the doc's rule: the host serves snapshots
+   *  carrying older library versions than the one it ships). */
+  supportsAwaitTracking: boolean;
   /** Manifest of every pending host call, oldest first. */
   pending(): GuestSurfaceEntry[];
   /**
@@ -665,6 +662,13 @@ export interface GuestSurface {
   settle(callId: string, outcome: 'resolve' | 'reject', value: unknown): boolean;
   /** Counters for diagnostics and the workspace manifest. */
   stats(): { version: string; callSeq: number; logSeq: number; pendingCalls: number };
+  /** The awaits logged since the host last took them, oldest first
+   *  (call-id strings); the log is cleared by the take. The eval-break
+   *  targeting seam — the entries between two operation boundaries are
+   *  the awaits of the operations' own code plus any continuations
+   *  their drains resumed. Absent on 0.1.0 library copies (the host
+   *  guards on `supportsAwaitTracking`). */
+  awaitLogTake?(): string[];
 }
 
 /**
@@ -715,11 +719,33 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
     statsHandle?.dispose();
     if (!complete) return undefined;
 
+    // The 0.2.0 eval-await tracking seam: `supportsAwaitTracking` (a
+    // static boolean) and the optional `awaitLogTake` function. A
+    // snapshot carrying the 0.1.0 library lacks both — the surface
+    // reports `false` and the host degrades (no await instrumenter, no
+    // eval-break targeting).
+    const trackingHandle = readOwnDataProperty(surfaceHandle, 'supportsAwaitTracking');
+    let supportsAwaitTracking = false;
+    if (trackingHandle !== undefined) {
+      try {
+        supportsAwaitTracking = trackingHandle.isBool && trackingHandle.toBoolean();
+      } finally {
+        trackingHandle.dispose();
+      }
+    }
+    const awaitTakeHandle = readOwnDataProperty(surfaceHandle, 'awaitLogTake');
+    const hasAwaitTake = awaitTakeHandle !== undefined && awaitTakeHandle.isFunction;
+    awaitTakeHandle?.dispose();
+
     return {
       version,
+      supportsAwaitTracking,
       pending: () => callSurfaceFunction(vm, 'pending') as GuestSurfaceEntry[],
       settle: (callId, outcome, value) => callSurfaceSettle(vm, callId, outcome, value),
       stats: () => callSurfaceFunction(vm, 'stats') as ReturnType<GuestSurface['stats']>,
+      ...(supportsAwaitTracking && hasAwaitTake
+        ? { awaitLogTake: () => callSurfaceFunction(vm, 'awaitLogTake') as string[] }
+        : {}),
     };
   } finally {
     symbol.dispose();
@@ -766,7 +792,7 @@ function callRaw(e: QuickJSExports, shim: QuickJS, fnPtr: number, args: JSValueH
  */
 function callSurfaceFunction(
   vm: ReplVm,
-  member: 'pending' | 'stats',
+  member: 'pending' | 'stats' | 'awaitLogTake',
 ): unknown {
   const shim = getVmShim(vm) as QuickJS;
   const e = shim._getExports() as QuickJSExports;
@@ -785,17 +811,17 @@ function callSurfaceFunction(
         return undefined;
       }
       if (result.isUndefined) return undefined;
-      // The pending-call registry is the host's own reconciliation
-      // metadata (call ids, kinds, verbatim options — created by the
-      // frozen guest library, never by guest code), not guest content:
-      // the read's array cap is lifted so `pending` reports the WHOLE
-      // registry (phase-E review round 3: the generic 256-element cap
-      // silently truncated the list, and its `[ArrayTruncated]` marker
-      // leaked into the broker's id lists as an `undefined` hole). The
-      // bound is still generous-but-finite — the registry is bounded by
-      // the VM's memory, and a pathological guest's registry must not
-      // make every `pending` read pathological.
-      return readValue(result, 0, new Set(), SURFACE_READ_MAX_LEN);
+      // The pending-call registry and the await log are the host's own
+      // reconciliation/targeting metadata (call ids, kinds, verbatim
+      // options — created by the frozen guest library, never by guest
+      // code), not guest content: the read is COMPLETE (no array-length
+      // or object-key cap — phase-E review round 3: the 16 384-element
+      // array cap silently truncated the pending registry and its
+      // `[ArrayTruncated]` marker leaked into the broker's id lists as
+      // an `undefined` hole; `readValueComplete` lifts both caps, so
+      // `pending` reports the WHOLE registry, bounded like the metadata
+      // itself by the VM's memory).
+      return readValueComplete(result);
     } finally {
       result.dispose();
     }

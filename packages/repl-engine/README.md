@@ -202,6 +202,24 @@ registry lives in the library's closure and **travels inside snapshots**; on res
 host re-registers the four callbacks by name (`registerGuestHostCallbacks`) and
 reconciles — the library itself is never re-evaluated (idempotence guard).
 
+**Eval-await tracking (version 0.2.0)** — the eval-break targeting seam (the `interrupt`
+tool's no-id arm): the library defines `__replAwait(value)` — the global the host's
+`instrumentTopLevelAwaits` rewrite inserts around every TOP-LEVEL `await` of an eval
+(`await x` → `await __replAwait(x)`) — which records the awaited value's call id when it
+is one of the library's own registry promises (each registry entry carries its `promise`
+field; the look-up is a closure-private registry scan, forge-proof — a per-promise side
+table measurably grew every parked call's realm footprint and tipped the bounded-memory
+suite's knife-edge). The chronological `awaitLog` is consumed by the host at operation
+boundaries through the surface's `awaitLogTake()` (take semantics; `supportsAwaitTracking`
+reports the capability), and the entries are the broker's attribution of WHICH pending
+call's settlement queues WHICH suspended eval's continuation — the armed signal fires
+only on the target's own resume keys, never on an unawaited sibling call. A snapshot
+carrying the 0.1.0 library is served as-is (the version-compatibility rule below): the
+host skips the instrumenter on it and the eval-break interrupt degrades to the honest
+refusal. The transform is a pure source rewrite at exact AST boundaries (acorn; nested
+function bodies are never touched — an await inside a `.then` callback or a combinator
+thunk belongs to its own continuation, not the eval's).
+
 **Version compatibility** (the doc's evolution disciplines): the library is versioned with the
 workspace, not the host — a host must serve any snapshot whose resident library is the same or
 an older version, the host-call surface is append-only (new optional trailing arguments =

@@ -60,8 +60,17 @@
  * on the same idempotent settlement function; the first settlement wins.
  */
 
-/** The guest library's version (the `__REPL_GUEST_VERSION` marker value). */
-export const GUEST_LIBRARY_VERSION = '0.1.0';
+/** The guest library's version (the `__REPL_GUEST_VERSION` marker value).
+ *  0.2.0 adds the eval-await tracking surface: '__replAwait' (the global
+ *  the host's top-level-await instrumenter inserts), the registry
+ *  entries' 'promise' field (which promise each pending call's
+ *  settlement resolves — the await-attribution look-up), the 'awaitLog'
+ *  (the chronological record of awaited call ids), and the surface's
+ *  'supportsAwaitTracking'/'awaitLogTake' members. A snapshot
+ *  carrying 0.1.0 is served as-is (the doc's rule: the host serves
+ *  snapshots carrying older library versions) — the host degrades by not
+ *  instrumenting awaits on it (no eval-break targeting, honest refusal). */
+export const GUEST_LIBRARY_VERSION = '0.2.0';
 
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
 export const GUEST_SURFACE_KEY = 'repl.guest';
@@ -308,6 +317,25 @@ const GUEST_LIBRARY_SOURCE = `/*
     callSeq: 0,          // monotonic call-id counter ("c1", "c2", ...)
     logSeq: 0,           // monotonic $N counter
     registry: new Map(), // callId -> { id, kind, detail, optionsJson, createdAt, resolve, reject }
+    // The eval-await tracking surface (version 0.2.0): the registry
+    // entries' 'promise' field maps every registry promise
+    // (agent/checkpoint/steer) to its call id — the look-up table
+    // '__replAwait' resolves an awaited value against; 'awaitLog' is
+    // the chronological record of awaited call
+    // ids (the host's top-level-await instrumenter rewrites 'await x'
+    // into 'await __replAwait(x)', and the library logs every awaited
+    // value that IS one of its registry promises). The log is the
+    // host-side eval-break targeting seam: the broker reads and clears
+    // it at operation boundaries (surface.awaitLogTake) and attributes
+    // the entries to the suspended evals whose continuations the
+    // awaited calls resume — the armed target's REAL resume keys, as
+    // opposed to every call an eval merely created (phase-E review
+    // rejection: an unawaited sibling call's settlement used to consume
+    // the eval-break signal against its own unrelated '.then'
+    // continuation). Entries are plain call-id strings; the host takes
+    // them at every operation boundary, so the log never grows past one
+    // operation's awaits.
+    awaitLog: [],
   };
 
   // Captured intrinsics: the registry is the host's settlement table, so
@@ -462,6 +490,14 @@ const GUEST_LIBRARY_SOURCE = `/*
       modelSpec: modelSpec === undefined ? null : modelSpec,
       resolve: resolveFn,
       reject: rejectFn,
+      // Track the promise for the eval-await attribution ('__replAwait'):
+      // the registry entry carries the exact promise the settlement
+      // resolves, so awaiting THIS promise (or awaiting it again from a
+      // later eval — the "running eval awaiting an earlier binding"
+      // case) is attributable by identity. The 'promise' field is never
+      // exposed by the pending() manifest (it builds explicit fields) —
+      // it is closure-internal bookkeeping.
+      promise: promise,
     });
     var returned;
     try {
@@ -1435,6 +1471,40 @@ const GUEST_LIBRARY_SOURCE = `/*
   Object.freeze(consoleObject);
 
   // ────────────────────────────────────────────────────────────────────────
+  // The eval-await tracking: '__replAwait' — the global the host's
+  // top-level-await instrumenter inserts around every top-level 'await'
+  // ('await x' → 'await __replAwait(x)'). It records the awaited call id
+  // when the awaited value is one of this library's registry promises and
+  // otherwise passes the value through untouched. NEVER throws (it runs
+  // inside arbitrary guest code; a throw would break the eval). The log
+  // is consumed by the host at operation boundaries
+  // (surface.awaitLogTake) — the entries between two boundaries are
+  // exactly the awaits of the operations' own code plus the awaits of
+  // any continuations its drains resumed.
+  // ────────────────────────────────────────────────────────────────────────
+
+  function replAwait(value) {
+    try {
+      if (value !== null && (typeof value === 'object' || typeof value === 'function')) {
+        // Identity scan of the registry (see the state note): the
+        // awaited value is one of this library's promises iff it is
+        // some pending entry's 'promise'. A guest cannot forge an
+        // entry (the registry is closure-private), so attribution is
+        // precise: only values the LIBRARY minted are logged.
+        var found = null;
+        registryForEach.call(state.registry, function (entry) {
+          if (found === null && entry.promise === value) found = entry.id;
+        });
+        if (found !== null) state.awaitLog.push(found);
+      }
+    } catch (_err) {
+      // Never throws by contract: a broken value must not take down
+      // guest code (the bridge's stance, mirrored here).
+    }
+    return value;
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
   // The reconciliation surface — the host's post-restore door back into the
   // registry. Keyed by Symbol.for so it stays out of the workspace manifest
   // and out of the DSL vocabulary the orchestrator is conditioned on, while
@@ -1446,6 +1516,25 @@ const GUEST_LIBRARY_SOURCE = `/*
   var surface = {
     /** Guest library version (same value as __REPL_GUEST_VERSION). */
     version: VERSION,
+    /** True when this library copy carries the 0.2.0 eval-await tracking
+     *  surface ('__replAwait' + 'awaitLog' + the entries' 'promise'
+     *  field). The host
+     *  gates its top-level-await instrumenter on this: a restored
+     *  snapshot carrying the 0.1.0 library is served as-is (the doc's
+     *  older-library rule) and simply gets no await attribution — the
+     *  eval-break interrupt degrades to the honest refusal. */
+    supportsAwaitTracking: true,
+    /** The awaits logged since the host last took them, oldest first
+     *  (call-id strings only — the library's own registry ids; a
+     *  pathologically large log is bounded by one operation's awaits
+     *  because the host takes it at every operation boundary). The
+     *  returned array is a fresh copy; the log is cleared in the same
+     *  call (take semantics — the host is the only consumer). */
+    awaitLogTake: function () {
+      var out = state.awaitLog;
+      state.awaitLog = [];
+      return out;
+    },
     /**
      * JSON-safe manifest of every pending host call, oldest first:
      * [{ id, kind: "agent" | "checkpoint" | "steer", detail, optionsJson,
@@ -1528,6 +1617,7 @@ const GUEST_LIBRARY_SOURCE = `/*
   Object.freeze(gate);
   Object.freeze(retry);
   Object.freeze(loopUntilDry);
+  Object.freeze(replAwait);
 
   installGlobal('agent', agent);
   installGlobal('checkpoint', checkpoint);
@@ -1539,6 +1629,11 @@ const GUEST_LIBRARY_SOURCE = `/*
   installGlobal('retry', retry);
   installGlobal('loopUntilDry', loopUntilDry);
   installGlobal('console', consoleObject);
+  // The host's top-level-await instrumenter inserts calls to this global
+  // ('await x' → 'await __replAwait(x)'); a bare VM without the library
+  // never has the instrumenter applied (the broker gates on
+  // 'supportsAwaitTracking').
+  installGlobal('__replAwait', replAwait);
 
   // Version marker (snapshot versioning: hosts read this — or
   // surface.version — to know which guest library a restored workspace

@@ -1000,3 +1000,194 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
     await daemon.close();
   }
 });
+
+// ── Round 4: exact action shapes, manifest fields, bounded status ─────
+
+test("review round 4: the input is action-discriminated — every action's EXACT field set is enforced at the boundary (eval without code, reset with code, status with ids, interrupt with timeoutMs, wait with code, eval with ids: all rejected with 'cannot include'/'requires'; irrelevant known fields are never silently accepted)", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const PROJECT = makeProjectDir("repl-shapes");
+      // Missing required fields.
+      const noCode = await repl(session, { action: "eval", projectDir: PROJECT });
+      assert.ok(isErrorResult(noCode), textOf(noCode));
+      assert.ok(textOf(noCode).includes("eval requires a non-empty code string"), textOf(noCode));
+      // Extraneous known fields per action (the carried defect: the
+      // flat optional-field bag silently accepted them and deferred the
+      // semantics to late handler checks).
+      const resetWithCode = await repl(session, { action: "reset", projectDir: PROJECT, code: "1 + 1" });
+      assert.ok(isErrorResult(resetWithCode), textOf(resetWithCode));
+      assert.ok(textOf(resetWithCode).includes('cannot include code'), textOf(resetWithCode));
+      const statusWithIds = await repl(session, { action: "status", projectDir: PROJECT, ids: ["c1"] });
+      assert.ok(isErrorResult(statusWithIds), textOf(statusWithIds));
+      assert.ok(textOf(statusWithIds).includes('cannot include ids'), textOf(statusWithIds));
+      const interruptWithTimeout = await repl(session, { action: "interrupt", projectDir: PROJECT, timeoutMs: 100 });
+      assert.ok(isErrorResult(interruptWithTimeout), textOf(interruptWithTimeout));
+      assert.ok(textOf(interruptWithTimeout).includes('cannot include timeoutMs'), textOf(interruptWithTimeout));
+      const waitWithCode = await repl(session, { action: "wait", projectDir: PROJECT, code: "1 + 1" });
+      assert.ok(isErrorResult(waitWithCode), textOf(waitWithCode));
+      assert.ok(textOf(waitWithCode).includes('cannot include code'), textOf(waitWithCode));
+      const evalWithIds = await repl(session, { action: "eval", projectDir: PROJECT, code: "1 + 1", ids: ["c1"] });
+      assert.ok(isErrorResult(evalWithIds), textOf(evalWithIds));
+      assert.ok(textOf(evalWithIds).includes('cannot include ids'), textOf(evalWithIds));
+      const resetWithId = await repl(session, { action: "reset", projectDir: PROJECT, id: "c1" });
+      assert.ok(isErrorResult(resetWithId), textOf(resetWithId));
+      assert.ok(textOf(resetWithId).includes('cannot include id'), textOf(resetWithId));
+      // The workspace was never created by the rejected calls (nothing
+      // ran): a status still reports the project as not opened... (the
+      // named status IS a first touch — assert the workspace is still
+      // usable and fresh).
+      const ok = await repl(session, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+      assert.ok(!isErrorResult(ok), textOf(ok));
+      assert.ok(textOf(ok).includes("result: 42"), textOf(ok));
+      // A well-formed reset (no extraneous fields) works.
+      const reset = await repl(session, { action: "reset", projectDir: PROJECT });
+      assert.ok(!isErrorResult(reset), textOf(reset));
+      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("review round 4: the structured manifest carries the machine-readable type and live-handle status fields — `agent handle` type, the call id, and pending→settled status transitions as their own fields (phase-E review round 4: the manifest exposed only the human token with the status and call id embedded in the string)", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const PROJECT = makeProjectDir("repl-manifest-fields");
+      const evaled = await repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: 'const research = agent("pi/x", "investigate"); globalThis.answer = 42; console.log("hello"); answer',
+      });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      await tick();
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!isErrorResult(status), textOf(status));
+      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
+      const bindings = w.bindings as Array<Record<string, unknown>>;
+      const handle = bindings.find((b) => b.name === "research");
+      assert.ok(handle, "the agent handle binding");
+      assert.equal(handle.type, "agent handle", "the machine-readable type");
+      assert.equal(handle.handleCallId, "c1", "the call id is its own field, not just token text");
+      assert.equal(handle.handleStatus, "pending", "the live-handle status is its own field");
+      assert.ok((handle.token as string).includes("agent handle · pending · call c1"), `the token still carries the human form: ${handle.token}`);
+      const plain = bindings.find((b) => b.name === "answer");
+      assert.ok(plain, "the plain binding");
+      assert.equal(plain.type, "number", "the plain binding's machine-readable type");
+      assert.equal(plain.handleCallId, null);
+      assert.equal(plain.handleStatus, null);
+      // The handle settles: the structured status transitions to
+      // `settled` (the call store is the authority).
+      runner.last().completeTurn("done");
+      await tick();
+      const after = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
+      assert.ok(!isErrorResult(after), textOf(after));
+      const statusAfter = await repl(session, { action: "status", projectDir: PROJECT });
+      const scAfter = (statusAfter as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const wAfter = (scAfter.workspaces as Array<Record<string, unknown>>)[0];
+      const handleAfter = (wAfter.bindings as Array<Record<string, unknown>>).find((b) => b.name === "research");
+      assert.equal(handleAfter?.handleStatus, "settled", "the handle status transitioned");
+      assert.equal(handleAfter?.handleCallId, "c1");
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("review round 4: the structured status respects the output limits for guest-derived fields — a huge agent task is head+tail elided at the ENGINE seam, so the wire's structuredContent carries at most the documented 200-char bound (the carried defect: structured status copied the raw task, so a guest could push an unbounded string through structuredContent while only the text was capped)", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const PROJECT = makeProjectDir("repl-bounded-status");
+      const hugeTask = "T".repeat(10_000);
+      const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const big = agent("pi/x", ${JSON.stringify(hugeTask)}); "started"` });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      await tick();
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!isErrorResult(status), textOf(status));
+      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
+      const agent = (w.liveAgents as Array<Record<string, unknown>>)[0];
+      assert.equal(agent.callId, "c1");
+      assert.ok(typeof agent.task === "string", "the task is a string");
+      assert.ok(agent.task.length <= 200, `the wire task respects the 200-char cap: ${agent.task.length}`);
+      assert.ok(agent.task.startsWith("T".repeat(99)) && agent.task.endsWith("T".repeat(100)), "head+tail elision keeps both ends");
+      assert.ok(agent.task.includes("…"), "the elision marker is present");
+      // The raw task never reaches the wire in ANY structured field.
+      assert.ok(!JSON.stringify(sc).includes(hugeTask), "the unbounded task never crosses the wire");
+      // The bounded text rendering carries the same elided form.
+      assert.ok(!textOf(status).includes(hugeTask), "the text rendering is bounded too");
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("review round 4: eval-through-MCP output above the former registry-read cap — 16 500 parked checkpoints report ALL 16 500 ids in the structured result (no truncation hole), and a daemon RESTART restores and reconciles the full registry (the carried defect: 16 400 checkpoints returned 16 384 ids plus an undefined hole)", async () => {
+  const runner = new FakeRunner();
+  const daemon = await startReplDaemon(runner);
+  const PROJECT = makeProjectDir("repl-whole-registry");
+  const CHECKPOINTS = 16_500;
+  try {
+    const session = await connectHttp(daemon.url);
+    try {
+      const evaled = await repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: `for (let i = 0; i < ${CHECKPOINTS}; i++) checkpoint("q" + i); "raised"`,
+      });
+      assert.ok(!isErrorResult(evaled), textOf(evaled));
+      const sc = (evaled as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const pending = sc.pending as string[];
+      assert.equal(pending.length, CHECKPOINTS, `the whole registry crosses the wire: ${pending.length}`);
+      assert.equal(pending[0], "c1");
+      assert.equal(pending[pending.length - 1], `c${CHECKPOINTS}`);
+      for (const id of pending) {
+        assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no truncation/undefined hole: ${JSON.stringify(id)}`);
+      }
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon.close();
+  }
+  // A daemon RESTART over the same store: the first touch restores the
+  // snapshot and reconciles the in-VM pending-call registry — the full
+  // registry must survive (the same complete read serves the restore
+  // path).
+  const daemon2 = await startReplDaemon(runner);
+  try {
+    const session = await connectHttp(daemon2.url);
+    try {
+      const status = await repl(session, { action: "status", projectDir: PROJECT });
+      assert.ok(!isErrorResult(status), textOf(status));
+      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
+      assert.equal(w.state, "restored", "the workspace restored from the snapshot");
+      const pending = w.pending as string[];
+      assert.equal(pending.length, CHECKPOINTS, `the whole registry survives the restart: ${pending.length}`);
+      for (const id of pending) {
+        assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no hole after restore: ${JSON.stringify(id)}`);
+      }
+      assert.equal((w.checkpoints as unknown[]).length, CHECKPOINTS, "every checkpoint re-surfaced");
+    } finally {
+      await session.dispose();
+    }
+  } finally {
+    await daemon2.close();
+  }
+});

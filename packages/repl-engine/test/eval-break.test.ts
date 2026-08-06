@@ -436,3 +436,111 @@ test('review round 3: waitForCalls respects the REMAINING wait budget — a 10 m
   await broker.dispose();
   ws.dispose();
 });
+
+// ── 7. Round 4: the armed identity is the calls the eval AWAITS ────────
+
+test('review round 4: an UNAWAITED SIBLING call (c2.then with a bytecode-heavy continuation) neither fires nor consumes the eval-break signal — settling c2 runs its own .then to completion, the awaited c1 stays pending, the armed target stays tracked (a later arm still returns true), and the target breaks at c1\'s actual settlement (the carried defect: every call an eval CREATED was a resume key, so settling the unawaited sibling interrupted its unrelated heavy .then, left c1 pending, and made the next arm refuse)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // The eval AWAITS c1 but only TENS c2: `await c1` is a top-level await
+  // (instrumented — recorded as a resume key); `c2.then(...)` is not an
+  // await (never recorded). The carried defect treated every call the
+  // eval created as a resume key.
+  const a = await broker.eval(
+    'const c1 = agent("pi/x", "one"); const c2 = agent("pi/x", "two"); const heavy = c2.then((v) => { let x = 0; for (let i = 0; i < 200000; i++) x += i; return "heavy:" + v; }); await c1; while (true) {}',
+  );
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  assert.ok(a.pending.includes('c2'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'the running eval is targetable (it awaits c1)');
+  // The UNAWAITED sibling settles first: its drain runs c2's OWN heavy
+  // .then continuation — 200k iterations polling the armed interrupt
+  // handler — and must COMPLETE (the drain does not belong to the
+  // target: c2 is not one of its resume keys).
+  runner.sessions[1].completeTurn('sibling');
+  await tick();
+  const probe = await bounded('probe after the unawaited sibling settled', broker.eval('await heavy'));
+  assert.ok(
+    probe.result !== undefined && probe.result.includes('heavy:sibling'),
+    `the unawaited sibling's own .then ran to completion, never interrupted: ${output(probe).join('\n')}`,
+  );
+  assert.ok(
+    !output(probe).some((line) => line.includes('interrupted')),
+    `no execution was interrupted by the sibling's settlement: ${output(probe).join('\n')}`,
+  );
+  // The armed state SURVIVED the unrelated settlement: the target is
+  // still tracked and c1 is still pending (the carried defect: the
+  // signal was consumed and the tracked eval released, so this arm
+  // returned false and c1 became uninterruptible).
+  assert.equal(await broker.armEvalBreak(), true, 'the target is still tracked after the sibling settlement');
+  assert.ok((await broker.eval('"still-pending"')).pending.includes('c1'), 'c1 is still pending');
+  // The awaited call settles: the eval\'s continuation (the runaway
+  // loop) executes and the still-armed signal breaks it MID-RUN.
+  runner.sessions[0].completeTurn('resumed');
+  await tick();
+  const broken = await bounded('probe after the awaited call settled', broker.eval('"after"'));
+  assert.ok(
+    output(broken).some((line) => line.includes('interrupted')),
+    `the awaited call's settlement resumed the runaway continuation and the armed signal broke it: ${output(broken).join('\n')}`,
+  );
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review round 4: a RUNNING eval awaiting an EARLIER eval\'s binding remains targetable — `await p` on a promise a previous eval created logs the call as THIS eval\'s resume key (the carried defect: an eval\'s resume keys were the calls it CREATED, so this eval had none and the arm refused)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // eval 1 creates the call and resolves; the binding outlives the eval.
+  const first = await broker.eval('const p = agent("pi/x", "earlier"); "started"');
+  assert.ok(first.pending.includes('c1'), `pending: ${first.pending.join(', ')}`);
+  // eval 2 awaits the EARLIER binding: its continuation is queued by
+  // c1's settlement — exactly the execution the interrupt must be able
+  // to break.
+  const second = await broker.eval('await p; while (true) {}');
+  assert.ok(second.pending.includes('c1'), `pending: ${second.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'an eval awaiting an earlier binding is targetable');
+  // Settling c1 resumes eval 2's continuation (the runaway loop): the
+  // armed signal breaks it mid-run.
+  runner.last().completeTurn('resumed');
+  await tick();
+  const probe = await bounded('probe after settling the earlier binding', broker.eval('"probe"'));
+  assert.ok(
+    output(probe).some((line) => line.includes('interrupted')),
+    `the resumed continuation was broken mid-run: ${output(probe).join('\n')}`,
+  );
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 8. Round 4: the wait's chain ACQUISITION is deadline-bounded ───────
+
+test('review round 4: waitForCalls\'s chain acquisition is bounded by the wait deadline — a bounded wait queued behind a long chain hold (the client-presence drain pumping a slow turn) returns at its bound, not behind the drain (the carried defect: a 20 ms wait behind a 250 ms eval took ~253 ms because the acquisition enqueued with no deadline)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // A slow turn keeps the client-presence drain pumping: the drain is
+  // ONE serialized op, so its internal pumps/sleeps HOLD the broker
+  // serialization chain for the whole bounded run (the event loop stays
+  // free — the drain sleeps between pumps).
+  const a = await broker.eval('const p = agent("pi/x", "slow"); await p; "done"');
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  const draining = broker.drainForDisconnect(2000, () => false);
+  await tick();
+  // The 30 ms wait's acquisitions must race the REMAINING budget: with
+  // the chain held by the drain, the wait reports "still running" at
+  // its bound instead of queueing behind the drain.
+  const started = Date.now();
+  const { result, drained } = await bounded('bounded wait behind the drain', broker.waitForCalls(['c1'], 30));
+  const elapsed = Date.now() - started;
+  assert.equal(drained, false, 'the slow turn never settled within the wait bound — "still running"');
+  assert.deepEqual(result.pending, ['c1'], 'the target ids are reported (none observed settled)');
+  assert.ok(elapsed < 80, `the 30 ms wait returned at its bound (${elapsed} ms), not behind the drain`);
+  // The drain still completes its work once the turn settles: the turn
+  // drains to completion and the children release (the doc's graceful
+  // drain is unaffected by the wait's bounded acquisition).
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  runner.sessions[0].completeTurn('slow-done');
+  assert.equal(await bounded('drain completion', draining), true, 'the drain drained the turn to completion');
+  await broker.dispose();
+  ws.dispose();
+});

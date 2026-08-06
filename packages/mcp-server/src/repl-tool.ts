@@ -153,6 +153,87 @@ export interface ReplToolOptions {
   acceptingWork: () => boolean;
 }
 
+/** One parsed `repl` tool input — the action discriminator's output
+ *  (the workflow tool's pattern: the MCP SDK validates the primitive
+ *  fields, then the discriminator enforces each action's EXACT field
+ *  set — required fields missing, and irrelevant known fields present,
+ *  are both rejected at the boundary; phase-E review round 4: the
+ *  input used to be a flat bag of optional fields with the action
+ *  semantics deferred to late handler checks, so `reset` with `code`
+ *  or `status` with `ids` was silently accepted). */
+export type ParsedReplToolInput =
+  | { action: "eval"; projectDir?: string; code: string }
+  | { action: "wait"; projectDir?: string; ids?: string[]; timeoutMs: number }
+  | { action: "status"; projectDir?: string }
+  | { action: "interrupt"; projectDir?: string; id?: string }
+  | { action: "reset"; projectDir?: string };
+
+/** Which fields belong to which action (the discriminator's exact-shape
+ *  vocabulary). */
+const replInputFields = ["action", "projectDir", "code", "ids", "timeoutMs", "id"] as const;
+type ReplInputField = (typeof replInputFields)[number];
+
+const REPL_ACTION_FIELDS: Record<string, ReadonlySet<ReplInputField>> = {
+  eval: new Set(["action", "projectDir", "code"]),
+  wait: new Set(["action", "projectDir", "ids", "timeoutMs"]),
+  status: new Set(["action", "projectDir"]),
+  interrupt: new Set(["action", "projectDir", "id"]),
+  reset: new Set(["action", "projectDir"]),
+};
+
+function invalidReplInput(message: string): never {
+  throw new McpError(ErrorCode.InvalidParams, `Invalid repl tool input: ${message}`);
+}
+
+/** Apply the action discriminator after the MCP SDK has validated the
+ *  primitive fields: every action's EXACT field set is enforced here
+ *  (missing required fields and extraneous known fields are both
+ *  rejected; unknown fields are the SDK's rejection — the input schema
+ *  is non-strict-shaped, so the discriminator additionally rejects
+ *  irrelevant KNOWN fields like `reset` with `code` or `status` with
+ *  `ids`). `requireProjectDir` mirrors the workflow tool's daemon-mode
+ *  rule: projectDir is required for every action except `status` (which
+ *  may list every known project context without naming one). */
+export function parseReplToolInput(
+  raw: Record<string, unknown>,
+  options: { requireProjectDir: boolean },
+): ParsedReplToolInput {
+  const action = replToolInputShape.action.parse(raw.action);
+  const allowed = REPL_ACTION_FIELDS[action];
+  const present = replInputFields.filter((field) => field !== "action" && raw[field] !== undefined);
+  for (const field of present) {
+    if (!allowed.has(field)) {
+      invalidReplInput(`action "${action}" cannot include ${field}`);
+    }
+  }
+  const projectDir = raw.projectDir === undefined ? undefined : replToolInputShape.projectDir.parse(raw.projectDir);
+  if (projectDir === undefined && options.requireProjectDir && action !== "status") {
+    invalidReplInput("projectDir is required on the shared workflow daemon");
+  }
+  switch (action) {
+    case "eval": {
+      const code = replToolInputShape.code.parse(raw.code);
+      if (code === undefined || code.length === 0) {
+        invalidReplInput('eval requires a non-empty code string');
+      }
+      return { action, projectDir, code };
+    }
+    case "wait": {
+      const ids = raw.ids === undefined ? undefined : replToolInputShape.ids.parse(raw.ids);
+      const timeoutMs = replToolInputShape.timeoutMs.parse(raw.timeoutMs ?? 30_000) ?? 30_000;
+      return { action, projectDir, ids, timeoutMs };
+    }
+    case "status":
+      return { action, projectDir };
+    case "interrupt": {
+      const id = raw.id === undefined ? undefined : replToolInputShape.id.parse(raw.id);
+      return { action, projectDir, id };
+    }
+    case "reset":
+      return { action, projectDir };
+  }
+}
+
 /** The project context a repl call addresses; undefined = no project. */
 function resolveContext(
   options: ReplToolOptions,
@@ -261,13 +342,27 @@ const reconcileReportShape = z.object({
 });
 
 /** One workspace-manifest binding (the doc's manifest contract: name,
- *  type token, size, provenance — metadata, never content). */
+ *  type, size, provenance, live-handle status — metadata, never
+ *  content). The type is the machine-readable structure-only label, the
+ *  handle status and call id are their own fields (phase-E review round
+ *  4: the manifest used to expose only the human-formatted `token`,
+ *  with the live-handle status and call id embedded in the string). */
 const manifestBindingShape = z.object({
   name: z.string(),
   /** Structure-only token (type/shape/size, and the live-handle status
    *  for agent handles) — never value content. */
   token: z.string(),
+  /** The machine-readable structure-only type label (`string`,
+   *  `number`, `object`, `array`, `agent handle`, … — see the engine's
+   *  `manifestTypeLabel` vocabulary). */
+  type: z.string(),
   sizeBytes: z.number().int().nonnegative(),
+  /** The stable call id of an agent-handle binding; null otherwise. */
+  handleCallId: z.string().nullable(),
+  /** The live-handle status of an agent-handle binding (`pending`
+   *  while its founding call is unsettled, `settled` once it
+   *  completed); null for non-handle bindings. */
+  handleStatus: z.enum(["pending", "settled"]).nullable(),
   provenance: z.string().nullable(),
   provenanceAtMs: z.number().int().nonnegative().nullable(),
   task: z.string().nullable(),
@@ -281,11 +376,17 @@ const logRefsShape = z.object({
   count: z.number().int().nonnegative(),
 });
 
-/** One live subagent session as status carries it. */
+/** One live subagent session as status carries it. The guest-derived
+ *  `task` is previewed at the ENGINE seam (head+tail capped at 200
+ *  chars, the same bound as the manifest's task field): the structured
+ *  status must respect the doc's output limits like the text content
+ *  does (phase-E review round 4: the structured status used to copy
+ *  the raw task, so a guest could push an unbounded task string
+ *  through `structuredContent` while only the text was capped). */
 const liveAgentShape = z.object({
   callId: z.string(),
   modelSpec: z.string(),
-  task: z.string(),
+  task: z.string().max(200),
   state: z.enum(["opening", "running", "delivering", "idle"]),
   supportsSteering: z.boolean(),
   queuedSteers: z.number().int().nonnegative(),
@@ -678,16 +779,15 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           "Workflow server is shutting down and is no longer accepting tool calls.",
         );
       }
-      const args = rawArgs as Record<string, unknown>;
-      const action = replToolInputShape.action.parse(args.action);
-      const projectDir =
-        args.projectDir === undefined ? undefined : replToolInputShape.projectDir.parse(args.projectDir);
-      if (projectDir === undefined && requireProjectDir && action !== "status") {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Invalid repl tool input: projectDir is required on the shared workflow daemon",
-        );
-      }
+      // The action discriminator (the workflow tool's pattern): the MCP
+      // SDK validates the primitive fields, then the discriminator
+      // enforces each action's EXACT field set — `eval` without code,
+      // `reset` with code, `status` with ids, `interrupt` with
+      // timeoutMs, and projectDir-missing on the daemon are all
+      // rejected HERE, never deferred to late handler checks (phase-E
+      // review round 4).
+      const input = parseReplToolInput(rawArgs as Record<string, unknown>, { requireProjectDir });
+      const { action, projectDir } = input;
       // status can list every known project context without naming one
       // (both modes); the stateful actions resolve a single context.
       if (action === "status") {
@@ -711,13 +811,13 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           return {
             structuredContent: {
               action: "status",
-              projectDir: projectDir as string,
-              error: `No project context is available for projectDir "${String(projectDir)}".`,
+              projectDir,
+              error: `No project context is available for projectDir "${projectDir}".`,
             },
             content: [
               {
                 type: "text",
-                text: `No project context is available for projectDir "${String(projectDir)}".`,
+                text: `No project context is available for projectDir "${projectDir}".`,
               },
             ],
             isError: true,
@@ -730,7 +830,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           await ensureReplWorkspace(state, await wasm, options.runner, options.evalTimeoutMs);
         }
         return {
-          structuredContent: structuredStatus([context], context.projectDir),
+          structuredContent: structuredStatus([context], projectDir),
           content: [{ type: "text", text: capToolResultText(renderStatus([context])) }],
         };
       }
@@ -739,10 +839,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         return {
           structuredContent: {
             action,
-            projectDir: projectDir as string,
-            error: `No project context is available for projectDir "${String(projectDir)}".`,
+            projectDir,
+            error: `No project context is available for projectDir "${projectDir}".`,
           },
-          content: [{ type: "text", text: capToolResultText(`No project context is available for projectDir "${String(projectDir)}".`) }],
+          content: [{ type: "text", text: capToolResultText(`No project context is available for projectDir "${projectDir}".`) }],
           isError: true,
         };
       }
@@ -776,11 +876,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
 
       const broker = state.broker!;
       if (action === "eval") {
-        const code = replToolInputShape.code.parse(args.code) ?? "";
-        if (code.length === 0) {
-          throw new McpError(ErrorCode.InvalidParams, "Invalid repl tool input: eval requires a non-empty code string");
-        }
-        const result = await broker.eval(code);
+        const result = await broker.eval(input.code);
         const line = drainErrorLine(state);
         const rendered = renderEvalResult(result);
         const text = line !== null ? `${line}\n${rendered}` : rendered;
@@ -790,15 +886,13 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         };
       }
       if (action === "wait") {
-        const timeoutMs = replToolInputShape.timeoutMs.parse(args.timeoutMs ?? 30_000) ?? 30_000;
-        const ids = args.ids === undefined ? undefined : replToolInputShape.ids.parse(args.ids);
         // The wait returns the SAME shape as an eval — console output
         // included (phase-D review round 2: the wait used to drop the
         // output drained by its pumps and defer it to the next eval).
-        const { result, drained } = await broker.waitForCalls(ids, timeoutMs);
+        const { result, drained } = await broker.waitForCalls(input.ids, input.timeoutMs);
         const text = renderEvalResult(result);
         const line = drainErrorLine(state);
-        const body = drained ? text : `${text}\n(still running — wait timed out after ${timeoutMs} ms)`;
+        const body = drained ? text : `${text}\n(still running — wait timed out after ${input.timeoutMs} ms)`;
         const waitText = line !== null ? `${line}\n${body}` : body;
         return {
           structuredContent: structuredEvalWait("wait", context.projectDir, result, drained),
@@ -829,7 +923,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       // mid-run — that case is bounded by the per-eval wall-clock
       // deadline (the harness's eval guard); every eval that YIELDS is
       // interruptible at its next execution.
-      if (args.id === undefined) {
+      if (input.id === undefined) {
         const targeted = await broker.armEvalBreak();
         if (!targeted) {
           return {
@@ -843,9 +937,9 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
                 type: "text",
                 text: capToolResultText(
                   `workspace ${context.projectDir}: no running eval to interrupt — no eval is in flight, or the ` +
-                    `in-flight eval's continuation is not attributable to any pending call it owns (it awaits only ` +
-                    `earlier bindings or a never-settling promise, so no execution can ever be keyed to it); ` +
-                    `nothing was armed`,
+                    `in-flight eval awaits nothing this host can key an execution to (a local or never-settling ` +
+                    `promise, or an indirect chain like Promise.all of agent calls — its settlement is the LAST ` +
+                    `component's, unknowable in advance); nothing was armed`,
                 ),
               },
             ],
@@ -869,21 +963,20 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           ],
         };
       }
-      const id = replToolInputShape.id.parse(args.id) ?? "";
-      const outcome = await broker.cancelCall(id);
+      const outcome = await broker.cancelCall(input.id);
       const text =
         outcome === "cancelled"
-          ? `interrupt ${id}: ACP session/cancel sent`
+          ? `interrupt ${input.id}: ACP session/cancel sent`
           : outcome === "idle"
-            ? `interrupt ${id}: the session was idle — nothing to cancel`
+            ? `interrupt ${input.id}: the session was idle — nothing to cancel`
             : outcome === "failed"
-              ? `interrupt ${id}: could not reach the backend session (lazy re-attach failed)`
-              : `interrupt ${id}: no live session to cancel`;
+              ? `interrupt ${input.id}: could not reach the backend session (lazy re-attach failed)`
+              : `interrupt ${input.id}: no live session to cancel`;
       return {
         structuredContent: {
           action: "interrupt",
           projectDir: context.projectDir,
-          interrupt: { outcome, callId: id },
+          interrupt: { outcome, callId: input.id },
         },
         content: [{ type: "text", text: capToolResultText(text) }],
       };

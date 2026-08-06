@@ -451,19 +451,52 @@ export function readProxyTarget(handle: JSValueHandle): JSValueHandle | undefine
  *
  * `maxLen` bounds the ARRAY read (default 256): the general preview read
  * (a completion value, a provenance registry) truncates arrays past the
- * cap with a `'[ArrayTruncated]'` marker. The guest-surface read (the
- * pending-call registry — the host's OWN reconciliation metadata, not
- * guest content) passes a far larger bound so `pending` lists the WHOLE
- * registry (the broker's documented contract) instead of silently
- * truncating at 256 entries with a marker that maps to `undefined` in
- * the broker's id lists (phase-E review round 3: the marker leaked into
- * the tool's structured `pending` array as a hole).
+ * cap with a `'[ArrayTruncated]'` marker. The COMPLETE read — the
+ * host-owned metadata surfaces (`readValueComplete`: the pending-call
+ * registry, the await log, the provenance registry's `read()` result) —
+ * lifts both caps: those surfaces are the frozen guest library's own
+ * metadata, never guest content, and truncating them leaks markers into
+ * the broker's id lists (phase-E review round 3: the 16 384-element cap
+ * truncated the pending registry and its marker mapped to `undefined`;
+ * the 256-property cap dropped bindings 256+ from the manifest's
+ * provenance).
  *
  * This is the conservative seed of the ObjectPreview rendering the tool
  * result eventually carries (the full CDP-style previewer is
  * `preview.ts`); everything read here is trap-free and bounded.
  */
 export function readValue(handle: JSValueHandle, depth: number, seen: Set<number>, maxLen = 256): unknown {
+  return readValueBounded(handle, depth, seen, maxLen, 256);
+}
+
+/**
+ * The COMPLETE trap-free read for host-owned metadata surfaces — the
+ * guest-surface reads (the pending-call registry, the await log) and the
+ * provenance registry's `read()` result. Identical discipline to
+ * `readValue` (own-data-property descriptor reads, engine brand checks,
+ * cycle guard, depth bound) with NO array-length or object-key cap: the
+ * pending-call registry must report the WHOLE registry (phase-E review
+ * rejection: the 16 384-element array cap silently truncated the list
+ * and its `[ArrayTruncated]` marker leaked into the broker's id lists as
+ * an `undefined` hole) and the provenance registry must report every
+ * binding's origin (phase-E review rejection: the 256-property object
+ * cap dropped bindings 256+ from the manifest's provenance). These
+ * surfaces are the frozen guest library's own metadata (call ids,
+ * kinds, options strings, origin labels) — never guest-authored content
+ * — so the adversarial caps don't apply; the read is bounded by the VM's
+ * memory like the metadata itself.
+ */
+export function readValueComplete(handle: JSValueHandle, depth = 0, seen = new Set<number>()): unknown {
+  return readValueBounded(handle, depth, seen, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+}
+
+function readValueBounded(
+  handle: JSValueHandle,
+  depth: number,
+  seen: Set<number>,
+  maxLen: number,
+  maxKeys: number,
+): unknown {
   if (handle.isUndefined) return undefined;
   if (handle.isNull) return null;
 
@@ -516,7 +549,7 @@ export function readValue(handle: JSValueHandle, depth: number, seen: Set<number
         const v = readOwnDataProperty(handle, String(i));
         if (v === undefined) continue; // sparse hole
         try {
-          out.push(readValue(v, depth + 1, seen, maxLen));
+          out.push(readValueBounded(v, depth + 1, seen, maxLen, maxKeys));
         } finally {
           v.dispose();
         }
@@ -528,14 +561,14 @@ export function readValue(handle: JSValueHandle, depth: number, seen: Set<number
     const out: Record<string, unknown> = {};
     let count = 0;
     for (const key of rawOwnKeys(handle)) {
-      if (count >= 256) {
+      if (count >= maxKeys) {
         out['[Truncated]'] = true;
         break;
       }
       const v = readOwnDataProperty(handle, key);
       if (v === undefined) continue; // accessor or deleted between reads
       try {
-        out[key] = readValue(v, depth + 1, seen);
+        out[key] = readValueBounded(v, depth + 1, seen, maxLen, maxKeys);
       } finally {
         v.dispose();
       }

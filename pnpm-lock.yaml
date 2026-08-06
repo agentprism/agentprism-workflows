@@ -185,6 +185,9 @@ importers:
       '@automatalabs/workflows':
         specifier: workspace:*
         version: link:../workflows
+      acorn:
+        specifier: ^8.17.0
+        version: 8.17.0
       quickjs-wasi:
         specifier: 3.3.1
         version: 3.3.1

@@ -1109,7 +1109,7 @@ export function inspectGlobal(vm: ReplVm, name: string): {
 export function manifestBinding(
   vm: ReplVm,
   name: string,
-): { token: string; handleCallId: string | null; sizeBytes: number } | null {
+): { token: string; type: string; handleCallId: string | null; sizeBytes: number } | null {
   // The lexical view first (see `inspectGlobal`): a global lexical
   // binding shadows a same-named global-object property, so the
   // manifest's binding is the lexical one. Lexical bindings are always
@@ -1127,7 +1127,7 @@ export function manifestBinding(
   if (value === undefined) {
     const kind = readRealmSlotKind(vm, name);
     if (kind === 'accessor') {
-      return { token: 'accessor (getter not invoked)', handleCallId: null, sizeBytes: 0 };
+      return { token: 'accessor (getter not invoked)', type: 'accessor', handleCallId: null, sizeBytes: 0 };
     }
     return null;
   }
@@ -1148,7 +1148,7 @@ export function manifestBinding(
 function describeBindingValue(
   vm: ReplVm,
   value: JSValueHandle,
-): { token: string; handleCallId: string | null; sizeBytes: number } {
+): { token: string; type: string; handleCallId: string | null; sizeBytes: number } {
   try {
     // The live-handle detector first: an own data property under the
     // registered handle symbol, read through the raw descriptor export
@@ -1165,13 +1165,32 @@ function describeBindingValue(
       preview.type === 'object' && preview.subtype === undefined ? ownKeyCount(value) : null;
     const size = estimateSize(value);
     if (handleCallId !== null) {
-      return { token: 'agent handle', handleCallId, sizeBytes: size };
+      return { token: 'agent handle', type: 'agent handle', handleCallId, sizeBytes: size };
     }
     const token = describeManifest(preview, size, keyCount);
-    return { token, handleCallId: null, sizeBytes: size };
+    return { token, type: manifestTypeLabel(preview), handleCallId: null, sizeBytes: size };
   } catch {
-    return { token: '?', handleCallId: null, sizeBytes: 0 };
+    return { token: '?', type: '?', handleCallId: null, sizeBytes: 0 };
   }
+}
+
+/** The machine-readable type label of a previewed value — the
+ *  structure-only vocabulary the structured manifest carries alongside
+ *  the human token (phase-E review round 4: the manifest exposed only
+ *  the formatted token, with the live-handle status and call id
+ *  embedded in the string and the type implicit in it; a structured
+ *  consumer must not have to parse the token). Mirrors the token's
+ *  label vocabulary exactly (see `describeManifest`): `undefined`,
+ *  `number`, `boolean`, `bigint`, `symbol`, `function`, `string`, the
+ *  object subtypes (`null`, `array`, `typedarray`, `arraybuffer`,
+ *  `map`, `set`, `weakmap`, `weakset`, `weakref`, `date`, `regexp`,
+ *  `error`, `proxy`, `promise`, `dataview`), `object` for plain
+ *  objects, `agent handle` for live agent handles (the caller appends
+ *  the live-handle status), and `accessor`/`?` for the unreadable
+ *  cases — metadata, never content. */
+function manifestTypeLabel(preview: ObjectPreview): string {
+  if (preview.type !== 'object') return preview.type;
+  return preview.subtype === undefined ? 'object' : preview.subtype;
 }
 
 /** The structure-only token for a previewed value (see `manifestBinding`;

@@ -62,7 +62,7 @@ import { wasmSha256Of } from './snapshot-envelope.js';import {
   getPropRaw,
   hasOwnRaw,
   rawOwnKeys,
-  readValue,
+  readValueComplete,
   takeAndFreeException,
   type QuickJSExports,
 } from './trapfree.js';
@@ -352,8 +352,13 @@ export function provenanceRecord(vm: ReplVm, origin: ProvenanceOrigin): void {
  * Read the registry for rendering, SANITIZED: only host-shaped origin
  * labels survive (`eval N` / `worker <ids>` / `session restore`); a
  * vandalized registry degrades to missing provenance, never to content in
- * the manifest. The read itself is trap-free (the registry's own `read`
- * closure returns plain data; `readValue` reads own data properties).
+ * the manifest. The read itself is trap-free and COMPLETE (the registry's
+ * own `read` closure returns plain data; `readValueComplete` reads own
+ * data properties with no property-count cap — phase-E review round 4:
+ * the generic 256-property cap silently dropped bindings 256+ from the
+ * manifest's provenance, reporting null provenance for bindings the eval
+ * did create; the registry is the host's own metadata, bounded by the
+ * VM's memory like the bindings it describes).
  */
 export function provenanceView(vm: ReplVm): ProvenanceView {
   const shim = getVmShim(vm) as QuickJS;
@@ -373,7 +378,7 @@ export function provenanceView(vm: ReplVm): ProvenanceView {
         return emptyView();
       }
       if (result.isUndefined) return emptyView();
-      const data = readValue(result, 0, new Set()) as { evalSeq?: unknown; origins?: unknown } | null;
+      const data = readValueComplete(result) as { evalSeq?: unknown; origins?: unknown } | null;
       if (typeof data !== 'object' || data === null) return emptyView();
       const origins = new Map<string, OriginRecord>();
       if (typeof data.origins === 'object' && data.origins !== null) {

@@ -146,6 +146,20 @@ export interface ReplEvalOptions {
    */
   drainInterruptHandler?: () => boolean;
   /**
+   * Called exactly once per eval, AFTER the script's synchronous code
+   * phase and BEFORE the job drain. The seam the broker's eval-await
+   * attribution uses: an eval's own code awaits (`__replAwait` calls)
+   * all execute synchronously in the code phase — the continuations a
+   * synchronous host-callback settlement (a checkpoint answer) queued
+   * run only in the drain phase — so this boundary splits the eval's
+   * OWN awaits from other evals' resumed continuations (phase-E review
+   * round 4: the eval-break targeting identity is the calls the eval
+   * AWAITS, and the eval's own awaits end here). The callback runs
+   * while the VM is idle (the code phase returned; no guest code is on
+   * the stack), so the caller may perform host-side VM reads.
+   */
+  beforeDrain?: () => void;
+  /**
    * Attach the engine's uncaught-rejection bridge when the eval SUSPENDS
    * (its completion promise is still pending after the drain): the bridge
    * — `p.then(undefined, err => console.error(err))` — routes a late
@@ -474,6 +488,12 @@ export class ReplVm {
           : evalHandler === null
             ? options.drainInterruptHandler
             : () => evalHandler() || options.drainInterruptHandler!();
+      // The code-phase boundary (see `ReplEvalOptions.beforeDrain`): the
+      // script's synchronous execution — including every synchronous
+      // host callback it made — has finished, and the drain phase (which
+      // runs the continuations the code phase queued) is next. The VM is
+      // idle here, so the callback may touch the VM.
+      options.beforeDrain?.();
       try {
         this.runDrain();
       } catch (e) {
