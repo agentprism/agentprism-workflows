@@ -60,6 +60,21 @@
  *    no helper binding is injected into the persistent global lexical
  *    record).
  *
+ * Round 6 (the carried review's defects) adds:
+ * 11. The lease is associated with the ACTUAL CONTINUATION JOB, not
+ *    the next job: a sibling `q.then(...)` registered AFTER the
+ *    target's await runs after the wrapper's settlement but BEFORE the
+ *    lease-setting reaction (the reaction now rides the WRAPPER
+ *    itself, immediately before the await machinery's own) — the
+ *    sibling completes (siblingDone), the target's continuation is the
+ *    job broken mid-run (targetDone never happens).
+ * 12. The for-await ITERABLE wrap preserves the iterable protocol: a
+ *    `for await` loop over `[1, 2]` (or an async generator, or an
+ *    awaited iterable) iterates normally through the broker — the
+ *    0.3.0 wrap returned a promise, making every loop throw
+ *    `TypeError: not a function` — and a running loop remains
+ *    breakable mid-iteration through the per-iteration lease.
+ *
  * All suites disable the per-eval deadline (`evalTimeoutMs: 0`), so
  * the ONLY thing that can break a runaway here is the armed signal —
  * a regression hangs the operation and the test's watchdog fails it.
@@ -672,6 +687,120 @@ test('review round 5: the top-level-await instrumenter is HYGIENIC — a guest l
   assert.equal(again.result, '"again"', `the loop idiom does not redeclare: ${output(again).join('\n')}`);
   const seen3 = await broker.eval('seen3');
   assert.equal(seen3.result, '9');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 12. Round 6: the lease is the continuation job, not the next job ───
+
+test('review round 6: a sibling `q.then(...)` registered AFTER the target\'s await neither fires nor consumes the eval-break signal — the lease is set only by the WRAPPER reaction (immediately before the await machinery\'s own), so the sibling job completes and the target\'s OWN continuation is the job broken mid-run (the carried defect: the 0.3.0 lease-setting reaction ran on the awaited VALUE\'s settlement, so the sibling job ran between the lease set and the continuation, consumed the armed signal, and the target\'s continuation completed later UNPROTECTED — the siblingDone:false / targetDone:true repro)', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // `await q` is evaluated FIRST (the wrap's resolve reaction is
+  // registered on q at that moment); the sibling `q.then(...)` is
+  // registered LATER, by a deferred microtask (so the reactions on q
+  // are [wrap-resolve, sibling] in registration order). Settlement
+  // queues [wrap-resolve, sibling] and the wrap-resolve job queues the
+  // WRAPPER's [lease-setting, machinery] reactions AFTER the sibling —
+  // the sibling job runs with NO lease set (it can neither fire nor
+  // consume the armed signal), and the machinery job — the target's
+  // actual continuation — starts with the lease set and is broken
+  // mid-run. The 0.3.0 ordering set the lease inside the wrap-resolve
+  // job: the sibling job then started with the lease set, the drain
+  // attributed it, the interrupt broke the SIBLING, and the target's
+  // continuation ran later with the arm consumed (targetDone).
+  const a = await broker.eval(
+    'const q = agent("pi/x", "one"); const deferred = Promise.resolve().then(() => q.then((v) => { let x = 0; for (let i = 0; i < 200000; i++) x += i; return "sibling:" + v; })); await q; while (true) {}',
+  );
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'the running eval is targetable');
+  // The awaited call settles: the drain runs [wrap-resolve, sibling,
+  // lease-setting, continuation]. The sibling job must COMPLETE — with
+  // the carried defect it was the job right after the lease set, so it
+  // was interrupted instead and the deferred sibling promise never
+  // settled (this probe would hang and the watchdog would fail).
+  runner.sessions[0].completeTurn('resumed');
+  await tick();
+  const probe = await bounded('probe after settling the awaited call', broker.eval('await deferred'));
+  assert.ok(
+    probe.result !== undefined && probe.result.includes('sibling:resumed'),
+    `the sibling reaction ran to completion, never interrupted: ${output(probe).join('\n')}`,
+  );
+  assert.ok(
+    output(probe).some((line) => line.includes('interrupted')),
+    `the target's own continuation was broken mid-run (not the sibling's job): ${output(probe).join('\n')}`,
+  );
+  // The broken eval was released (the interrupted job's continuation
+  // lease named it exactly): a later arm refuses — the target never
+  // completed (an interrupted continuation's wrapper never settles).
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
+  await broker.dispose();
+  ws.dispose();
+});
+
+// ── 13. Round 6: for-await iterables keep the iterable protocol ────────
+
+test('review round 6: the for-await ITERABLE wrap preserves the iterable protocol — `for await (const x of [1, 2])` iterates normally through the broker (the carried defect: the 0.3.0 instrumenter wrapped the iterable in `__replAwait`, whose promise result made the loop throw `TypeError: not a function` instead of iterating)', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval(
+    'globalThis.forAwaitSum = 0; for await (const x of [1, 2]) { globalThis.forAwaitSum += x; } "iterated"',
+  );
+  assert.equal(r.result, '"iterated"', `the for-await loop completed normally: ${output(r).join('\n')}`);
+  const sum = await broker.eval('forAwaitSum');
+  assert.equal(sum.result, '3', 'the loop iterated [1, 2] — the iterable protocol is preserved');
+  // An ASYNC-GENERATOR iterable still iterates across drains (each
+  // iteration's `next()`-result await rides the wrap's lease-wrapped
+  // promises).
+  const g = await broker.eval(
+    'globalThis.g = (async function* () { yield 10; yield 20; })(); globalThis.genSum = 0; for await (const x of g) { globalThis.genSum += x; } "gen"',
+  );
+  assert.equal(g.result, '"gen"', `the async-generator loop completed: ${output(g).join('\n')}`);
+  const genSum = await broker.eval('genSum');
+  assert.equal(genSum.result, '30', 'the async generator yielded 10 then 20');
+  // `for await (const x of await y)`: the iterable IS an awaited
+  // expression — the instrumenter skips the iterable wrap (the loop
+  // iterates the unwrapped value), so the shape keeps its semantics.
+  const nested = await broker.eval(
+    'globalThis.nestedSum = 0; for await (const x of await Promise.resolve([3])) { globalThis.nestedSum += x; } "nested"',
+  );
+  assert.equal(nested.result, '"nested"', `the awaited-iterable shape completed: ${output(nested).join('\n')}`);
+  const nestedSum = await broker.eval('nestedSum');
+  assert.equal(nestedSum.result, '3', 'the awaited iterable [3] iterated once');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('review round 6: a RUNNING for-await loop is breakable mid-iteration — the iterable wrap sets the continuation lease per iteration, so the armed signal breaks the loop\'s continuation exactly like any other awaited segment', async () => {
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ runner });
+  // The loop's body awaits a host call every iteration: the eval is in
+  // flight across drains (the loop never completes) and the interrupt
+  // arms against it. The per-iteration lease (set by the iterable
+  // wrap's next()-result reactions, immediately before the loop's
+  // continuation job) makes the armed signal fire while the loop's own
+  // continuation executes — with the 0.3.0 wrap the eval threw
+  // `TypeError: not a function` at the first iteration (the wrap
+  // returned a promise, not an async iterable) and was never targetable.
+  // The per-iteration work matters exactly like the other runaway
+  // suites: quickjs's interrupt counter only polls the handler on a
+  // bytecode budget, so a bare `await agent()` chunk can complete
+  // without a poll — the work loop is what the handler breaks mid-run.
+  const a = await broker.eval(
+    'const gen = (async function* () { for (;;) { yield 1; } })(); globalThis.ticks = 0; for await (const x of gen) { globalThis.ticks++; let y = 0; for (let i = 0; i < 200000; i++) y += i; await agent("pi/x", "tick"); } "done"',
+  );
+  assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+  assert.equal(await broker.armEvalBreak(), true, 'the running for-await eval is targetable');
+  // The awaited call settles: the loop's continuation (the next
+  // iteration's body) executes with the lease set and the armed signal
+  // breaks it MID-RUN.
+  runner.sessions[0].completeTurn('tick');
+  await tick();
+  const probe = await bounded('probe after settling the loop iteration', broker.eval('"probe"'));
+  assert.ok(
+    output(probe).some((line) => line.includes('interrupted')),
+    `the loop's continuation was broken mid-run: ${output(probe).join('\n')}`,
+  );
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();
   ws.dispose();
 });

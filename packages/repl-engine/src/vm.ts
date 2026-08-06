@@ -803,10 +803,18 @@ export class ReplVm {
    * drain's first job), read before each job into `cell.current` (the
    * interrupt handler consulted during the job reads the mirror), and
    * cleared again after a job that started with one. The guest library's
-   * lease-setting reaction sets the lease DURING its own job, so the job
-   * AFTER it — the eval's continuation segment — starts with the lease
-   * set, and the segment's end (the next loop iteration) clears it: the
-   * lease is set exactly while the segment executes.
+   * lease-setting reaction is registered on the WRAPPER promise itself
+   * — immediately BEFORE the await machinery's own reaction on the same
+   * wrapper (phase-E review rejection round 6: the 0.3.0 reaction ran on
+   * the awaited VALUE's settlement, so a sibling `q.then(...)` registered
+   * after the eval started awaiting `q` ran between the lease set and
+   * the continuation and consumed the armed signal) — so the wrapper's
+   * settlement queues the lease-setting job DIRECTLY BEFORE the
+   * machinery job that runs the eval's continuation segment: the job
+   * AFTER the lease-setting job starts with the lease set — it IS the
+   * segment — and the segment's end (the next loop iteration) clears
+   * it: the lease is set exactly while the segment executes, and no
+   * job in between can run with it set.
    */
   private runDrain(lease?: ReplJobLease): number {
     const e = this.vm._getExports();

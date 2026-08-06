@@ -471,7 +471,12 @@ export class Workspace {
    * value's metadata), and a baseline global whose value's type token
    * changed from the fresh-realm baseline has been rebinding by user
    * code and is listed too — phase-E review round 5: the baseline
-   * filter used to remove both), with its structure-only token
+   * filter used to remove both; a baseline global whose VALUE is no
+   * longer the pristine baseline object (a SAME-TYPE overwrite —
+   * `Math = { userOwned: true }` keeps the `object` token) is listed
+   * the same way through the registry's changed-known read — phase-E
+   * review rejection round 6: the token-only detector missed same-type
+   * replacements entirely), with its structure-only token
    * (type/shape/size — metadata, never content), its provenance label
    * (`via eval N` / `via worker cN` — null when untracked), and the
    * live-handle call id when the binding is an agent handle (the caller
@@ -493,6 +498,7 @@ export class Workspace {
     const lexicalBaseline = this.baselineLexicalKeys();
     const lexicalKeys = new Set(rawLexicalStringKeys(this.vm));
     const names = unionNames(rawGlobalStringKeys(this.vm), rawLexicalStringKeys(this.vm));
+    const view = provenanceView(this.vm);
     const user = names.filter((name) => {
       if (!baseline.has(name) && !lexicalBaseline.has(name)) return true;
       // A GLOBAL LEXICAL binding SHADOWS a same-named baseline global
@@ -506,11 +512,16 @@ export class Workspace {
       // value's trap-free type token changed from the fresh-realm
       // baseline — the user overwrote the built-in, and the manifest
       // lists the overwrite like any other user binding (phase-E
-      // review rejection: overwritten built-ins were hidden).
-      if (this.baselineChanged(name)) return true;
+      // review rejection: overwritten built-ins were hidden). A
+      // SAME-TYPE overwrite (`Math = { userOwned: true }` — both
+      // values are objects, so the token cannot see it) is caught by
+      // the registry's changed-known list, which compares the current
+      // value against the ORIGINAL baseline value (SameValue —
+      // phase-E review rejection round 6: same-type overwrites stayed
+      // absent from the manifest with no provenance).
+      if (this.baselineChanged(name) || view.changed.has(name)) return true;
       return false;
     });
-    const view = provenanceView(this.vm);
     const bindings: WorkspaceBinding[] = [];
     const logRefs: number[] = [];
     for (const name of user) {
@@ -555,7 +566,10 @@ export class Workspace {
 
   /** Whether a baseline name's current type token differs from the
    *  fresh-realm baseline's (a user rebinding of the built-in). Trap-
-   *  free: descriptor read only, never a `[[Get]]`. */
+   *  free: descriptor read only, never a `[[Get]]`. Same-type
+   *  replacements (`Math = { userOwned: true }`) keep the token and
+   *  are detected by the registry's changed-known list instead (see
+   *  `manifest`) — the value identity the token cannot provide. */
   private baselineChanged(name: string): boolean {
     const baselineType = this.baselineTypes.get(name);
     if (baselineType === undefined) return false;

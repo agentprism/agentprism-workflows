@@ -88,7 +88,18 @@
  * Lease`): a restored snapshot with the 0.1.0/0.2.0 library is served
  * as-is and simply gets no instrumentation (the eval-break interrupt
  * degrades to the honest refusal — the 0.2.0 log-only targeting is the
- * rejected settled-call-ids identity).
+ * rejected settled-call-ids identity). The for-await ITERABLE sites are
+ * gated separately on the 0.3.1 iterable-lease surface
+ * (`surface.supportsIterableLease` — `instrumentTopLevelAwaits`'s
+ * `wrapIterables` option): a 0.3.0 snapshot's for-await wrap returned a
+ * promise (breaking every `for await` loop), so those sites are left
+ * UNWRAPPED on a 0.3.0 copy — the loop runs natively, and only the
+ * loop's mid-iteration eval-break targeting is lost (the honest
+ * degradation). `for await (... of await y)` needs no iterable wrap at
+ * all: the right expression's own top-level await is instrumented
+ * normally (the loop iterates the unwrapped value), so the site is
+ * skipped — wrapping the AwaitExpression itself would hand the
+ * iterable wrap a promise.
  */
 
 import { parse } from 'acorn';
@@ -103,12 +114,7 @@ const INSTRUMENT_CACHE_MAX = 256;
  *  eval-independent — only the per-eval TOKEN varies, so the splice is
  *  re-derived per call from this plan. */
 interface InstrumentPlan {
-  /** Insert `this["__replAwait"](` at each of these positions (the
-   *  awaited expression's start). */
-  opens: number[];
-  /** Insert `, "TOKEN")` at each of these positions (the awaited
-   *  expression's end). */
-  closes: number[];
+  sites: AwaitSite[];
 }
 
 const cache = new Map<string, InstrumentPlan | typeof MISS>();
@@ -131,13 +137,23 @@ const FUNCTION_NODE_TYPES = new Set([
  * Rewrite every TOP-LEVEL `await <expr>` of the script into
  * `await this["__replAwait"](<expr>, TOKEN)` (and every top-level
  * `for await (... of <iterable>)` into
- * `for await (... of this["__replAwait"](<iterable>, TOKEN))`). Returns
+ * `for await (... of this["__replAwaitIterable"](<iterable>, TOKEN))` —
+ * the iterable wrap is the 0.3.1 surface and is applied only when
+ * `opts.wrapIterables` is set (the broker gates it on the resident
+ * library's `supportsIterableLease`; a 0.3.0 snapshot's for-await sites
+ * stay unwrapped — native semantics, the honest degradation). Returns
  * the original code unchanged when there is nothing to rewrite or the
  * code does not parse (the VM reports the syntax error).
  */
-export function instrumentTopLevelAwaits(code: string, token: string): string {
+export function instrumentTopLevelAwaits(
+  code: string,
+  token: string,
+  opts: { wrapIterables?: boolean } = {},
+): string {
   const plan = planFor(code);
-  if (plan === undefined || plan.opens.length === 0) return code;
+  if (plan === undefined || plan.sites.length === 0) return code;
+  const enabled = opts.wrapIterables ? plan.sites : plan.sites.filter((site) => site.kind === 'await');
+  if (enabled.length === 0) return code;
   const tokenJson = JSON.stringify(token);
   // All insertions, applied right-to-left by position: sites NEST (an
   // outer await's range contains its argument's awaits — `await (await
@@ -145,12 +161,23 @@ export function instrumentTopLevelAwaits(code: string, token: string): string {
   // through the already-shifted interior. Point insertions at exact AST
   // boundaries are position-safe at any nesting depth (each site's
   // `start` and `end` are distinct positions; when two sites share a
-  // position — `for await (const x of await y)` — the doubled
+  // position — `for await (const x of a ?? await y)` — the doubled
   // insertion is harmless: both wrappers still surround their
-  // expression).
+  // expression, and the shared-position close order (inner first in
+  // the text — the inner close is applied last at the position) keeps
+  // the outer wrap's argument an EXPRESSION, evaluated before the outer
+  // call: `__replAwaitIterable(a ?? await __replAwait(y, T), T)`). The
+  // one shape this cannot express — `for await (const x of await y)`,
+  // where the iterable IS the awaited expression — is skipped at
+  // collection time (see `findAwaitSites`).
   const insertions: Array<{ pos: number; text: string }> = [];
-  for (const pos of plan.opens) insertions.push({ pos, text: `this["__replAwait"](` });
-  for (const pos of plan.closes) insertions.push({ pos, text: `, ${tokenJson})` });
+  for (const site of enabled) {
+    insertions.push({
+      pos: site.start,
+      text: site.kind === 'iterable' ? 'this["__replAwaitIterable"](' : 'this["__replAwait"](',
+    });
+    insertions.push({ pos: site.end, text: `, ${tokenJson})` });
+  }
   insertions.sort((a, b) => b.pos - a.pos);
   let out = code;
   for (const insertion of insertions) {
@@ -168,12 +195,7 @@ function planFor(code: string): InstrumentPlan | undefined {
   let plan: InstrumentPlan | undefined;
   try {
     const sites = findAwaitSites(code);
-    if (sites.length > 0) {
-      plan = {
-        opens: sites.map((site) => site.start),
-        closes: sites.map((site) => site.end),
-      };
-    }
+    if (sites.length > 0) plan = { sites };
   } catch {
     // Parse failure — the engine reports the syntax error; never
     // instrument what we cannot parse (a half-rewritten script would
@@ -211,7 +233,7 @@ function visit(node: AcornNode | null | undefined, inFunction: boolean, sites: A
 
   if (node.type === 'AwaitExpression') {
     if (!inFunction && node.argument !== null && typeof node.argument === 'object') {
-      sites.push({ start: node.argument.start, end: node.end });
+      sites.push({ start: node.argument.start, end: node.end, kind: 'await' });
     }
     visit(node.argument, inFunction, sites);
     return;
@@ -219,9 +241,23 @@ function visit(node: AcornNode | null | undefined, inFunction: boolean, sites: A
   if (node.type === 'ForOfStatement') {
     // `for await (const x of y)`: the eval suspends on the ITERABLE's
     // iterator — wrapping the iterable rides the iteration's first
-    // suspension like any other awaited value.
+    // suspension like any other awaited value. The wrap must preserve
+    // the iterable protocol (the 0.3.1 `__replAwaitIterable` returns an
+    // ASYNC-ITERABLE, never a promise — phase-E review rejection round
+    // 6: the 0.3.0 `__replAwait` wrap made `for await (const x of [1,
+    // 2])` throw `TypeError: not a function`). When the iterable IS an
+    // AwaitExpression (`for await (const x of await y)`), the site is
+    // SKIPPED: the right expression's own top-level await is
+    // instrumented separately (the loop then iterates the unwrapped
+    // value, exactly like the un-instrumented program) — wrapping the
+    // awaited expression itself would hand the iterable wrap a promise
+    // (the machinery evaluates the instrumented `await` BEFORE the
+    // wrapper call only when the await sits INSIDE the argument, which
+    // a top-level AwaitExpression right cannot be).
     if (node.await === true && node.right !== null && typeof node.right === 'object') {
-      sites.push({ start: node.right.start, end: node.right.end });
+      if (node.right.type !== 'AwaitExpression') {
+        sites.push({ start: node.right.start, end: node.right.end, kind: 'iterable' });
+      }
     }
     visit(node.left, inFunction, sites);
     visit(node.right, inFunction, sites);
@@ -243,11 +279,15 @@ function visit(node: AcornNode | null | undefined, inFunction: boolean, sites: A
 }
 
 interface AwaitSite {
-  /** Where to insert `this["__replAwait"](` (the awaited expression's
+  /** Where to insert the wrap call's open (the awaited expression's
    *  start). */
   start: number;
   /** Where to insert `, "TOKEN")` (the awaited expression's end). */
   end: number;
+  /** Which seam the site rides: a top-level `await` (the `__replAwait`
+   *  promise wrap) or a `for await` ITERABLE (the `__replAwaitIterable`
+   *  async-iterable wrap — gated on the 0.3.1 iterable-lease surface). */
+  kind: 'await' | 'iterable';
 }
 
 /** The acorn AST node shape the walker needs (a structural subset). */

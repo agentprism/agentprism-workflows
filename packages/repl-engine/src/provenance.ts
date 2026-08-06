@@ -91,6 +91,15 @@ export interface OriginRecord {
 export interface ProvenanceView {
   evalSeq: number;
   origins: Map<string, OriginRecord>;
+  /** The KNOWN (baseline) names whose CURRENT value is no longer the
+   *  pristine baseline — the type token changed OR the value is no
+   *  longer SameValue to the registry's ORIGINAL baseline value
+   *  (same-type replacement: `Math = { userOwned: true }` keeps the
+   *  `object` token; the value identity is the detector the token
+   *  cannot provide — phase-E review rejection round 6). Computed at
+   *  read time by the registry's own trap-free descriptor pass. The
+   *  manifest's changed-binding filter for overwritten built-ins. */
+  changed: Set<string>;
 }
 
 /** A fresh-realm baseline key set (see the module docs). */
@@ -303,6 +312,22 @@ export async function provenanceBootstrap(
       `for (var t in toks) reg.baseTok[t] = toks[t]; ` +
       `if (!reg.lexKnown) reg.lexKnown = {}; var lk = ${lexKnownJson}; ` +
       `for (var li = 0; li < lk.length; li++) reg.lexKnown[lk[li]] = true; ` +
+      // The baseline-VALUE fill (phase-E review rejection round 6): a
+      // registry that predates the same-type-replacement detector (a
+      // pre-0.3.1 snapshot) lacks reg.baseVal/reg.knownPrev — fill them
+      // from the CURRENT realm for every known name (the same
+      // descriptor-based capture the factory performs). Guarded in its
+      // own try/catch: a realm hostile enough to shadow Object/
+      // globalThis degrades to the token-only detector, never failing
+      // the fill (a pre-snapshot same-type overwrite is the same
+      // undetectable corner the bootstrap accepts for pre-provenance
+      // restores).
+      `try { if (!reg.baseVal) reg.baseVal = {}; if (!reg.knownPrev) reg.knownPrev = {}; ` +
+      `var hOP = Object.prototype.hasOwnProperty; var gOPD = Object.getOwnPropertyDescriptor; var g = globalThis; ` +
+      `for (var n = 0; n < names.length; n++) { var kn = names[n]; if (hOP.call(reg.baseVal, kn)) continue; ` +
+      `var kd = gOPD(g, kn); var kv; if (kd !== undefined && hOP.call(kd, 'value')) kv = kd.value; ` +
+      `else if (kd !== undefined && hOP.call(kd, 'get')) kv = kd.get; ` +
+      `reg.baseVal[kn] = kv; reg.knownPrev[kn] = kv; } } catch (e) {} ` +
       `return 1; } catch (e) { return 0; } })()`;
     const outcome = await vm.evalCode(source, { filename: '<provenance-bootstrap>' });
     void outcome;
@@ -435,7 +460,11 @@ export function provenanceView(vm: ReplVm): ProvenanceView {
         return emptyView();
       }
       if (result.isUndefined) return emptyView();
-      const data = readValueComplete(result) as { evalSeq?: unknown; origins?: unknown } | null;
+      const data = readValueComplete(result) as {
+        evalSeq?: unknown;
+        origins?: unknown;
+        changed?: unknown;
+      } | null;
       if (typeof data !== 'object' || data === null) return emptyView();
       const origins = new Map<string, OriginRecord>();
       if (typeof data.origins === 'object' && data.origins !== null) {
@@ -446,9 +475,19 @@ export function provenanceView(vm: ReplVm): ProvenanceView {
           origins.set(name, { via: r.via, at: typeof r.at === 'number' ? r.at : 0 });
         }
       }
+      // The changed-known-names list, SANITIZED the same way (strings
+      // only — a vandalized registry degrades to no changed bindings,
+      // never to content in the manifest).
+      const changed = new Set<string>();
+      if (Array.isArray(data.changed)) {
+        for (const name of data.changed) {
+          if (typeof name === 'string' && name.length > 0) changed.add(name);
+        }
+      }
       return {
         evalSeq: typeof data.evalSeq === 'number' ? data.evalSeq : 0,
         origins,
+        changed,
       };
     } finally {
       result.dispose();
@@ -461,7 +500,7 @@ export function provenanceView(vm: ReplVm): ProvenanceView {
 }
 
 function emptyView(): ProvenanceView {
-  return { evalSeq: 0, origins: new Map() };
+  return { evalSeq: 0, origins: new Map(), changed: new Set() };
 }
 
 /** Whether an origin label matches one of the shapes this host writes

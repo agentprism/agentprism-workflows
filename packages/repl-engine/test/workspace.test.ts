@@ -415,3 +415,50 @@ test('manifest: user bindings that SHADOW or OVERWRITE baseline globals are enum
     ws.dispose();
   }
 });
+
+test('manifest: a SAME-TYPE overwrite of a baseline global (`Math = { userOwned: true }`) is enumerated with complete metadata and provenance — the type token cannot see it (both values are objects), the value identity can (phase-E review rejection round 6: the token-only detector missed same-type replacements entirely, leaving them absent from the manifest with no provenance)', async () => {
+  const ws = await Workspace.create('/tmp/repl-same-type-project');
+  const broker = await Broker.attach(ws, { evalTimeoutMs: 0 });
+  try {
+    // `Math = { userOwned: true }` (sloppy assignment rebinds the
+    // global property): the value's trap-free type token is `object` —
+    // the same as the pristine baseline Math — so the token-only
+    // detector saw no change. The registry's baseline-VALUE identity
+    // (SameValue against the ORIGINAL baseline value, captured when the
+    // registry was created in the pristine realm) is the detector that
+    // catches it: the manifest lists the overwrite with its provenance.
+    const r = await broker.eval('Math = { userOwned: true }; "rebound"');
+    assert.equal(r.result, '"rebound"');
+    let manifest = broker.workspaceManifest();
+    let byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    const math = byName.get('Math');
+    assert.ok(math, `the same-type overwrite of Math is listed: ${[...byName.keys()].join(', ')}`);
+    assert.equal(math!.type, 'object', 'the overwriting value is reported as an object');
+    assert.ok(typeof math!.sizeBytes === 'number' && math!.sizeBytes >= 0);
+    assert.equal(math!.provenance, 'eval 1', 'the same-type overwrite is attributed to its declaring eval');
+    assert.ok(typeof math!.provenanceAtMs === 'number' && math!.provenanceAtMs! > 0);
+    // Untouched baseline globals stay hidden (no noise).
+    assert.ok(!byName.has('JSON'), 'an untouched baseline builtin stays hidden');
+    // A SECOND same-type rebind re-attributes to its own eval (the
+    // last-attributed value is the comparison base — a pre-snapshot
+    // rebind is never re-attributed by a later pass either), and
+    // IN-PLACE mutation of the rebound value deliberately does NOT
+    // re-attribute (the binding still refers to the value its recorded
+    // origin produced — the manifest's documented stance).
+    await broker.eval('Math = { other: 1 }; 1');
+    manifest = broker.workspaceManifest();
+    byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    assert.equal(byName.get('Math')!.provenance, 'eval 2', 'a second same-type rebind re-attributes to its own eval');
+    await broker.eval('Math.other = 2; 1');
+    manifest = broker.workspaceManifest();
+    byName = new Map(manifest.bindings.map((b) => [b.name, b]));
+    assert.equal(byName.get('Math')!.provenance, 'eval 2', 'in-place mutation of the rebound value does not re-attribute');
+    assert.ok(byName.has('Math'), 'the overwritten binding stays listed');
+    // The workspace keeps working: the guest sees the overwritten values.
+    const live = await broker.eval('Math.userOwned === undefined && Math.other === 2');
+    assert.equal(live.result, 'true', 'the guest sees the overwritten binding');
+  } finally {
+    await broker.dispose();
+    ws.dispose();
+  }
+});

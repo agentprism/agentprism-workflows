@@ -993,6 +993,11 @@ export class Broker {
    *  never changes within a broker's lifetime; `undefined` until first
    *  probed. */
   private leaseCapabilityCached: boolean | undefined;
+  /** The cached iterable-lease capability probe (see
+   *  `iterableLeaseAvailable`): whether the workspace's guest library
+   *  carries the 0.3.1 `__replAwaitIterable` surface. Cached like
+   *  `leaseCapabilityCached`; `undefined` until first probed. */
+  private iterableLeaseCapabilityCached: boolean | undefined;
   /** True once the client-presence drain released every child (see
    *  `drainForDisconnect`): the workspace stays live, and later
    *  followUp/steer/cancel on a settled handle lazily re-attach the
@@ -2455,7 +2460,12 @@ export class Broker {
    *  the carried review's defects): an unrelated drain — and an
    *  unrelated JOB inside a drain that settled a target's call (an
    *  unawaited sibling `.then` registered before the target's await
-   *  runs FIRST, before the lease-setting reaction) — neither fires
+   *  runs FIRST, before the lease-setting reaction; one registered
+   *  AFTER the target's await runs after the wrapper's settlement but
+   *  still BEFORE the lease-setting job — the lease is set only by the
+   *  reaction registered on the WRAPPER itself, immediately before the
+   *  await machinery's own reaction, so no other job can run with it
+   *  set — phase-E review rejection round 6) — neither fires
    *  nor consumes it, and the armed state stays intact for the
    *  target's actual continuation. Returns `undefined` while nothing
    *  is armed (the composition drops it). */
@@ -4352,7 +4362,9 @@ export class Broker {
     // is served as-is and simply gets no instrumentation (the interrupt
     // degrades to the honest refusal — the 0.2.0 log-only targeting is
     // the rejected settled-call-ids identity).
-    const instrumented = this.continuationLeaseAvailable() ? instrumentTopLevelAwaits(code, token) : code;
+    const instrumented = this.continuationLeaseAvailable()
+      ? instrumentTopLevelAwaits(code, token, { wrapIterables: this.iterableLeaseAvailable() })
+      : code;
     const result = this.workspace.evalWithCompletion(instrumented, {
       ...options,
       // The per-eval handler overrides the broker-level default (the
@@ -4400,6 +4412,28 @@ export class Broker {
       this.leaseCapabilityCached = false;
     }
     return this.leaseCapabilityCached;
+  }
+
+  /** Whether the workspace's guest library carries the 0.3.1
+   *  ITERABLE-LEASE surface (`__replAwaitIterable` — the for-await
+   *  iterable wrap that preserves the iterable protocol while setting
+   *  the continuation lease per iteration). The instrumenter's
+   *  for-await sites are gated on this: a restored snapshot carrying
+   *  the 0.3.0 library (whose for-await wrap returned a promise and
+   *  broke every `for await` loop — phase-E review rejection round 6)
+   *  is served as-is, its for-await sites are left UNWRAPPED, and the
+   *  loops run natively (no mid-loop eval-break targeting — the honest
+   *  degradation). Cached per check like `continuationLeaseAvailable`.
+   */
+  private iterableLeaseAvailable(): boolean {
+    if (this.iterableLeaseCapabilityCached !== undefined) return this.iterableLeaseCapabilityCached;
+    try {
+      const surface = this.workspace.surface();
+      this.iterableLeaseCapabilityCached = surface?.supportsIterableLease === true;
+    } catch {
+      this.iterableLeaseCapabilityCached = false;
+    }
+    return this.iterableLeaseCapabilityCached;
   }
 
   /** Compose the per-operation interrupt handlers with the per-eval

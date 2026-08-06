@@ -758,6 +758,15 @@ export interface GuestSurface {
    *  instrumenter, and the interrupt refuses honestly (the 0.2.0
    *  log-only targeting is the rejected settled-call-ids identity). */
   supportsContinuationLease: boolean;
+  /** True when this library copy carries the 0.3.1 ITERABLE-LEASE
+   *  surface (`__replAwaitIterable` — the for-await iterable wrap that
+   *  preserves the iterable protocol while setting the continuation
+   *  lease per iteration). False on a 0.3.0 copy (whose for-await wrap
+   *  returned a promise and broke every `for await` loop): the host
+   *  leaves that snapshot's for-await sites unwrapped — native loop
+   *  semantics, no mid-loop eval-break targeting (the honest
+   *  degradation). */
+  supportsIterableLease: boolean;
   /** Manifest of every pending host call, oldest first. */
   pending(): GuestSurfaceEntry[];
   /**
@@ -852,6 +861,18 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
         leaseHandle.dispose();
       }
     }
+    // The 0.3.1 iterable-lease seam: `supportsIterableLease` (a static
+    // boolean). Absent on 0.1.0/0.2.0/0.3.0 copies — the instrumenter
+    // leaves their for-await iterables unwrapped (native semantics).
+    const iterableLeaseHandle = readOwnDataProperty(surfaceHandle, 'supportsIterableLease');
+    let supportsIterableLease = false;
+    if (iterableLeaseHandle !== undefined) {
+      try {
+        supportsIterableLease = iterableLeaseHandle.isBool && iterableLeaseHandle.toBoolean();
+      } finally {
+        iterableLeaseHandle.dispose();
+      }
+    }
     const awaitTakeHandle = readOwnDataProperty(surfaceHandle, 'awaitLogTake');
     const hasAwaitTake = awaitTakeHandle !== undefined && awaitTakeHandle.isFunction;
     awaitTakeHandle?.dispose();
@@ -860,6 +881,7 @@ export function readGuestSurface(vm: ReplVm): GuestSurface | undefined {
       version,
       supportsAwaitTracking,
       supportsContinuationLease,
+      supportsIterableLease,
       pending: () => callSurfaceFunction(vm, 'pending') as GuestSurfaceEntry[],
       settle: (callId, outcome, value) => callSurfaceSettle(vm, callId, outcome, value),
       stats: () => callSurfaceFunction(vm, 'stats') as ReturnType<GuestSurface['stats']>,

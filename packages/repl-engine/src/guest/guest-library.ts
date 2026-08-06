@@ -87,8 +87,23 @@
  *  carrying 0.1.0 is served as-is (the doc's rule: the host serves
  *  snapshots carrying older library versions) — the host degrades by
  *  not instrumenting awaits on it (no eval-break targeting, honest
- *  refusal). */
-export const GUEST_LIBRARY_VERSION = '0.3.0';
+ *  refusal).
+ *  0.3.1 fixes two continuation-lease defects (phase-E review rejection
+ *  round 6): the lease-setting reaction moved from the awaited VALUE's
+ *  settlement onto the WRAPPER itself (registered before the await
+ *  machinery's own reaction), so a sibling `q.then(...)` registered
+ *  after the eval started awaiting `q` can no longer run with the
+ *  lease set — the lease is associated with the actual continuation
+ *  job; and the for-await ITERABLE wrap became a real async-iterable
+ *  (`__replAwaitIterable` — the 0.3.0 instrumenter wrapped `for await`
+ *  iterables in `__replAwait`, whose promise result made every `for
+ *  await` loop throw `TypeError: not a function`). The surface gains
+ *  'supportsIterableLease'; a 0.3.0 snapshot is served as-is — its
+ *  for-await sites are left unwrapped by the instrumenter (native
+ *  semantics, no mid-loop targeting) while its awaits stay instrumented
+ *  (the 0.3.0 lease-set defect is the older copy's own, never
+ *  re-injected). */
+export const GUEST_LIBRARY_VERSION = '0.3.1';
 
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
 export const GUEST_SURFACE_KEY = 'repl.guest';
@@ -137,6 +152,14 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
   // lexical Math shadow, swallowing every attribution).
   var jmax = Math.max;
   var jcreate = Object.create;
+  // The realm's global object, captured when the factory runs (before
+  // any user code on a fresh workspace): the pass's own code must keep
+  // working when user code SHADOWS a baseline global — 'const
+  // globalThis = …' is a legitimate user program, and the lexical
+  // binding would shadow the factory's free-variable globalThis at
+  // call time (the same discipline as the captured Math/Object
+  // intrinsics above).
+  var g = globalThis;
   var reg = {
     evalSeq: 0,
     origins: Object.create(null),
@@ -150,6 +173,18 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
     // like the property pass's prev values).
     lexPrev: Object.create(null),
     known: Object.create(null),
+    // The ORIGINAL baseline VALUES of the known names (see the
+    // typeToks loop below): NEVER updated on attribution — the
+    // manifest's "changed from the baseline" comparison needs the
+    // pristine value forever.
+    baseVal: Object.create(null),
+    // The LAST-ATTRIBUTED value of each known name (initialized to the
+    // baseline value): the record pass's SameValue rebind detector — a
+    // SECOND rebind re-attributes to its own eval, and a restored
+    // registry's last-attributed values survive the snapshot (a
+    // pre-snapshot rebind is not re-attributed by the first
+    // post-restore pass).
+    knownPrev: Object.create(null),
   };
   // The fresh-realm BASELINE TYPE TOKENS (name -> typeof token of the
   // pristine value, captured by the host in a throwaway realm): a KNOWN
@@ -157,20 +192,46 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
   // user code — 'Math = 42' overwrites the built-in — and is
   // attributed like any other rebinding (phase-E review rejection: the
   // known-set skip made overwritten built-ins invisible to the
-  // manifest). SameValue against the baseline VALUE is impossible (the
-  // baseline lives in a different realm), so the type token is the
-  // change detector; the token observed at each pass is remembered
-  // (reg.baseTok), so an untouched builtin is a no-op forever and a
-  // SECOND rebind re-attributes to its own eval. The tokens are
-  // CONSTANT per registry lifetime (the baseline never changes), so
-  // they arrive at factory creation.
+  // manifest). SameValue against the throwaway realm's baseline VALUE
+  // is impossible (different realm), so the tokens are the host-side
+  // change detector, while the registry's OWN baseline values
+  // (reg.baseVal, captured below) extend it to SAME-TYPE replacements
+  // ('Math = { userOwned: true }' — the token cannot see those; the
+  // value identity can, within this realm). The token observed at each
+  // pass is remembered (reg.baseTok), so an untouched builtin is a
+  // no-op forever and a SECOND rebind re-attributes to its own eval.
+  // The tokens are CONSTANT per registry lifetime (the baseline never
+  // changes), so they arrive at factory creation.
   reg.baseTok = Object.create(null);
   if (typeof typeToks === 'string') {
     try { typeToks = jparse(typeToks); } catch (e) { typeToks = null; }
   }
   if (typeToks !== null && typeToks !== undefined && typeof typeToks === 'object') {
     for (var tk in typeToks) {
-      if (typeof typeToks[tk] === 'string') reg.baseTok[tk] = typeToks[tk];
+      if (typeof typeToks[tk] === 'string') {
+        reg.baseTok[tk] = typeToks[tk];
+        // The ORIGINAL baseline VALUE of the known name (descriptor
+        // read, never a [[Get]] — the pass's discipline): captured when
+        // the factory runs. On a fresh workspace the realm is pristine
+        // (the bootstrap runs before any user code), so this is the
+        // true baseline; a restored registry carries the references
+        // inside the snapshot. The values are NEVER updated on
+        // attribution: the manifest's same-type-replacement detector
+        // ('Math = { userOwned: true }' keeps the 'object' type token)
+        // compares the CURRENT value against the ORIGINAL baseline —
+        // value identity is the only detector a type token cannot
+        // provide (phase-E review rejection round 6). A pre-provenance
+        // restore runs the factory over the restored (dirty) realm —
+        // the captured values may be user-rebound; the type-token
+        // detector still catches token-changing overwrites there (the
+        // same corner the bootstrap accepts).
+        var bd = gOPD(g, tk);
+        var bv;
+        if (bd !== undefined && hasOwnProp.call(bd, 'value')) bv = bd.value;
+        else if (bd !== undefined && hasOwnProp.call(bd, 'get')) bv = bd.get;
+        reg.baseVal[tk] = bv;
+        reg.knownPrev[tk] = bv;
+      }
     }
   }
   // The LEXICAL baseline key set (the fresh realm's own top-level
@@ -241,7 +302,7 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
           if (typeof lk === 'string') lexSet[lk] = true;
         }
       }
-      var names_ = gOPN(globalThis);
+      var names_ = gOPN(g);
       var seen = jcreate(null);
       for (var i = 0; i < names_.length; i++) {
         var k = names_[i];
@@ -261,19 +322,33 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
           // token differs from the fresh-realm baseline token ('Math =
           // 42', 'globalThis.JSON = "x"' — the phase-E review
           // rejection: the baseline filter hid overwritten built-ins
-          // from the manifest). The token is remembered per pass
-          // (reg.baseTok), so an untouched builtin is a no-op forever
-          // and a SECOND rebind re-attributes to its own eval. The
-          // name is present (it is in the property list), so it is
-          // marked seen — an attributed rebinding must never be swept
-          // by the gone pass in the same sweep.
+          // from the manifest), OR the current value is no longer
+          // SameValue to the last-attributed value — a SAME-TYPE
+          // replacement ('Math = { userOwned: true }' keeps the
+          // 'object' token; phase-E review rejection round 6: the
+          // token-only detector missed same-type overwrites entirely,
+          // leaving them absent from the manifest with no provenance).
+          // The token and the value are remembered per pass
+          // (reg.baseTok / reg.knownPrev), so an untouched builtin is a
+          // no-op forever and a SECOND rebind re-attributes to its own
+          // eval. The name is present (it is in the property list), so
+          // it is marked seen — an attributed rebinding must never be
+          // swept by the gone pass in the same sweep.
           seen[k] = true;
           if (reg.baseTok && typeof reg.baseTok[k] === 'string') {
             var tok = hasOwnProp.call(d, 'value') ? typeof d.value : 'accessor';
-            if (tok !== reg.baseTok[k]) {
+            var rebound = tok !== reg.baseTok[k];
+            if (!rebound && reg.knownPrev && hasOwnProp.call(reg.knownPrev, k)) {
+              var prevV = reg.knownPrev[k];
+              // SameValue semantics (NaN-stable), like the pass's other
+              // value comparisons.
+              rebound = prevV !== v && !(prevV !== prevV && v !== v);
+            }
+            if (rebound) {
               reg.origins[k] = { via: label, at: atMs };
               reg.prev[k] = v;
               reg.baseTok[k] = tok;
+              reg.knownPrev[k] = v;
             }
           }
           continue;
@@ -340,8 +415,45 @@ export const PROVENANCE_FACTORY = `(function (names, typeToks, lexKnownArr) {
         var o = reg.origins[k];
         out[k] = { via: o.via, at: o.at };
       }
-      return { evalSeq: reg.evalSeq, origins: out };
-    } catch (e) { return { evalSeq: 0, origins: Object.create(null) }; }
+      // The KNOWN names whose CURRENT value is no longer the baseline:
+      // the type token differs from the pristine token, OR the value is
+      // no longer SameValue to the ORIGINAL baseline value (reg.baseVal
+      // — never updated on attribution) — the manifest's
+      // changed-binding detector for overwritten built-ins. A SAME-TYPE
+      // overwrite ('Math = { userOwned: true }') is caught by the value
+      // identity, which the type token alone cannot see (phase-E review
+      // rejection round 6). Computed at READ time (the manifest is
+      // rendered under the operation chain), descriptor-based and
+      // trap-free like the record pass: an accessor-rebound name is
+      // detected through its getter function identity, never invoked.
+      var changed = [];
+      for (var ck in reg.baseTok) {
+        if (!reg.known[ck]) continue;
+        var cd;
+        try {
+          cd = gOPD(g, ck);
+        } catch (e) {
+          continue;
+        }
+        if (cd === undefined) continue;
+        var cv = hasOwnProp.call(cd, 'value')
+          ? cd.value
+          : hasOwnProp.call(cd, 'get')
+            ? cd.get
+            : undefined;
+        var ctok = hasOwnProp.call(cd, 'value') ? typeof cd.value : 'accessor';
+        var cchanged = ctok !== reg.baseTok[ck];
+        if (!cchanged && reg.baseVal && hasOwnProp.call(reg.baseVal, ck)) {
+          var cbv = reg.baseVal[ck];
+          // SameValue semantics (NaN-stable).
+          cchanged = cbv !== cv && !(cbv !== cbv && cv !== cv);
+        }
+        if (cchanged) changed.push(ck);
+      }
+      return { evalSeq: reg.evalSeq, origins: out, changed: changed };
+    } catch (e) {
+      return { evalSeq: 0, origins: Object.create(null), changed: [] };
+    }
   }
   reg.record = record;
   reg.read = read;
@@ -1611,28 +1723,43 @@ const GUEST_LIBRARY_SOURCE = `/*
     try {
       if (typeof token === 'string' && token.length > 0) {
         // The 0.3.0 continuation-lease form: wrap the awaited value in
-        // a fresh promise whose settle reaction sets the lease (before
-        // resolving the wrapper — the eval's continuation is queued by
-        // the wrapper's settlement, so the lease is in place exactly
-        // when the segment starts). The wrapper mirrors the value
-        // (identity for the resolution value, same rejection value) —
-        // the async machinery sees exactly what it would have seen.
-        return new Promise(function (resolve, reject) {
-          Promise.resolve(value).then(
-            function (v) {
-              try {
-                setContinuationLease(token);
-              } catch (_e) {}
-              resolve(v);
-            },
-            function (e) {
-              try {
-                setContinuationLease(token);
-              } catch (_e) {}
-              reject(e);
-            },
-          );
+        // a fresh promise. The CONTINUATION LEASE is set by a reaction
+        // registered on the WRAPPER itself — BEFORE the await machinery
+        // registers its own reaction on the wrapper (the machinery's
+        // registration happens at the await site, after this function
+        // returns). The wrapper's settlement therefore queues the
+        // lease-setting job IMMEDIATELY BEFORE the machinery job that
+        // runs the eval's continuation segment: the job after the
+        // lease-setting reaction IS the segment, and NO job queued
+        // between the awaited value's settlement and the wrapper's
+        // settlement can run with the lease set (phase-E review
+        // rejection round 6: the 0.3.0 reaction set the lease inside
+        // the job that resolved the wrapper — the job right after the
+        // awaited value's settlement — so a sibling \`q.then(...)\`
+        // registered AFTER the eval started awaiting \`q\` ran between
+        // the lease set and the continuation, consumed the armed
+        // signal, and the target's continuation ran later unprotected;
+        // the lease is now associated with the actual continuation
+        // job, not with whichever job runs next). The wrapper mirrors
+        // the value (identity for the resolution value, same rejection
+        // value) — the async machinery sees exactly what it would have
+        // seen.
+        var wrapper = new Promise(function (resolve, reject) {
+          Promise.resolve(value).then(resolve, reject);
         });
+        wrapper.then(
+          function () {
+            try {
+              setContinuationLease(token);
+            } catch (_e) {}
+          },
+          function () {
+            try {
+              setContinuationLease(token);
+            } catch (_e) {}
+          },
+        );
+        return wrapper;
       }
       // The 0.2.0 form (no token): record the awaited call id when the
       // awaited value is one of this library's registry promises and
@@ -1655,6 +1782,123 @@ const GUEST_LIBRARY_SOURCE = `/*
       // failure degrades to the unwrapped value below.
     }
     return value;
+  }
+
+  /**
+   * The for-await ITERABLE wrap (version 0.3.1): the instrumenter
+   * rewrites every top-level \`for await (... of <iterable>)\` iterable
+   * into \`this["__replAwaitIterable"](<iterable>, TOKEN)\` — the same
+   * continuation-lease discipline as \`__replAwait\`, WITHOUT breaking the
+   * iterable protocol (phase-E review rejection round 6: the 0.3.0
+   * instrumenter wrapped for-await iterables in \`__replAwait\`, whose
+   * promise result made \`for await (const x of [1, 2])\` throw
+   * \`TypeError: not a function\` instead of iterating — the eval's
+   * continuation is queued by the loop's \`next()\`-result awaits, so the
+   * wrap must RIDE those promises, not replace the iterable with one).
+   *
+   * The returned object is an ASYNC-ITERABLE wrapper over the
+   * underlying iterable, resolved exactly like \`for await\` resolves one:
+   * \`@@asyncIterator\` first, then \`@@iterator\` (a plain array iterates
+   * synchronously; a promise is not iterable and throws the same
+   * TypeError the un-instrumented loop throws). Every \`next()\` (and
+   * \`return()\`/\`throw()\` — an abrupt completion must never leak the
+   * underlying iterator without its cleanup) returns a FRESH promise
+   * whose settling reaction — registered BEFORE the for-await machinery
+   * registers its own on the same promise (the machinery awaits the
+   * \`next()\` result — its registration happens after this function
+   * returns) — sets the continuation lease to the eval's token: the job
+   * after the lease-setting reaction IS the loop segment's continuation,
+   * so the eval-break interrupt can break a runaway for-await loop
+   * mid-iteration, exactly like any other awaited segment. Never throws:
+   * a broken iterable degrades to the UNWRAPPED iterable, so the
+   * for-await machinery reports the original TypeError (or runs the
+   * loop untouched).
+   */
+  function replAwaitIterable(iterable, token) {
+    try {
+      if (typeof token !== 'string' || token.length === 0) return iterable;
+      // Resolve the underlying iterator exactly like \`for await\` does
+      // (GetMethod semantics): \`@@asyncIterator\` first, then
+      // \`@@iterator\`; both absent or not callable is the same TypeError
+      // the un-instrumented loop throws. Property reads and calls can
+      // throw (guest accessors) — the outer try/catch degrades to the
+      // unwrapped iterable, and the machinery then throws the original
+      // error.
+      var asyncIterMethod =
+        iterable === null || iterable === undefined ? undefined : iterable[Symbol.asyncIterator];
+      var syncIterMethod =
+        asyncIterMethod === undefined && iterable !== null && iterable !== undefined
+          ? iterable[Symbol.iterator]
+          : undefined;
+      var underlying;
+      if (typeof asyncIterMethod === 'function') {
+        underlying = asyncIterMethod.call(iterable);
+      } else if (typeof syncIterMethod === 'function') {
+        underlying = syncIterMethod.call(iterable);
+      } else {
+        throw new TypeError('not async iterable');
+      }
+      // One lease-wrapped iterator-result promise: the settle reaction
+      // is registered on the FRESH promise before the for-await
+      // machinery registers its own (the machinery awaits \`next()\`'s
+      // result), so the lease-setting job runs immediately before the
+      // loop segment's continuation job — the same ordering discipline
+      // as \`__replAwait\` (no job in between can run with the lease
+      // set). A synchronous throw from the underlying iterator is
+      // converted to a rejected promise — the loop observes the same
+      // rejection either way.
+      var wrapLease = function () {
+        try {
+          setContinuationLease(token);
+        } catch (_e) {}
+      };
+      var wrapResult = function (result) {
+        var p = new Promise(function (resolve, reject) {
+          Promise.resolve(result).then(resolve, reject);
+        });
+        p.then(wrapLease, wrapLease);
+        return p;
+      };
+      var wrapped = {};
+      wrapped[Symbol.asyncIterator] = function () {
+        return wrapped;
+      };
+      // Forward with the EXACT argument count the for-await machinery
+      // uses: \`next()\` is called with NO arguments (the loop's value
+      // travels through the iterator, never into \`next()\`), while
+      // \`return()\`/\`throw()\` receive the completion value even when it
+      // is undefined — an \`arguments.length\`-sensitive underlying
+      // iterator must observe the same calls it would have observed
+      // unwrapped.
+      var forward = function (method, hasArg, arg) {
+        var result;
+        try {
+          result = hasArg ? method.call(underlying, arg) : method.call(underlying);
+        } catch (e) {
+          return wrapResult(Promise.reject(e));
+        }
+        return wrapResult(result);
+      };
+      wrapped.next = function () {
+        return forward(underlying.next, false);
+      };
+      if (typeof underlying.return === 'function') {
+        wrapped.return = function (value) {
+          return forward(underlying.return, true, value);
+        };
+      }
+      if (typeof underlying.throw === 'function') {
+        wrapped.throw = function (value) {
+          return forward(underlying.throw, true, value);
+        };
+      }
+      return wrapped;
+    } catch (_err) {
+      // Never throws by contract: a broken iterable degrades to the
+      // unwrapped iterable (the for-await machinery then reports the
+      // original TypeError, exactly like the un-instrumented loop).
+      return iterable;
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -1687,6 +1931,16 @@ const GUEST_LIBRARY_SOURCE = `/*
      *  settled-call-ids identity), no eval-break targeting — the
      *  interrupt refuses honestly. */
     supportsContinuationLease: true,
+    /** True when this library copy carries the 0.3.1 iterable-leash
+     *  surface ('__replAwaitIterable' — the for-await iterable wrap
+     *  that preserves the iterable protocol while setting the
+     *  continuation lease per iteration). The host gates its
+     *  instrumenter's for-await sites on this: a snapshot carrying the
+     *  0.3.0 library (whose for-await wrap returned a promise and
+     *  broke every \`for await\` loop) reports false, its for-await
+     *  sites are left unwrapped, and the loops run natively (no
+     *  mid-loop eval-break targeting — the honest degradation). */
+    supportsIterableLease: true,
     /** The awaits logged since the host last took them, oldest first
      *  (call-id strings only — the library's own registry ids; a
      *  pathologically large log is bounded by one operation's awaits
@@ -1783,6 +2037,7 @@ const GUEST_LIBRARY_SOURCE = `/*
   Object.freeze(retry);
   Object.freeze(loopUntilDry);
   Object.freeze(replAwait);
+  Object.freeze(replAwaitIterable);
 
   installGlobal('agent', agent);
   installGlobal('checkpoint', checkpoint);
@@ -1799,6 +2054,13 @@ const GUEST_LIBRARY_SOURCE = `/*
   // never has the instrumenter applied (the broker gates on
   // 'supportsAwaitTracking').
   installGlobal('__replAwait', replAwait);
+  // The for-await iterable wrap (version 0.3.1): the instrumenter
+  // inserts calls to this global at every top-level \`for await\`
+  // iterable ('for await (const x of y)' → 'for await (const x of
+  // __replAwaitIterable(y, TOKEN))'); a bare VM without the library
+  // never has the instrumenter applied (the broker gates on
+  // 'supportsIterableLease').
+  installGlobal('__replAwaitIterable', replAwaitIterable);
 
   // The continuation lease (version 0.3.0): a WRITABLE accessor whose
   // getter/setter are this closure's own (the host's drain loop reads it

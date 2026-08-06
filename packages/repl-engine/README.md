@@ -202,7 +202,7 @@ registry lives in the library's closure and **travels inside snapshots**; on res
 host re-registers the four callbacks by name (`registerGuestHostCallbacks`) and
 reconciles — the library itself is never re-evaluated (idempotence guard).
 
-**Eval-await tracking — the continuation lease (version 0.3.0)** — the eval-break
+**Eval-await tracking — the continuation lease (version 0.3.1)** — the eval-break
   targeting seam (the `interrupt` tool's no-id arm): the library defines
   `__replAwait(value, token)` — the global the host's `instrumentTopLevelAwaits` rewrite
   inserts around every TOP-LEVEL `await` of an eval (`await x` →
@@ -211,24 +211,44 @@ reconciles — the library itself is never re-evaluated (idempotence guard).
   shadowable identifier — the phase-E review round-5 hygiene regression: the old
   instrumenter's guest-resolvable `__replAwait` identifier was shadowable by a lexical
   declaration, changing program semantics). With a token the awaited value is WRAPPED in
-  a fresh promise whose settling reaction — the job that runs IMMEDIATELY BEFORE the
-  eval's continuation segment — sets the CONTINUATION LEASE (the writable `__replLease`
-  accessor global) to the eval's token. The host's drain loop reads the lease between
-  jobs: a job that starts with a lease set IS the armed eval's continuation, and the
-  lease is cleared after the segment ends — the armed signal's genuine per-eval
-  identity. An unawaited sibling `.then` registered before the target's await runs
-  first in the settlement drain (before the lease-setting reaction) and can neither
-  fire nor consume the signal; an indirect wait (`await Promise.all([q])`) is
-  targetable through the promise graph (the 0.2.0 log-only targeting refused it); a
-  never-settling local promise is refused at arm time (no pending host call can ever
-  resume it). The surface's `supportsContinuationLease` reports the capability. A
-  snapshot carrying the 0.1.0/0.2.0 library is served as-is (the version-compatibility
+  a fresh promise. The CONTINUATION LEASE (the writable `__replLease` accessor global)
+  is set by a reaction registered on the WRAPPER itself — BEFORE the await machinery
+  registers its own reaction on the same wrapper — so the wrapper's settlement queues
+  the lease-setting job DIRECTLY BEFORE the machinery job that runs the eval's
+  continuation segment: the job after the lease-setting reaction IS the segment, and
+  NO job queued between the awaited value's settlement and the wrapper's settlement can
+  run with the lease set (round-6 rejection: the 0.3.0 reaction ran on the awaited
+  VALUE's settlement, so a sibling `q.then(...)` registered after the eval started
+  awaiting `q` ran between the lease set and the continuation, consumed the armed
+  signal, and the target's continuation ran later unprotected — the lease is
+  associated with the actual continuation job, not the next job). The host's drain
+  loop reads the lease between jobs: a job that starts with a lease set IS the armed
+  eval's continuation, and the lease is cleared after the segment ends — the armed
+  signal's genuine per-eval identity. An unawaited sibling `.then` registered before
+  the target's await runs first in the settlement drain (before the lease-setting
+  reaction) and can neither fire nor consume the signal; an indirect wait (`await
+  Promise.all([q])`) is targetable through the promise graph (the 0.2.0 log-only
+  targeting refused it); a never-settling local promise is refused at arm time (no
+  pending host call can ever resume it). The surface's `supportsContinuationLease`
+  reports the capability. For-await loops ride the same discipline through a second
+  global, `__replAwaitIterable(value, token)` (0.3.1): the instrumenter wraps every
+  top-level `for await (... of <iterable>)` ITERABLE in it, and the wrap returns an
+  ASYNC-ITERABLE — never a promise — that sets the lease per iteration, so the loop
+  iterates exactly like the un-instrumented program (`for await (const x of [1, 2])`
+  works — the 0.3.0 wrap returned a promise and made every loop throw `TypeError: not
+  a function`, the round-6 rejection) and stays breakable mid-iteration. The surface's
+  `supportsIterableLease` gates the for-await sites: a snapshot carrying the 0.3.0
+  library is served as-is with its for-await sites left unwrapped (native semantics,
+  no mid-loop targeting — the honest degradation). A snapshot carrying the
+  0.1.0/0.2.0 library is served as-is (the version-compatibility
   rule below): the host skips the instrumenter on it and the eval-break interrupt
   degrades to the honest refusal (the 0.2.0 log-only targeting is the rejected
   settled-call-ids identity). The transform is a pure source rewrite at exact AST
   boundaries (acorn; nested function bodies are never touched — an await inside a
   `.then` callback or a combinator thunk belongs to its own continuation, not the
-  eval's) and injects nothing but the call sites (no helper binding — a top-level
+  eval's; `for await (... of await y)` needs no iterable wrap — the right expression's
+  own await is instrumented normally and the loop iterates the unwrapped value) and
+  injects nothing but the call sites (no helper binding — a top-level
   `const` would persist in the realm's global lexical record and redeclare on the loop
   idiom).
 
@@ -636,6 +656,12 @@ round 5):
 - **The eval-break signal is keyed to the armed target's CONTINUATION, not to whichever drain runs next.** The carried defect: the drain-phase interrupt handler was installed on every later eval's drain without checking whether that drain resumed an armed target — an unrelated finite eval B (or an unrelated settlement drain) consumed the signal and the interrupted-drain release cleared the target's tracking while its checkpoint stayed pending and uninterruptible. The armed identity is the target's CONTINUATION TOKEN (round 5): the guest library's `__replAwait(value, token)` wrap sets the continuation lease to the eval's token in the job immediately before the eval's continuation segment, the drain loop mirrors the lease per job, and the signal fires only while the executing JOB holds an armed token — the executing job IS the target's continuation. An unrelated drain — and an unrelated JOB inside a drain that settled a target's call (an unawaited sibling `.then` registered before the target's await runs first, before the lease-setting reaction: it can neither fire nor consume the signal) — leaves the armed state intact; an indirect wait (`await Promise.all([q])`) is targetable through the promise graph (round 5's regressions). The interrupted-drain release (`releaseInterruptedEval`) is exact the same way: the interrupted job's lease names the eval whose continuation was actually executing — exactly that eval is released (a deadline-broken resumed runaway releases its tracked eval even when no signal was armed — a stale target would make a later arm target a dead eval); an unrelated interrupted drain leaves the armed state and every tracked eval intact. A no-id interrupt with NOTHING BREAKABLE — no eval in flight, or every in-flight eval suspended with NO pending host call (a never-settling local promise — no execution can ever resume it; a suspended eval's continuation is always queued by a pending call's settlement, directly or through any promise chain) — REFUSES and arms nothing.
 - **The bounded wait sleeps only for the REMAINING budget**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches. A zero `timeoutMs` still performs ONE immediately available state read (round 5's regression: the chain acquisition used to return unacquired with the deadline already past, so an idle workspace reported `drained: false` and a pending call's surface read as empty).
 - **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array cap silently truncated the guest surface's `pending()` list, and its `[ArrayTruncated]` marker mapped to `undefined` in the broker's id lists (a hole in the tool's structured `pending`). `readValue` still bounds the general preview read (default 256); the host-owned metadata surfaces (`readValueComplete` — the pending registry, the await log, the provenance registry's `read()` result) read with NO array-length or object-key cap: they are the frozen guest library's own metadata, bounded by the VM's memory like the metadata itself.
+
+Phase E review round 6 decisions (the carried review's three defects):
+
+- **The lease is associated with the ACTUAL CONTINUATION JOB, not the next job.** The carried defect: the 0.3.0 lease-setting reaction ran on the awaited VALUE's settlement (inside the job that resolved the wrapper), so a sibling `q.then(...)` registered AFTER the eval started awaiting `q` ran between the lease set and the continuation — the drain attributed the lease to the SIBLING job, fired the armed signal on it, and the target's continuation ran later unprotected (repro: `siblingDone: false`, then `targetDone: true`). The 0.3.1 reaction is registered on the WRAPPER promise itself, immediately before the await machinery's own reaction: the wrapper's settlement queues [lease-setting, machinery] adjacently, so the job after the lease-setting job IS the continuation, and no job queued between the value's settlement and the wrapper's settlement can run with the lease set. Regression: a deferred sibling reaction registered after `await q` completes (`await deferred` resolves `sibling:resumed`) while the target's own continuation is the job broken mid-run.
+- **The for-await iterable wrap preserves the iterable protocol.** The carried defect: the 0.3.0 instrumenter wrapped every top-level `for await` iterable in `__replAwait`, whose promise result made `for await (const x of [1, 2])` throw `TypeError: not a function` instead of iterating. The 0.3.1 surface adds `__replAwaitIterable(value, token)`: an ASYNC-ITERABLE wrapper (resolved exactly like `for await` resolves an iterable — `@@asyncIterator` then `@@iterator`; a promise iterable throws the same TypeError) whose per-`next()` results are lease-wrapped promises (registered before the machinery's own reactions), so the loop iterates natively and remains breakable mid-iteration. `for await (... of await y)` is not wrapped at all (the right expression's own await is instrumented normally). The instrumenter gates the for-await sites on the new `supportsIterableLease` surface flag; a 0.3.0 snapshot's loops run unwrapped (native semantics, honest degradation). Regressions: array/async-generator/awaited-iterable iteration through the broker, and a mid-loop break.
+- **Same-type baseline-global overwrites are tracked and attributed.** The carried defect: baseline-global rebinding was detected only when the value's TYPE TOKEN changed, so `Math = { userOwned: true }` (both values objects) stayed absent from the manifest with no provenance. The provenance registry now captures the ORIGINAL baseline VALUES at creation (descriptor reads in the pristine realm; they travel inside snapshots and are never updated on attribution) and tracks the last-attributed value per known name: the record pass re-attributes on SameValue difference (a second same-type rebind re-attributes to its own eval; a pre-snapshot rebind is not re-attributed by the first post-restore pass), and the registry's read reports the changed-known list (current value no longer SameValue to the ORIGINAL baseline, or token changed) which the manifest's filter consults alongside the host-side token check. In-place mutation of a rebound value still does not re-attribute (the documented stance). Regression: `Math = { userOwned: true }` is listed with `object` type and `eval 1` provenance.
 
 Phase B decisions (the guest library, bridge, previewer):
 
