@@ -47,7 +47,9 @@ interface EventsDoc {
   events: unknown[];
 }
 
-const POLL_MS = 1000;
+// Matches the ext-apps "Polling for live data" pattern cadence (2s). The panel is the only
+// live-status channel, so this interval sets how often the app calls the app-only events tool.
+const POLL_MS = 2000;
 const MAX_BACKOFF_MS = 15_000;
 
 function runIdFromArgs(args: Record<string, unknown> | null): string | undefined {
@@ -83,15 +85,19 @@ interface MonitorState {
   fatal: string | undefined;
 }
 
-/** Poll workflow-events into a fold-model; re-renders by bumping a version counter. */
-function useRunModel(app: App | null, runId: string | undefined): MonitorState {
+/**
+ * Poll workflow-events into a fold-model; re-renders by bumping a version counter.
+ * `tornDown` stops the loop for good once the host tears the panel down, so a replaced or
+ * dismissed panel cannot keep calling the server from a detached iframe.
+ */
+function useRunModel(app: App | null, runId: string | undefined, tornDown: boolean): MonitorState {
   const modelRef = useRef<RunModel | null>(null);
   const [, setVersion] = useState(0);
   const [connectionLost, setConnectionLost] = useState(false);
   const [fatal, setFatal] = useState<string | undefined>(undefined);
 
   useEffect(() => {
-    if (!app || runId === undefined) return;
+    if (!app || runId === undefined || tornDown) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let backoffMs = POLL_MS;
@@ -182,7 +188,7 @@ function useRunModel(app: App | null, runId: string | undefined): MonitorState {
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [app, runId]);
+  }, [app, runId, tornDown]);
 
   return { model: runId === undefined ? null : modelRef.current, connectionLost, fatal };
 }
@@ -195,7 +201,7 @@ function useRunModel(app: App | null, runId: string | undefined): MonitorState {
  * trailing edge for routine transitions, and go out immediately for paused/terminal ones.
  * A host that rejects the request (feature unsupported) disables the channel for good.
  */
-function useModelContextSync(app: App | null, model: RunModel | null): void {
+function useModelContextSync(app: App | null, model: RunModel | null, tornDown: boolean): void {
   const signature = model === null ? undefined : modelContextSignature(model);
   const modelRef = useRef<RunModel | null>(model);
   modelRef.current = model;
@@ -203,7 +209,7 @@ function useModelContextSync(app: App | null, model: RunModel | null): void {
   const lastPushRef = useRef(0);
 
   useEffect(() => {
-    if (!app || signature === undefined || disabledRef.current) return;
+    if (!app || signature === undefined || disabledRef.current || tornDown) return;
     const current = modelRef.current;
     if (!current) return;
     const wait = nextPushDelayMs(isUrgentStatus(current), lastPushRef.current, Date.now());
@@ -222,7 +228,7 @@ function useModelContextSync(app: App | null, model: RunModel | null): void {
         });
     }, wait);
     return () => clearTimeout(timer);
-  }, [app, signature]);
+  }, [app, signature, tornDown]);
 }
 
 /**
@@ -407,6 +413,9 @@ function MonitorBody({
 function RunMonitor() {
   const [toolArgs, setToolArgs] = useState<Record<string, unknown> | null>(null);
   const [toolResult, setToolResult] = useState<CallToolResult | null>(null);
+  // The host tears the panel down when its session completes or the user dismisses it. Latch
+  // it so every outbound channel (event polling, model-context pushes) stops permanently.
+  const [tornDown, setTornDown] = useState(false);
 
   const { app, error } = useApp({
     appInfo: { name: "AgentPrism Run Monitor", version: "1.0.0" },
@@ -416,7 +425,10 @@ function RunMonitor() {
         setToolArgs((input.arguments as Record<string, unknown> | undefined) ?? {});
       };
       created.ontoolresult = (result) => setToolResult(result);
-      created.onteardown = async () => ({});
+      created.onteardown = async () => {
+        setTornDown(true);
+        return {};
+      };
       created.onerror = console.error;
     },
   });
@@ -424,10 +436,10 @@ function RunMonitor() {
   useHostFonts(app, app?.getHostContext());
 
   const runId = runIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
-  const { model, connectionLost, fatal } = useRunModel(app, runId);
+  const { model, connectionLost, fatal } = useRunModel(app, runId, tornDown);
   const skeleton = useSkeleton(app, runId);
   const budget = budgetFromResult(toolResult);
-  useModelContextSync(app, model);
+  useModelContextSync(app, model, tornDown);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
   if (!app) return <div className="log-empty">Connecting…</div>;
