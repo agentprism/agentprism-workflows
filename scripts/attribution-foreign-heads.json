@@ -35,6 +35,11 @@
       "sha": "4bb290f5bd3d48d6b07338d3634cc13fe9c1b49e",
       "imported": "2026-08-06",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (goal resume fix)"
+    },
+    {
+      "sha": "91cbfd30467d57eae06d3a57ccb068320bb7e171",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.1.11/v1.1.12 releases)"
     }
   ]
 }
