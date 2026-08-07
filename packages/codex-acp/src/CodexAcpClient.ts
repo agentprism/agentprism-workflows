@@ -20,9 +20,9 @@ import type {Disposable} from "vscode-jsonrpc";
 import type {
     ClientInfo,
     ReasoningEffort,
-    ServiceTier,
     ServerNotification
 } from "./app-server";
+import type {ServiceTier} from "./app-server/ServiceTier";
 import type {JsonValue} from "./app-server/serde_json/JsonValue";
 import {ModelId} from "./ModelId";
 import {AgentMode} from "./AgentMode";
@@ -51,6 +51,7 @@ import packageJson from "../package.json";
 import type {AuthenticationStatusResponse} from "./AcpExtensions";
 import {createCodexCollaborationMode} from "./CollaborationModeConfig";
 import type {ModeKind} from "./app-server/ModeKind";
+import {arePathBasenamesEqual, arePathsEqual, isAbsolutePathLike} from "./PathUtils";
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -504,12 +505,17 @@ export class CodexAcpClient {
         sessionId: string,
         objective: string,
         onTurnStarted?: (turnId: string) => void,
+        onGoalSet?: (goal: ThreadGoal) => void,
     ): Promise<TurnCompletedNotification | null> {
-        return await this.codexClient.runGoalSet({
+        const params = {
             threadId: sessionId,
             objective,
             status: "active",
-        }, onTurnStarted);
+        } as const;
+        if (onGoalSet === undefined) {
+            return await this.codexClient.runGoalSet(params, onTurnStarted);
+        }
+        return await this.codexClient.runGoalSet(params, onTurnStarted, undefined, onGoalSet);
     }
 
     async setGoalStatus(sessionId: string, status: ThreadGoalStatus): Promise<ThreadGoal> {
@@ -529,11 +535,16 @@ export class CodexAcpClient {
     async resumeGoal(
         sessionId: string,
         onTurnStarted?: (turnId: string) => void,
+        onGoalSet?: (goal: ThreadGoal) => void,
     ): Promise<TurnCompletedNotification | null> {
-        return await this.codexClient.runGoalSet({
+        const params = {
             threadId: sessionId,
             status: "active",
-        }, onTurnStarted);
+        } as const;
+        if (onGoalSet === undefined) {
+            return await this.codexClient.runGoalSet(params, onTurnStarted);
+        }
+        return await this.codexClient.runGoalSet(params, onTurnStarted, undefined, onGoalSet);
     }
 
     async clearGoal(sessionId: string): Promise<void> {
@@ -873,11 +884,10 @@ export class CodexAcpClient {
         const requestedCwd = request.cwd?.trim() ?? null;
         const filterByCwd = (thread: Thread): boolean => {
             if (!requestedCwd) return true;
-            if (path.isAbsolute(requestedCwd)) {
-                return thread.cwd === requestedCwd;
+            if (isAbsolutePathLike(requestedCwd)) {
+                return arePathsEqual(thread.cwd, requestedCwd);
             }
-            const requestedBase = path.basename(requestedCwd);
-            return path.basename(thread.cwd) === requestedBase;
+            return arePathBasenamesEqual(thread.cwd, requestedCwd);
         };
 
         const preferredProvider = this.getModelProvider();
@@ -905,7 +915,7 @@ export class CodexAcpClient {
             const filtered = listResponse.data
                 .filter(filterByCwd)
                 .map(mapThreadToSession);
-            if (filtered.length > 0 || path.isAbsolute(requestedCwd)) {
+            if (filtered.length > 0 || isAbsolutePathLike(requestedCwd)) {
                 sessions = filtered;
             } else {
                 logger.log("Ignoring non-absolute cwd filter for session/list", {cwd: requestedCwd});

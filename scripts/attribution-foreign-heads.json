@@ -45,6 +45,11 @@
       "sha": "ea57892f7d8e305fc1bd489de420adb19de055b0",
       "imported": "2026-08-06",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.1.13)"
+    },
+    {
+      "sha": "145ebba5d2030b4aa6d19cbb89d190b7b498d454",
+      "imported": "2026-08-07",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.1.14 — codex 0.147.0, provider-neutral ACP goal replacement, Windows cwd-filter normalization)"
     }
   ]
 }
