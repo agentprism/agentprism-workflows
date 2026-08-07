@@ -1,5 +1,106 @@
 # @automatalabs/acp-agents
 
+## 0.36.0
+
+### Minor Changes
+
+- 30f3aa5: Interactive sessions gain the structured-output contract: `openSession({ schema })` (and the other `*Session` entry points) folds the schema into the backend's native channels exactly like `run()` — session/new `_meta` where the backend carries it there (Claude), the per-turn `_meta` forward where the backend computes it on the turn (Codex), and an in-band prompt contract for backends whose agent may ignore the `_meta` forward entirely (`embedSchemaInPrompt`). The schema never changes the interactive contract otherwise: the host drives the repair ladder itself and reads the result through the session's additive surface — the new `outputSchema` accessor, plus `currentTurnText()`/`finalMessageText()`/`rawStructuredOutput()`. The client-hosted StructuredOutput capture tool is never injected on the interactive path (it stays a per-call `run()` device). Also updates the engine seams for the REPL broker: `AcpAgentRunner.openSession`/`loadSession`/`forkSession`/`resumeSession` forward the schema to session creation and the per-turn channels.
+
+  `InteractiveSession.prompt()` gains the `onHandoff` option — the host's explicit handoff acknowledgment. It fires exactly once the prompt has passed every preflight check (released session, aborted signal, prompt-in-flight, image validation) AND the underlying ACP session/prompt request has actually been invoked — the invocation runs synchronously through request construction and the wire send, so the payload is on the wire before the acknowledgment: the point of no return. Hosts that record a "delivered" marker for a prompt (the REPL broker's queued-steer delivery marker) record it in this callback: an async pre-handoff rejection never reaches it, so the marker can never precede the backend handoff and a restore can never skip a turn that was never delivered. The acknowledgment firing AFTER the invocation is the crash-boundary contract (review regression: it used to fire before, so a crash in that interval left a durable "delivered" marker on a prompt the backend never received — and a restore then skipped a never-delivered turn): a crash before the acknowledgment leaves the prompt undelivered-in-the-store and a restore re-issues it (at-least-once). A throwing callback aborts the turn — its error propagates through the normal mapping — but the backend prompt is already invoked at that point, so the turn is the host's delivery-failure path (the abandoned response can never become an unhandled host rejection), never a not-sent turn.
+
+  `InteractiveSession.awaitCurrentTurn()` makes the REPL broker's re-attach arm REAL (phase D review round 1: the seam used to be absent from the adapter, so every built-in backend loaded, released, and re-issued). Its protocol-bounded semantics: the `session/load` contract (the agent replays the entire persisted conversation via `session/update` and only then resolves the load) makes the founding turn's completion observable exactly when the replayed transcript's trailing content event is an assistant message — a turn that ended while the host was down has its final message in the replay, and the seam resolves with it (`stopReason` synthesized `end_turn`; the protocol's replay carries none). A turn still in flight at the backend has no observable completion (the protocol has no turn-end signal for a turn this client did not start), so the seam rejects with a host-side error naming the condition and the broker degrades to re-issue, surfaced guest-visibly. The transcript probe (`SessionState.loadedTurnState`/`loadedTurnText` — the last user-message boundary and the trailing content kind, tracked from the update stream) is additive accumulator state; live sessions are unaffected. The fake-agent integration fixture's `session/load` replay additionally accepts `{ role: "user"|"assistant", text }` entries so tests can replay the founding turn's prompt alongside its outcome.
+
+- bd28cd9: The loaded-session re-attach arm's completion evidence is now the `_session/loaded_turn` vendor extension (phase-D review round 3; the `_session/steering` precedent) — an AUTHORITATIVE turn-terminal channel for loaded sessions, replacing the quiet-grace heuristic (a settled stream with a trailing assistant chunk treated as completion, which durably settled an assistant PARTIAL as a completed-while-down turn when the next live chunk arrived later) and the blind re-issue fallback (which duplicated a still-running backend turn).
+
+  - **New extension**: `_session/loaded_turn/query { sessionId }` → `{ status: "completed" | "running" | "interrupted" }`, asked right after `session/load` resolves (the runner still marks the load boundary synchronously after the response); `_session/loaded_turn/ended { sessionId, stopReason? | error? }` pushed when a turn that a query classified `running` ends. Advertised at initialize via strict `InitializeResponse._meta.loadedTurn.supported === true` (`NegotiatedCapabilities.supportsLoadedTurnTerminalState`). Served by the in-repo `@automatalabs/pi-acp` and `@automatalabs/codex-acp`; `ACP_EXTENSION_SUPPORT_MATRIX` pins all eight agent/method rows (claude and opencode: not-advertised).
+  - **`InteractiveSession.awaitCurrentTurn()` rewritten around the extension**: `completed` settles immediately from the replay (the trailing assistant message is the turn's FINAL message — authoritative); `interrupted` rejects with the safe-re-issue class (nothing is running); `running` keeps the loaded session attached and settles ONLY from the ended notification with the turn's real accumulated text (bounded by `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS`, default 15 min). A backend WITHOUT the extension degrades guest-visibly — the seam rejects immediately with `LoadedTurnStillRunningError` (structural `loadedTurnStillRunning` marker, non-re-armable): never settling partial output, never re-issuing a possibly-running turn. A `running` turn past the max-wait bound rejects with the RE-ARMABLE form (a later notification or cancel still settles the call); a turn that failed at the backend rejects with `LoadedTurnFailedError` (structural `loadedTurnFailed` marker — a definite outcome, settled as a rejection, never re-issued). `isLoadedTurnStillRunningError`/`isLoadedTurnFailedError` exported. The settle-grace env var (`AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS`) is gone.
+  - The integration fixture's fake ACP agent advertises and serves the extension (`loadSession.loadedTurn` status, scripted `turnEnded` pushes), and the seam integration test now pins: completed-while-down settle, the round-3 regression (a replay ending in an assistant partial with the next live chunk arriving after any grace is NEVER settled before the authoritative notification), interrupted immediate re-issue, max-wait re-armable rejection, extension-absent degradation, and the no-user-message arm.
+
+- af917eb: REPL orchestrator phase D, review round 2: the loaded-session founding-turn seam and the opencode persistence root.
+
+  - **`InteractiveSession.awaitCurrentTurn()` is an observing wait, not a one-shot probe** (the REPL broker's re-attach arm). ACP message chunks are progress, never terminal markers, so the seam no longer treats a trailing `agent_message_chunk` as proof of completion: after `session/load` resolves it waits for the session's update stream to SETTLE — no `session/update` for the loaded-turn settle grace (default 250 ms; `AGENTPRISM_ACP_LOADED_TURN_SETTLE_GRACE_MS`) — and only then reads the transcript's trailing content. A turn that ended while the host was down (its final message in the replay) resolves with the REAL accumulated text (stop reason synthesized `end_turn` — the protocol's replay carries none). A turn still IN FLIGHT at the backend keeps streaming live chunks after the load response: the seam waits for its authoritative completion instead of rejecting — the loaded session stays attached and the re-attached call settles from the turn's real outcome (no re-issue, no duplicated work). It rejects only on genuine unobservability: a transcript with no user message, a released/dead session (the wait also races the session's release), or a stream settled without a terminal assistant message within the max-wait backstop (default 15 min; `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS`). New additive `SessionHandle`/`SessionState` surface: `lastUpdateAtMs()` and `subscribeUpdates()`.
+  - **OpenCode's spawned servers now use a STABLE per-user XDG data/state/cache root** (review: a random tmpdir per spawn made cross-process `session/load` fall back to a fresh session — re-attachment was not real for the opencode built-in despite it advertising `loadSession: true`). The root lives OUTSIDE the user's live opencode data dir (a sibling `agentprism/opencode` tree under the user's data home, seeded with credentials from the real dir as before), so the daemon's instances never overlap the user's own TUI store while agent-persisted sessions survive pool recycles and daemon restarts. `AGENTPRISM_OPENCODE_DATA_ROOT` overrides the root (tests/ops).
+
+- 0c29a86: REPL orchestrator phase F, review round 2: authoritative re-attachment/completion for ALL four built-ins, the out-of-band eval-break relay, and addressable truncation references.
+
+  **acp-agents — the observation path for backends without the `_session/loaded_turn` extension** (the built-in claude and opencode backends today; also the fallback when an extension backend's query wire fails). The old degradation — reject with the non-re-armable `LoadedTurnStillRunningError` so the broker releases the loaded session and re-issues the call — could duplicate a still-running backend turn. The seam now classifies the loaded session's founding turn authoritatively: the post-load continuation watch (`AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS`, default 1 s — any CONTENT update after the load boundary is live continuation, the still-running signal) plus the replay probe under the CONNECTION-DEATH CONTRACT (live-verified: claude-agent-acp and pi-acp exit on connection close and cancel their turns, `opencode acp` exits on stdin EOF, codex-acp ends/kills the codex process, and their persisted transcripts hold only completed messages — so at restore the founding turn is never still running and the replay's trailing content is authoritative: an assistant message is the turn's terminal message (completed-while-down, settled from the transcript), anything else means it died mid-way (the safe-re-issue class — nothing running, no duplication)). Live continuation flips the classification to the keep-attached wait (bounded, re-armable). The `_session/loaded_turn` extension path is unchanged. Tests pin the seam-less completed/interrupted/still-running classifications end to end through the real adapter.
+
+  **repl-engine — a possibly-running call is never re-issued** (the broker's restore/re-attach arm): every `LoadedTurnStillRunningError` — re-armable and non-re-armable forms alike — keeps the loaded session attached and re-arms the seam on it (the doc's re-attach-to-a-still-running-task arm); re-issue is reserved for the observably-dead classes (interrupted classification, a transcript that never received its prompt, a dead/released session, a third-party adapter with no seam at all). Also new: **the out-of-band eval-break channel** (`EvalBreakChannel` / `createEvalBreakChannel`) — a worker-thread relay with a loopback HTTP break endpoint and a shared-memory (SAB + Atomics) break flag. The interrupt tool's no-id path becomes deliverable to a SYNCHRONOUSLY running eval: a never-yielding eval blocks the daemon's single thread, so the request itself cannot be processed — the relay (a separate thread) arms the flag, and every eval execution's quickjs interrupt handler consumes it mid-run with the arm-after-start rule (a stale break — armed while the workspace was idle — is dropped on first observation and never breaks a later eval). `BrokerOptions.evalBreakChannel` wires it; the broker reports consumed out-of-band breaks to the tool for the honest outcome.
+
+  **mcp-server — the daemon wiring for both**: `run-daemon` creates the channel and advertises its URL in daemon.json (`replBreakUrl`); the stdio shim fires the relay automatically when it forwards a `repl` interrupt without an id (before forwarding, so the break lands while the daemon is wedged); the interrupt tool reports the honest out-of-band outcome (and clears the flag once its own processing owns the break). And **the structured-output cap's continuation references**: the aggregate 10 KB cap previously discarded the tail entries of elided arrays (pending ids, checkpoint questions, completion ids, status metadata) keeping only counts — the omitted values had no address and repeated reads could never recover them. Every elision now snapshots the dropped entries in the workspace's `TruncationRefStore` under a ref id that the `truncated` record carries (`{ elided, ref }`), and a later eval/wait/status call's optional `refs` parameter reads them back under `referenced` (a referenced read is itself capped, chaining fresh refs) — the cap costs reads, never data, for every omitted field. The truncation marker text now names both the `$N` refs and the structured continuation refs.
+
+### Patch Changes
+
+- fac9d5d: ACP maintenance: lift the wrapped Claude runtime to `@anthropic-ai/claude-agent-sdk@0.3.224` by
+  moving the root `pnpm.overrides` pin from 0.3.223 (`@agentclientprotocol/claude-agent-acp@0.65.0`
+  still exact-pins 0.3.220, and its latest has not yet caught up, so the override remains — drop it
+  once the adapter advances; see CONTRIBUTING "When the dependency gate blocks").
+
+  0.3.224 is a mechanical patch relative to 0.3.223: additive settings and capabilities
+  (`crossSessionInbound`/`dialogExpiry` cross-session messaging, an additive `SDKMessageOrigin`
+  `subkind: 'peer-send-message'`, archive-source plugin install, sandbox credential masking) plus a
+  bug fix (long project paths no longer cross-referencing other projects' sessions). The runtime is
+  wrapped behind the `claude-agent-acp` adapter — we never import it directly — so an additive+fix
+  patch changes no ACP surface the Claude backend integrates against. The `@earendil-works` and
+  `@agentclientprotocol` legs of the dependency gate pass clean, and the acp-agents live steering e2e
+  (real Claude driven through the adapter over the 0.3.224 runtime) is green.
+
+- 149b606: Phase-F review round 1: the re-attach arm's unobservable-completion degradation is replaced
+  by the doc's honest re-issue fallback — the undocumented fourth reconciliation arm
+  ("pending until interrupt/reset") is gone. The doc's restore path settles every outstanding
+  call exactly once through exactly one of the three arms (settle from the store / re-attach /
+  re-issue); the old `registerUnobservableReattach` path left a successfully re-attached call
+  permanently pending when the loaded session's founding-turn completion was unobservable,
+  which is the case for the built-in claude and opencode backends (they do not advertise the
+  `_session/loaded_turn` extension, per the live-verified `ACP_EXTENSION_SUPPORT_MATRIX`).
+  Now:
+
+  - A loaded session WITHOUT the `awaitCurrentTurn` seam (a third-party adapter) is released
+    and the call is re-issued under the same id — the same degradation the catch arm already
+    used for load failures, surfaced guest-visibly with a warn line naming the reason.
+  - A NON-re-armable `LoadedTurnStillRunningError` (backend without the extension, or a
+    failed `_session/loaded_turn/query` wire) degrades the same way: release + re-issue under
+    the same id. Never settled from a quiet gap (partial output is still never settled),
+    never left pending.
+  - The RE-ARMABLE class is unchanged: a `running` turn past the max-wait bound on a backend
+    that DOES carry the extension keeps the loaded session attached and re-arms the seam — the
+    doc's second arm (re-attach to a still-running task); a later `_session/loaded_turn/ended`
+    notification or a cancel still settles the call.
+  - The drain/disposal fences are unchanged: while the broker is draining or disposed, even
+    safe-re-issue rejections resolve `hold` — the drain's forced stop settles every
+    still-pending call DURABLY at its bound (recorded `AGENT_CANCELLED`, guest-settled), so a
+    drained call is never left pending, and a disposed broker's state is being torn down.
+    These are now the only `hold` producers left in the pump.
+
+  The seam's rejection messages in acp-agents (`LoadedTurnStillRunningError` text) and the
+  `awaitCurrentTurn` documentation were re-worded to match (the broker re-issues; the
+  re-armable form keeps the wait on the attached session); repl-engine module docs, the
+  package READMEs, and docs/api.md document the degradation and the exhaustive three-arm
+  contract. Regressions: the seam-absent adapter test and the non-re-armable rejection test
+  now pin the re-issue path end to end (loaded session released, reissue recorded, fresh
+  turn settles the SAME guest promise exactly once, warn line names the reason), and the
+  acp-agents integration test pins the re-worded non-re-armable message.
+
+- bcede5b: REPL orchestrator phase F, review round 3 — the full-repo verification's carried defects, all closed:
+
+  - **ACP freshness gate green**: the `packages/codex-acp` subtree is re-synced with upstream `agentclientprotocol/codex-acp@main` (ea57892 — the goal-extension `resume` action and the v1.1.11–1.1.13 releases) via a true non-squashed merge commit; the fork's `package.json` version line wins, the package lockfile stays deleted, and the imported upstream head is recorded in the attribution allowlist.
+  - **The observation path's replay classification is restricted to the verified built-ins** (acp-agents): a CUSTOM backend's quiet observation window is not terminal evidence — its connection-death behavior is not live-verified — so its loaded session stays attached and the seam waits for the authoritative terminal state (the re-armable still-running rejection) instead of settling stale/partial replay or re-issuing a possibly-running call.
+  - **Non-re-armable seam rejections are never re-invoked** (repl-engine): the broker kept recursing into a seam that rejects with `LoadedTurnStillRunningError` and `rearmable: false`, spinning in an unbounded microtask/warning loop that starved cancellation, drain, and every other task. The broker now keeps the loaded session attached and waits for the terminal state from the session-level `_session/loaded_turn/ended` surface, the call's cancel (settled as the recoverable `AGENT_CANCELLED`), the session's release (the safe-re-issue class), or the drain's forced stop.
+  - **The interrupt is implemented in the in-process/library mode too** (mcp-server): the single-project server now owns an eval-break channel by default and exposes its relay (`replBreakUrl()`); the stdio transport's stdin reader lives on a worker thread that fires the relay for no-id `repl` interrupts, so a synchronous `while(true)` eval is breakable mid-run exactly like in daemon mode. The relay keys are realpath'd on every fire side (shim and in-process reader), so symlinked or non-normalized projectDirs interrupt correctly.
+  - **Break targeting has no clock-resolution window** (repl-engine): the eval-break channel now orders arms against execution starts on a shared monotonic arm-sequence counter instead of millisecond `Date.now()` stamps — a break arriving in the same millisecond as the execution start is delivered, never consumed as stale and lost. The channel's slots also GROW on demand (no fixed workspace ceiling) and are released on broker teardown for reuse.
+  - **The structured-output cap's continuation refs are cumulative, namespaced, and never evicted** (mcp-server): repeated halving of one field chains every dropped chunk into the advertised ref (earlier tails stay addressable); ref ids carry the workspace's project key so a ref from one project can never resolve in another's store; the store retains every ref until `reset` (which now clears it); and the `wait` result variant accepts `referenced` (the handler attached it, the validator forbade it).
+  - Documentation and the phase-F changeset re-worded: the `repl-engine` dependency line and the shipped-tool status are stated as they are, and the changeset no longer carries the banned marker strings.
+
+- Updated dependencies [2e4bb60]
+- Updated dependencies [142a23e]
+- Updated dependencies [bd28cd9]
+- Updated dependencies [fac9d5d]
+- Updated dependencies [142a23e]
+- Updated dependencies [bd28cd9]
+- Updated dependencies [bcede5b]
+  - @automatalabs/codex-acp@1.8.0
+  - @automatalabs/pi-acp@0.4.0
+
 ## 0.35.3
 
 ### Patch Changes

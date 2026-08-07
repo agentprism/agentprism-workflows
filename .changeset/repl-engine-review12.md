@@ -1,7 +1,0 @@
----
-"@automatalabs/repl-engine": minor
----
-
-REPL orchestrator phase D, review round 12: the client-presence drain's deadline is absolute against a chain REPLACED mid-wait — the serialized-chain enqueue is atomic with a changed-chain re-check.
-
-- **The drain bound now survives an operation queued precisely as the prior chain releases** (review rejection: `serialized()`'s deadline path raced ONE chain promise, and after that race won it re-read the mutable `this.opChain` field — an operation enqueued in the microtasks between the chain's release and the re-read chained onto the just-released chain and REPLACED the field, so the drain enqueued behind the NEW operation with no deadline race on it. Reproduced with a pending call: a 20 ms `drainForDisconnect()` took 307 ms; with a replacement op polling another pending call, the drain returned only at the replacement's own 10 s timeout). The post-race path now re-checks the field and, when it changed, re-races the new chain against the REMAINING time — each loop pass only consumes remaining budget, so the total wait can never exceed the deadline plus timer slop no matter how many ops enqueue around a release; and the check-and-enqueue when the field is unchanged run in ONE synchronous block, so no operation can interleave between them. Regression: a drain racing a chain released by a settled call, with a second wait op enqueued mid-wait holding another pending call — the drain returns at its deadline, settles the still-pending call durably, and never waits behind the replacement.

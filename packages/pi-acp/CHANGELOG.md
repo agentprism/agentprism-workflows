@@ -1,5 +1,32 @@
 # @automatalabs/pi-acp
 
+## 0.4.0
+
+### Minor Changes
+
+- 142a23e: The `_session/loaded_turn/ended` push is ORDERED behind the session's update pump (phase-D review round 6): a turn's final deltas are only enqueued (the pump delivers them asynchronously), and the ended notification was sent synchronously at turn finish — the terminal marker could reach the ACP client before the last chunk, and the re-attach seam settles with the accumulated text at the marker, durably recording PARTIAL output. The push now awaits the update pump (best-effort) before notifying, so the turn's final text always precedes its terminal marker on the wire.
+- bd28cd9: The `_session/loaded_turn` vendor extension (the `_session/steering` precedent): turn-TERMINAL state for loaded sessions — the re-attach arm's authoritative completion evidence. Advertised at initialize as `_meta: { steering: { supported: true }, loadedTurn: { supported: true } }`; `_session/loaded_turn/query { sessionId }` answers whether the loaded session's founding turn is still running right now — `running` while a turn executes in this process (arming a one-shot watch that pushes `_session/loaded_turn/ended { sessionId, stopReason? | error? }` when that turn finishes), `completed` when the session journal's last message entry is an assistant message (pi persists every complete LLM message atomically at `message_end`, so a completed turn always leaves an assistant leaf and the replay's trailing assistant message is the turn's FINAL message — authoritative), and `interrupted` otherwise (an interrupted/abandoned turn — nothing is running, so re-issue is safe). Strict request parsing and `unknown_session` for unknown ids, mirroring the steering surface.
+
+### Patch Changes
+
+- fac9d5d: ACP maintenance: bump the pi runtime to 0.84.1 (`pi-ai`, `pi-coding-agent`, `pi-agent-core`).
+
+  0.84.1 is a mechanical patch — it ships **no breaking changes** (unlike 0.84.0). Its entries are
+  additive features (Qwen Token Plan Individual provider, `pi auth check`, fullscreen mouse/word
+  selection and half-page scrolling, extension `tool_call` `terminate`) and fixes (Bun standalone
+  startup, extension TUI wrapper recursion, Windows fullscreen paste, `Agent.reset()` now rejecting
+  during active runs, LaTeX spacing, tmux/Zellij/Screen mouse volume). None touch the pi-acp
+  integration surface: pi-acp is a headless ACP server, so the TUI/mouse/LaTeX work is irrelevant; we
+  import no renamed/removed symbol; `Agent.reset()` is never called; and the npm dep diff is confined
+  to the internal `@earendil-works/pi-*` family pins moving `^0.84.0` → `^0.84.1`. Typecheck is clean
+  and the pi-acp packaging and classifier tests pass against the installed 0.84.1 dists; the ACP
+  freshness gate reports `@earendil-works/pi-*` at `0.84.1 == latest`, and the live acp-agents steering
+  e2e is green.
+
+  The classifier fixtures re-verify byte-identically against the installed pi v0.84.1 runtime (E1
+  green — the auth-guidance and provider-error prose still classify unchanged), so only the pinned
+  versions move: `FIXTURE_PI_PIN` and the exact-pin map in `packaging.test.ts`.
+
 ## 0.3.2
 
 ### Patch Changes
