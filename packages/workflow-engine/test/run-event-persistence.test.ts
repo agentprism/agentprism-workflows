@@ -870,3 +870,76 @@ test("withRunEvents wraps structural persistence once, delegates it, and deletes
     rmSync(runsDir, { recursive: true, force: true });
   }
 });
+
+// R0 acceptance (docs/roadmap/workflow-permission-model.md §R0): the daemon event path honors its
+// bounds. On a real ≥20,000-record journal with a cursor lagging ≥5,000 records, a readEvents page
+// and a watchEvents catch-up must both stay bounded (no whole-file re-parse per record served) AND
+// yield the event loop while draining. Pre-fix, watchEvents.consume() re-parsed the entire journal
+// once per record yielded — a measured 115.8-second main-thread block for a 500-record catch-up on
+// a 9.7 MB journal, which starved /healthz and blew waitMs.
+test(
+  "R0: a >=20k-record journal serves a 5k-lagging read page and watch catch-up within bounds while yielding the loop",
+  withPersistence(async ({ persistence }) => {
+    const runId = "r0-bounded";
+    persistence.save(state(runId));
+    const total = 20_000;
+    for (let seq = 1; seq <= total; seq++) {
+      persistence.appendEvent(runId, {
+        seq,
+        timestamp: TIMESTAMP,
+        event: { type: "log", runId, scope: runId, message: `bounded-${seq}` },
+      });
+    }
+    // Model the watermark trailing the journal tail by the lag amount, exactly as the daemon's
+    // snapshot cadence lags its append cadence.
+    const lag = 5_000;
+    const after = total - lag; // 15000
+    persistence.save(state(runId, { eventSeq: after }));
+
+    // A read from the lagging cursor returns its exact 100-record window fast — no per-call
+    // whole-journal re-parse (that this process wrote it warmed the cache; a cold reader would pay
+    // exactly one validated parse, not one per record).
+    const readStart = Date.now();
+    const page = persistence.readEvents(runId, { after, limit: 100 });
+    const readMs = Date.now() - readStart;
+    assert.deepEqual(
+      page.events.map((record) => record.seq),
+      Array.from({ length: 100 }, (_, index) => after + index + 1),
+    );
+    assert.equal(page.endCursor, total);
+    assert.equal(page.hasMore, true);
+    assert.ok(readMs < 1_000, `readEvents of a 5k-lagging page took ${readMs}ms (expected < 1000ms)`);
+
+    // Reproduce the daemon await's catch-up: watch from the lagging cursor and drain all 5,000
+    // backlog records. Pre-fix each next() re-parsed the whole 20k-record journal, so the drain
+    // held the event loop for many minutes; a 0 ms timer scheduled alongside it would not fire
+    // until it finished. Post-fix the catch-up is served from the cache and stays a short burst, so
+    // the timer fires promptly — the same responsiveness the daemon's /healthz probe relies on.
+    let timerDelayMs = Number.POSITIVE_INFINITY;
+    const timerScheduledAt = Date.now();
+    const heartbeat = setTimeout(() => {
+      timerDelayMs = Date.now() - timerScheduledAt;
+    }, 0);
+
+    const stream = persistence.watchEvents(runId, { after });
+    const drained: number[] = [];
+    const drainStart = Date.now();
+    try {
+      while (drained.length < lag) {
+        const next = await stream.next();
+        assert.equal(next.done, false);
+        drained.push(next.value!.seq);
+      }
+    } finally {
+      stream.close();
+    }
+    const drainMs = Date.now() - drainStart;
+    // Let the pending 0 ms timer run now that the drain has released the loop.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    clearTimeout(heartbeat);
+
+    assert.deepEqual(drained, Array.from({ length: lag }, (_, index) => after + index + 1));
+    assert.ok(drainMs < 2_000, `watchEvents catch-up of ${lag} records took ${drainMs}ms (expected < 2000ms)`);
+    assert.ok(timerDelayMs < 1_000, `a 0ms timer was starved for ${timerDelayMs}ms by the catch-up`);
+  }),
+);
