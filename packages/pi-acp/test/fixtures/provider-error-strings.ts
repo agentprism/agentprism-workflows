@@ -1,4 +1,9 @@
-export const FIXTURE_PI_PIN = "0.84.0";
+export const FIXTURE_PI_PIN = "0.84.1";
+// 2026-08-07 bump 0.84.0 -> 0.84.1: a no-breaking-changes patch (additive Qwen provider,
+// `pi auth check`, fullscreen mouse/scroll, extension tool_call `terminate`, plus TUI/Bun/LaTeX
+// fixes) that touches no classified surface. E1 re-verified against the installed pi v0.84.1
+// dists — the auth guidance strings and provider-error prose below classify byte-identically, so
+// only the pin moves.
 // 2026-08-06 bump 0.83.0 -> 0.84.0: re-verified against the installed pi v0.84.0 dists. Three
 // auth strings moved from literal `"anthropic"` forms to `${provider}` template literals
 // (dist/core/agent-session.js, auth-guidance.js), but the classifier matches the stable
