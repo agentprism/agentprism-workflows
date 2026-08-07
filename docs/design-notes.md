@@ -191,8 +191,8 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **nine** packages — **eight** published to
-> npm; `@automatalabs/repl-engine` is publishable but not yet released, at `0.0.0` —
+> Packaging (as implemented): a pnpm monorepo of **nine** published packages — **eight**
+> released to npm; `@automatalabs/repl-engine` is publishable but not yet released, at `0.0.0` —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
 > `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade),
 > `@automatalabs/agentprism-otel` (the optional telemetry bridge), `@automatalabs/pi-acp`
