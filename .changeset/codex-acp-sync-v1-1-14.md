@@ -1,5 +1,5 @@
 ---
-"@automatalabs/codex-acp": minor
+"@automatalabs/codex-acp": patch
 ---
 
 Resync the fork with upstream `agentclientprotocol/codex-acp@145ebba` (v1.1.14 tip) via a
@@ -30,6 +30,12 @@ the fork-owned `loaded-turn.test.ts` `Thread` fixture is migrated from `isPinned
 `section`/`sectionEnteredAt` to match the 0.147.0 shape (mirroring upstream's own fixture fix). The
 turn-level `outputSchema` forward — the reason this fork exists — is untouched.
 
-Scored **minor**: the published package gains a backward-compatible ACP capability (goal
-replacement control) plus the codex 0.147.0 runtime feature bump, consistent with how the goal
-extension's introduction was versioned.
+Scored **patch**: this is an upstream-tracking maintenance resync, not a new fork-owned capability.
+The fork's own published contract — the turn-level `outputSchema` forward that is the sole reason
+`@automatalabs/codex-acp` is published — is untouched, and every folded-in delta is
+backward-compatible: codex 0.147.0 is a runtime/type regeneration (the `turn/start` and
+`thread/start` surfaces we forward against are unchanged), #376 *refines* the provider-neutral goal
+extension that was already introduced and versioned (minor, 1.7.0) rather than adding a new
+extension, and #377 is a Windows `cwd`-filter bugfix. This matches the repo's patch precedent for
+focused upstream resyncs that carry runtime bumps and refinements without extending a fork-owned
+surface (e.g. `0e4727e`, the #374 goal-resume fix, and `193714b`, the codex 0.146.0 resync).
