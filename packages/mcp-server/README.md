@@ -652,7 +652,7 @@ The examples below run against one workspace, `/work/acme`, in sequence — the 
 
 The eval **resolved** — a `const` declaration resolves with the guest value `undefined`, which previews as the string `"undefined"`, so `result` is `"undefined"`. The `agent(...)` call took id `c1` and keeps running server-side, listed in `pending`. (An eval carries no `result` field when it **suspends** — e.g. `const x = await agent(...)` or `await checkpoint(...)`, where `pending` lists the id and there is no completion value yet — or when it **throws, rejects, syntax-errors, or is interrupted**.)
 
-**`wait`** blocks server-side until the target calls settle (or `timeoutMs` elapses), then returns the **same shape as `eval`** — including any console output drained by its pumps — plus `drained` and `timedOut` (`timedOut === !drained`). On timeout the text appends `(still running — wait timed out after N ms)`; call `wait` again to keep waiting. It absorbs client tool-call timeouts.
+**`wait`** blocks server-side until the target calls settle (or `timeoutMs` elapses), then returns the **same shape as `eval`** — including any console output drained by its pumps — plus `drained` and `timedOut` (`timedOut === !drained`). The one shape difference: `wait` **never carries `result`**. It renders settlement, drained output, pending, and checkpoints — not a completion value — so the inherited optional `result` field is never populated on a `wait` result, even though the type permits it. On timeout the text appends `(still running — wait timed out after N ms)`; call `wait` again to keep waiting. It absorbs client tool-call timeouts.
 
 ```json
 { "action": "wait", "projectDir": "/work/acme", "ids": ["c1"], "timeoutMs": 60000 }
@@ -724,7 +724,7 @@ A refused snapshot (see [Durability](#the-workspace-project-model-and-durability
 
 ### Output
 
-Every result carries the machine-readable `structuredContent` below — the published `outputSchema`, a `oneOf` over the six variants — alongside the bounded text. The fields present on each variant are exactly those listed; the discriminator forbids any other top-level field.
+Every result carries the machine-readable `structuredContent` below — a `oneOf` over the six variants, published as the tool's `outputSchema` — alongside the bounded text. The interfaces below are the shapes the tool **emits at runtime**: its Zod refinement admits each variant with exactly the fields listed and no other. The published JSON-Schema `outputSchema` is a deliberately **looser** projection of the same union: its per-branch guard forbids only an enumerated vocabulary of variant fields, and that vocabulary omits `referenced`, so the schema permits `referenced` on *every* branch — `interrupt`/`reset`/`error` included — and it types `reset`'s `dropped` as `boolean`, not the literal `true`. No runtime path emits either looser shape; a host that validates against the published schema alone gets those two extra degrees of freedom the emitted results never use.
 
 ```ts
 type ReplToolOutput =
@@ -746,6 +746,9 @@ interface ReplEvalResult {
 
 interface ReplWaitResult extends Omit<ReplEvalResult, "action"> {
   action: "wait";
+  // `result?` is inherited from ReplEvalResult, but Broker.renderWaitResult never sets it:
+  // a wait reports settlement + drained output, never a completion value. `result` is
+  // absent on every wait result (the field survives here only through the `extends`).
   drained: boolean;             // the targets settled within the bound
   timedOut: boolean;            // === !drained
 }
@@ -819,7 +822,7 @@ interface ReplInterruptResult {
   };
 }
 
-interface ReplResetResult { action: "reset"; projectDir: string; dropped: true; }
+interface ReplResetResult { action: "reset"; projectDir: string; dropped: true; }  // runtime always emits dropped: true; the published schema types this field boolean
 
 interface ReplErrorResult {     // isError: true — a refused snapshot (eval/wait/interrupt; a named status reports refusal via its status variant instead) or a missing project context (the stateful actions eval/wait/interrupt/reset; status never takes this path)
   // The enum lists "status" for schema completeness only — no runtime path emits an error variant for it.
@@ -869,7 +872,7 @@ Every `console.log` value is **captured inside the VM** as `$1`, `$2`, … via `
 [$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}
 ```
 
-So the orchestrator slices deeper in a later eval — `console.log($14.sections.map(s => s.title))` — instead of re-running work. Cloneable data — plain objects, arrays, `Map`/`Set`/`Date`/`RegExp`/`Error`/`ArrayBuffer`/typed arrays — is preserved whole. What `structuredClone` cannot take is *not* dropped from the graph: an iterative marker-copy fallback substitutes a typed marker (`{ __unclonable__: "function" | "symbol" | "promise" | "weakmap" | "weakset" | "weakref" | "unfreezable", description? }`) for functions, symbols, promises, weak collections, and hostile or otherwise unfreezable subgraphs — so `$N` preserves the value's *shape* with those specific pieces stood in for by markers, rather than either failing or silently losing the surrounding structure. Nothing cloneable is lost by logging, and nothing floods the client's context by being logged.
+So the orchestrator slices deeper in a later eval — `console.log($14.sections.map(s => s.title))` — instead of re-running work. Cloneable data — plain objects, arrays, `Map`/`Set`/`Date`/`RegExp`/`Error`/`ArrayBuffer`/typed arrays — is preserved whole. What `structuredClone` cannot take is *not* dropped from the graph: an iterative marker-copy fallback substitutes a typed marker (`{ __unclonable__: "function" | "symbol" | "promise" | "weakmap" | "weakset" | "weakref" | "unfreezable" | "thrown", description? }`) for functions, symbols, promises, weak collections, hostile or otherwise unfreezable subgraphs, and any element, property, or enumeration whose read *throws* — a getter, a proxy `get`/`ownKeys` trap, or a hostile container iterator, recorded as `"thrown"` — so `$N` preserves the value's *shape* with those specific pieces stood in for by markers, rather than either failing or silently losing the surrounding structure. Nothing cloneable is lost by logging, and nothing floods the client's context by being logged.
 
 The two surfaces are capped **independently**:
 

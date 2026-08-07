@@ -1494,7 +1494,7 @@ type ReplToolInput =
   | { action: "reset"; projectDir?: string };
 ```
 
-`projectDir` is required on the shared daemon for every action **except `status`**, and defaults to the server's own project on `--in-process`. A discriminator rejects a missing required field or an irrelevant known one (`reset` with `code`, `status` with `ids`) as Invalid Params (`-32602`). Every result carries both `structuredContent` (the published `outputSchema`, a `oneOf` over the six variants below) and bounded text:
+`projectDir` is required on the shared daemon for every action **except `status`**, and defaults to the server's own project on `--in-process`. A discriminator rejects a missing required field or an irrelevant known one (`reset` with `code`, `status` with `ids`) as Invalid Params (`-32602`). Every result carries both `structuredContent` and bounded text. The union below is the shape the tool **emits** at runtime (its Zod refinement admits exactly these per-variant fields); the published `outputSchema` JSON Schema is a looser projection — it permits `referenced` on every branch (not only eval/wait/status) and types `reset`'s `dropped` as `boolean` rather than the literal `true`, though no runtime path emits either of those looser shapes:
 
 ```ts
 type ReplToolOutput =
@@ -1509,7 +1509,7 @@ type ReplToolOutput =
       truncated?: TruncatedRecord; referenced?: Record<string, unknown[]> }
   | { action: "interrupt"; projectDir: string;
       interrupt: { outcome: "targeted" | "refused-idle" | "cancelled" | "idle" | "failed" | "none"; callId?: string } }
-  | { action: "reset"; projectDir: string; dropped: true }
+  | { action: "reset"; projectDir: string; dropped: true } // runtime always dropped: true; published schema types it boolean
   | { action: "eval" | "wait" | "status" | "interrupt" | "reset"; projectDir?: string; error: string }; // isError: true
 
 interface CheckpointSummary { id: string; question: string } // question previewed (double-quoted, head+tail past 200 chars)

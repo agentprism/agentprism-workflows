@@ -894,8 +894,11 @@ in-flight promise — one VM and broker per project, the single-writer persisten
 the broker's state-changing-boundary sink is attached so every eval and every settlement
 drain that changed VM state persists. A stored snapshot that REFUSES on first touch
 (corrupt/truncated, format-version bump, or a wasm-hash mismatch naming both hashes) is
-CONTAINED: the refusal is surfaced loudly in every `repl` result and `reset` clears the
-store — the daemon never crash-loops and never silently discards the data. The workspace
+CONTAINED and surfaced per action: `eval`/`wait`/`interrupt` return the `isError` error
+variant, a named `status` reports it through its status variant (`state: "refused"` with a
+`restoreError`), and `reset` clears the store outright (dropping the refused snapshot, so it
+surfaces no refusal at all) — the daemon never crash-loops and never silently discards the
+data. The workspace
 therefore survives daemon restarts: this is the production wiring the phase-D review
 demanded (`ReplWorkspaceStore` used to be exported/tested only).
 
