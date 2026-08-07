@@ -231,7 +231,7 @@ In `packages/mcp-server/test/authoring-prompt.test.ts`:
 
 1. Keep the byte-for-byte generator drift assertion.
 2. Add sentinels asserting that `AUTHORING_PROMPT_CONTENT` contains the canonical one-line rule, `agent-definition`, `maxRounds: 6`, `maxRounds: 8`, and the explanation that only rounds 7 and 8 run live.
-3. Keep `the prompt adds zero model-facing tool surface` unchanged so the work cannot accidentally add a second MCP tool.
+3. Keep `the prompt adds zero model-facing tool surface` unchanged so the `author-workflow` **prompt** never becomes a tool. (This is about the prompt only; the server does separately register a second model-facing tool, `repl`, as a deliberate feature — see the pack [README](README.md)'s historical-scope note. The invariant here is that the authoring prompt adds none.)
 
 Verification commands for the implementation PR are the existing package scripts:
 

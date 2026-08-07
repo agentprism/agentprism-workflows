@@ -108,11 +108,12 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
-    // The model-facing surface is `workflow` plus the app-only `workflow-events` poller
-    // (visibility ["app"] — Apps hosts keep it out of the model's tool loop; see app-ui.ts).
+    // The model-facing surface is `workflow` plus `repl` (the phase-D persistent
+    // workspace tool) plus the app-only `workflow-events` poller (visibility
+    // ["app"] — Apps hosts keep it out of the model's tool loop; see app-ui.ts).
     assert.deepEqual(
       tools.map((candidate) => candidate.name).sort(),
-      ["workflow", "workflow-events"],
+      ["repl", "workflow", "workflow-events"],
     );
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");

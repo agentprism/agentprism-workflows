@@ -1,0 +1,5 @@
+---
+"@automatalabs/codex-acp": minor
+---
+
+The `_session/loaded_turn` vendor extension (the `_session/steering` precedent): turn-TERMINAL state for loaded sessions — the re-attach arm's authoritative completion evidence. Advertised at initialize as `_meta: { steering: { supported: true }, loadedTurn: { supported: true } }`. `_session/loaded_turn/query { sessionId }` answers whether the loaded session's founding turn is still running right now: `running` while a turn executes in-process (`currentTurnId` set — the query arms a one-shot watch that pushes `_session/loaded_turn/ended { sessionId, stopReason? | error? }` when that turn completes, with the ACP stop reason for completed/interrupted turns or the turn's error for failed ones), `completed` when the loaded thread's last turn status is `completed` (the replayed final message is the founding turn's FINAL message — authoritative), and `interrupted` for `inProgress`/`interrupted`/`failed` last turns (nothing is running — re-issue is safe). The thread's last turn status is captured on the session state at `session/load`; the ended push is emitted from the codex event handler's `turn/completed` path.

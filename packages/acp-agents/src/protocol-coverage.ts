@@ -7,7 +7,7 @@ import type {
   AuthMethodTerminal,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
-import { SESSION_STEERING_METHOD } from "./acp-client.js";
+import { LOADED_TURN_QUERY_METHOD, SESSION_STEERING_METHOD } from "./acp-client.js";
 
 type ValueOf<T> = T[keyof T];
 type ClientMethod = ValueOf<typeof CLIENT_METHODS>;
@@ -187,7 +187,13 @@ export interface AuthMetaMatrixRow {
 
 /** The §3.6 auth `_meta` matrix as executable rows — the exact surfaces §4.6.4 item 4 enumerates
  *  (claude gateway/terminal-auth, codex api-key/gateway/DEFAULT_AUTH_REQUEST, opencode terminal-auth),
- *  plus the codex tool-approval `persist` and the cross-agent provider-env passthrough. Each
+ *  plus the codex tool-approval `persist` and the cross-agent provider-env passthrough. The
+ *  loaded-turn extension rows (turn-terminal state for loaded sessions) record which servers
+ *  SERVE the extension: claude and opencode do not advertise it, and the re-attach seam's
+ *  observation path classifies their loaded turns authoritatively instead (see
+ *  `InteractiveSession.awaitCurrentTurn` — the connection-death contract makes the replay
+ *  probe authoritative for the VERIFIED BUILT-INS; phase-F review round 2, restricted to the
+ *  built-in instances in round 3). Each
  *  `capability` is a literal that MUST appear in spec §3.6; `docs-drift.test.ts` asserts that lockstep,
  *  and (where `distProbe` is set) `protocol-coverage.test.ts` asserts the literal is still present in
  *  the installed agent dist — so neither the spec nor an agent bump can silently drift a `_meta`
@@ -210,11 +216,21 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
 
 /** One executable disposition for a vendor extension that is intentionally absent from the
  *  standard SDK AGENT_METHODS table. `typed-unsupported` means the public wrapper exists and
- *  rejects from initialize negotiation before emitting a wire request. */
+ *  rejects from initialize negotiation before emitting a wire request. The loaded-turn
+ *  extension (turn-terminal state for loaded sessions) is only served by the two in-repo
+ *  servers (pi-acp, codex-acp); claude and opencode do not advertise it — the seam then
+ *  classifies the loaded session's founding turn through the OBSERVATION path instead (the
+ *  post-load continuation watch plus the replay probe under the connection-death contract —
+ *  see `InteractiveSession.awaitCurrentTurn`; phase-F review round 2: the old degradation
+ *  released the loaded session and re-issued the call, which can duplicate a still-running
+ *  turn; a possibly-running call is never re-issued). The replay classification is restricted
+ *  to the VERIFIED BUILT-IN instances (`connectionDeathVerified`) — a custom backend's quiet
+ *  observation window is not terminal evidence and degrades to the keep-attached
+ *  still-running wait (phase-F review round 3). */
 export interface AcpExtensionSupportMatrixRow {
   readonly agent: string;
-  readonly method: typeof SESSION_STEERING_METHOD;
-  readonly disposition: "supported" | "typed-unsupported";
+  readonly method: typeof SESSION_STEERING_METHOD | typeof LOADED_TURN_QUERY_METHOD;
+  readonly disposition: "supported" | "typed-unsupported" | "not-advertised";
   /** Installed distributions whose method + initialize advertisement are probed by the protocol
    *  coverage suite. Pi is workspace-owned and covered in its package tests instead. */
   readonly distProbe?: "claude" | "codex";
@@ -241,6 +257,28 @@ const ACP_EXTENSION_SUPPORT_MATRIX_ROWS = [
   {
     agent: "pi",
     method: SESSION_STEERING_METHOD,
+    disposition: "supported",
+  },
+  {
+    agent: "claude",
+    method: LOADED_TURN_QUERY_METHOD,
+    disposition: "not-advertised",
+    distProbe: "claude",
+  },
+  {
+    agent: "codex",
+    method: LOADED_TURN_QUERY_METHOD,
+    disposition: "supported",
+    distProbe: "codex",
+  },
+  {
+    agent: "opencode",
+    method: LOADED_TURN_QUERY_METHOD,
+    disposition: "not-advertised",
+  },
+  {
+    agent: "pi",
+    method: LOADED_TURN_QUERY_METHOD,
     disposition: "supported",
   },
 ] satisfies readonly AcpExtensionSupportMatrixRow[];

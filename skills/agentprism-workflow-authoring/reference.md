@@ -204,8 +204,10 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) is the canonical way an agent
 runs an authored script; registration and the per-action contracts are in the Running workflows
-guide section. The `workflow` tool is the server's whole tool surface: run/resume/inspect/await/stop
-are action branches, not separate tools, and this input does not resolve a saved workflow name. A
+guide section. The `workflow` tool is the server's whole *workflow* surface: run/resume/inspect/await/stop
+are action branches, not separate tools, and this input does not resolve a saved workflow name.
+(The server also registers a second, separate model-facing tool, `repl`, for interactive REPL
+orchestration — outside this authoring guide's scope.) A
 run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
 logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as
 a slash command) also get this entire guide from the server itself as the **`author-workflow`**
@@ -222,7 +224,7 @@ Embedding hosts drive the same contract directly through the SDK — `runDynamic
 `WorkflowManager` from `@automatalabs/workflows`, with `exec` limits (`tokenBudget`, `maxAgents`,
 `concurrency`, `agentTimeoutMs`, `agentRetries`), a live `confirm` checkpoint channel, and
 `exec.resumeFromRunId` for edited-script resume. See `docs/api.md` in the repository. The shapes
-below are the MCP tool surface, which is what script authors interact with.
+below are the `workflow` tool's MCP surface, which is what script authors interact with.
 
 Exact MCP tool input/output types:
 

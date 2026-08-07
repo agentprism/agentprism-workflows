@@ -35,6 +35,13 @@ export interface DaemonInfo {
   url: string;
   startedAt: string;
   envFingerprint: string;
+  /** The REPL eval-break relay's loopback endpoint (see
+   *  `repl-engine`'s `EvalBreakChannel`): the shim fires the interrupt
+   *  tool's no-id break here while the daemon's main thread is blocked
+   *  in a synchronous eval. Absent on older daemons (the shim then
+   *  skips the out-of-band fire and the per-eval deadline remains the
+   *  bound). */
+  replBreakUrl?: string;
 }
 
 export interface SpawnLock {

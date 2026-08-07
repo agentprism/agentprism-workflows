@@ -27,9 +27,12 @@ import type {
     ThreadGoalClearedNotification,
     ThreadGoalUpdatedNotification,
     ThreadTokenUsageUpdatedNotification,
+    Turn,
+    TurnCompletedNotification,
     TurnPlanUpdatedNotification,
     WarningNotification
 } from "./app-server/v2";
+import {pushLoadedTurnEnded} from "./AcpExtensions";
 import type { McpStartupCompleteEvent } from "./app-server";
 import {toTokenCount} from "./TokenCount";
 import {
@@ -95,6 +98,7 @@ export class CodexEventHandler {
     private readonly session: ACPSessionConnection;
     private planUpdateTimer: ReturnType<typeof setTimeout> | null = null;
     private planUpdateChain: Promise<void> = Promise.resolve();
+    private readonly loadedTurnEndedScheduler: ((turn: Turn) => void) | undefined;
     private disposed = false;
     private readonly seenReasoningDeltaItemIds = new Set<string>();
     private readonly terminalCommandIds = new Set<string>();
@@ -109,11 +113,68 @@ export class CodexEventHandler {
         // Fork-owned parameter LAST so upstream call sites (and their tests) keep positional
         // compatibility with the canonical (connection, sessionState, supportsPlanUpdates) shape.
         readFileContent?: FileContentReader,
+        // The `_session/loaded_turn/ended` push scheduler (review round 6):
+        // when provided, the terminal marker is delivered through it — the
+        // server routes it onto the load-time watcher's per-session update
+        // chain so it can never reach the ACP client before the turn's
+        // final text deltas. Absent (tests, direct constructions): the
+        // direct push.
+        loadedTurnEndedScheduler?: (turn: Turn) => void,
     ) {
         this.sessionState = sessionState;
         this.supportsPlanUpdates = supportsPlanUpdates;
         this.readFileContent = readFileContent;
+        this.loadedTurnEndedScheduler = loadedTurnEndedScheduler;
         this.session = new ACPSessionConnection(connection, sessionState.sessionId);
+    }
+
+    /**
+     * The `_session/loaded_turn/ended` push (see `AcpExtensions.ts`): when
+     * a `_session/loaded_turn/query` answered `running` for this session,
+     * the client is waiting for that turn's authoritative end — this
+     * fires the ended notification when the watched turn completes, with
+     * the ACP stop reason for a completed/interrupted turn or the turn's
+     * error for a failed one, and clears the watch. The watch targets the
+     * LOADED active turn when one is recorded (its `turn/completed` —
+     * another turn's completion is not its terminal marker); otherwise
+     * any completing turn settles it (the in-process arm — the watched
+     * turn is the one `currentTurnId` tracks). Best-effort: a failing
+     * notification must not break turn processing. When the server
+     * supplied a scheduler, the push rides the load-time watcher's
+     * per-session update chain (review round 6) — the terminal marker
+     * must never reach the client before the turn's final text deltas,
+     * or the re-attach seam durably settles partial output.
+     */
+    private notifyLoadedTurnEnded(notification: TurnCompletedNotification): void {
+        const loadedActiveTurnId = this.sessionState.loadedActiveTurnId;
+        // The match is by id ONLY when the loaded last turn itself was
+        // `inProgress` (its id IS the active turn's id). A thread whose
+        // runtime status is `active` with an ended last turn has an
+        // active turn whose id is NOT in the loaded turns list — ANY
+        // completion settles it (phase-D review round 5: the id filter
+        // used to ignore the actual active turn's differently identified
+        // completion, so the `running` answer never terminated).
+        if (
+            !this.sessionState.loadedActiveTurnIsAny &&
+            loadedActiveTurnId !== null &&
+            notification.turn.id !== loadedActiveTurnId
+        ) {
+            return;
+        }
+        if (loadedActiveTurnId !== null || this.sessionState.loadedActiveTurnIsAny) {
+            // The loaded active turn ended: its terminal status becomes
+            // the loaded thread's authoritative last-turn status, and the
+            // active-turn detection clears (a later query classifies
+            // consistently).
+            this.sessionState.loadedLastTurnStatus = notification.turn.status;
+            this.sessionState.loadedActiveTurnId = null;
+            this.sessionState.loadedActiveTurnIsAny = false;
+        }
+        if (this.loadedTurnEndedScheduler !== undefined) {
+            this.loadedTurnEndedScheduler(notification.turn);
+            return;
+        }
+        pushLoadedTurnEnded(this.session, this.sessionState, notification.turn);
     }
 
     getFailure(): RequestError | null {
@@ -186,6 +247,7 @@ export class CodexEventHandler {
                 await this.flushPendingPlanUpdates();
                 this.clearPlanTurnState();
                 this.sessionState.currentTurnId = null;
+                this.notifyLoadedTurnEnded(notification.params);
                 return null;
             case "thread/tokenUsage/updated":
                 return this.createUsageUpdate(notification.params);

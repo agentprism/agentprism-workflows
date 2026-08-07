@@ -25,7 +25,11 @@ import { installPermissionWrapper } from "./permissions.js";
 import type { McpBridge, McpResultProjection } from "./mcp-bridge.js";
 import { ChildCleanupFailure, type ChildProcessRegistrySlot } from "./child-process-registry.js";
 import type { SteeringRequest, SteeringResponse } from "./steering.js";
-
+import {
+  LOADED_TURN_ENDED_METHOD,
+  type LoadedTurnEndedNotification,
+  type LoadedTurnStatus,
+} from "./loaded-turn.js";
 interface ActiveTurn {
   controller: AbortController;
   settlement: Promise<void>;
@@ -93,6 +97,13 @@ export class PiSession {
   private cleanupGeneration: CleanupGeneration | undefined;
   private resourceDisposePromise: Promise<void> | undefined;
   private bridgeClosePromise: Promise<void> | undefined;
+  /** The `_session/loaded_turn` extension's watch flag: set when a
+   *  `loadedTurnStatus()` query answered `running` (a client is waiting
+   *  for that turn's authoritative end), cleared — and the
+   *  `_session/loaded_turn/ended` notification sent — when the turn
+   *  finishes for any reason (response outcome with its stop reason, or
+   *  a failure with its error). */
+  private loadedTurnReportedRunning = false;
 
   constructor(options: PiSessionOptions) {
     this.sessionId = options.sessionId;
@@ -135,6 +146,39 @@ export class PiSession {
 
   get busy(): boolean {
     return this.activeTurn !== undefined || this.configReserved || this.closing;
+  }
+
+  /**
+   * The `_session/loaded_turn/query` answer — the authoritative
+   * founding-turn terminal classification for a loaded session (see
+   * `packages/pi-acp/src/loaded-turn.ts`):
+   *
+   * - `running` when a turn is executing in this process right now (the
+   *   client then waits for the `_session/loaded_turn/ended` push — the
+   *   watch flag is armed here so the turn's finish sends it),
+   * - `completed` when the session journal's last message entry is an
+   *   assistant message (pi persists every complete LLM message
+   *   atomically at `message_end`, so a completed turn always leaves an
+   *   assistant leaf and the replay's trailing assistant message is the
+   *   turn's FINAL message — authoritative, never a quiet-gap guess),
+   * - `interrupted` otherwise (the journal shows an interrupted or
+   *   abandoned turn — no turn is running, so re-issue is safe).
+   */
+  loadedTurnStatus(): LoadedTurnStatus {
+    const turn = this.activeTurn;
+    if (turn !== undefined && !turn.completed && !this.closing) {
+      this.loadedTurnReportedRunning = true;
+      return "running";
+    }
+    const leaf = this.manager.getLeafEntry();
+    if (
+      leaf !== undefined &&
+      leaf.type === "message" &&
+      leaf.message.role === "assistant"
+    ) {
+      return "completed";
+    }
+    return "interrupted";
   }
 
   configOptions() {
@@ -233,6 +277,26 @@ export class PiSession {
     turn.releaseBoundary?.();
     turn.releaseBoundary = undefined;
     if (this.activeTurn === turn) this.activeTurn = undefined;
+    // The `_session/loaded_turn` extension's authoritative end push: a
+    // client that was told this turn was `running` at query time gets the
+    // ended notification now — with the turn's stop reason (response
+    // outcome) or its error (failure), never both. Best-effort: a
+    // failing notification must not break the turn's settlement. The
+    // push is ORDERED behind the turn's final update pump (review round
+    // 6): the last deltas were only enqueued (the pump delivers them
+    // asynchronously), and the re-attach seam settles with the
+    // accumulated text at the terminal marker — a marker delivered
+    // before the final chunk would durably settle PARTIAL text.
+    if (this.loadedTurnReportedRunning) {
+      this.loadedTurnReportedRunning = false;
+      const notification: LoadedTurnEndedNotification = "response" in outcome
+        ? { sessionId: this.sessionId, stopReason: outcome.response.stopReason }
+        : { sessionId: this.sessionId, error: normalizeTurnError(outcome.error) };
+      void this.drain()
+        .catch(() => undefined)
+        .then(() => this.client.notify(LOADED_TURN_ENDED_METHOD, notification))
+        .catch(() => undefined);
+    }
     const generation = this.cleanupGeneration;
     if (generation?.resumeRefreshesOnSettlement && generation.mode === "cancel-only") {
       this.cleanupGeneration = undefined;
@@ -777,4 +841,21 @@ export class PiSession {
       console.error("pi-acp poisoned-session cleanup error:", error);
     });
   }
+}
+
+/** Normalize a turn's failure into the loaded-turn ended notification's
+ *  `{ name, message }` error shape (best-effort — the notification
+ *  carries the turn's error verbatim-ish, never the whole stack). */
+function normalizeTurnError(error: unknown): { name: string; message: string } {
+  if (error !== null && typeof error === "object") {
+    const candidate = error as { name?: unknown; message?: unknown };
+    return {
+      name: typeof candidate.name === "string" ? candidate.name : "Error",
+      message:
+        typeof candidate.message === "string"
+          ? candidate.message
+          : String(candidate.message ?? error),
+    };
+  }
+  return { name: "Error", message: String(error) };
 }

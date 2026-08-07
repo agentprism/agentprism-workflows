@@ -1263,7 +1263,8 @@ Additive minor across four packages; the two host-facing library packages take n
   (`workflow-tool-output.ts:46-55`, `kind` at `:53`; consumed via `executionDetailsShape.fallbacks`
   `:179` in `executionResultSchema` `:184` and `workflowToolOutputShape` `:259`; projected at `:437`;
   `toWorkflowToolResult` `:444`), so a continuation notice can pass through the MCP host. No new
-  **input**; the single `workflow` tool's inputs are unchanged. This widening lands **before** the
+  **input**; the `workflow` tool's inputs are unchanged (the server also registers a separate
+  `repl` tool, unaffected by this spec). This widening lands **before** the
   engine activates the behavior (§8) so no stage ever emits a `kind` the MCP boundary would reject.
 - **`@automatalabs/workflows`** (patch/transitive): no new inputs; it picks up the behavior through
   the engine.

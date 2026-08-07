@@ -18,6 +18,12 @@ export class ACPSessionConnection {
             update: update
         });
     }
+
+    /** Vendor-extension notification (e.g. `_session/loaded_turn/ended`),
+     *  stamped with this session's id by the caller's params. */
+    async notify<Params = unknown>(method: string, params: Params) {
+        await this.connection.notify(method, params);
+    }
 }
 
 export type UpdateSessionEvent = SessionNotification["update"];

@@ -296,7 +296,8 @@ Rejected for this label-only grammar. Filesystem glob semantics (`**`, dotfiles,
 
 - `@automatalabs/workflows`: **minor**. `ValidateWorkflowOptions.mockAnswers`, two CLI flags, eight exported mock-answer input/report types, `ValidatedAgentCall.mockAnswer`, and `dryRun.mockAnswers` are additive. Existing calls without `mockAnswers` preserve fabrication, concurrency, report-field presence, and exit behavior. The programmatic function gains a new `TypeError` rejection path only when a caller supplies the new option with an invalid runtime value; SDK embedders using untyped input should catch that option-contract error, while invalid workflow scripts continue to resolve to reports. Move the already-used workspace version of `typebox` into runtime dependencies. Add one Changesets minor entry.
 - `@automatalabs/mcp-server`: **patch**. This item adds no mock-answer field to the `workflow` tool
-  and keeps the single-tool surface; only the generated public `author-workflow` prompt gains
+  and keeps its surface unchanged (`workflow` was then the server's single model-facing tool — see
+  the pack [README](README.md)'s historical-scope note); only the generated public `author-workflow` prompt gains
   validator instructions, and its workspace dependency will point at the new workflows minor. The
   coordinated run/inspect/await changes remain owned by specs 01 and 02. Add a Changesets patch entry
   (or the equivalent patch dependency release produced by the repo's

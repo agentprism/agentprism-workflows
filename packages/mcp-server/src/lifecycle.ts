@@ -9,6 +9,31 @@ export type McpServerShutdownReason = "stdin-close" | "stdin-end" | "transport-c
 /** A small server-owned admission gate, kept separate from the MCP transport lifecycle. */
 export interface WorkflowServerControl {
   stopAcceptingWork(): void;
+  /** The REPL eval-break relay address (the out-of-band interrupt's
+   *  fire side — phase-F review round 3: the in-process/library server
+   *  owns an eval-break channel by default, so the documented no-id
+   *  interrupt for a SYNCHRONOUSLY running eval is deliverable in every
+   *  supported mode; a host whose main thread is blocked in a sync eval
+   *  POSTs `{ key: projectDir }` here from another thread, exactly like
+   *  the daemon mode's shim does). Resolves when the relay worker is
+   *  listening. */
+  replBreakUrl(): Promise<string>;
+  /** The single-project server's own project key — the context the
+   *  `repl` tool resolves when its projectDir argument is omitted
+   *  (phase-F review round 4: the relay stdio transport fires the
+   *  out-of-band eval-break with this key for an omitted-projectDir
+   *  interrupt, so the documented optional-projectDir interrupt works
+   *  for a synchronously running eval). Undefined in daemon mode
+   *  (projectDir is required there). OPTIONAL for minimal third-party
+   *  implementations. */
+  replDefaultProjectDir?(): string | undefined;
+  /** Dispose the SERVER-OWNED eval-break channel (a caller-provided
+   *  channel stays the caller's to dispose — the daemon owns its own).
+   *  Idempotent; the channel's worker is unref'd, so a process can exit
+   *  without this call. OPTIONAL for minimal third-party server
+   *  implementations that don't own a channel (the lifecycle calls it
+   *  defensively). */
+  disposeReplEvalBreakChannel?(): Promise<void>;
 }
 
 interface DisposableRunner {
@@ -133,6 +158,12 @@ export function installMcpServerLifecycle(options: McpServerLifecycleOptions): M
 
       shutdownPromise = disposeRunnerWithDeadline(options.runner, deadlineMs).then(() => {
         removeListeners();
+        // The server-owned eval-break channel (the in-process mode's
+        // default channel) dies with the server; a caller-provided
+        // channel (the daemon's) is the caller's to dispose. Fire-and-
+        // forget: the exit below is authoritative, and the channel's
+        // worker is unref'd.
+        void options.server.disposeReplEvalBreakChannel?.().catch(() => undefined);
         processHandle.exit(exitCodeFor(reason));
       });
       return shutdownPromise;

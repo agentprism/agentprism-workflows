@@ -37,6 +37,14 @@ const authOnceSentinel = process.env.AGENTPRISM_FAKE_AUTH_ONCE_SENTINEL;
 const hasScenarioModes = Object.prototype.hasOwnProperty.call(scenario, "modes");
 const hasLifecycleSupport = scenario.lifecycleSupport === true;
 const hasLoadSessionSupport = scenario.loadSessionSupport ?? hasLifecycleSupport;
+const hasLoadedTurnSupport =
+  scenario.loadedTurnSupport === true ||
+  (scenario.loadSession !== undefined &&
+    scenario.loadSession !== null &&
+    typeof scenario.loadSession === "object" &&
+    (scenario.loadSession.loadedTurn !== undefined ||
+      scenario.loadSession.turnEnded !== undefined ||
+      scenario.loadSession.loadedTurnQueryError !== undefined));
 const hasResumeSessionSupport = scenario.resumeSessionSupport ?? hasLifecycleSupport;
 const hasMcpAcpSupport = scenario.mcpAcpSupport === true;
 const hasMcpHttpSupport = scenario.mcpHttpSupport === true;
@@ -277,6 +285,7 @@ class FakeAgent {
         ...(hasProviderSupport ? { providers: {} } : {}),
         ...(hasLogoutSupport ? { auth: { logout: {} } } : {}),
       },
+      ...(hasLoadedTurnSupport ? { _meta: { loadedTurn: { supported: true } } } : {}),
       ...(Array.isArray(scenario.authMethods) ? { authMethods: clone(scenario.authMethods) } : {}),
     };
   }
@@ -284,6 +293,19 @@ class FakeAgent {
   async extMethod(method, params) {
     const fixture = scenario.extensionRequest;
     record({ method: "extensionRequest", extensionMethod: method, params });
+    // The loaded-turn terminal-state query (the re-attach arm's
+    // authoritative founding-turn classification): answered from the
+    // scenario's scripted per-session loaded-turn state.
+    if (method === "_session/loaded_turn/query") {
+      if (hasLoadedTurnSupport) {
+        if (scenario.loadSession?.loadedTurnQueryError !== undefined) {
+          throw new RequestError(-32603, String(scenario.loadSession.loadedTurnQueryError));
+        }
+        const loadedTurn = scenario.loadSession?.loadedTurn ?? {};
+        return { status: loadedTurn.status ?? "interrupted" };
+      }
+      throw new RequestError(-32601, "_session/loaded_turn/query was not advertised by this agent");
+    }
     if (fixture?.method === method) {
       if (typeof fixture.delayMs === "number" && fixture.delayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, fixture.delayMs));
@@ -375,14 +397,72 @@ class FakeAgent {
         : Array.isArray(load.replay)
           ? load.replay
           : [load.replay];
-    for (const text of replay) {
-      await this.conn.sessionUpdate({
-        sessionId: params.sessionId,
-        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
-      });
+    for (const entry of replay) {
+      // A plain string replays an assistant message chunk (the historical
+      // shape); an object may carry `{ role: "user"|"assistant", text }` so
+      // a test can replay the founding turn's PROMPT (user_message_chunk)
+      // alongside its outcome — the transcript shape the re-attach arm's
+      // observability probe keys on, mirroring how a real agent replays
+      // persisted history (getSessionMessages → toAcpNotifications).
+      if (entry && typeof entry === "object") {
+        const role = entry.role === "user" ? "user" : "assistant";
+        await this.conn.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
+            content: { type: "text", text: entry.text },
+          },
+        });
+      } else {
+        await this.conn.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: String(entry) },
+          },
+        });
+      }
     }
     for (const update of Array.isArray(load.updates) ? load.updates : []) {
       await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
+    }
+    // Post-response LIVE continuation: a real agent whose founding turn is still in flight
+    // keeps streaming session/update notifications AFTER the session/load response (the
+    // replay ends at the last persisted chunk; the live turn continues). The re-attach arm
+    // observes these on the same update stream — the transcript probe must see them arrive
+    // AFTER the load response to tell "still running" from "completed while down". The
+    // response is returned immediately; the continuation streams in the background.
+    if (Array.isArray(load.continue)) {
+      for (const entry of load.continue) {
+        const afterMs = typeof entry.afterMs === "number" ? entry.afterMs : 0;
+        setTimeout(async () => {
+          try {
+            await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(entry.update) });
+          } catch {
+            // The client may have disconnected before the continuation fired; best-effort.
+          }
+        }, afterMs);
+      }
+    }
+    // The loaded-turn TERMINAL notification (the `_session/loaded_turn`
+    // extension's authoritative completion evidence): a turn classified
+    // `running` at query time ends — scripted here as `load.turnEnded`
+    // `{ afterMs, stopReason? }` (or `{ afterMs, error }`), mirroring a
+    // real agent's turn-end push after the load response.
+    const turnEnded = load.turnEnded;
+    if (turnEnded) {
+      const afterMs = typeof turnEnded.afterMs === "number" ? turnEnded.afterMs : 0;
+      setTimeout(async () => {
+        try {
+          await this.conn.notify("_session/loaded_turn/ended", {
+            sessionId: params.sessionId,
+            ...(turnEnded.stopReason !== undefined ? { stopReason: turnEnded.stopReason } : {}),
+            ...(turnEnded.error !== undefined ? { error: clone(turnEnded.error) } : {}),
+          });
+        } catch {
+          // The client may have disconnected before the notification fired; best-effort.
+        }
+      }, afterMs);
     }
     return {
       configOptions,

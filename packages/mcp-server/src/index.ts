@@ -7,10 +7,10 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createAcpRunner } from "@automatalabs/workflows";
 
 import { installMcpServerLifecycle } from "./lifecycle.js";
+import { ReplRelayStdioTransport } from "./repl-stdio-transport.js";
 import { createWorkflowServer } from "./server.js";
 
 export { BackgroundRunRegistry, createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
@@ -50,6 +50,17 @@ export type {
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
+export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
+export { capStructuredResult } from "./repl-tool.js";
+export type { ReplToolOptions } from "./repl-tool.js";
+export {
+  createReplProjectState,
+  ensureReplWorkspace,
+  disposeReplProjectState,
+  resetReplProjectState,
+} from "./repl-project.js";
+export type { ReplProjectState } from "./repl-project.js";
+export { ReplPresenceLedger } from "./repl-presence.js";
 export {
   RUN_MONITOR_RESOURCE_URI,
   WORKFLOW_EVENTS_TOOL_NAME,
@@ -78,11 +89,23 @@ export type {
  * AgentRunner, inject it into the workflow-engine via the server shell, and serve on
  * stdin/stdout. Backend auth stays with the agents' own CLI credential stores; a run that
  * hits AUTH_REQUIRED pauses and resumes (resumeFromRunId) after an out-of-band CLI login.
+ * The stdio transport is the RELAY transport (phase-F review round 3): its stdin reader
+ * lives on a worker thread that fires the server's out-of-band eval-break relay for
+ * `repl` interrupt calls, so the documented no-id interrupt works for a synchronously
+ * running eval in this mode too (the daemon mode's shim does the same from a separate
+ * process).
  */
 export async function main(): Promise<void> {
   const runner = createAcpRunner();
   const server = createWorkflowServer(runner);
-  const transport = new StdioServerTransport();
+  // The default-project-key source: the in-process server's own
+  // project — the relay fires the out-of-band break under it when a
+  // `repl` interrupt omits projectDir (the tool documents projectDir
+  // as optional in single-project mode; phase-F review round 4).
+  const transport = new ReplRelayStdioTransport(
+    () => server.replBreakUrl(),
+    () => server.replDefaultProjectDir?.(),
+  );
   await server.connect(transport);
   // Install after connect because the SDK takes transport callback ownership during connect.
   installMcpServerLifecycle({ runner, server, transport });

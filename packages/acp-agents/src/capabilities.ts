@@ -66,6 +66,12 @@ export interface NegotiatedCapabilities {
    *  top-level initialize-response `_meta.steering.supported === true` contract. This is
    *  intentionally independent of agentCapabilities._meta, which gates outgoing custom metadata. */
   supportsSteering: boolean;
+  /** Whether the agent advertises the `_session/loaded_turn` vendor extension through the
+   *  top-level initialize-response `_meta.loadedTurn.supported === true` contract: the
+   *  loaded-session founding-turn TERMINAL STATE channel (the re-attach arm's authoritative
+   *  completion evidence — see `InteractiveSession.awaitCurrentTurn`). Same strict parse and
+   *  same independence from agentCapabilities._meta as steering. */
+  supportsLoadedTurnTerminalState: boolean;
   /** Whether session/close is advertised (gates the best-effort release-time close). */
   supportsClose: boolean;
   /** Whether session/load is advertised. The current SDK keeps this as the legacy top-level
@@ -107,6 +113,9 @@ export function negotiateCapabilities(
     // Steering is an initialize-response extension advertisement. Never infer it from the
     // backend name/version or from agentCapabilities._meta (the separate outgoing-meta gate).
     supportsSteering: advertisesSteering(response._meta),
+    // The loaded-turn terminal-state extension rides the same initialize-response `_meta`
+    // advertisement channel (strict `loadedTurn.supported === true`), never inferred.
+    supportsLoadedTurnTerminalState: advertisesLoadedTurn(response._meta),
     supportsClose: advertised(sessionCapabilities?.close),
     supportsLoadSession:
       agent.loadSession === true || advertised((sessionCapabilities as Record<string, unknown> | undefined)?.load),
@@ -121,6 +130,20 @@ export function negotiateCapabilities(
       : undefined,
     gatedKeys: customCapabilities ? [...customCapabilities.gatedKeys] : undefined,
   };
+}
+
+/** Strict, defensive parser for the top-level loaded-turn extension advertisement. Only the
+ *  exact boolean true is support; absent, null, malformed, array, string, numeric, and truthy
+ *  values are all unsupported. */
+function advertisesLoadedTurn(meta: InitializeResponse["_meta"]): boolean {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return false;
+  const loadedTurn = (meta as Record<string, unknown>).loadedTurn;
+  return Boolean(
+    loadedTurn &&
+      typeof loadedTurn === "object" &&
+      !Array.isArray(loadedTurn) &&
+      (loadedTurn as Record<string, unknown>).supported === true,
+  );
 }
 
 /** Strict, defensive parser for the top-level steering extension advertisement. Only the exact

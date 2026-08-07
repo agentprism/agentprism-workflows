@@ -193,7 +193,7 @@ test("the prompt adds zero model-facing tool surface", async () => {
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
-      ["workflow", "workflow-events"],
+      ["repl", "workflow", "workflow-events"],
       "the tool list stays workflow plus the app-only events poller (visibility ['app'])",
     );
   } finally {

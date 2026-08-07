@@ -20,6 +20,9 @@ import {
   workflowHomeDir,
   type WorkflowRunResult,
 } from "@automatalabs/workflows";
+import type { ReplProjectState } from "./repl-project.js";
+import { disposeReplProjectState } from "./repl-project.js";
+import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 
 export const MAX_BACKGROUND_RUNS = 4;
 
@@ -68,6 +71,10 @@ export interface ProjectContext {
   projectDir: string;
   manager: WorkflowManager;
   backgroundRuns: BackgroundRunRegistry;
+  /** The REPL workspace's daemon state (phase D): created on first touch
+   *  of the `repl` tool, null until then — a pure-workflow project never
+   *  opens a repl store. See `src/repl-project.ts`. */
+  repl?: ReplProjectState;
 }
 
 /** The routing surface WorkflowScriptResources needs — a registry, or a single pinned store. */
@@ -193,6 +200,47 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
     let total = 0;
     for (const context of this.contexts.values()) total += context.backgroundRuns.activeCount();
     return total;
+  }
+
+  /** Dispose every context's REPL workspace: each one DRAINS with the
+   *  shutdown bound first (in-flight subagent turns settle into the VM
+   *  and snapshot; the reviewer-mandated drain-then-close posture — the
+   *  old path cancelled busy sessions on disposal) — then the broker
+   *  teardown (releasing every held ACP session) and the store close.
+   *  Called by the daemon at shutdown; the workflow managers' own
+   *  lifecycle is untouched.
+   *
+   *  ONE deadline spans the drain AND the teardown (phase-D review
+   *  round 7: the disposal used to run unbounded — a drain that failed
+   *  or consumed the whole bound then entered a teardown that awaited
+   *  hung cancel/release forever, so daemon shutdown could hang on the
+   *  exact hung backend the drain had already caught). A drain that
+   *  fails or times out leaves the teardown only the remaining bound;
+   *  an expired deadline skips straight to the disposal's bookkeeping
+   *  clear. `boundMs` defaults to the daemon's shutdown deadline (the
+   *  engine's own dispose default mirrors it). */
+  async disposeReplStates(boundMs: number = SHUTDOWN_DEADLINE_MS): Promise<void> {
+    const deadline = Date.now() + Math.max(0, boundMs);
+    for (const context of this.contexts.values()) {
+      const state = context.repl;
+      if (state === undefined) continue;
+      const broker = state.broker;
+      if (broker !== null) {
+        await broker
+          .drainForDisconnect(Math.max(0, deadline - Date.now()))
+          .catch(() => undefined);
+      }
+      // The teardown's own failures are contained here too: its op-end
+      // flush retries a boundary the drain's failed flush retained, and
+      // a second failure (the disk is still broken) must not abort the
+      // shutdown — the VM release and the store close already ran in
+      // `disposeReplProjectState`'s FINALLY path (phase-D review round
+      // 8: a disposal rejection used to skip them entirely), the
+      // persistence failure was already loud (the drain's failure), and
+      // the process is exiting anyway. The state on disk keeps the last
+      // good snapshot.
+      await disposeReplProjectState(state, Math.max(0, deadline - Date.now())).catch(() => undefined);
+    }
   }
 
   snapshot(): Array<{ projectDir: string; activeRuns: number }> {

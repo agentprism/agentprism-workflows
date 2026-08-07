@@ -53,6 +53,12 @@ export type { ProviderIntent } from "./provider-store.js";
 export { claudeAuthProfile, codexAuthProfile, opencodeAuthProfile, piAuthProfile } from "./auth/auth-profiles.js";
 export type { AuthProfile, TerminalLaunch } from "./auth/auth-profile.js";
 export { InteractiveSession } from "./interactive.js";
+export {
+  LoadedTurnFailedError,
+  LoadedTurnStillRunningError,
+  isLoadedTurnFailedError,
+  isLoadedTurnStillRunningError,
+} from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
 export { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
@@ -143,6 +149,8 @@ export {
   PI_PROCESS_SHUTDOWN_ENVELOPE_MS,
   PooledConnection,
   SESSION_STEERING_METHOD,
+  LOADED_TURN_QUERY_METHOD,
+  LOADED_TURN_ENDED_METHOD,
   SessionHandle,
   isChildCleanupError,
 } from "./acp-client.js";
@@ -152,6 +160,10 @@ export type {
   SteeringOutcome,
   SteeringRequest,
   SteeringResponse,
+  LoadedTurnQueryRequest,
+  LoadedTurnQueryResponse,
+  LoadedTurnEndedNotification,
+  LoadedTurnStatus,
 } from "./acp-client.js";
 
 export {

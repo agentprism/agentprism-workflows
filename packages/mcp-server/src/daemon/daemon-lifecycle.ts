@@ -57,14 +57,26 @@ export function installDaemonLifecycle(options: DaemonLifecycleOptions): DaemonL
       log(`[agentprism-daemon] evicted ${evicted.length} idle session(s): ${evicted.join(", ")}`);
     }
     if (options.idleTtlMs <= 0) return;
-    const busy = options.daemon.sessions.size > 0 || options.daemon.activeRunCount() > 0;
+    // Idleness means NO sessions, NO active workflow runs, AND NO active
+    // REPL client-presence drain (phase-E review rejection round 2: the
+    // drain used to be invisible to the accounting, so with the final
+    // session deleted the default 15-minute idle shutdown could fire
+    // while a last-client-disconnect drain was legitimately running
+    // toward its full session-eviction-TTL bound — and the shutdown
+    // path then replaced the drain's bound with the five-second
+    // shutdown deadline, so in-flight turns were not guaranteed to
+    // drain to completion under the documented bound).
+    const busy =
+      options.daemon.sessions.size > 0 ||
+      options.daemon.activeRunCount() > 0 ||
+      options.daemon.activeReplDrainCount() > 0;
     if (busy) {
       idleSince = undefined;
       return;
     }
     idleSince ??= Date.now();
     if (Date.now() - idleSince >= options.idleTtlMs) {
-      log(`[agentprism-daemon] idle for ${options.idleTtlMs}ms with no sessions or runs; shutting down`);
+      log(`[agentprism-daemon] idle for ${options.idleTtlMs}ms with no sessions, runs, or repl drains; shutting down`);
       void lifecycle.shutdown("idle");
     }
   }, options.reaperIntervalMs ?? REAPER_INTERVAL_MS);

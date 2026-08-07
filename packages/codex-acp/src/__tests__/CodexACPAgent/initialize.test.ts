@@ -73,6 +73,9 @@ describe('CodexACPAgent - initialize', () => {
                 steering: {
                     supported: true,
                 },
+                loadedTurn: {
+                    supported: true,
+                },
                 goal: {
                     version: 1,
                     controlMethod: "_session/goal",

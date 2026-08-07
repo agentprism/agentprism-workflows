@@ -683,6 +683,19 @@ export class CodexAcpClient {
         return ModelId.create(defaultModel.id, reasoningEffort ?? defaultModel.defaultReasoningEffort);
     }
 
+    /**
+     * Register the session's persistent event listener — the
+     * `_session/loaded_turn` load-time watcher's subscription (see
+     * `CodexAcpServer.watchLoadedTurn`). The app-server keeps ONE
+     * notification handler per session: this registration is replaced by
+     * a prompt's own subscription when a turn runs in-process, and that
+     * handler forwards the same loaded-turn terminal markers
+     * (`pushLoadedTurnEnded`), so the watch is never unobserved.
+     */
+    onSessionNotification(sessionId: string, eventHandler: (event: ServerNotification) => void): void {
+        this.codexClient.onServerNotification(sessionId, eventHandler);
+    }
+
     async subscribeToSessionEvents(
         sessionId: string,
         eventHandler: (result: ServerNotification) => void | Promise<void>,

@@ -86,6 +86,7 @@ import {
   type SessionConfigSelectOptions,
   type SessionModeState,
   type SessionNotification,
+  type SessionUpdate,
   type SetProviderRequest,
   type SetProviderResponse,
   type SetSessionConfigOptionRequest,
@@ -153,6 +154,36 @@ const CLIENT_INFO = {
 const CLAUDE_RAW_MESSAGE_METHOD = "_claude/sdkMessage";
 /** Cross-agent vendor extension for injecting content into a live prompt turn. */
 export const SESSION_STEERING_METHOD = "_session/steering" as const;
+/** Cross-agent vendor extension carrying turn-TERMINAL state for LOADED sessions (the re-attach
+ *  arm's authoritative completion evidence — see `InteractiveSession.awaitCurrentTurn`): the
+ *  `_session/loaded_turn/query` request answers whether the loaded session's founding turn is
+ *  still running at the backend ("running"), observably completed while the host was down
+ *  ("completed" — the replay's trailing assistant message is the turn's FINAL message), or ended
+ *  without a terminal message ("interrupted" — nothing is running, re-issue is safe), and the
+ *  `_session/loaded_turn/ended` notification fires when a turn that was "running" at query time
+ *  ends (with its stop reason, or its error). Backends without the extension degrade
+ *  guest-visibly through the same strict advertisement gate as steering. */
+export const LOADED_TURN_QUERY_METHOD = "_session/loaded_turn/query" as const;
+export const LOADED_TURN_ENDED_METHOD = "_session/loaded_turn/ended" as const;
+/** The founding-turn terminal classification a capable backend answers with (see the
+ *  `LOADED_TURN_QUERY_METHOD` docs). */
+export type LoadedTurnStatus = "completed" | "running" | "interrupted";
+/** Exact `_session/loaded_turn/query` wire request. */
+export interface LoadedTurnQueryRequest {
+  sessionId: string;
+}
+/** Exact `_session/loaded_turn/query` wire response. */
+export interface LoadedTurnQueryResponse {
+  status: LoadedTurnStatus;
+}
+/** Exact `_session/loaded_turn/ended` wire notification. `stopReason` is the ACP stop-reason
+ *  vocabulary for a turn that ended with a response; `error` replaces it for a turn that ended
+ *  by failing (the seam then rejects the founding call with the error instead of settling). */
+export interface LoadedTurnEndedNotification {
+  sessionId: string;
+  stopReason?: string;
+  error?: { name: string; message: string };
+}
 /** Every outcome an ACP steering agent can resolve with. */
 export type SteeringOutcome = "injected" | "startedNewTurn" | "failed";
 /** Exact `_session/steering` wire request. Optional `_meta` uses the same outgoing custom-meta
@@ -331,6 +362,58 @@ class SessionState {
   modes: SessionModeState | null | undefined;
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
+  /** The re-attach arm's transcript probe (phase D): where the LOADED
+   *  session's founding turn starts — the assistant-text length after the
+   *  LAST replayed user message (the founding turn's prompt). Tracked from
+   *  the session/update stream; only meaningful for sessions re-opened via
+   *  `session/load` (whose replay streams in BEFORE the load response). */
+  private loadedTurnStartIndex = 0;
+  /** Whether the transcript ever showed a user message (a turn started at
+   *  all — a session whose replay has none never received its prompt). */
+  private sawUserMessage = false;
+  /** The KIND of the transcript's last content event: an assistant message
+   *  chunk is a PROGRESS event, never a terminal marker by itself — the
+   *  re-attach arm's completion evidence is a terminal assistant message
+   *  on a SETTLED stream (no updates for the loaded-turn settle grace),
+   *  not a trailing chunk at an arbitrary instant (phase-D review: a
+   *  trailing chunk used to be treated as proof of completion, so partial
+   *  output of a still-streaming turn could be settled as success). Any
+   *  other trailing content (a user message, a tool call, a thought, a
+   *  plan) means the founding turn ended without a terminal message —
+   *  not observable as a successful completion. */
+  private trailingContentKind: 'assistant-message' | 'other' = 'other';
+  /** Monotonic wall-clock of the session's most recent update (the
+   *  re-attach arm's stream-settled probe — `applyUpdate` is synchronous
+   *  on the wire, so this is the authoritative last-progress instant). */
+  private lastUpdateAt = Date.now();
+  /** The re-attach arm's update watchers (woken by every session/update). */
+  private readonly updateWatchers = new Set<() => void>();
+  /**
+   * The load boundary — the phase-D review round-2 fix for the re-attach
+   * arm's completion evidence. `session/load` obliges the agent to replay
+   * the ENTIRE persisted conversation and only then resolve the request,
+   * so the transcript is complete AT load resolution; anything applied
+   * after that instant is LIVE CONTINUATION evidence of a turn still
+   * running at the backend. `markLoadBoundary()` (called by the runner
+   * synchronously after the load response) snapshots the replay-complete
+   * state, and every CONTENT update applied after the mark flips
+   * `sawPostLoadContentUpdate` — the seam's "the turn may still be
+   * running" signal. Bookkeeping updates (usage, mode, available
+   * commands, session info) are NOT continuation evidence (claude's
+   * adapter emits an `available_commands_update` right after every
+   * load).
+   */
+  private loadBoundary:
+    | { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' }
+    | null = null;
+  private sawPostLoadContentUpdate = false;
+  /** The loaded-turn TERMINAL state (the `_session/loaded_turn` extension's authoritative
+   *  completion evidence): the `_session/loaded_turn/ended` notification this session received
+   *  (a turn that was running at load ended), or null when no such notification arrived. The
+   *  seam's `awaitCurrentTurn` waits on this instead of guessing from a quiet gap. */
+  private loadedTurnEnded: { stopReason?: string; error?: { name: string; message: string } } | null = null;
+  /** The loaded-turn-ended watchers (woken by every ended notification). */
+  private readonly loadedTurnEndedWatchers = new Set<() => void>();
 
   /** `label`/`runId`/`callIndex` are carried here ONLY so the MultiplexClient can stamp them onto emitted
    *  events as context — they never affect routing or the wire request. */
@@ -380,8 +463,17 @@ class SessionState {
   }
 
   applyUpdate(update: SessionNotification["update"]): void {
+    this.lastUpdateAt = Date.now();
+    // A CONTENT update applied after the load boundary is live-continuation
+    // evidence (a turn still running at the backend). Bookkeeping update
+    // kinds never flip the flag — the seam must not mistake claude's
+    // post-load `available_commands_update` for a running turn.
+    if (this.loadBoundary !== null && isContentUpdate(update.sessionUpdate)) {
+      this.sawPostLoadContentUpdate = true;
+    }
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
+        this.trailingContentKind = 'assistant-message';
         if (update.content.type === "text") {
           this.textChunks.push(update.content.text);
           this.history.push({
@@ -394,6 +486,7 @@ class SessionState {
         break;
       }
       case "tool_call": {
+        this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
         this.history.push({
           role: "tool",
@@ -406,11 +499,30 @@ class SessionState {
       }
       // Any other CONTENT event also ends the in-flight assistant message — text streamed after
       // it belongs to a new message. Bookkeeping updates (usage, mode) never break a message.
-      case "user_message_chunk":
+      case "user_message_chunk": {
+        // The loaded-session founding-turn probe (see the fields above): the
+        // LAST user message in the replay is the founding turn's prompt, and
+        // its assistant text starts after it.
+        this.sawUserMessage = true;
+        this.loadedTurnStartIndex = this.textChunks.length;
+        this.trailingContentKind = 'other';
+        this.finalMessageStartIndex = this.textChunks.length;
+        break;
+      }
       case "agent_thought_chunk":
       case "tool_call_update":
       case "plan": {
+        // A trailing thought/tool/plan event means the model is still
+        // working — the founding turn is not observably complete.
+        this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        break;
+      }
+      case "plan_update":
+      case "plan_removed": {
+        // Plan mutations are content progress but never a completed
+        // assistant message; they do not segment the final message.
+        this.trailingContentKind = 'other';
         break;
       }
       case "usage_update": {
@@ -432,12 +544,131 @@ class SessionState {
       default:
         break;
     }
+    // Wake the re-attach arm's stream watchers after EVERY update kind
+    // (any update — chunk, thought, tool call, usage — resets the loaded
+    // turn's settle clock; the seam's quiet wait keys on this).
+    for (const watcher of this.updateWatchers) watcher();
   }
 
   applyRawMessage(message: RawResultSuccess | undefined): void {
     if (message && message.type === "result" && message.subtype === "success") {
       this.rawResultSuccess = message;
     }
+  }
+
+  /** The loaded-session founding-turn observability probe: whether the
+   *  transcript shows a turn ever started (a user message) and the KIND of
+   *  the trailing content event. The trailing kind is PROGRESS evidence,
+   *  not completion by itself — the re-attach arm classifies completion
+   *  from the LOAD BOUNDARY (the transcript as of load resolution) plus
+   *  whether any content update followed the load (see
+   *  `loadBoundaryState` and `InteractiveSession.awaitCurrentTurn`). */
+  loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
+    return {
+      hasUserMessage: this.sawUserMessage,
+      trailingContentKind: this.trailingContentKind,
+    };
+  }
+
+  /** The most recent instant a session/update arrived for this session
+   *  (the re-attach arm's stream-settled clock; `applyUpdate` runs
+   *  synchronously on the wire, so the timestamp is authoritative). */
+  lastUpdateAtMs(): number {
+    return this.lastUpdateAt;
+  }
+
+  /**
+   * Mark the load boundary (see the field docs): called by the runner
+   * synchronously after the `session/load` response, when the replay is
+   * complete and the transcript holds the entire persisted conversation.
+   * Idempotent: the FIRST mark wins (a re-load over the same handle keeps
+   * the original boundary).
+   */
+  markLoadBoundary(): void {
+    if (this.loadBoundary !== null) return;
+    this.loadBoundary = {
+      hasUserMessage: this.sawUserMessage,
+      trailingContentKind: this.trailingContentKind,
+    };
+    this.sawPostLoadContentUpdate = false;
+  }
+
+  /**
+   * The load-boundary probe (the re-attach arm's completion evidence;
+   * see `InteractiveSession.awaitCurrentTurn`): the replay-complete
+   * transcript state captured at load resolution, plus whether any
+   * CONTENT update arrived after the boundary (live-continuation
+   * evidence). `marked: false` when the handle was never load-marked (a
+   * session that did not come from the runner's `loadSession` path) —
+   * the seam refuses rather than guessing.
+   */
+  loadBoundaryState(): {
+    marked: boolean;
+    hasUserMessage: boolean;
+    trailingContentKind: 'assistant-message' | 'other';
+    sawPostLoadContentUpdate: boolean;
+  } {
+    return {
+      marked: this.loadBoundary !== null,
+      hasUserMessage: this.loadBoundary?.hasUserMessage ?? this.sawUserMessage,
+      trailingContentKind: this.loadBoundary?.trailingContentKind ?? this.trailingContentKind,
+      sawPostLoadContentUpdate: this.sawPostLoadContentUpdate,
+    };
+  }
+
+  /** Record the loaded-turn terminal notification (a turn that was
+   *  running at load ended — with its stop reason, or its error) and
+   *  wake the seam's watchers. Idempotent per session: the FIRST ended
+   *  notification wins (a re-sent notification after a reconnect cannot
+   *  overwrite the recorded terminal state). */
+  recordLoadedTurnEnded(notification: { stopReason?: string; error?: { name: string; message: string } }): void {
+    if (this.loadedTurnEnded !== null) return;
+    this.loadedTurnEnded = {
+      ...(notification.stopReason !== undefined ? { stopReason: notification.stopReason } : {}),
+      ...(notification.error !== undefined ? { error: notification.error } : {}),
+    };
+    for (const watcher of this.loadedTurnEndedWatchers) watcher();
+  }
+
+  /** The recorded loaded-turn terminal state, or null when the running
+   *  turn has not ended (yet). */
+  loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
+    return this.loadedTurnEnded;
+  }
+
+  /** Watch the loaded-turn-ended channel: the listener fires when the
+   *  `_session/loaded_turn/ended` notification arrives (and immediately
+   *  for a notification that already arrived). Returns the unsubscribe
+   *  thunk. The re-attach arm's authoritative terminal wait. */
+  subscribeLoadedTurnEnded(listener: () => void): () => void {
+    if (this.loadedTurnEnded !== null) {
+      queueMicrotask(listener);
+      return () => {};
+    }
+    this.loadedTurnEndedWatchers.add(listener);
+    return () => {
+      this.loadedTurnEndedWatchers.delete(listener);
+    };
+  }
+
+  /** Watch the session/update stream: the listener fires after every
+   *  applied update. Returns the unsubscribe thunk. The re-attach arm
+   *  waits on this instead of polling, so a long still-running turn is
+   *  observed with zero busy work. */
+  subscribeUpdates(listener: () => void): () => void {
+    this.updateWatchers.add(listener);
+    return () => {
+      this.updateWatchers.delete(listener);
+    };
+  }
+
+  /** The founding turn's assistant text: the transcript accumulated after
+   *  the last user-message boundary (the outcome text the re-attach arm
+   *  resolves with — identical to `finalMessageText()` exactly when the
+   *  trailing content event is an assistant message, which is the probe's
+   *  completeness condition). */
+  loadedTurnText(): string {
+    return this.textChunks.slice(this.loadedTurnStartIndex).join('');
   }
 
   /** Settle every deferred permission still parked on this session. Used by release/cancel/death
@@ -839,6 +1070,32 @@ class MultiplexClient {
   }
 
   extNotification(method: string, params: Record<string, unknown>): void {
+    if (method === LOADED_TURN_ENDED_METHOD) {
+      // The loaded-turn terminal notification (the re-attach arm's
+      // authoritative completion evidence): route by sessionId and record
+      // the terminal state on the session (the seam's wait target).
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+      if (!sessionId) return;
+      const state = this.sessions.get(sessionId);
+      if (!state) return;
+      const raw = (params as { stopReason?: unknown; error?: unknown }).error;
+      const error =
+        raw !== undefined && typeof raw === "object" && raw !== null
+          ? ({
+              name: typeof (raw as { name?: unknown }).name === "string" ? (raw as { name: string }).name : "Error",
+              message:
+                typeof (raw as { message?: unknown }).message === "string"
+                  ? (raw as { message: string }).message
+                  : String((raw as { message?: unknown }).message),
+            } as const)
+          : undefined;
+      const stopReason =
+        typeof (params as { stopReason?: unknown }).stopReason === "string"
+          ? (params as { stopReason: string }).stopReason
+          : undefined;
+      state.recordLoadedTurnEnded({ ...(stopReason !== undefined ? { stopReason } : {}), ...(error !== undefined ? { error } : {}) });
+      return;
+    }
     if (method !== CLAUDE_RAW_MESSAGE_METHOD) return;
     // claude-agent-acp stamps the owning sessionId on every raw _claude/sdkMessage; route by it
     // so structured_output lands in the right session under concurrency.
@@ -1335,6 +1592,11 @@ export class PooledConnection {
         CLAUDE_RAW_MESSAGE_METHOD,
         (params: unknown) => (params ?? {}) as Record<string, unknown>,
         ({ params }) => this.client.extNotification(CLAUDE_RAW_MESSAGE_METHOD, params),
+      )
+      .onNotification(
+        LOADED_TURN_ENDED_METHOD,
+        (params: unknown) => (params ?? {}) as Record<string, unknown>,
+        ({ params }) => this.client.extNotification(LOADED_TURN_ENDED_METHOD, params),
       )
       .onNotification(CLIENT_METHODS.elicitation_complete, ({ params }) => this.client.elicitationComplete(params))
       .onRequest(CLIENT_METHODS.session_request_permission, ({ params }) => this.client.requestPermission(params))
@@ -2089,6 +2351,28 @@ export class PooledConnection {
     return response;
   }
 
+  /** Driven `_session/loaded_turn/query` extension request (the re-attach
+   *  arm's authoritative founding-turn classification): asks whether the
+   *  loaded session's founding turn is still running at the backend, or
+   *  ended while the host was down. Strictly capability-gated on the
+   *  initialize `_meta.loadedTurn.supported === true` advertisement — a
+   *  backend without the extension rejects before any wire request (the
+   *  "same gate" the seam's degradation keys on). */
+  async queryLoadedTurn(sessionId: string, label?: string): Promise<LoadedTurnQueryResponse> {
+    await this.ready;
+    if (this.negotiated?.supportsLoadedTurnTerminalState !== true) {
+      throw new WorkflowError(
+        `ACP agent (${this.backendId}) does not advertise ${LOADED_TURN_QUERY_METHOD}; ` +
+          "InitializeResponse._meta.loadedTurn.supported was not exactly true",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: label },
+      );
+    }
+    return this.rawAgentRequest<LoadedTurnQueryResponse, LoadedTurnQueryRequest>(LOADED_TURN_QUERY_METHOD, {
+      sessionId,
+    });
+  }
+
   /** session/set_config_option on this connection, raced against process death. */
   setSessionConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_set_config_option, request));
@@ -2512,6 +2796,74 @@ export class SessionHandle implements StructuredSource {
     return this.state.rawResultSuccess?.structured_output;
   }
 
+  /** The loaded-session founding-turn observability probe (see
+   *  `InteractiveSession.awaitCurrentTurn`): whether the replayed transcript
+   *  shows a turn ever started, and the KIND of the trailing content event.
+   *  The trailing kind is PROGRESS evidence, never completion by itself —
+   *  the seam classifies completion from the LOAD BOUNDARY plus whether
+   *  any content update followed the load (see `loadBoundaryState`).
+   *  Added for the REPL broker's re-attach arm; additive passthrough to
+   *  `SessionState`. */
+  loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
+    return this.state.loadedTurnState();
+  }
+
+  /** Mark the load boundary (see `markLoadBoundary` on `SessionState`):
+   *  the runner calls this synchronously after the `session/load` response
+   *  — the replay is complete at that instant, and any CONTENT update
+   *  applied afterwards is live-continuation evidence. */
+  markLoadBoundary(): void {
+    this.state.markLoadBoundary();
+  }
+
+  /** The load-boundary probe (see `loadBoundaryState` on `SessionState`). */
+  loadBoundaryState(): {
+    marked: boolean;
+    hasUserMessage: boolean;
+    trailingContentKind: 'assistant-message' | 'other';
+    sawPostLoadContentUpdate: boolean;
+  } {
+    return this.state.loadBoundaryState();
+  }
+
+  /** The most recent instant a session/update arrived for this session
+   *  (the re-attach arm's stream-settled clock). Added for the REPL
+   *  broker's re-attach arm; additive passthrough to `SessionState`. */
+  lastUpdateAtMs(): number {
+    return this.state.lastUpdateAtMs();
+  }
+
+  /** Watch the session/update stream (fires after every applied update;
+   *  returns the unsubscribe thunk). Added for the REPL broker's re-attach
+   *  arm; additive passthrough to `SessionState`. */
+  subscribeUpdates(listener: () => void): () => void {
+    return this.state.subscribeUpdates(listener);
+  }
+
+  /** The founding turn's assistant text (the transcript accumulated after
+   *  the last user-message boundary). Added for the REPL broker's re-attach
+   *  arm; additive passthrough to `SessionState`. */
+  loadedTurnText(): string {
+    return this.state.loadedTurnText();
+  }
+
+  /** The recorded `_session/loaded_turn/ended` terminal state (the
+   *  re-attach arm's authoritative completion evidence), or null when a
+   *  running founding turn has not ended yet. Added for the REPL broker's
+   *  re-attach arm; additive passthrough to `SessionState`. */
+  loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
+    return this.state.loadedTurnEndedState();
+  }
+
+  /** Watch the loaded-turn-ended channel (fires when the
+   *  `_session/loaded_turn/ended` notification arrives — and immediately
+   *  when one already arrived). Returns the unsubscribe thunk. Added for
+   *  the REPL broker's re-attach arm; additive passthrough to
+   *  `SessionState`. */
+  subscribeLoadedTurnEnded(listener: () => void): () => void {
+    return this.state.subscribeLoadedTurnEnded(listener);
+  }
+
   /** Cancel the active turn. A backend that does not settle within the grace window is closed and
    *  its pooled child is quarantined for recycle after sibling sessions drain. */
   async cancel(): Promise<void> {
@@ -2603,4 +2955,29 @@ function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfi
     else out.push(entry);
   }
   return out;
+}
+
+/** Is this update kind CONTENT (a live turn's progress) rather than
+ *  bookkeeping? The re-attach arm's load-boundary classification: only
+ *  content updates are continuation evidence (a resumed turn streams
+ *  chunks/thoughts/tool calls/plans; usage/mode/command/session-info
+ *  updates are ambient bookkeeping — claude's adapter emits an
+ *  `available_commands_update` right after every load, live turn or
+ *  not). */
+function isContentUpdate(
+  kind: SessionUpdate["sessionUpdate"],
+): boolean {
+  switch (kind) {
+    case "user_message_chunk":
+    case "agent_message_chunk":
+    case "agent_thought_chunk":
+    case "tool_call":
+    case "tool_call_update":
+    case "plan":
+    case "plan_update":
+    case "plan_removed":
+      return true;
+    default:
+      return false;
+  }
 }

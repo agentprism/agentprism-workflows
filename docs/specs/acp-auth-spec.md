@@ -1,5 +1,18 @@
 # ACP Authentication — Implemented End-to-End Design Record
 
+> **Current-state correction (2026-08-07) — read first.** The **SDK / runner** auth surface this
+> record describes *is* implemented in `@automatalabs/acp-agents` and remains current: `AuthStore` /
+> `BackendAuthMachine`, `describeAuthMethods` / `completeAuth`, the `runner.auth` controller, the
+> per-agent `AuthProfile`s, and the code-first `AUTH_REQUIRED` pause/cold-resume. **However, the
+> MCP-server auth *tools* were never registered.** `packages/mcp-server/src` contains **no**
+> `workflow_auth_status` or `workflow_authenticate` tool, no `auth-tool-io.ts` / `auth-resolver.ts`,
+> no `auth-tools.test.ts`, and honors no `AGENTPRISM_MCP_INLINE_AUTH`. The shipped server registers
+> exactly two model-facing tools — **`workflow`** and **`repl`** — and no auth tools; backend auth
+> stays with the agents' own credential stores, and a run that hits `AUTH_REQUIRED` pauses and
+> resumes out-of-band. Every §4.3 / PR5 passage below about MCP auth tools, their files, their tests,
+> and their env control is therefore **historical design, not the current server contract**. Hosts
+> that want to drive auth programmatically duck-type `AuthCapableRunner` on the SDK runner directly.
+
 ## Status and original motivation
 
 AgentPrism's ACP authentication lifecycle is **implemented and shipped**. This document is the
@@ -19,8 +32,11 @@ secret handling.
   controller are live. `onAuth` resolves a `-32000` inline and retries exactly once.
 - `AUTH_REQUIRED` is code-first, carries non-secret `authContext`, and pauses a managed workflow
   with `reason:"auth_required"`; cold resume re-arms via `runner.auth.canResume`.
-- The default MCP server registers `workflow_auth_status` and `workflow_authenticate` alongside
-  `workflow`; `AGENTPRISM_MCP_INLINE_AUTH=1` optionally adds masked elicitation collection.
+- *(Historical — not shipped; see the current-state correction at the top.)* This spec designed the
+  default MCP server to register `workflow_auth_status` and `workflow_authenticate` alongside
+  `workflow`, with `AGENTPRISM_MCP_INLINE_AUTH=1` optionally adding masked elicitation collection. The
+  shipped server registers **no** auth tools (only `workflow` and `repl`); this line records the
+  original intent, not the current contract.
 - Claude, Codex, OpenCode, and Pi profiles plus the profile-less custom-agent fixture are implemented,
   with executable `_meta`/method drift tripwires and credential-gated live suites.
 
@@ -250,7 +266,7 @@ export type AuthResolver = (ctx: AuthContext) => Promise<AuthResolution> | AuthR
   2. Pure-spec fallback → `command = spawn.command`, `args = [...spawn.args, ...(method.args ?? [])]`, `env = { ...(method.env ?? {}) }` (per the SDK, `AuthMethodTerminal.args`/`env` apply to the **agent binary** for terminal auth, `schema/types.gen.d.ts:2277-2286`).
 - **`env_var`** (`AuthMethodEnvVar`, `schema/types.gen.d.ts:2221-2252`): map `vars` from `AuthEnvVar[]` (`:2177-2209`), reading SDK defaults — `secret` defaults **true** (`:2186-2192`), `optional` defaults **false** (`:2193-2198`) — carrying `link` (`:2238-2241`) and each var's first-class `AuthEnvVar._meta` (`:2199-2209`) through unchanged (Principle 3, §3.6).
 
-**High-level runner entry points** (the surface §4 hosts drive — MCP tools, SDK, web):
+**High-level runner entry points** (the surface §4 hosts drive — the SDK and web, plus the §4.3 MCP auth tools of the *historical* plan, which were never registered — see the current-state correction at the top):
 
 ```ts
 // packages/acp-agents/src/runner.ts
@@ -677,7 +693,7 @@ export interface AuthStatusSnapshot {              // redacted; ids/types/names 
   authenticated: boolean;
   canResume: boolean;
 }
-// Canonical shape (also surfaced by the MCP tool and web — §4.1).
+// Canonical shape (also surfaced by web — and, in the historical §4.1/§4.3 plan, by an MCP auth tool that was never registered).
 
 export interface AuthController {
   methods(opts?: AuthMethodsOptions): Promise<AuthMethodDescriptor[]>;           // §1.3 builder; alias of describeAuthMethods
@@ -1177,7 +1193,7 @@ export interface AuthController {
 }
 readonly auth: AuthController;
 
-/** Redacted status view surfaced by the controller, MCP tool, and web (canonical shape; §2.14 redaction). */
+/** Redacted status view surfaced by the controller and web (canonical shape; §2.14 redaction); the §4.3 MCP auth tool that would also have surfaced it was never registered. */
 export interface AuthStatusSnapshot {
   backendId: string;
   poolKey: string;
@@ -1190,15 +1206,16 @@ export interface AuthStatusSnapshot {
 
 The pre-existing raw verbs `runner.authenticate()`/`runner.logout()` (`runner.ts:313/404`) keep their signatures for advanced callers but are rebuilt off the dispose-after-connection path onto the `AuthStore` + recycle (§2) — the dedicated-connection-in-`finally`-dispose that loses the in-process gateway credential (`runner.ts:319-331`) is removed.
 
-**MCP-server detection contract** — so the MCP composition root can register auth tools without widening the frozen `AgentRunner` seam (`packages/shared-types/src/agent-runner.ts:16`, whose only method is `run`), export a structural capability interface from `runner.ts`; `AcpAgentRunner` implements it, `MockRunner`/`WorkflowAgent` do not:
+**MCP-server detection contract** — *(the `AuthCapableRunner` interface below ships and is exported; the MCP auth tools that were to consume it do not — see the current-state correction at the top.)* So the MCP composition root *could* register auth tools without widening the frozen `AgentRunner` seam (`packages/shared-types/src/agent-runner.ts:16`, whose only method is `run`), export a structural capability interface from `runner.ts`; `AcpAgentRunner` implements it, `MockRunner`/`WorkflowAgent` do not:
 
 ```ts
 export interface AuthCapableRunner {
   describeAuthMethods(opts?: AuthMethodsOptions): Promise<AuthMethodDescriptor[]>;
   completeAuth(opts: CompleteAuthOptions): Promise<AuthOutcome>;
   /** Ids of every configured backend (built-ins + AcpRunnerOptions.backends), whether or not it
-   *  yet has a BackendAuthMachine. The MCP `workflow_auth_status` handler uses this to enumerate
-   *  backends when its `backend` argument is omitted (§4.3). */
+   *  yet has a BackendAuthMachine. In the historical §4.3 plan the MCP `workflow_auth_status`
+   *  handler would have used this to enumerate backends when its `backend` argument was omitted —
+   *  that handler was never registered (see the current-state correction at the top). */
   listBackends(): string[];
   readonly auth: AuthController;
 }
@@ -1221,7 +1238,7 @@ export type {
 export type { AuthErrorContext } from "@automatalabs/shared-types"; // via workflow-engine re-export (§1.5)
 ```
 
-`packages/mcp-server` imports its runner-facing auth types through this facade (its only `@automatalabs` dependencies are `workflows` and `shared-types`), so the type re-exports and MCP auth tools form one compile-time dependency. The `isAuthRequired` value export below resolves through the workflow-engine re-export chain (§4.7).
+`packages/mcp-server` imports its runner-facing auth types through this facade, so in the historical §4.3 plan the type re-exports and the MCP auth tools would have formed one compile-time dependency. **As shipped, `mcp-server` registers no auth tools**, and its `@automatalabs` dependencies are `workflows`, `repl-engine`, and `shared-types` (not only `workflows` and `shared-types`). The `isAuthRequired` value export below resolves through the workflow-engine re-export chain (§4.7).
 
 **Value export** — `isAuthRequired` sits next to `isProviderUsageLimit`. It is defined once in **`packages/shared-types/src/errors.ts`** beside `isProviderUsageLimit` (`errors.ts:71`), then re-exported by `@automatalabs/workflow-engine` in **two** places: (a) the shared-types re-export block in `packages/workflow-engine/src/errors.ts:17-23` (which names `isProviderUsageLimit` at `:21` and has **no** `export *`), and (b) the named re-export block in `packages/workflow-engine/src/index.ts:37-49`. Both re-export sites are required for the facade to resolve. It is surfaced here in the existing block at `index.ts:64-70`:
 
@@ -1240,7 +1257,12 @@ export { isAuthRequired } from "@automatalabs/workflow-engine";
 
 ---
 
-### 4.3 MCP server auth tools
+### 4.3 MCP server auth tools *(historical design — not shipped)*
+
+> This subsection describes MCP auth tools that were **not** ultimately registered. `packages/mcp-server/src`
+> has no `auth-tool-io.ts` / `auth-resolver.ts` and registers no `workflow_auth_status` / `workflow_authenticate`;
+> the shipped server exposes only `workflow` and `repl`. It is retained as the frozen design record — see the
+> current-state correction at the top of this document.
 
 Files: **`packages/mcp-server/src/server.ts`** (registration + summary branch + optional resolver bridge), new **`packages/mcp-server/src/auth-tool-io.ts`** (Zod shapes, mirroring `workflow-tool-input.ts`/`workflow-tool-output.ts`). The single `workflow` tool (`server.ts:401`) is untouched; two read-only/action tools are added alongside it, sharing the injected runner.
 
@@ -1359,7 +1381,7 @@ No library change beyond the PR3 lifecycle work (§2). The **local runner** is l
 
 ### 4.6 Implemented test matrix (historical plan)
 
-The following plan was implemented across the package test suites. It remains here as a traceability map from design obligation to executable coverage, so file descriptions use the original delivery language. Runner: `tsx --test "test/**/*.test.ts"` (node:test + `node:assert/strict`) per package. Default `pnpm test` stays deterministic and credential-free; live-e2e is env-gated.
+The following plan was implemented across the package test suites — **except the MCP-auth-tool portions**: `packages/mcp-server/test/auth-tools.test.ts` (§4.6.2) and the `workflow_authenticate` redaction test (§4.6.5) were **never created**, because the §4.3 MCP auth tools they would cover were never registered (see the current-state correction at the top). It otherwise remains here as a traceability map from design obligation to executable coverage, so file descriptions use the original delivery language. Runner: `tsx --test "test/**/*.test.ts"` (node:test + `node:assert/strict`) per package. Default `pnpm test` stays deterministic and credential-free; live-e2e is env-gated.
 
 #### 4.6.1 Unit
 
@@ -1378,7 +1400,7 @@ New **`packages/acp-agents/test/auth.integration.test.ts`** drives it over the r
 
 Extend **`packages/acp-agents/test/auth-providers.integration.test.ts`** (currently asserts single-`newSession`, non-retry at `:130-152`) so the retry-once + recycle behavior is regression-locked against the change.
 
-New **`packages/mcp-server/test/auth-tools.test.ts`** — against a stub `AuthCapableRunner`: `workflow_auth_status` projection; `workflow_authenticate` env/meta/completed → `AuthResolution` mapping and `{status,methodId,recycled}` output; `formatTerminalSummary` `auth_required` branch reads `authContext` (never the message); the pause → `workflow_authenticate` → `workflow(resumeFromRunId)` loop; and that a plain `AgentRunner` stub registers only the `workflow` tool (detection contract, §4.3).
+*(Historical — never created; the §4.3 MCP auth tools were never registered, and the shipped server's model-facing tools are `workflow` and `repl`.)* The planned **`packages/mcp-server/test/auth-tools.test.ts`** — against a stub `AuthCapableRunner`: `workflow_auth_status` projection; `workflow_authenticate` env/meta/completed → `AuthResolution` mapping and `{status,methodId,recycled}` output; `formatTerminalSummary` `auth_required` branch reads `authContext` (never the message); the pause → `workflow_authenticate` → `workflow(resumeFromRunId)` loop; and that a plain `AgentRunner` stub registers only the `workflow` tool (detection contract, §4.3).
 
 #### 4.6.3 Live-e2e per first-class backend — all three equally
 
@@ -1408,7 +1430,7 @@ New **`packages/acp-agents/test/auth-secrets.test.ts`** (Principle 9). Assert, a
 - `authenticateMeta` (gateway payload) and `envValues` never appear in any emitted ACP event (`runner.on(...)`), the persisted journal, `WorkflowError.message`/`authContext`, or `backend_error` events (`acp-client.ts:1145`).
 - The spawn-env overlay (§2.8) is never logged, is not returned in `SpawnConfig`, and the `stderrTail` (`acp-client.ts:960`) passes through a redaction pass that strips known key patterns (`*_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, gateway header values).
 - `logout` zeroizes secrets in the machine (§2.14).
-- MCP `workflow_authenticate` `content`/`structuredContent` never echo the `env`/`meta` inputs (§4.3).
+- *(Historical — never created; the §4.3 MCP auth tools were never registered.)* MCP `workflow_authenticate` `content`/`structuredContent` never echo the `env`/`meta` inputs (§4.3).
 - `AuthStatusSnapshot` (all surfaces) exposes only ids/types/names/state.
 
 ---
@@ -1423,7 +1445,7 @@ The implementation was delivered as seven PR-sized stages, error-taxonomy-first,
 | **PR2** | Client auth advertisement (§1.2) | `packages/acp-agents/src/client-handlers.ts`, `capabilities.ts`, `acp-client.ts` (initialize thread), `pool.ts`, `runner.ts` (`authCapabilities`), `protocol-coverage.ts`, `client-handlers.test.ts`, `protocol-coverage.test.ts` | Default-OFF; the `auth` key is omitted unless a host sets `authCapabilities`, so zero behavior change. This delivery added the drift shape assertion. |
 | **PR3** | Auth contracts + `AuthStore`/`BackendAuthMachine` + generation-stamped lifecycle + resolver + runner API (§1.3, §2, §4.1) | new `packages/acp-agents/src/auth/{auth-types,auth-store}.ts`, `acp-client.ts` (replay-after-initialize + spawn overlay + stamp/reapply), `pool.ts` (generation-gated `selectConnection` + `recycle` + drain), `runner.ts` (`describeAuthMethods`/`completeAuth`/`auth`/`onAuth`/inline retry-once; rebuild `authenticate`/`logout`), `fixtures/fake-auth-agent.mjs`, `auth-descriptors.test.ts`, `auth-store.test.ts`, `auth.integration.test.ts`, `auth-secrets.test.ts`, `auth-providers.integration.test.ts` | The core correctness PR (fixes gap 3). Behavioral but opt-in: unset `onAuth`/`authCapabilities` ⇒ identical to today; the fixture proves conformance-by-absence. |
 | **PR4** | Engine pause-for-auth + cold-resume re-arm (§2.12, §2.13) | `packages/workflow-engine/src/workflow-manager.ts`, `run-persistence.ts`, `packages/shared-types/src/{errors,workflow-result}.ts` (`reason` widen + `authContext`), `auth-pause.test.ts`, `run-persistence.test.ts` | Generalizes the existing `PROVIDER_USAGE_LIMIT` pause branch (`workflow-manager.ts:620-649,675-699`); `PersistedRunState.pauseReason` is already free-form (`run-persistence.ts:43`) so no migration. |
-| **PR5** | MCP server auth tools (§4.3) | `packages/mcp-server/src/server.ts`, new `auth-tool-io.ts`, new `auth-resolver.ts`, `packages/workflows/src/index.ts` (the §4.2 type re-exports — see the §4.2 sequencing note), `packages/mcp-server/test/auth-tools.test.ts` | Two additive tools + summary branch; `createWorkflowServer` signature unchanged; inline elicitation is env-gated OFF. |
+| **PR5** *(designed, not shipped — §4.3)* | MCP server auth tools (§4.3) | `packages/mcp-server/src/server.ts`, new `auth-tool-io.ts`, new `auth-resolver.ts`, `packages/workflows/src/index.ts` (the §4.2 type re-exports — see the §4.2 sequencing note), `packages/mcp-server/test/auth-tools.test.ts` | Two additive tools + summary branch were designed here, but the shipped server registers **no** auth tools (only `workflow` and `repl`); the SDK type re-exports of §4.2 did land. See the current-state correction at the top. |
 | **PR6** | SDK exports (§4.2) | `packages/workflows/src/index.ts` | Re-exported the `isAuthRequired` value through the facade after the type re-exports described in §4.2; no new behavior. |
 | **PR7** | Per-agent profiles + codex spawn channel + `_meta` matrix tripwire + `permission _meta.persist` (§3, §2.8, §3.6) | new `packages/acp-agents/src/auth/auth-profiles.ts`, `backend.ts` (`authProfile?`), the three built-in backends, `codexAuthProfile.spawnAuthEnv` (`DEFAULT_AUTH_REQUEST`), `protocol-coverage.ts`/`docs-drift.test.ts` (`_meta`-matrix assertions), `permissions.ts` (`PermissionResolver.persist?`), `auth.live.e2e.test.ts` | Profiles are pure data layered on the PR3 base; codex `DEFAULT_AUTH_REQUEST` is an existing spawn-time agent surface consumed client-side (Principle 6 lever note, §3.3) on top of the universal replay (never required for correctness); per-agent live-e2e lands here. |
 

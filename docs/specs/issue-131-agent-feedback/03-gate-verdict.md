@@ -44,7 +44,7 @@ Its validator type permits only `{ ok: boolean; feedback?: string }`, so it neit
 
 `packages/shared-types/src/workflow-result.ts` defines `JournalEntry` as `{ index, hash, result, session? }` and `WorkflowRunResult<T>.result` as the script's JSON-serializable top-level return value. `packages/workflow-engine/src/workflow-manager.ts` persists the per-call journal and, after completion, `managed.result?.result` in `PersistedRunState.result`. There is no gate-specific persisted shape.
 
-`packages/mcp-server/src/workflow-tool-output.ts` deliberately types the script result as `z.unknown().optional()` in `workflowToolOutputShape`. A script that returns a gate result can therefore carry an added nested `verdict` without changing the MCP tool input, output schema, or the single-tool surface.
+`packages/mcp-server/src/workflow-tool-output.ts` deliberately types the script result as `z.unknown().optional()` in `workflowToolOutputShape`. A script that returns a gate result can therefore carry an added nested `verdict` without changing the MCP tool input, output schema, or the `workflow` tool's surface (then the server's single model-facing tool — see the pack [README](README.md)'s historical-scope note).
 
 ### Token-free validator
 
@@ -370,7 +370,7 @@ Update every author-facing gate surface in the same PR:
 11. Run `node scripts/generate-authoring-prompt.mjs` after all skill/reference edits and commit the regenerated `packages/mcp-server/src/generated/authoring-prompt-content.ts`. Do not edit the generated file by hand.
 12. Update the prompt sentinel in `packages/mcp-server/test/authoring-prompt.test.ts` so CI checks that the new contract reaches MCP prompt consumers while the existing single-tool assertion remains intact.
 
-The MCP tool surface must remain exactly one `workflow` tool; the documentation change is delivered through the already-existing `author-workflow` prompt.
+This change adds no MCP tool — the `workflow` tool surface is unchanged (the server's separate `repl` tool, added by the later `repl-orchestrator` work, is unrelated to this feature); the documentation change is delivered through the already-existing `author-workflow` prompt.
 
 ## 8. Implementation breakdown
 

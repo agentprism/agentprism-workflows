@@ -1,8 +1,8 @@
 # API reference
 
-The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.23.1, `acp-agents` 0.22.1, `workflow-engine` 0.12.0, `shared-types` 0.14.0, `mcp-server` 0.4.1, and `agentprism-otel` 0.1.0.
+The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.46.2, `acp-agents` 0.35.2, `workflow-engine` 0.35.1, `shared-types` 0.29.1, `mcp-server` 0.25.0, and `agentprism-otel` 0.1.2. `repl-engine` is unreleased (0.0.0); its engine and the `repl` MCP tool that `mcp-server` registers over it are implemented (see [MCP server](#mcp-server)) but ship with a future release.
 
-Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
+Packages (all but `repl-engine` published to npm, Apache-2.0, ESM-only, Node >= 22):
 
 | Package | What it is | Depend on it when |
 |---|---|---|
@@ -10,10 +10,11 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
-| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, bounded await, resume, and inspect | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded await, resume, inspect, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/pi-acp` | Standalone in-process pi coding-agent ACP server (bin `pi-acp`) with a side-effect-free library entry | You use the first-class `pi` backend or embed the ACP server directly |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
+| `@automatalabs/repl-engine` | The REPL orchestrator engine: persistent JavaScript REPL in a QuickJS-in-WASM VM — workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts | You build a persistent-JS-REPL surface (this package is the engine tier under `mcp-server`'s `repl` tool — see [MCP server](#mcp-server)) |
 
 ---
 
@@ -1147,7 +1148,7 @@ Credentials live in exactly one place — the runner's per-instance `AuthStore` 
 - `runner.describeAuthMethods(opts?)` → `AuthMethodDescriptor[]`: a read-only probe that opens a dedicated connection, reads the advertised methods, and returns their type-dispatched descriptors (`agent` with `expectsMeta`/`interactive`; `terminal` with a resolved `launch`; `env_var` with `vars` carrying SDK defaults `secret=true`/`optional=false`).
 - `runner.completeAuth({ methodId, resolution, ... })` → `AuthOutcome` (`{ status, methodId, recycled }`): records the host-collected `AuthResolution` (`{ outcome: "completed" | "agent-login" | "env" | "meta" | "cancelled" }`) into the `AuthStore`, advances the generation, and recycles the pool. The credential class (`disk` / `in-process` / `spawn-env`) is derived from the chosen method's type + `_meta` shape, never from the outcome.
 - `AcpRunnerOptions.onAuth` (an `AuthResolver`): when set, a `-32000` at `session/new` is resolved inline and the acquire retried **exactly once** — the run never pauses (a second `-32000` propagates as `AUTH_REQUIRED`). Setting `onAuth` also derives `authCapabilities` to `{ terminal: false, gateway: true }` unless you pass it explicitly.
-- `runner.auth`: the verbs as one object — `methods()` (= `describeAuthMethods`), `authenticate()` (= `completeAuth`), `logout()`, `status()` (redacted `AuthStatusSnapshot[]` — ids/types/names + state only, **never** secrets), and `canResume(backendId)` (cold-resume re-arm predicate). `AuthCapableRunner` is the structural interface an MCP host duck-types to register auth tools.
+- `runner.auth`: the verbs as one object — `methods()` (= `describeAuthMethods`), `authenticate()` (= `completeAuth`), `logout()`, `status()` (redacted `AuthStatusSnapshot[]` — ids/types/names + state only, **never** secrets), and `canResume(backendId)` (cold-resume re-arm predicate). `AuthCapableRunner` is the structural interface an embedding host duck-types to drive this auth surface **programmatically** — the stdio MCP server registers **no** auth tools (auth stays with the agents' own credential stores; a run that hits `AUTH_REQUIRED` pauses and resumes out-of-band).
 
 `env`/`meta` payloads are **SECRET** and flow only through the resolver return value into the `AuthStore` and the spawn env — never into events, journals, logs, error messages, or `status()`. `logout()` clears the store (zeroizing the secret payload), recycles the pool, and issues the agent `logout` RPC only where advertised. Default-OFF: with neither `onAuth` nor `authCapabilities` set, the wire behavior is byte-identical to a host that never opted in.
 
@@ -1225,7 +1226,7 @@ const forked = await runner.forkSession({ sessionId, cwd: "/abs/dir" });
 
 `listSessions()` returns the SDK `ListSessionsResponse` (`sessions: SessionInfo[]`, plus `nextCursor?`); `deleteSession()` resolves to `void`. `loadSession()`, `resumeSession()`, and `forkSession()` return live `InteractiveSession`s tracked and released like `openSession()` sessions. Their signature is `(opts: ReattachSessionOptions) => Promise<InteractiveSession>`: they accept the same session-scoped fields as `openSession()` plus the required `sessionId`, and `mcpServers` defaults to `[]` on the wire. For `loadSession()` and `resumeSession()`, that id is the session being reopened. For `forkSession()`, it is the **source** session id; ACP returns a **new** independent session seeded with the source's conversation context, and that new id is exposed as both `forked.sessionId` and `forked.sessionRef.sessionId`.
 
-`loadSession()` registers the caller-supplied id before sending `session/load`, so replayed `session/update` history is accumulated and permissions during replay are routed. After it resolves, replay is visible in `session.text` / `session.history`. `resumeSession()` reattaches without replay. `forkSession()` can register only after `session/fork` returns its new id, matching `session/new`; subsequent updates, permissions, and prompts route exclusively under that response id. All three adopt response `configOptions`/`modes`; a routed model id is then sent verbatim, while `mode` is validated and applied strictly from the response mode catalog. The upstream SDK marks `session/fork` **UNSTABLE** / `@experimental`; this wrapper may need to track future protocol changes.
+`loadSession()` registers the caller-supplied id before sending `session/load`, so replayed `session/update` history is accumulated and permissions during replay are routed. After it resolves, replay is visible in `session.text` / `session.history`. `InteractiveSession.awaitCurrentTurn()` resolves with the loaded session's founding turn (the turn that was in flight when the host died) — the REPL broker's re-attach arm — using the **`_session/loaded_turn` vendor extension** (the `_session/steering` precedent; advertised at initialize via `InitializeResponse._meta.loadedTurn.supported === true`, served by the in-repo `@automatalabs/pi-acp` and `@automatalabs/codex-acp`): right after the load response the seam asks `_session/loaded_turn/query` whether the founding turn is still running — `completed` (observably completed while the host was down; the replay's trailing assistant message is its FINAL message, resolved immediately with the real accumulated text, stop reason synthesized `end_turn`), `interrupted` (ended without a terminal message, nothing running — the safe-re-issue class), or `running` (kept attached, waiting for the authoritative `_session/loaded_turn/ended` notification — pushed with the stop reason, or the error, when the turn ends; a quiet gap is only a progress-stream gap, never terminal evidence, and the wait is bounded by `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS`, default 15 min). A backend WITHOUT the extension (the built-in claude and opencode backends today) is classified by the **observation path** — the post-load continuation watch plus the replay probe under the **connection-death contract** (phase-F review round 2, restricted to the VERIFIED BUILT-INS in round 3 — a custom registry backend's connection-death behavior is not live-verified, so its quiet observation window is not terminal evidence and degrades to the keep-attached still-running wait): the built-in ACP servers terminate in-flight turns when the client connection closes (live-verified — claude-agent-acp/pi-acp exit on connection close and cancel, `opencode acp` exits on stdin EOF, codex-acp ends/kills the codex process) and their persisted transcripts hold only completed messages, so after a daemon crash the founding turn is NEVER still running at the backend and the replay's trailing content is authoritative — an assistant message is the turn's terminal message (completed-while-down, resolved with the real accumulated text), anything else means the turn died mid-way (the safe-re-issue class — nothing running, no duplication possible). The one caveat — content still in flight when the load response resolved — is absorbed by the bounded post-load continuation watch (`AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS`, default 1 s): any CONTENT update after the load boundary is live continuation, the authoritative still-running signal, and flips the classification to the keep-attached wait. A query FAILURE on an extension backend falls through to the same observation path (a possibly-running call is never released-and-re-issued). A `running` turn past the max-wait bound rejects with the re-armable `LoadedTurnStillRunningError` (the broker re-arms the seam on the still-attached session — a later terminal notification or a cancel still settles the call), and a turn that failed at the backend rejects with `LoadedTurnFailedError` (a definite rejection, never a re-issue). A seam that rejects with the NON-re-armable still-running class (a third-party adapter that can never observe the terminal state) is NOT re-invoked — an immediate recursive re-arm would spin in an unbounded microtask/warning loop (phase-F review round 3): the broker keeps the loaded session attached and waits for the terminal state from the session-level `_session/loaded_turn/ended` surface (when the backend pushes one anyway), the call's cancel (settled as the recoverable `AGENT_CANCELLED`), the session's release (the process died — the safe-re-issue class), or the client-presence drain's forced stop (settled durably at the bound). `resumeSession()` reattaches without replay. `forkSession()` can register only after `session/fork` returns its new id, matching `session/new`; subsequent updates, permissions, and prompts route exclusively under that response id. All three adopt response `configOptions`/`modes`; a routed model id is then sent verbatim, while `mode` is validated and applied strictly from the response mode catalog. The upstream SDK marks `session/fork` **UNSTABLE** / `@experimental`; this wrapper may need to track future protocol changes.
 
 Where does `sessionId` come from? Three sources: `listSessions()`, an `InteractiveSession.sessionRef` you persisted, or — for one-shot workflow agents — `WorkflowRunResult.agentSessions`. Every `agent()` call that opened a live session lands one `AgentSessionRecord` (`AgentSessionRef` + `callIndex`/`label`/`phase`/`keptOpen`) on the run result (even with `journaling: false` — it rides the result, not the journal), in the journal entry (so resume replays it), and on the `agentEnd` event/snapshot. The one-shot-plan round trip:
 
@@ -1244,7 +1245,7 @@ await chat.prompt("Revise section 3 — the user wants X.");
 
 Set `agent(prompt, { keepSession: true })` in the script (or `RunOptions.keepSession` on direct `run()` calls) when you intend to re-open: it skips the release-time best-effort `session/close`, guaranteeing the agent-persisted session is untouched. Without it the record is still surfaced, and the four first-class agents keep closed sessions loadable — but `keepSession` is the explicit, agent-agnostic contract. Check `reopen.load`/`reopen.resume` before offering re-attach and optional `reopen.fork` before offering a fork in UI: an agent that persists nothing advertises none of them, and its sessions are reachable only while held open (`openSession`). The fork flag is optional so records written before this field existed remain valid.
 
-Lifecycle methods are capability-gated after initialize. In particular, `forkSession()` requires `sessionCapabilities.fork`; when absent it throws a non-recoverable `WorkflowError` naming the backend and `session/fork` before any fork request is sent. The installed `@agentclientprotocol/claude-agent-acp@0.65.0` advertises `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close/fork (fork verified live: the forked session carries the source conversation's context). `@automatalabs/codex-acp` (workspace) advertises `loadSession: true` plus list/delete/resume/close — no fork yet. OpenCode advertises load/list/resume/close/fork (also verified live). `@automatalabs/pi-acp` advertises load plus list/resume/close/fork and deliberately omits delete; unsupported lifecycle methods still fail through the same gate.
+Lifecycle methods are capability-gated after initialize. In particular, `forkSession()` requires `sessionCapabilities.fork`; when absent it throws a non-recoverable `WorkflowError` naming the backend and `session/fork` before any fork request is sent. The installed `@agentclientprotocol/claude-agent-acp@0.65.0` advertises `loadSession: true` plus `sessionCapabilities` for list/delete/resume/close/fork (fork verified live: the forked session carries the source conversation's context). `@automatalabs/codex-acp` (workspace) advertises `loadSession: true` plus list/delete/resume/close — no fork yet. OpenCode advertises load/list/resume/close/fork (also verified live). `@automatalabs/pi-acp` advertises load plus list/resume/close/fork and deliberately omits delete; unsupported lifecycle methods still fail through the same gate. The `_session/loaded_turn` extension (turn-terminal state for loaded sessions — the re-attach arm's authoritative completion evidence, see the `loadSession()` paragraph above) is advertised and served only by the in-repo `@automatalabs/pi-acp` and `@automatalabs/codex-acp`; claude and opencode do not advertise it, and their re-attached calls are classified by the seam's OBSERVATION path instead — the post-load continuation watch plus the replay probe under the connection-death contract (see the `loadSession()` paragraph): the built-in ACP servers terminate in-flight turns when the client connection closes (live-verified), so the replay's trailing content is authoritative and a possibly-running call is NEVER released-and-re-issued (phase-F review round 2 — re-issue is reserved for the observably-dead classes: the interrupted classification, a transcript that never received its prompt, a dead session, or a third-party adapter with no seam at all). The `ACP_EXTENSION_SUPPORT_MATRIX` in `packages/acp-agents/src/protocol-coverage.ts` pins all eight rows.
 
 ### Capabilities
 
@@ -1303,7 +1304,7 @@ for every new first-class row.
 
 Workflow scripts may *declare* backends via `meta.backends`, but declarations are inert until the composition root approves them (`allowScriptBackends` / `ExecOptions.scriptBackends` / `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`).
 
-**Environment variables**: `AGENTPRISM_ACP_POOL_SIZE` (processes per backend, default 1), `AGENTPRISM_ACP_INIT_TIMEOUT_MS` (initialize handshake deadline, default 60s), `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex` | `opencode` | `pi` | custom name), `AGENTPRISM_BACKENDS` (host custom-backend registry JSON), `AGENTPRISM_PERSISTENCE_ROOT`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_OPENCODE_E2E_MODEL` (live e2e only; default `opencode/openrouter/moonshotai/kimi-k3`), `AGENTPRISM_PI_E2E_MODEL` (live e2e only; default `openrouter/google/gemini-2.5-flash`), plus the per-backend `*_CMD`/`_ARGS`/`_BIN` above.
+**Environment variables**: `AGENTPRISM_ACP_POOL_SIZE` (processes per backend, default 1), `AGENTPRISM_ACP_INIT_TIMEOUT_MS` (initialize handshake deadline, default 60s), `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` (the re-attach arm's terminal-wait backstop for a `running` loaded turn, default 15min), `AGENTPRISM_OPENCODE_DATA_ROOT` (overrides the opencode built-in's stable per-user XDG data/state/cache root — the tree where agent-persisted sessions live so cross-process `session/load` re-attachment is real), `AGENTPRISM_DEFAULT_BACKEND` (`claude` | `codex` | `opencode` | `pi` | custom name), `AGENTPRISM_BACKENDS` (host custom-backend registry JSON), `AGENTPRISM_PERSISTENCE_ROOT`, `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`, `AGENTPRISM_OPENCODE_E2E_MODEL` (live e2e only; default `opencode/openrouter/moonshotai/kimi-k3`), `AGENTPRISM_PI_E2E_MODEL` (live e2e only; default `openrouter/google/gemini-2.5-flash`), plus the per-backend `*_CMD`/`_ARGS`/`_BIN` above.
 
 ---
 
@@ -1333,7 +1334,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 
 ## MCP server
 
-`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes a single tool, **`workflow`** — the server's whole surface. By default the stdio process is a thin shim proxying to the shared per-user workflow daemon (Streamable HTTP on loopback, auto-started, spec 2025-11-25 session management and resumability); `--in-process` serves everything in the one stdio process instead, and HTTP-capable hosts can register the daemon URL directly (`agentprism-workflow daemon url`). The tool contract is identical on every path except one knob: the daemon **requires** `projectDir` on run inputs, while an in-process server defaults it to its own project. Its input is this union:
+`npx @automatalabs/mcp-server` (bin `agentprism-workflow`) speaks stdio MCP and exposes two model-facing tools, **`workflow`** and **`repl`** (a persistent JavaScript REPL — see [The `repl` tool](#the-repl-tool) below). By default the stdio process is a thin shim proxying to the shared per-user workflow daemon (Streamable HTTP on loopback, auto-started, spec 2025-11-25 session management and resumability); `--in-process` serves everything in the one stdio process instead, and HTTP-capable hosts can register the daemon URL directly (`agentprism-workflow daemon url`). The tool contract is identical on every path except one knob: the daemon **requires** `projectDir` on run inputs, while an in-process server defaults it to its own project. Its input is this union:
 
 ```ts
 interface WorkflowExecuteToolInput {
@@ -1476,9 +1477,100 @@ keeps current error semantics: failed/aborted are tool errors, paused is a succe
 call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped
 at 12,288 bytes; malformed pre-run scripts have no run ID or tail.
 
-**The `author-workflow` prompt.** Prompt-capable hosts additionally get one user-controlled MCP prompt, `author-workflow` (optional `task` argument): it returns the complete, self-contained authoring guide — SKILL.md + the exhaustive reference tables + a validated example script, generated from `skills/agentprism-workflow-authoring` at `scripts/generate-authoring-prompt.mjs` and version-matched to the installed engine. Prompts never enter the model's tool-selection loop, so the tool surface stays exactly `workflow`.
+**The `author-workflow` prompt.** Prompt-capable hosts additionally get one user-controlled MCP prompt, `author-workflow` (optional `task` argument): it returns the complete, self-contained authoring guide — SKILL.md + the exhaustive reference tables + a validated example script, generated from `skills/agentprism-workflow-authoring` at `scripts/generate-authoring-prompt.mjs` and version-matched to the installed engine. Prompts never enter the model's tool-selection loop, so the prompt adds no tool to the model-facing surface (`workflow` and `repl`).
 
 **Auth is the agents' own concern.** Claude, Codex, and OpenCode use their CLI credential stores; pi uses provider environment keys or `~/.pi/agent/auth.json`. Configured credentials need no MCP-side step, and the server exposes no auth state for a host to inspect or manage. A run that genuinely hits ACP `AUTH_REQUIRED` pauses with `reason:"auth_required"` and a summary built from the structured, non-secret `authContext` (backend id + advertised method `{ id, type, name }[]`) — never parsed from the error message — directing out-of-band credential configuration followed by `workflow` with `resumeFromRunId`. Programmatic credential injection and provider routing (`completeAuth`, `listProviders` / `setProvider` / `disableProvider`) are [SDK runner APIs](#auth--providers) for embedding hosts.
+
+### The `repl` tool
+
+The server also registers a second model-facing tool, **`repl`** — a persistent QuickJS-in-WASM JavaScript REPL, **one VM per `projectDir`**, for live, stateful subagent orchestration (the interactive complement to `workflow`'s deterministic scripts). Workspace state — bindings, pending subagent calls, raised checkpoints, logged values — persists in the VM across tool calls, MCP-session churn, and daemon restarts. Its full contract, with worked examples per action, is in the [package README](../packages/mcp-server/README.md#the-repl-tool); the surface in brief:
+
+```ts
+type ReplToolInput =
+  | { action: "eval"; projectDir?: string; code: string; refs?: string[] }
+  | { action: "wait"; projectDir?: string; ids?: string[]; timeoutMs?: number; refs?: string[] } // timeoutMs default 30_000, max 120_000
+  | { action: "status"; projectDir?: string; refs?: string[] }
+  | { action: "interrupt"; projectDir?: string; id?: string }
+  | { action: "reset"; projectDir?: string };
+```
+
+`projectDir` is required on the shared daemon for every action **except `status`**, and defaults to the server's own project on `--in-process`. A discriminator rejects a missing required field or an irrelevant known one (`reset` with `code`, `status` with `ids`) as Invalid Params (`-32602`). Every result carries both `structuredContent` and bounded text. The union below is the shape the tool **emits** at runtime (its Zod refinement admits exactly these per-variant fields); the published `outputSchema` JSON Schema is a looser projection — it permits `referenced` on every branch (not only eval/wait/status) and types `reset`'s `dropped` as `boolean` rather than the literal `true`, though no runtime path emits either of those looser shapes:
+
+```ts
+type ReplToolOutput =
+  | { action: "eval"; projectDir: string; output: string[]; outputTruncated: boolean;
+      result?: string; pending: string[]; checkpoints: CheckpointSummary[]; completed: string[];
+      truncated?: TruncatedRecord; referenced?: Record<string, unknown[]> }
+  | { action: "wait"; projectDir: string; output: string[]; outputTruncated: boolean;
+      result?: string; pending: string[]; checkpoints: CheckpointSummary[]; completed: string[];
+      truncated?: TruncatedRecord; referenced?: Record<string, unknown[]>;
+      drained: boolean; timedOut: boolean } // timedOut === !drained; wait itself never sets `result`
+  | { action: "status"; projectDir?: string; workspaces: WorkspaceStatus[];
+      truncated?: TruncatedRecord; referenced?: Record<string, unknown[]> }
+  | { action: "interrupt"; projectDir: string;
+      interrupt: { outcome: "targeted" | "refused-idle" | "cancelled" | "idle" | "failed" | "none"; callId?: string } }
+  | { action: "reset"; projectDir: string; dropped: true } // runtime always dropped: true; published schema types it boolean
+  | { action: "eval" | "wait" | "status" | "interrupt" | "reset"; projectDir?: string; error: string }; // isError: true
+
+interface CheckpointSummary { id: string; question: string } // question previewed (double-quoted, head+tail past 200 chars)
+
+interface WorkspaceStatus {
+  projectDir: string;
+  state: "not-opened" | "fresh" | "restored" | "refused";
+  restoreError?: string;                 // refused only
+  reconcile?: ReconcileReport;           // restored only
+  bindings: ManifestBinding[];
+  logs: { first: number | null; last: number | null; count: number }; // the $N range
+  evalSeq: number;
+  inFlight: string[];
+  checkpoints: CheckpointSummary[];
+  liveAgents: LiveAgent[];
+  pending: string[];
+  childrenClosed: boolean;
+  drainError?: string;
+}
+interface ReconcileReport {
+  settledFromStore: string[]; reattached: string[]; reissued: string[];
+  failedLost: string[]; requeuedCheckpoints: string[]; leftPending: string[]; reQueuedUndelivered: string[];
+}
+interface ManifestBinding {              // metadata, never value content
+  name: string; token: string; type: string; sizeBytes: number;
+  handleCallId: string | null; handleStatus: "pending" | "settled" | null;
+  provenance: string | null;             // "eval N", "worker c2", "session restore"
+  provenanceAtMs: number | null;
+  task: string | null;                   // the founding call's task, ≤ 200 chars head+tail
+}
+interface LiveAgent {
+  callId: string;
+  modelSpec: string;                     // ≤ 200 chars head+tail
+  task: string;                          // ≤ 200 chars head+tail
+  state: "opening" | "running" | "delivering" | "idle"; supportsSteering: boolean; queuedSteers: number;
+}
+// truncated: field-path → elided count, or { elided, ref } when a continuation ref was captured;
+// reserved key `strings` is a plain count from the string backstop.
+type TruncatedRecord = Record<string, number | { elided: number; ref: string }>;
+```
+
+`result` is the previewed completion value, present **when the eval resolves to a value** — a guest `undefined` (a declaration or a bare `console.log(...)`) renders as the string `"undefined"`, so it is a real value, not a missing field. `result` is absent when the eval **suspends** (on a subagent call, a `checkpoint()`, or any other unsettled promise — the eval returns immediately with the pending ids and no `result`) **or when it throws, rejects, hits a syntax error, or is interrupted** (the error renders in `output` as a plain `Name: message` line — the error's own `name` and `message`, e.g. `TypeError: x is not a function` — **not** an `error:`-prefixed line, which is reserved for a late uncaught rejection bridged through `console.error`). (A `wait` never sets `result` — it has no completion value of its own.) The error variant carries the optional `projectDir` (omitted when the call omitted it) and is flagged `isError: true`; a **refused snapshot** returns the error variant on `eval`/`wait`/`interrupt`, while a **named `status`** reports the same refusal through its status variant (`state: "refused"`, `restoreError`) rather than `isError`, and `reset` clears the store rather than refusing. A **missing project context** (single-project mode with no adopted default) returns the error variant only on the four stateful actions `eval`/`wait`/`interrupt`/`reset`. `status` never takes the error path: a project-less `status` lists every known workspace (an empty array when none exist), and a **named** `status` is a first touch that *creates*/restores the workspace, so it can never find one missing. The published schema's error branch still enumerates all five `action` values, but no runtime path emits it with `action: "status"`.
+
+Subagent `agent()` calls and `checkpoint()` draw from **one shared per-workspace id sequence** — `c1`, `c2`, … — so a `checkpoint()` after a single `agent()` call is `c2`, answered by `checkpoint.answer("c2", value)` in a later eval (checkpoint answers are excluded from `completed`). The two output surfaces are capped **independently**: the **text** at 256 physical lines *or* 10,000 UTF-8 bytes (whichever trips first), and **`structuredContent`** at a 10,000-byte serialized-JSON bound *only* (no line cap). Elided console values stay reachable through their `$N` refs; elided structured arrays are recorded in `truncated` and — when a ref was captured — read back through the `refs` parameter (returned under `referenced`). That read-back is **itself subject to the same 10,000-byte cap**, so a retrieved tail that is still oversized is re-elided and yields a **fresh** continuation ref; a large tail drains across **chained reads** rather than in one call. Continuation refs are **workspace-namespaced**, held **in memory**: `reset` clears them and a daemon restart loses them (the caller re-reads current state). Subagents are [`acp-agents`](#acpagentrunner-createacprunner) sessions, 6 concurrent per workspace; the workspace snapshots to the per-project store at every state-changing boundary and restores **lazily on first touch** with a three-way call reconcile (settle / re-attach / re-issue). `repl` shares the `workflow` tool's project model and daemon lifetime.
+
+## `@automatalabs/repl-engine`
+
+The engine tier the `repl` tool registers over (unreleased at `0.0.0`; imported by `mcp-server` as `workspace:*`). It is a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM; the public surface:
+
+- **`Workspace`** / **`WorkspaceRegistry`** (`WorkspaceOptions`, `WorkspaceRegistryOptions`, `WorkspaceManifest`, `WorkspaceBinding`) — one VM per workspace, owning the lifecycle (`create` → `eval` → `drainJobs` → `dispose`) and the manifest surface. `ReplVm` (`loadShippedWasm`, `ReplVmOptions`, `ReplEvalOptions`, `ReplDrainOptions`, `ReplEvalOutcome`, `DrainJobError`) is the raw quickjs-wasi shim tier.
+- **`Broker`** (`DEFAULT_MAX_CONCURRENT_AGENTS`, `DEFAULT_EVAL_TIMEOUT_MS`, `DEFAULT_DISPOSE_BOUND_MS`, `BrokerOptions`, `BrokerRunner`, `ReplEvalResult`, `CheckpointSummary`, `LiveAgentInfo`, `ReconcileReport`, `WorkspaceManifestReport`, …) — drives subagents as ACP sessions, records results by call id, and reconciles on restore. The call store is `InMemoryCallStore` / `JsonlCallStore` (`CallStore`, `CallRecord`, `CallOutcome`, …).
+- **Snapshots and durability** — `serializeSnapshot` / `deserializeSnapshot` / `wasmSha256Of`, `SNAPSHOT_FORMAT` / `SNAPSHOT_FORMAT_VERSION`, `SnapshotEnvelopeError` / `SnapshotRestoreError`, and the per-project `ReplWorkspaceStore` (`REPL_STORE_SUBDIR`, `SNAPSHOT_FILENAME`, `CALL_STORE_FILENAME`).
+- **The previewer and caps** — `renderPreviewLine` / `renderCollapsed` / `renderGlobalLine` / `manifestBinding` / `formatByteSize` and the CDP preview types (`ObjectPreview`, `PropertyPreview`, …); `applyOutputCaps` / `capFinalText` with `OUTPUT_MAX_LINES` (256) and `OUTPUT_MAX_BYTES` (10 000).
+- **The guest bridge and provenance** — `installGuestBridge`, `GUEST_LIBRARY_VERSION`, the `HOST_*` callback names; `provenanceRecord` / `provenanceView` (`eval N` / `worker cN` / `session restore` labels).
+- **The out-of-band eval-break channel** — `createEvalBreakChannel` / `EvalBreakChannel` (the worker-thread relay the MCP shim fires to break a synchronous runaway).
+
+The full engine contract (guest library, host-call surface, FORMAT.md preview rules, reconcile semantics) is documented in the [package README](../packages/repl-engine/README.md).
+
+### The `repl` adapter exports from `@automatalabs/mcp-server`
+
+`@automatalabs/mcp-server` re-exports the REPL adapter surface for hosts mounting the tool themselves: `replToolInputShape` / `replToolOutputShape` (the Zod input/output schemas), `capStructuredResult` (the 10 KB structured cap), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). `createWorkflowServer` registers both `workflow` and `repl`; `CreateWorkflowServerOptions` exposes `replRunner` / `replPresence` / `replClientId` / `replEvalBreakChannel` / `replDrainBoundMs`. Breaking a *fully synchronous* runaway requires the relay stdio transport `main()` installs; a vanilla `StdioServerTransport` bounds it only by the per-eval deadline (`AGENTPRISM_REPL_EVAL_TIMEOUT_MS`, default 30 000 ms).
 
 ## Workflow script DSL
 

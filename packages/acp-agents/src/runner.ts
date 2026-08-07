@@ -1101,7 +1101,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
 
     const prepared = this.prepareSession(opts, {
       cwd: opts.cwd,
-      schema: undefined,
+      schema: opts.schema,
       registry: this.backends,
       permissionResolver: opts.permissionResolver ?? opts.onPermissionRequest,
       elicitationResolver: opts.onElicitation,
@@ -1119,6 +1119,16 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     let session: SessionHandle | undefined;
     try {
       session = await open(connection, prepared);
+      if (methodName === "loadSession") {
+        // The re-attach arm's load boundary (phase-D review round 2):
+        // `session/load` replays the ENTIRE persisted conversation before
+        // resolving, so the transcript is complete at this instant — the
+        // mark runs synchronously after the response, before any
+        // post-load wire message can be applied (a live continuation's
+        // first chunk arrives as a later I/O event). Anything applied
+        // after the mark is live-continuation evidence.
+        session.markLoadBoundary();
+      }
       opts.signal?.throwIfAborted();
       await applyModelSelection(session, prepared.modelSpec, opts);
       opts.signal?.throwIfAborted();
@@ -1138,6 +1148,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         label: opts.label,
         cwd: opts.cwd,
         keepSession: opts.keepSession === true,
+        schema: opts.schema,
       });
       this.interactiveSessions.set(interactive, connection);
       return interactive;

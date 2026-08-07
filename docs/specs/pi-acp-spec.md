@@ -888,6 +888,21 @@ session, and content is converted with `convertPromptContent()`. Behavior is cod
   only typed adapter errors (unknown/terminated session, malformed params, preflight) surface as
   JSON-RPC errors.
 
+`_session/loaded_turn` is the sibling vendor extension for loaded-session turn-TERMINAL state (the
+REPL broker's re-attach arm's authoritative completion evidence), advertised only at top-level
+`InitializeResponse._meta.loadedTurn.supported === true`. Its parser accepts `{ sessionId }`, the
+agent routes it through `requireLive()`, and the answer is the session's own state:
+
+- **`running`** — a turn is executing in this process right now; the query arms a one-shot watch and
+  the turn's `finish()` pushes `_session/loaded_turn/ended { sessionId, stopReason? | error? }` (the
+  ACP stop reason for a response outcome, the error for a failure) — the authoritative terminal
+  marker a client waiting on the turn settles from.
+- **`completed`** — the session journal's last message entry is an assistant message (pi persists
+  every complete LLM message atomically at `message_end`), so the replayed trailing assistant
+  message is the founding turn's FINAL message.
+- **`interrupted`** — otherwise (an interrupted/abandoned turn; nothing is running, so re-issue is
+  safe).
+
 ---
 
 ## 7. Stop-reason taxonomy

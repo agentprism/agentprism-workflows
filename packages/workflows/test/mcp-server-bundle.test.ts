@@ -10,8 +10,13 @@ const REPOSITORY_ROOT = resolve(import.meta.dirname, "../../..");
 const WORKFLOWS_ROOT = resolve(import.meta.dirname, "..");
 const WORKFLOWS_DIST_ENTRY = resolve(WORKFLOWS_ROOT, "dist/index.js");
 const MCP_SOURCE_ENTRY = resolve(REPOSITORY_ROOT, "packages/mcp-server/src/index.ts");
-const MCP_BUNDLE = resolve(WORKFLOWS_ROOT, "dist/mcp-server.js");
-const WORKFLOWS_PACKAGE = (await import("../package.json", { with: { type: "json" } })).default;
+// The bundle lives under the MCP server's OWN tree so the externalized
+// `@automatalabs/*` imports resolve exactly like the published package's
+// (the mcp-server node_modules links repl-engine, shared-types, and
+// workflows — the workflows link is what keeps WORKFLOWS_DIST_ENTRY
+// load-bearing).
+const MCP_BUNDLE = resolve(REPOSITORY_ROOT, "packages/mcp-server/dist/mcp-server-bundle-smoke.js");
+const MCP_PACKAGE = (await import("../../mcp-server/package.json", { with: { type: "json" } })).default;
 
 interface JsonRpcFrame {
   jsonrpc?: unknown;
@@ -148,7 +153,7 @@ test("the bundled stdio server initializes once and advertises the workflow tool
       serverInfo?: { name?: unknown; version?: unknown };
     };
     assert.equal(initializeResult.serverInfo?.name, "agentprism-workflow");
-    assert.equal(initializeResult.serverInfo?.version, WORKFLOWS_PACKAGE.version);
+    assert.equal(initializeResult.serverInfo?.version, MCP_PACKAGE.version);
 
     const toolsResult = toolsList.result as { tools?: Array<{ name?: unknown }> };
     assert.ok(toolsResult.tools?.some((tool) => tool.name === "workflow"), "workflow tool was not advertised");

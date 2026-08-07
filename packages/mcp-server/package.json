@@ -49,6 +49,7 @@
     "prepublishOnly": "tsc -b"
   },
   "dependencies": {
+    "@automatalabs/repl-engine": "workspace:*",
     "@automatalabs/shared-types": "workspace:*",
     "@automatalabs/workflows": "workspace:*",
     "@modelcontextprotocol/ext-apps": "^1.7.4",

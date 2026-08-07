@@ -8,6 +8,7 @@ import {
 import { PiAcpAgent } from "./agent.js";
 import { resolveDeps, type PiAcpDeps } from "./deps.js";
 import { SESSION_STEERING_METHOD, steeringRequestParser } from "./steering.js";
+import { LOADED_TURN_QUERY_METHOD, loadedTurnQueryParser } from "./loaded-turn.js";
 
 export { PiAcpAgent } from "./agent.js";
 
@@ -30,6 +31,7 @@ export async function runAcp(options: RunAcpOptions = {}) {
     .onRequest(methods.agent.session.setConfigOption, (context) => impl.setConfigOption(context))
     .onRequest(methods.agent.session.prompt, (context) => impl.prompt(context))
     .onRequest(SESSION_STEERING_METHOD, steeringRequestParser, (context) => impl.steer(context))
+    .onRequest(LOADED_TURN_QUERY_METHOD, loadedTurnQueryParser, (context) => impl.loadedTurnQuery(context))
     .onNotification(methods.agent.session.cancel, (context) => impl.cancel(context));
   const stream = options.stream ?? ndJsonStream(
     Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,

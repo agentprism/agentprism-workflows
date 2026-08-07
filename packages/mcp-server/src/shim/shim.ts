@@ -14,6 +14,8 @@
  *    cached initialize, and retries. The client never notices an eviction or daemon restart.
  */
 
+import { realpathSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   StreamableHTTPClientTransport,
@@ -40,6 +42,45 @@ function initializeResultProtocolVersion(message: JSONRPCMessage): string | unde
 export async function runShim(options: RunShimOptions): Promise<void> {
   const log = (line: string) => console.error(line);
   const info = await ensureDaemonRunning({ bundlePath: options.bundlePath, port: options.port, log });
+  // The REPL eval-break relay (phase-F review round 2): the worker-
+  // thread channel whose loopback endpoint stays reachable while the
+  // daemon's main thread is blocked in a synchronous eval. The shim
+  // fires the `repl` interrupt tool's no-id break here BEFORE forwarding
+  // the request to the daemon — the out-of-band delivery that makes the
+  // documented quickjs-interrupt behavior real for a never-yielding
+  // eval (the daemon processes the forwarded request only after the
+  // eval ends or breaks; the relay's flag is what breaks it mid-run).
+  let replBreakUrl: string | undefined = info.replBreakUrl;
+
+  /** Fire the out-of-band break for a `repl` interrupt without an id
+   *  (best-effort, fire-and-forget: the daemon's own processing clears
+   *  the flag when it lands; a missing/stale relay URL or a dead relay
+   *  degrades to the per-eval deadline bound). The key is REALPATH'd
+   *  exactly like the daemon's own project validation (phase-F review
+   *  round 3: the raw caller-supplied path used to be posted verbatim,
+   *  while the tool realpaths it and the channel registers the
+   *  canonical path — a valid absolute symlink or a path with
+   *  redundant components therefore got a relay 404 and could not
+   *  interrupt the running eval). An unresolvable path is skipped: the
+   *  tool call itself is refused as an invalid projectDir. */
+  function fireOutOfBandBreak(projectDir: unknown): void {
+    if (typeof projectDir !== "string" || replBreakUrl === undefined) return;
+    let key: string;
+    try {
+      if (!isAbsolute(projectDir)) return;
+      key = realpathSync(projectDir);
+    } catch {
+      return; // invalid/unresolvable — the daemon's own validation refuses the call
+    }
+    void fetch(replBreakUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key }),
+      signal: AbortSignal.timeout(1000),
+    }).catch(() => {
+      // Best-effort: a dead relay must never break the forwarding path.
+    });
+  }
 
   const stdio = new StdioServerTransport();
 
@@ -124,8 +165,9 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     }
     try {
       await http.close().catch(() => undefined);
-      // Re-ensure: the daemon may have restarted (new port) or died entirely.
+      // Re-ensure: the daemon may have restarted (new port).
       const fresh = await ensureDaemonRunning({ bundlePath: options.bundlePath, port: options.port, log });
+      replBreakUrl = fresh.replBreakUrl;
       http = makeHttpTransport(fresh.url);
       await http.start();
       pendingReinitId = `__shim_reinit_${++reinitCounter}__`;
@@ -185,6 +227,22 @@ export async function runShim(options: RunShimOptions): Promise<void> {
         if (typeof uri === "string") {
           if (message.method === "resources/subscribe") subscribedUris.add(uri);
           else subscribedUris.delete(uri);
+        }
+      } else if (message.method === "tools/call") {
+        // The out-of-band repl eval-break (phase-F review round 2): a
+        // `repl` interrupt WITHOUT a call id fires the relay first — the
+        // daemon may be blocked in a synchronous eval, and the relay's
+        // worker thread is the only path that can reach it mid-run. The
+        // forwarded request is still sent (when the daemon is
+        // responsive, its own arm/refuse/clear handling owns the
+        // break; the flag is consumed on first observation or cleared
+        // by the daemon — never a stale break).
+        const params = message.params as { name?: unknown; arguments?: Record<string, unknown> } | undefined;
+        if (params?.name === "repl") {
+          const args = params.arguments ?? {};
+          if (args.action === "interrupt" && args.id === undefined) {
+            fireOutOfBandBreak(args.projectDir);
+          }
         }
       }
     }

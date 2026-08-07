@@ -20,6 +20,7 @@ import {
 import { envFingerprint, pidIsAlive, probeHealthz, readDaemonInfo, writeDaemonInfo } from "./daemon-info.js";
 import { installDaemonLifecycle } from "./daemon-lifecycle.js";
 import { createDaemon, DaemonPortInUseError } from "./http-daemon.js";
+import { createEvalBreakChannel } from "@automatalabs/repl-engine";
 
 export interface RunDaemonOptions {
   port?: number;
@@ -50,8 +51,15 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
   const runner = createAcpRunner();
 
   let daemon;
+  const sessionTtlMs = envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS);
+  // The eval-break relay (phase-F review round 2): a worker-thread
+  // channel whose loopback endpoint stays reachable while the daemon's
+  // main thread is blocked in a synchronous eval — the `interrupt`
+  // tool's no-id break. Its address travels in daemon.json so the shim
+  // can fire it out of band.
+  const evalBreakChannel = createEvalBreakChannel();
   try {
-    daemon = await createDaemon({ runner, port, log });
+    daemon = await createDaemon({ runner, port, log, sessionTtlMs, evalBreakChannel });
   } catch (error) {
     if (!(error instanceof DaemonPortInUseError)) throw error;
     if (await ownDaemonAlreadyRunning()) {
@@ -61,7 +69,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     // A foreign process owns the default port. Discovery goes through daemon.json, never a
     // blind dial of the default port, so an ephemeral port is fully functional.
     log(`[${DAEMON_NAME}] port ${port} is taken by another process; falling back to an ephemeral port`);
-    daemon = await createDaemon({ runner, port: 0, log });
+    daemon = await createDaemon({ runner, port: 0, log, sessionTtlMs, evalBreakChannel });
   }
 
   writeDaemonInfo({
@@ -72,6 +80,10 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     url: daemon.url,
     startedAt: daemon.startedAt,
     envFingerprint: envFingerprint(),
+    ...(await evalBreakChannel
+      .breakUrl()
+      .then((url) => ({ replBreakUrl: url }))
+      .catch(() => ({}))),
   });
 
   installDaemonLifecycle({
