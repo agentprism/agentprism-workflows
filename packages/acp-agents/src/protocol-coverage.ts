@@ -192,7 +192,8 @@ export interface AuthMetaMatrixRow {
  *  SERVE the extension: claude and opencode do not advertise it, and the re-attach seam's
  *  observation path classifies their loaded turns authoritatively instead (see
  *  `InteractiveSession.awaitCurrentTurn` — the connection-death contract makes the replay
- *  probe authoritative; phase-F review round 2). Each
+ *  probe authoritative for the VERIFIED BUILT-INS; phase-F review round 2, restricted to the
+ *  built-in instances in round 3). Each
  *  `capability` is a literal that MUST appear in spec §3.6; `docs-drift.test.ts` asserts that lockstep,
  *  and (where `distProbe` is set) `protocol-coverage.test.ts` asserts the literal is still present in
  *  the installed agent dist — so neither the spec nor an agent bump can silently drift a `_meta`
@@ -222,7 +223,10 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
  *  post-load continuation watch plus the replay probe under the connection-death contract —
  *  see `InteractiveSession.awaitCurrentTurn`; phase-F review round 2: the old degradation
  *  released the loaded session and re-issued the call, which can duplicate a still-running
- *  turn; a possibly-running call is never re-issued). */
+ *  turn; a possibly-running call is never re-issued). The replay classification is restricted
+ *  to the VERIFIED BUILT-IN instances (`connectionDeathVerified`) — a custom backend's quiet
+ *  observation window is not terminal evidence and degrades to the keep-attached
+ *  still-running wait (phase-F review round 3). */
 export interface AcpExtensionSupportMatrixRow {
   readonly agent: string;
   readonly method: typeof SESSION_STEERING_METHOD | typeof LOADED_TURN_QUERY_METHOD;

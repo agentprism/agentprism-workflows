@@ -14,6 +14,8 @@
  *    cached initialize, and retries. The client never notices an eviction or daemon restart.
  */
 
+import { realpathSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   StreamableHTTPClientTransport,
@@ -53,13 +55,27 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   /** Fire the out-of-band break for a `repl` interrupt without an id
    *  (best-effort, fire-and-forget: the daemon's own processing clears
    *  the flag when it lands; a missing/stale relay URL or a dead relay
-   *  degrades to the per-eval deadline bound). */
+   *  degrades to the per-eval deadline bound). The key is REALPATH'd
+   *  exactly like the daemon's own project validation (phase-F review
+   *  round 3: the raw caller-supplied path used to be posted verbatim,
+   *  while the tool realpaths it and the channel registers the
+   *  canonical path — a valid absolute symlink or a path with
+   *  redundant components therefore got a relay 404 and could not
+   *  interrupt the running eval). An unresolvable path is skipped: the
+   *  tool call itself is refused as an invalid projectDir. */
   function fireOutOfBandBreak(projectDir: unknown): void {
     if (typeof projectDir !== "string" || replBreakUrl === undefined) return;
+    let key: string;
+    try {
+      if (!isAbsolute(projectDir)) return;
+      key = realpathSync(projectDir);
+    } catch {
+      return; // invalid/unresolvable — the daemon's own validation refuses the call
+    }
     void fetch(replBreakUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ key: projectDir }),
+      body: JSON.stringify({ key }),
       signal: AbortSignal.timeout(1000),
     }).catch(() => {
       // Best-effort: a dead relay must never break the forwarding path.

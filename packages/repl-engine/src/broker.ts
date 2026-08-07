@@ -195,9 +195,14 @@
  *    past the max-wait bound (re-armable `LoadedTurnStillRunningError`
  *    — the broker re-arms the seam on the still-attached session so a
  *    later notification or cancel still settles the call; the
- *    NON-re-armable form from a third-party seam is treated the SAME
- *    way — a possibly-running call is never re-issued, phase-F review
- *    round 2), or a turn
+ *    NON-re-armable form from a third-party seam (it can NEVER observe
+ *    the terminal state) is NOT re-invoked — an immediate recursive
+ *    re-arm would spin in an unbounded microtask/warning loop,
+ *    starving cancellation, drain, and every other task — the broker
+ *    instead waits for the terminal state from the session's own ended
+ *    notification, the call's cancel, the session's release, or the
+ *    drain's forced stop (phase-F review round 2: a possibly-running
+ *    call is never re-issued), or a turn
  *    that failed at the backend
  *    (`LoadedTurnFailedError` — a definite outcome, settled as an
  *    ordinary rejection, never re-issued). While the broker is
@@ -347,6 +352,7 @@
 import type { JSValueHandle } from 'quickjs-wasi';
 import {
   AcpAgentRunner,
+  LoadedTurnFailedError,
   isLoadedTurnFailedError,
   isLoadedTurnStillRunningError,
   parseFinalJson,
@@ -513,9 +519,31 @@ export interface BrokerSession {
    * duplicate). OPTIONAL for third-party `BrokerSession` adapters: an
    * adapter without the seam still re-attaches the session, then
    * degrades through the re-issue fallback — never a permanent hold
-   * (re-attachment itself is unavailable there).
+   * (re-attachment itself is unavailable there). A seam that rejects
+   * with the still-running class and `rearmable: false` (it can NEVER
+   * observe the terminal state) is NOT re-invoked: the broker keeps the
+   * loaded session attached and waits for the terminal state from the
+   * surfaces below (`loadedTurnEndedState`/`subscribeLoadedTurnEnded`,
+   * `released`, the call's cancel, or the client-presence drain's
+   * forced stop).
    */
   awaitCurrentTurn?(): Promise<BrokerTurn>;
+  /** The loaded session's recorded founding-turn terminal state (the
+   *  `_session/loaded_turn/ended` notification, when the backend pushed
+   *  one — a seam-less backend that sends it anyway). The
+   *  non-re-armable settlement wait's observability surface; OPTIONAL
+   *  for third-party adapters that cannot observe it (the wait then
+   *  settles only on a cancel, the drain's forced stop, or the
+   *  session's release). */
+  loadedTurnEndedState?(): { stopReason?: string; error?: { name: string; message: string } } | null;
+  /** Watch the loaded-turn-ended channel (fires immediately for a
+   *  notification that already arrived). Returns the unsubscribe
+   *  thunk. OPTIONAL like `loadedTurnEndedState`. */
+  subscribeLoadedTurnEnded?(listener: () => void): () => void;
+  /** Resolve when the session is released (its dedicated process died
+   *  or was disposed) — the non-re-armable settlement wait's release
+   *  watch. OPTIONAL for third-party adapters that cannot expose it. */
+  released?(): Promise<void>;
 }
 
 /** The runner seam the broker drives (structural subset of
@@ -812,6 +840,10 @@ interface SessionEntry {
   callSettled: boolean;
   /** True when the founding call was cancelled — the queue is dropped. */
   callCancelled: boolean;
+  /** Waiters woken when the entry's cancel flag flips (the
+   *  non-re-armable settlement wait's cancel signal — see
+   *  `markCancelled`). One-shot listeners, removed on fire. */
+  readonly cancelWaiters: Set<() => void>;
   /** Queued followUp/steer payloads (no-extension backends with a turn
    *  in flight, and cap-pressure queues on idle sessions), in order. */
   queue: Array<{ callId: string; prompt: string; promptMeta?: Record<string, unknown> }>;
@@ -1022,12 +1054,18 @@ export class Broker {
    *  observation (the quickjs interrupt polls constantly, so the next
    *  target continuation execution after arming breaks mid-run). */
   private evalBreakArmed = false;
-  /** The OUT-OF-BAND break probe's execution clock (phase-F review
-   *  round 2, see `evalBreakProbe`): the wall-clock moment the CURRENT
-   *  execution began — a fresh eval's code phase or a settlement
-   *  drain. The probe consumes the channel's break flag only when it
-   *  was armed after this instant (the arm-after-start rule). */
-  private currentExecutionStartMs = 0;
+  /** The OUT-OF-BAND break probe's execution marker (phase-F review
+   *  round 2, see `evalBreakProbe`; round 3: the wall-clock start was
+   *  replaced by the channel's monotonic ARM-SEQUENCE marker — a total
+   *  order across the worker and this thread, so a break armed in the
+   *  same millisecond as the execution's start can never be consumed
+   *  as stale and lost): the arm-sequence counter's value the moment
+   *  the CURRENT execution began — a fresh eval's code phase or a
+   *  settlement drain. The probe consumes the channel's break flag
+   *  only when its arm sequence exceeds this marker (the arm-after-
+   *  start rule). Zero when no channel is wired (the probe is then
+   *  absent anyway). */
+  private currentExecutionStartSeq = 0;
   /** How many out-of-band breaks were CONSUMED by an executing eval
    *  (a break that actually broke a running eval). */
   outOfBandBreakCount = 0;
@@ -1714,6 +1752,7 @@ export class Broker {
       delivering: false,
       callSettled: false,
       callCancelled: false,
+      cancelWaiters: new Set(),
       queue: this.pendingSteers.get(entry.id) ?? [],
     };
     this.pendingSteers.delete(entry.id);
@@ -1790,19 +1829,35 @@ export class Broker {
           // The turn may still be running at the backend and its terminal
           // state is unobservable: never settle partial output, and never
           // re-issue a possibly-running call. The broker KEEPS THE LOADED
-          // SESSION ATTACHED and re-arms the seam on it — the doc's
-          // second reconciliation arm, re-attach to a still-running task —
-          // for both the re-armable form (a `running` turn past the
-          // max-wait bound on an extension-carrying backend) and the
-          // non-re-armable form (a third-party seam that can never
-          // observe the terminal state); a later terminal notification —
-          // or a cancel — still settles the call, and the drain's forced
-          // stop settles it durably at its bound (phase-F review round 2:
-          // the non-re-armable form used to release the loaded session
-          // and re-issue the call — a still-running backend turn would
-          // have been duplicated; the seam's own observation path now
-          // classifies the seam-less built-ins authoritatively, and
-          // re-issue is reserved for the observably-dead classes below).
+          // SESSION ATTACHED — the doc's second reconciliation arm,
+          // re-attach to a still-running task. The RE-ARMABLE form (a
+          // `running` turn past the max-wait bound on an extension-
+          // carrying backend): re-arm the seam on the still-attached
+          // session — a later ended notification — or a cancel — still
+          // settles the call. The NON-RE-ARMABLE form (a third-party seam
+          // that can never observe the terminal state) is NOT re-invoked:
+          // an immediate recursive re-arm would spin in an unbounded
+          // microtask/warning loop (each rejection cycles instantly),
+          // starving cancellation, drain, and every other task — the
+          // broker instead waits for the terminal state from the
+          // remaining authority surfaces (see
+          // `waitForNonRearmableSettlement`). The drain's forced stop
+          // settles a still-pending call durably at its bound either way
+          // (phase-F review round 2: the non-re-armable form used to
+          // release the loaded session and re-issue the call — a
+          // still-running backend turn would have been duplicated; the
+          // seam's own observation path now classifies the seam-less
+          // built-ins authoritatively, and re-issue is reserved for the
+          // observably-dead classes below).
+          if (error.rearmable === false) {
+            this.warnLine(
+              'warn',
+              `call ${callId}: ${toRejectionValue(error).message} — the seam can never observe the terminal state; ` +
+                `the loaded session stays attached and the call settles on a cancel, the backend's ended ` +
+                `notification, the session's release, or the client-presence drain`, // eslint-disable-line max-len
+            );
+            return this.waitForNonRearmableSettlement(callId, entry, parsed);
+          }
           this.warnLine('warn', `call ${callId}: ${toRejectionValue(error).message} — re-armed on the attached session`);
           return this.runReattachedTask(callId, entry, parsed);
         }
@@ -1840,6 +1895,140 @@ export class Broker {
         return { outcome: 'reject', value: toRejectionValue(error) };
       }
     })();
+  }
+
+  /** The NON-RE-ARMABLE still-running settlement wait (see
+   *  `runReattachedTask`'s seam-rejection classification): a third-party
+   *  seam that rejects with `LoadedTurnStillRunningError` and
+   *  `rearmable: false` can NEVER observe the loaded session's founding-
+   *  turn terminal state, so re-invoking it is pointless — the immediate
+   *  recursive re-arm would spin in an unbounded microtask/warning loop
+   *  (each rejection cycles instantly), starving cancellation, drain,
+   *  and every other task. The broker KEEPS THE LOADED SESSION ATTACHED
+   *  (a possibly-running call is never re-issued, never settled from a
+   *  quiet gap) and waits — zero polling, one-shot subscriptions — for
+   *  the terminal state from the remaining authority surfaces:
+   *
+   *  - the session's own `_session/loaded_turn/ended` notification (the
+   *    `loadedTurnEndedState`/`subscribeLoadedTurnEnded` surfaces — a
+   *    seam-less backend that pushes the notification anyway): a turn
+   *    that ended with an error settles as a rejection (the
+   *    `LoadedTurnFailedError` class — a definite outcome, never
+   *    re-issued); one that ended with a response resolves with the
+   *    accumulated text (the stop-reason gate applies, exactly like a
+   *    live call);
+   *  - a cancel of the call: settled as the recoverable `AGENT_CANCELLED`
+   *    (the interrupt tool works on a held call);
+   *  - the session's release: its dedicated process died — the backend
+   *    turn died with it — the safe-re-issue class (fenced by
+   *    `reissueReattached`);
+   *  - the client-presence drain: the forced stop settles every
+   *    still-pending call DURABLY at the bound (recorded `AGENT_CANCELLED`,
+   *    guest-settled); while draining/disposed, the wait holds — the
+   *    call stays as the drain/disposal left it.
+   *
+   *  The wait is a bounded task exactly like the re-armable seam's: it
+   *  holds the call's in-flight entry, and a later settlement is
+   *  first-wins against the drain's recorded completion. */
+  private async waitForNonRearmableSettlement(
+    callId: string,
+    entry: SessionEntry,
+    parsed: ParsedAgentOptions,
+  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
+    const session = entry.session;
+    // The release watch (the session's process death/disposal): created
+    // once and raced every cycle. Absent on adapters that cannot expose
+    // it — the wait then settles only on the remaining signals. The
+    // flag is set exactly once (a released session stays released), so
+    // the race can never spin on a resolved watch.
+    let released = false;
+    const releaseWatch = (session.released?.() ?? new Promise<void>(() => undefined)).then(() => {
+      released = true;
+    });
+    for (;;) {
+      if (this.draining || this.disposed) {
+        // The drain/disposal fences: the forced stop settled (or is
+        // about to settle) the call durably at the bound — never a
+        // re-issue after the last client disconnected, and never a
+        // settlement from a torn-down state.
+        this.warnLine(
+          'warn',
+          `call ${callId}: the held re-attach's settlement wait was cut off by the client-presence drain (or ` +
+            `the broker was disposed) — the call stays as the drain/disposal left it`, // eslint-disable-line max-len
+        );
+        return { outcome: 'hold', value: undefined };
+      }
+      if (released) {
+        // The loaded session's dedicated process died (or was
+        // disposed): the backend turn died with it — observably dead —
+        // the safe-re-issue class (fenced by `reissueReattached`).
+        return this.reissueReattached(
+          callId,
+          entry,
+          parsed,
+          new Error(
+            'the held loaded session was released while awaiting its founding turn — the backend process ' +
+              'died; re-issue is the honest fallback',
+          ),
+        );
+      }
+      if (entry.callCancelled) {
+        // A cancel landed on the held call: settle it as the recoverable
+        // `AGENT_CANCELLED` — the interrupt tool's contract, exactly like
+        // a live call's cancellation.
+        const value = toRejectionValue(
+          new WorkflowError(`call ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
+            recoverable: true,
+          }),
+        );
+        return { outcome: 'reject', value };
+      }
+      const ended = session.loadedTurnEndedState?.() ?? null;
+      if (ended !== null) {
+        if (ended.error !== undefined) {
+          // The turn RAN and failed at the backend: a definite outcome —
+          // settled as an ordinary rejection, never re-issued and never
+          // settled as success.
+          return {
+            outcome: 'reject',
+            value: toRejectionValue(
+              new LoadedTurnFailedError(
+                `the loaded session's founding turn failed at the backend: ${ended.error.message}`,
+              ),
+            ),
+          };
+        }
+        try {
+          this.assertNormalStopReason(ended.stopReason ?? 'end_turn', callId);
+          return { outcome: 'resolve', value: this.finalTextOf(session.currentTurnText(), callId) };
+        } catch (error) {
+          return { outcome: 'reject', value: toRejectionValue(error) };
+        }
+      }
+      // One-shot signal promises: the ended notification (immediately
+      // for a notification that already arrived — the state was checked
+      // above, so only the in-between race can land here), the cancel
+      // flag, and the release watch. Each wake re-runs the checks; the
+      // wait never spins.
+      const endedNotification = new Promise<void>((resolve) => {
+        const off = session.subscribeLoadedTurnEnded?.(() => {
+          off?.();
+          resolve();
+        });
+      });
+      const cancelSignal = new Promise<void>((resolve) => {
+        if (entry.callCancelled) {
+          resolve();
+          return;
+        }
+        const wake = () => {
+          entry.cancelWaiters.delete(wake);
+          resolve();
+        };
+        entry.cancelWaiters.add(wake);
+      });
+      await Promise.race([endedNotification, cancelSignal, releaseWatch]);
+    }
   }
 
   /** The safe-re-issue degradation (inside the re-attached task) — the
@@ -2035,6 +2224,7 @@ export class Broker {
         delivering: false,
         callSettled: true,
         callCancelled: false,
+        cancelWaiters: new Set(),
         queue: this.pendingSteers.get(sessionId) ?? [],
       };
       this.pendingSteers.delete(sessionId);
@@ -2397,6 +2587,7 @@ export class Broker {
         return 'idle';
       }
       current.callCancelled = true;
+      for (const wake of current.cancelWaiters) wake();
       return 'cancelled';
     });
   }
@@ -3484,6 +3675,12 @@ export class Broker {
         await boundedOne(runnerDispose, deadline);
       }
     }, deadline);
+    // The workspace's eval-break slot is released with the broker (the
+    // channel's slots are per-project and reusable — phase-F review
+    // round 3: the old channel never released slots, and a fresh
+    // workspace for the same project re-registers on its broker's
+    // attach). Fire-and-forget: the channel is a best-effort relay.
+    this.evalBreakChannel?.unregister(this.workspace.projectDir);
   }
 
   // ── Guest bridge handlers ─────────────────────────────────────────────
@@ -3937,6 +4134,7 @@ export class Broker {
         delivering: false,
         callSettled: false,
         callCancelled: false,
+        cancelWaiters: new Set(),
         queue: this.pendingSteers.get(callId) ?? [],
       };
       this.pendingSteers.delete(callId);
@@ -4176,7 +4374,21 @@ export class Broker {
    *  own fate. */
   private async cancelSession(entry: SessionEntry): Promise<void> {
     await entry.session.cancel();
+    this.markCancelled(entry);
+  }
+
+  /** Set the entry's cancel flag and wake its waiters (the
+   *  non-re-armable settlement wait's cancel signal — a held re-attach
+   *  call is settled as the recoverable `AGENT_CANCELLED` the moment a
+   *  cancel lands, never left pending until the drain). Idempotent;
+   *  waiters are one-shot and removed on fire. */
+  private markCancelled(entry: SessionEntry): void {
+    if (entry.callCancelled) return;
     entry.callCancelled = true;
+    for (const wake of [...entry.cancelWaiters]) {
+      entry.cancelWaiters.delete(wake);
+      wake();
+    }
   }
 
   /** Drop a cancelled/failed call's queued steers (their promises already
@@ -4440,10 +4652,10 @@ export class Broker {
    * interrupted drain releases nothing and leaves the eval-break armed
    * state intact. */
   private drain(boundDeadlineMs?: number): void {
-    // The OUT-OF-BAND probe's execution clock: this drain began now (a
+    // The OUT-OF-BAND probe's execution marker: this drain began now (a
     // break armed mid-drain breaks the running job — an interrupt lands
     // promptly mid-wait).
-    this.currentExecutionStartMs = Date.now();
+    this.currentExecutionStartSeq = this.evalBreakChannel?.executionStartMarker() ?? 0;
     const boundHandler =
       boundDeadlineMs === undefined ? undefined : () => Date.now() >= boundDeadlineMs;
     try {
@@ -4525,10 +4737,10 @@ export class Broker {
    *  through the quickjs interrupt handler, even when an explicit signal
    *  handler is armed and unset). */
   private runEval(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
-    // The OUT-OF-BAND probe's execution clock: this eval's code phase
+    // The OUT-OF-BAND probe's execution marker: this eval's code phase
     // began now — a break armed after this instant breaks THIS eval; a
     // stale flag (armed before) is dropped on first observation.
-    this.currentExecutionStartMs = Date.now();
+    this.currentExecutionStartSeq = this.evalBreakChannel?.executionStartMarker() ?? 0;
     // The eval's CONTINUATION TOKEN (phase-E review round 5): minted
     // per eval, embedded in the instrumented code's `__replAwait(value,
     // token)` calls (see `await-instrument.ts`), and attributed to the
@@ -4674,7 +4886,7 @@ export class Broker {
     if (channel === undefined) return undefined;
     const projectDir = this.workspace.projectDir;
     return () => {
-      if (channel.consumeBreak(projectDir, this.currentExecutionStartMs)) {
+      if (channel.consumeBreak(projectDir, this.currentExecutionStartSeq)) {
         this.outOfBandBreakCount++;
         this.lastOutOfBandBreakAtMs = Date.now();
         return true;

@@ -52,9 +52,10 @@ export interface CreateDaemonOptions {
   /** The REPL eval-break relay (phase-F review round 2; see
    *  repl-engine's `EvalBreakChannel`): the worker-thread channel whose
    *  loopback endpoint the shim fires while the daemon's main thread is
-   *  blocked in a synchronous eval. Omitted in single-project mode
-   *  (there is no separate shim to fire it — the per-eval deadline
-   *  remains the bound). */
+   *  blocked in a synchronous eval. The daemon passes its own channel
+   *  (single-project servers own one by default — round 3: the
+   *  in-process mode's relay transport fires it, see
+   *  `repl-stdio-transport.ts`). */
   evalBreakChannel?: EvalBreakChannel;
 }
 

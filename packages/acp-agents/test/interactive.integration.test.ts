@@ -645,6 +645,96 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
     assert.deepEqual(turn5d, { stopReason: "end_turn", text: "result D (loaded)" });
     await loaded5d.release();
 
+    // 5e) A CUSTOM backend (a registered registry entry) WITHOUT the
+    //     extension: the connection-death contract is NOT live-verified
+    //     for it, so its quiet observation window is NOT terminal
+    //     evidence (phase-F review round 3: the replay classification
+    //     used to apply to every extension-less backend — a durable
+    //     custom backend can keep a turn running while quiet, and
+    //     settling stale/partial replay or re-issuing would violate the
+    //     no-duplicate invariant). The seam keeps the loaded session
+    //     attached and waits for the authoritative terminal state — the
+    //     max-wait bound rejects with the RE-ARMABLE still-running class
+    //     (the broker re-arms the wait on the attached session); the
+    //     replay's trailing assistant message is never settled as
+    //     completed.
+    const { config: config5e, cwd: cwd5e, readLog: readLog5e } = fakeCustomBackend({
+      loadSessionSupport: true,
+      loadSession: {
+        replay: [
+          { role: "user", text: "task" },
+          { role: "assistant", text: "looks complete but the backend may still be running" },
+        ],
+      },
+    });
+    const runner5e = makeRunner({ backends: { fakecustom: config5e } });
+    const loaded5e = await runner5e.loadSession({ sessionId: "fake-session-any", cwd: cwd5e, model: "fakecustom" });
+    await assert.rejects(
+      () => loaded5e.awaitCurrentTurn(),
+      (error: unknown) => {
+        assert.ok(
+          (error as { loadedTurnStillRunning?: unknown }).loadedTurnStillRunning === true,
+          `the still-running marker: ${String((error as Error).message)}`,
+        );
+        assert.equal(
+          (error as { rearmable?: unknown }).rearmable,
+          true,
+          "re-armable: the broker keeps the attached session and re-arms the wait",
+        );
+        assert.ok(
+          (error as Error).message.includes("not live-verified"),
+          (error as Error).message,
+        );
+        assert.ok(
+          (error as Error).message.includes("stayed quiet after the load"),
+          (error as Error).message,
+        );
+        return true;
+      },
+    );
+    assert.ok(
+      !readLog5e().some((e) => e.method === "extensionRequest" && e.extensionMethod === "_session/loaded_turn/query"),
+      "no query on the wire — the custom backend advertised no extension",
+    );
+    await loaded5e.release();
+
+    // 5f) A CUSTOM backend whose EXTENSION query fails: the query's
+    //     failure falls through to the observation path, and the same
+    //     unverified rule applies — the quiet window is not terminal
+    //     evidence, the loaded session stays attached, and the max-wait
+    //     bound rejects with the RE-ARMABLE still-running class (never
+    //     a replay settlement, never a re-issue of a possibly-running
+    //     turn).
+    const { config: config5f, cwd: cwd5f } = fakeCustomBackend({
+      loadSessionSupport: true,
+      loadSession: {
+        loadedTurnQueryError: "query exploded",
+        replay: [
+          { role: "user", text: "task" },
+          { role: "assistant", text: "looks complete but the backend may still be running" },
+        ],
+      },
+    });
+    const runner5f = makeRunner({ backends: { fakecustom: config5f } });
+    const loaded5f = await runner5f.loadSession({ sessionId: "fake-session-any", cwd: cwd5f, model: "fakecustom" });
+    await assert.rejects(
+      () => loaded5f.awaitCurrentTurn(),
+      (error: unknown) => {
+        assert.ok(
+          (error as { loadedTurnStillRunning?: unknown }).loadedTurnStillRunning === true,
+          `the still-running marker: ${String((error as Error).message)}`,
+        );
+        assert.equal(
+          (error as { rearmable?: unknown }).rearmable,
+          true,
+          "re-armable: the broker keeps the attached session and re-arms the wait",
+        );
+        assert.ok((error as Error).message.includes("query failed: query exploded"), (error as Error).message);
+        return true;
+      },
+    );
+    await loaded5f.release();
+
     // 6) The unconditional arm: a transcript with NO user message (the recorded session
     //    never received its prompt) rejects with the safe-re-issue class even when the
     //    extension is advertised — nothing reached the backend.

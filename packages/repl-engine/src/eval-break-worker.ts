@@ -6,11 +6,16 @@
  * never blocks with the daemon.
  *
  * Wire contract: `POST /break` with a JSON body `{ "key": "<workspace
- * key>" }` arms the key's flag (timestamp first, flag second — release
- * order, so a consumed flag always carries its arm moment); 204 when
- * the key is registered, 404 otherwise. `{ type: "register", key, slot }`
- * messages from the main thread teach the key→slot mapping; `dispose`
- * closes the server and exits.
+ * key>" }` arms the key's flag (arm sequence first, flag second —
+ * release order, so a consumed flag always carries its arm sequence);
+ * 204 when the key is registered, 404 otherwise. `{ type: "register",
+ * key, slot }` messages from the main thread teach the key→slot
+ * mapping; `{ type: "unregister", key }` drops it (the slot returns to
+ * the main thread's free pool); `dispose` closes the server and exits.
+ *
+ * The shared buffer is RESIZABLE: the length-tracking `Int32Array` view
+ * below follows the main thread's growth automatically, and the slot
+ * stride is fixed, so no re-view handshake is ever needed.
  */
 
 import { createServer } from "node:http";
@@ -21,10 +26,16 @@ interface WorkerData {
 }
 
 const { sab } = workerData as WorkerData;
-const SLOTS = 64;
-const flags = new Int32Array(sab, 0, SLOTS);
-const times = new Float64Array(sab, SLOTS * 4, SLOTS);
+const view = new Int32Array(sab);
 const slotsByKey = new Map<string, number>();
+
+function slotFlagWord(slot: number): number {
+  return 1 + 2 * slot;
+}
+
+function slotSeqWord(slot: number): number {
+  return 1 + 2 * slot + 1;
+}
 
 const server = createServer((req, res) => {
   if (req.method !== "POST" || req.url !== "/break") {
@@ -53,9 +64,15 @@ const server = createServer((req, res) => {
       res.writeHead(404).end();
       return;
     }
-    // Release order: the arm moment is visible before the flag.
-    times[slot] = Date.now();
-    Atomics.store(flags, slot, 1);
+    // Release order: the arm's sequence is visible before the flag. The
+    // sequence is the SHARED monotonic arm counter (word 0) — a total
+    // order across this thread and the main thread, so a break armed
+    // after an execution began always carries a greater sequence than
+    // the execution's start marker (no clock-resolution window — the
+    // phase-F review round 3 same-millisecond loss is impossible).
+    const seq = Atomics.add(view, 0, 1) + 1;
+    Atomics.store(view, slotSeqWord(slot), seq);
+    Atomics.store(view, slotFlagWord(slot), 1);
     res.writeHead(204).end();
   });
 });
@@ -63,6 +80,10 @@ const server = createServer((req, res) => {
 parentPort?.on("message", (message: { type?: string; key?: string; slot?: number }) => {
   if (message.type === "register" && typeof message.key === "string" && typeof message.slot === "number") {
     slotsByKey.set(message.key, message.slot);
+    return;
+  }
+  if (message.type === "unregister" && typeof message.key === "string") {
+    slotsByKey.delete(message.key);
     return;
   }
   if (message.type === "dispose") {

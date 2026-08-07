@@ -17,6 +17,7 @@ import type { RunOptions } from "@automatalabs/shared-types";
 import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import type { TSchema } from "typebox";
 import type { Backend, BackendId } from "./backend.js";
+import { CustomAcpBackend } from "./backends/custom.js";
 import type { NegotiatedCapabilities } from "./capabilities.js";
 import {
   isChildCleanupError,
@@ -481,7 +482,16 @@ export class InteractiveSession {
    *    applied after the load boundary is LIVE CONTINUATION — the
    *    authoritative still-running signal — and flips the classification
    *    to the keep-attached wait (below). No content within the window
-   *    → classify from the replay (completed / interrupted). The window
+   *    → classify from the replay (completed / interrupted) — but ONLY
+   *    on a VERIFIED BUILT-IN backend (`connectionDeathVerified`: the
+   *    four built-in instances; a custom registry entry's
+   *    connection-death behavior is not live-verified, so its quiet
+   *    window is NOT terminal evidence — phase-F review round 3: the
+   *    replay classification used to apply to every extension-less
+   *    backend and every query failure, so a durable custom backend
+   *    could have a still-running turn settled from stale/partial
+   *    replay or re-issued, violating the no-duplicate invariant). The
+   *    window
    *    is the spec-owed concrete decision replacing the rejected
    *    quiet-grace heuristic: the grace is bounded AND the classification
    *    rests on the connection-death contract, never on a quiet gap
@@ -592,9 +602,20 @@ export class InteractiveSession {
    * doc for the full semantics — the connection-death contract, the
    * post-load continuation watch, and the replay probe). Never settles
    * a quiet gap, never re-issues a possibly-running turn: the
-   * classification is authoritative for the built-ins because their ACP
-   * servers terminate in-flight turns when the client connection closes
-   * (live-verified), and the replay holds only completed messages.
+   * classification is authoritative ONLY for the VERIFIED BUILT-INS
+   * (`connectionDeathVerified`) because their ACP servers terminate
+   * in-flight turns when the client connection closes (live-verified),
+   * and their replay holds only completed messages. A CUSTOM backend
+   * (a registered registry entry — its connection-death behavior is
+   * NOT live-verified) that stays quiet through the window is NOT
+   * classified from the replay: its turn may still be running at the
+   * backend, so the seam keeps the loaded session attached and waits
+   * for the authoritative terminal state instead (phase-F review round
+   * 3: the quiet-window-plus-replay classification used to apply to
+   * every extension-less backend and every query failure, so a durable
+   * custom backend could have a still-running turn settled from stale
+   * replay or re-issued — the no-duplicate invariant requires the
+   * verified assumption to be restricted to the verified backends).
    */
   private async observeLoadedTurn(
     boundary: {
@@ -614,7 +635,7 @@ export class InteractiveSession {
       if (this.releasePromise) {
         throw new Error("InteractiveSession has been released");
       }
-      if (!contentArrived) {
+      if (!contentArrived && this.connectionDeathVerified) {
         // The stream stayed quiet through the observation window: classify
         // the founding turn's terminal state from the REPLAY (authoritative
         // under the connection-death contract — the replay's trailing
@@ -631,16 +652,45 @@ export class InteractiveSession {
         );
       }
     }
-    // Live continuation was observed: the turn IS still running. Keep the
-    // loaded session attached and wait for the terminal state (see
-    // `waitForRunningLoadedTurn`).
+    // Live continuation was observed — or the window stayed quiet on an
+    // UNVERIFIED backend (a custom registry entry, whose connection-death
+    // behavior is not live-verified): either way the turn may still be
+    // running at the backend. Keep the loaded session attached and wait
+    // for the authoritative terminal state (the ended notification, the
+    // max-wait bound — the re-armable still-running rejection the broker
+    // re-arms on the attached session). Never settle a quiet gap and
+    // never re-issue a possibly-running turn.
     return this.waitForRunningLoadedTurn(
       loadedTurnMaxWaitMs(),
       queryFailure === undefined
-        ? `live content followed the load response on ${this.backendId}`
-        : `live content followed the load response on ${this.backendId} (_session/loaded_turn/query failed: ` +
-          `${thrownMessageOf(queryFailure)})`,
+        ? this.connectionDeathVerified
+          ? `live content followed the load response on ${this.backendId}`
+          : `the loaded session's stream stayed quiet after the load on ${this.backendId} (a custom backend's ` +
+            `connection-death behavior is not live-verified — the quiet window is not terminal evidence)`
+        : this.connectionDeathVerified
+          ? `live content followed the load response on ${this.backendId} (_session/loaded_turn/query failed: ` +
+            `${thrownMessageOf(queryFailure)})`
+          : `the loaded session's stream stayed quiet after the load on ${this.backendId} (a custom backend's ` +
+            `connection-death behavior is not live-verified — the quiet window is not terminal evidence; ` +
+            `_session/loaded_turn/query failed: ${thrownMessageOf(queryFailure)})`,
     );
+  }
+
+  /** Is this session's backend one of the four built-ins whose ACP
+   *  servers' connection-death behavior is LIVE-VERIFIED (claude,
+   *  codex, opencode, pi — every built-in server terminates its
+   *  sessions' in-flight turns when the client connection closes, so a
+   *  restored session's replay holds only completed messages)? The
+   *  observation path's quiet-window-plus-replay classification is
+   *  authoritative ONLY for these; a CUSTOM backend (a registered
+   *  registry entry — even one that shadows a built-in name) can keep a
+   *  turn running while quiet, so its quiet window degrades to the
+   *  keep-attached still-running wait (phase-F review round 3: the
+   *  verified assumption must be restricted to the verified built-ins).
+   *  Instance-based: a custom backend registered under a built-in name
+   *  is a `CustomAcpBackend` and is never counted as verified. */
+  private get connectionDeathVerified(): boolean {
+    return !(this.backend instanceof CustomAcpBackend);
   }
 
   /** The post-load continuation watch: resolve true on the first CONTENT
@@ -812,6 +862,45 @@ export class InteractiveSession {
   release(): Promise<void> {
     this.releasePromise ??= this.doRelease();
     return this.releasePromise;
+  }
+
+  /** The loaded session's recorded founding-turn terminal state (the
+   *  `_session/loaded_turn/ended` notification, when the backend pushed
+   *  one — a seam-less backend that sends it anyway), or null when the
+   *  turn has not ended (yet). The broker's non-re-armable settlement
+   *  wait reads this surface instead of re-invoking a seam that can
+   *  never observe the terminal state. */
+  loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
+    return this.session.loadedTurnEndedState();
+  }
+
+  /** Watch the loaded-turn-ended channel: the listener fires when the
+   *  `_session/loaded_turn/ended` notification arrives (and immediately
+   *  for a notification that already arrived). Returns the unsubscribe
+   *  thunk. The broker's non-re-armable settlement wait's observability
+   *  surface (the same channel the seam's own wait subscribes to). */
+  subscribeLoadedTurnEnded(listener: () => void): () => void {
+    return this.session.subscribeLoadedTurnEnded(listener);
+  }
+
+  /** Resolve when the session is released (its dedicated process died or
+   *  was disposed); never resolves on a live session. The broker's
+   *  non-re-armable settlement wait's release watch — a released
+   *  session means the backend turn died with the process (the
+   *  safe-re-issue class). */
+  released(): Promise<void> {
+    if (this.releasePromise !== undefined) return this.releasePromise;
+    return new Promise((resolve) => {
+      if (this.releasePromise !== undefined) {
+        resolve();
+        return;
+      }
+      const watcher = () => {
+        this.releaseWatchers.delete(watcher);
+        resolve();
+      };
+      this.releaseWatchers.add(watcher);
+    });
   }
 
   /** The re-attach handle for this session — persist it, then re-open later with

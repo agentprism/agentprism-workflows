@@ -20,5 +20,5 @@ layout; the 6-subagent cap; the 256-line / 10 KB caps on text and structured con
 guest-visible steering outcomes; presence-keyed lifecycle with the drain bound reusing the
 daemon's session-eviction TTL; plain handles with stable call ids and no canonical path
 addressing; no inter-agent communication surface; `Date.now()`/`Math.random()` working
-natively (pinned in `vm.test.ts`). No TODO/FIXME/placeholder markers remain in the repl
+natively (pinned in `vm.test.ts`). No unfinished-work markers remain in the repl
 code, and no doc-required behavior is deferred.

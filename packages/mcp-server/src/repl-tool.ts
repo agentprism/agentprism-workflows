@@ -169,9 +169,11 @@ export interface ReplToolOptions {
    *  repl-engine's `EvalBreakChannel`): the worker-thread relay the MCP
    *  shim fires while the daemon's main thread is blocked in a
    *  synchronous eval, so the interrupt tool's no-id path breaks the
-   *  eval mid-run instead of waiting for the per-eval deadline.
-   *  Omitted in single-project mode (no separate shim exists to fire
-   *  it). */
+   *  eval mid-run instead of waiting for the per-eval deadline. The
+   *  server always wires one — the daemon passes its own, and
+   *  single-project servers own one by default (round 3) whose relay
+   *  the stdio transport's worker-reader fires (see
+   *  `repl-stdio-transport.ts`). */
   evalBreakChannel?: EvalBreakChannel;
   /** When true, the server is shutting down and rejects new calls. */
   acceptingWork: () => boolean;
@@ -219,10 +221,14 @@ function parseRefs(raw: Record<string, unknown>): string[] | undefined {
 
 /** The tool handler's `refs` resolution: read each requested ref from
  *  the given contexts' truncation-reference stores (the elided
- *  entries' snapshots — see `capStructuredResult`). Unknown refs are
- *  skipped (the store is bounded and per-workspace; a ref older than
- *  the ring or from another workspace simply has nothing to read — the
- *  caller re-reads current state and gets fresh refs). */
+ *  entries' snapshots — see `capStructuredResult`). Refs are
+ *  WORKSPACE-NAMESPACED (`<project-key>:t<seq>` — phase-F review round
+ *  3), so each ref resolves in exactly the store that advertised it:
+ *  the projectless-status search can never substitute another
+ *  project's data (the id's namespace prefix only exists in the owning
+ *  workspace's store). Unknown refs are skipped (a foreign namespace,
+ *  or a ref from a reset workspace — the caller re-reads current
+ *  state and gets fresh refs). */
 function resolveRefs(
   refs: string[] | undefined,
   contexts: Array<{ projectDir: string; repl?: ReplProjectState }>,
@@ -243,9 +249,11 @@ function resolveRefs(
 
 /** The elision-capture store for a multi-context result (the
  *  projectDir-less status): the FIRST workspace's store — its elided
- *  entries' refs are found by the same `resolveRefs` search. When no
- *  workspace state exists yet, the elisions degrade to plain counts
- *  (nothing was ever readable anyway). */
+ *  entries' refs are found by the same `resolveRefs` search (the refs
+ *  are namespaced to that workspace, and the snapshot is exactly the
+ *  merged-status entries the result elided). When no workspace state
+ *  exists yet, the elisions degrade to plain counts (nothing was ever
+ *  readable anyway). */
 function stateRefStoreOf(
   contexts: Array<{ projectDir: string; repl?: ReplProjectState }>,
 ): TruncationRefStore | undefined {
@@ -598,7 +606,7 @@ export const replToolOutputShape = z
         hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed");
     } else if (value.action === "wait") {
       valid =
-        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated") &&
+        only("projectDir", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "truncated", "referenced") &&
         hasAll("projectDir", "output", "outputTruncated", "pending", "checkpoints", "completed", "drained", "timedOut");
     } else if (value.action === "status") {
       valid = only("projectDir", "workspaces", "truncated", "referenced") && has("workspaces");
@@ -830,8 +838,24 @@ function capStructuredResult(
   // the lists inside them). The dropped TAIL is snapshotted under the
   // continuation ref.
   const recordElision = (key: string, dropped: unknown[]): void => {
-    const ref = capture(dropped);
     const prior = truncated[key];
+    // ROUND 3 — the continuation ref is CUMULATIVE: a repeated halving
+    // of the same field used to overwrite the prior ref with a ref
+    // holding only the LATEST dropped chunk, so the earlier tails
+    // (including the largest first drop) became undiscoverable —
+    // contradicting "the cap costs reads, never data". Each new
+    // elision's snapshot now chains the field's previously dropped
+    // values ahead of the new chunk, so the latest advertised ref
+    // addresses the WHOLE dropped tail; earlier refs stay readable
+    // too (the store never evicts — see `TruncationRefStore`).
+    const priorRef =
+      typeof prior === 'object' && prior !== null ? (prior as { ref?: string }).ref : undefined;
+    const priorValues =
+      priorRef !== undefined && truncationRefs !== undefined
+        ? truncationRefs.get(priorRef)
+        : undefined;
+    const accumulated = priorValues !== undefined ? [...priorValues, ...dropped] : dropped;
+    const ref = capture(accumulated);
     const priorElided =
       typeof prior === 'object' && prior !== null
         ? (prior as { elided: number }).elided

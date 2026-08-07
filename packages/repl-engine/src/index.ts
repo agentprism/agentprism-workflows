@@ -5,8 +5,10 @@
  * One VM per workspace; the workspace object owns the VM lifecycle
  * (create, eval, drain, dispose). This package is the engine tier of the
  * REPL orchestrator roadmap doc (docs/roadmap/repl-orchestrator.md); the
- * `repl` MCP tool that registers in `mcp-server` (a later phase) is a thin
- * entry over `WorkspaceRegistry`.
+ * `repl` MCP tool in `mcp-server` registers over it (the roadmap's
+ * phase E — shipped), and the broker drives subagents as ACP sessions
+ * through `@automatalabs/acp-agents` (the same backends the SDK's
+ * workflow engine drives).
  *
  * Engine posture (all quickjs-wasi built-ins, used as-is):
  * `memoryLimit` per VM, `interruptHandler` per eval.
@@ -110,7 +112,8 @@ export { applyOutputCaps, capFinalText, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type
 export {
   EvalBreakChannelImpl,
   createEvalBreakChannel,
-  EVAL_BREAK_CHANNEL_SLOTS,
+  EVAL_BREAK_CHANNEL_INITIAL_SLOTS,
+  EVAL_BREAK_CHANNEL_MAX_BYTES,
   type EvalBreakChannel,
 } from './eval-break-channel.js';
 

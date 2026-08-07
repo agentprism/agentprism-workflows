@@ -123,6 +123,15 @@ class FakeSession implements BrokerSession {
    *  no scripted outcome is set). */
   readonly loadedTurns: Array<{ resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
+  /** The session-level loaded-turn terminal state (the real adapter's
+   *  `loadedTurnEndedState` — the `_session/loaded_turn/ended`
+   *  notification a seam-less backend pushes anyway). Null until
+   *  `fireLoadedTurnEnded`. */
+  endedState: { stopReason?: string; error?: { name: string; message: string } } | null = null;
+  private readonly endedWatchers = new Set<() => void>();
+  /** The `released()` watch (the real adapter's release promise). */
+  private releasedWatchers: Array<() => void> = [];
+  private releasedFlag = false;
   stopReason = 'end_turn';
   readonly completedTexts: string[] = [];
   /** The seam's scripted loaded-turn outcome (the real adapter reads it
@@ -180,9 +189,45 @@ class FakeSession implements BrokerSession {
     return Promise.resolve();
   }
 
+  loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
+    return this.endedState;
+  }
+
+  subscribeLoadedTurnEnded(listener: () => void): () => void {
+    if (this.endedState !== null) {
+      queueMicrotask(listener);
+      return () => {};
+    }
+    this.endedWatchers.add(listener);
+    return () => {
+      this.endedWatchers.delete(listener);
+    };
+  }
+
+  /** Drive the session-level ended notification (the test's handle for
+   *  the non-re-armable wait's observability surface). */
+  fireLoadedTurnEnded(state: { stopReason?: string; error?: { name: string; message: string } }, text?: string): void {
+    this.endedState = state;
+    if (text !== undefined) this.completedTexts.push(text);
+    for (const watcher of [...this.endedWatchers]) watcher();
+  }
+
+  released(): Promise<void> {
+    if (this.releasedFlag) return Promise.resolve();
+    return new Promise((resolve) => {
+      if (this.releasedFlag) {
+        resolve();
+        return;
+      }
+      this.releasedWatchers.push(resolve);
+    });
+  }
+
   release(): Promise<void> {
     this.releases++;
     if (this.hangRelease) return new Promise(() => {});
+    this.releasedFlag = true;
+    for (const watcher of this.releasedWatchers.splice(0)) watcher();
     return Promise.resolve();
   }
 
@@ -1836,7 +1881,7 @@ test('a RE-ARMABLE still-running seam rejection keeps the call attached and pend
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a NON-re-armable still-running seam rejection keeps the loaded session ATTACHED and re-arms the seam — a possibly-running call is never re-issued (phase-F review round 2: the old degradation released the loaded session and re-issued the call, which can duplicate a still-running backend turn), and the later seam resolution settles the SAME guest promise exactly once', async () => {
+test('a NON-re-armable still-running seam rejection is NEVER re-invoked — the broker keeps the loaded session ATTACHED and waits for the terminal state from the session-level surfaces: a later ended notification settles the call exactly once, and a cancel settles it as the recoverable AGENT_CANCELLED (phase-F review round 3: the old immediate recursive re-arm spun in an unbounded microtask/warning loop, starving cancellation, drain, and every other task)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nonrearm-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
@@ -1861,33 +1906,131 @@ test('a NON-re-armable still-running seam rejection keeps the loaded session ATT
   );
   await tick();
   await tick();
-  // Phase-F review round 2: a possibly-running call is NEVER re-issued —
-  // the broker keeps the loaded session attached and re-arms the seam on
-  // it for BOTH the re-armable and the non-re-armable forms (the doc's
-  // second reconciliation arm, re-attach to a still-running task). No
-  // release, no fresh session, no reissue record.
+  // Phase-F review round 3: a possibly-running call is NEVER re-issued —
+  // the loaded session stays attached (no release, no fresh session, no
+  // reissue record) — and the NON-re-armable seam is NOT re-invoked (an
+  // immediate recursive re-arm would spin in an unbounded
+  // microtask/warning loop, starving cancellation, drain, and every
+  // other task). The call is still pending — partial output is never
+  // settled — and the broker now waits for the terminal state from the
+  // remaining authority surfaces below.
   assert.equal(runner2.sessions[0].releases, 0, 'the loaded session stays attached');
   assert.equal(runner2.sessions.length, 1, 'no fresh session — no re-issue');
   assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'no reissue was recorded');
   assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the attach key is unchanged');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call is still pending — partial output is never settled');
-  // The RE-ARMED seam is consulted again (the broker re-ran the
-  // re-attached task on the same session); when it resolves, the call
-  // settles with the turn's real outcome exactly once.
-  const rearmed = runner2.sessions[0].loadedTurns.shift();
-  assert.ok(rearmed, 'the seam was re-armed on the attached session');
-  rearmed.resolve({ stopReason: 'end_turn', text: 'the turn eventually completed' });
+  assert.equal(runner2.sessions[0].loadedTurns.length, 0, 'the seam was NOT re-invoked — no loop');
+  const probe = await broker2.eval('"probe"');
+  assert.ok(
+    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('can never observe')),
+    output(probe).join('\n'),
+  );
+  // The SESSION-LEVEL ended notification settles the call (a seam-less
+  // backend that pushes `_session/loaded_turn/ended` anyway) with the
+  // turn's real accumulated text — exactly once.
+  runner2.sessions[0].fireLoadedTurnEnded({ stopReason: 'end_turn' }, 'the turn eventually completed');
   await tick();
   await broker2.pump();
-  // The re-arm's warn line is drained by the settlement eval itself (the
-  // console buffer ships with the eval that pumps the settlement).
   const settleProbe = await broker2.eval('await p');
-  assert.ok(
-    output(settleProbe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('re-armed')),
-    output(settleProbe).join('\n'),
-  );
   assert.equal(settleProbe.result, '"the turn eventually completed"');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'the turn eventually completed');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a NON-re-armable still-running seam rejection settles on a CANCEL as the recoverable AGENT_CANCELLED — the interrupt tool works on a held call (phase-F review round 3: the old re-arm loop never yielded, so cancellation could not reach the held call)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nonrearm-cancel-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  await broker2.reconcile();
+  const seam = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(seam);
+  seam.reject(
+    new LoadedTurnStillRunningError(
+      'a third-party seam that can never observe the terminal state',
+      false,
+    ),
+  );
+  await tick();
+  await tick();
+  // The held call is cancelable: the interrupt tool's wire cancel flips
+  // the entry's cancel flag, the non-re-armable wait observes it, and
+  // the call settles as the recoverable AGENT_CANCELLED (recorded first,
+  // delivered by the pump) — never left pending until the drain.
+  const outcome = await broker2.cancelCall('c1');
+  assert.equal(outcome, 'cancelled', 'the interrupt tool reports the cancel');
+  await tick();
+  await broker2.pump();
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the call settled — not left pending');
+  const record = broker2.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED', 'the recoverable cancel code');
+  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal(record.reissues, 0, 'never re-issued');
+  assert.equal(runner2.sessions[0].releases, 0, 'the loaded session stays attached (the cancel did not release it)');
+  // The guest promise rejected with the recoverable cancellation (a
+  // later eval reads it; the workspace stays live).
+  let result: string | undefined;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const got = await broker2.eval('await p.catch((e) => "ERR:" + e.message)');
+    if (got.result !== undefined) {
+      result = got.result;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(result?.includes('c1 was cancelled'), `guest-visible settlement: ${result}`);
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a NON-re-armable held call whose SESSION IS RELEASED re-issues through the safe-re-issue class — the backend process died, so nothing is running to duplicate (phase-F review round 3: the wait\'s release branch)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nonrearm-release-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
+  await broker2.reconcile();
+  const seam = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(seam);
+  seam.reject(
+    new LoadedTurnStillRunningError(
+      'a third-party seam that can never observe the terminal state',
+      false,
+    ),
+  );
+  await tick();
+  await tick();
+  assert.equal(runner2.sessions[0].loadedTurns.length, 0, 'the seam was NOT re-invoked — no loop');
+  // The loaded session's dedicated process dies: the wait's release
+  // watch fires, and the observably-dead call is re-issued under the
+  // same id (the fresh session's turn settles the SAME guest promise).
+  await runner2.sessions[0].release();
+  await tick();
+  assert.equal(broker2.store().lookup('c1')!.reissues, 1, 'the released-session re-issue was recorded');
+  assert.equal(runner2.sessions.length, 2, 'the re-issue opened a fresh session');
+  runner2.sessions[1].completeTurn('the re-issued turn completed');
+  await tick();
+  await broker2.pump();
+  const probe = await broker2.eval('await p');
+  assert.equal(probe.result, '"the re-issued turn completed"');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
   await broker2.dispose();
   ws2.dispose();

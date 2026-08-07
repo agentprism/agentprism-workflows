@@ -45,6 +45,7 @@ import type {
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
 import {
+  createEvalBreakChannel,
   loadShippedWasm,
   type BrokerRunner,
   type EvalBreakChannel,
@@ -1177,10 +1178,13 @@ export interface CreateWorkflowServerOptions {
    * under it.
    */
   replClientId?: () => string | undefined;
-  /** The REPL eval-break relay (phase-F review round 2; daemon mode
-   *  only — the shim fires it while the daemon's main thread is blocked
-   *  in a synchronous eval). Omitted in single-project mode: the per-
-   *  eval deadline remains the bound there (see `repl-tool.ts`). */
+  /** The REPL eval-break relay (phase-F review round 2; daemon mode —
+   *  the shim fires it while the daemon's main thread is blocked in a
+   *  synchronous eval). OMITTED in single-project mode: the server owns
+   *  a channel of its own by default (round 3 — the documented no-id
+   *  interrupt must work in every supported mode; the stdio transport's
+   *  worker-reader fires it, and `replBreakUrl()` exposes the relay to
+   *  library hosts). */
   replEvalBreakChannel?: EvalBreakChannel;
   /**
    * The concrete client-presence drain bound — the daemon reuses its session-eviction
@@ -1198,9 +1202,26 @@ export function createWorkflowServer(
 ): WorkflowServer {
   const mcp = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
   let acceptingWork = true;
+  // The REPL eval-break channel (phase-F review round 3): the in-process/
+  // library server OWNS one by default — the documented no-id interrupt
+  // for a synchronously running eval is deliverable in every supported
+  // mode, not only daemon mode (the daemon passes its own channel and
+  // owns its lifetime; `disposeReplEvalBreakChannel` disposes only a
+  // server-owned channel). The relay address is exposed as
+  // `replBreakUrl()` on the server control — the stdio transport's
+  // worker-reader fires it (see `repl-stdio-transport.ts`), and a
+  // library host can fire it from another thread.
+  const ownsReplEvalBreakChannel = options.replEvalBreakChannel === undefined;
+  const replEvalBreakChannel = options.replEvalBreakChannel ?? createEvalBreakChannel();
   const server = Object.assign(mcp, {
     stopAcceptingWork() {
       acceptingWork = false;
+    },
+    replBreakUrl() {
+      return replEvalBreakChannel.breakUrl();
+    },
+    async disposeReplEvalBreakChannel() {
+      if (ownsReplEvalBreakChannel) await replEvalBreakChannel.dispose();
     },
   });
 
@@ -1267,7 +1288,7 @@ export function createWorkflowServer(
     evalTimeoutMs: replEvalTimeoutMs(),
     presence: replPresence,
     clientId: options.replClientId ?? (() => "single-project"),
-    evalBreakChannel: options.replEvalBreakChannel,
+    evalBreakChannel: replEvalBreakChannel,
     acceptingWork: () => acceptingWork,
   });
 
