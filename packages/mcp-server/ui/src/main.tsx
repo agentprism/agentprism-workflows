@@ -5,10 +5,13 @@
 //   - tool ARGUMENTS for action inspect/await/stop (runId is an input), or
 //   - the tool RESULT's structuredContent.runId for execute calls (background admission
 //     returns it immediately; foreground returns it with the terminal result).
-// Once a runId is known the panel keeps itself live by polling the app-only
-// `workflow-events` cursor tool (~1s while the run is live, exponential backoff on faults)
-// and folding each page into the render model — the model/host are not involved again.
-// Stop issues `workflow` action:"stop" through the host bridge.
+// Once a runId is known the panel keeps itself live by polling the events RESOURCE
+// (`workflow://runs/{runId}/events`, ~2s while the run is live, adaptive backoff when idle and
+// on faults) and folding each page into the render model — the model/host are not involved
+// again. A resource read is used, not the `workflow-events` tool, because some Apps-capable
+// hosts narrate every app-originated tools/call into the model's conversation while leaving
+// resource reads silent; the tool stays registered for other clients. Stop issues `workflow`
+// action:"stop" through the host bridge.
 import type { App } from "@modelcontextprotocol/ext-apps";
 import { useApp, useHostFonts, useHostStyleVariables } from "@modelcontextprotocol/ext-apps/react";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -23,10 +26,12 @@ import type { NodeSelection } from "./GraphView.js";
 import {
   buildModelContextSnapshot,
   formatModelContextText,
+  hasFoldedEvents,
   isUrgentStatus,
   modelContextSignature,
   nextPushDelayMs,
 } from "./model-context.js";
+import { nextErrorBackoffMs, nextIdleDelayMs, POLL_MS, shouldGiveUp } from "./poll-backoff.js";
 import { extractSkeleton } from "./skeleton.js";
 import type { Skeleton } from "./skeleton.js";
 import { agentCount, createRunModel, foldRecord } from "./state.js";
@@ -47,10 +52,9 @@ interface EventsDoc {
   events: unknown[];
 }
 
-// Matches the ext-apps "Polling for live data" pattern cadence (2s). The panel is the only
-// live-status channel, so this interval sets how often the app calls the app-only events tool.
-const POLL_MS = 2000;
-const MAX_BACKOFF_MS = 15_000;
+// Per-page cursor read size (server caps limit at 1000). Catch-up paging chains reads via hasMore.
+// POLL_MS / MAX_BACKOFF_MS / MAX_POLL_FAILURES and the backoff policy live in poll-backoff.ts.
+const PAGE_LIMIT = 500;
 
 function runIdFromArgs(args: Record<string, unknown> | null): string | undefined {
   const runId = args?.["runId"];
@@ -72,28 +76,43 @@ function budgetFromResult(result: CallToolResult | null): number | null | undefi
   return typeof budget === "number" || budget === null ? budget : undefined;
 }
 
-function firstTextBlock(result: CallToolResult): string {
-  const block = (result.content as Array<{ type?: string; text?: string }> | undefined)?.find(
-    (candidate) => candidate.type === "text",
-  );
-  return typeof block?.text === "string" ? block.text : "";
+/** Parse the events resource read into the shared document, mirroring the skeleton read's shape. */
+function eventsDocFromResource(result: { contents: readonly unknown[] }): EventsDoc | undefined {
+  const text = (result.contents as Array<{ text?: unknown }>).find(
+    (content) => typeof content.text === "string",
+  )?.text as string | undefined;
+  if (text === undefined) return undefined;
+  try {
+    return JSON.parse(text) as EventsDoc;
+  } catch {
+    return undefined;
+  }
 }
 
 interface MonitorState {
   model: RunModel | null;
   connectionLost: boolean;
+  /** Latched once the poll loop gives up for good (bounded consecutive faults); render is stale. */
+  disconnected: boolean;
   fatal: string | undefined;
 }
 
 /**
- * Poll workflow-events into a fold-model; re-renders by bumping a version counter.
+ * Poll the events RESOURCE into a fold-model; re-renders by bumping a version counter.
  * `tornDown` stops the loop for good once the host tears the panel down, so a replaced or
- * dismissed panel cannot keep calling the server from a detached iframe.
+ * dismissed panel cannot keep reading from the server from a detached iframe.
+ *
+ * A resource read (not the `workflow-events` tool) is used because some Apps-capable hosts narrate
+ * every app-originated tools/call into the model's conversation but leave resource reads silent.
+ * The panel discovers the stream generation with one canonical read, then pages by cursor with the
+ * explicit streamId the query form requires. Idle polls back off (2s→4s→8s→cap) and reset on new
+ * events; a bounded run of read faults gives up for good rather than retrying a dead run forever.
  */
 function useRunModel(app: App | null, runId: string | undefined, tornDown: boolean): MonitorState {
   const modelRef = useRef<RunModel | null>(null);
   const [, setVersion] = useState(0);
   const [connectionLost, setConnectionLost] = useState(false);
+  const [disconnected, setDisconnected] = useState(false);
   const [fatal, setFatal] = useState<string | undefined>(undefined);
 
   useEffect(() => {
@@ -101,10 +120,13 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let backoffMs = POLL_MS;
+    let idleDelayMs = POLL_MS;
+    let consecutiveFailures = 0;
     let finalConfirmDone = false;
     modelRef.current = createRunModel(runId);
     setFatal(undefined);
     setConnectionLost(false);
+    setDisconnected(false);
     setVersion((version) => version + 1);
 
     const bump = () => setVersion((version) => version + 1);
@@ -114,69 +136,101 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
       timer = setTimeout(() => void poll(), delayMs);
     };
     const degrade = () => {
+      consecutiveFailures += 1;
+      if (shouldGiveUp(consecutiveFailures)) {
+        // The run is unreachable (dead daemon, deleted store, host down). Stop for good and show a
+        // disconnected panel rather than retrying a long-gone run forever at the backoff cap.
+        setConnectionLost(false);
+        setDisconnected(true);
+        return;
+      }
       setConnectionLost(true);
-      backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+      backoffMs = nextErrorBackoffMs(backoffMs);
       schedule(backoffMs);
+    };
+    const eventsUri = (streamId: string | undefined): string =>
+      streamId === undefined
+        ? // Bootstrap: canonical read has no query and returns the current streamId without
+          // requiring one (the query form mandates streamId, unknown until the first read lands).
+          `workflow://runs/${runId}/events`
+        : `workflow://runs/${runId}/events?after=${modelRef.current?.cursor ?? 0}&limit=${PAGE_LIMIT}&streamId=${streamId}`;
+
+    const onReadError = (error: unknown): void => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("STREAM_MISMATCH") || message.includes("CURSOR_AHEAD")) {
+        // Stream generation changed (run deleted/recreated): rebuild and re-bootstrap the stream.
+        modelRef.current = createRunModel(runId);
+        consecutiveFailures = 0;
+        idleDelayMs = POLL_MS;
+        bump();
+        schedule(POLL_MS);
+      } else if (
+        message.includes("RUN_NOT_FOUND") ||
+        message.includes("ORPHANED_LOG") ||
+        message.includes("No workflow run found")
+      ) {
+        setFatal("This run is no longer present in the run store.");
+      } else {
+        degrade();
+      }
     };
 
     const poll = async (): Promise<void> => {
       const model = modelRef.current;
       if (cancelled || !model) return;
-      let result: CallToolResult;
+      let doc: EventsDoc | undefined;
       try {
-        result = await app.callServerTool({
-          name: "workflow-events",
-          arguments: {
-            runId,
-            after: model.cursor,
-            limit: 500,
-            ...(model.streamId !== undefined ? { streamId: model.streamId } : {}),
-          },
-        });
-      } catch {
+        const result = await app.readServerResource({ uri: eventsUri(model.streamId) });
+        if (cancelled) return;
+        doc = eventsDocFromResource(result);
+      } catch (error) {
+        if (cancelled) return;
+        onReadError(error);
+        return;
+      }
+      if (doc === undefined) {
         degrade();
         return;
       }
-      if (cancelled) return;
 
-      if (result.isError) {
-        const text = firstTextBlock(result);
-        if (text.startsWith("[STREAM_MISMATCH]") || text.startsWith("[CURSOR_AHEAD]")) {
-          modelRef.current = createRunModel(runId);
-          bump();
-          schedule(POLL_MS);
-        } else if (
-          text.startsWith("[RUN_NOT_FOUND]") ||
-          text.startsWith("[ORPHANED_LOG]") ||
-          text.includes("No workflow run found")
-        ) {
-          setFatal("This run is no longer present in the run store.");
-        } else {
-          degrade();
-        }
-        return;
-      }
-
-      const doc = result.structuredContent as unknown as EventsDoc;
-      if (model.streamId !== undefined && doc.streamId !== model.streamId) {
-        // Stream generation changed (run deleted/recreated): rebuild from scratch.
-        modelRef.current = createRunModel(runId);
-      }
-      const current = modelRef.current;
-      if (!current) return;
-      current.streamId = doc.streamId;
-      for (const record of doc.events) foldRecord(current, record as RunEventLogRecord);
-      current.cursor = doc.cursor;
-      current.status = doc.status;
-      current.finalized = doc.finalized;
-      if (current.name === undefined && doc.workflowName) current.name = doc.workflowName;
-      setConnectionLost(false);
+      // A read succeeded: clear fault state and the error backoff.
+      consecutiveFailures = 0;
       backoffMs = POLL_MS;
+      setConnectionLost(false);
+      setDisconnected(false);
+
+      if (model.streamId === undefined) {
+        // Bootstrap read: adopt the stream generation and workflow name.
+        model.streamId = doc.streamId;
+        if (model.name === undefined && doc.workflowName) model.name = doc.workflowName;
+        if (doc.after !== 0) {
+          // The canonical read returned a tail window (the run already had more than a page of
+          // events when the panel opened). Keep the cursor at 0 and immediately re-read from the
+          // start with the now-known streamId so the fold model is complete, not just the tail.
+          bump();
+          idleDelayMs = POLL_MS;
+          schedule(0);
+          return;
+        }
+        // doc.after === 0: the canonical read covered the whole log; fold it and page by cursor.
+      }
+
+      for (const record of doc.events) foldRecord(model, record as RunEventLogRecord);
+      model.cursor = doc.cursor;
+      model.status = doc.status;
+      model.finalized = doc.finalized;
+      if (model.name === undefined && doc.workflowName) model.name = doc.workflowName;
       bump();
 
-      if (doc.hasMore) schedule(0);
-      else if (!current.finalized) schedule(POLL_MS);
-      else if (!finalConfirmDone) {
+      if (doc.hasMore) {
+        idleDelayMs = POLL_MS;
+        schedule(0);
+      } else if (!model.finalized) {
+        // Adaptive idle backoff: reset to the base cadence when a poll brought new events, else
+        // double the next delay toward the cap so an idle/paused run is not polled every 2s.
+        idleDelayMs = nextIdleDelayMs(idleDelayMs, doc.events.length > 0);
+        schedule(idleDelayMs);
+      } else if (!finalConfirmDone) {
         // One trailing read after the terminal status, in case late records land.
         finalConfirmDone = true;
         schedule(1500);
@@ -190,7 +244,12 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
     };
   }, [app, runId, tornDown]);
 
-  return { model: runId === undefined ? null : modelRef.current, connectionLost, fatal };
+  return {
+    model: runId === undefined ? null : modelRef.current,
+    connectionLost,
+    disconnected,
+    fatal,
+  };
 }
 
 /**
@@ -211,7 +270,10 @@ function useModelContextSync(app: App | null, model: RunModel | null, tornDown: 
   useEffect(() => {
     if (!app || signature === undefined || disabledRef.current || tornDown) return;
     const current = modelRef.current;
-    if (!current) return;
+    // Hold every push until at least one events page has folded. The effect seeds an empty model
+    // and bumps a render before the first page lands; pushing that seed would leak the "workflow"
+    // name fallback and an agents-settled 0/0 into the model's context ahead of real data.
+    if (!current || !hasFoldedEvents(current)) return;
     const wait = nextPushDelayMs(isUrgentStatus(current), lastPushRef.current, Date.now());
     // Trailing-edge timer: superseded signatures cancel, so only the latest state lands.
     const timer = setTimeout(() => {
@@ -336,6 +398,7 @@ function MonitorBody({
   model,
   skeleton,
   connectionLost,
+  disconnected,
   fatal,
   budget,
 }: {
@@ -343,6 +406,7 @@ function MonitorBody({
   model: RunModel;
   skeleton: Skeleton | undefined;
   connectionLost: boolean;
+  disconnected: boolean;
   fatal: string | undefined;
   budget: number | null | undefined;
 }) {
@@ -352,7 +416,9 @@ function MonitorBody({
   const [expandedWaves, setExpandedWaves] = useState<ReadonlySet<string>>(new Set());
   const [loopSelections, setLoopSelections] = useState<ReadonlyMap<string, number>>(new Map());
 
-  const live = !model.finalized && model.status !== "completed";
+  // Once the poll loop has given up for good the panel can no longer act on the run: freeze the
+  // live affordances (Stop) and show a stale marker instead of the transient "reconnecting…".
+  const live = !model.finalized && model.status !== "completed" && !disconnected;
   const bannerMessage = fatal ?? model.banner;
   const bannerIsError =
     fatal !== undefined || model.status === "failed" || model.status === "aborted";
@@ -367,7 +433,13 @@ function MonitorBody({
         <RunStatusChip status={model.status} />
         <ElapsedClock model={model} />
         <span className="spacer" />
-        {connectionLost && <span className="conn-lost">reconnecting…</span>}
+        {disconnected ? (
+          <span className="conn-lost" title="The run monitor stopped receiving updates.">
+            disconnected — updates stopped
+          </span>
+        ) : (
+          connectionLost && <span className="conn-lost">reconnecting…</span>
+        )}
         {live && <StopButton app={app} runId={model.runId} />}
       </header>
       {bannerMessage !== undefined && (
@@ -436,7 +508,7 @@ function RunMonitor() {
   useHostFonts(app, app?.getHostContext());
 
   const runId = runIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
-  const { model, connectionLost, fatal } = useRunModel(app, runId, tornDown);
+  const { model, connectionLost, disconnected, fatal } = useRunModel(app, runId, tornDown);
   const skeleton = useSkeleton(app, runId);
   const budget = budgetFromResult(toolResult);
   useModelContextSync(app, model, tornDown);
@@ -455,6 +527,7 @@ function RunMonitor() {
       model={model}
       skeleton={skeleton}
       connectionLost={connectionLost}
+      disconnected={disconnected}
       fatal={fatal}
       budget={budget}
     />

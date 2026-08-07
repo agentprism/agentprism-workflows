@@ -12,6 +12,7 @@ import type { RunEventLogRecord } from "@automatalabs/shared-types";
 import {
   buildModelContextSnapshot,
   formatModelContextText,
+  hasFoldedEvents,
   isUrgentStatus,
   MODEL_CONTEXT_MIN_INTERVAL_MS,
   modelContextSignature,
@@ -193,6 +194,23 @@ test("routine pushes are throttled on the trailing edge; urgent ones are not", (
   assert.equal(nextPushDelayMs(false, 0, now), 0);
   // A clock that jumped backwards cannot stretch the wait past one interval.
   assert.equal(nextPushDelayMs(false, now + 60_000, now), MODEL_CONTEXT_MIN_INTERVAL_MS);
+});
+
+test("no model-context push until the first events page has folded", () => {
+  // A freshly seeded model (the effect bumps a render before any page lands) must be held back:
+  // the name is unknown and would fall back to "workflow", with agents-settled reading 0/0.
+  const seed = createRunModel("run-hold");
+  assert.equal(hasFoldedEvents(seed), false);
+
+  // Learning the workflow name from any page releases the hold...
+  const named = createRunModel("run-hold");
+  named.name = "review-changes";
+  assert.equal(hasFoldedEvents(named), true);
+
+  // ...as does the cursor advancing past the seed, even before a name is known.
+  const advanced = createRunModel("run-hold");
+  advanced.cursor = 4;
+  assert.equal(hasFoldedEvents(advanced), true);
 });
 
 // The signature joins fields with NUL so no phase title or banner can forge a boundary.

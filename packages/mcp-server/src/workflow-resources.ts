@@ -193,6 +193,24 @@ export class WorkflowScriptResources {
     return this.router.storeFor(runId)?.manager.getPersistence();
   }
 
+  /**
+   * Reconcile a run orphaned by a dead owner before reading its events. `await`/`stop` already do
+   * this (server.ts), but the events read path did not: a run left "running" with a frozen journal
+   * by a daemon that exited stayed status "running", so buildEventsDocument reported finalized:false
+   * forever and the run-monitor panel polled it without end. Mirror the tool paths — only reconcile
+   * when nothing live in THIS process owns the run — and let a failed reconcile fall through to
+   * reporting the run's current persisted state.
+   */
+  private reconcileDeadRunForEvents(runId: string): void {
+    const manager = this.router.storeFor(runId)?.manager;
+    if (!manager || manager.getRun(runId) !== undefined) return;
+    try {
+      manager.reconcileExternallyDeadRun(runId);
+    } catch {
+      // Best-effort: a reconcile fault must not block an otherwise-serviceable events read.
+    }
+  }
+
   /** Load a persisted run from whichever project store holds it. */
   private loadState(runId: string): PersistedRunState | null {
     return this.persistenceFor(runId)?.load(runId) ?? null;
@@ -489,6 +507,7 @@ export class WorkflowScriptResources {
     limit?: number;
     streamId?: string;
   }): WorkflowRunEventsResourceDocument {
+    this.reconcileDeadRunForEvents(request.runId);
     const persistence = this.persistenceFor(request.runId);
     const state = persistence?.load(request.runId);
     if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
@@ -508,6 +527,7 @@ export class WorkflowScriptResources {
 
   /** Canonical (query-less) resource read: the tail window of the current stream. */
   private readEventsTail(runId: string): WorkflowRunEventsResourceDocument {
+    this.reconcileDeadRunForEvents(runId);
     const persistence = this.persistenceFor(runId);
     const state = persistence?.load(runId);
     if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {

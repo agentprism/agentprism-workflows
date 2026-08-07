@@ -64,6 +64,16 @@ export function isUrgentStatus(model: RunModel): boolean {
   return model.finalized || model.status === "paused";
 }
 
+/**
+ * True once the panel has folded at least one events page — the workflow name is known or the
+ * cursor has advanced past the seed. Gates the very first model-context push: the effect seeds an
+ * empty model and bumps a render before any page lands, and pushing that seed leaks the "workflow"
+ * name fallback and an agents-settled 0/0 into the model's context before real data has folded.
+ */
+export function hasFoldedEvents(model: RunModel): boolean {
+  return model.name !== undefined || model.cursor > 0;
+}
+
 /** Minimum spacing between routine pushes; urgent transitions ignore it. */
 export const MODEL_CONTEXT_MIN_INTERVAL_MS = 2000;
 

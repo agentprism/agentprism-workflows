@@ -86,6 +86,10 @@ export function registerWorkflowAppUi(mcp: McpServer, deps: WorkflowAppUiDeps): 
       description:
         "Cursor-paged, redacted, append-only run events for the run-monitor panel. after/streamId " +
         "default to 0 and the run's current stream, so the first call bootstraps the full log.",
+      // Paging the event log never mutates run state. The hint is metadata for hosts that gate on
+      // it (e.g. VS Code skips the pre-run confirmation, ChatGPT dev mode classifies un-hinted
+      // tools as write actions); it does not change how any host narrates app-originated calls.
+      annotations: { readOnlyHint: true },
       inputSchema: {
         runId: z.string().describe("Workflow runId whose event log to read."),
         after: z
