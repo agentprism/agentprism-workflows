@@ -1,5 +1,5 @@
 {
-  "$comment": "Imported third-party history the attribution gate exempts (check-attribution.mjs). Commits REACHABLE from a recorded head are skipped on the message axis and identity axis; every commit not reachable from a head \u2014 including the import/sync merge commits themselves \u2014 is gated normally. Add a head only via a reviewed PR that merges that exact history (owner policy, 2026-07-28).",
+  "$comment": "Imported third-party history the attribution gate exempts (check-attribution.mjs). Commits REACHABLE from a recorded head are skipped on the message axis and identity axis; every commit not reachable from a head — including the import/sync merge commits themselves — is gated normally. Add a head only via a reviewed PR that merges that exact history (owner policy, 2026-07-28).",
   "heads": [
     {
       "sha": "0c53f0c2ceed6fa7181664a8d85ee6f868713c40",
@@ -32,9 +32,19 @@
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (lockfile dev-deps bump)"
     },
     {
+      "sha": "4bb290f5bd3d48d6b07338d3634cc13fe9c1b49e",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (goal resume fix)"
+    },
+    {
+      "sha": "91cbfd30467d57eae06d3a57ccb068320bb7e171",
+      "imported": "2026-08-06",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.1.11/v1.1.12 releases)"
+    },
+    {
       "sha": "ea57892f7d8e305fc1bd489de420adb19de055b0",
       "imported": "2026-08-06",
-      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (goal resume + v1.1.11-13 releases)"
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.1.13)"
     }
   ]
 }

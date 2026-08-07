@@ -1,5 +1,16 @@
 # @automatalabs/acp-agents
 
+## 0.35.3
+
+### Patch Changes
+
+- Updated dependencies [dcd2ae4]
+- Updated dependencies [f9936cc]
+- Updated dependencies [0e4727e]
+- Updated dependencies [f9936cc]
+  - @automatalabs/codex-acp@1.7.0
+  - @automatalabs/pi-acp@0.3.2
+
 ## 0.35.2
 
 ### Patch Changes
