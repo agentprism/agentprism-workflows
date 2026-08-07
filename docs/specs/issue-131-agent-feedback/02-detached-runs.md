@@ -17,7 +17,8 @@ contract that opts one invocation into that existing background lifecycle, ackno
 immediately, and lets a timeout-constrained caller make bounded status/await calls until it can
 collect the terminal result.
 
-This design adds `background: true` to the execution branch of the existing single `workflow` tool
+This design adds `background: true` to the execution branch of the existing `workflow` tool
+(then the server's only model-facing tool — see the pack [README](README.md)'s historical-scope note)
 and adds an `action: "await"` branch. The immediate `action: "inspect"` branch and the exact shared
 `WorkflowRunStatus` payload are the ones specified in
 `docs/specs/issue-131-agent-feedback/01-run-observability.md`; await extends that payload without

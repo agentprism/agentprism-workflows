@@ -1,6 +1,6 @@
 # REPL orchestrator — the workspace as an MCP server
 
-**Status:** concept, core decisions settled · **Updated:** 2026-08-05
+**Status:** implemented (roadmap phase E) — the `repl` tool ships in [`@automatalabs/mcp-server`](../../packages/mcp-server) over the [`@automatalabs/repl-engine`](../../packages/repl-engine) tier; this doc remains the semantic reference, and the exact tool contract lives in the [package README](../../packages/mcp-server/README.md#the-repl-tool). · **Updated:** 2026-08-07
 
 A deliberately small MCP surface whose entire product is a **persistent JavaScript REPL** in a
 capability-free QuickJS-in-WASM VM. The client's agent (Claude Code, or any MCP client) scripts
@@ -190,28 +190,43 @@ argument the `workflow` tool uses. MCP-session churn (client restarts, transport
 never touches the workspace; the daemon's lifetime plus disk snapshots carry it across
 everything else.
 
-- `eval { projectDir, code }` → `{ output, result?, pending: [...], checkpoints: [...], completed: [...] }`
+*As implemented, each result carries a machine-readable `structuredContent` (the published
+`outputSchema`) alongside the bounded text; the exact field shapes are in the
+[package README](../../packages/mcp-server/README.md#the-repl-tool).*
+
+- `eval { projectDir, code }` → `{ output, outputTruncated, result?, pending: [...], checkpoints: [...], completed: [...] }`
   — runs the script, drains microtasks/jobs, settles what it can, returns. `result` is the
-  previewed completion value when the eval resolved; absent when suspended.
+  previewed completion value present **when the eval resolves to a value** — a guest `undefined`
+  (a declaration or a bare `console.log(...)`) renders as the string `"undefined"`, not a missing
+  field; `result` is absent when the eval **suspends** (on a subagent call, a `checkpoint()`, or
+  any other unsettled promise) or when it **throws, rejects, syntax-errors, or is interrupted**.
+  `checkpoints` are `{ id, question }`, the question previewed; `completed` excludes checkpoint answers.
 - `wait { projectDir, ids?, timeoutMs }` → bounded server-side wait; returns the same shape
-  ("still running" on timeout — absorbs client tool-call timeouts).
-- `status { projectDir? }` → workspaces, live agents, pending ops, and the **workspace
-  manifest** — the harness's answer to the orchestrator *losing track of what it has* thirty
-  calls in: top-level bindings with name, type, size, provenance (which subagent produced the
-  value, from what task, when), and live-handle status. Metadata, never content — `ls` for
-  the data plane.
-- `interrupt { projectDir, id? }` → cancel one subagent call (ACP `session/cancel` downward)
-  or break a runaway eval (the quickjs interrupt handler).
-- `reset { projectDir }` → teardown (cancels in-flight ACP sessions, drops the VM and its
-  stored state).
+  plus `drained` / `timedOut` ("still running" on timeout — absorbs client tool-call timeouts).
+- `status { projectDir? }` → `{ workspaces: [...] }`: per workspace the `state`
+  (`not-opened`/`fresh`/`restored`/`refused`), the restore `reconcile` summary, live agents,
+  pending ops, and the **workspace manifest** — the harness's answer to the orchestrator
+  *losing track of what it has* thirty calls in: top-level bindings with name, type, size,
+  provenance (which subagent produced the value, from what task, when — `eval N` / `worker cN`
+  / `session restore`), and live-handle status. Metadata, never content — `ls` for the data
+  plane. A **named** `status` is a first touch (creates/restores); only projectless `status`
+  is non-materializing.
+- `interrupt { projectDir, id? }` → `{ interrupt: { outcome, callId? } }`. With `id`, cancel one
+  subagent call (ACP `session/cancel` downward) — `outcome` `cancelled`/`idle`/`failed`/`none`.
+  Without `id`, break the running eval (the quickjs interrupt handler) — `outcome` `targeted`
+  or `refused-idle` (nothing breakable is in flight).
+- `reset { projectDir }` → `{ dropped: true }`: teardown (cancels in-flight ACP sessions, drops
+  the VM and its stored state, and clears the workspace's continuation refs).
 
 Snapshotting is implicit — there is no user-facing snapshot action (§Snapshots).
 
 **Output is addressed, not just truncated.** Per the harness's bridge design, every
 `console.log` is truncated in the tool result but frozen in full inside the VM as `$1`, `$2`, …
-(DevTools-style, via `structuredClone`), and the rendered line carries its address —
-`[$14 · object · 48kB] {"sections":[{"title":"Auth flow"…` — so the orchestrator slices deeper
-in a later eval (`console.log($14.sections.map(s => s.title))`) instead of re-running work.
+(DevTools-style, via `structuredClone`), and the rendered line carries its address in the
+previewer's collapsed CDP syntax — property names unquoted, strings double-quoted, nested objects
+and arrays as brand tokens — e.g. `[$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}`
+— so the orchestrator slices deeper in a later eval (`console.log($14.sections.map(s => s.title))`)
+instead of re-running work.
 Nothing is lost by logging it; nothing floods the client's context by being logged. The
 truncation format is the Chrome DevTools Protocol's `ObjectPreview` model, adopted as a spec
 (the harness's normative record:
@@ -246,9 +261,14 @@ no net, no timers beyond the job drain — the VM's entire effect surface is the
 bridge.
 
 Engine posture (all quickjs-wasi built-ins): `memoryLimit` per VM, `interruptHandler` per
-eval. Limits: **6 concurrent subagents per workspace**; tool-result output capped at **256
-lines or 10 KB** (whichever trips first — everything beyond the cap remains reachable through
-`$N` slicing, so the cap costs reads, never data).
+eval. Limits: **6 concurrent subagents per workspace**; the tool result's **text** is capped at
+**256 physical lines or 10 KB, whichever trips first**, and its **`structuredContent`** at a
+**10 KB serialized-JSON** bound *only* (no line cap). Console output beyond the cap remains
+reachable through `$N` slicing; an elided structured array that captured a continuation ref is
+read back through the `refs` parameter — so *that* elision costs only a read. The guarantee is
+not universal: an array dropped with no ref store available records a bare count, and the string
+backstop head+tail-*shortens* an oversized string element in place (a bare `strings` count, never
+stored), so those elisions do lose data.
 
 ## Snapshots and durability
 
@@ -261,13 +281,16 @@ cooperating pieces:
 - **Enveloped snapshots** — `serializeSnapshot()` output wrapped in the identity envelope
   (transfer lesson 5): wasm-binary hash + format version + gzip. Snapshots are written at
   **every state-changing boundary** — after each eval and after each settlement drain that
-  changed VM state. At ~190 KB gzipped per write, a daemon kill at any moment loses nothing;
-  in the harness design's words, reconciliation on relaunch is the normal startup path, not a
-  recovery path. Snapshots and the call store live in the daemon's existing per-project
+  changed VM state. Because durability is boundary-based, a daemon kill loses at most the
+  *in-flight* operation that had not yet reached a boundary; every committed boundary — and,
+  through the append-only call store, every recorded subagent result — is durable, so in the
+  harness design's words reconciliation on relaunch is the normal startup path, not a recovery
+  path. Snapshots and the call store live in the daemon's existing per-project
   store — a `repl/` subdirectory next to the workflow state under
   `workflowHomeDir()/projects/<key>/`, whose `project.json` manifest already maps the store
   key back to its project directory.
-- **The restore path** — on daemon start (or first touch of a stored workspace): restore the
+- **The restore path** — **lazy, on the first touch of a stored workspace** (a named `status`,
+  `eval`, `wait`, or `interrupt` — there is no daemon-startup restore sweep): restore the
   VM, re-register host callbacks by name (a quickjs-wasi built-in), read the in-VM
   pending-call registry, and reconcile each outstanding call three ways — completed while
   down → settle from the store; still resumable at the backend → re-attach; lost → re-issue.
@@ -282,11 +305,15 @@ cooperating pieces:
 **Subagent processes are client-presence keyed, with graceful drain.** Child ACP processes
 stay warm while any MCP client is connected to the project (the daemon's session registry
 already measures liveness by connection presence — a live client always holds an open
-connection). On last-client disconnect, in-flight subagent turns **drain to completion** —
-their results settle into the VM and each settlement boundary snapshots, so "close the laptop
-while two researchers run" ends with the findings durable in the workspace — and then idle
-children close. On the next client connect, the workspace is live (or restores from snapshot)
-and `followUp` re-attaches the subagent session lazily via the capability matrix above.
+connection; the presence ledger is shared with the `workflow` tool, so a workflow-only client
+keeps the workspace warm too). On last-client disconnect, in-flight subagent turns **drain to
+completion within a bound** — the daemon's session-eviction TTL (`SESSION_IDLE_TTL_MS`,
+default 2 h) — their results settle into the VM and each settlement boundary snapshots, so
+"close the laptop while two researchers run" ends with the findings durable in the workspace;
+a turn that overruns the bound is force-settled as the recoverable `AGENT_CANCELLED`, and then
+idle children close. A client that **reconnects mid-drain aborts it**, keeping the children
+warm. On the next client connect, the workspace is live (or restores from snapshot) and
+`followUp` re-attaches the subagent session lazily via the capability matrix above.
 
 Consequences of the npm-shipped binary: snapshots are compatible across daemon restarts and
 across machines running the **same quickjs-wasi package version**; a version bump makes old
@@ -309,15 +336,21 @@ envelope makes that a clean rejection rather than a surprise.
   [workflow engine](../../packages/workflow-engine) keeps batch determinism; this package
   deliberately doesn't compete with it.
 
-## What the implementation spec still owes
+## What the implementation resolved
 
-- The drain-completion bound on disconnect (in-flight turns already run under the runner's
-  existing runaway protections) and the reuse of the daemon's session-eviction TTL.
-- Atomic snapshot-write mechanics (tmp+rename), debounce within a single drain burst, and
-  config knob names.
-- The per-backend steering *mechanism* table — which backends advertise `_session/steering`
-  today versus fall back to queued delivery. The outcome surface is defined above; the table
-  is documentation generated from the capability probes.
+These decisions the concept doc left open were made and shipped in phases C–F:
+
+- The drain-completion bound on disconnect **reuses the daemon's session-eviction TTL**
+  (`SESSION_IDLE_TTL_MS`); a turn that overruns it is force-settled as the recoverable
+  `AGENT_CANCELLED`, and a mid-drain reconnect aborts the drain.
+- Snapshot-write mechanics (atomic tmp+rename, debounce within a drain burst) and the config
+  knobs landed — the per-eval deadline is `AGENTPRISM_REPL_EVAL_TIMEOUT_MS` (default 30 000 ms).
+- The per-backend steering *mechanism* table is a **generated artifact**
+  ([`packages/repl-engine/docs/steering-mechanism-table.md`](../../packages/repl-engine/docs/steering-mechanism-table.md)),
+  produced from the live capability probes in `@automatalabs/acp-agents` and gated by a test.
+- Interruption of a *fully synchronous* runaway is delivered **out of band** (phase F) by a
+  worker-thread relay the stdio shim fires; a host on ordinary HTTP falls back to the per-eval
+  deadline. The interactive no-id `interrupt` honestly refuses the cases it cannot key.
 
 ## Relationship to existing roadmap items
 

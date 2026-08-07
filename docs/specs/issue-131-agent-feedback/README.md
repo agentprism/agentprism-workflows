@@ -4,12 +4,19 @@
 
 **Issue:** [#131](https://github.com/agentprism/agentprism-workflows/issues/131)
 
+> **Historical scope (superseded surface count).** These specs predate the `repl` tool and describe
+> the MCP server when its only model-facing tool was `workflow`. The server now registers **two**
+> model-facing tools — `workflow` and `repl` — so the "single / one model-facing tool" language
+> throughout this pack is historical: it describes the `workflow` surface these specs govern, not a
+> claim that the server exposes exactly one tool today. Every design point below still applies to
+> the `workflow` tool; the later `repl` tool is out of scope here.
+
 This pack turns the operational feedback from a five-run, roughly 200-agent-call workflow into one
 coordinated design: safe run inspection and failure context, request-detached execution with bounded
 result collection, complete `gate()` verdicts, deterministic dry-run branch fixtures, and prominent
-journal-resume guidance. Together the specs extend the existing single `workflow` MCP tool, shared
-run contracts, engine lifecycle, public SDK, validator CLI, and authoring guidance while keeping
-journal replay deterministic and package releases additive.
+journal-resume guidance. Together the specs extend the then-single `workflow` MCP tool (see the
+historical-scope note above), shared run contracts, engine lifecycle, public SDK, validator CLI, and
+authoring guidance while keeping journal replay deterministic and package releases additive.
 
 ## Specs
 

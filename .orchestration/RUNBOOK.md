@@ -33,7 +33,7 @@ npx @automatalabs/workflows validate .claude/workflows/acp-build-phase1-freeze.j
 
 The MCP `workflow` tool accepts the **raw JavaScript source** in its `script` input. It does not resolve a saved workflow name. SDK callers may read a saved file themselves, call `openWorkflowDir(".claude/workflows").read(name)`, or pass the directory view to `runDynamicWorkflow(name, { workflows: view })`.
 
-Runs return a `runId`. A paused run can be resumed with the same script plus `resumeFromRunId`; completed agents are recovered from the persisted journal when their deterministic definitions still match. Authentication pauses return `reason: "auth_required"` (persisted as the run's pause reason): inspect status, complete authentication through the runner or MCP auth tools, then resume the original `runId`.
+Runs return a `runId`. A paused run can be resumed with the same script plus `resumeFromRunId`; completed agents are recovered from the persisted journal when their deterministic definitions still match. Authentication pauses return `reason: "auth_required"` (persisted as the run's pause reason): inspect status, complete authentication out of band — the backend's own CLI login, or the SDK runner's auth APIs (the MCP server registers no auth tools) — then resume the original `runId`.
 
 Before replaying any script, review and update:
 

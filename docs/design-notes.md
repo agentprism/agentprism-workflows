@@ -6,7 +6,7 @@ package-specific API references (field/method names, file:line, versions). For i
 usage, start with the README; read this when you need the protocol-level mechanics (ACP lifecycle,
 the structured-output crux, model/permission/usage wiring, the engine lineage).
 
-> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in seven
+> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in nine
 > `@automatalabs/*` packages — see [§2](#2-codebase--module-structure). The Pi `src/…` citations
 > throughout are provenance for the lifted engine, not paths in this repo.
 
@@ -41,14 +41,16 @@ The orchestrator process plays **two protocol roles at once**:
 
 ```
    MCP host (Claude Code / Zed / …)
-        │  calls tool "workflow"  (MCP, stdio)
+        │  calls tool "workflow" or "repl"  (MCP, stdio)
         ▼
-┌──────────────────────────────────────────────┐
-│  workflow-orchestrator process                │
-│   • MCP SERVER  → exposes the `workflow` tool │
-│   • ACP CLIENT  → drives agent servers        │
-│   • the deterministic engine runs the script  │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  workflow-orchestrator process                             │
+│   • MCP SERVER  → exposes the `workflow` and `repl` tools   │
+│   • ACP CLIENT  → drives agent servers (both tools)         │
+│   • `workflow` → the deterministic engine runs the script  │
+│   • `repl`     → a per-project QuickJS-in-WASM broker runs  │
+│                  the interactive REPL workspace            │
+└────────────────────────────────────────────────────────────┘
         │  session/new, session/prompt … (ACP, JSON-RPC over stdio)
         ▼
    claude-agent-acp / codex-acp / opencode acp / pi-acp  (one or more long-lived subprocesses)
@@ -67,39 +69,45 @@ extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (co
 source) and write the rest fresh. The engine imports no Pi code; `acp-agents` reaches Pi only by
 spawning the exact-pinned `@automatalabs/pi-acp` package as an ACP server.
 
-The code is published as **nine packages** with a one-way dependency direction. The lower
+The code is organized as **nine packages** with a one-way dependency direction (eight released to
+npm; `@automatalabs/repl-engine` is publishable but unreleased, at `0.0.0`). The lower
 layers remain independently usable — in particular, the ACP agent logic and workflow engine both
 work **with no MCP server at all** — while the facade and integration leaves stay thin.
 
 ```
  ┌──────────────────────────┐       ┌──────────────────────────┐
  │ mcp-server               │       │ agentprism-otel          │
- │ stdio tools + auth       │       │ observes manager events  │
- └────────────┬─────────────┘       └────────────┬─────────────┘
-              │ depends on                          │ structural attach
-              ▼                                     ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ workflows — public SDK facade + ACP event bridge            │
- └────────────────┬───────────────────────┬────────────────────┘
-                  ▼                       ▼
- ┌──────────────────────────┐  ┌───────────────────────────────┐
- │ workflow-engine          │  │ acp-agents                    │
- │ vm, journal, budgets,    │  │ pooled built-in ACP agents  │
- │ resume, worktrees        │  │ + custom ACP, auth, sessions │
- └────────────┬─────────────┘  └──────────────┬────────────────┘
-              └──────────────┬────────────────┘
-                             ▼
-                shared-types — AgentRunner seam
+ │ stdio tools:             │       │ observes manager events  │
+ │  workflow + repl         │       └────────────┬─────────────┘
+ └──────┬───────────┬───────┘                    │ structural attach
+        │ depends on │ depends on                 ▼
+        │            └────────────┐   (attaches to a WorkflowManager)
+        ▼                         ▼
+ ┌─────────────────────────────┐  │
+ │ workflows — public SDK      │◄─┤ repl-engine also depends on workflows
+ │ facade + ACP event bridge   │  │
+ └────────┬───────────────┬────┘  │
+          ▼               ▼       │
+ ┌──────────────────┐  ┌──────────┴─────────────────┐
+ │ workflow-engine  │  │ acp-agents                 │◄── repl-engine
+ │ vm, journal,     │  │ pooled built-in ACP agents │
+ │ budgets, resume  │  │ + custom ACP, auth, sessions│
+ └────────┬─────────┘  └──────────────┬─────────────┘
+          └──────────────┬────────────┘
+                         ▼
+            shared-types — AgentRunner seam  ◄── repl-engine, mcp-server
 ```
 
-A leaf outside that chain is the REPL engine (roadmap `repl-orchestrator`):
+The REPL engine (roadmap `repl-orchestrator`) is **not** a leaf outside that chain — it composes it:
 
 ```
  ┌──────────────────────────┐
- │ repl-engine              │   persistent JS REPL in a QuickJS-in-WASM VM;
- │ REPL VM layer            │   composes only the quickjs-wasi shim today.
- │ (roadmap: repl-orchestrator)│   The repl MCP tool wiring into mcp-server
- └──────────────────────────┘   is a later phase.
+ │ repl-engine              │   persistent JS REPL in a QuickJS-in-WASM VM.
+ │ REPL VM layer            │   Depends directly on workflows (the shared
+ │ (roadmap: repl-orchestrator)│   per-project key), acp-agents (subagents are
+ └──────────────────────────┘   ACP sessions), and shared-types. Its `repl`
+                                MCP tool is registered in mcp-server (phase E —
+                                implemented; the package is unreleased at 0.0.0).
 ```
 
 `workflow-engine` and `acp-agents` are **siblings**: neither imports the other. They meet only at
@@ -155,11 +163,13 @@ or any other backend (exactly how the Pi tests drive it today via `options.agent
 
 ### `mcp-server` — the shell / composition root
 
-Owns the **`workflow` tool definition** (input schema + handler), the two conditional auth tools,
-and the stdio MCP transport; streams progress via MCP `notifications/progress`; exposes the
-`resumeFromRunId` param. It depends on `@automatalabs/workflows`, constructs the ACP runner, and
-injects it into the facade manager. It is just **one** consumer — the engine + agents can equally
-be driven by a CLI, a test harness, or another server, with no MCP involved.
+Owns the **`workflow` tool definition** (input schema + handler) and the **`repl` tool** (registered
+over a per-project QuickJS VM through `@automatalabs/repl-engine`), plus the stdio MCP transport;
+streams progress via MCP `notifications/progress`; exposes the `resumeFromRunId` param. It registers
+**no auth tools** — backend auth stays with the agents' own credential stores. It depends on
+`@automatalabs/workflows`, `@automatalabs/repl-engine`, and `@automatalabs/shared-types`, constructs
+the ACP runner, and injects it into the facade manager. It is just **one** consumer — the engine +
+agents can equally be driven by a CLI, a test harness, or another server, with no MCP involved.
 
 ### `workflows` — the public SDK facade
 
@@ -173,12 +183,15 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **nine** published packages —
+> Packaging (as implemented): a pnpm monorepo of **nine** published packages (eight released to
+> npm; `@automatalabs/repl-engine` is publishable but not yet released, at `0.0.0`) —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
-> `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade), and
+> `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade),
 > `@automatalabs/agentprism-otel` (the optional telemetry bridge), `@automatalabs/pi-acp`
-> (the standalone in-process pi ACP server), and `@automatalabs/repl-engine`
-> (the REPL orchestrator's QuickJS-in-WASM VM layer; the `repl` MCP tool is a later roadmap phase).
+> (the standalone in-process pi ACP server), `@automatalabs/codex-acp` (the Codex ACP fork adding
+> turn-level `outputSchema` forwarding, pulled in by `acp-agents`), and `@automatalabs/repl-engine`
+> (the REPL orchestrator's QuickJS-in-WASM VM layer, unreleased at `0.0.0`; its `repl` MCP tool is
+> registered in `mcp-server` — roadmap phase E, implemented).
 > The dependency direction and the `AgentRunner` seam are the contract.
 
 ### Lifted from `pi-dynamic-workflows` → `workflow-engine` (copied/adapted, mostly unchanged)
@@ -200,7 +213,7 @@ outside the engine/runner dependency chain.
 |---|---|---|---|
 | `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives Claude, Codex, OpenCode, pi, or custom ACP agents |
 | `workflows` | **Facade** — compose + validate | no Pi equivalent | public SDK, one-shot helper, workflow folders/validator, manager ACP-event bridge |
-| `mcp-server` | **Shell** — expose tools | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering `workflow` plus conditional auth tools; progress via MCP notifications |
+| `mcp-server` | **Shell** — expose tools | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering the `workflow` and `repl` tools (no auth tools); progress via MCP notifications |
 | `agentprism-otel` | **Observability** | no Pi equivalent | OTel trace/metric mapping over manager events |
 | `acp-agents` | **Structured output** | injected `structured_output` tool ([`src/structured-output.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/structured-output.ts)) | Claude/Codex schema channels plus client-hosted StructuredOutput MCP capture for Pi, OpenCode, and eligible custom ACP backends (§6) |
 
@@ -213,7 +226,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ### Tool exposure (MCP server)
 
 - **`@modelcontextprotocol/sdk`** — official TypeScript MCP SDK. Use its stdio server
-  transport to expose the `workflow` tool. (Pulled transitively by claude-agent-sdk as
+  transport to expose the `workflow` and `repl` tools. (Pulled transitively by claude-agent-sdk as
   `@modelcontextprotocol/sdk@1.29.0`; pin your own direct dependency.)
   Ref: https://github.com/modelcontextprotocol/typescript-sdk · https://modelcontextprotocol.io
 
@@ -256,29 +269,41 @@ All versions below were re-verified from the installed workspace dependency grap
 
 ## 4. The MCP side — exposing the `workflow` tool
 
-The `workflow` tool keeps essentially the same input contract as today
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)), exposed via the MCP server instead of `defineTool`:
+The `workflow` tool grew from Pi's single-form input
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `inspect`, `await`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (inspection fields on a run, or execution fields on an inspect/await/stop, are `InvalidParams`):
 
-- `script` (**required** string) — raw JS; must start with
-  `export const meta = { name, description, phases? }`. Agent-less deterministic scripts are valid;
-  the validator warns when a script has neither `agent()` nor `checkpoint()`.
-- `args` (optional) — exposed to the script as global `args`.
-- `maxAgents` (optional, default 1000), `concurrency` (optional, clamped to 16),
-  `agentRetries` (optional, ≤3), `agentTimeoutMs` (optional, default none),
-  `tokenBudget` (optional, default none).
+- **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
+  fences, or an absolute server-side path read once at admission; the first statement must be
+  `export const meta = { name, description, phases? }`), plus `projectDir` — the absolute project
+  directory selecting the run store and default cwd, **required on the shared daemon** and
+  defaulting to the server's own project under `--in-process`. Agent-less deterministic scripts are
+  valid; the validator warns when a script has neither `agent()` nor `checkpoint()`. Other run
+  fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
+  (clamped to ≤3), `agentTimeoutMs` (default none), `tokenBudget` (default none), the explicit-resume
+  trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
+- **Inspect / await / stop** — take a `runId` and never execution fields; `await` adds `waitMs`
+  (default 20 000), `stop` adds an optional `callIndex` that cancels one in-flight agent (its slot
+  settles to `null` with `AGENT_CANCELLED`) instead of aborting the whole run, and all three accept
+  the `lastN` / `labelGlob` / `logLines` projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
-  `MAX_AGENT_RETRIES` 3), so defer to it and keep the "clamped" semantics above (matches Pi).
+  `MAX_AGENT_RETRIES` 3), so defer to it and keep the "clamped" semantics above (matches Pi). The
+  inspection *bounds* (`lastN`/`logLines`/`waitMs`), by contrast, are wire-contract limits rejected
+  at the Zod boundary.
 
-**One semantic change vs. Pi.** MCP tool calls are request/response within the caller's turn;
-there is no "return immediately, deliver the result into a *later* turn" mechanism (that was a
-Pi-extension affordance, `installResultDelivery`). So the MCP `workflow` tool runs
-**synchronously**: execute to completion, stream progress via MCP **`notifications/progress`**,
-return the final result. This is exactly the existing `background:false` / `runSync` path
-([`src/workflow-tool.ts:223`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L223)) — make it the default and drop `startInBackground`.
+**Background execution, not just synchronous.** Pi's "return immediately, deliver the result into a
+*later* turn" affordance (`installResultDelivery`) has no MCP equivalent, so a **foreground** run
+(the default, `background: false`) executes to completion, streams progress via MCP
+**`notifications/progress`**, and returns the final result — bound to the request and its timeout.
+But background support was **not** dropped. Runs execute in a shared per-user **workflow daemon**
+(the stdio entry is a thin shim that auto-starts it), so `background: true` acknowledges after
+durable admission with a `runId` and the run outlives the request — collected later with bounded
+`await` calls, and durable across client disconnects, shim kills, and session eviction (only daemon
+exit, or the single client-owned process exiting under `--in-process`, stops in-flight work). Resume
+is **explicit**: a new run with `resumeFromRunId` continues from the persisted journal.
 
-The shipped server registers `workflow` alone — its whole tool surface. Backend auth belongs to
+The shipped server registers the `workflow` and `repl` tools — and no auth tool. Backend auth belongs to
 the agents' own CLI credential stores, and the server deliberately exposes no auth state for a
 host to inspect: agents that self-authenticate from disk are invisible to any host-side auth
 bookkeeping, so an auth-status surface could only report "unauthenticated" on fully logged-in

@@ -15,9 +15,9 @@ Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipe
 **Your agent authors** a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
 
 - **As a TypeScript SDK** — `@automatalabs/workflows` — embed the runner in your own program.
-- **As a stdio MCP server** — `@automatalabs/mcp-server`, built on the SDK — expose a `workflow` tool to any MCP host (Claude Code, Zed, …).
+- **As a stdio MCP server** — `@automatalabs/mcp-server`, built on the SDK — expose `workflow` and `repl` tools to any MCP host (Claude Code, Zed, …).
 
-> The `@automatalabs/*` packages are **published on npm** — see [Install](#install). Two are user-facing: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server.
+> The `@automatalabs/*` packages are **published on npm** (except `@automatalabs/repl-engine`, unreleased at `0.0.0` while its `repl` tool ships inside `@automatalabs/mcp-server`) — see [Install](#install). Two are user-facing: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server.
 
 ---
 
@@ -108,6 +108,8 @@ One process plays **two protocol roles at once**: it's an **MCP server** (or a l
 
 The deterministic engine (sandboxed `vm` realm, `parallel`/`pipeline`, journal/resume, token budget, worktree isolation) is independent of *how* a single agent runs and of *how* the tool is exposed. See [`docs/design-notes.md`](docs/design-notes.md) for the full protocol-level design.
 
+The MCP server also exposes a second, **interactive** route: the `repl` tool. Instead of running a deterministic script to completion, it holds a persistent **QuickJS-in-WASM VM per project** (the [`@automatalabs/repl-engine`](packages/repl-engine) tier), and the client's own agent writes live JavaScript that spawns subagents over the same ACP path — workspace state (bindings, pending calls, checkpoints, logged values) persisting between tool calls and across daemon restarts. Workflows is the batch orchestrator; `repl` is the live steering plane. See [The `repl` tool](packages/mcp-server/README.md#the-repl-tool).
+
 ---
 
 ## Requirements
@@ -146,12 +148,12 @@ pnpm build        # tsc -b across all packages
 
 ## Packages
 
-Two packages are the primary **user-facing entry points** — start with one of these:
+These are the packages you interact with directly. The first two are the primary **user-facing entry points** — start with one of them; the third is a standalone backend server:
 
 | Package | What it is |
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
-| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing one `workflow` tool for foreground/background run, await, resume, and inspect — built on `@automatalabs/workflows`. |
+| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, await, resume, inspect, stop) and the `repl` tool (a persistent JavaScript REPL for live subagent orchestration) — built on `@automatalabs/workflows` and `@automatalabs/repl-engine`. |
 | **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; exact-pinned and spawned by the first-class `pi` backend. |
 
 One optional integration package attaches to the SDK's manager surface:
@@ -160,16 +162,17 @@ One optional integration package attaches to the SDK's manager surface:
 |---|---|
 | **`@automatalabs/agentprism-otel`** | OpenTelemetry traces and metrics for a `WorkflowManager`; peer-depends only on `@opentelemetry/api` and no-ops when the host has no OTel SDK. |
 
-The three packages below are **internal building blocks**, composed by the SDK. You normally don't depend on them directly: `@automatalabs/workflows` is the public entry point for the supported orchestration surface.
+The five packages below are **internal building blocks**. Most are composed by the SDK (`@automatalabs/workflows` → `workflow-engine`, `acp-agents`, `shared-types`); the exceptions are `@automatalabs/repl-engine`, which **depends on** the SDK and is composed by the **MCP server** (which registers its `repl` tool), and `@automatalabs/codex-acp`, which is spawned by `acp-agents`. You normally don't depend on any of them directly: `@automatalabs/workflows` is the public entry point for the supported orchestration surface.
 
 | Package | What it is |
 |---|---|
 | **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, budgets, worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
-| **`@automatalabs/repl-engine`** | The REPL orchestrator engine: a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts, trap-free completion reads, the append-only call store and enveloped snapshots). The `repl` MCP tool wiring in `mcp-server` is the roadmap's `repl-orchestrator` phase E; the package depends on `acp-agents` (subagents are ACP sessions) and `shared-types`. |
+| **`@automatalabs/repl-engine`** | The REPL orchestrator engine: a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts, trap-free completion reads, the append-only call store and enveloped snapshots). Its `repl` MCP tool is registered in `mcp-server` (the roadmap's `repl-orchestrator`, phase E — implemented; the package itself is unreleased at `0.0.0`); it depends on `workflows`, `acp-agents` (subagents are ACP sessions), and `shared-types`. |
+| **`@automatalabs/codex-acp`** | The workspace fork of `agentclientprotocol/codex-acp` (imported with full history) — the ACP server the Codex backend spawns, baking turn-level `outputSchema` forwarding into its shipped dist. Consumed by `@automatalabs/acp-agents` as `workspace:*`; you never depend on it directly. |
 | **`@automatalabs/shared-types`** | The `AgentRunner` seam + shared types the others compose against. Internal — public entry is `@automatalabs/workflows`. |
 
-Dependency direction: `mcp-server` → `{ workflows, repl-engine }`; `workflows` → `{ workflow-engine, acp-agents, shared-types }`; `repl-engine` → `{ acp-agents, shared-types }`. The SDK (`workflows`) is the single facade that composes the deterministic engine and the ACP backend, which meet only at the `AgentRunner` seam in `shared-types`. The engine never names a backend; the agents never know they're inside a workflow. `repl-engine` composes the QuickJS-in-WASM shim with `acp-agents` (the REPL's subagents are ACP sessions against the same backends the SDK drives) and ships its `repl` tool in `mcp-server`.
+Dependency direction: `mcp-server` → `{ workflows, repl-engine, shared-types }`; `workflows` → `{ workflow-engine, acp-agents, shared-types }`; `acp-agents` → `{ codex-acp, pi-acp, shared-types }`; `repl-engine` → `{ workflows, acp-agents, shared-types }`. The SDK (`workflows`) is the single facade that composes the deterministic engine and the ACP backend, which meet only at the `AgentRunner` seam in `shared-types`. The engine never names a backend; the agents never know they're inside a workflow. `acp-agents` spawns the bundled `codex-acp` / `pi-acp` ACP servers as its Codex and pi backends. `repl-engine` composes the QuickJS-in-WASM shim with `workflows` (for the shared per-project key) and `acp-agents` (the REPL's subagents are ACP sessions against the same backends the SDK drives), and ships its `repl` tool in `mcp-server`.
 
 ---
 
@@ -233,7 +236,7 @@ await runner.dispose();   // closes pooled backend processes
 
 ## Quickstart — MCP server
 
-The single `workflow` tool runs in the foreground by default, can acknowledge long work with
+The `workflow` tool runs in the foreground by default, can acknowledge long work with
 `background: true`, waits for it with bounded `action: "await"` calls, and safely inspects any known
 project-scoped run by ID. Foreground execution streams `notifications/progress` and returns the
 terminal structured result.
@@ -309,9 +312,11 @@ locally against the ext-apps reference host, run
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"run" \| "inspect" \| "await"` | Omit for the legacy run form. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state. |
-| `script` | string (required for run) | Raw JS; first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await. |
-| `background` | boolean | Run only; default `false`. `true` returns `{ runId, status: "running" }` after durable admission. |
+| `action` | `"run" \| "inspect" \| "await" \| "stop"` | Omit for the run form. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state; `"stop"` durably aborts a live run (or one in-flight agent with `callIndex`). |
+| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
+| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for inspect/await/stop. |
+| `projectDir` | absolute path string | Run only: the project the run belongs to (its project-scoped run store + default cwd). **Required for run** on the shared daemon; defaults to the server's own project under `--in-process`. Forbidden for inspect/await/stop — a `runId` locates its project. |
+| `background` | boolean | Run only; default `false`. `true` acknowledges after durable admission and executes in the daemon (returns `{ runId, status: "running" }`). |
 | `args` | any | Exposed to the script as the global `args`. |
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
@@ -321,11 +326,12 @@ locally against the ext-apps reference host, run
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
-| `runId` | string | Required for inspect/await; the project-scoped run capability returned by execution. |
+| `runId` | string | Required for inspect/await/stop; the project-scoped run capability returned by execution. |
+| `callIndex` | integer | Stop only: cancel exactly that one in-flight agent call (its slot settles to `null` with `AGENT_CANCELLED`) without aborting the run. Forbidden for every other action. |
 | `waitMs` | integer | Await only: default 20,000, range 0–25,000; zero is a non-blocking status read. |
-| `lastN` | integer | Inspect/await: latest matching calls, default 20, range 1–50. |
-| `labelGlob` | string | Inspect/await: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
-| `logLines` | integer | Inspect/await: latest log lines, default 20, range 0–50. |
+| `lastN` | integer | Inspect/await/stop: latest matching calls, default 20, range 1–50. |
+| `labelGlob` | string | Inspect/await/stop: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
+| `logLines` | integer | Inspect/await/stop: latest log lines, default 20, range 0–50. |
 
 Foreground remains the default. For long work, start it and retain the new run ID:
 
@@ -425,7 +431,7 @@ Inspection returns lifecycle status, ordered phases, a redacted log tail, and at
 call previews. Its structured payload is capped at 24,576 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
-The `workflow` tool is the server's whole *tool* surface; prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The `workflow` and `repl` tools are the server's model-facing *tool* surface — `repl` is a persistent QuickJS-in-WASM JavaScript REPL (one VM per project) for live, stateful subagent orchestration, documented in the [package README](packages/mcp-server/README.md#the-repl-tool). Prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -581,7 +587,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 ## Documentation
 
 - [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes three selected backends in one autonomous multi-stage run.
-- [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, MCP auth tools, and the full `WorkflowError` code table.
+- [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, the SDK auth/provider APIs, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
 - [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add agentprism/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.

@@ -21,8 +21,9 @@ or aborted execution result carries the latest 20 run-log lines in both structur
 human-readable MCP text response, so the first failure response is independently diagnosable.
 
 Inspection remains part of the existing `workflow` tool. The server deliberately removed auth and
-provider control-plane tools and now promises one model-facing tool; run, resume, and inspect are
-operations on the same workflow-run resource. A discriminated action avoids reintroducing tool-choice
+provider control-plane tools and, at the time of this spec, promised one model-facing tool (`workflow`;
+the server has since added a second, `repl` — see the pack [README](README.md)'s historical-scope note);
+run, resume, and inspect are operations on the same workflow-run resource. A discriminated action avoids reintroducing tool-choice
 noise while retaining byte-for-byte-valid legacy execution inputs that omit the action.
 
 ## 2. Current state

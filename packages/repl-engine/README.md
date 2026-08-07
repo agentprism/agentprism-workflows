@@ -4,8 +4,11 @@ The engine package of the **REPL orchestrator** (see
 [`docs/roadmap/repl-orchestrator.md`](../../docs/roadmap/repl-orchestrator.md)): a persistent
 JavaScript REPL in a capability-free QuickJS-in-WASM VM. One VM per workspace; the workspace
 object owns the VM lifecycle (`create` → `eval` → `drainJobs` → `dispose`). The `repl` MCP
-tool that registers in `mcp-server` (the daemon wiring below) is a thin entry over
-[`WorkspaceRegistry`](#workspace-registry); this package is the engine tier it sits on.
+tool that registers in `mcp-server` (the daemon wiring below) is built directly on this
+engine's `Broker` + `Workspace` + per-project `ReplWorkspaceStore` — with its own tool-level
+input/output schemas, an action discriminator, output caps, and the client-presence drain —
+**not** a thin [`WorkspaceRegistry`](#workspace-registry) wrapper; this package is the engine
+tier it sits on.
 
 ```ts
 import { Workspace } from '@automatalabs/repl-engine';
@@ -408,8 +411,10 @@ serialize, so overlapping tool calls can never interleave settlement bookkeeping
 
 ## Decisions for spec-owed details
 
-These are the decisions this phase made where the roadmap doc left room; later phases must
-build on them rather than re-open them.
+These are the decisions this phase (the broker/engine tier) made where the roadmap doc left
+room. The later phases that build on them — the daemon wiring and the `repl` MCP tool — have
+since shipped (roadmap phase E; see [Daemon wiring](#daemon-wiring-phase-d-in-mcp-server)
+below).
 
 - **Default memory limit: 64 MiB per VM** (configurable per workspace and per registry).
 - **Per-eval and per-drain interrupts composed over the built-in per-VM handler** (see
@@ -585,27 +590,36 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   progress-stream gap, never terminal evidence), absorbing the live update stream and
   settling with the turn's REAL accumulated text at the notification, bounded by
   `AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS` (default 15 min — the "never hang
-  unobserved" backstop). A backend WITHOUT the extension degrades through the same
-  honest fallback the doc's restore path prescribes for a capability-omitting backend
-  (never by settling partial output): the seam rejects immediately with the
-  non-re-armable `LoadedTurnStillRunningError`, and this broker releases the loaded
-  session and re-issues the call under the same id, surfaced guest-visibly — never a
-  permanent hold (phase-F review: the old keep-attached-and-pending arm left
-  re-attached calls on seam-less backends — the built-in claude and opencode backends
-  today — pending until interrupt/reset; every continuation must settle exactly once
-  through one of the three reconciliation arms). A `running` turn past the max-wait
-  bound rejects with the RE-ARMABLE form of the same error (the broker re-arms the seam
-  on the still-attached session — a later notification or a cancel still settles the
-  call); a turn that failed at the backend rejects with `LoadedTurnFailedError` (a
-  definite outcome, settled as an ordinary rejection, never re-issued); everything else
-  (no user message in the transcript, `interrupted`, a dead process) is the safe-re-issue
-  class. A handle that was never load-marked rejects immediately (without the boundary
-  the completion is not observable and the seam never guesses). The broker arms the
-  re-attached call on the seam WITHOUT blocking reconcile: reconcile returns
-  immediately, the pump delivers the completion through the same record → settle →
-  consume path as a live call. A third-party `BrokerSession` adapter WITHOUT the seam
-  still re-attaches the session, then degrades through the SAME re-issue fallback — the
-  seam absence is a capability omission.
+  unobserved" backstop). A backend WITHOUT the `_session/loaded_turn` extension — the
+  built-in **claude** and **opencode** backends today — is classified by the seam's
+  **observation path** instead (phase-F review round 2: the old degradation released the
+  loaded session and blindly re-issued, which can duplicate a still-running backend turn
+  — re-issue is now reserved for the observably-dead classes). The observation path is
+  the post-load **continuation watch** (any content update after the load boundary is
+  live continuation — the authoritative still-running signal, which flips to the
+  keep-attached wait) plus the replay probe under the **connection-death contract**: the
+  built-in ACP servers terminate in-flight turns when the client connection closes
+  (live-verified) and their persisted transcripts hold only completed messages, so at
+  restore the founding turn is never still running — the replay's trailing assistant
+  message is the turn's terminal message (`completed`-while-down, settled from the
+  replay), and anything else means it died mid-way (the safe-re-issue class, no
+  duplication possible). A `running` turn past the max-wait bound rejects with
+  `LoadedTurnStillRunningError`: the **re-armable** form re-arms the seam on the
+  still-attached session (a later notification or a cancel still settles the call), and
+  the **non-re-armable** form (a third-party seam that can NEVER observe the terminal
+  state) is NOT re-invoked — the broker keeps the loaded session attached and waits for
+  the terminal state from the session's own ended notification, the call's cancel, the
+  session's release, or the client-presence drain's forced stop (a possibly-running call
+  is never re-issued). A turn that failed at the backend rejects with
+  `LoadedTurnFailedError` (a definite outcome, settled as an ordinary rejection, never
+  re-issued); everything else (no user message in the transcript, `interrupted`, a dead
+  process) is the safe-re-issue class. A handle that was never load-marked rejects
+  immediately (without the boundary the completion is not observable and the seam never
+  guesses). The broker arms the re-attached call on the seam WITHOUT blocking reconcile:
+  reconcile returns immediately, the pump delivers the completion through the same
+  record → settle → consume path as a live call. Only a third-party `BrokerSession`
+  adapter WITHOUT the seam at all re-attaches the session and then degrades through the
+  re-issue fallback — the seam absence is a capability omission.
 - **Backend identity/pool routing is persisted** (phase-D review round 2): the store
   records the model spec VERBATIM (including the guest's `"default"` sentinel) AND the
   RESOLVED backend id at session open (`recordAttached` — a backend id doubles as a model
@@ -623,11 +637,12 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   serves the steering operation per the mechanism table. Concurrent lazy re-attaches of
   one session share a single load.
 - **The client-presence drain** (`Broker.drainForDisconnect`, phase-D review round 2):
-  in-flight turns DRAIN TO COMPLETION (each settlement boundary snapshots — never a
-  cancel of running work), bounded by the spec-owed concrete bound, which REUSES the
-  daemon's session-eviction TTL (the daemon passes `SESSION_IDLE_TTL_MS`; an over-bound
-  turn is cancelled — the honest bounded teardown, settled as the recoverable
-  `AGENT_CANCELLED`), then every idle child closes (`keepSession` keeps the backend
+  in-flight turns DRAIN TO COMPLETION **within the bound** (each settlement boundary
+  snapshots — a turn that finishes in time is never cancelled), bounded by the spec-owed
+  concrete bound, which REUSES the daemon's session-eviction TTL (the daemon passes
+  `SESSION_IDLE_TTL_MS`; a turn that OVERRUNS the bound is force-cancelled — the honest
+  bounded teardown, settled as the recoverable `AGENT_CANCELLED`), then every idle child
+  closes (`keepSession` keeps the backend
   sessions re-openable; queued-but-undelivered steers are re-queued durably against
   their founding session ids and delivered by the next re-attach exactly once). The
   workspace and broker stay alive; the next client's followUp/steer/cancel lazily
@@ -643,10 +658,14 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
 - **The per-eval wall-clock deadline** (`BrokerOptions.evalTimeoutMs`, default 30 s,
   `AGENTPRISM_REPL_EVAL_TIMEOUT_MS`; phase-D review round 2): every eval and settlement
   drain runs under a deadline enforced by the quickjs interrupt handler, COMPOSED with
-  the configured signal handler — a currently-running runaway eval is ALWAYS breakable
-  (the armed signal alone could only break the NEXT execution, because a synchronous
-  eval blocks the event loop before a later request can arm it; the harness's own eval
-  guard is the model). The VM stays usable after an interruption.
+  the configured signal handler — so a runaway eval can never hang the workspace
+  forever: the deadline ALWAYS bounds it (a synchronous eval blocks the event loop before
+  a later interrupt request could arm the signal, so the deadline, not the signal, is the
+  last-resort bound; phase F adds the out-of-band relay that breaks a synchronous runaway
+  before the deadline). This is distinct from the interactive no-id `interrupt`, which
+  breaks a *yielding* eval promptly but honestly **refuses** (`refused-idle`) the cases it
+  cannot key a resumption to — a never-settling local promise, or a restored older guest
+  that predates the continuation-lease seam. The VM stays usable after an interruption.
 - **The workspace manifest** (`Broker.workspaceManifest()`, phase-D review round 2; the
   doc's status surface): top-level USER bindings (fresh-realm baseline set difference —
   the baseline is captured once per process from a throwaway VM provisioned exactly like
@@ -841,10 +860,11 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
   `_session/loaded_turn` extension's authoritative terminal classification (a `completed`
   answer settles from the replay immediately; an `interrupted` answer re-issues safely;
   a `running` turn is KEPT ATTACHED and settles only from the `_session/loaded_turn/ended`
-  notification — a quiet gap is never settled, a still-running turn is never re-issued,
-  and a backend without the extension degrades to the same pending-on-the-attached-
-  session posture, surfaced guest-visibly; a turn that failed at the backend settles as
-  a definite rejection). Pending checkpoints re-surface (answerable
+  notification — a quiet gap is never settled, a still-running turn is never re-issued;
+  a built-in backend without the extension is classified by the observation path instead
+  (the post-load continuation watch plus the connection-death replay probe — never a
+  blind possibly-running re-issue, never a permanent pending hold); a turn that failed at
+  the backend settles as a definite rejection). Pending checkpoints re-surface (answerable
   across a restore, through the reconciliation surface) and pending steers whose wire call
   died with the process resolve the honest `failed` with a warn line (their outcome is
   unknowable; re-injecting would duplicate; queued-but-undelivered steers are the one
@@ -878,35 +898,56 @@ oneOf-branch pattern) mirrors eval/wait as `{ output, result?, pending,
 checkpoints, completed }` plus the wait-only `drained`/`timedOut` flags,
 status as structured workspaces (state, the reconcile summary, the
 workspace manifest with name/token/size/provenance/task per binding, the
-live agents, the pending ops), interrupt as its honest outcome, reset as
-the dropped acknowledgement, and the error variant for refusals. Guest
-output (the capped console lines, the previewed result) stays in
+live agents, the pending ops), interrupt as its honest outcome, and reset
+as the dropped acknowledgement. The error variant replaces the
+eval/wait/interrupt result and is flagged `isError` — a **refused snapshot**
+on `eval`/`wait`/`interrupt`, or a **missing project context** on any action.
+A **named `status`** instead reports a refused snapshot through its normal
+status variant (`state: "refused"` with a `restoreError`), not the error
+variant. `reset` never refuses a *snapshot* — it clears the store — but it
+still returns the error variant when there is **no project context** to reset
+(single-project mode with no adopted default).
+Guest output (the capped console lines, the previewed result) stays in
 separate fields from the trusted orchestration metadata — never one
 flat string — and every structured field is bounded metadata (output
 capped by the broker, checkpoint questions previewed, manifest tokens
-structure-only). The bounded text stays alongside for human reading.
+structure-only). The whole `structuredContent` is bounded AGAIN at the
+tool seam by a **10 000-byte serialized-JSON cap** (distinct from the
+text's 256-line / 10 000-byte cap — the structured surface has no line
+cap): the largest arrays are elided head-first, and each drop is recorded
+in a `truncated` record (field path → elided count, or `{ elided, ref }`
+when a continuation ref was captured; the reserved `strings` key is a
+plain count). A captured ref reads the dropped tail back through a later
+call's `refs` parameter (returned under `referenced`); refs are
+workspace-namespaced, held in memory, cleared by `reset`, and lost on a
+daemon restart. The bounded text stays alongside for human reading.
 
 ## Client presence and the drain (phase D, in `mcp-server`)
 
 The doc's client-presence policy is wired in full. The daemon's session registry measures
 liveness by connection presence and now SIGNALS last-connection-closed
 (`SessionRegistry.onLastConnectionClosed`); a per-daemon `ReplPresenceLedger` maps MCP
-sessions to the repl projects they touched (every `repl` call touches), and a project
-whose client set becomes EMPTY is DRAINED: in-flight subagent turns drain to completion —
-`Broker.drainForDisconnect` pumps until no session has a turn running, each settlement
-boundary snapshots, so "close the laptop while two researchers run" ends with the
-findings durable in the workspace — bounded by the SPEC-OWED concrete bound, which
-REUSES the daemon's session-eviction TTL (`SESSION_IDLE_TTL_MS`; the runner's own
-runaway protections already bound individual turns — the TTL is the outer ceiling; an
-over-bound turn is cancelled, the honest bounded teardown), and then every idle child
-closes (`keepSession` keeps the backend sessions re-openable). The workspace and broker
-stay alive; on the next client connect `followUp`/`steer`/`cancel` on a settled handle
-RE-ATTACHES the recorded backend session lazily via the capability matrix
-(`Broker.canLazyReattach`/`lazyReattach` — the runner's own `loadSession` gate; a custom
-backend without the capability degrades through the same gate, surfaced guest-visibly).
-Queued-but-undelivered steers survive the drain (re-queued durably against their founding
-session ids — the next re-attach delivers them exactly once). At daemon shutdown every
-workspace drains with the shutdown deadline before the broker teardown.
+sessions to the repl projects they touched. The ledger is **shared with the `workflow`
+tool** — a session that only ran `workflow` calls against a project is present on it too,
+so a repl client's disconnect never drains a workspace while a workflow-only client is
+still connected. A project whose client set becomes EMPTY is DRAINED: in-flight subagent
+turns drain to completion — `Broker.drainForDisconnect` pumps until no session has a turn
+running, each settlement boundary snapshots, so "close the laptop while two researchers
+run" ends with the findings durable in the workspace — bounded by the SPEC-OWED concrete
+bound, which REUSES the daemon's session-eviction TTL (`SESSION_IDLE_TTL_MS`; the runner's
+own runaway protections already bound individual turns — the TTL is the outer ceiling; a
+turn that overruns the bound is force-cancelled, the honest bounded teardown), and then
+every idle child closes (`keepSession` keeps the backend sessions re-openable). A client
+that **reconnects mid-drain ABORTS it** — `drainForDisconnect` re-checks presence every
+iteration and before every destructive phase, so the children stay warm while any client
+is connected. The workspace and broker stay alive; on the next client connect
+`followUp`/`steer`/`cancel` on a settled handle RE-ATTACHES the recorded backend session
+lazily via the capability matrix (`Broker.canLazyReattach`/`lazyReattach` — the runner's
+own `loadSession` gate; a custom backend without the capability degrades through the same
+gate, surfaced guest-visibly). Queued-but-undelivered steers survive the drain (re-queued
+durably against their founding session ids — the next re-attach delivers them exactly
+once). At daemon shutdown every workspace drains with the shutdown deadline before the
+broker teardown.
 
 ## The generated steering mechanism table
 
@@ -1052,8 +1093,9 @@ from the loaded session's replay with no re-issue, wire-log proven — including
 authoritative `_session/loaded_turn/ended` notification — an assistant PARTIAL whose next
 live chunk arrives later than any quiet grace is never durably settled, and the
 still-running turn is never re-issued (no fresh session ever opens); an `interrupted`
-turn re-issues immediately; a backend without the extension degrades to the pending-on-
-the-attached-session posture). Phase-D
+turn re-issues immediately; a built-in backend WITHOUT the extension is classified by the
+observation path — a completed-while-down turn settles from the replay with no re-issue
+and no extension query on the wire, under the connection-death contract). Phase-D
 review round 2 adds `review2.test.ts` (the lazy re-attach of settled handles after the
 client-presence drain — followUp/steer/cancel re-attach the recorded backend session
 through the capability gate, and a gate failure degrades to the honest `failed` surfaced

@@ -12,9 +12,9 @@ or a registered custom ACP agent — driving the actual subprocess to completion
 This package is the **canonical SDK** that the stdio MCP server
 [`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server) is built on.
 Its CLI can also delegate to a build-time embedded copy of that server with the `mcp` subcommand,
-so an MCP host can expose the `workflow` tool without a separate package install. The standalone
-MCP server package remains independently published, while programs embedding the runner continue
-to use this package's workflow/runner APIs.
+so an MCP host can expose the `workflow` and `repl` tools without a separate package install. The
+standalone MCP server package remains independently published, while programs embedding the runner
+continue to use this package's workflow/runner APIs.
 
 The SDK itself remains a thin programmatic facade over the engine + ACP packages, with
 ACP-defaulted helpers for ordinary runs (`runDynamicWorkflow`) and substitution tests
@@ -808,6 +808,13 @@ hosts (Claude Code `--transport http`, Codex `config.toml` `url`), which can ski
 entirely. See the [`@automatalabs/mcp-server` README](../mcp-server#the-workflow-daemon) for
 the daemon's full contract (discovery, project routing, idle shutdown, security posture).
 
+The bundled server exposes **two** model-facing tools — `workflow` and **`repl`** — and no auth
+tools. The `repl` tool is a persistent QuickJS-in-WASM JavaScript REPL, **one VM per `projectDir`**
+(the same per-project model as `workflow`), for live, stateful subagent orchestration: workspace
+state (bindings, pending subagent calls, checkpoints, logged values) persists in the VM across tool
+calls and daemon restarts through the per-project `repl/` store, and drains when the project's last
+MCP client disconnects. See [The `repl` tool](../mcp-server#the-repl-tool) for its full contract.
+
 For the source inner loop, build workflows before launching its compiled CLI:
 
 ```bash
@@ -1003,9 +1010,9 @@ the exhaustive option tables.
   autonomous cross-vendor triage; and `image-gate`, a single gated script with an
   MCP-wired image producer.
 - **[`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server)** — the
-  stdio MCP server built on this SDK. It wraps the same engine + ACP backend behind `workflow`
-  and conditional auth tools (bin: `agentprism-workflow`) for any MCP host. Use it when you want the
-  **MCP-tool route** instead of embedding the runner in code.
+  stdio MCP server built on this SDK. It wraps the same engine + ACP backend behind the `workflow`
+  and `repl` tools (bin: `agentprism-workflow`; no auth tools) for any MCP host. Use it when you want
+  the **MCP-tool route** instead of embedding the runner in code.
 
 ## License
 
