@@ -58,6 +58,18 @@ function replEvalCode(client: Client, projectDir: string, code: string): Promise
   );
 }
 
+function replEvalNoDir(client: Client, code: string): Promise<CallToolResult> {
+  return client.callTool({ name: "repl", arguments: { action: "eval", code } }, undefined, {
+    timeout: 60_000,
+  });
+}
+
+function replInterruptNoDir(client: Client): Promise<CallToolResult> {
+  return client.callTool({ name: "repl", arguments: { action: "interrupt" } }, undefined, {
+    timeout: 60_000,
+  });
+}
+
 function replInterrupt(client: Client, projectDir: string): Promise<CallToolResult> {
   return client.callTool(
     { name: "repl", arguments: { action: "interrupt", projectDir } },
@@ -118,8 +130,47 @@ test("the in-process stdio server's worker-reader fires the relay: a no-id inter
   }
 });
 
-test("the relay key is the CANONICAL projectDir: an interrupt through a symlink breaks the running eval (phase-F review round 3: the raw path used to get a relay 404)", async () => {
-  const home = mkdtempSync(join(TEST_TMP, "home-sym-"));
+test("the OMITTED-projectDir interrupt fires the relay with the server's own project key: the documented optional projectDir works for a synchronous runaway (phase-F review round 4: the relay used to skip the omitted-projectDir interrupt, so the eval ran to the per-eval deadline and the interrupt reported refused-idle)", async () => {
+  const home = mkdtempSync(join(TEST_TMP, "home-nodir-"));
+  const client = await startServer(home);
+  try {
+    // No projectDir anywhere: the repl tool resolves the server's own
+    // adopted project (its cwd), and the reader worker's relay fires
+    // under the SAME key (the transport's default project key).
+    const warm = await replEvalNoDir(client, "6 * 7");
+    assert.ok(textOf(warm).includes("result: 42"), textOf(warm));
+    const startedAt = Date.now();
+    const runaway = replEvalNoDir(client, "while (true) {}");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 400));
+    const interrupt = await replInterruptNoDir(client);
+    const interruptText = textOf(interrupt);
+    assert.ok(
+      interruptText.includes("out of band") ||
+        interruptText.includes("out-of-band") ||
+        interruptText.includes("broken OUT OF BAND"),
+      `the interrupt reports the out-of-band break: ${interruptText}`,
+    );
+    const structured = (interrupt.structuredContent ?? {}) as { interrupt?: { outcome?: string } };
+    assert.equal(structured.interrupt?.outcome, "targeted", JSON.stringify(structured));
+    const result = await runaway;
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 8000, `the eval broke out of band, not at the 20 s deadline: ${elapsed} ms`);
+    const text = textOf(result);
+    assert.ok(text.includes("interrupted") || text.includes("error"), `the eval reports the break: ${text}`);
+    // The default workspace stays usable, and an idle no-dir interrupt
+    // refuses (no stale break ever reaches a later eval).
+    const after = await replEvalNoDir(client, "40 + 2");
+    assert.ok(textOf(after).includes("result: 42"), textOf(after));
+    const idle = await replInterruptNoDir(client);
+    const idleStructured = (idle.structuredContent ?? {}) as { interrupt?: { outcome?: string } };
+    assert.equal(idleStructured.interrupt?.outcome, "refused-idle", JSON.stringify(idleStructured));
+    await client.close().catch(() => undefined);
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+});
+
+test("the relay key is the CANONICAL projectDir: an interrupt through a symlink breaks the running eval (phase-F review round 3: the raw path used to get a relay 404)", async () => {  const home = mkdtempSync(join(TEST_TMP, "home-sym-"));
   const realDir = join(home, "real-project");
   const symDir = join(home, "linked-project");
   mkdirSync(realDir, { recursive: true });

@@ -1220,6 +1220,17 @@ export function createWorkflowServer(
     replBreakUrl() {
       return replEvalBreakChannel.breakUrl();
     },
+    replDefaultProjectDir() {
+      // The single-project server's own project: the FIRST registry
+      // context — exactly what the repl tool's projectDir-omitted
+      // resolution returns (`resolveContext`: `stores()[0]`). The
+      // relay transport fires its out-of-band break under this key
+      // when the client omits projectDir (phase-F review round 4: the
+      // omitted-projectDir interrupt used to skip the relay entirely
+      // and run to the per-eval deadline). Undefined in daemon mode
+      // (projectDir is required there) and when no context exists yet.
+      return projects.stores()[0]?.projectDir;
+    },
     async disposeReplEvalBreakChannel() {
       if (ownsReplEvalBreakChannel) await replEvalBreakChannel.dispose();
     },

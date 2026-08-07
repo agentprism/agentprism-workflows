@@ -24,8 +24,49 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { replToolOutputShape } from "../src/index.js";
+import { capStructuredResult, replToolOutputShape } from "../src/index.js";
 import { TruncationRefStore } from "../src/repl-project.js";
+
+test("cumulative continuation refs preserve the ORIGINAL VERBATIM order across repeated halvings (round 4: the chunks used to chain in reverse)", () => {
+  const store = new TruncationRefStore("proj-e-555555555555");
+  // A pending list big enough to trip the aggregate 10 KB cap across
+  // several halving passes (only `pending` is elidable here — the
+  // other arrays are empty, so the elision record is deterministic).
+  const pending = Array.from(
+    { length: 2000 },
+    (_, i) => `call-${String(i).padStart(4, "0")}-${'x'.repeat(40)}`,
+  );
+  const result = capStructuredResult(
+    {
+      action: "eval",
+      projectDir: "/tmp/w",
+      output: [],
+      outputTruncated: false,
+      pending,
+      checkpoints: [],
+      completed: [],
+    },
+    store,
+  );
+  const truncated = (result as { truncated?: Record<string, { elided: number; ref?: string }> }).truncated;
+  assert.ok(truncated?.pending?.ref, "the elision advertises a continuation ref");
+  const dropped = store.get(truncated!.pending!.ref!)!;
+  assert.equal(dropped.length, truncated!.pending!.elided, "the ref holds every elided entry");
+  // THE ORDER: the dropped tail must read back in the ORIGINAL array
+  // order — the newest dropped chunk PRECEDES the older chunks (the
+  // halving pass always drops from the current array's tail, which is
+  // the kept prefix of the previous array). Round 4: the old
+  // accumulation appended the new chunk AFTER the prior values, so
+  // after dropping [4…7] and then [2…3] the advertised ref held
+  // [4…7,2…3] instead of the output contract's verbatim tail [2…7].
+  const kept = (result as { pending?: string[] }).pending!;
+  assert.deepEqual(dropped, pending.slice(kept.length), "the advertised ref reads back the original verbatim tail, in order");
+  // The kept head plus the ref reconciles to the whole registry (the
+  // cap costs reads, never data).
+  assert.equal(kept.length + dropped.length, pending.length);
+  assert.deepEqual([...kept, ...dropped], pending, "head + tail reassemble the original list exactly");
+});
+
 
 test("the wait result variant ACCEPTS referenced (round 3: the handler attaches it, the validator used to forbid it)", () => {
   const base = {

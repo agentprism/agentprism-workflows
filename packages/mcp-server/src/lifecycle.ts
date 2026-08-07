@@ -18,6 +18,15 @@ export interface WorkflowServerControl {
    *  the daemon mode's shim does). Resolves when the relay worker is
    *  listening. */
   replBreakUrl(): Promise<string>;
+  /** The single-project server's own project key — the context the
+   *  `repl` tool resolves when its projectDir argument is omitted
+   *  (phase-F review round 4: the relay stdio transport fires the
+   *  out-of-band eval-break with this key for an omitted-projectDir
+   *  interrupt, so the documented optional-projectDir interrupt works
+   *  for a synchronously running eval). Undefined in daemon mode
+   *  (projectDir is required there). OPTIONAL for minimal third-party
+   *  implementations. */
+  replDefaultProjectDir?(): string | undefined;
   /** Dispose the SERVER-OWNED eval-break channel (a caller-provided
    *  channel stays the caller's to dispose — the daemon owns its own).
    *  Idempotent; the channel's worker is unref'd, so a process can exit

@@ -815,8 +815,9 @@ function capStructuredStrings(node: unknown, max: number): number {
  *  hole). Results that fit the bound are returned untouched. Applied to
  *  the eval / wait / status variants (the output-bearing surfaces); the
  *  interrupt / reset / error variants carry only broker-authored
- *  scalar fields and are left as-is. */
-function capStructuredResult(
+ *  scalar fields and are left as-is. Exported for the truncation-ref
+ *  unit tests. */
+export function capStructuredResult(
   result: Record<string, unknown>,
   truncationRefs?: TruncationRefStore,
 ): Record<string, unknown> {
@@ -854,7 +855,16 @@ function capStructuredResult(
       priorRef !== undefined && truncationRefs !== undefined
         ? truncationRefs.get(priorRef)
         : undefined;
-    const accumulated = priorValues !== undefined ? [...priorValues, ...dropped] : dropped;
+    // ROUND 4 — the chained snapshot preserves the ORIGINAL verbatim
+    // order: the halving pass always drops from the CURRENT array's
+    // tail, and the current array is the kept prefix of the previous
+    // one, so the newest dropped chunk precedes every previously
+    // dropped chunk in the ORIGINAL array. The old accumulation
+    // (`[...priorValues, ...dropped]`) concatenated the chunks in
+    // reverse order — after dropping [4…7] and then [2…3] the
+    // advertised ref held [4…7,2…3] instead of the verbatim tail
+    // [2…7] the output contract promises.
+    const accumulated = priorValues !== undefined ? [...dropped, ...priorValues] : dropped;
     const ref = capture(accumulated);
     const priorElided =
       typeof prior === 'object' && prior !== null

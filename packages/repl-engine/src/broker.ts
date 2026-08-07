@@ -967,6 +967,13 @@ export class Broker {
   private readonly interruptHandler: (() => boolean) | undefined;
   private readonly evalTimeoutMs: number;
   private readonly evalBreakChannel: EvalBreakChannel | undefined;
+  /** The workspace's eval-break slot REGISTRATION ACK (phase-F review
+   *  round 4): resolves once the relay worker applied the key→slot
+   *  mapping; every serialized operation awaits it before touching the
+   *  VM (`runSerialized`). Rejects when the worker dies before
+   *  acknowledging — operations swallow the rejection and degrade to
+   *  the per-eval deadline bound. */
+  private readonly evalBreakReady: Promise<void>;
   private readonly sink: SnapshotSink | undefined;
   private readonly consoleBuffer: Array<{ level: string; refs: string[]; args: unknown[] }> = [];
   private readonly sessions = new Map<string, SessionEntry>();
@@ -1153,9 +1160,16 @@ export class Broker {
     this.evalTimeoutMs = options.evalTimeoutMs ?? DEFAULT_EVAL_TIMEOUT_MS;
     this.evalBreakChannel = options.evalBreakChannel;
     // The workspace's slot is registered up front so the worker's HTTP
-    // endpoint knows the key before any eval can run (fire-and-forget:
-    // a break for an unregistered key is a 404 no-op).
-    options.evalBreakChannel?.register(this.workspace.projectDir);
+    // endpoint knows the key before any eval can run. The registration
+    // is ACKNOWLEDGED (phase-F review round 4): every serialized
+    // operation awaits the ack before touching the VM (see
+    // `runSerialized`), so a no-id interrupt can never 404 against a
+    // key→slot mapping the worker has not applied yet — the old
+    // fire-and-forget registration left a window where the first
+    // interrupt's out-of-band break was lost and the eval ran to the
+    // per-eval deadline.
+    this.evalBreakReady =
+      options.evalBreakChannel?.register(this.workspace.projectDir) ?? Promise.resolve();
     this.sink = options.snapshotSink;
     this.ownsRunner = options.runner === undefined;
     this.runner = options.runner ?? new AcpAgentRunner();
@@ -5171,6 +5185,15 @@ export class Broker {
    *  boundaries are exactly the moments the tracking can advance. */
   private async runSerialized<T>(fn: () => Promise<T>): Promise<T> {
     try {
+      // Every serialized operation waits for the workspace's eval-break
+      // slot ACK (phase-F review round 4): guest-executing operations
+      // must not start before the relay worker knows the workspace's
+      // key — an interrupt fired during the operation would 404 against
+      // an unapplied mapping. The ack resolves once (milliseconds after
+      // attach) and is a settled-promise microtask from then on; a dead
+      // channel rejects it and the swallow degrades to the documented
+      // per-eval deadline bound — never a hang.
+      await this.evalBreakReady.catch(() => undefined);
       this.sweepActiveEvals();
       return await fn();
     } finally {

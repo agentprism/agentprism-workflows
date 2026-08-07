@@ -51,6 +51,7 @@ export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
 export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
+export { capStructuredResult } from "./repl-tool.js";
 export type { ReplToolOptions } from "./repl-tool.js";
 export {
   createReplProjectState,
@@ -97,7 +98,14 @@ export type {
 export async function main(): Promise<void> {
   const runner = createAcpRunner();
   const server = createWorkflowServer(runner);
-  const transport = new ReplRelayStdioTransport(() => server.replBreakUrl());
+  // The default-project-key source: the in-process server's own
+  // project — the relay fires the out-of-band break under it when a
+  // `repl` interrupt omits projectDir (the tool documents projectDir
+  // as optional in single-project mode; phase-F review round 4).
+  const transport = new ReplRelayStdioTransport(
+    () => server.replBreakUrl(),
+    () => server.replDefaultProjectDir?.(),
+  );
   await server.connect(transport);
   // Install after connect because the SDK takes transport callback ownership during connect.
   installMcpServerLifecycle({ runner, server, transport });
