@@ -15,6 +15,7 @@ import {
   hasFoldedEvents,
   isUrgentStatus,
   MODEL_CONTEXT_MIN_INTERVAL_MS,
+  modelContextPushKey,
   modelContextSignature,
   nextPushDelayMs,
 } from "../ui/src/model-context.js";
@@ -211,6 +212,68 @@ test("no model-context push until the first events page has folded", () => {
   const advanced = createRunModel("run-hold");
   advanced.cursor = 4;
   assert.equal(hasFoldedEvents(advanced), true);
+});
+
+test("the first folded page reruns the push effect and releases the held snapshot (no milestone needed)", () => {
+  // Reproduce React's useEffect(deps) scheduling for useModelContextSync: run the effect on mount,
+  // then again only when its dependency key changes, and let it push a snapshot once a real page has
+  // folded. Driving the scheduler with the panel's ACTUAL trigger (modelContextPushKey) makes this a
+  // guard on the exact regression the reviewer rejected — keying on the milestone signature alone
+  // leaves the effect un-run when the first page carries only the name and an agent START, so the
+  // corrected initial snapshot waits a whole milestone before it goes out.
+  const model = createRunModel("run-fold");
+  model.status = "running";
+
+  // Minimal effect scheduler: pushes whenever the effect re-runs (dep key moved) AND the fold gate
+  // is open, mirroring the `!hasFoldedEvents(current)` early return inside the real effect.
+  const runEffect = (keyOf: (m: typeof model) => string) => {
+    const pushes: string[] = [];
+    let lastKey: string | undefined;
+    return {
+      pushes,
+      render() {
+        const key = keyOf(model);
+        if (key === lastKey) return; // deps unchanged: React does not re-run the effect
+        lastKey = key;
+        if (hasFoldedEvents(model)) {
+          pushes.push(buildModelContextSnapshot(model).workflowName ?? "workflow");
+        }
+      },
+    };
+  };
+
+  // Correct trigger vs. the rejected buggy one (milestone signature alone).
+  const fixed = runEffect(modelContextPushKey);
+  const buggy = runEffect(modelContextSignature);
+
+  // Render 1 — the empty seed the effect bumps a render for before any page lands. Held in both.
+  fixed.render();
+  buggy.render();
+  assert.deepEqual(fixed.pushes, []);
+  assert.deepEqual(buggy.pushes, []);
+
+  // Render 2 — first events page: name known, cursor advanced, one agent STARTED. NOT a milestone
+  // (nothing settled, no phase, not terminal), so the milestone signature does not move.
+  const seedSignature = modelContextSignature(model);
+  model.name = "review-changes";
+  model.cursor = 2;
+  fold(model, { type: "agentStart", callIndex: 0, label: "finder", scope: "run-fold" });
+  assert.equal(modelContextSignature(model), seedSignature, "first page is not a milestone");
+
+  fixed.render();
+  buggy.render();
+  // The fix: the corrected snapshot (real name, not the "workflow" fallback) is released now.
+  assert.deepEqual(fixed.pushes, ["review-changes"]);
+  // The regression: keyed on the signature alone the effect never re-runs, so nothing goes out yet.
+  assert.deepEqual(buggy.pushes, []);
+
+  // Render 3 — a genuine milestone (the agent settles) finally moves the signature; only NOW does
+  // the signature-keyed effect fire, i.e. the buggy build's first push lands a whole milestone late.
+  fold(model, { type: "agentEnd", callIndex: 0, tokens: 10 });
+  fixed.render();
+  buggy.render();
+  assert.deepEqual(fixed.pushes, ["review-changes", "review-changes"]);
+  assert.deepEqual(buggy.pushes, ["review-changes"]);
 });
 
 // The signature joins fields with NUL so no phase title or banner can forge a boundary.

@@ -28,7 +28,7 @@ import {
   formatModelContextText,
   hasFoldedEvents,
   isUrgentStatus,
-  modelContextSignature,
+  modelContextPushKey,
   nextPushDelayMs,
 } from "./model-context.js";
 import { nextErrorBackoffMs, nextIdleDelayMs, POLL_MS, shouldGiveUp } from "./poll-backoff.js";
@@ -261,14 +261,18 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
  * A host that rejects the request (feature unsupported) disables the channel for good.
  */
 function useModelContextSync(app: App | null, model: RunModel | null, tornDown: boolean): void {
-  const signature = model === null ? undefined : modelContextSignature(model);
+  // Key the effect on the push key, not the milestone signature alone: the folded bit is part of
+  // the trigger so React re-runs the effect the instant the first events page folds — otherwise a
+  // first page that only sets the name and starts an agent (no milestone) would not move the
+  // signature and the held-back initial snapshot would wait until the next milestone.
+  const pushKey = model === null ? undefined : modelContextPushKey(model);
   const modelRef = useRef<RunModel | null>(model);
   modelRef.current = model;
   const disabledRef = useRef(false);
   const lastPushRef = useRef(0);
 
   useEffect(() => {
-    if (!app || signature === undefined || disabledRef.current || tornDown) return;
+    if (!app || pushKey === undefined || disabledRef.current || tornDown) return;
     const current = modelRef.current;
     // Hold every push until at least one events page has folded. The effect seeds an empty model
     // and bumps a render before the first page lands; pushing that seed would leak the "workflow"
@@ -290,7 +294,7 @@ function useModelContextSync(app: App | null, model: RunModel | null, tornDown: 
         });
     }, wait);
     return () => clearTimeout(timer);
-  }, [app, signature, tornDown]);
+  }, [app, pushKey, tornDown]);
 }
 
 /**
