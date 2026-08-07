@@ -221,13 +221,18 @@ everything else.
 Snapshotting is implicit — there is no user-facing snapshot action (§Snapshots).
 
 **Output is addressed, not just truncated.** Per the harness's bridge design, every
-`console.log` is truncated in the tool result but frozen in full inside the VM as `$1`, `$2`, …
-(DevTools-style, via `structuredClone`), and the rendered line carries its address in the
+`console.log` is truncated in the tool result but captured inside the VM as `$1`, `$2`, …
+(DevTools-style, via `structuredClone` with an iterative marker-copy fallback), and the rendered
+line carries its address in the
 previewer's collapsed CDP syntax — property names unquoted, strings double-quoted, nested objects
 and arrays as brand tokens — e.g. `[$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}`
 — so the orchestrator slices deeper in a later eval (`console.log($14.sections.map(s => s.title))`)
 instead of re-running work.
-Nothing is lost by logging it; nothing floods the client's context by being logged. The
+Cloneable data is captured whole; what `structuredClone` can't take — functions, symbols,
+promises, weak collections, and hostile or otherwise unfreezable subgraphs — is stood in for by a
+typed marker (`{ __unclonable__: <kind>, description? }`), so `$N` preserves the value's *shape*
+rather than failing or dropping the surrounding structure. Nothing cloneable is lost by logging it;
+nothing floods the client's context by being logged. The
 truncation format is the Chrome DevTools Protocol's `ObjectPreview` model, adopted as a spec
 (the harness's normative record:
 [`FORMAT.md`](/home/vikash/agentprism-harness/agentprism-rust/crates/previewer/FORMAT.md)).
@@ -265,7 +270,10 @@ eval. Limits: **6 concurrent subagents per workspace**; the tool result's **text
 **256 physical lines or 10 KB, whichever trips first**, and its **`structuredContent`** at a
 **10 KB serialized-JSON** bound *only* (no line cap). Console output beyond the cap remains
 reachable through `$N` slicing; an elided structured array that captured a continuation ref is
-read back through the `refs` parameter — so *that* elision costs only a read. The guarantee is
+read back through the `refs` parameter. That read-back is itself subject to the same 10 KB
+structured cap, so a retrieved tail that is still oversized is re-elided under a *fresh*
+continuation ref — a large tail drains across chained reads, one ref per round, never in a single
+call, and never losing data. The guarantee is
 not universal: an array dropped with no ref store available records a bare count, and the string
 backstop head+tail-*shortens* an oversized string element in place (a bare `strings` count, never
 stored), so those elisions do lose data.
@@ -315,9 +323,13 @@ idle children close. A client that **reconnects mid-drain aborts it**, keeping t
 warm. On the next client connect, the workspace is live (or restores from snapshot) and
 `followUp` re-attaches the subagent session lazily via the capability matrix above.
 
-Consequences of the npm-shipped binary: snapshots are compatible across daemon restarts and
-across machines running the **same quickjs-wasi package version**; a version bump makes old
-snapshots refuse loudly (both hashes named) instead of corrupting. Snapshot portability with
+Consequences of the npm-shipped binary: the snapshot envelope records and compares only the
+**`quickjs.wasm` binary's SHA-256** plus the envelope **format version** — never the npm package
+version. Snapshots are therefore compatible across daemon restarts and across machines running a
+**byte-identical `quickjs.wasm`**; a package upgrade refuses old snapshots only when it changes
+that binary's hash (or the format version is bumped), and the refusal is loud (both hashes named)
+instead of corrupting. A version bump that ships the same binary keeps old snapshots restorable.
+Snapshot portability with
 the Rust harness is explicitly **not** a goal — different binary, different layout, and the
 envelope makes that a clean rejection rather than a surprise.
 

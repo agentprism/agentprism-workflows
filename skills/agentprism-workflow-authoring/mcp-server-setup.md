@@ -1,6 +1,6 @@
 ## Running workflows — the MCP `workflow` tool
 
-Agents run workflows through the single `workflow` tool served by `@automatalabs/mcp-server`. Register it once in the host's MCP configuration (project-scoped is typical):
+Agents run workflows through the `workflow` tool served by `@automatalabs/mcp-server` (the server also registers a separate `repl` tool for interactive REPL orchestration, out of scope here). Register it once in the host's MCP configuration (project-scoped is typical):
 
 ```json
 { "mcpServers": { "agentprism-workflows": { "command": "npx", "args": ["-y", "@automatalabs/mcp-server@latest"] } } }

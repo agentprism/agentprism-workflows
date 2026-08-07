@@ -75,20 +75,28 @@ layers remain independently usable — in particular, the ACP agent logic and wo
 work **with no MCP server at all** — while the facade and integration leaves stay thin.
 
 ```
- ┌──────────────────────────┐       ┌──────────────────────────┐
- │ mcp-server               │       │ agentprism-otel          │
- │ stdio tools:             │       │ observes manager events  │
- │  workflow + repl         │       └────────────┬─────────────┘
- └──────┬───────────┬───────┘                    │ structural attach
-        │ depends on │ depends on                 ▼
-        │            └────────────┐   (attaches to a WorkflowManager)
-        ▼                         ▼
- ┌─────────────────────────────┐  │
- │ workflows — public SDK      │◄─┤ repl-engine also depends on workflows
- │ facade + ACP event bridge   │  │
- └────────┬───────────────┬────┘  │
-          ▼               ▼       │
- ┌──────────────────┐  ┌──────────┴─────────────────┐
+ ┌──────────────────────────────┐          ┌──────────────────────────┐
+ │ mcp-server                   │          │ agentprism-otel          │
+ │ stdio tools: workflow + repl │          │ observes manager events  │
+ └──────────────┬───────────────┘          └────────────┬─────────────┘
+                │ registers `repl` over → depends on      │ structural attach
+                │ (also → workflows + shared-types,       ▼
+                │  annotated below)              (attaches to a WorkflowManager)
+                ▼
+ ┌──────────────────────────────┐
+ │ repl-engine                  │
+ │ persistent JS REPL in a      │
+ │ QuickJS-in-WASM VM + broker  │
+ └──────────────┬───────────────┘
+                │ depends on workflows
+                │ (and acp-agents + shared-types, annotated below)
+                ▼
+ ┌─────────────────────────────┐◄── mcp-server, repl-engine
+ │ workflows — public SDK      │
+ │ facade + ACP event bridge   │
+ └────────┬───────────────┬────┘
+          ▼               ▼
+ ┌──────────────────┐  ┌────────────────────────────┐
  │ workflow-engine  │  │ acp-agents                 │◄── repl-engine
  │ vm, journal,     │  │ pooled built-in ACP agents │
  │ budgets, resume  │  │ + custom ACP, auth, sessions│
@@ -183,8 +191,8 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **nine** published packages (eight released to
-> npm; `@automatalabs/repl-engine` is publishable but not yet released, at `0.0.0`) —
+> Packaging (as implemented): a pnpm monorepo of **nine** packages — **eight** published to
+> npm; `@automatalabs/repl-engine` is publishable but not yet released, at `0.0.0` —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
 > `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade),
 > `@automatalabs/agentprism-otel` (the optional telemetry bridge), `@automatalabs/pi-acp`

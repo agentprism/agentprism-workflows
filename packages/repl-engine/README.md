@@ -27,10 +27,13 @@ The runtime shim is [`quickjs-wasi`](https://github.com/vercel-labs/quickjs-wasi
 including the npm package's shipped `quickjs.wasm` binary** — the roadmap doc's mapping table
 is followed verbatim, and we never build our own binary. `loadShippedWasm()` resolves the
 binary through the package export map and compiles it once per process into a reusable
-`WebAssembly.Module`. The engine pins `quickjs-wasi` at an exact version because snapshot
-compatibility (phase D's envelope + restore) holds only across runs on the same package
-version; a version bump refuses old snapshots loudly (both hashes named), never restores
-them silently.
+`WebAssembly.Module`. The engine pins `quickjs-wasi` at an exact version to keep the shipped
+`quickjs.wasm` byte-identical across installs — but snapshot compatibility (phase D's envelope +
+restore) is enforced on the binary itself, **not** the package version: the envelope records and
+compares the `quickjs.wasm` **SHA-256** plus the envelope **format version**. An upgrade that
+changes that binary's hash — or a format-version bump — refuses old snapshots loudly (both hashes
+named), never restoring them silently; a package bump that ships the same binary keeps old
+snapshots restorable.
 
 - **`memoryLimit` per VM** — passed straight through to `QuickJSOptions.memoryLimit`
   (quickjs-wasi built-in). Exceeding it fails allocations with
@@ -285,12 +288,17 @@ now: state, `$N` store, registry and marker survive a snapshot/restore round tri
 
 ### The console bridge and the previewer
 
-Every `console.log` is truncated in the tool result but **frozen in full inside the VM** as
+Every `console.log` is truncated in the tool result but **captured inside the VM** as
 `$1`, `$2`, … (what-you-saw-is-what-you-have: mutation after the log never changes `$N`), and
 the rendered line carries the address, type and size — `[$14 · object · 48kB] {sections:
 Array(12), title: "Auth flow", …}` — so the orchestrator slices deeper in a later eval
-(`console.log($14.sections.map(s => s.title))`) instead of re-running work. Nothing is lost by
-logging it; nothing floods the client's context by being logged.
+(`console.log($14.sections.map(s => s.title))`) instead of re-running work. The capture is a
+`structuredClone` with an iterative marker-copy fallback: cloneable data (objects, arrays,
+`Map`/`Set`/`Date`/`RegExp`/`Error`/`ArrayBuffer`/typed arrays) is preserved whole, while
+functions, symbols, promises, weak collections, and hostile or otherwise unfreezable subgraphs are
+stood in for by a typed marker (`{ __unclonable__: <kind>, description? }`) — so `$N` keeps the
+value's *shape* rather than failing or losing the surrounding structure. Nothing cloneable is lost
+by logging it; nothing floods the client's context by being logged.
 
 The truncation format is the Chrome DevTools Protocol's `ObjectPreview` model, adopted as a
 spec; the harness's `previewer/FORMAT.md` is the normative reference and this package imitates
@@ -900,13 +908,19 @@ status as structured workspaces (state, the reconcile summary, the
 workspace manifest with name/token/size/provenance/task per binding, the
 live agents, the pending ops), interrupt as its honest outcome, and reset
 as the dropped acknowledgement. The error variant replaces the
-eval/wait/interrupt result and is flagged `isError` — a **refused snapshot**
-on `eval`/`wait`/`interrupt`, or a **missing project context** on any action.
+result and is flagged `isError` — a **refused snapshot**
+on `eval`/`wait`/`interrupt`, or a **missing project context** on the four
+stateful actions `eval`/`wait`/`interrupt`/`reset`.
 A **named `status`** instead reports a refused snapshot through its normal
 status variant (`state: "refused"` with a `restoreError`), not the error
-variant. `reset` never refuses a *snapshot* — it clears the store — but it
+variant, and `status` never takes the missing-context path at all: a
+project-less `status` lists every known workspace (an empty array when none
+exist) and a named `status` *creates* the context, so it can never find one
+missing. `reset` never refuses a *snapshot* — it clears the store — but it
 still returns the error variant when there is **no project context** to reset
-(single-project mode with no adopted default).
+(single-project mode with no adopted default). The published schema's error
+branch enumerates all five actions, but no runtime path emits it with
+`action: "status"`.
 Guest output (the capped console lines, the previewed result) stays in
 separate fields from the trusted orchestration metadata — never one
 flat string — and every structured field is bounded metadata (output
@@ -918,7 +932,10 @@ cap): the largest arrays are elided head-first, and each drop is recorded
 in a `truncated` record (field path → elided count, or `{ elided, ref }`
 when a continuation ref was captured; the reserved `strings` key is a
 plain count). A captured ref reads the dropped tail back through a later
-call's `refs` parameter (returned under `referenced`); refs are
+call's `refs` parameter (returned under `referenced`) — and that read-back
+re-enters the same 10 000-byte cap, so a still-oversized tail is re-elided
+under a *fresh* ref and a large tail drains across chained reads rather than
+one call. Refs are
 workspace-namespaced, held in memory, cleared by `reset`, and lost on a
 daemon restart. The bounded text stays alongside for human reading.
 

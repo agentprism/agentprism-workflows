@@ -16,13 +16,14 @@ This package is a **thin MCP adapter**. The `workflow` tool's real work — pars
    MCP host (Claude Code / Zed / Cursor / …)
         │   tools/call  →  "workflow" | "repl"   (JSON-RPC over stdio)
         ▼
-┌────────────────────────────────────────────────────┐
-│  agentprism-workflow  (this package)               │
-│   • registers the "workflow" and "repl" tools       │
-│   • createAcpRunner()  →  injected into both        │
-│   • workflow → per-project WorkflowManager          │
-│   • repl → per-project QuickJS-in-WASM VM + broker   │
-└────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  agentprism-workflow  (this package)                 │
+│   • registers the "workflow" and "repl" tools        │
+│   • createAcpRunner()  →  the workflow engine        │
+│   • workflow → per-project WorkflowManager           │
+│   • repl → per-project QuickJS VM + broker;          │
+│            each workspace owns its own AcpAgentRunner │
+└──────────────────────────────────────────────────────┘
         │   session/new, session/prompt … (ACP over stdio)
         ▼
    claude-agent-acp / codex-acp / opencode acp / pi-acp
@@ -638,7 +639,7 @@ The tool is an **action union**. The MCP SDK validates the primitive fields, the
 
 The examples below run against one workspace, `/work/acme`, in sequence — the state each call leaves is what the next one sees.
 
-**`eval`** runs `code` in the workspace VM, drains microtasks/jobs, settles what it can, and returns. `result` is the previewed completion value **when the eval resolves to a value** — including the literal string `"undefined"` when that value is the guest `undefined` (a `const`/`let`/`class` declaration or a bare `console.log(...)` statement resolves with `undefined`, so those evals carry `result: "undefined"`, not a missing field). `result` is **absent whenever the eval does not resolve to a value**: when it **suspends** — on a subagent call, a `checkpoint()`, or any other unsettled promise — it returns *immediately with no fabricated value* and `pending` lists the call ids (the continuation resumes at settlement, exactly like a `.then`); and when it **throws, rejects, hits a syntax error, or is interrupted**, the error renders as an `error:`-level line in `output` and there is no completion value. The first `eval` in an untouched workspace creates (or restores) the VM.
+**`eval`** runs `code` in the workspace VM, drains microtasks/jobs, settles what it can, and returns. `result` is the previewed completion value **when the eval resolves to a value** — including the literal string `"undefined"` when that value is the guest `undefined` (a `const`/`let`/`class` declaration or a bare `console.log(...)` statement resolves with `undefined`, so those evals carry `result: "undefined"`, not a missing field). `result` is **absent whenever the eval does not resolve to a value**: when it **suspends** — on a subagent call, a `checkpoint()`, or any other unsettled promise — it returns *immediately with no fabricated value* and `pending` lists the call ids (the continuation resumes at settlement, exactly like a `.then`); and when it **throws, rejects, hits a syntax error, or is interrupted**, the error renders in `output` as a plain `Name: message` line — the error's own `name` and `message`, e.g. `TypeError: x is not a function`, **not** an `error:`-prefixed line — and there is no completion value. (The `error:` prefix is reserved for a *late uncaught* rejection of an already-suspended continuation, which the VM's rejection bridge routes through `console.error`.) The first `eval` in an untouched workspace creates (or restores) the VM.
 
 ```json
 { "action": "eval", "projectDir": "/work/acme",
@@ -663,7 +664,7 @@ The eval **resolved** — a `const` declaration resolves with the guest value `u
 
 `c1` settled during the wait, so its id is in `completed`; nothing awaited it yet, so there is no console output. A later `eval` that reads it — `console.log({ chars: (await research).length })` — resolves immediately and prints `$1`, with `completed: []` (c1 already settled).
 
-**`status`** is `ls` for the data plane. Per workspace it reports `state` (`not-opened` / `fresh` / `restored` / `refused`), the restore `reconcile` summary (restored only), the **workspace manifest** (`bindings` — top-level names with a structure-only `token`, `type`, `sizeBytes`, `provenance`/`task`/`provenanceAtMs`, and, for agent handles, `handleCallId` + `handleStatus`), the `$N` `logs` range, the `evalSeq` counter, `inFlight` calls, `checkpoints`, `liveAgents`, `pending` ops, `childrenClosed`, and any retained `drainError`. It is metadata, never content. **A named `status` is a first touch** — it creates or restores the workspace exactly like the stateful actions, so its manifest, reconcile summary, and any refusal surface. Only the **project-less** `status` (omit `projectDir`) is non-materializing: it lists every already-known workspace without opening one.
+**`status`** is `ls` for the data plane. Per workspace it reports `state` (`not-opened` / `fresh` / `restored` / `refused`), the restore `reconcile` summary (restored only), the **workspace manifest** (`bindings` — top-level names with a structure-only `token`, `type`, `sizeBytes`, `provenance`/`task`/`provenanceAtMs`, and, for agent handles, `handleCallId` + `handleStatus`), the `$N` `logs` range, the `evalSeq` counter, `inFlight` calls, `checkpoints`, `liveAgents`, `pending` ops, `childrenClosed`, and any retained `drainError`. It is metadata, never content. **A named `status` is a first touch** — it creates or restores the workspace exactly like the stateful actions, so its manifest, reconcile summary, and any restore refusal are all surfaced on that first call. Only the **project-less** `status` (omit `projectDir`) is non-materializing: it lists every already-known workspace (an empty array when none have been opened) without opening one.
 
 ```json
 { "action": "status", "projectDir": "/work/acme" }
@@ -719,7 +720,7 @@ The eval **resolved** — a `const` declaration resolves with the guest value `u
 { "action": "reset", "projectDir": "/work/acme", "dropped": true }
 ```
 
-A refused snapshot (see [Durability](#the-workspace-project-model-and-durability)) or a missing project context returns the **error variant** — `{ action, projectDir?, error }` flagged `isError: true`, where `action` is whichever of the five actions touched the refused/absent workspace. A **refused snapshot** returns the error variant on `eval`/`wait`/`interrupt`; a **named `status`** instead reports the same refusal *through its normal status variant* — `state: "refused"` with a `restoreError` message, **not** the `isError` error variant — and `reset` clears the store rather than surfacing a snapshot refusal at all. A **missing project context** (single-project mode with no adopted default) returns the error variant for *any* action, `reset` included, so the published schema's error branch permits all five `action` values.
+A refused snapshot (see [Durability](#the-workspace-project-model-and-durability)) or a missing project context returns the **error variant** — `{ action, projectDir?, error }` flagged `isError: true`, where `action` is whichever action touched the refused/absent workspace. A **refused snapshot** returns the error variant on `eval`/`wait`/`interrupt`; a **named `status`** instead reports the same refusal *through its normal status variant* — `state: "refused"` with a `restoreError` message, **not** the `isError` error variant — and `reset` clears the store rather than surfacing a snapshot refusal at all. A **missing project context** (single-project mode with no adopted default) returns the error variant on the four **stateful** actions — `eval`, `wait`, `interrupt`, and `reset`. `status` never takes the error path: a project-less `status` lists every known workspace (an empty array when none have been opened) and a named `status` *creates* the context, so it can never find one missing. The published schema's error branch still enumerates all five `action` values for completeness, but no runtime path emits it with `action: "status"`.
 
 ### Output
 
@@ -820,7 +821,8 @@ interface ReplInterruptResult {
 
 interface ReplResetResult { action: "reset"; projectDir: string; dropped: true; }
 
-interface ReplErrorResult {     // isError: true — a refused snapshot (eval/wait/interrupt; a named status reports refusal via its status variant instead) or a missing project context (any action, reset included)
+interface ReplErrorResult {     // isError: true — a refused snapshot (eval/wait/interrupt; a named status reports refusal via its status variant instead) or a missing project context (the stateful actions eval/wait/interrupt/reset; status never takes this path)
+  // The enum lists "status" for schema completeness only — no runtime path emits an error variant for it.
   action: "eval" | "wait" | "status" | "interrupt" | "reset";
   projectDir?: string;
   error: string;
@@ -861,18 +863,18 @@ An answered id leaves the `checkpoints` list — that is its visibility; checkpo
 
 ### Output addressing and the caps
 
-Every `console.log` value is **frozen in full inside the VM** as `$1`, `$2`, … (via `structuredClone`), and the rendered line carries its address in the previewer's collapsed CDP syntax — property names unquoted, strings double-quoted, nested objects as brand tokens:
+Every `console.log` value is **captured inside the VM** as `$1`, `$2`, … via `structuredClone` (a stable snapshot — mutating the value after the log never changes `$N`), and the rendered line carries its address in the previewer's collapsed CDP syntax — property names unquoted, strings double-quoted, nested objects as brand tokens:
 
 ```text
 [$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}
 ```
 
-So the orchestrator slices deeper in a later eval — `console.log($14.sections.map(s => s.title))` — instead of re-running work. Nothing logged is lost, and nothing floods the client's context by being logged.
+So the orchestrator slices deeper in a later eval — `console.log($14.sections.map(s => s.title))` — instead of re-running work. Cloneable data — plain objects, arrays, `Map`/`Set`/`Date`/`RegExp`/`Error`/`ArrayBuffer`/typed arrays — is preserved whole. What `structuredClone` cannot take is *not* dropped from the graph: an iterative marker-copy fallback substitutes a typed marker (`{ __unclonable__: "function" | "symbol" | "promise" | "weakmap" | "weakset" | "weakref" | "unfreezable", description? }`) for functions, symbols, promises, weak collections, and hostile or otherwise unfreezable subgraphs — so `$N` preserves the value's *shape* with those specific pieces stood in for by markers, rather than either failing or silently losing the surrounding structure. Nothing cloneable is lost by logging, and nothing floods the client's context by being logged.
 
 The two surfaces are capped **independently**:
 
 - **The text block** is capped at **256 physical lines or 10,000 UTF-8 bytes, whichever trips first** (line-granular — a line that would trip either limit is dropped whole and a truncation marker ships instead; embedded newlines count toward the line cap). Console values beyond the cap stay reachable through their `$N` refs.
-- **`structuredContent`** is capped only by a **10,000-byte serialized-JSON** bound (no line cap). When it trips, the largest arrays are elided head-first and each drop is recorded in the `truncated` record. An elided array carries a **continuation ref** (`{ elided, ref }`) *when the workspace captured one* — pass those ref ids back through the `refs` parameter of a later `eval`/`wait`/`status` call and the dropped entries return verbatim under `referenced`, so **that** elision costs only a read. The guarantee is **not universal**, though: an array dropped when no ref store is available (a project-less `status` before any workspace has materialized) keeps a bare count, and the `strings` backstop head+tail-*shortens* an oversized string element in place — recorded as a bare `strings` count, never stored — so those two elisions do lose data.
+- **`structuredContent`** is capped only by a **10,000-byte serialized-JSON** bound (no line cap). When it trips, the largest arrays are elided head-first and each drop is recorded in the `truncated` record. An elided array carries a **continuation ref** (`{ elided, ref }`) *when the workspace captured one* — pass those ref ids back through the `refs` parameter of a later `eval`/`wait`/`status` call and the dropped entries return under `referenced`. That read-back is **itself subject to the same 10,000-byte cap**: `referenced` re-enters the structured cap, so a retrieved tail that is still over the bound is re-elided and a **fresh** continuation ref is issued for its remainder. A large tail therefore drains across **chained reads** — one ref read per round — rather than in a single call; each read costs only a read and loses no data. The guarantee is **not universal**, though: an array dropped when no ref store is available (a project-less `status` before any workspace has materialized) keeps a bare count, and the `strings` backstop head+tail-*shortens* an oversized string element in place — recorded as a bare `strings` count, never stored — so those two elisions do lose data.
 
 Continuation refs are **workspace-namespaced** (`<project-key>:t<seq>`) and held **in memory** per workspace: a ref from one project can never resolve in another, `reset` clears them, and a daemon restart loses them (the caller re-reads current state and gets fresh refs).
 
