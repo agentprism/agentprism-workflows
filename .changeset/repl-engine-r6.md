@@ -1,9 +1,0 @@
----
-"@automatalabs/repl-engine": minor
----
-
-REPL orchestrator phase D, review round 6: the drain's outer bound is absolute for the guest drain too, the bound's forced stop never orphans a pending call, and a client reconnecting mid-drain aborts the drain.
-
-- **The disconnect bound now bounds the GUEST drains the drain's pumps trigger** (review: a ready settlement resumed the guest continuation through `drainJobs` under the per-eval deadline alone — a runaway continuation near the disconnect deadline could exceed the session-eviction TTL). `pumpUnlocked`/`drain` take an optional remaining-bound deadline and compose it into the quickjs interrupt handler; both of `drainForDisconnect`'s pumps race it, and an interrupted continuation surfaces as a warn-level line in the next tool result.
-- **The bound's forced stop never orphans a pending call** (review: a re-attached call whose seam rejected mid-drain resolved `hold`, then the release phase discarded its session — the call stayed pending forever, uncancelable except by reset, because reconcile never runs again on a live workspace). After the bound expires, every call still pending on an attached session is settled with the recoverable `AGENT_CANCELLED` (recorded FIRST, settled into the guest, one bounded drain + settlement boundary) — the same forced-stop vocabulary as a stopped open; a still-observing task's later outcome is a first-wins no-op against the recorded completion.
-- **A client reconnecting mid-drain ABORTS the drain** (review: the drain ran to its release phase and closed every child regardless of presence — children must remain warm while any client is connected). `drainForDisconnect(boundMs, shouldAbort?)` consults the abort probe every iteration and before every destructive phase; an abort leaves every child attached and running, keeps the drain latch clear, and returns `false` so the next disconnect drains again.
