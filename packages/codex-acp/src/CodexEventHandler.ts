@@ -33,7 +33,7 @@ import type {
     WarningNotification
 } from "./app-server/v2";
 import {pushLoadedTurnEnded} from "./AcpExtensions";
-import type { McpStartupCompleteEvent } from "./app-server";
+import type { McpStartupCompleteEvent } from "./app-server/McpStartupCompleteEvent";
 import {toTokenCount} from "./TokenCount";
 import {
     commandExecutionUsesTerminalOutput,

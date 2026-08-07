@@ -20,6 +20,7 @@ import type {
     Model,
     ReasoningEffortOption,
     Thread,
+    ThreadGoal,
     ThreadItem,
     Turn,
     TurnCompletedNotification,
@@ -46,7 +47,7 @@ import {
 } from "./ModelConfigOption";
 import type {TokenCount} from "./TokenCount";
 import {toPromptUsage} from "./TokenCount";
-import {CodexCommands} from "./CodexCommands";
+import {CodexCommands, GOAL_CONTINUATION_PROMPT} from "./CodexCommands";
 import {SteeringQueue} from "./SteeringQueue";
 import type {QuotaMeta} from "./QuotaMeta";
 import {logger} from "./Logger";
@@ -257,6 +258,7 @@ export class CodexAcpServer {
      *  a separate `session/update` notification, and a concurrent send
      *  could scramble the accumulated text). */
     private readonly loadedTurnUpdateChains = new Map<string, Promise<void>>();
+    private readonly goalControlGenerations: Map<string, number>;
 
     constructor(
         connection: AcpClientConnection,
@@ -273,6 +275,7 @@ export class CodexAcpServer {
         this.closingSessions = new Map();
         this.sessionGenerations = new Map();
         this.sessionOpenGenerations = new Map();
+        this.goalControlGenerations = new Map();
         this.connection = connection;
         this.codexAcpClient = codexAcpClient;
         this.defaultAuthRequest = defaultAuthRequest ?? null;
@@ -374,11 +377,50 @@ export class CodexAcpServer {
                     throw RequestError.invalidParams(undefined, `Unknown session: ${methodRequest.params.sessionId}`);
                 }
                 const sessionGeneration = this.getSessionGeneration(sessionState.sessionId);
-                if (methodRequest.params.action === "pause" || methodRequest.params.action === "resume") {
-                    const status = methodRequest.params.action === "pause" ? "paused" : "active";
-                    const goal = await this.runWithProcessCheck(() => this.codexAcpClient.setGoalStatus(sessionState.sessionId, status));
+                const goalControlGeneration = this.bumpGoalControlGeneration(sessionState.sessionId);
+                if (methodRequest.params.action === "set") {
+                    const objective = methodRequest.params.objective;
+                    let updatedGoal: ThreadGoal | null = null;
+                    const turnCompleted = await this.runWithProcessCheck(() => this.codexAcpClient.setGoal(
+                        sessionState.sessionId,
+                        objective,
+                        undefined,
+                        (goal) => {
+                            updatedGoal = goal;
+                        },
+                    ));
+                    if (turnCompleted === null && updatedGoal !== null) {
+                        await this.startGoalContinuationIfCurrent(
+                            sessionState,
+                            sessionGeneration,
+                            goalControlGeneration,
+                            updatedGoal,
+                        );
+                    }
+                } else if (methodRequest.params.action === "pause") {
+                    const goal = await this.runWithProcessCheck(() => this.codexAcpClient.setGoalStatus(sessionState.sessionId, "paused"));
                     if (this.goalPublishIsCurrent(sessionState, sessionGeneration)) {
                         await this.publishGoalSnapshot(sessionState, toThreadGoalSnapshot(goal), false);
+                    }
+                } else if (methodRequest.params.action === "resume") {
+                    let updatedGoal: ThreadGoal | null = null;
+                    const turnCompleted = await this.runWithProcessCheck(() => this.codexAcpClient.resumeGoal(
+                        sessionState.sessionId,
+                        undefined,
+                        (goal) => {
+                            updatedGoal = goal;
+                        },
+                    ));
+                    if (updatedGoal !== null && this.goalPublishIsCurrent(sessionState, sessionGeneration)) {
+                        await this.publishGoalSnapshot(sessionState, toThreadGoalSnapshot(updatedGoal), false);
+                    }
+                    if (turnCompleted === null && updatedGoal !== null) {
+                        await this.startGoalContinuationIfCurrent(
+                            sessionState,
+                            sessionGeneration,
+                            goalControlGeneration,
+                            updatedGoal,
+                        );
                     }
                 } else if (methodRequest.params.action === "clear") {
                     await this.runWithProcessCheck(() => this.codexAcpClient.clearGoal(sessionState.sessionId));
@@ -485,6 +527,12 @@ export class CodexAcpServer {
 
     private getSessionGeneration(sessionId: string): number {
         return this.sessionGenerations.get(sessionId) ?? 0;
+    }
+
+    private bumpGoalControlGeneration(sessionId: string): number {
+        const generation = (this.goalControlGenerations.get(sessionId) ?? 0) + 1;
+        this.goalControlGenerations.set(sessionId, generation);
+        return generation;
     }
 
     private bumpSessionGeneration(sessionId: string): number {
@@ -724,6 +772,7 @@ export class CodexAcpServer {
                 this.steeringQueues.delete(params.sessionId);
                 this.pendingLoadNotifications.delete(params.sessionId);
                 this.loadedTurnUpdateChains.delete(params.sessionId);
+                this.goalControlGenerations.delete(params.sessionId);
             }
             this.endSessionCloseFence(params.sessionId);
         }
@@ -1145,25 +1194,58 @@ export class CodexAcpServer {
      *     fails or is cancelled before the turn starts.
      */
     private async startNewTurnFromSteering(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
-        // A prompt can outlive its turn (post-turn cleanup runs before it leaves
-        // activePrompts), so a steer can miss the turn while the prompt is still
-        // winding down. Starting a new turn now would run a second prompt on the
-        // same session, so wait for the current one to drain first (a no-op when idle).
+        await this.startNewTurnFromExternalPrompt(params, "Steering");
+        return {outcome: "startedNewTurn"};
+    }
+
+    private async startGoalContinuationIfCurrent(
+        sessionState: SessionState,
+        sessionGeneration: number,
+        goalControlGeneration: number,
+        expectedGoal: ThreadGoal,
+    ): Promise<void> {
+        await this.startNewTurnFromExternalPrompt({
+            sessionId: sessionState.sessionId,
+            prompt: GOAL_CONTINUATION_PROMPT,
+        }, "Goal continuation", async () => {
+            if (!this.goalPublishIsCurrent(sessionState, sessionGeneration)
+                || this.goalControlGenerations.get(sessionState.sessionId) !== goalControlGeneration) {
+                return false;
+            }
+            const currentGoal = await this.runWithProcessCheck(() => this.codexAcpClient.getGoal(sessionState.sessionId));
+            return currentGoal?.status === "active"
+                && currentGoal.objective === expectedGoal.objective
+                && currentGoal.createdAt === expectedGoal.createdAt
+                && this.goalControlGenerations.get(sessionState.sessionId) === goalControlGeneration;
+        });
+    }
+
+    private async startNewTurnFromExternalPrompt(
+        params: acp.PromptRequest,
+        source: string,
+        canStart: () => Promise<boolean> = async () => true,
+    ): Promise<boolean> {
+        // A prompt can outlive its turn while post-turn cleanup runs. Starting a
+        // control-triggered turn during that window would run two prompts on the
+        // same session, so wait for the current prompt to drain first.
         const previousPrompt = this.activePrompts.get(params.sessionId);
         await previousPrompt?.completion;
         if (this.sessionIsClosing(params.sessionId)) {
             throw RequestError.invalidRequest(`Session ${params.sessionId} is closing`);
         }
+        if (!await canStart()) {
+            return false;
+        }
 
-        return await new Promise<SessionSteeringResponse>((resolve, reject) => {
+        return await new Promise<boolean>((resolve, reject) => {
             let turnStarted = false;
             const promptDone = this.prompt(params, undefined, () => {
                 turnStarted = true;
-                logger.log("Steering session started a new turn", {sessionId: params.sessionId});
+                logger.log(`${source} started a new turn`, {sessionId: params.sessionId});
                 // The new turn is now running. This is the success path: answer the
                 // steer immediately ("a turn was started") and let prompt() finish the
                 // turn in the background.
-                resolve({outcome: "startedNewTurn"});
+                resolve(true);
             });
             promptDone.then(
                 (response) => {
@@ -1176,7 +1258,7 @@ export class CodexAcpServer {
                         // resolve in the callback above), or the prompt finished
                         // without ever starting a turn and was not cancelled (e.g. a
                         // command-only turn). Both count as a successfully accepted steer.
-                        resolve({outcome: "startedNewTurn"});
+                        resolve(turnStarted);
                     }
                 },
                 (error: unknown) => {
@@ -1184,7 +1266,7 @@ export class CodexAcpServer {
                         // The turn had already started, so the steer was already
                         // answered "startedNewTurn". This is a failure of a turn running
                         // in the background — nothing to return, just log it.
-                        logger.error(`Steering-started prompt for session ${params.sessionId} failed`, error);
+                        logger.error(`${source} prompt for session ${params.sessionId} failed`, error);
                     } else {
                         // The prompt failed before the turn started. The steer never
                         // took, so surface the failure to the caller.
@@ -2342,6 +2424,10 @@ export class CodexAcpServer {
                 };
             }
 
+            const effectiveParams = commandResult.prompt === undefined
+                ? params
+                : {...params, prompt: commandResult.prompt};
+
             if (this.sessionIsClosing(params.sessionId)) {
                 return this.cancelledPromptResponse(sessionState);
             }
@@ -2358,7 +2444,7 @@ export class CodexAcpServer {
                 });
             }
 
-            if (!sessionState.supportedInputModalities.includes("image") && params.prompt.some(b => b.type === "image")) {
+            if (!sessionState.supportedInputModalities.includes("image") && effectiveParams.prompt.some(b => b.type === "image")) {
                 throw RequestError.invalidRequest("The current model does not support image input");
             }
             const agentMode = sessionState.agentMode;
@@ -2369,7 +2455,7 @@ export class CodexAcpServer {
             ensurePendingTurnStart();
             const sendPromptPromise = this.runWithProcessCheck(
                 () => this.codexAcpClient.sendPrompt(
-                    params,
+                    effectiveParams,
                     agentMode,
                     modelId,
                     serviceTier,
