@@ -23,7 +23,7 @@ import { createWorkflowServer, SERVER_VERSION } from "../server.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
 import { ReplPresenceLedger } from "../repl-presence.js";
 import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, SESSION_IDLE_TTL_MS } from "./constants.js";
-import { envFingerprint } from "./daemon-info.js";
+import { envFingerprint, isSupersededBy } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
 import { validateRequest } from "./middleware.js";
 import { SessionRegistry } from "./session-registry.js";
@@ -57,6 +57,24 @@ export interface CreateDaemonOptions {
    *  in-process mode's relay transport fires it, see
    *  `repl-stdio-transport.ts`). */
   evalBreakChannel?: EvalBreakChannel;
+  /**
+   * This daemon's identity for discovery/succession accounting. Defaults to `process.pid`;
+   * injected in tests. It is the pid reported by /healthz and compared against `daemon.json`
+   * to decide lame-duck (superseded) status.
+   */
+  ownPid?: number;
+  /**
+   * The version string reported by /healthz. Defaults to `SERVER_VERSION`; injected in tests
+   * to simulate a divergent (older/newer) daemon that a current-version shim must supersede.
+   */
+  version?: string;
+  /**
+   * Whether this daemon has been superseded (a newer daemon owns discovery). A lame-duck
+   * daemon admits no new MCP sessions. Defaults to the stateless `daemon.json` pid check
+   * (`isSupersededBy(ownPid)`), re-evaluated on every admission so discovery pointing back at
+   * this daemon transparently restores normal service. Injected in tests.
+   */
+  isSuperseded?: () => boolean;
 }
 
 export interface DaemonHandle {
@@ -94,6 +112,11 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   const env = options.env ?? process.env;
   const log = options.log ?? ((line: string) => console.error(line));
   const startedAt = new Date().toISOString();
+  const ownPid = options.ownPid ?? process.pid;
+  const version = options.version ?? SERVER_VERSION;
+  // A lame duck (a newer daemon owns discovery) admits no new sessions. Re-evaluated per
+  // request so that if discovery is ever repointed back at this daemon it resumes service.
+  const isSuperseded = options.isSuperseded ?? (() => isSupersededBy(ownPid));
 
   const sessions = new SessionRegistry();
   // ONE registry shared by every session: run calls select their project via the required
@@ -135,7 +158,20 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     }
 
     // No session header: this must be an initialize request (the SDK transport 400s
-    // anything else). Sessions are project-agnostic — every run call names its project.
+    // anything else). A superseded daemon is a lame duck — a newer daemon owns discovery, so
+    // this one finishes its existing sessions and runs but admits NO new sessions. Every new
+    // client therefore lands on the current daemon, and this daemon can drain and exit. (The
+    // check is stateless: if discovery is repointed back at us we admit again.)
+    if (isSuperseded()) {
+      writeJsonRpcError(
+        res,
+        503,
+        `${DAEMON_NAME} (pid ${ownPid}) has been superseded by a newer daemon and is draining; reconnect to reach the current daemon`,
+      );
+      return;
+    }
+
+    // Sessions are project-agnostic — every run call names its project.
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       eventStore: new BoundedEventStore(),
@@ -195,14 +231,15 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
         res.end(
           JSON.stringify({
             name: DAEMON_NAME,
-            version: SERVER_VERSION,
-            pid: process.pid,
+            version,
+            pid: ownPid,
             port: boundPort,
             startedAt,
             sessions: sessions.size,
             activeRuns: projects.activeRunCount(),
             envFingerprint: envFingerprint(env),
             projects: projects.snapshot(),
+            lameDuck: isSuperseded(),
           }),
         );
         return;

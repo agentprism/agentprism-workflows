@@ -24,6 +24,14 @@ import { createEvalBreakChannel } from "@automatalabs/repl-engine";
 
 export interface RunDaemonOptions {
   port?: number;
+  /**
+   * Replace a divergent daemon that still holds discovery. The predecessor is deliberately
+   * left running to drain its in-flight sessions and runs, so a successor never fights for
+   * the port — it binds an ephemeral one and repoints `daemon.json` at itself, demoting the
+   * predecessor to a lame duck (whose pid no longer matches `daemon.json`). Set by the shim
+   * (`--supersede`) when its version/env fingerprint diverges from the live daemon.
+   */
+  supersede?: boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -47,8 +55,8 @@ async function ownDaemonAlreadyRunning(): Promise<boolean> {
 
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<"started" | "already-running"> {
   const log = (line: string) => console.error(line);
-  const port = resolveDaemonPort(options.port);
   const runner = createAcpRunner();
+  const supersede = options.supersede ?? false;
 
   let daemon;
   const sessionTtlMs = envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS);
@@ -58,20 +66,33 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
   // tool's no-id break. Its address travels in daemon.json so the shim
   // can fire it out of band.
   const evalBreakChannel = createEvalBreakChannel();
-  try {
-    daemon = await createDaemon({ runner, port, log, sessionTtlMs, evalBreakChannel });
-  } catch (error) {
-    if (!(error instanceof DaemonPortInUseError)) throw error;
-    if (await ownDaemonAlreadyRunning()) {
-      log(`[${DAEMON_NAME}] already running (port ${port}); nothing to do`);
-      return "already-running";
-    }
-    // A foreign process owns the default port. Discovery goes through daemon.json, never a
-    // blind dial of the default port, so an ephemeral port is fully functional.
-    log(`[${DAEMON_NAME}] port ${port} is taken by another process; falling back to an ephemeral port`);
+  if (supersede) {
+    // Succession: the divergent predecessor may still hold the default port and is left
+    // running to drain, so never contend for it — bind an ephemeral port. daemon.json
+    // (repointed below) is the sole discovery channel, so an ephemeral port is fully
+    // functional; the predecessor becomes a lame duck the moment we repoint.
+    log(`[${DAEMON_NAME}] starting as a successor to a superseded daemon (ephemeral port)`);
     daemon = await createDaemon({ runner, port: 0, log, sessionTtlMs, evalBreakChannel });
+  } else {
+    const port = resolveDaemonPort(options.port);
+    try {
+      daemon = await createDaemon({ runner, port, log, sessionTtlMs, evalBreakChannel });
+    } catch (error) {
+      if (!(error instanceof DaemonPortInUseError)) throw error;
+      if (await ownDaemonAlreadyRunning()) {
+        log(`[${DAEMON_NAME}] already running (port ${port}); nothing to do`);
+        return "already-running";
+      }
+      // A foreign process owns the default port. Discovery goes through daemon.json, never a
+      // blind dial of the default port, so an ephemeral port is fully functional.
+      log(`[${DAEMON_NAME}] port ${port} is taken by another process; falling back to an ephemeral port`);
+      daemon = await createDaemon({ runner, port: 0, log, sessionTtlMs, evalBreakChannel });
+    }
   }
 
+  // Atomically (tmp+rename) repoint daemon.json at THIS process. For a succession this is the
+  // step that demotes the predecessor to a lame duck (its pid no longer matches daemon.json);
+  // the pid-guarded clearDaemonInfo means the predecessor's own shutdown never clobbers it.
   writeDaemonInfo({
     name: DAEMON_NAME,
     version: SERVER_VERSION,
@@ -95,6 +116,9 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     log,
   });
 
-  log(`[${DAEMON_NAME}] v${SERVER_VERSION} listening on ${daemon.url} (pid ${process.pid})`);
+  log(
+    `[${DAEMON_NAME}] v${SERVER_VERSION} listening on ${daemon.url} (pid ${process.pid})` +
+      (supersede ? " — superseding a previous daemon; discovery repointed here" : ""),
+  );
   return "started";
 }

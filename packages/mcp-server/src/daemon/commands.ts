@@ -87,6 +87,9 @@ export async function runDaemonCommand(args: string[], options: { bundlePath: st
           `  uptime:      ${Math.round(uptimeMs / 1000)}s`,
           `  sessions:    ${health.sessions}`,
           `  active runs: ${health.activeRuns}`,
+          ...(health.lameDuck
+            ? ["  lame duck:   yes (superseded by a newer daemon — draining, admits no new sessions)"]
+            : []),
           ...health.projects.map((p) => `    ${p.projectDir}: ${p.activeRuns} active run(s)`),
         ].join("\n"),
       );

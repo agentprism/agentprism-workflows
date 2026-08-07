@@ -4,7 +4,7 @@
  *
  *   (default)                  stdio shim — auto-starts the daemon, proxies stdio↔HTTP
  *   --in-process               the pre-daemon behavior: serve MCP over stdio in-process
- *   --daemon-run [--port n]    the daemon itself (what the shim spawns, detached)
+ *   --daemon-run [--port n] [--supersede]   the daemon itself (what the shim spawns, detached)
  *   daemon <start|stop|status|url|run|logs>   daemon management commands
  *
  * The shim spawns the daemon from this same file (realpath of argv[1]), so one artifact is
@@ -64,7 +64,7 @@ export async function dispatch(argv: string[]): Promise<void> {
     return;
   }
   if (argv.includes("--daemon-run")) {
-    const outcome = await runDaemon({ port: portFlag(argv) });
+    const outcome = await runDaemon({ port: portFlag(argv), supersede: argv.includes("--supersede") });
     if (outcome === "started") {
       // The listening HTTP server holds the event loop; the daemon lifecycle exits.
       await new Promise(() => undefined);

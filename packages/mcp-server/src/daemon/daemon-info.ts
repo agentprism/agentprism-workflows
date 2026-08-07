@@ -61,6 +61,13 @@ export interface DaemonHealth {
   activeRuns: number;
   envFingerprint: string;
   projects: Array<{ projectDir: string; activeRuns: number }>;
+  /**
+   * True when this daemon has been superseded — a newer daemon owns discovery
+   * (`daemon.json` names a different pid) so this one is a lame duck: it admits no new
+   * sessions and exits once idle. Absent on daemons predating the succession model; readers
+   * treat a missing field as "not a lame duck".
+   */
+  lameDuck?: boolean;
 }
 
 /**
@@ -143,10 +150,25 @@ export function clearDaemonInfo(pid: number): void {
 }
 
 /**
+ * True when a successor has taken over discovery: daemon.json exists and names a pid other
+ * than `ownPid`. Such a daemon is a "lame duck" — it keeps serving its existing sessions and
+ * runs but admits no new sessions, and exits once idle within the normal idle-TTL bound.
+ *
+ * A missing/unreadable daemon.json is NOT supersession (no successor has claimed the
+ * discovery file). The check is intentionally stateless: if daemon.json is later repointed
+ * back at `ownPid` — e.g. a successor died and this daemon reclaimed discovery — this returns
+ * false again and normal service resumes.
+ */
+export function isSupersededBy(ownPid: number): boolean {
+  const info = readDaemonInfo();
+  return info !== undefined && info.pid !== ownPid;
+}
+
+/**
  * The runner resolves its backend registry and spawn behavior from these once at construction,
  * so a daemon serves every client with the env it was started with. The fingerprint lets the
- * shim detect a divergent client env and restart an idle daemon instead of silently serving
- * with stale configuration.
+ * shim detect a divergent client env and supersede a stale daemon (spawn a current successor
+ * and repoint discovery) instead of silently serving with stale configuration.
  */
 const ENV_FINGERPRINT_PREFIXES = ["AGENTPRISM_", "OPENCODE_ACP_", "PI_ACP_", "CODEX_ACP_"];
 
