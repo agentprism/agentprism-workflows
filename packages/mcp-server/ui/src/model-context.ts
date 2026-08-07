@@ -64,6 +64,33 @@ export function isUrgentStatus(model: RunModel): boolean {
   return model.finalized || model.status === "paused";
 }
 
+/**
+ * True once the panel has folded at least one events page — the workflow name is known or the
+ * cursor has advanced past the seed. Gates the very first model-context push: the effect seeds an
+ * empty model and bumps a render before any page lands, and pushing that seed leaks the "workflow"
+ * name fallback and an agents-settled 0/0 into the model's context before real data has folded.
+ */
+export function hasFoldedEvents(model: RunModel): boolean {
+  return model.name !== undefined || model.cursor > 0;
+}
+
+/**
+ * Dependency key for the panel's model-context push effect (main.tsx `useModelContextSync`).
+ * React re-runs that effect — and thus re-evaluates whether to release a push — only when this
+ * key changes, so it MUST fold `hasFoldedEvents` in ALONGSIDE the milestone signature.
+ *
+ * The first events page can set the workflow name and start an agent WITHOUT moving the milestone
+ * signature (still live / 0 settled / 0 phases). Keying the effect on the signature alone would
+ * therefore leave it un-run on that transition, and the corrected initial snapshot (real name,
+ * real agent counts) would sit held-back until the NEXT milestone. Combining the folded bit into
+ * the key makes React re-run the effect the instant real data folds, releasing the held snapshot.
+ */
+export function modelContextPushKey(model: RunModel): string {
+  return [hasFoldedEvents(model) ? "folded" : "seed", modelContextSignature(model)].join(
+    SIGNATURE_SEP,
+  );
+}
+
 /** Minimum spacing between routine pushes; urgent transitions ignore it. */
 export const MODEL_CONTEXT_MIN_INTERVAL_MS = 2000;
 

@@ -63,6 +63,22 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
   }
 });
 
+test("workflow-events is annotated read-only (metadata for hosts that gate on the hint)", async () => {
+  const { client, dispose } = await connect(okRunner());
+  try {
+    const { tools } = await client.listTools();
+    const events = tools.find((tool) => tool.name === WORKFLOW_EVENTS_TOOL_NAME);
+    // Paging the event log never mutates run state. The hint is metadata for hosts that gate on it;
+    // it does not change how any host narrates app-originated calls.
+    assert.equal(
+      (events?.annotations as { readOnlyHint?: boolean } | undefined)?.readOnlyHint,
+      true,
+    );
+  } finally {
+    await dispose();
+  }
+});
+
 test("workflow-events pages a background run's event log to terminal state", async () => {
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {

@@ -1181,6 +1181,64 @@ test("events resources push append hints and page exact durable catch-up", async
   }
 });
 
+test("an events read reconciles an externally-dead run so finalized flips for the panel", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-events-reconcile-"));
+  // managerA produces the run and then "exits"; a fresh cold managerB (never owned the run) serves
+  // the panel's reads, exactly as a restarted/other server process would after a daemon died.
+  const managerA = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const run = await managerA.runSync(NO_AGENT_SCRIPT.replace("no-agent", "orphaned-run"));
+  const managerB = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
+  const persistence = managerB.getPersistence();
+  const completed = persistence.load(run.runId);
+  assert.ok(completed);
+  assert.ok(completed.eventStreamId && completed.eventSeq !== undefined);
+  assert.equal(completed.status, "completed");
+  assert.equal(managerB.getRun(run.runId), undefined);
+
+  const mcp = new McpServer({ name: "events-reconcile", version: "0.0.0" }, { capabilities: {} });
+  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+  const resources = new WorkflowScriptResources(mcp, managerB);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "events-reconcile-client", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([mcp.connect(serverTransport), client.connect(clientTransport)]);
+
+  try {
+    // A dead daemon leaves the run persisted as "running" with a frozen journal, and nothing live
+    // in this process owns it. Without reconciliation on the read path buildEventsDocument reports
+    // finalized:false forever and the panel polls it without end.
+    persistence.save({ ...completed, status: "running" });
+    assert.equal(persistence.load(run.runId)?.status, "running");
+
+    // The shared page seam (used by both the workflow-events tool and the resource read) reconciles
+    // the orphan, so `finalized` flips and the panel can stop polling.
+    const page = resources.readEventsPage({
+      runId: run.runId,
+      after: 0,
+      streamId: completed.eventStreamId,
+    });
+    assert.equal(page.finalized, true, "orphaned run is finalized once the read reconciles it");
+    assert.notEqual(page.status, "running");
+    assert.equal(persistence.load(run.runId)?.status, "paused");
+    assert.equal(persistence.load(run.runId)?.pauseReason, "interrupted");
+
+    // Re-orphan, then read through the exact resource path the panel uses (the query form) to prove
+    // the read path itself reconciles — not merely the direct readEventsPage call above.
+    persistence.save({ ...persistence.load(run.runId)!, status: "running" });
+    const uri = `workflow://runs/${run.runId}/events?after=0&limit=500&streamId=${completed.eventStreamId}`;
+    const doc = JSON.parse(resourceText(await client.readResource({ uri }))) as {
+      status: string;
+      finalized: boolean;
+    };
+    assert.equal(doc.finalized, true);
+    assert.notEqual(doc.status, "running");
+    assert.equal(persistence.load(run.runId)?.status, "paused");
+  } finally {
+    await client.close();
+    await mcp.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a slow events subscriber holds one promise plus one dirty bit while durable pages keep every record", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-events-backpressure-"));
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
