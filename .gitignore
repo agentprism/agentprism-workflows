@@ -3,3 +3,9 @@ dist/
 *.tsbuildinfo
 nanobanana-output/
 .agentprism/
+
+# Build product: the run-monitor MCP App panel, generated from packages/mcp-server/ui/ by
+# scripts/ensure-run-monitor-html.mjs at build/test/typecheck/prepublish/postinstall time. Never
+# committed — generation is automatic so it can't go stale. (The sibling authoring-prompt-content.ts
+# IS committed; it has a different provenance and a drift test.)
+packages/mcp-server/src/generated/run-monitor-html.ts

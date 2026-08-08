@@ -42,11 +42,11 @@
     }
   },
   "scripts": {
-    "build": "tsc -b",
-    "build:ui": "vite build ui && node ../../scripts/generate-run-monitor-html.mjs",
-    "typecheck": "tsc --noEmit && tsc -p ui --noEmit",
-    "test": "tsc -p tsconfig.type-tests.json && tsx --test \"test/**/*.test.ts\"",
-    "prepublishOnly": "tsc -b"
+    "build": "node ../../scripts/ensure-run-monitor-html.mjs && tsc -b",
+    "build:ui": "node ../../scripts/ensure-run-monitor-html.mjs --force",
+    "typecheck": "node ../../scripts/ensure-run-monitor-html.mjs && tsc --noEmit && tsc -p ui --noEmit",
+    "test": "node ../../scripts/ensure-run-monitor-html.mjs && tsc -p tsconfig.type-tests.json && tsx --test \"test/**/*.test.ts\"",
+    "prepublishOnly": "node ../../scripts/ensure-run-monitor-html.mjs && tsc -b"
   },
   "dependencies": {
     "@automatalabs/repl-engine": "workspace:*",
