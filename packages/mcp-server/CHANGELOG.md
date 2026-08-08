@@ -1,5 +1,23 @@
 # @automatalabs/mcp-server
 
+## 0.27.0
+
+### Minor Changes
+
+- 4a7e4b5: Run-monitor panel rebuilt on the MCP Apps negotiation model: UI-enabled registration
+  (the panel resource, the workflow tool's UI metadata, and the app-only workflow-events
+  tool) now requires the client to advertise the io.modelcontextprotocol/ui extension
+  capability; all other clients get the identical text-only workflow tool. The panel
+  updates itself by polling the app-only workflow-events tool (the spec's Interactive
+  Updates pattern) and informs the model via ui/message for exactly three event families:
+  phase changes, pauses (permission/attention needed), and terminal states.
+
+### Patch Changes
+
+- Updated dependencies [4a7e4b5]
+  - @automatalabs/workflows@0.47.0
+  - @automatalabs/repl-engine@0.1.7
+
 ## 0.26.7
 
 ### Patch Changes
