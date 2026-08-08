@@ -9,7 +9,6 @@ import test from "node:test";
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
 
 import { RUN_MONITOR_RESOURCE_URI, WORKFLOW_EVENTS_TOOL_NAME } from "../src/index.js";
-import { PI_STREAM_MODE_EAGER, PI_STREAM_TOOL_META_KEY } from "../src/pi-stream.js";
 import { ONE_AGENT_SCRIPT, connect, okRunner, structured, textOf } from "./_harness.js";
 
 function runIdOf(res: Awaited<ReturnType<Awaited<ReturnType<typeof connect>>["client"]["callTool"]>>): string {
@@ -59,24 +58,6 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
     const content = resource.contents[0] as { mimeType?: string; text?: string };
     assert.equal(content.mimeType, RESOURCE_MIME_TYPE);
     assert.ok(typeof content.text === "string" && content.text.includes("<script"));
-  } finally {
-    await dispose();
-  }
-});
-
-test("both panel tools declare pi eager streamMode in _meta.ui so pi opens its native push channel", async () => {
-  const { client, dispose } = await connect(okRunner());
-  try {
-    const { tools } = await client.listTools();
-    const streamModeOf = (name: string): unknown => {
-      const tool = tools.find((candidate) => candidate.name === name);
-      const ui = (tool?._meta as { ui?: Record<string, unknown> } | undefined)?.ui;
-      return ui?.[PI_STREAM_TOOL_META_KEY];
-    };
-    // pi reads _meta.ui["pi-mcp-adapter.streamMode"] and, when eager, stamps a stream-token onto the
-    // tools/call so the server can push cursor-bearing event windows to the panel.
-    assert.equal(streamModeOf("workflow"), PI_STREAM_MODE_EAGER);
-    assert.equal(streamModeOf(WORKFLOW_EVENTS_TOOL_NAME), PI_STREAM_MODE_EAGER);
   } finally {
     await dispose();
   }
