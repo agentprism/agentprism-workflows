@@ -1,5 +1,17 @@
 # @automatalabs/mcp-server
 
+## 0.26.7
+
+### Patch Changes
+
+- d4a0682: Revert the run-monitor panel pi push-channel change that shipped in
+  mcp-server@0.26.6 / workflows@0.46.9 (owner decision: wrong implementation;
+  a spec-compliant approach to app-resource-less hosts will follow). Restores
+  the prior panel read path.
+- Updated dependencies [d4a0682]
+  - @automatalabs/workflows@0.46.10
+  - @automatalabs/repl-engine@0.1.6
+
 ## 0.26.6
 
 ### Patch Changes
