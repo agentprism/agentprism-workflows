@@ -63,6 +63,13 @@ import {
 } from "./project-registry.js";
 import { RUN_MONITOR_RESOURCE_URI, registerWorkflowAppUi } from "./app-ui.js";
 import {
+  PI_STREAM_MODE_EAGER,
+  PI_STREAM_TOOL_META_KEY,
+  PiStreamManager,
+  piResultPatchNotification,
+  readPiStreamToken,
+} from "./pi-stream.js";
+import {
   toWorkflowExecutionOutcome,
   toWorkflowToolResult,
   workflowToolOutputShape,
@@ -73,7 +80,7 @@ import type {
   WorkflowStopResult,
 } from "./workflow-tool-output.js";
 import { createAwaitProgressReporter, createProgressReporter, formatAgentProgressMessage } from "./progress.js";
-import type { AwaitProgressReporter } from "./progress.js";
+import type { AwaitProgressReporter, WorkflowToolExtra } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { registerReplTool } from "./repl-tool.js";
 import { ReplPresenceLedger } from "./repl-presence.js";
@@ -1255,6 +1262,35 @@ export function createWorkflowServer(
     ? undefined
     : projects.adopt(options.manager ?? new WorkflowManager({ agent: runner }), options.backgroundRuns);
   const scriptResources = new WorkflowScriptResources(mcp, { router: projects });
+  // pi native server->app push channel for the run-monitor panel (pi-stream.ts). Only ever active
+  // when pi stamps a stream-token onto a workflow tools/call; other hosts never trigger it. Bounded
+  // by stream token and torn down with the server.
+  const piStreams = new PiStreamManager();
+  const previousServerClose = mcp.server.onclose;
+  mcp.server.onclose = () => {
+    piStreams.disposeAll();
+    previousServerClose?.();
+  };
+  /**
+   * Start the pi push channel for `runId` if this tools/call carried a pi stream-token. Reads the
+   * event log server-side and streams self-contained result-patch frames (no host narration, no
+   * agent turn). A no-op on every non-pi host and safe to call for any action once a runId resolves.
+   */
+  const maybeBeginPiStream = (extra: WorkflowToolExtra, runId: string): void => {
+    const streamToken = readPiStreamToken(extra);
+    if (streamToken === undefined) return;
+    piStreams.begin({
+      runId,
+      streamToken,
+      readEventsPage: (request) => scriptResources.readEventsPage(request),
+      watch: (after, streamId, onRecord) => scriptResources.watchRunEventFeed(runId, after, streamId, onRecord),
+      send: (params) => {
+        void mcp.server.notification(piResultPatchNotification(params)).catch(() => {
+          /* advisory push channel: a closed/failing transport must never affect the run. */
+        });
+      },
+    });
+  };
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
   const backendApprovals: BackendApprovals = new Set();
   // The REPL client-presence ledger (see `repl-presence.ts`): one per
@@ -1316,7 +1352,15 @@ export function createWorkflowServer(
     mcp,
     "workflow",
     {
-      _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI } },
+      // resourceUri renders the panel on Apps-capable hosts. pi (whose Apps bridge never wired
+      // resources/read for app-originated reads — measured -32601) additionally reads
+      // `pi-mcp-adapter.streamMode: eager` to open its native server->app push channel: it stamps a
+      // stream-token onto this tools/call, and the handler streams cursor-bearing event windows to
+      // the panel via notifications (invisible to the host — no narration, no agent turn). Other
+      // hosts ignore the extra key. See pi-stream.ts.
+      _meta: {
+        ui: { resourceUri: RUN_MONITOR_RESOURCE_URI, [PI_STREAM_TOOL_META_KEY]: PI_STREAM_MODE_EAGER },
+      },
       title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
       description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
@@ -1380,6 +1424,12 @@ export function createWorkflowServer(
       replPresence.touch(context.repl, options.replClientId?.() ?? "unknown");
       const manager = context.manager;
       const backgroundRuns = context.backgroundRuns;
+      // Panel-opening runId actions (inspect/await/stop) carry the runId in their arguments, so the
+      // pi push channel can start immediately if this host is pi. run/execute reveals its runId only
+      // after admission — those branches begin the stream once started.runId is known.
+      if (parsedInput.action === "inspect" || parsedInput.action === "await" || parsedInput.action === "stop") {
+        maybeBeginPiStream(extra, parsedInput.runId);
+      }
       if ((parsedInput.action === undefined || parsedInput.action === "run") && parsedInput.resumeFromRunId !== undefined) {
         // Cross-project resume is an explicit redirect, never a silent miss in the wrong store.
         if (!manager.getPersistence().load(parsedInput.resumeFromRunId)) {
@@ -1788,6 +1838,10 @@ export function createWorkflowServer(
             throw new McpError(ErrorCode.InternalError, "Workflow admission did not resolve run limits");
           }
           executionLatch.admit();
+          // The admitted run has a durable event stream now; on pi, stream it to the panel. The
+          // session runs detached (like the tracked background promise) and stops on the terminal
+          // frame — the panel/UI session outlives this immediate-returning tool call.
+          maybeBeginPiStream(extra, started.runId);
           const workflowName = admittedRun.snapshot.name;
           backgroundRuns.track(started.runId, started.promise);
           backgroundReservation = false;
@@ -1831,6 +1885,9 @@ export function createWorkflowServer(
         // unless its immutable script resource is already durable.
         const started = manager.startInBackground(admittedScript, input.args, exec);
         foregroundRunId = started.runId;
+        // On pi, stream the run's events to the panel while this foreground call blocks on the
+        // promise; the session pushes patch frames concurrently and stops on the terminal frame.
+        maybeBeginPiStream(extra, started.runId);
         scriptResources.trackPendingElicitation(started.runId, elicitationController);
         requireAdmissionResource(
           manager,
