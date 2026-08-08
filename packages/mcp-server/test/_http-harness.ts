@@ -10,7 +10,12 @@ import { ElicitRequestSchema, ResourceUpdatedNotificationSchema } from "@modelco
 import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentRunner } from "@automatalabs/shared-types";
 
-import { TEST_HOME, makeRunner } from "./_harness.js";
+import {
+  TEST_HOME,
+  makeRunner,
+  uiClientCapabilities,
+  type UiCapabilityMode,
+} from "./_harness.js";
 import { createDaemon, type DaemonHandle } from "../src/daemon/http-daemon.js";
 
 export async function startDaemon(runner: AgentRunner): Promise<DaemonHandle> {
@@ -39,6 +44,7 @@ export async function connectHttp(
   url: string,
   opts: {
     listTools?: boolean;
+    uiCapability?: UiCapabilityMode;
     /** Advertise the elicitation capability and answer checkpoint forms with this. */
     elicit?: (request: ElicitRequest) => ElicitResult | Promise<ElicitResult>;
   } = {},
@@ -46,7 +52,12 @@ export async function connectHttp(
   const transport = new StreamableHTTPClientTransport(new URL(url));
   const client = new Client(
     { name: "mcp-http-test", version: "0.0.0" },
-    { capabilities: opts.elicit ? { elicitation: {} } : {} },
+    {
+      capabilities: {
+        ...uiClientCapabilities(opts.uiCapability ?? "matching"),
+        ...(opts.elicit ? { elicitation: {} } : {}),
+      },
+    },
   );
   const elicitations: ElicitRequest[] = [];
   if (opts.elicit) {

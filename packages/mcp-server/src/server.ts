@@ -51,7 +51,13 @@ import {
   type EvalBreakChannel,
 } from "@automatalabs/repl-engine";
 
-import { EXTENSION_ID, registerAppTool } from "@modelcontextprotocol/ext-apps/server";
+import {
+  EXTENSION_ID,
+  RESOURCE_MIME_TYPE,
+  getUiCapability,
+  registerAppTool,
+  type ToolCallback,
+} from "@modelcontextprotocol/ext-apps/server";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import {
@@ -1312,22 +1318,9 @@ export function createWorkflowServer(
     acceptingWork: () => acceptingWork,
   });
 
-  // MCP Apps surface, per the extension's graceful-degradation model: registered for every
-  // client. Apps-capable hosts render the panel from the `workflow` tool's `_meta.ui`;
-  // everyone else ignores the meta (and the app-only events tool) and keeps the tool's
-  // text/structured output unchanged.
-  registerWorkflowAppUi(mcp, {
-    readEventsPage: (request) => scriptResources.readEventsPage(request),
-    registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
-  });
-
-  registerAppTool(
-    mcp,
-    "workflow",
-    {
-      _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI } },
-      title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
-      description:
+  const workflowToolConfig = {
+    title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
+    description:
         "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
         "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
@@ -1341,7 +1334,7 @@ export function createWorkflowServer(
         "with notifications/progress while they block. Pass resumeFromRunId to execute a new " +
         "run from a prior journal prefix. " +
         "In hosts that render MCP Apps, every call of this tool shows a live self-updating run-monitor " +
-        "panel and the panel pushes current run status into your context on its own — do NOT poll " +
+        "panel and the panel reports phase starts, pauses, and terminal outcomes on its own — do NOT poll " +
         'action:"inspect" to check on a run there; prefer a single bounded action:"await". ' +
         'Use action:"inspect" with a runId when you need machine-readable status data: a safe bounded status, log tail, and attributed call previews. ' +
         'Use action:"stop" to durably abort a live run; add callIndex to cancel only that in-flight agent ' +
@@ -1350,10 +1343,12 @@ export function createWorkflowServer(
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
         "Background runs are tracked per project, capped at four active/starting runs, and use " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
-      inputSchema: workflowToolInputShape,
-      outputSchema: workflowToolOutputShape,
-    },
-    async (args, extra) => {
+    inputSchema: workflowToolInputShape,
+    outputSchema: workflowToolOutputShape,
+    annotations: undefined,
+  };
+
+  const workflowToolHandler: ToolCallback<typeof workflowToolInputShape> = async (args, extra) => {
       if (!acceptingWork) {
         throw new McpError(
           ErrorCode.InternalError,
@@ -1826,7 +1821,7 @@ export function createWorkflowServer(
                     : "") +
                   `Call workflow with action="await" and this runId to wait for its result, or ` +
                   `action="inspect" for an immediate status snapshot. If a live run-monitor panel ` +
-                  `is shown for this run, it self-updates and pushes status into your context — ` +
+                  `is shown for this run, it self-updates and reports phase starts, pauses, and terminal outcomes — ` +
                   `do not poll inspect for status.`,
               },
               ...links,
@@ -1875,8 +1870,31 @@ export function createWorkflowServer(
         }
         if (backgroundReservation) backgroundRuns.releaseReservation();
       }
-    },
-  );
+  };
+
+  // Tool and panel registration is session-specific: the initialize request is the first point
+  // at which the client's MCP Apps MIME support is known. Preserve any callback installed by a
+  // caller before composing this hook.
+  const previousOnInitialized = mcp.server.oninitialized;
+  mcp.server.oninitialized = () => {
+    previousOnInitialized?.();
+    const uiCap = getUiCapability(mcp.server.getClientCapabilities());
+    const uiCapable = uiCap?.mimeTypes?.includes(RESOURCE_MIME_TYPE) === true;
+    if (uiCapable) {
+      registerWorkflowAppUi(mcp, {
+        readEventsPage: (request) => scriptResources.readEventsPage(request),
+        registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
+      });
+      registerAppTool(
+        mcp,
+        "workflow",
+        { ...workflowToolConfig, _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI } } },
+        workflowToolHandler,
+      );
+    } else {
+      mcp.registerTool("workflow", workflowToolConfig, workflowToolHandler);
+    }
+  };
 
   return server;
 }

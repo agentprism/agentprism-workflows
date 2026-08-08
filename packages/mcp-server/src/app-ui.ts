@@ -1,12 +1,10 @@
 // packages/mcp-server/src/app-ui.ts
 //
 // MCP Apps (io.modelcontextprotocol/ui) surface for the workflow server, per the extension
-// spec's graceful-degradation model: the `workflow` tool itself carries
-// `_meta.ui.resourceUri` (attached where the tool is registered in server.ts), Apps-capable
-// hosts read that meta and render the panel when the tool is called, and every other client
-// simply ignores the meta and keeps the tool's text/structured output. Nothing is gated on
-// client capabilities; the server declares the extension in its own initialize-response
-// capabilities (see server.ts).
+// spec's capability-negotiation model: server.ts registers this surface only after a client
+// advertises the extension and the MCP Apps HTML MIME type. The UI-enabled `workflow` tool carries
+// `_meta.ui.resourceUri`; every other client receives the same tool config without UI metadata.
+// The server still declares the extension unconditionally in its initialize-response capabilities.
 //
 // This module registers the two panel-support pieces:
 //   - the ui:// panel resource (the Vite single-file React app, embedded at build time), and

@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
 import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
 
 import { createWorkflowServer } from "../src/index.js";
@@ -81,6 +82,19 @@ export interface Connected {
   dispose: () => Promise<void>;
 }
 
+export type UiCapabilityMode = "matching" | "absent" | "nonmatching";
+
+export function uiClientCapabilities(mode: UiCapabilityMode): Record<string, unknown> {
+  if (mode === "absent") return {};
+  return {
+    extensions: {
+      [EXTENSION_ID]: {
+        mimeTypes: mode === "matching" ? [RESOURCE_MIME_TYPE] : ["text/html"],
+      },
+    },
+  };
+}
+
 /**
  * Wire a fresh in-memory MCP client to a real workflow server backed by `runner`.
  *
@@ -89,10 +103,14 @@ export interface Connected {
  * client-side against the published schema (the realistic host path). Leave it false to
  * exercise pure shell routing without the client-side output-schema gate.
  */
-export async function connect(runner: AgentRunner, opts: { listTools?: boolean } = {}): Promise<Connected> {
+export async function connect(
+  runner: AgentRunner,
+  opts: { listTools?: boolean; uiCapability?: UiCapabilityMode } = {},
+): Promise<Connected> {
   const server = createWorkflowServer(runner);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities: {} });
+  const capabilities = uiClientCapabilities(opts.uiCapability ?? "matching");
+  const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   if (opts.listTools) await client.listTools();
   return {

@@ -81,6 +81,24 @@ export interface RunModel {
   banner?: string;
 }
 
+type PausedEvent = Extract<PersistedRunEvent, { type: "paused" }>;
+
+/** The panel banner for every persisted pause reason; model messages reuse this verbatim. */
+export function pausedBanner(event: PausedEvent): string {
+  if (event.reason === "auth_required") {
+    const backend = event.authContext?.backendId;
+    return `Paused: authentication required${backend ? ` for backend "${backend}"` : ""}. Log in on this machine, then resume.`;
+  }
+  if (event.reason === "checkpoint_required") {
+    const prompt = event.checkpointContext?.prompt;
+    return `Paused: awaiting a ${event.checkpointContext?.kind ?? "checkpoint"} decision${prompt ? ` — ${prompt}` : ""}.`;
+  }
+  if (event.reason === "usage_limit") {
+    return `Paused: usage limit reached${event.resetHint ? ` — ${event.resetHint}` : ""}.`;
+  }
+  return "Paused.";
+}
+
 export function createRunModel(runId: string): RunModel {
   return {
     runId,
@@ -290,17 +308,7 @@ export function foldRecord(model: RunModel, record: RunEventLogRecord): void {
     }
     case "paused": {
       model.status = "paused";
-      if (event.reason === "auth_required") {
-        const backend = event.authContext?.backendId;
-        model.banner = `Paused: authentication required${backend ? ` for backend "${backend}"` : ""}. Log in on this machine, then resume.`;
-      } else if (event.reason === "checkpoint_required") {
-        const prompt = event.checkpointContext?.prompt;
-        model.banner = `Paused: awaiting a ${event.checkpointContext?.kind ?? "checkpoint"} decision${prompt ? ` — ${prompt}` : ""}.`;
-      } else if (event.reason === "usage_limit") {
-        model.banner = `Paused: usage limit reached${event.resetHint ? ` — ${event.resetHint}` : ""}.`;
-      } else {
-        model.banner = "Paused.";
-      }
+      model.banner = pausedBanner(event);
       return;
     }
     case "error": {

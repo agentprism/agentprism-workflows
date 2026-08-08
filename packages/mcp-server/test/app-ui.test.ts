@@ -1,8 +1,5 @@
-// MCP Apps surface, per the extension's graceful-degradation model: the `workflow` tool
-// carries `_meta.ui.resourceUri` for every client (non-Apps hosts ignore it and keep the
-// text/structured output), the server declares the extension in its initialize-response
-// capabilities, and the app-only `workflow-events` poller plus the ui:// panel resource are
-// always registered.
+// MCP Apps surface: the server always declares the extension, but registers UI metadata, the
+// app-only events tool, and the ui:// resource only for clients advertising the exact app MIME.
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -60,6 +57,41 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
     assert.ok(typeof content.text === "string" && content.text.includes("<script"));
   } finally {
     await dispose();
+  }
+});
+
+test("absent and nonmatching UI capabilities receive only the identical text workflow surface", async () => {
+  const matching = await connect(okRunner(), { uiCapability: "matching" });
+  const absent = await connect(okRunner(), { uiCapability: "absent" });
+  const nonmatching = await connect(okRunner(), { uiCapability: "nonmatching" });
+  try {
+    const matchingTools = (await matching.client.listTools()).tools;
+    const matchingWorkflow = matchingTools.find((tool) => tool.name === "workflow");
+    assert.ok(matchingWorkflow);
+    assert.ok(matchingTools.some((tool) => tool.name === WORKFLOW_EVENTS_TOOL_NAME));
+
+    const sharedFields = (tool: typeof matchingWorkflow) => ({
+      title: tool.title,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      outputSchema: tool.outputSchema,
+      annotations: tool.annotations,
+    });
+
+    for (const session of [absent, nonmatching]) {
+      const tools = (await session.client.listTools()).tools;
+      assert.deepEqual(tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+      const workflow = tools.find((tool) => tool.name === "workflow");
+      assert.ok(workflow);
+      assert.equal(workflow._meta, undefined, "text workflow has no UI metadata");
+      assert.deepEqual(sharedFields(workflow), sharedFields(matchingWorkflow));
+      await assert.rejects(
+        session.client.readResource({ uri: RUN_MONITOR_RESOURCE_URI }),
+        /not found|Invalid params/i,
+      );
+    }
+  } finally {
+    await Promise.all([matching.dispose(), absent.dispose(), nonmatching.dispose()]);
   }
 });
 

@@ -5,56 +5,38 @@
 //   - tool ARGUMENTS for action inspect/await/stop (runId is an input), or
 //   - the tool RESULT's structuredContent.runId for execute calls (background admission
 //     returns it immediately; foreground returns it with the terminal result).
-// Once a runId is known the panel keeps itself live by polling the events RESOURCE
-// (`workflow://runs/{runId}/events`, ~2s while the run is live, adaptive backoff when idle and
-// on faults) and folding each page into the render model — the model/host are not involved
-// again. A resource read is used, not the `workflow-events` tool, because some Apps-capable
-// hosts narrate every app-originated tools/call into the model's conversation while leaving
-// resource reads silent; the tool stays registered for other clients. Stop issues `workflow`
-// action:"stop" through the host bridge.
+// Once a runId is known the panel keeps itself live with the MCP Apps Interactive Updates
+// pattern: it polls the app-only `workflow-events` tool (~2s while live, adaptive backoff when
+// idle or faulted) and folds structured event pages into the render model. Server-side capability
+// negotiation gates access to that tool and this panel. Polling itself carries no model-notification
+// machinery; selected folded events use ui/message. Hosts that narrate app-originated tool calls
+// diverge from the official design; that compatibility issue is tracked at
+// nicobailon/pi-mcp-adapter#314. Stop issues `workflow` action:"stop" through the host bridge.
 import type { App } from "@modelcontextprotocol/ext-apps";
 import { useApp, useHostFonts, useHostStyleVariables } from "@modelcontextprotocol/ext-apps/react";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { RunEventLogRecord } from "@automatalabs/shared-types";
 
 import { DetailView } from "./DetailView.js";
 import { fmtCost, fmtDuration, fmtTokens, shortRunId } from "./format.js";
 import { GraphView } from "./GraphView.js";
 import type { NodeSelection } from "./GraphView.js";
+import { createModelMessageState, sendModelMessagesForFold } from "./model-messages.js";
 import {
-  buildModelContextSnapshot,
-  formatModelContextText,
-  hasFoldedEvents,
-  isUrgentStatus,
-  modelContextPushKey,
-  nextPushDelayMs,
-} from "./model-context.js";
-import { nextErrorBackoffMs, nextIdleDelayMs, POLL_MS, shouldGiveUp } from "./poll-backoff.js";
+  classifyPollFailure,
+  nextErrorBackoffMs,
+  nextIdleDelayMs,
+  POLL_MS,
+  shouldGiveUp,
+} from "./poll-backoff.js";
 import { extractSkeleton } from "./skeleton.js";
 import type { Skeleton } from "./skeleton.js";
 import { agentCount, createRunModel, foldRecord } from "./state.js";
 import type { RunModel, RunStatus } from "./state.js";
+import { readWorkflowEventsPage } from "./workflow-events-poll.js";
+import type { EventsDoc } from "./workflow-events-poll.js";
 import "./style.css";
-
-interface EventsDoc {
-  schemaVersion: number;
-  runId: string;
-  streamId: string;
-  workflowName: string;
-  status: RunStatus;
-  finalized: boolean;
-  after: number;
-  cursor: number;
-  endCursor: number;
-  hasMore: boolean;
-  events: unknown[];
-}
-
-// Per-page cursor read size (server caps limit at 1000). Catch-up paging chains reads via hasMore.
-// POLL_MS / MAX_BACKOFF_MS / MAX_POLL_FAILURES and the backoff policy live in poll-backoff.ts.
-const PAGE_LIMIT = 500;
 
 function runIdFromArgs(args: Record<string, unknown> | null): string | undefined {
   const runId = args?.["runId"];
@@ -76,19 +58,6 @@ function budgetFromResult(result: CallToolResult | null): number | null | undefi
   return typeof budget === "number" || budget === null ? budget : undefined;
 }
 
-/** Parse the events resource read into the shared document, mirroring the skeleton read's shape. */
-function eventsDocFromResource(result: { contents: readonly unknown[] }): EventsDoc | undefined {
-  const text = (result.contents as Array<{ text?: unknown }>).find(
-    (content) => typeof content.text === "string",
-  )?.text as string | undefined;
-  if (text === undefined) return undefined;
-  try {
-    return JSON.parse(text) as EventsDoc;
-  } catch {
-    return undefined;
-  }
-}
-
 interface MonitorState {
   model: RunModel | null;
   connectionLost: boolean;
@@ -98,15 +67,15 @@ interface MonitorState {
 }
 
 /**
- * Poll the events RESOURCE into a fold-model; re-renders by bumping a version counter.
+ * Poll the app-only events tool into a fold-model; re-renders by bumping a version counter.
  * `tornDown` stops the loop for good once the host tears the panel down, so a replaced or
- * dismissed panel cannot keep reading from the server from a detached iframe.
+ * dismissed panel cannot keep calling the server from a detached iframe.
  *
- * A resource read (not the `workflow-events` tool) is used because some Apps-capable hosts narrate
- * every app-originated tools/call into the model's conversation but leave resource reads silent.
- * The panel discovers the stream generation with one canonical read, then pages by cursor with the
- * explicit streamId the query form requires. Idle polls back off (2s→4s→8s→cap) and reset on new
- * events; a bounded run of read faults gives up for good rather than retrying a dead run forever.
+ * This is the MCP Apps Interactive Updates pattern, and access is gated by server-side extension
+ * negotiation. Hosts that narrate app-originated calls diverge from the official design; tracked at
+ * nicobailon/pi-mcp-adapter#314. The first call discovers the stream generation, then cursor pages
+ * carry it explicitly. Idle polls back off (2s→4s→8s→cap) and reset on new events; a bounded run of
+ * call faults gives up for good rather than retrying a dead run forever.
  */
 function useRunModel(app: App | null, runId: string | undefined, tornDown: boolean): MonitorState {
   const modelRef = useRef<RunModel | null>(null);
@@ -123,6 +92,7 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
     let idleDelayMs = POLL_MS;
     let consecutiveFailures = 0;
     let finalConfirmDone = false;
+    const modelMessages = createModelMessageState();
     modelRef.current = createRunModel(runId);
     setFatal(undefined);
     setConnectionLost(false);
@@ -148,27 +118,16 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
       backoffMs = nextErrorBackoffMs(backoffMs);
       schedule(backoffMs);
     };
-    const eventsUri = (streamId: string | undefined): string =>
-      streamId === undefined
-        ? // Bootstrap: canonical read has no query and returns the current streamId without
-          // requiring one (the query form mandates streamId, unknown until the first read lands).
-          `workflow://runs/${runId}/events`
-        : `workflow://runs/${runId}/events?after=${modelRef.current?.cursor ?? 0}&limit=${PAGE_LIMIT}&streamId=${streamId}`;
-
-    const onReadError = (error: unknown): void => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("STREAM_MISMATCH") || message.includes("CURSOR_AHEAD")) {
+    const onPollError = (error: unknown): void => {
+      const failure = classifyPollFailure(error);
+      if (failure === "rebuild") {
         // Stream generation changed (run deleted/recreated): rebuild and re-bootstrap the stream.
         modelRef.current = createRunModel(runId);
         consecutiveFailures = 0;
         idleDelayMs = POLL_MS;
         bump();
         schedule(POLL_MS);
-      } else if (
-        message.includes("RUN_NOT_FOUND") ||
-        message.includes("ORPHANED_LOG") ||
-        message.includes("No workflow run found")
-      ) {
+      } else if (failure === "run-not-found") {
         setFatal("This run is no longer present in the run store.");
       } else {
         degrade();
@@ -180,12 +139,15 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
       if (cancelled || !model) return;
       let doc: EventsDoc | undefined;
       try {
-        const result = await app.readServerResource({ uri: eventsUri(model.streamId) });
+        doc = await readWorkflowEventsPage(app, {
+          runId,
+          after: model.cursor,
+          streamId: model.streamId,
+        });
         if (cancelled) return;
-        doc = eventsDocFromResource(result);
       } catch (error) {
         if (cancelled) return;
-        onReadError(error);
+        onPollError(error);
         return;
       }
       if (doc === undefined) {
@@ -215,11 +177,12 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
         // doc.after === 0: the canonical read covered the whole log; fold it and page by cursor.
       }
 
-      for (const record of doc.events) foldRecord(model, record as RunEventLogRecord);
+      for (const record of doc.events) foldRecord(model, record);
       model.cursor = doc.cursor;
       model.status = doc.status;
       model.finalized = doc.finalized;
       if (model.name === undefined && doc.workflowName) model.name = doc.workflowName;
+      sendModelMessagesForFold(app, runId, doc.after, doc.events, modelMessages);
       bump();
 
       if (doc.hasMore) {
@@ -250,51 +213,6 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
     disconnected,
     fatal,
   };
-}
-
-/**
- * Mirror run status into the host's model context (`ui/update-model-context`) so the agent
- * learns of phase transitions, failures, pauses, and the terminal state without re-calling
- * the `workflow` tool — every model-initiated call renders another panel instance. Pushes
- * overwrite each other, fire only when the run's signature changes, are throttled on the
- * trailing edge for routine transitions, and go out immediately for paused/terminal ones.
- * A host that rejects the request (feature unsupported) disables the channel for good.
- */
-function useModelContextSync(app: App | null, model: RunModel | null, tornDown: boolean): void {
-  // Key the effect on the push key, not the milestone signature alone: the folded bit is part of
-  // the trigger so React re-runs the effect the instant the first events page folds — otherwise a
-  // first page that only sets the name and starts an agent (no milestone) would not move the
-  // signature and the held-back initial snapshot would wait until the next milestone.
-  const pushKey = model === null ? undefined : modelContextPushKey(model);
-  const modelRef = useRef<RunModel | null>(model);
-  modelRef.current = model;
-  const disabledRef = useRef(false);
-  const lastPushRef = useRef(0);
-
-  useEffect(() => {
-    if (!app || pushKey === undefined || disabledRef.current || tornDown) return;
-    const current = modelRef.current;
-    // Hold every push until at least one events page has folded. The effect seeds an empty model
-    // and bumps a render before the first page lands; pushing that seed would leak the "workflow"
-    // name fallback and an agents-settled 0/0 into the model's context ahead of real data.
-    if (!current || !hasFoldedEvents(current)) return;
-    const wait = nextPushDelayMs(isUrgentStatus(current), lastPushRef.current, Date.now());
-    // Trailing-edge timer: superseded signatures cancel, so only the latest state lands.
-    const timer = setTimeout(() => {
-      const latest = modelRef.current;
-      if (!latest || disabledRef.current) return;
-      lastPushRef.current = Date.now();
-      void app
-        .updateModelContext({
-          content: [{ type: "text", text: formatModelContextText(latest) }],
-          structuredContent: { ...buildModelContextSnapshot(latest) },
-        })
-        .catch(() => {
-          disabledRef.current = true;
-        });
-    }, wait);
-    return () => clearTimeout(timer);
-  }, [app, pushKey, tornDown]);
 }
 
 /**
@@ -490,7 +408,7 @@ function RunMonitor() {
   const [toolArgs, setToolArgs] = useState<Record<string, unknown> | null>(null);
   const [toolResult, setToolResult] = useState<CallToolResult | null>(null);
   // The host tears the panel down when its session completes or the user dismisses it. Latch
-  // it so every outbound channel (event polling, model-context pushes) stops permanently.
+  // it so event polling (and therefore new model messages) stops permanently.
   const [tornDown, setTornDown] = useState(false);
 
   const { app, error } = useApp({
@@ -515,7 +433,6 @@ function RunMonitor() {
   const { model, connectionLost, disconnected, fatal } = useRunModel(app, runId, tornDown);
   const skeleton = useSkeleton(app, runId);
   const budget = budgetFromResult(toolResult);
-  useModelContextSync(app, model, tornDown);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
   if (!app) return <div className="log-empty">Connecting…</div>;
