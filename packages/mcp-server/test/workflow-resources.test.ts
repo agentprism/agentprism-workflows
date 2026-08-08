@@ -9,7 +9,6 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   ElicitRequestSchema,
-  McpError,
   ResourceListChangedNotificationSchema,
   ResourceUpdatedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -1179,45 +1178,6 @@ test("events resources push append hints and page exact durable catch-up", async
     await client.close();
     await mcp.close();
     rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("a truly-unknown run's events read carries a RUN_NOT_FOUND token; a real run's read does not", async () => {
-  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-events-runnotfound-"));
-  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-  const mcp = new McpServer({ name: "run-not-found", version: "0.0.0" }, { capabilities: {} });
-  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
-  const resources = new WorkflowScriptResources(mcp, manager);
-  try {
-    // No store holds this run: the shared page seam throws an InvalidParams McpError whose message
-    // carries the matchable RUN_NOT_FOUND token, so the panel's onReadError classifies it as fatal
-    // and stops instantly instead of spinning "reconnecting…" for ~42s against a run that never was.
-    assert.throws(
-      () => resources.readEventsPage({ runId: "aaaaaaaa-bbbbbb" }),
-      (error: unknown) => error instanceof McpError && /RUN_NOT_FOUND/.test(error.message),
-    );
-
-    // A run that DOES exist reads its events with no such token — the fatal path is reserved for
-    // truly-unknown runs, and existing runs are untouched.
-    const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "known-run"));
-    const page = resources.readEventsPage({ runId: run.runId });
-    assert.equal(page.runId, run.runId);
-    assert.ok(page.events.length > 0);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("the events resource read for an unknown run surfaces RUN_NOT_FOUND over the wire", async () => {
-  const { client, dispose } = await connect(okRunner());
-  try {
-    // The canonical (query-less) tail read the panel bootstraps with must also carry the token.
-    await assert.rejects(
-      client.readResource({ uri: "workflow://runs/aaaaaaaa-bbbbbb/events" }),
-      (error: unknown) => error instanceof McpError && /RUN_NOT_FOUND/.test(error.message),
-    );
-  } finally {
-    await dispose();
   }
 });
 

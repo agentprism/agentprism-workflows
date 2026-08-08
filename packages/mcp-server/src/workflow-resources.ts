@@ -510,17 +510,7 @@ export class WorkflowScriptResources {
     this.reconcileDeadRunForEvents(request.runId);
     const persistence = this.persistenceFor(request.runId);
     const state = persistence?.load(request.runId);
-    if (!persistence || !state) {
-      // No project store holds this run: it is truly unknown (deleted, or never admitted here).
-      // Carry a matchable RUN_NOT_FOUND token so the panel's onReadError hits the fatal path
-      // instantly instead of spinning "reconnecting…" for ~42s against a run that will never
-      // appear. A run that DOES exist but has no event stream yet keeps the un-tokened message.
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Workflow events for ${request.runId} are unavailable (RUN_NOT_FOUND).`,
-      );
-    }
-    if (!state.eventStreamId || state.eventSeq === undefined) {
+    if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
       throw new McpError(
         ErrorCode.InvalidParams,
         `Workflow events for ${request.runId} are unavailable.`,
@@ -535,61 +525,12 @@ export class WorkflowScriptResources {
     return this.buildEventsDocument(request.runId, state, after, page);
   }
 
-  /**
-   * Subscribe to a run's live event feed for the pi push channel (pi-stream.ts). `onRecord` fires
-   * (best-effort) whenever new events may be available past `after`; the caller coalesces and
-   * re-reads by cursor. Returns a disposer, or undefined if the run has no watchable event stream.
-   *
-   * Server-side only: unlike the resource `subscribeEvents` path this emits NO resources/updated
-   * notifications and holds no per-URI bookkeeping — it is a private feed for the pi emitter, which
-   * turns each signal into a self-contained result-patch frame. The drain loop swallows feed faults
-   * (rotation/EOF) so a dead feed never wedges the run.
-   */
-  watchRunEventFeed(
-    runId: string,
-    after: number,
-    streamId: string,
-    onRecord: () => void,
-  ): (() => void) | undefined {
-    const persistence = this.persistenceFor(runId);
-    if (!persistence) return undefined;
-    let stream: RunEventStream;
-    try {
-      stream = persistence.watchEvents(runId, { after, streamId });
-    } catch {
-      return undefined;
-    }
-    let closed = false;
-    void (async () => {
-      try {
-        for await (const _record of stream) {
-          if (closed) return;
-          onRecord();
-        }
-      } catch {
-        // Feed ended or the log rotated; the push session stops reading. Best-effort channel.
-      }
-    })();
-    return () => {
-      closed = true;
-      stream.close();
-    };
-  }
-
   /** Canonical (query-less) resource read: the tail window of the current stream. */
   private readEventsTail(runId: string): WorkflowRunEventsResourceDocument {
     this.reconcileDeadRunForEvents(runId);
     const persistence = this.persistenceFor(runId);
     const state = persistence?.load(runId);
-    if (!persistence || !state) {
-      // Same as readEventsPage: a run no store holds is truly unknown; the RUN_NOT_FOUND token
-      // routes the panel to its fatal path immediately rather than a ~42s reconnect spin.
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Workflow events for ${runId} are unavailable (RUN_NOT_FOUND).`,
-      );
-    }
-    if (!state.eventStreamId || state.eventSeq === undefined) {
+    if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
       throw new McpError(ErrorCode.InvalidParams, `Workflow events for ${runId} are unavailable.`);
     }
     const head = persistence.readEvents(runId, { limit: 1, streamId: state.eventStreamId });

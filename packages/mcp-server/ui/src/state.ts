@@ -95,27 +95,6 @@ export function createRunModel(runId: string): RunModel {
   };
 }
 
-/**
- * Seed a minimal render model for the STATIC fallback host class — a host that serves neither
- * app-originated resource reads (so the event poll is impossible) nor the pi push channel. The panel
- * cannot build a live graph there; it shows only what the tool call itself delivered: the runId
- * always, plus the status and workflow name when the result carried them (foreground calls return a
- * terminal status; background calls return "running"). The panel renders an honest "live updates
- * aren't supported by this host" state around this seed instead of the reconnect spinner.
- */
-export function seedStaticRunModel(
-  runId: string,
-  seed?: { status?: RunStatus; workflowName?: string },
-): RunModel {
-  const model = createRunModel(runId);
-  if (seed?.status !== undefined) {
-    model.status = seed.status;
-    model.finalized = seed.status === "completed" || seed.status === "failed" || seed.status === "aborted";
-  }
-  if (seed?.workflowName !== undefined) model.name = seed.workflowName;
-  return model;
-}
-
 function rowFromHistoryEntry(entry: AgentHistoryEntry, order: number, fallbackTs?: number): DetailRow {
   const kind =
     entry.kind === "toolCall"
