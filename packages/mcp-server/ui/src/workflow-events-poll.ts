@@ -8,6 +8,9 @@ import type { RunStatus } from "./state.js";
 // import the server registration module and its Node-only dependency graph).
 export const WORKFLOW_EVENTS_TOOL_NAME = "workflow-events";
 
+// Per-page cursor read size (server caps limit at 1000). Catch-up paging chains reads via hasMore.
+export const PAGE_LIMIT = 500;
+
 export interface EventsDoc {
   schemaVersion: number;
   runId: string;
@@ -45,6 +48,7 @@ export async function readWorkflowEventsPage(
     arguments: {
       runId: request.runId,
       after: request.after,
+      limit: PAGE_LIMIT,
       streamId: request.streamId,
     },
   });

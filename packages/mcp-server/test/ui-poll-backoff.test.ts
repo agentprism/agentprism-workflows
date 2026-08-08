@@ -83,7 +83,7 @@ test("polling calls the app-only tool with cursor arguments and folds structured
   assert.deepEqual(calls, [
     {
       name: WORKFLOW_EVENTS_TOOL_NAME,
-      arguments: { runId: "run-poll", after: 0, streamId: undefined },
+      arguments: { runId: "run-poll", after: 0, limit: 500, streamId: undefined },
     },
   ]);
   assert.deepEqual(page, document);
