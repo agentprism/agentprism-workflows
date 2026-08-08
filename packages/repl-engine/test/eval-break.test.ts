@@ -475,20 +475,47 @@ test('review round 3: a no-id interrupt with NOTHING BREAKABLE — an in-flight 
 test('review round 3: waitForCalls respects the REMAINING wait budget — a 10 ms timeout returns in ~10 ms, never the fixed 50 ms poll overshoot (~51 ms for every sub-50 ms timeout: the carried review defect)', async () => {
   const { ws, broker } = await setup();
   // A parked checkpoint keeps c1 pending forever (no runner needed):
-  // the wait pumps (nothing ready), sleeps, and must return at its
-  // deadline.
+  // each wait pumps (nothing ready), sleeps, and must return at its
+  // deadline. The same parked call is reused across every sample — it
+  // never settles, so each `waitForCalls(['c1'], 10)` is an independent
+  // bounded poll.
   const raised = await broker.eval('const q = checkpoint("go?"); "raised"');
   assert.ok(raised.pending.includes('c1'), `pending: ${raised.pending.join(', ')}`);
-  const started = Date.now();
-  const { result, drained } = await bounded('bounded 10 ms wait', broker.waitForCalls(['c1'], 10));
-  const elapsed = Date.now() - started;
-  assert.equal(drained, false, 'the parked checkpoint never settles — "still running"');
-  assert.deepEqual(result.pending, ['c1'], 'the pending ids are reported');
-  // The old code slept a fixed 50 ms per pump regardless of the budget
-  // (~51 ms total for a 10 ms wait). The remaining-budget sleep must
-  // return within the requested bound plus a generous scheduling
-  // margin — 45 ms is 4.5x the budget and far under the old overshoot.
-  assert.ok(elapsed < 45, `the 10 ms wait returned in ${elapsed} ms (the fixed 50 ms overshoot is gone)`);
+  // DEFECT SIGNATURE: a FIXED ~51 ms poll overshoot on EVERY sub-50 ms
+  // timeout — a DETERMINISTIC floor (the old code slept an unconditional
+  // 50 ms per pump regardless of the remaining budget, so a 10 ms wait
+  // always returned in ~51 ms). Load noise is a DIFFERENT distribution:
+  // an intermittent inflated sample (the CI flake measured 67 ms once)
+  // riding an otherwise ~10 ms wait. A single-sample threshold cannot
+  // separate the two — one 67 ms load spike is indistinguishable from
+  // the ~51 ms defect floor — so naked widening would only destroy the
+  // test's power. Instead measure the wait N times (N = 8) and assert
+  // the MINIMUM is well under the 50 ms defect floor: the defect
+  // inflates EVERY sample to ~51 ms so its min is ~51 ms (caught), while
+  // a healthy 10 ms wait has a true ~10 ms floor and load noise is
+  // intermittent, so across N samples at least one lands near the floor
+  // and the min stays ~10 ms (passes under arbitrary load). min-of-N
+  // cleanly discriminates a deterministic floor from intermittent noise.
+  const SAMPLES = 8;
+  const elapsedSamples: number[] = [];
+  for (let i = 0; i < SAMPLES; i += 1) {
+    const started = Date.now();
+    const { result, drained } = await bounded('bounded 10 ms wait', broker.waitForCalls(['c1'], 10));
+    elapsedSamples.push(Date.now() - started);
+    assert.equal(drained, false, 'the parked checkpoint never settles — "still running"');
+    assert.deepEqual(result.pending, ['c1'], 'the pending ids are reported');
+  }
+  const minElapsed = Math.min(...elapsedSamples);
+  // 40 ms is 10 ms below the ~51 ms deterministic defect floor and ~4x
+  // the ~10 ms healthy floor: the defect (every sample ~51 ms) can never
+  // produce a min under 40 ms, while a healthy wait's least-contended
+  // sample lands near 10 ms even when sibling samples are load-inflated
+  // (measured: min stayed 10–12 ms under 72 CPU-bound workers on 48
+  // cores). The min-of-N floor, not any single sample, is the discriminator.
+  assert.ok(
+    minElapsed < 40,
+    `the min of ${SAMPLES} 10 ms waits was ${minElapsed} ms (samples: ${elapsedSamples.join(', ')}); the fixed ~51 ms overshoot is gone`,
+  );
   await broker.dispose();
   ws.dispose();
 });
@@ -590,7 +617,21 @@ test('review round 4: waitForCalls\'s chain acquisition is bounded by the wait d
   const elapsed = Date.now() - started;
   assert.equal(drained, false, 'the slow turn never settled within the wait bound — "still running"');
   assert.deepEqual(result.pending, ['c1'], 'the target ids are reported (none observed settled)');
-  assert.ok(elapsed < 80, `the 30 ms wait returned at its bound (${elapsed} ms), not behind the drain`);
+  // DEFECT SIGNATURE: an unbounded chain acquisition makes the 30 ms
+  // wait QUEUE behind the drain and return only when the drain releases
+  // the chain — historically ~253 ms (a 20 ms wait behind a 250 ms
+  // drain), and in THIS test ~2000 ms (the drain's full bound, since the
+  // turn is settled only AFTER this measurement). Healthy the wait
+  // returns at its ~30 ms bound. The two distributions do NOT overlap
+  // (measured healthy worst case 40 ms under 72 CPU-bound workers on 48
+  // cores; the CI flake was 81 ms, just over the old 80 ms epsilon),
+  // so — unlike the ~51 ms floor defect above, whose load noise overlaps
+  // the floor — a generous single-sample ceiling discriminates unambiguously
+  // without weakening the test. 150 ms is ~5x the ~30 ms bound (ample
+  // headroom over the 81 ms flake) yet far below the ≥253 ms defect: a
+  // wait that honors its bound cannot reach 150 ms, and the
+  // queued-behind-the-drain defect cannot come in under it.
+  assert.ok(elapsed < 150, `the 30 ms wait returned at its bound (${elapsed} ms), not behind the drain`);
   // The drain still completes its work once the turn settles: the turn
   // drains to completion and the children release (the doc's graceful
   // drain is unaffected by the wait's bounded acquisition).

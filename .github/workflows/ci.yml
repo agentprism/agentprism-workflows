@@ -15,7 +15,10 @@ jobs:
     # check matches this string exactly — renaming it wedges every merge until
     # the ruleset context is updated to match.
     name: Build & test
-    runs-on: ubuntu-latest
+    # Self-hosted (owner's box, 4 docker runners, org group allows public repos as of
+    # 2026-08-07). Faster than hosted; fork-PR workflow runs still require approval per
+    # repo/org settings before touching these runners.
+    runs-on: [self-hosted, agentprism]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -96,5 +99,12 @@ jobs:
       # AGENTPRISM_LIVE_E2E is intentionally left UNSET here so the gated live
       # end-to-end test is skipped — this keeps CI deterministic and
       # credential-free.
+      # codex-acp is EXCLUDED on purpose (owner decision, 2026-08-07): its suite is
+      # UPSTREAM's own vitest tests for vendored code we sync mechanically — upstream CI
+      # runs them, and our acp-agents integration tests cover the adapter behavior we
+      # depend on. It entered `pnpm -r test` when upstream switched to pnpm; our merges
+      # must not gate on upstream test infra (their vitest worker pools also crash in
+      # the docker runners). Run it explicitly during codex-acp sync maintenance:
+      # pnpm --filter @automatalabs/codex-acp test
       - name: Test
-        run: pnpm -r test
+        run: pnpm -r --filter '!@automatalabs/codex-acp' test
