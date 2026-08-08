@@ -21,6 +21,7 @@ const MCP_PACKAGE = (await import("../../mcp-server/package.json", { with: { typ
 interface JsonRpcFrame {
   jsonrpc?: unknown;
   id?: unknown;
+  method?: unknown;
   result?: unknown;
 }
 
@@ -157,11 +158,22 @@ test("the bundled stdio server initializes once and advertises the workflow tool
 
     const toolsResult = toolsList.result as { tools?: Array<{ name?: unknown }> };
     assert.ok(toolsResult.tools?.some((tool) => tool.name === "workflow"), "workflow tool was not advertised");
+    // The workflow tool registers per-session in oninitialized (capability negotiation), so the
+    // SDK legitimately emits notifications/tools/list_changed after initialize. Responses must
+    // still be exactly one initialize and one tools/list — a double-started server would answer
+    // each request twice — and every id-less frame must be that one notification kind.
     assert.deepEqual(
-      frames.map((frame) => frame.id),
+      frames.filter((frame) => frame.id !== undefined).map((frame) => frame.id),
       [1, 2],
       `expected exactly one initialize and one tools/list response; frames=${JSON.stringify(frames)}`,
     );
+    for (const frame of frames.filter((candidate) => candidate.id === undefined)) {
+      assert.equal(
+        frame.method,
+        "notifications/tools/list_changed",
+        `unexpected server-initiated frame: ${JSON.stringify(frame)}`,
+      );
+    }
     assert.equal(stdoutBuffer, "", `incomplete stdout frame: ${JSON.stringify(stdoutBuffer)}`);
   } catch (error) {
     throw new Error(

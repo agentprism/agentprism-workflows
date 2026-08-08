@@ -113,7 +113,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
         `runId: ${acceptedRunId}\n` +
         `Call workflow with action="await" and this runId to wait for its result, or ` +
         `action="inspect" for an immediate status snapshot. If a live run-monitor panel ` +
-        `is shown for this run, it self-updates and pushes status into your context — ` +
+        `is shown for this run, it self-updates and reports phase starts, pauses, and terminal outcomes — ` +
         `do not poll inspect for status.`,
     );
     assert.equal(controlled.calls.length, 1);
