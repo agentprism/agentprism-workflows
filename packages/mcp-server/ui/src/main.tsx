@@ -31,12 +31,33 @@ import {
   modelContextPushKey,
   nextPushDelayMs,
 } from "./model-context.js";
+import {
+  getPiStreamHostContext,
+  parseUiResultPatch,
+  PiStreamFold,
+} from "./pi-stream.js";
 import { nextErrorBackoffMs, nextIdleDelayMs, POLL_MS, shouldGiveUp } from "./poll-backoff.js";
+import { classifyReadError } from "./read-error.js";
 import { extractSkeleton } from "./skeleton.js";
 import type { Skeleton } from "./skeleton.js";
-import { agentCount, createRunModel, foldRecord } from "./state.js";
+import { agentCount, createRunModel, foldRecord, seedStaticRunModel } from "./state.js";
 import type { RunModel, RunStatus } from "./state.js";
 import "./style.css";
+
+/**
+ * The live-update channel the panel resolved for this host:
+ *   - "resource": the events resource read works — the primary channel, polled every ~2s. Its
+ *     behavior is unchanged from a resource-capable host; the two other modes only ever engage on
+ *     hosts where the resource read is impossible.
+ *   - "stream": a pi (pi-mcp-adapter) eager stream — the server pushes cursor-bearing event windows
+ *     as notifications and the panel folds them; no polling of any kind.
+ *   - "static": the host serves neither app-originated resource reads nor the pi stream — the panel
+ *     renders from the tool delivery alone and states honestly that live updates are unsupported.
+ */
+type HostMode = "resource" | "stream" | "static";
+
+/** Banner shown in the static fallback: honest, and never the transient reconnect spinner. */
+const STATIC_UNSUPPORTED_MESSAGE = "Live updates aren't supported by this host; showing the last delivered state.";
 
 interface EventsDoc {
   schemaVersion: number;
@@ -76,6 +97,32 @@ function budgetFromResult(result: CallToolResult | null): number | null | undefi
   return typeof budget === "number" || budget === null ? budget : undefined;
 }
 
+const RUN_STATUSES: readonly RunStatus[] = [
+  "pending",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "aborted",
+];
+
+/**
+ * Extract the static-fallback seed from a tool result's structuredContent — the run status and
+ * workflow name a resource-less host still delivers (foreground calls return a terminal status;
+ * background calls return "running"). Used only when the panel resolves the static host class; on
+ * every live-channel host the event stream supersedes it.
+ */
+function staticSeedFromResult(result: CallToolResult | null): StaticSeed | undefined {
+  const structured = result?.structuredContent as
+    | { status?: unknown; workflowName?: unknown }
+    | undefined;
+  if (!structured) return undefined;
+  const seed: StaticSeed = {};
+  if (RUN_STATUSES.includes(structured.status as RunStatus)) seed.status = structured.status as RunStatus;
+  if (typeof structured.workflowName === "string") seed.workflowName = structured.workflowName;
+  return seed.status === undefined && seed.workflowName === undefined ? undefined : seed;
+}
+
 /** Parse the events resource read into the shared document, mirroring the skeleton read's shape. */
 function eventsDocFromResource(result: { contents: readonly unknown[] }): EventsDoc | undefined {
   const text = (result.contents as Array<{ text?: unknown }>).find(
@@ -95,6 +142,14 @@ interface MonitorState {
   /** Latched once the poll loop gives up for good (bounded consecutive faults); render is stale. */
   disconnected: boolean;
   fatal: string | undefined;
+  /** The live-update channel resolved for this host (see HostMode). */
+  mode: HostMode;
+}
+
+/** Static-fallback seed extracted from the tool call's own delivery (the only data such a host gives). */
+interface StaticSeed {
+  status?: RunStatus;
+  workflowName?: string;
 }
 
 /**
@@ -108,30 +163,90 @@ interface MonitorState {
  * explicit streamId the query form requires. Idle polls back off (2s→4s→8s→cap) and reset on new
  * events; a bounded run of read faults gives up for good rather than retrying a dead run forever.
  */
-function useRunModel(app: App | null, runId: string | undefined, tornDown: boolean): MonitorState {
+function useRunModel(
+  app: App | null,
+  runId: string | undefined,
+  tornDown: boolean,
+  staticSeed: StaticSeed | undefined,
+): MonitorState {
   const modelRef = useRef<RunModel | null>(null);
   const [, setVersion] = useState(0);
   const [connectionLost, setConnectionLost] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
   const [fatal, setFatal] = useState<string | undefined>(undefined);
+  const [mode, setMode] = useState<HostMode>("resource");
+  // The seed is read once when the panel resolves the static fallback; keep it in a ref so the effect
+  // (keyed on app/runId/tornDown) does not re-run — and re-latch — every time the tool result mutates.
+  const staticSeedRef = useRef<StaticSeed | undefined>(staticSeed);
+  staticSeedRef.current = staticSeed;
 
   useEffect(() => {
     if (!app || runId === undefined || tornDown) return;
     let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let backoffMs = POLL_MS;
-    let idleDelayMs = POLL_MS;
-    let consecutiveFailures = 0;
-    let finalConfirmDone = false;
     modelRef.current = createRunModel(runId);
     setFatal(undefined);
     setConnectionLost(false);
     setDisconnected(false);
     setVersion((version) => version + 1);
-
     const bump = () => setVersion((version) => version + 1);
+
+    // --- Host classification, positive fast path: pi advertises its push channel in hostContext. ---
+    const piStream = getPiStreamHostContext(app.getHostContext() as Record<string, unknown> | undefined);
+
+    // Shared pi-stream fold path, reused whether the channel is discovered via hostContext (below) or
+    // via a late ui-result-patch notification arriving in resource/static mode.
+    let fold: PiStreamFold | undefined;
+    const previousNotificationHandler = app.fallbackNotificationHandler;
+    const restoreNotificationHandler = () => {
+      app.fallbackNotificationHandler = previousNotificationHandler;
+    };
+
+    const enterStreamMode = (uiStreamId: string) => {
+      // Discard any resource-poll fault state — the pi stream is the live channel now, not a fallback.
+      setConnectionLost(false);
+      setDisconnected(false);
+      fold = new PiStreamFold(uiStreamId);
+      setMode("stream");
+    };
+
+    const foldFrame = (notification: unknown): void => {
+      const parsed = parseUiResultPatch(notification);
+      if (parsed === undefined) return;
+      // A ui-result-patch arriving without a prior hostContext advertisement (belt-and-suspenders for
+      // "OR ui-result-patch notifications arrive"): adopt the stream on the first frame.
+      if (fold === undefined) enterStreamMode(parsed.envelope.streamId);
+      const model = modelRef.current;
+      if (model && fold && fold.fold(model, parsed)) bump();
+    };
+
+    // Install the notification handler for BOTH modes: in stream mode it is the only channel; in
+    // resource/static mode it lets a late pi frame upgrade the panel to the stream. A resource-capable
+    // host never emits these, so the resource poll below stays byte-identical there.
+    app.fallbackNotificationHandler = async (notification) => {
+      if (!cancelled) foldFrame(notification);
+      await previousNotificationHandler?.(notification);
+    };
+
+    if (piStream) {
+      // pi eager stream: no polling of any kind (an app-originated read is -32601 and every
+      // app-originated tools/call would wake the agent). Fold server-pushed windows only.
+      enterStreamMode(piStream.streamId);
+      return () => {
+        cancelled = true;
+        restoreNotificationHandler();
+      };
+    }
+
+    // --- Resource poll path (primary channel on capable hosts; unchanged behavior there). ---
+    setMode("resource");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let backoffMs = POLL_MS;
+    let idleDelayMs = POLL_MS;
+    let consecutiveFailures = 0;
+    let finalConfirmDone = false;
+
     const schedule = (delayMs: number) => {
-      if (cancelled) return;
+      if (cancelled || fold !== undefined) return;
       if (timer !== undefined) clearTimeout(timer);
       timer = setTimeout(() => void poll(), delayMs);
     };
@@ -148,6 +263,17 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
       backoffMs = nextErrorBackoffMs(backoffMs);
       schedule(backoffMs);
     };
+    const enterStaticMode = () => {
+      // A host that answers app-originated resource reads with -32601 will never serve them: this is
+      // a permanent host property, NOT a transient fault. Stop the poll for good, drop any spinner,
+      // and render the honest static state seeded from the tool delivery.
+      if (timer !== undefined) clearTimeout(timer);
+      setConnectionLost(false);
+      setDisconnected(false);
+      modelRef.current = seedStaticRunModel(runId, staticSeedRef.current);
+      setMode("static");
+      bump();
+    };
     const eventsUri = (streamId: string | undefined): string =>
       streamId === undefined
         ? // Bootstrap: canonical read has no query and returns the current streamId without
@@ -156,35 +282,36 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
         : `workflow://runs/${runId}/events?after=${modelRef.current?.cursor ?? 0}&limit=${PAGE_LIMIT}&streamId=${streamId}`;
 
     const onReadError = (error: unknown): void => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("STREAM_MISMATCH") || message.includes("CURSOR_AHEAD")) {
-        // Stream generation changed (run deleted/recreated): rebuild and re-bootstrap the stream.
-        modelRef.current = createRunModel(runId);
-        consecutiveFailures = 0;
-        idleDelayMs = POLL_MS;
-        bump();
-        schedule(POLL_MS);
-      } else if (
-        message.includes("RUN_NOT_FOUND") ||
-        message.includes("ORPHANED_LOG") ||
-        message.includes("No workflow run found")
-      ) {
-        setFatal("This run is no longer present in the run store.");
-      } else {
-        degrade();
+      switch (classifyReadError(error)) {
+        case "stream-rebuild":
+          // Stream generation changed (run deleted/recreated): rebuild and re-bootstrap the stream.
+          modelRef.current = createRunModel(runId);
+          consecutiveFailures = 0;
+          idleDelayMs = POLL_MS;
+          bump();
+          schedule(POLL_MS);
+          return;
+        case "run-not-found":
+          setFatal("This run is no longer present in the run store.");
+          return;
+        case "host-no-app-resources":
+          enterStaticMode();
+          return;
+        default:
+          degrade();
       }
     };
 
     const poll = async (): Promise<void> => {
       const model = modelRef.current;
-      if (cancelled || !model) return;
+      if (cancelled || fold !== undefined || !model) return;
       let doc: EventsDoc | undefined;
       try {
         const result = await app.readServerResource({ uri: eventsUri(model.streamId) });
-        if (cancelled) return;
+        if (cancelled || fold !== undefined) return;
         doc = eventsDocFromResource(result);
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || fold !== undefined) return;
         onReadError(error);
         return;
       }
@@ -241,6 +368,7 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
     return () => {
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
+      restoreNotificationHandler();
     };
   }, [app, runId, tornDown]);
 
@@ -249,6 +377,7 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
     connectionLost,
     disconnected,
     fatal,
+    mode,
   };
 }
 
@@ -308,6 +437,14 @@ function useSkeleton(app: App | null, runId: string | undefined): Skeleton | und
     if (!app || runId === undefined) return;
     let cancelled = false;
     setSkeleton(undefined);
+    // A pi (or any) host that advertises the push channel has no app-originated resource reads, so
+    // the script read is a guaranteed -32601. Skip it entirely and let the graph use the timing-based
+    // wave layout — hide the skeleton-derived preview gracefully rather than firing a doomed read.
+    if (getPiStreamHostContext(app.getHostContext() as Record<string, unknown> | undefined)) {
+      return () => {
+        cancelled = true;
+      };
+    }
     void (async () => {
       try {
         const result = await app.readServerResource({ uri: `workflow://runs/${runId}/script` });
@@ -316,8 +453,13 @@ function useSkeleton(app: App | null, runId: string | undefined): Skeleton | und
           (content) => typeof content.text === "string",
         )?.text as string | undefined;
         if (text !== undefined) setSkeleton(extractSkeleton(text));
-      } catch {
-        // Fall back silently; the wave view needs nothing beyond the event stream.
+      } catch (error) {
+        // Classify the failure the same way the events poll does rather than swallowing it blindly.
+        // A host with no app-originated resource reads answers this script read with -32601 exactly
+        // as it does the events read (host-no-app-resources): a permanent host property, so hide the
+        // skeleton-derived layout GRACEFULLY (the graph falls back to the timing-based wave view)
+        // instead of surfacing an error. Missing/unparseable scripts degrade the same silent way.
+        void classifyReadError(error);
       }
     })();
     return () => {
@@ -405,6 +547,7 @@ function MonitorBody({
   disconnected,
   fatal,
   budget,
+  mode,
 }: {
   app: App;
   model: RunModel;
@@ -413,6 +556,7 @@ function MonitorBody({
   disconnected: boolean;
   fatal: string | undefined;
   budget: number | null | undefined;
+  mode: HostMode;
 }) {
   const [view, setView] = useState<{ kind: "graph" } | { kind: "detail"; target: NodeSelection }>({
     kind: "graph",
@@ -423,7 +567,10 @@ function MonitorBody({
   // Once the poll loop has given up for good the panel can no longer act on the run: freeze the
   // live affordances (Stop) and show a stale marker instead of the transient "reconnecting…".
   const live = !model.finalized && model.status !== "completed" && !disconnected;
-  const bannerMessage = fatal ?? model.banner;
+  // The static fallback host has no live channel: state honestly that updates are unsupported rather
+  // than ever showing the reconnect spinner. run-store-fatal / paused-failed banners still win.
+  const bannerMessage =
+    fatal ?? model.banner ?? (mode === "static" ? STATIC_UNSUPPORTED_MESSAGE : undefined);
   const bannerIsError =
     fatal !== undefined || model.status === "failed" || model.status === "aborted";
   const usage = model.usage;
@@ -512,7 +659,13 @@ function RunMonitor() {
   useHostFonts(app, app?.getHostContext());
 
   const runId = runIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
-  const { model, connectionLost, disconnected, fatal } = useRunModel(app, runId, tornDown);
+  const staticSeed = staticSeedFromResult(toolResult);
+  const { model, connectionLost, disconnected, fatal, mode } = useRunModel(
+    app,
+    runId,
+    tornDown,
+    staticSeed,
+  );
   const skeleton = useSkeleton(app, runId);
   const budget = budgetFromResult(toolResult);
   useModelContextSync(app, model, tornDown);
@@ -534,6 +687,7 @@ function RunMonitor() {
       disconnected={disconnected}
       fatal={fatal}
       budget={budget}
+      mode={mode}
     />
   );
 }

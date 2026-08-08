@@ -23,6 +23,7 @@ import { RunEventLogError } from "@automatalabs/workflows";
 import { z } from "zod";
 
 import { RUN_MONITOR_HTML } from "./generated/run-monitor-html.js";
+import { PI_STREAM_MODE_EAGER, PI_STREAM_TOOL_META_KEY } from "./pi-stream.js";
 import type { WorkflowRunEventsResourceDocument } from "./workflow-resources.js";
 import { workflowEventsOutputShape } from "./workflow-tool-output.js";
 
@@ -111,7 +112,18 @@ export function registerWorkflowAppUi(mcp: McpServer, deps: WorkflowAppUiDeps): 
           .describe("Expected event stream generation; mismatch fails so the reader can restart."),
       },
       outputSchema: workflowEventsOutputShape,
-      _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI, visibility: ["app"] } },
+      // Same panel + the same pi eager streamMode declaration as the `workflow` tool, kept
+      // consistent so the pi push channel is described identically wherever the panel is attached.
+      // Inert on pi in practice: this tool is app-only and, in pi stream mode, the panel does no
+      // polling of any kind (an app-originated tools/call would wake the agent), so pi never opens a
+      // stream session for it — the live channel is driven entirely by the `workflow` call.
+      _meta: {
+        ui: {
+          resourceUri: RUN_MONITOR_RESOURCE_URI,
+          visibility: ["app"],
+          [PI_STREAM_TOOL_META_KEY]: PI_STREAM_MODE_EAGER,
+        },
+      },
     },
     ({ runId, after, limit, streamId }) => {
       try {
