@@ -1,5 +1,75 @@
 # @automatalabs/mcp-server
 
+## 0.26.5
+
+### Patch Changes
+
+- @automatalabs/repl-engine@0.1.4
+- @automatalabs/workflows@0.46.8
+
+## 0.26.4
+
+### Patch Changes
+
+- 1a2f27d: Generate the run-monitor MCP App panel at build time instead of committing it.
+
+  `packages/mcp-server/src/generated/run-monitor-html.ts` (the Vite single-file build of the
+  `ui://` run-monitor panel, exported as `RUN_MONITOR_HTML`) is no longer checked in — it is a build
+  product, now gitignored and produced by a single shared, idempotent generator
+  (`scripts/ensure-run-monitor-html.mjs`). The package's `build`, `test`, `typecheck`, and
+  `prepublishOnly` scripts each run the generator first, and the root `postinstall` runs it too, so a
+  pristine checkout, a cold `test`/`typecheck`, and the publish path all get a correct artifact with
+  no manual `build:ui` step. The generator rebuilds only when the UI sources change (content-hash
+  staleness check) and no-ops otherwise. `build:ui` remains as a force-rebuild convenience.
+
+  No user-facing behavior change: the served resource content and its `ui://agentprism-workflow/run-monitor.html`
+  URI are unchanged. This removes a staleness footgun where the committed panel could drift from the
+  UI sources because nothing in the build, publish, or CI paths regenerated it.
+
+- Updated dependencies [1a2f27d]
+  - @automatalabs/workflows@0.46.7
+  - @automatalabs/repl-engine@0.1.3
+
+## 0.26.3
+
+### Patch Changes
+
+- dbddbce: Give the bounded `await` drain loop an in-loop deadline check.
+
+  `waitForTerminal` relied solely on a `setTimeout(waitMs)` to end a bounded `await`. When the event
+  watcher's catch-up monopolized the event loop, that timer could not fire and the `await` overran
+  its `waitMs` badly. The catch-up itself is now bounded (see `@automatalabs/workflow-engine`), and
+  the drain loop additionally checks the deadline each iteration, so the `await` returns within its
+  bound even if the timer callback is briefly starved. Adds an automated `/healthz`-under-drain
+  acceptance test on a real daemon at the ≥20,000-record / ≥5,000-record-lag magnitude. No contract
+  change.
+
+- f7d5c61: Daemon succession: new clients supersede a stale daemon, and stale daemons drain and exit.
+
+  Previously, when a stdio shim's version/env fingerprint diverged from the live daemon, it
+  restarted the daemon only while it was idle; a **busy** divergent daemon was adopted with just
+  a warning. Because every new client added a session and reset the daemon's idle clock, new
+  clients were precisely what kept a superseded daemon alive — so it never died and served
+  out-of-date code to those clients indefinitely.
+
+  Now a shim whose fingerprint diverges from the live daemon **never adopts it** (busy or idle).
+  It spawns a current-version successor on an ephemeral port, atomically repoints `daemon.json`
+  at the successor, and connects there. The superseded daemon — whose pid no longer matches
+  `daemon.json` — becomes a **lame duck**: it rejects new MCP sessions at admission with a clear
+  error, keeps serving its existing sessions and running workflows to completion, and exits once
+  idle within the existing idle-TTL bound (lame-duck status neither resets nor extends the TTL).
+  If discovery is ever repointed back at it, it resumes normal service.
+
+  `/healthz` (and `daemon status`) now report the daemon's `version` and `lameDuck` status, and
+  the shim logs succession loudly (old version/pid → new version/pid, with the reason). The
+  divergent-but-busy adoption warning is gone because the adoption path is gone. Split-brain
+  safety is unchanged: the pid-guarded `daemon.json` and per-run leases keep two live daemons
+  over one run store safe, and the successor never disturbs the predecessor's in-flight runs or
+  sessions.
+
+  - @automatalabs/workflows@0.46.6
+  - @automatalabs/repl-engine@0.1.2
+
 ## 0.26.2
 
 ### Patch Changes

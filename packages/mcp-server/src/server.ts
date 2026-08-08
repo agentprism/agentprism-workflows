@@ -1041,6 +1041,7 @@ async function waitForTerminal(
       return;
     }
 
+    const deadline = Date.now() + waitMs;
     timer = setTimeout(() => finish("timeout"), waitMs);
     if (localPromise) {
       void localPromise.then(
@@ -1069,6 +1070,14 @@ async function waitForTerminal(
       void (async () => {
         try {
           while (!done) {
+            // The bounded RunEventStream yields the event loop between records, so the waitMs
+            // setTimeout above still fires under a heavy catch-up; this in-loop check is the
+            // belt-and-suspenders bound the daemon investigation asked for, ending the drain at
+            // the deadline even if the timer callback is itself briefly starved.
+            if (Date.now() >= deadline) {
+              finish("timeout");
+              break;
+            }
             const next = await activeStream.next();
             if (next.done) break;
             consumeRecord(next.value);
