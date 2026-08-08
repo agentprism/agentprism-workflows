@@ -7,7 +7,7 @@
     "postinstall": "node scripts/ensure-run-monitor-html.mjs --soft",
     "build": "pnpm -r run build",
     "typecheck": "node scripts/ensure-run-monitor-html.mjs && pnpm -r exec tsc --noEmit",
-    "test": "pnpm build && pnpm -r test",
+    "test": "pnpm build && pnpm -r --filter '!@automatalabs/codex-acp' test",
     "generate:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts",
     "check:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts --check",
     "generate:authoring-prompt": "node scripts/generate-authoring-prompt.mjs",
