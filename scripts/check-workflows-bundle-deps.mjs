@@ -37,7 +37,8 @@
 // reach across lines to hide a real import on another line. Node built-ins only.
 //
 // HOW IT IS ENFORCED. Wired into the packages/workflows `build` script (right after esbuild emits the
-// bundle), the same idiom mcp-server's `build:ui` uses to call a repo script. `pnpm build` runs it in
+// bundle), the same idiom the build scripts use to call a repo script (e.g. the shared
+// scripts/ensure-run-monitor-html.mjs both package builds invoke first). `pnpm build` runs it in
 // CI's "Build & test" required job, in the pre-push hook, and in release.yml — every path that emits
 // the bundle validates it. Run standalone against an already-built tree with:
 //   node scripts/check-workflows-bundle-deps.mjs
