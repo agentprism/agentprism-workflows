@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 0.36.2
+
+### Patch Changes
+
+- 05af591: Runtime override: force wrapped `@anthropic-ai/claude-agent-sdk` to 0.3.225 (upstream released; `@agentclientprotocol/claude-agent-acp` still pins older — per the dependency-gate runbook, drop the override when the adapter catches up).
+
 ## 0.36.1
 
 ### Patch Changes
