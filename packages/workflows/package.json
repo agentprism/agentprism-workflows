@@ -1,6 +1,6 @@
 {
   "name": "@automatalabs/workflows",
-  "version": "0.46.5",
+  "version": "0.46.7",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
@@ -39,7 +39,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -b && esbuild ../mcp-server/src/entry.ts --bundle --platform=node --format=esm --target=node22 --external:@automatalabs/* --outfile=dist/mcp-server.js && node ../../scripts/check-workflows-bundle-deps.mjs",
+    "build": "node ../../scripts/ensure-run-monitor-html.mjs && tsc -b && esbuild ../mcp-server/src/entry.ts --bundle --platform=node --format=esm --target=node22 --external:@automatalabs/* --outfile=dist/mcp-server.js && node ../../scripts/check-workflows-bundle-deps.mjs",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "test": "tsx --test \"test/**/*.test.ts\"",
     "prepublishOnly": "pnpm run build"
