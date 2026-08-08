@@ -96,5 +96,12 @@ jobs:
       # AGENTPRISM_LIVE_E2E is intentionally left UNSET here so the gated live
       # end-to-end test is skipped — this keeps CI deterministic and
       # credential-free.
+      # codex-acp is EXCLUDED on purpose (owner decision, 2026-08-07): its suite is
+      # UPSTREAM's own vitest tests for vendored code we sync mechanically — upstream CI
+      # runs them, and our acp-agents integration tests cover the adapter behavior we
+      # depend on. It entered `pnpm -r test` when upstream switched to pnpm; our merges
+      # must not gate on upstream test infra (their vitest worker pools also crash in
+      # the docker runners). Run it explicitly during codex-acp sync maintenance:
+      # pnpm --filter @automatalabs/codex-acp test
       - name: Test
-        run: pnpm -r test
+        run: pnpm -r --filter '!@automatalabs/codex-acp' test

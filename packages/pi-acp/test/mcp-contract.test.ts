@@ -873,6 +873,24 @@ test("M5 refresh discards pre-commit aliases and poisons the session after mutat
 
 test("M4 turn cancellation suppresses every late remote progress and settlement", async () => {
   const setup = fakeDeps();
+  // CI-robust headroom for the timeout that is NOT this test's subject.
+  // The subject is turn-cancellation suppression: `turn.abort()` (below)
+  // must win settleMcpOperation's priority race (lifecycle > session >
+  // peer > timeout) so the operation rejects with the turn-cancellation
+  // "failed" reason. fakeDeps defaults mcpTimeoutMs to 20 ms — a tight
+  // absolute timer that, on a load-starved scheduler, can fire in the
+  // gap between `tool.execute()` and `turn.abort()` and preempt the
+  // abort, rejecting with "timed out" instead (the observed hosted-CI
+  // flake: "MCP tool mcp__updates__progress timed out"). That is a test
+  // calibration issue, not a production race: production defaults this
+  // timeout to 60 000 ms (DEFAULT_REQUEST_TIMEOUT_MSEC), where an abort
+  // always wins. Pinning the same production headroom lets the abort win
+  // deterministically under any load while every suppression assertion
+  // below is unchanged — the late progress/settlement are still fully
+  // proven suppressed. The timer is cleared the instant the abort
+  // settles the op (finish() -> timer.abort() -> realSleep clearTimeout),
+  // so no 60 s timer leaks past the test.
+  setup.deps.mcpTimeoutMs = 60_000;
   const remote = deferred<Awaited<ReturnType<ReturnType<typeof fakeMcpHandle>["callTool"]>>>();
   let sendProgress: ((value: unknown) => void) | undefined;
   setup.deps.connectMcpClient = async () => fakeMcpHandle({
