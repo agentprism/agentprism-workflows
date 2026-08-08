@@ -1,5 +1,14 @@
 # @automatalabs/acp-agents
 
+## 0.36.3
+
+### Patch Changes
+
+- 7e1f1db: Track the wrapped Claude agent runtime forward: root pnpm override pins
+  @anthropic-ai/claude-agent-sdk to 0.3.226 (npm latest) until
+  @agentclientprotocol/claude-agent-acp catches up, per the ACP dependency
+  freshness runbook.
+
 ## 0.36.2
 
 ### Patch Changes
