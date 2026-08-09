@@ -77,7 +77,7 @@ import type {
   BrokerSession,
   BrokerTurn,
 } from "@automatalabs/repl-engine";
-import { OUTPUT_MAX_BYTES } from "@automatalabs/repl-engine";
+import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "@automatalabs/repl-engine";
 import { workflowProjectPaths } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -943,76 +943,76 @@ test("every repl action returns the doc's machine-readable shape as structuredCo
   }
 });
 
-test("eval-through-MCP round trip applies the output caps to the FINAL result (256 lines / 10 KB, whichever trips first, marker included) and the $N refs reach the truncated values", async () => {
+test("eval-through-MCP round trip applies the output caps to the FINAL result (4000 lines / 50 KB, whichever trips first, marker included) and the $N refs reach the truncated values", async () => {
   const daemon = await startReplDaemon(new FakeRunner());
   try {
     const session = await connectHttp(daemon.url);
     try {
       const PROJECT = makeProjectDir("repl-caps");
-      // The LINE cap: 300 console.log calls render 300 preview lines. The
-      // caps apply to the FINAL assembled tool result (phase-E review
+      // The caps apply to the FINAL assembled tool result (phase-E review
       // rejection: the completion line and the metadata sections used to
-      // be appended UNcapped, shipping 257 wire lines) — at most 256
-      // lines reach the wire, and a truncation marker ships instead of
-      // the dropped tail (its own budget is reserved inside the caps).
+      // be appended UNcapped). Large lines so the BYTE cap (50 KB) trips
+      // well before the 4000-line cap; a truncation marker ships instead
+      // of the dropped tail (its own budget is reserved inside the caps).
       const big = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
-        code: 'for (let i = 0; i < 300; i++) console.log("line-" + i);',
+        code: 'for (let i = 0; i < 60; i++) console.log("line-" + i + "-" + "y".repeat(1000));',
       });
       assert.ok(!isErrorResult(big), textOf(big));
       const text = textOf(big);
       const lines = text.split("\n");
-      assert.ok(lines.length <= 256, `the 256-line cap holds on the wire: ${lines.length}`);
-      assert.ok(text.includes("tool result truncated"), `the truncation marker ships: ${text.slice(0, 120)}`);
+      assert.ok(lines.length <= OUTPUT_MAX_LINES, `the line cap holds on the wire: ${lines.length}`);
+      assert.ok(Buffer.byteLength(text) <= OUTPUT_MAX_BYTES, `the byte cap holds: ${Buffer.byteLength(text)} bytes`);
+      const bigSc = (big as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      assert.equal(bigSc.outputTruncated, true, "the console output was truncated by the byte cap");
       // The kept lines carry their $N addresses (the doc's "output is
       // addressed, not just truncated").
-      assert.ok(text.startsWith('[$1 · string · 6B] "line-0"'), text.slice(0, 80));
-      assert.ok(text.includes('"line-2'), "the kept head lines are the earliest lines");
-      assert.ok(!text.includes("line-299"), "the tail beyond the cap is never shipped");
+      assert.ok(text.startsWith("[$1 · string · "), text.slice(0, 80));
+      assert.ok(text.includes('"line-0-'), "the kept head lines are the earliest lines");
+      assert.ok(!text.includes("line-59-"), "the tail beyond the cap is never shipped");
       // The truncated values stay reachable through the $N refs the kept
-      // lines carry (the cap costs reads, never data).
-      const sliced = await repl(session, { action: "eval", projectDir: PROJECT, code: 'console.log($300); "ok"' });
+      // lines carry (the cap costs reads, never data). $60 is the 60th log.
+      const sliced = await repl(session, { action: "eval", projectDir: PROJECT, code: 'console.log($60); "ok"' });
       assert.ok(!isErrorResult(sliced), textOf(sliced));
-      assert.ok(textOf(sliced).includes('"line-299"'), textOf(sliced));
-      // The BYTE cap: 100 two-kilobyte strings trip the 10 KB cap long
-      // before the 256-line cap; only the lines that fit are emitted,
-      // and the marker ships.
+      assert.ok(textOf(sliced).includes("line-59-"), textOf(sliced));
+      // The BYTE cap: two-kilobyte strings trip the 50 KB cap long before
+      // the line cap; only the lines that fit are emitted.
       const heavy = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
-        code: 'for (let i = 0; i < 100; i++) console.log("B".repeat(2000) + i);',
+        code: 'for (let i = 0; i < 40; i++) console.log("B".repeat(2000) + i);',
       });
       assert.ok(!isErrorResult(heavy), textOf(heavy));
       const heavyText = textOf(heavy);
-      assert.ok(heavyText.split("\n").length < 100, "the byte cap tripped before the line cap");
-      assert.ok(Buffer.byteLength(heavyText) <= 10_000, `the 10 KB cap: ${Buffer.byteLength(heavyText)} bytes`);
+      assert.ok(heavyText.split("\n").length < 40, "the byte cap tripped before the line cap");
+      assert.ok(Buffer.byteLength(heavyText) <= OUTPUT_MAX_BYTES, `the byte cap: ${Buffer.byteLength(heavyText)} bytes`);
       // (The broker already capped the console lines, so the final text
       // fits without a marker; the marker-on-byte-cap path is pinned by
       // capFinalText's unit tests.)
       // The full value behind a capped line is one global: addressable by
-      // its ref in a later eval. The 300 prior logs created $1..$300, the
-      // sliced eval's log created $301, and the heavy loop created
-      // $302..$401 — the last one is "B" × 2000 + "99" (length 2002),
+      // its ref in a later eval. The 60 prior logs created $1..$60, the
+      // sliced eval's log created $61, and the heavy loop created
+      // $62..$101 — the last one is "B" × 2000 + "39" (length 2002),
       // intact.
-      const length = await repl(session, { action: "eval", projectDir: PROJECT, code: "$401.length" });
+      const length = await repl(session, { action: "eval", projectDir: PROJECT, code: "$101.length" });
       assert.ok(!isErrorResult(length), textOf(length));
       assert.ok(textOf(length).includes("result: 2002"), textOf(length));
       // METADATA-heavy results are capped too (phase-E review rejection:
       // pending ids, checkpoints, completed ids, and timeout text were
-      // appended uncapped): 300 parked checkpoints render 300 checkpoint
+      // appended uncapped): 2500 parked checkpoints render 2500 checkpoint
       // lines plus the result/pending sections — the final text is
-      // capped at 256 lines with the marker, head sections kept in
-      // order.
+      // capped with the marker, head sections kept in order.
+      const CHECKPOINTS = 2500;
       const meta = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
-        code: 'for (let i = 0; i < 300; i++) checkpoint("q-" + i); "asked"',
+        code: `for (let i = 0; i < ${CHECKPOINTS}; i++) checkpoint("q-" + i); "asked"`,
       });
       assert.ok(!isErrorResult(meta), textOf(meta));
       const metaText = textOf(meta);
       const metaLines = metaText.split("\n");
-      assert.ok(metaLines.length <= 256, `metadata-heavy result capped: ${metaLines.length}`);
+      assert.ok(metaLines.length <= OUTPUT_MAX_LINES, `metadata-heavy result capped: ${metaLines.length}`);
       assert.ok(metaText.includes("tool result truncated"), "the metadata cap marker ships");
       assert.ok(metaText.includes("pending:"), "the pending section is kept (head)");
       assert.ok(metaText.includes("checkpoint"), "the checkpoint section is kept (head)");
@@ -1034,7 +1034,7 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
       const scPending = scMeta.pending as string[];
       assert.equal(
         scPending.length + (truncated.pending?.elided ?? 0),
-        300,
+        CHECKPOINTS,
         "the structured pending reconciles to the whole registry",
       );
       assert.ok(scPending.every((id, index) => id === `c${index + 1}`), "dense and in order — no holes");
@@ -1044,7 +1044,7 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
       const scCheckpoints = scMeta.checkpoints as unknown[];
       assert.equal(
         scCheckpoints.length + (truncated.checkpoints?.elided ?? 0),
-        300,
+        CHECKPOINTS,
         "the structured checkpoints reconcile to the whole registry",
       );
       assert.ok(typeof truncated.checkpoints?.ref === "string", "the elided checkpoint tail carries its continuation ref");
@@ -1062,7 +1062,7 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
         ...(truncated.pending !== undefined ? [truncated.pending.ref!] : []),
       ];
       let hops = 0;
-      while (queue.length > 0 && hops < 8) {
+      while (queue.length > 0 && hops < 40) {
         const refRead = await repl(session, {
           action: "status",
           projectDir: PROJECT,
@@ -1089,9 +1089,9 @@ test("eval-through-MCP round trip applies the output caps to the FINAL result (2
         hops++;
       }
       if (truncated.pending !== undefined) {
-        assert.equal(recovered.size, 300, "every elided pending id was recovered through the ref chain");
+        assert.equal(recovered.size, CHECKPOINTS, "every elided pending id was recovered through the ref chain");
       }
-      assert.equal(questions.size, 300, "every elided checkpoint question was recovered through the ref chain");
+      assert.equal(questions.size, CHECKPOINTS, "every elided checkpoint question was recovered through the ref chain");
     } finally {
       await session.dispose();
     }

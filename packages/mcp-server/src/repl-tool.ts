@@ -1135,17 +1135,45 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
     "repl",
     {
       description:
-        "One persistent QuickJS-in-WASM VM per projectDir, addressed by the same project model as the workflow tool. " +
-        "State (bindings, pending subagent calls, checkpoints) lives in the VM between calls and survives MCP-session " +
-        "churn and daemon restarts: every eval and every settlement drain that changed state persists the workspace " +
-        "to the daemon's per-project repl store, and the first touch of a stored workspace restores it and reconciles " +
-        "every outstanding call (settle from the store / re-attach via ACP session/load / re-issue). A stored snapshot " +
-        "that refuses (corrupt, a format upgrade, or a wasm-binary mismatch) is surfaced loudly and never silently " +
-        "discarded — reset drops it and starts fresh. Subagents are ACP sessions via acp-agents (6 concurrent per " +
-        "workspace); console output is captured and previewed. On last-client disconnect the workspace drains " +
-        "in-flight subagent turns to completion (each settlement boundary snapshots) and closes idle children; " +
-        "followUp re-attaches the subagent session lazily on the next connect. Every result carries the machine- " +
-        "readable shape (see the output schema) as structuredContent alongside the bounded text.",
+        "A persistent QuickJS-in-WASM JavaScript VM you drive interactively to orchestrate subagents — one VM per " +
+        "projectDir, addressed by the same project model as the workflow tool. Where workflow runs a deterministic " +
+        "script to completion, repl is the LIVE plane: you write JavaScript with action:\"eval\", and every binding, " +
+        "pending subagent call, raised checkpoint, and logged value PERSISTS in the VM between tool calls — a later " +
+        "eval sees the same variables and awaits the same promises; nothing lives in the transcript. " +
+        // How to write the `code`: the in-VM DSL every calling agent needs.
+        "Inside code (JavaScript; top-level await is allowed, top-level return is a syntax error; console output is " +
+        "captured) the host bridge provides: agent(modelSpec, task, opts?) → Promise — spawn an ACP subagent on a " +
+        "registry built-in (currently Claude, Codex, OpenCode, and pi) or a registered custom agent (opts: a " +
+        "structured-output JSON schema validated per call, cwd, backend config); checkpoint(question) — park a " +
+        "promise for a human answer, resolved by checkpoint.answer(id, value) in a later eval; and console, whose " +
+        "logged values are captured as addressable $1, $2, … references so you can slice deeper in a later eval " +
+        "(console.log($14.sections.map(s => s.title))) instead of re-running work. Agent handles carry " +
+        "followUp / steer / cancel, which resolve with what actually happened (live injection where the backend " +
+        "supports steering, queued-for-next-turn delivery where it does not). Everything else workflow authors " +
+        "know — parallel, pipeline, verify, judgePanel, gate, retry, loopUntilDry — is plain JavaScript layered on " +
+        "agent(), injected as the guest library. Start-and-don't-await is idiomatic: `const research = agent(...)` " +
+        "returns immediately with the eval and keeps running server-side; await it (or read $N) in a later call. " +
+        "No fs, no net, no timers, and no budget surface. Subagents (6 concurrent per workspace) take stable ids " +
+        "c1, c2, … used by interrupt and status. " +
+        // The action loop.
+        "Actions: eval runs code, drains jobs, settles what it can, and returns immediately — a suspended eval " +
+        "(awaiting a subagent, a checkpoint, or any unsettled promise) lists its pending call ids and resumes its " +
+        "continuation at settlement with no fabricated result; a throw/reject/syntax-error/interrupt renders in " +
+        "output. wait blocks server-side (bounded; default 30 000 ms, max 120 000 ms) until the target calls " +
+        "settle, then returns the same shape. status is ls for the workspace: the binding manifest (name, type, " +
+        "size, provenance), live agents, pending ops, and the $N range — a named status is a first touch, a " +
+        "project-less status lists every open workspace without creating one. interrupt cancels one subagent call " +
+        "(with id) or breaks the running eval (no id). reset tears the workspace down. " +
+        // Durability (kept from the prior description).
+        "State survives MCP-session churn and daemon restarts: every eval and every settlement drain that changed " +
+        "state persists the workspace to the daemon's per-project repl store, and the first touch of a stored " +
+        "workspace restores it and reconciles every outstanding call (settle from the store / re-attach via ACP " +
+        "session/load / re-issue). A stored snapshot that refuses (corrupt, a format upgrade, or a wasm-binary " +
+        "mismatch) is surfaced loudly and never silently discarded — reset drops it and starts fresh. On last-client " +
+        "disconnect the workspace drains in-flight subagent turns to completion (each settlement boundary snapshots) " +
+        "and closes idle children; followUp re-attaches the subagent session lazily on the next connect. Every result " +
+        "carries the machine-readable shape (see the output schema) as structuredContent alongside the bounded text, " +
+        "with guest output kept in fields separate from the orchestration metadata.",
       inputSchema: replToolInputShape,
       outputSchema: replToolOutputShape,
     },

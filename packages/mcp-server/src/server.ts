@@ -95,6 +95,32 @@ const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
 export const SERVER_VERSION = (require("../package.json") as { version: string }).version;
 
+// Server-wide guidance returned in the MCP initialize response (ServerOptions.instructions),
+// surfaced by hosts to orient the calling agent to the two model-facing tools and when to reach
+// for each. Kept short and behavioral — the exhaustive contract lives in each tool's own
+// description and the package README.
+export const SERVER_INSTRUCTIONS = [
+  "This server exposes two model-facing tools for orchestrating multi-agent work. Both spawn " +
+    "subagents over the same ACP backends — the registry built-ins Claude, Codex, OpenCode, and " +
+    "pi, plus any registered custom agents — and key their durable state by an absolute projectDir " +
+    "(required on the shared daemon; defaults to the server's own project in single-project mode). " +
+    "Backend credentials come from each agent's own login (claude, codex, opencode, pi), so there " +
+    "is nothing auth-shaped to configure here.",
+  "• workflow — DETERMINISTIC BATCH orchestration. Supply a JavaScript workflow script (inline or " +
+    "by absolute scriptPath) that fans out agent() subagents and optional checkpoint() gates; it " +
+    "runs to completion in the foreground, or background:true returns a durable runId for bounded " +
+    "action:\"await\"/\"inspect\"/\"stop\" calls, with journaling, replay, and resumeFromRunId. Reach " +
+    "for it when the orchestration is known up front and you want it repeatable and resumable. The " +
+    "user-invocable author-workflow prompt helps write scripts.",
+  "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM you drive " +
+    "incrementally with action:\"eval\"; bindings, pending subagents, checkpoints, and logged $N " +
+    "values persist in the VM between calls and survive daemon restarts. Reach for it when you want " +
+    "to inspect intermediate results and decide the next step adaptively, or keep a human in the " +
+    "loop via checkpoint().",
+  "Rule of thumb: use workflow when you can script the whole plan ahead of time; use repl when you " +
+    "want a live, stateful session that evolves call by call.",
+].join("\n\n");
+
 export { BackgroundRunRegistry, MAX_BACKGROUND_RUNS } from "./project-registry.js";
 
 const TERMINAL_STATUSES = new Set(["paused", "completed", "failed", "aborted"]);
@@ -1215,7 +1241,10 @@ export function createWorkflowServer(
   runner: AgentRunner,
   options: CreateWorkflowServerOptions = {},
 ): WorkflowServer {
-  const mcp = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
+  const mcp = new McpServer(
+    { name: SERVER_NAME, version: SERVER_VERSION },
+    { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
+  );
   let acceptingWork = true;
   // The REPL eval-break channel (phase-F review round 3): the in-process/
   // library server OWNS one by default — the documented no-id interrupt

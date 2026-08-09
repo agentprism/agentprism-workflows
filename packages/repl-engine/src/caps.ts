@@ -1,6 +1,6 @@
 /**
- * Output caps for the `repl` tool result — the doc's limits: **256 lines or
- * 10 KB per tool result, whichever trips first**. Everything beyond the
+ * Output caps for the `repl` tool result — the limits: **4000 lines or
+ * 50 KB per tool result, whichever trips first**. Everything beyond the
  * cap remains reachable through the `$N` refs the capped lines carry (the
  * cap costs reads, never data).
  *
@@ -10,7 +10,7 @@
  * of the canonical serialization (lines joined with `\n`, no trailing
  * newline) — so the cap matches what the client agent actually receives.
  *
- * The 256-line cap counts PHYSICAL lines, not array entries: a rendered
+ * The line cap counts PHYSICAL lines, not array entries: a rendered
  * line may itself contain embedded `\n` characters — the previewer
  * renders property names verbatim (FORMAT.md §5.18), so a name carrying
  * 300 line feeds reaches the tool result as 301 physical lines inside ONE
@@ -20,14 +20,26 @@
  * included (Buffer.byteLength already counts them for the byte cap;
  * `countPhysicalLines` counts them for the line cap).
  *
- * The 10 KB unit is decimal (10 × 1000 bytes), consistent with the
+ * The BYTE cap (50 KB) is the load-bearing bound: a directly emitted
+ * top-level string — a `console.log` argument or the eval result — is
+ * carried whole up to this budget (see `EMISSION_STRING_MAX_CHARS` in
+ * `preview.ts`), so a subagent's answer arrives in one call instead of
+ * being clamped to a 200-char preview. The LINE cap is a flood guard that
+ * must therefore be generous enough not to truncate a single up-to-50 KB
+ * multi-line emission before the byte cap does: a 50 KB markdown answer is
+ * one rendered line whose embedded newlines make it hundreds-to-thousands
+ * of physical lines. 4000 keeps the byte budget the real bound for any
+ * emission averaging ≥ ~13 bytes/line while still capping a pathological
+ * all-newline flood.
+ *
+ * The 50 KB unit is decimal (50 × 1000 bytes), consistent with the
  * preview format's byte-size convention (FORMAT.md §2.2 uses ×1000 units).
  */
 
 /** Maximum lines per tool result. */
-export const OUTPUT_MAX_LINES = 256;
-/** Maximum bytes per tool result (10 KB, decimal units). */
-export const OUTPUT_MAX_BYTES = 10 * 1000;
+export const OUTPUT_MAX_LINES = 4000;
+/** Maximum bytes per tool result (50 KB, decimal units). */
+export const OUTPUT_MAX_BYTES = 50 * 1000;
 
 /** The capped result of `applyOutputCaps`. */
 export interface OutputCapResult {
