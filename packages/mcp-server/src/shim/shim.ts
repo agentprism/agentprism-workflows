@@ -189,6 +189,9 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     return error instanceof TypeError;
   }
 
+  /** Serializes client→daemon forwarding so frames reach the daemon in the order sent. */
+  let sendChain: Promise<void> = Promise.resolve();
+
   async function pumpSend(message: JSONRPCMessage): Promise<void> {
     if (reinitializing) {
       queue.push(message);
@@ -246,7 +249,13 @@ export async function runShim(options: RunShimOptions): Promise<void> {
         }
       }
     }
-    void pumpSend(message);
+    // Forward in the order the client sent. pumpSend is async, so firing each frame
+    // without sequencing let consecutive frames race as concurrent POSTs and reach the
+    // daemon out of order — a client that pipelines `notifications/initialized` with its
+    // first request could have the request processed first. Chaining serializes only the
+    // POST *initiation*: the SDK's send() resolves on the response headers and streams the
+    // reply separately, so concurrent tool calls stay concurrent.
+    sendChain = sendChain.then(() => pumpSend(message)).catch(() => undefined);
   };
 
   let exiting = false;
