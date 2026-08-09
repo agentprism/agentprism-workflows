@@ -72,6 +72,13 @@ const OPENCODE_E2E_MODEL = process.env.AGENTPRISM_OPENCODE_E2E_MODEL ?? "opencod
 // Kimi K3 can exceed the MCP request deadline under provider load. Gemini Flash exercises the
 // same Pi/OpenRouter routing and native schema path with enough latency headroom for all four calls.
 const PI_E2E_MODEL = process.env.AGENTPRISM_PI_E2E_MODEL ?? "openrouter/google/gemini-2.5-flash";
+// The Claude adapter validates `model` against the SESSION's selectable option list — the CLI's
+// model picker for that working directory — not the Anthropic model catalog. A model can be
+// perfectly valid and still be rejected here as "Invalid value for config option model" simply
+// because it isn't in that session's picker. ANTHROPIC_DEFAULT_OPUS_MODEL (exported by
+// .githooks/pre-push) is what puts it there; naming the model explicitly then makes the leg fail
+// loudly if it ever stops being selectable, instead of silently running the CLI's default.
+const CLAUDE_E2E_MODEL = process.env.AGENTPRISM_CLAUDE_E2E_MODEL ?? "claude/claude-opus-4-8";
 
 function resolveOpenCodeBin(): string {
   if (process.env.AGENTPRISM_OPENCODE_ACP_CMD) return process.env.AGENTPRISM_OPENCODE_ACP_CMD;
@@ -186,7 +193,14 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
   const { Check, Convert } = tbValue;
 
   const MARKER = pkgTail(BACKEND_BIN[backend]);
-  const model = backend === "opencode" ? OPENCODE_E2E_MODEL : backend === "pi" ? PI_E2E_MODEL : undefined;
+  const model =
+    backend === "opencode"
+      ? OPENCODE_E2E_MODEL
+      : backend === "pi"
+        ? PI_E2E_MODEL
+        : backend === "claude"
+          ? CLAUDE_E2E_MODEL
+          : undefined;
   const script = buildScript(backend, model);
 
   const out: LiveOutcome = {

@@ -15,11 +15,23 @@ const SKIP: string | false = LIVE
 
 const OUTCOMES: readonly SteeringOutcome[] = ["injected", "startedNewTurn", "failed"];
 
+// The Claude adapter validates `model` against the SESSION's selectable option list — the CLI's
+// model picker for this working directory — not the Anthropic model catalog. Each leg runs in a
+// fresh temp cwd, so no project settings apply and the picker is whatever the environment says:
+// ANTHROPIC_DEFAULT_OPUS_MODEL (exported by .githooks/pre-push) is what makes this model
+// selectable. Naming it explicitly keeps the gate honest — if it ever stops being selectable the
+// leg fails with "Invalid value for config option model" instead of quietly steering a different
+// model than the one we intend to gate on.
+const BACKEND_MODEL: Record<"claude" | "codex", string> = {
+  claude: process.env.AGENTPRISM_CLAUDE_E2E_MODEL ?? "claude/claude-opus-4-8",
+  codex: "codex",
+};
+
 async function steerLiveBackend(backend: "claude" | "codex"): Promise<void> {
   const cwd = mkdtempSync(join(tmpdir(), `agentprism-${backend}-steering-live-`));
   const runner = createAcpRunner();
   try {
-    const session = await runner.openSession({ model: backend, cwd });
+    const session = await runner.openSession({ model: BACKEND_MODEL[backend], cwd });
     try {
       assert.equal(
         session.capabilities?.supportsSteering,

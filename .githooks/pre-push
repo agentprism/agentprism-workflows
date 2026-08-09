@@ -91,8 +91,14 @@ pnpm build >/dev/null 2>&1
 # on screen (never buried under later output or lost to truncation), and the log survives
 # for inspection after the run.
 E2E_LOG="$(git rev-parse --git-dir)/pre-push-live-e2e.log"
+# The Claude legs gate on Opus 4.8. The adapter validates `model` against the session's
+# selectable option list — the CLI's model picker for the session's working directory — so a
+# valid model is still refused ("Invalid value for config option model") when it isn't in that
+# picker, and the steering leg runs in a fresh temp cwd where no project settings apply. This
+# env var is what makes the model selectable there; the test files name it explicitly so a leg
+# fails loudly rather than silently falling back to whatever the CLI would have picked.
 # timeout: an expired agent login must fail the push loudly, not hang it forever.
-if ! AGENTPRISM_LIVE_E2E=1 timeout 420 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts packages/acp-agents/test/steering.live.e2e.test.ts 2>&1 | tee "$E2E_LOG" >&2; then
+if ! AGENTPRISM_LIVE_E2E=1 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 timeout 420 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts packages/acp-agents/test/steering.live.e2e.test.ts 2>&1 | tee "$E2E_LOG" >&2; then
   echo "" >&2
   echo "pre-push: LIVE backend e2e FAILED — push blocked. Exact failure:" >&2
   if grep -q "failing tests:" "$E2E_LOG"; then
