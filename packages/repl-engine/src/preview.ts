@@ -44,6 +44,7 @@ import {
   type OwnDescriptor,
   type TypedArrayInfo,
 } from './trapfree.js';
+import { OUTPUT_MAX_BYTES } from './caps.js';
 
 // ---- Caps (normative — FORMAT.md §3). All character counts are Unicode
 // scalar values (code points), not bytes and not UTF-16 units. ----
@@ -60,12 +61,29 @@ export const PROPERTY_STRING_HEAD_CHARS = 24;
 export const PROPERTY_STRING_TAIL_CHARS = 8;
 /** Error-description chars (top level). */
 export const MAX_ERROR_MESSAGE_CHARS = 120;
-/** Longest top-level string rendered whole. */
+/** Longest top-level string rendered whole in a PREVIEW (a string shown to
+ *  convey shape — a nested/inspected value, a checkpoint question). This is
+ *  the FORMAT.md §5.5 constant; emission uses `EMISSION_STRING_MAX_CHARS`. */
 export const MAX_STRING_PREVIEW_CHARS = 200;
-/** Head kept when a top-level string is elided. */
+/** Head kept when a preview string is elided (= MAX_STRING_PREVIEW_CHARS × 3/5). */
 export const STRING_HEAD_CHARS = 120;
-/** Tail kept when a top-level string is elided. */
+/** Tail kept when a preview string is elided (= MAX_STRING_PREVIEW_CHARS × 1/5). */
 export const STRING_TAIL_CHARS = 40;
+/**
+ * Longest top-level string rendered whole in an EMISSION — a string the
+ * orchestrator directly emits (a `console.log` argument, or the eval
+ * result). Such a string is OUTPUT the agent explicitly asked to see, not
+ * a preview of a value's shape, so it is carried up to the tool-result
+ * byte budget ("200 chars OR the KB max, whichever is greater") rather than
+ * clamped to the 200-char preview length. Beyond it the string head/tail-
+ * elides (proportionally, keeping its `$N` ref) so the rendered line stays
+ * bounded. A small reserve below `OUTPUT_MAX_BYTES` leaves room for the
+ * `[$N · … ]` header, the surrounding quotes, and a few multi-byte code
+ * points, so a whole-rendered string fits the byte budget rather than being
+ * dropped as a single over-budget line by `applyOutputCaps`. Nested and
+ * property strings are unaffected — they stay preview-short.
+ */
+export const EMISSION_STRING_MAX_CHARS = Math.max(MAX_STRING_PREVIEW_CHARS, OUTPUT_MAX_BYTES - 512);
 /** Hard backstop on the rendered collapsed body. */
 export const MAX_COLLAPSED_CHARS = 400;
 
@@ -187,15 +205,22 @@ function truncateChars(s: string, cap: number): string {
   return chars.slice(0, cap).join('') + '…';
 }
 
-/** FORMAT.md §5.5: top-level strings — whole ≤ 200, else head AND tail. */
-export function stringDescription(s: string): string {
+/** FORMAT.md §5.5: top-level strings — whole ≤ `wholeCap`, else head AND
+ *  tail (proportional 3/5 head, 1/5 tail — the FORMAT.md 120/40 split at the
+ *  default 200 cap). `wholeCap` defaults to the preview length; emission
+ *  callers (a directly logged string, the eval result) pass
+ *  `EMISSION_STRING_MAX_CHARS` so output is carried up to the byte budget
+ *  rather than clamped to a preview. */
+export function stringDescription(s: string, wholeCap: number = MAX_STRING_PREVIEW_CHARS): string {
   const chars = toChars(s);
-  if (chars.length <= MAX_STRING_PREVIEW_CHARS) {
+  if (chars.length <= wholeCap) {
     return `"${escapeString(s)}"`;
   }
-  const head = chars.slice(0, STRING_HEAD_CHARS).join('');
-  const tail = chars.slice(chars.length - STRING_TAIL_CHARS).join('');
-  const elided = chars.length - STRING_HEAD_CHARS - STRING_TAIL_CHARS;
+  const headCount = Math.floor((wholeCap * 3) / 5);
+  const tailCount = Math.floor(wholeCap / 5);
+  const head = chars.slice(0, headCount).join('');
+  const tail = chars.slice(chars.length - tailCount).join('');
+  const elided = chars.length - headCount - tailCount;
   return `"${escapeString(head)}" …[${elided} chars elided]… "${escapeString(tail)}"`;
 }
 
@@ -238,7 +263,12 @@ function previewHandle(handle: JSValueHandle): ObjectPreview {
   if (handle.isNull) return leaf('object', 'null', 'null');
   if (handle.isBool) return leaf('boolean', undefined, handle.toBoolean() ? 'true' : 'false');
   if (handle.isNumber) return leaf('number', undefined, formatNumber(handle.toNumber()));
-  if (handle.isString) return leaf('string', undefined, stringDescription(handle.toString()));
+  // A top-level string is rendered at EMISSION width: `previewHandle` feeds
+  // the emission line renderers (a console.log line, the eval result), and
+  // the manifest — which ignores this description (metadata only, see
+  // `describeManifest`) — so widening it carries directly-emitted output up
+  // to the byte budget without leaking string content into the manifest.
+  if (handle.isString) return leaf('string', undefined, stringDescription(handle.toString(), EMISSION_STRING_MAX_CHARS));
   if (handle.isBigInt) return leaf('bigint', undefined, handle.toBigInt().toString() + 'n');
   if (handle.isSymbol) {
     // The description is not readable trap-free (it sits behind
@@ -681,6 +711,16 @@ function label(preview: ObjectPreview): string {
  *  at MAX_COLLAPSED_CHARS (FORMAT.md §3). */
 export function renderCollapsed(preview: ObjectPreview): string {
   let body: string;
+  if (preview.type === 'string') {
+    // A top-level string that IS the emitted value (a console.log argument
+    // or the eval result) is OUTPUT, not a preview of shape: its
+    // description is already bounded by EMISSION_STRING_MAX_CHARS in
+    // `previewHandle`, so it is returned whole rather than re-clamped to the
+    // 400-char collapsed-preview backstop. The result byte budget
+    // (`applyOutputCaps`) is the real bound. Non-string primitives and
+    // composites keep the backstop below.
+    return preview.description;
+  }
   if (preview.type !== 'object') {
     // Primitives, functions, symbols: the description IS the preview.
     body = preview.description;

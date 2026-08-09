@@ -41,6 +41,7 @@ import {
   type CallOutcome,
   type CallStore,
   type ReplEvalResult,
+  OUTPUT_MAX_LINES,
 } from '../src/index.js';
 
 const PROJECT = '/tmp/repl-broker-project';
@@ -798,17 +799,19 @@ test('trap-free result rendering: accessor properties render as (...) and never 
   await ws.dispose();
 });
 
-test('output lines are preview lines (one per logged argument, levels prefixed) and the caps truncate at 256 lines with outputTruncated', async () => {
+test('output lines are preview lines (one per logged argument, levels prefixed) and the caps truncate a large output with outputTruncated', async () => {
   const { ws, broker } = await setup();
   const r = await broker.eval('console.log({ a: 1 }, "text"); console.error("boom"); "done"');
   assert.match(output(r)[0], /^\[\$1 · object · \d+B\] \{a: 1\}$/);
   assert.equal(output(r)[1], '[$2 · string · 4B] "text"');
   assert.equal(output(r)[2], 'error: [$3 · string · 4B] "boom"');
   assert.equal(r.outputTruncated, false);
-  // 300 console.log calls → 600 refs → the 256-line cap trips.
-  const big = await broker.eval('for (let i = 0; i < 300; i++) console.log("line", i); "done"');
+  // Enough console.log calls (2 refs each → 2 preview lines) to exceed the
+  // output caps; the byte cap dominates for headered preview lines.
+  const big = await broker.eval('for (let i = 0; i < 3000; i++) console.log("line", i); "done"');
   assert.equal(big.outputTruncated, true);
-  assert.equal(big.output.length, 256);
+  assert.ok(big.output.length < 6000, 'the caps dropped the tail');
+  assert.ok(big.output.length <= OUTPUT_MAX_LINES, 'the kept lines are within the line cap');
   // The truncated content stays reachable through $N.
   assert.ok(output(big).some((line) => line.startsWith('[$')) );
   await ws.dispose();

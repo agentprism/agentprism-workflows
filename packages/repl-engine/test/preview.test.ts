@@ -23,6 +23,8 @@ import {
   renderRefLine,
   shortString,
   stringDescription,
+  EMISSION_STRING_MAX_CHARS,
+  OUTPUT_MAX_LINES,
   type ConsoleEvent,
   type GuestBridgeHandlers,
   type GuestCall,
@@ -108,21 +110,28 @@ test('formatNumber: ECMAScript Number::toString(10) semantics', () => {
   assert.equal(formatNumber(1 / 3), String(1 / 3));
 });
 
-test('strings: whole ≤ 200; head AND tail with elision counts beyond; escaping', async () => {
+test('top-level emission strings: whole up to the byte budget ("greater of 200 or the KB max"); head AND tail beyond; escaping', async () => {
   using vm = await createVm();
   assert.equal(body(await lineOf(vm, '"hi"')), '"hi"');
   const short = 'a'.repeat(200);
   assert.equal(body(await lineOf(vm, JSON.stringify(short))), `"${short}"`);
-  const long = 'x'.repeat(201);
-  assert.equal(
-    body(await lineOf(vm, JSON.stringify(long))),
-    `"${'x'.repeat(120)}" …[41 chars elided]… "${'x'.repeat(40)}"`,
-  );
-  const mixed = 'head' + 'm'.repeat(200) + 'tail';
-  assert.equal(
-    body(await lineOf(vm, JSON.stringify(mixed))),
-    `"head${'m'.repeat(116)}" …[48 chars elided]… "${'m'.repeat(36)}tail"`,
-  );
+  // The drift fix: a directly emitted string past the 200-char PREVIEW
+  // length is OUTPUT the agent asked to see, not a shape preview — it is
+  // carried WHOLE up to EMISSION_STRING_MAX_CHARS, not clamped to 200.
+  const wasClamped = 'x'.repeat(201);
+  assert.equal(body(await lineOf(vm, JSON.stringify(wasClamped))), `"${wasClamped}"`);
+  const nearCap = 'y'.repeat(EMISSION_STRING_MAX_CHARS);
+  assert.equal(body(await lineOf(vm, JSON.stringify(nearCap))), `"${nearCap}"`);
+  // Only past the emission cap does it head/tail-elide (proportional 3/5
+  // head, 1/5 tail — the FORMAT.md split at the 200 preview cap), keeping
+  // its $N ref for the remainder.
+  const overCap = 'z'.repeat(EMISSION_STRING_MAX_CHARS + 5000);
+  const headCount = Math.floor((EMISSION_STRING_MAX_CHARS * 3) / 5);
+  const tailCount = Math.floor(EMISSION_STRING_MAX_CHARS / 5);
+  const rendered = body(await lineOf(vm, JSON.stringify(overCap)));
+  assert.ok(rendered.startsWith(`"${'z'.repeat(headCount)}" …[`), 'head kept, proportional to the emission cap');
+  assert.ok(rendered.endsWith(`… "${'z'.repeat(tailCount)}"`), 'tail kept');
+  assert.ok(rendered.includes('chars elided'), 'the elision marker is present');
   // Escaping: quote, backslash, LF, TAB, CR, other C0 controls.
   assert.equal(
     body(await lineOf(vm, JSON.stringify('a"b\\c\nd\te\rf\u0001g'))),
@@ -733,16 +742,18 @@ test('a property name carrying line feeds renders verbatim and caps count its ph
   assert.equal(out.kind, 'value');
   const line = renderRefLine(vm, '$951');
   assert.ok(line.includes('a\nb\nc'), 'the LF-carrying name renders verbatim');
-  // The cap pipeline counts the rendered line as 3 PHYSICAL lines: 253
-  // ordinary lines + this line = exactly 256 → fits (254 entries kept,
-  // not truncated); adding one more line trips the cap and drops the
-  // tail (line-granular), reporting truncation.
-  const fit = applyOutputCaps([...Array.from({ length: 253 }, () => 'x'), line]);
-  assert.equal(fit.lines.length, 254);
+  // The cap pipeline counts the rendered line as 3 PHYSICAL lines:
+  // (OUTPUT_MAX_LINES - 3) ordinary lines + this line = exactly
+  // OUTPUT_MAX_LINES → fits (OUTPUT_MAX_LINES - 2 entries kept, not
+  // truncated); adding one more line trips the cap and drops the tail
+  // (line-granular), reporting truncation.
+  const ordinary = Array.from({ length: OUTPUT_MAX_LINES - 3 }, () => 'x');
+  const fit = applyOutputCaps([...ordinary, line]);
+  assert.equal(fit.lines.length, OUTPUT_MAX_LINES - 2);
   assert.equal(fit.truncated, false);
-  assert.equal(fit.lines.join('\n').split('\n').length, 256);
-  const capped = applyOutputCaps([...Array.from({ length: 253 }, () => 'x'), line, 'tail']);
-  assert.equal(capped.lines.length, 254);
+  assert.equal(fit.lines.join('\n').split('\n').length, OUTPUT_MAX_LINES);
+  const capped = applyOutputCaps([...ordinary, line, 'tail']);
+  assert.equal(capped.lines.length, OUTPUT_MAX_LINES - 2);
   assert.equal(capped.truncated, true);
-  assert.equal(capped.lines.join('\n').split('\n').length, 256);
+  assert.equal(capped.lines.join('\n').split('\n').length, OUTPUT_MAX_LINES);
 });
