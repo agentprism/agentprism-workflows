@@ -16,6 +16,12 @@ jobs:
     # the ruleset context is updated to match.
     name: Build & test
     runs-on: ubuntu-latest
+    # A wedged job otherwise squats for GitHub's 360-minute default before anyone sees a
+    # log: on 2026-08-08 two post-merge runs on main each burned the full six hours and
+    # surfaced only as "cancelled", which reads like someone cancelled them. Healthy runs
+    # finish in 4-6 minutes, so this bounds a hang to a fast, visibly-failed run whose log
+    # is downloadable (logs are not retrievable while a job is still in progress).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7

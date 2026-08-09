@@ -54,8 +54,8 @@ import {
 import {
   EXTENSION_ID,
   RESOURCE_MIME_TYPE,
+  RESOURCE_URI_META_KEY,
   getUiCapability,
-  registerAppTool,
   type ToolCallback,
 } from "@modelcontextprotocol/ext-apps/server";
 
@@ -1872,28 +1872,35 @@ export function createWorkflowServer(
       }
   };
 
-  // Tool and panel registration is session-specific: the initialize request is the first point
-  // at which the client's MCP Apps MIME support is known. Preserve any callback installed by a
-  // caller before composing this hook.
+  // The tool itself is registered HERE, at construction — never behind the initialized
+  // notification. `notifications/initialized` carries no ordering guarantee against the
+  // requests that follow it (a client may pipeline it with its first tools/list or
+  // tools/call, and over the stdio shim those arrive as independent HTTP POSTs), so gating
+  // the tool on that notification let a client's very first request reach a server with
+  // nothing registered: an empty tools/list, or a tool-not-found result on the first call.
+  const workflowTool = mcp.registerTool("workflow", workflowToolConfig, workflowToolHandler);
+
+  // Only the MCP Apps surface is negotiated, and it can be: the initialize request is the
+  // first point at which the client's MCP Apps MIME support is known, and a client that
+  // never advertised the extension has no use for the panel anyway. Adding it here also
+  // emits tools/list_changed, so a capable client re-lists and picks up the UI metadata.
+  // Preserve any callback installed by a caller before composing this hook.
   const previousOnInitialized = mcp.server.oninitialized;
   mcp.server.oninitialized = () => {
     previousOnInitialized?.();
     const uiCap = getUiCapability(mcp.server.getClientCapabilities());
-    const uiCapable = uiCap?.mimeTypes?.includes(RESOURCE_MIME_TYPE) === true;
-    if (uiCapable) {
-      registerWorkflowAppUi(mcp, {
-        readEventsPage: (request) => scriptResources.readEventsPage(request),
-        registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
-      });
-      registerAppTool(
-        mcp,
-        "workflow",
-        { ...workflowToolConfig, _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI } } },
-        workflowToolHandler,
-      );
-    } else {
-      mcp.registerTool("workflow", workflowToolConfig, workflowToolHandler);
-    }
+    if (uiCap?.mimeTypes?.includes(RESOURCE_MIME_TYPE) !== true) return;
+    registerWorkflowAppUi(mcp, {
+      readEventsPage: (request) => scriptResources.readEventsPage(request),
+      registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
+    });
+    // The same normalization registerAppTool applies: both the nested and the flat key.
+    workflowTool.update({
+      _meta: {
+        ui: { resourceUri: RUN_MONITOR_RESOURCE_URI },
+        [RESOURCE_URI_META_KEY]: RUN_MONITOR_RESOURCE_URI,
+      },
+    });
   };
 
   return server;
