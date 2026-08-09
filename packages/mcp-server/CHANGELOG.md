@@ -1,5 +1,26 @@
 # @automatalabs/mcp-server
 
+## 0.28.0
+
+### Minor Changes
+
+- 0ddce7b: mcp-server: add tool-use instructions and server instructions.
+
+  The `repl` tool description now explains how a calling agent writes the eval `code`: the in-VM bridge (`agent()`, `checkpoint()`/`checkpoint.answer()`, `console` with addressable `$N` slices, handle methods `followUp`/`steer`/`cancel`), the guest library (`parallel`/`pipeline`/`verify`/`judgePanel`/`gate`/`retry`/`loopUntilDry`), started-not-awaited handles, stable call ids, and the `eval`/`wait`/`status`/`interrupt`/`reset` loop — alongside the existing persistence/reconciliation notes.
+
+  The server now returns MCP `instructions` in its initialize response, orienting a host/agent to the two model-facing tools and when to reach for each: `workflow` for deterministic, resumable batch orchestration and `repl` for interactive, stateful orchestration.
+
+### Patch Changes
+
+- 0ddce7b: repl: emit `console.log` output and eval results up to the result byte budget instead of clamping every string to a 200-char preview.
+
+  A directly emitted top-level string — a `console.log` argument or the eval result — is output the orchestrator asked to see, not a preview of a value's shape, so it is now carried whole up to the byte budget ("200 chars OR the KB max, whichever is greater") rather than head/tail-elided at 200 characters. A subagent's answer comes back whole in one call instead of forcing creative slice-by-slice extraction. The tool-result caps rise to **4000 lines / 50 KB** (from 256 / 10 KB), so a multi-line answer fits; only strings past the budget head/tail-elide (keeping their `$N` ref for the remainder). Nested and property strings are unchanged — they stay preview-short.
+
+- Updated dependencies [0ddce7b]
+- Updated dependencies [0ddce7b]
+  - @automatalabs/repl-engine@0.2.0
+  - @automatalabs/workflows@0.47.2
+
 ## 0.27.1
 
 ### Patch Changes
