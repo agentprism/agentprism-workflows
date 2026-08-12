@@ -68,7 +68,7 @@ Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired b
 
 1. **Attribution gate** (`node scripts/check-attribution.mjs`, also runnable standalone) over the commits actually being pushed — see "No agent attribution in the history" below.
 2. **ACP dependency gate** (`node scripts/check-acp-deps.mjs`, also runnable standalone), three sub-checks:
-   - *npm freshness*: the ACP client/agent libraries (`@agentclientprotocol/*`, `@earendil-works/pi-coding-agent`) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
+   - *npm freshness*: the ACP client/agent libraries (the `@agentclientprotocol/*` and `@earendil-works/*` scopes — every workspace dependency from either scope must be manifest-tracked, enforced before any network request) must match npm `latest` — policy is to bump them at every release. On failure it prints the exact `pnpm add` command per dep (preserving exact-pin vs caret style).
      On a pi runtime bump, re-capture `packages/pi-acp/test/fixtures/provider-error-strings.ts` and re-run the classifier suite so provider prose cannot silently change pause/retry classification.
    - *source-upstream containment*: the workspace fork `packages/codex-acp` must CONTAIN its upstream (`agentclientprotocol/codex-acp`) `main` — versions can't be compared because the fork's version line has diverged, so the gate fetches the canonical upstream ref into THIS repository and requires `git merge-base --is-ancestor <upstream tip> HEAD`. Sync policy is merge, never rebase or squash, so ancestry is the exact invariant: a non-squashed subtree merge satisfies it, and a squash or rewritten import can never fake it (new SHAs make the true upstream tip unreachable from HEAD). On failure it names the remediation: open/refresh the upstream-sync PR — `git subtree merge` (NO `--squash`) of upstream `main` into `packages/codex-acp` — review the upstream changes, add a `@automatalabs/codex-acp` changeset, and merge.
    - *wrapped runtime freshness*: an adapter can be at npm `latest` while exact-pinning a stale agent runtime inside it (e.g. `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` — the runtime that actually answers prompts), which the freshness check can't see. The gate compares the lockfile's *transitive* resolution of each wrapped runtime against the runtime's npm `latest`. Fix when behind: bump the adapter if its latest already wraps a current runtime, else add a root `pnpm.overrides` pin (then `pnpm install` + run the acp-agents live e2e before pushing). The check warns once an override becomes redundant so versions drift back to upstream-managed.
@@ -100,10 +100,30 @@ instead of editing the JSON by hand.
 
 1. **Identify what is stale** from the gate output: an ACP library behind npm `latest`, the codex-acp fork missing upstream commits, or a wrapped runtime lagging inside a current adapter.
 2. **Read the upstream changes before bumping** — the release notes/changelog, and for substantial jumps the source diff of the surfaces we integrate against. Decide which of three shapes this is:
-   - *Mechanical*: no cited surface changed — bump the pin (for the codex-acp fork: follow "The codex-acp fork leg" under Releasing below — merge upstream, push, the fork **auto-releases**, then bump the pin here), `pnpm install`, add a changeset, run the full suite plus the live e2e.
+   - *Mechanical*: no cited surface changed — bump the pin (for the codex-acp fork: run the sync per "The codex-acp upstream-sync leg" under Releasing below), `pnpm install`, add a changeset, run the full suite plus the live e2e.
    - *Upstream broke or changed our integration surface*: adapt the agentprism packages to the new API as part of the same PR — the bump and the adaptation land together, never a pin held back to avoid the work.
    - *Upstream added capability we should exploit*: land the mechanical bump first to unblock the gate, and file an issue for the capability work so it is tracked, not lost.
 3. **Land the maintenance PR** — its own CI passes because its tree carries the fixed pins, which is exactly why a stale gate never wedges the repo: the fix PR is always mergeable. Once it merges, every blocked PR unblocks on rebase/re-run, and the next push to `main` versions and publishes normally.
+
+Step 2 is the load-bearing one and it is a **judgment call, not a command**: the gate's printed
+remediation (`pnpm add …`, the override snippet, the subtree-merge line) is only the *mechanical*
+arm of the fix. Upstreams regularly add, change, or re-shape surfaces we integrate against, and a
+bump that lands without the matching adaptation is a defect that CI cannot see. Never land a bare
+bump just to get past the gate.
+
+### ACP dependency surface map
+
+What we actually integrate against, per tracked dependency — the places to check when its
+changelog shows API/wire changes:
+
+| Dependency | Our integration surface |
+|---|---|
+| `@agentclientprotocol/sdk` | The ACP wire contract everywhere: `packages/acp-agents` (client side), `packages/codex-acp` and `packages/pi-acp` (server side). Protocol-version or schema changes hit all three plus the `shared-types` `_meta` extension keys. |
+| `@agentclientprotocol/claude-agent-acp` | Spawned by the claude backend (`packages/acp-agents/src/backends/claude.ts`): session config options (model/effort validation is session-scoped), permission modes, steering advertisement, stop-reason mapping. |
+| `@anthropic-ai/claude-agent-sdk` (wrapped) | The runtime inside claude-agent-acp — our exposure is behavioral, through the adapter: turn results, stop reasons/`terminal_reason` values, usage accounting. Check the SDK release notes for changed terminal/error semantics even though we never import it directly. |
+| `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent` | Embedded in-process by `packages/pi-acp`: provider/session APIs, steering, error prose. On any bump, re-capture `packages/pi-acp/test/fixtures/provider-error-strings.ts` and re-run the classifier suite (pause/retry classification parses provider prose). |
+| `@earendil-works/pi-agent-core` | `packages/pi-acp` test surface — exact-pinned on the same upstream version line as pi-ai/pi-coding-agent; bump it in lockstep so the suite exercises the runtime actually shipped. |
+| `agentclientprotocol/codex-acp` (source upstream) | Our fork `packages/codex-acp` (fork-owned surfaces: turn-level `outputSchema` forwarding, goal extension, `_session/loaded_turn`) and its consumer, the codex backend in `packages/acp-agents`. Upstream changes to `CodexAcpServer`/`CodexEventHandler` routinely conflict with fork-owned code — resolve keeping both, fork-owned constructor parameters stay LAST. Run the fork's own vitest suite during a sync (it is excluded from our CI matrix). |
 
 ## No agent attribution in the history
 
@@ -205,11 +225,21 @@ pnpm release          # pnpm build && changeset publish (runs in release.yml's p
 
 ### The codex-acp upstream-sync leg (when the dependency gate demands it)
 
-`@automatalabs/codex-acp` lives in this monorepo at `packages/codex-acp` — our fork of `agentclientprotocol/codex-acp`, imported with its full history as a **non-squashed subtree** (#282) — and releases through the ordinary Changesets train like every other package. When the gate reports the package behind its upstream, the fix is one sync PR:
+`@automatalabs/codex-acp` lives in this monorepo at `packages/codex-acp` — our fork of `agentclientprotocol/codex-acp`, imported with its full history as a **non-squashed subtree** (#282) — and releases through the ordinary Changesets train like every other package. When the gate reports the package behind its upstream, the fix is one sync PR, driven by the script:
 
-1. `git fetch https://github.com/agentclientprotocol/codex-acp.git main`, then merge it into `packages/codex-acp` with `git subtree merge --prefix=packages/codex-acp` (or `git merge -X subtree=packages/codex-acp`) — **never `--squash`, never a rebase**: the gate verifies real ancestry, and a squashed or rewritten import can never satisfy it. Resolve the recurring `package.json` version/metadata conflict in the **fork's** favor (its version line is independent of upstream's).
-2. Review the upstream changes, run the codex-acp suite (`pnpm --filter @automatalabs/codex-acp test`) and the acp-agents live e2e, and add an explicit `@automatalabs/codex-acp` changeset — automation must not guess the bump size.
-3. Merge the sync PR; the normal release train versions and publishes the package with everything else. Imported upstream commits are exempt from the attribution gate via `scripts/attribution-foreign-heads.json` — record the merged upstream tip there in the same PR.
+```bash
+pnpm sync:codex-acp             # branch off origin/main, fetch upstream, subtree-merge (never --squash)
+# …resolve any conflicts the script could not auto-resolve, git add…
+pnpm sync:codex-acp --finish    # verify ancestry, record the tip, scaffold the changeset, run suite + gates
+# …review upstream changes, adapt integrated surfaces, finish the changeset…
+pnpm sync:codex-acp --pr        # push, open the PR, arm auto-merge as a MERGE COMMIT
+```
+
+The script (`scripts/sync-codex-acp.mjs`) exists because every step it owns has been gotten wrong by hand at least once; it is the runbook made mechanical:
+
+1. The merge is always `git merge -X subtree=packages/codex-acp --no-ff` of the upstream tip — **never `--squash`, never a rebase**: the gate verifies real ancestry, and a squashed or rewritten import can never satisfy it. Recurring policy conflicts auto-resolve (fork's deletions of upstream's npm lockfile/workflows stand; the changesets-owned `CHANGELOG.md` wins); the `package.json` version/description hunk resolves in the **fork's** favor (its version line is independent of upstream's), keeping upstream's dependency changes.
+2. **Review the upstream changes — the judgment step no script can own.** Check the surface map above; adapt integrated surfaces on the same branch. `--finish` runs the codex-acp suite (excluded from the CI matrix — the sync is where it runs) and the dependency + attribution gates; the changeset is scaffolded but must be finished by hand — automation must not guess the bump size, and `--pr` refuses to deliver while the scaffold placeholder remains.
+3. `--pr` arms auto-merge with `--merge`: a sync PR must merge as a **merge commit** — GitHub's squash button destroys the imported history server-side even when the branch is perfect, which re-reds the containment gate. The merged tip is recorded in `scripts/attribution-foreign-heads.json` in the same PR (imported upstream commits are exempt from the attribution gate only via that record).
 
 The Codex `outputSchema` forward lives in `packages/codex-acp` (consumed by `acp-agents` as `workspace:*`, published as an exact version), so any change to that wire key ships atomically with the adapter in one release. The package is licensed Apache-2.0 (`packages/codex-acp/LICENSE`).
 

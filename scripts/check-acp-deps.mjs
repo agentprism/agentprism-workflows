@@ -612,7 +612,27 @@ if (blockers.length > 0) {
   for (const b of blockers) console.error(`  ${b}`);
 }
 
-const failed = outdated.length > 0 || upstreamIssues.length > 0 || wrappedIssues.length > 0 || blockers.length > 0;
+// Staleness (as opposed to an unverifiable blocker) always carries a judgment call the
+// remediation commands above cannot make: whether upstream's changes touch a surface we
+// integrate against. Spell that out here so whoever hits the gate — human or agent — never
+// treats "make the gate green" as the whole task (owner directive, 2026-08-12).
+const stale = outdated.length > 0 || upstreamIssues.length > 0 || wrappedIssues.length > 0;
+if (stale) {
+  console.error("");
+  console.error("acp-deps: a pin bump alone is only the right fix when upstream changed NOTHING we");
+  console.error("  integrate against. For EACH stale item above: read the upstream release notes /");
+  console.error("  changelog (and for substantial jumps the source diff of the surfaces we consume),");
+  console.error("  then pick the shape:");
+  console.error("    1. mechanical      — no integrated surface changed: the bump + changeset IS the fix");
+  console.error("    2. surface changed — upstream broke or changed an API/wire surface we consume:");
+  console.error("                         adapt our integration code in the SAME PR as the bump;");
+  console.error("                         never land a bare bump just to get past the gate");
+  console.error("    3. new capability  — land the mechanical bump to unblock the gate, and file a");
+  console.error("                         tracking issue so the capability work is not lost");
+  console.error('  Our integration surface per dependency: CONTRIBUTING.md "ACP dependency surface map".');
+}
+
+const failed = stale || blockers.length > 0;
 if (failed) {
   console.error("");
   console.error('acp-deps: triage runbook: CONTRIBUTING.md "When the dependency gate blocks"');
