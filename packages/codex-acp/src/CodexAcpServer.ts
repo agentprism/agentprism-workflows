@@ -109,6 +109,15 @@ import {
     createUserMessageChunk,
 } from "./ContentChunks";
 import {sameThreadGoalSnapshot, type ThreadGoalSnapshot, toThreadGoalSnapshot,} from "./ThreadGoalSnapshot";
+import {randomUUID} from "node:crypto";
+import {
+    AIR_EXTENSION_CAPABILITIES_KEY,
+    AIR_EXTENSION_VERSION,
+    AIR_EXTENSION_VERSION_KEY,
+    AIR_META_KEY,
+    AIR_SESSION_FAILURE_KEY,
+    JETBRAINS_META_KEY,
+} from "./AirExtension";
 
 const IMPLEMENT_PLAN_OPTION_ID = "implement_plan";
 const REVISE_PLAN_OPTION_ID = "revise_plan";
@@ -187,6 +196,40 @@ export interface SessionState {
      *  finished between `session/load` and the query is never missed.
      *  Null otherwise. */
     loadedTurnEndedBeforeWatch: TurnCompletedNotification | null;
+    sessionFailure?: SessionFailure;
+}
+
+export type SessionFailureCategory =
+    | "transport_lost" | "auth_required" | "rate_limited" | "quota_exhausted" | "overloaded"
+    | "context_exhausted" | "budget_exhausted" | "policy_denied" | "bad_request"
+    | "provider_error" | "internal_error";
+
+export type SessionFailureAction = "retry" | "reconnect" | "login" | "new_turn" | "new_session";
+
+export interface SessionFailure {
+    id: string;
+    revision: number;
+    phase: "active" | "cleared";
+    category: SessionFailureCategory;
+    source: "codex";
+    safeMessage: string;
+    retryable: boolean;
+    actions: SessionFailureAction[];
+    turnId?: string;
+}
+
+const CODEX_PROCESS_EXITED_ERROR_CODE = 1001;
+
+function clientSupportsTypedSessionFailures(capabilities: acp.ClientCapabilities | null): boolean {
+    const jetbrains = capabilities?._meta?.[JETBRAINS_META_KEY] as Record<string, unknown> | undefined;
+    const air = jetbrains?.[AIR_META_KEY] as Record<string, unknown> | undefined;
+    const version = air?.[AIR_EXTENSION_VERSION_KEY];
+    const supported = air?.[AIR_EXTENSION_CAPABILITIES_KEY];
+    return typeof version === "number"
+        && Number.isInteger(version)
+        && version >= AIR_EXTENSION_VERSION
+        && Array.isArray(supported)
+        && supported.includes(AIR_SESSION_FAILURE_KEY);
 }
 
 interface ActiveAuthState {
@@ -227,6 +270,7 @@ export class CodexAcpServer {
     private readonly defaultAuthRequest: CodexAuthRequest | null;
     private readonly getExitCode: () => number | null;
     private readonly getRecentStderr: () => string;
+    private readonly sessionFailureEpoch: string;
     private readonly availableCommands: CodexCommands;
     private clientInfo: acp.Implementation | null;
     private clientCapabilities: acp.ClientCapabilities | null;
@@ -281,6 +325,7 @@ export class CodexAcpServer {
         this.defaultAuthRequest = defaultAuthRequest ?? null;
         this.getExitCode = getExitCode ?? (() => null);
         this.getRecentStderr = getRecentStderr ?? (() => "");
+        this.sessionFailureEpoch = randomUUID();
         this.clientInfo = null;
         this.clientCapabilities = null;
         this.terminalOutputMode = "terminal_output_delta";
@@ -347,6 +392,12 @@ export class CodexAcpServer {
                     version: GOAL_EXTENSION_VERSION,
                     controlMethod: GOAL_CONTROL_METHOD,
                     actions: [...GOAL_CONTROL_ACTIONS],
+                },
+                [JETBRAINS_META_KEY]: {
+                    [AIR_META_KEY]: {
+                        [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+                        [AIR_EXTENSION_CAPABILITIES_KEY]: [AIR_SESSION_FAILURE_KEY],
+                    },
                 },
             },
         };
@@ -2316,6 +2367,7 @@ export class CodexAcpServer {
             prompt: params.prompt,
         });
         const sessionState = this.getSessionState(params.sessionId);
+        let recoverableSessionFailure = sessionState.sessionFailure;
         sessionState.currentTurnId = null;
         sessionState.lastTokenUsage = null;
         const activePrompt = this.trackActivePrompt(params.sessionId);
@@ -2329,12 +2381,24 @@ export class CodexAcpServer {
         };
         const disposePromptRequestCancellation = this.observePromptRequestCancellation(signal, sessionState, activePrompt);
         let eventHandler: CodexEventHandler | null = null;
+        let promptNotificationsActive = true;
+        const clearRecoveredSessionFailure = async (handler: CodexEventHandler): Promise<void> => {
+            const current = sessionState.sessionFailure;
+            if (recoverableSessionFailure?.phase === "active"
+                && current?.phase === "active"
+                && current.id === recoverableSessionFailure.id
+                && current.revision === recoverableSessionFailure.revision) {
+                await handler.clearSessionFailure();
+            }
+        };
 
         try {
             const promptEventHandler = new CodexEventHandler(
                 this.connection,
                 sessionState,
                 clientSupportsPlanUpdates(this.clientCapabilities),
+                clientSupportsTypedSessionFailures(this.clientCapabilities),
+                this.sessionFailureEpoch,
                 // Fork-owned (#282): thread the client-backed file reader into fileChange updates.
                 this.clientFileSystem.createFileReader(params.sessionId),
                 // The ended push scheduler: the handler's own per-event
@@ -2355,8 +2419,19 @@ export class CodexAcpServer {
             );
             await this.codexAcpClient.subscribeToSessionEvents(params.sessionId,
                 async (event) => {
+                    if (!promptNotificationsActive) {
+                        await promptEventHandler.handleSessionScopedNotification(event);
+                        return;
+                    }
+                    const completesActiveTurn = event.method === "turn/completed"
+                        && event.params.turn.id === sessionState.currentTurnId;
                     await elicitationHandler.handleNotification(event);
-                    return promptEventHandler.handleNotification(event);
+                    await promptEventHandler.handleNotification(event);
+                    if (completesActiveTurn) {
+                        // The prompt may remain open for plan approval after its turn has ended. Switch at
+                        // the causal boundary so a queued late error cannot enter the completed turn's buffer.
+                        promptNotificationsActive = false;
+                    }
                 },
                 approvalHandler,
                 elicitationHandler);
@@ -2407,8 +2482,14 @@ export class CodexAcpServer {
                 return this.cancelledPromptResponse(sessionState);
             }
             if (commandResult.handled) {
+                promptNotificationsActive = false;
                 logger.log("Prompt handled by a command");
                 await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                await eventHandler.flushPendingErrors();
+                await eventHandler.flushPendingErrorsAsSessionScoped();
+                if (commandResult.turnCompleted) {
+                    await eventHandler.handleFailedTurn(commandResult.turnCompleted.turn);
+                }
                 if (commandResult.turnCompleted?.turn.status === "interrupted") {
                     return this.cancelledPromptResponse(sessionState);
                 }
@@ -2417,6 +2498,15 @@ export class CodexAcpServer {
                     // noinspection ExceptionCaughtLocallyJS
                     throw error;
                 }
+                const terminalFailure = this.terminalFailurePromptResponse(
+                    sessionState,
+                    eventHandler,
+                    commandResult.turnCompleted?.turn.id ?? sessionState.currentTurnId,
+                );
+                if (terminalFailure) {
+                    return terminalFailure;
+                }
+                await clearRecoveredSessionFailure(eventHandler);
                 return {
                     stopReason: "end_turn",
                     usage: this.buildPromptUsage(sessionState.lastTokenUsage),
@@ -2491,6 +2581,9 @@ export class CodexAcpServer {
             }
 
             await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+            await eventHandler.flushPendingErrors();
+            await eventHandler.handleFailedTurn(turnCompleted.turn);
+            promptNotificationsActive = false;
 
             if (turnCompleted.turn.status === "interrupted") {
                 await eventHandler.flushPendingPlanUpdates();
@@ -2501,6 +2594,14 @@ export class CodexAcpServer {
             if (error) {
                 // noinspection ExceptionCaughtLocallyJS
                 throw error;
+            }
+            const terminalFailure = this.terminalFailurePromptResponse(
+                sessionState,
+                eventHandler,
+                turnCompleted.turn.id,
+            );
+            if (terminalFailure) {
+                return terminalFailure;
             }
 
             await eventHandler.flushPendingPlanUpdates();
@@ -2531,6 +2632,7 @@ export class CodexAcpServer {
                         prompt: [{type: "text", text: "Implement the approved plan."}],
                     };
                     activePrompt.currentTurn = null;
+                    sessionState.currentTurnId = null;
                     const implementationPromise = this.runWithProcessCheck(
                         () => this.codexAcpClient.sendPrompt(
                             implementationRequest,
@@ -2548,6 +2650,10 @@ export class CodexAcpServer {
                                     return;
                                 }
                                 sessionState.currentTurnId = turnId;
+                                // Keep the approval-to-turn-start gap session-scoped. Once the new turn has
+                                // an identity, snapshot any unchanged session failure as its recovery baseline.
+                                recoverableSessionFailure = sessionState.sessionFailure;
+                                promptNotificationsActive = true;
                             },
                             () => this.promptShouldStop(params.sessionId, activePrompt),
                         ),
@@ -2568,6 +2674,9 @@ export class CodexAcpServer {
                     }
 
                     await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                    await eventHandler.flushPendingErrors();
+                    await eventHandler.handleFailedTurn(turnCompleted.turn);
+                    promptNotificationsActive = false;
                     if (turnCompleted.turn.status === "interrupted") {
                         await eventHandler.flushPendingPlanUpdates();
                         return this.cancelledPromptResponse(sessionState);
@@ -2577,8 +2686,18 @@ export class CodexAcpServer {
                     if (implementationError) {
                         throw implementationError;
                     }
+                    const implementationFailure = this.terminalFailurePromptResponse(
+                        sessionState,
+                        eventHandler,
+                        turnCompleted.turn.id,
+                    );
+                    if (implementationFailure) {
+                        return implementationFailure;
+                    }
                 }
             }
+
+            await clearRecoveredSessionFailure(eventHandler);
 
             await this.publishFallbackSessionTitle(
                 sessionState,
@@ -2592,8 +2711,32 @@ export class CodexAcpServer {
             };
         } catch (err) {
             logger.error(`Prompt for session ${params.sessionId} failed`, err);
+            if (activePrompt.signal.aborted || this.sessionIsClosing(params.sessionId)) {
+                return this.cancelledPromptResponse(sessionState);
+            }
+            const isProcessExit = err instanceof RequestError
+                && err.code === CODEX_PROCESS_EXITED_ERROR_CODE;
+            const isUnexpectedFailure = !(err instanceof RequestError);
+            if (eventHandler !== null
+                && clientSupportsTypedSessionFailures(this.clientCapabilities)
+                && (isProcessExit || isUnexpectedFailure)) {
+                const category: SessionFailureCategory = isProcessExit ? "transport_lost" : "internal_error";
+                eventHandler.recordSyntheticTerminalFailure(category, sessionState.currentTurnId);
+                const failureResponse = this.terminalFailurePromptResponse(
+                    sessionState,
+                    eventHandler,
+                    sessionState.currentTurnId,
+                    true,
+                );
+                if (failureResponse !== null) {
+                    return failureResponse;
+                }
+            }
             throw err;
         } finally {
+            // The app-server subscription is session-scoped and outlives this prompt. Flip routing before
+            // awaiting disposal so queued late notifications cannot enter prompt-local buffers.
+            promptNotificationsActive = false;
             logger.log("Prompt completed", {sessionId: params.sessionId});
             await eventHandler?.dispose();
             disposePromptRequestCancellation();
@@ -2674,6 +2817,26 @@ export class CodexAcpServer {
         };
     }
 
+    private terminalFailurePromptResponse(
+        sessionState: SessionState,
+        eventHandler: CodexEventHandler,
+        turnId: string | null,
+        allowUnattributed = false,
+    ): acp.PromptResponse | null {
+        const failureMeta = eventHandler.getTerminalSessionFailureMeta(turnId, allowUnattributed);
+        if (failureMeta === null) {
+            return null;
+        }
+        return {
+            stopReason: "end_turn",
+            usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+            _meta: {
+                ...this.buildQuotaMeta(sessionState),
+                ...failureMeta,
+            },
+        };
+    }
+
     private buildQuotaMeta(sessionState: SessionState): { quota: QuotaMeta } {
         const lastTokenUsage = sessionState.lastTokenUsage;
 
@@ -2705,7 +2868,7 @@ export class CodexAcpServer {
             return await operation();
         } catch (err) {
             const exitCode = this.getExitCode();
-            const requestErrorCode = 1001 // Just some magic number
+            const requestErrorCode = CODEX_PROCESS_EXITED_ERROR_CODE;
             if (exitCode == 3221225781) {
                 throw new RequestError(requestErrorCode, `VC++ redistributable should be installed`);
             }
