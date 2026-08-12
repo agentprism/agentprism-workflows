@@ -683,6 +683,28 @@ test("reverse coverage scans dependencies, devDependencies, and optionalDependen
   }
 });
 
+test("reverse coverage extends to the pi runtime scope (@earendil-works/*)", async () => {
+  // The pi runtime family rides one coordinated upstream version line; a workspace dep from its
+  // scope that is missing from freshness.npm must fail before any network request, exactly like
+  // an untracked @agentclientprotocol/* dep.
+  const PI_DEP = "@earendil-works/pi-agent-core";
+  const server = await registry({
+    [`/${SDK}/latest`]: { body: { version: "1.2.1" } },
+  });
+  try {
+    await earlyFailure(server, {
+      packageManifest: {
+        name: "@automatalabs/acp-agents",
+        engines: { node: ">=22" },
+        dependencies: { [SDK]: "^1.2.1" },
+        devDependencies: { [PI_DEP]: "0.84.1" },
+      },
+    }, new RegExp(`freshness\\.npm omits ${PI_DEP.replace("/", "\\/")}`));
+  } finally {
+    await server.close();
+  }
+});
+
 test("manifest-declared npm and wrapped-runtime work activate without gate source edits", async () => {
   const RUNTIME = "runtime-fixture";
   const server = await registry({
