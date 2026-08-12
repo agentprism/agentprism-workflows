@@ -82,7 +82,8 @@
         "npm": [
           "@agentclientprotocol/sdk",
           "@earendil-works/pi-ai",
-          "@earendil-works/pi-coding-agent"
+          "@earendil-works/pi-coding-agent",
+          "@earendil-works/pi-agent-core"
         ],
         "sourceUpstreams": [],
         "wrappedRuntimes": []

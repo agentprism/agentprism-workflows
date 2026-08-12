@@ -32,7 +32,10 @@ import { execFileSync } from "node:child_process";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestPath = join(repoRoot, "scripts", "acp-backends.manifest.json");
-const MANIFEST_COVERAGE_PREFIXES = Object.freeze(["@agentclientprotocol/"]);
+// Any workspace dependency under these scopes must appear in some backend's freshness.npm —
+// the ACP protocol libraries and the pi runtime family both ride coordinated release lines,
+// so an untracked package from either scope silently drifts out of step with its siblings.
+const MANIFEST_COVERAGE_PREFIXES = Object.freeze(["@agentclientprotocol/", "@earendil-works/"]);
 const NODE_FLOOR = /^>=(0|[1-9]\d*)(?:\.(0|[1-9]\d*)\.(0|[1-9]\d*))?$/;
 
 const backendManifest = loadBackendManifest();

@@ -107,7 +107,14 @@ export const piBackendDefinition = defineBuiltinBackend({
       path: "packages/pi-acp",
     },
     freshness: {
-      npm: ["@agentclientprotocol/sdk", "@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"],
+      npm: [
+        "@agentclientprotocol/sdk",
+        "@earendil-works/pi-ai",
+        "@earendil-works/pi-coding-agent",
+        // Test-surface runtime dep of pi-acp: exact-pinned on the same upstream version line as
+        // pi-ai/pi-coding-agent, so it must move in lockstep or the suite tests a stale runtime.
+        "@earendil-works/pi-agent-core",
+      ],
       sourceUpstreams: [],
       wrappedRuntimes: [],
     },
