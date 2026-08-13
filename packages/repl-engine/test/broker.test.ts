@@ -266,6 +266,11 @@ class FakeRunner implements BrokerRunner {
   /** configOptions keys the backend rejects at open (the dynamic-
    *  vocabulary late failure the [C]5 fallback covers). */
   failConfigKeys: Set<string> = new Set();
+  /** The backend's own error message for a rejected config option
+   *  (defaults to a key-free message). Lets tests model backends whose
+   *  late error names an accepted sibling while omitting the actual
+   *  rejected key — the [C]5 message-short-circuit defect. */
+  failConfigMessage = 'invalid config option';
 
   listBackends(): string[] {
     return ['claude', 'codex', 'opencode', 'pi', ...this.extraBackends];
@@ -287,7 +292,7 @@ class FakeRunner implements BrokerRunner {
     if (opts.configOptions !== undefined) {
       for (const key of Object.keys(opts.configOptions)) {
         if (this.failConfigKeys.has(key)) {
-          throw new Error('invalid config option');
+          throw new Error(this.failConfigMessage);
         }
       }
     }
@@ -645,6 +650,36 @@ test('§4.1 admission validation: configOptions keys validate against the resolv
   assert.ok(multiLine.includes('offending key "bad"'), multiLine);
   assert.ok(!multiLine.includes('among'), multiLine);
   assert.ok(!multiLine.includes('"good"'), `the accepted key is not accused: ${multiLine}`);
+  await ws.dispose();
+});
+
+test('§4.1 [C]5: a multi-key late configOptions error whose backend message NAMES AN ACCEPTED SIBLING still isolates and names the actual rejected key — the message hit never skips the prefix probes', async () => {
+  const { ws, broker, runner } = await setup();
+  // Dynamic vocabulary: admitted. The backend rejects `bad`, and its
+  // own late error names the ACCEPTED sibling `good` while omitting
+  // the rejected key — the round-6 review repro: { good: true,
+  // bad: true } + "accepted option good; another config option is
+  // invalid" emitted that vague message verbatim because ANY submitted
+  // key appearing in the message short-circuited the isolation.
+  runner.failConfigKeys = new Set(['bad']);
+  runner.failConfigMessage = 'accepted option good; another config option is invalid';
+  const late = await broker.eval(
+    'const m = await agent("pi/x", "t", { configOptions: { good: true, bad: true } }).catch(e => e.name + ": " + e.message); console.log("got", m); "done"',
+  );
+  assert.equal(late.result, undefined, 'the late rejection arrives after the eval suspended');
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  const line = output(probe).find((l) => l.startsWith('got ConfigOptionsError'));
+  assert.ok(line !== undefined, output(probe).join('\n'));
+  assert.ok(line.includes('offending key "bad"'), `the actual rejected key is named, never the vague backend message alone: ${line}`);
+  assert.ok(!line.includes('offending key "good"'), `the accepted sibling is never accused: ${line}`);
+  assert.ok(!line.includes('among'), line);
+  // The backend's own error is still reported verbatim — but as the
+  // quoted backend error inside the conforming attribution, not as the
+  // whole answer.
+  assert.ok(line.includes('accepted option good; another config option is invalid'), line);
+  assert.ok(line.includes('backend pi'), `the late error names the resolved backend: ${line}`);
   await ws.dispose();
 });
 

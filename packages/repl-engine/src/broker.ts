@@ -5255,8 +5255,15 @@ export class Broker {
     backendIdOverride: string | null,
   ): Promise<{ name: string; message: string; code?: string; recoverable?: boolean; replBackend?: string }> {
     const keys = Object.keys(parsed.configOptions!);
-    // The backend may already have named the key in its own message.
-    if (keys.some((key) => original.message.includes(key))) return original;
+    // The backend may already have named the offending key in its own
+    // message. That shortcut is only decisive with a SINGLE key: with
+    // several keys the message can name an accepted sibling while
+    // omitting the actual rejected key (the round-6 review repro:
+    // { good: true, bad: true } + "accepted option good; another
+    // config option is invalid" emitted the vague message verbatim),
+    // so multi-key failures NEVER skip the diagnostic reopen and the
+    // prefix-probe isolation below on the strength of a message hit.
+    if (keys.length === 1 && original.message.includes(keys[0])) return original;
     let diagnostic: BrokerSession | undefined;
     let diagnosticOpenFailed = false;
     try {
