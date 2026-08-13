@@ -232,6 +232,31 @@ class FakeRunner implements BrokerRunner {
   failDiagnosticOpens = 0;
   /** Load failures to inject (each one rejects loadSession once). */
   failNextLoads = 0;
+  /** When true, loadSession PARKS (the caller releases it through
+   *  `releaseParkedLoad`) — the delayed-load probe for the §4.2
+   *  mint-time addressability of lazy re-attach turns (a followUp on a
+   *  drained settled handle, or a restore whose queue rebuild
+   *  re-attaches the founding session). */
+  parkLoads = false;
+  readonly parkedLoads: Array<{
+    opts: BrokerLoadSessionOptions;
+    resolve: (session: FakeSession) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+
+  /** Resolve the oldest parked load with a fresh session (the
+   *  loadSession-shaped creation — capabilities and the scripted
+   *  loaded-turn outcome stamp like the normal path). */
+  releaseParkedLoad(): FakeSession {
+    const parked = this.parkedLoads.shift();
+    assert.ok(parked, 'a loadSession call must be parked');
+    const session = new FakeSession(parked.opts);
+    session.capabilities = { supportsSteering: this.supportsSteering };
+    session.loadedTurnTextValue = this.loadedTurnText;
+    this.sessions.push(session);
+    parked.resolve(session);
+    return session;
+  }
   disposeCalls = 0;
   /** Extra registered custom backends (appended to the known list). */
   extraBackends: string[] = [];
@@ -287,6 +312,11 @@ class FakeRunner implements BrokerRunner {
     if (this.failNextLoads > 0) {
       this.failNextLoads--;
       throw new Error('session not found at the backend');
+    }
+    if (this.parkLoads) {
+      return new Promise<FakeSession>((resolve, reject) => {
+        this.parkedLoads.push({ opts, resolve, reject });
+      });
     }
     const session = new FakeSession(opts);
     session.capabilities = { supportsSteering: this.supportsSteering };
@@ -1995,5 +2025,282 @@ test('§4.2: the interrupt targets an in-flight followUp TURN by its own call id
   // The founding call's session stays usable (idle — the founding call
   // itself was settled long before).
   assert.equal(await broker.cancelCall('c1'), 'idle');
+  await ws.dispose();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Review-rejection regressions (eval-plane redesign, review round 3):
+// guest cancellation of cap-queued dispatches, followUp addressability
+// during delayed lazy re-attachment, restored answer-mode queues without
+// an attached founding session, cancellation with queued answer-mode
+// siblings, reset ownership racing an unrelated suspended eval, and
+// verbatim long modelSpec values in agents().
+// ────────────────────────────────────────────────────────────────────────
+
+test('§4.1/§4.2: the guest handle\'s cancel() reaches a founding dispatch QUEUED above the cap — AGENT_CANCELLED, recorded durably, never a late prompt', async () => {
+  const { ws, broker, runner } = await setup({ maxConcurrentAgents: 1 });
+  await broker.eval('const a = agent("pi/x", "a"); const b = agent("pi/y", "b"); "started"');
+  assert.equal(runner.sessions.length, 1, 'only a dispatched — b waits in the dispatch queue');
+  // The handle's OWN cancel (the review probe: h.cancel() fell through
+  // to `failed` while the supposedly-cancelled queued dispatch later
+  // opened and prompted when a slot freed).
+  const steered = await broker.eval('const o = await b.cancel(); "cancelled:" + o');
+  assert.equal(steered.result, 'cancelled:cancelled', 'the handle cancel reports the honest cancelled outcome');
+  const record = broker.store().lookup('c2')!;
+  assert.equal(record.completion!.outcome, 'reject', 'the queued dispatch settled durably');
+  assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  const got = await broker.eval('await b.catch((e) => e.code + "/" + e.recoverable)');
+  assert.equal(got.result, 'AGENT_CANCELLED/true', 'the queued founding call rejects recoverable');
+  // Free the slot: the cancelled queued dispatch must never open a
+  // session or prompt.
+  await tick();
+  runner.sessions[0].completeTurn('a done');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(runner.sessions.length, 1, 'the cancelled queued dispatch never dispatched');
+  assert.equal(runner.sessions[0].prompts.length, 0);
+  await ws.dispose();
+});
+
+test('§4.2: a followUp on a DRAINED settled handle is minted and targetable from mint time — visible in agents() and interrupt-cancelable while the lazy re-attach load is still in flight', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  // The client-presence drain releases every child (the founding
+  // session is gone — a followUp re-attaches it lazily).
+  assert.equal(await broker.drainForDisconnect(200), true);
+  // Park the lazy load: the turn exists while the load is in flight.
+  runner.parkLoads = true;
+  const evaled = await broker.eval('const o = await pi.followUp("more").catch(e => e.code); console.log("got", o); "done"');
+  assert.equal(evaled.result, undefined, 'the followUp suspends until its turn answers');
+  await tick();
+  assert.equal(runner.parkedLoads.length, 1, 'the lazy re-attach load is parked');
+  // The review probe: during the delayed load the minted call was
+  // omitted from agents() and interrupt returned `none`. The turn must
+  // be visible and targetable from mint time.
+  const agents = broker.liveAgents();
+  assert.ok(
+    agents.some((a) => a.callId === 'c2' && a.state === 'opening' && a.task === 'more' && a.modelSpec === 'pi/deepseek-v4-flash-max'),
+    `the minted turn is listed while the load is in flight: ${JSON.stringify(agents)}`,
+  );
+  assert.equal(await broker.cancelCall('c2'), 'cancelled', 'interrupt targets the loading turn');
+  // The load lands: the cancelled turn must never start — it settles
+  // with the recoverable AGENT_CANCELLED, dropped durably.
+  const loaded = runner.releaseParkedLoad();
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(loaded.prompts.length, 0, 'the cancelled turn never prompted the re-attached session');
+  const record = broker.store().lookup('c2')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.notEqual(record.droppedAtMs, null, 'the drop is recorded durably');
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).some((l) => l === 'got AGENT_CANCELLED'), output(probe).join('\n'));
+  assert.ok(!broker.liveAgents().some((a) => a.callId === 'c2'), 'the cancelled turn left agents()');
+  await ws.dispose();
+});
+
+test('restore: a cap-queued answer-mode followUp whose founding handle was already settled re-queues ADDRESSABLY — registered and interrupt-cancelable while its re-attach load is parked, and delivered with the TURN\'S ANSWER once capacity frees', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-broker-restore-queued-followup-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner, maxConcurrentAgents: 1 });
+  // c1 opens + settles (idle); c2 takes the ONLY slot.
+  await broker.eval('const a = agent("pi/x", "a"); "started"');
+  await tick();
+  runner.sessions[0].completeTurn('a done');
+  await tick();
+  await broker.pump();
+  await broker.eval('const b = agent("pi/x", "b"); "started"');
+  await tick();
+  // Two followUps on the idle a-handle queue under the cap (c3, c4) —
+  // their promises stay pending; the store records the queued markers.
+  await broker.eval('const o3 = await a.followUp("three").catch(e => e.code); console.log("got3", o3); "done"');
+  await broker.eval('const o4 = await a.followUp("four").catch(e => e.code); console.log("got4", o4); "done"');
+  assert.equal(runner.sessions[0].prompts.length, 0, 'no delivery under cap pressure');
+  assert.notEqual(broker.store().lookup('c3')!.queuedAtMs, null, 'the queued marker is durable');
+  assert.notEqual(broker.store().lookup('c4')!.queuedAtMs, null);
+  // Simulated crash: snapshot + dispose with both followUps queued.
+  const snapshot = ws.snapshot();
+  await broker.dispose();
+  ws.dispose();
+  // Restore over the same store.
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  runner2.parkLoads = true;
+  const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath), maxConcurrentAgents: 1 });
+  // Reconcile parks on c2's re-attach load (the first parked load).
+  const reconciling = broker2.reconcile();
+  await tick();
+  assert.equal(runner2.parkedLoads.length, 1, 'c2\'s re-attach load is parked');
+  const reattachedC2 = runner2.releaseParkedLoad();
+  await reconciling;
+  await tick();
+  // The rebuild scheduled c1's lazy re-attach (the second parked load):
+  // the re-queued turns are registered with NO attached session — the
+  // review probe: agents() omitted them and interrupt returned `none`.
+  assert.equal(runner2.parkedLoads.length, 1, 'the founding session\'s lazy re-attach is parked');
+  const agents = broker2.liveAgents();
+  assert.ok(
+    agents.some((a) => a.callId === 'c3' && a.state === 'opening' && a.task === 'three'),
+    `the restored queued turn c3 is listed while its session re-attaches: ${JSON.stringify(agents)}`,
+  );
+  assert.ok(
+    agents.some((a) => a.callId === 'c4' && a.state === 'opening' && a.task === 'four'),
+    `the restored queued turn c4 is listed while its session re-attaches: ${JSON.stringify(agents)}`,
+  );
+  // Interrupt targets the queued turn while the load is parked.
+  assert.equal(await broker2.cancelCall('c3'), 'cancelled');
+  assert.equal(broker2.store().lookup('c3')!.completion!.outcome, 'reject');
+  assert.notEqual(broker2.store().lookup('c3')!.droppedAtMs, null, 'the drop is durable');
+  assert.ok(!broker2.liveAgents().some((a) => a.callId === 'c3'), 'the cancelled turn left agents()');
+  // The load lands; c4 merges into the rebuilt session's queue and
+  // waits for capacity (c2 still holds the only slot).
+  const loadedFounding = runner2.releaseParkedLoad();
+  await tick();
+  assert.equal(loadedFounding.prompts.length, 0, 'no delivery while the cap is exhausted');
+  assert.ok(
+    broker2.liveAgents().some((a) => a.callId === 'c4' && a.state === 'queued'),
+    'c4 waits attached and queued behind the cap',
+  );
+  // c2's re-attached loaded turn completes; its slot frees and the
+  // queued followUp delivers — settling the restored guest promise
+  // with the TURN'S ANSWER.
+  assert.equal(reattachedC2.loadedTurns.length, 1, 'the re-attach observes the loaded turn');
+  reattachedC2.loadedTurns[0].resolve({ stopReason: 'end_turn', text: 'b done' });
+  await tick();
+  await broker2.pump();
+  await tick();
+  assert.equal(loadedFounding.prompts.length, 1, 'the queued followUp started once a slot freed');
+  assert.equal(loadedFounding.prompts[0].content, 'four');
+  loadedFounding.completeTurn('four results');
+  await tick();
+  await broker2.pump();
+  // The restored SUSPENDED evals resumed at their settlements: the
+  // cancelled turn's continuation printed its recoverable rejection and
+  // the delivered turn's continuation printed the TURN'S ANSWER (the
+  // §4.2 promise semantics survive the restore).
+  const probe = await broker2.eval('"probe"');
+  assert.ok(output(probe).some((l) => l === 'got3 AGENT_CANCELLED'), output(probe).join('\n'));
+  assert.ok(output(probe).some((l) => l === 'got4 four results'), output(probe).join('\n'));
+  assert.equal(broker2.store().lookup('c4')!.completion!.value, 'four results', 'the delivered turn recorded its answer');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('§4.2: cancelling one in-flight followUp turn never discards its QUEUED answer-mode siblings — each settles with an explicit recoverable rejection (recorded + guest-settled)', async () => {
+  const { ws, broker, runner } = await setup({ maxConcurrentAgents: 1 });
+  // c1 opens + settles (idle); c2 takes the only slot.
+  await broker.eval('const a = agent("pi/x", "a"); "started"');
+  await tick();
+  runner.sessions[0].completeTurn('a done');
+  await tick();
+  await broker.pump();
+  await broker.eval('const busy = agent("pi/x", "busy"); "started"');
+  await tick();
+  // Two followUps queue behind the cap (c3, c4 — both answer-mode).
+  await broker.eval('const o3 = await a.followUp("three").catch(e => e.code); console.log("got3", o3); "done"');
+  await broker.eval('const o4 = await a.followUp("four").catch(e => e.code); console.log("got4", o4); "done"');
+  await tick();
+  assert.ok(broker.liveAgents().some((a) => a.callId === 'c3' && a.state === 'queued'));
+  assert.ok(broker.liveAgents().some((a) => a.callId === 'c4' && a.state === 'queued'));
+  // c2 settles: the kick starts c3's delivery turn (in flight).
+  runner.sessions[1].completeTurn('busy done');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(runner.sessions[0].prompts.length, 1, 'the first queued followUp is delivering');
+  // The interrupt cancels the IN-FLIGHT turn c3; the queue drop must
+  // settle the sibling c4 explicitly (the review probe: c4 vanished
+  // from agents() with completion: null and a pending guest promise).
+  assert.equal(await broker.cancelCall('c3'), 'cancelled');
+  await tick();
+  await broker.pump();
+  const c4 = broker.store().lookup('c4')!;
+  assert.notEqual(c4.completion, null, 'the sibling turn has a recorded completion');
+  assert.equal(c4.completion!.outcome, 'reject');
+  assert.equal((c4.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.notEqual(c4.droppedAtMs, null, 'the sibling drop is durable');
+  assert.ok(!broker.liveAgents().some((a) => a.callId === 'c4'), 'the dropped sibling left agents()');
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).some((l) => l === 'got3 AGENT_CANCELLED'), output(probe).join('\n'));
+  assert.ok(output(probe).some((l) => l === 'got4 AGENT_CANCELLED'), output(probe).join('\n'));
+  await ws.dispose();
+});
+
+test('§4.5: reset() ownership is the reset-calling eval ALONE — an unrelated suspended eval never gates the teardown (and a continuation-called reset() attributes through the continuation token)', async () => {
+  const { ws, broker } = await setup();
+  // The reset-owning eval suspends on a sleep; an UNRELATED eval
+  // suspends on a longer one. The review probe: the unrelated eval's
+  // suspension joined the owning set, so completing the reset-calling
+  // eval left the workspace running guest code while the unrelated
+  // eval stayed suspended.
+  const resetEval = await broker.eval('reset(); await sleep(50); console.log("reset-finished"); "reset-result"');
+  assert.equal(resetEval.result, undefined, 'the reset-owning eval suspended');
+  const unrelated = await broker.eval('await sleep(500); console.log("unrelated-finished"); "unrelated-result"');
+  assert.equal(unrelated.result, undefined, 'the unrelated eval suspended');
+  assert.equal(ws.isDisposed, false, 'the workspace is alive while the reset eval is in flight');
+  // The reset-owning eval's sleep fires; the unrelated eval is STILL
+  // suspended. The teardown is owed the moment the reset-calling eval
+  // completes — the next eval must reject on the disposed workspace
+  // (never run its code, never wait for the unrelated eval).
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  await assert.rejects(async () => broker.eval('"probe-ran"'), /disposed/);
+  assert.equal(ws.isDisposed, true, 'the teardown depended only on the reset-calling eval');
+  await ws.dispose();
+});
+
+test('§4.5: reset() called from a RESUMED continuation (`await sleep(…); reset()`) attributes to the reset-calling eval — the teardown runs at the pump that completes it', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('await sleep(30); reset(); console.log("continuation-reset"); "done-after-reset"');
+  assert.equal(r.result, undefined, 'the eval suspended on the sleep');
+  assert.equal(ws.isDisposed, false, 'the workspace is alive while the eval is in flight');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  // The pump runs the continuation (which calls reset()); the sweep
+  // releases the completed wrapper and the serialized-op post-hook
+  // tears the workspace down — before any later guest code.
+  await broker.pump();
+  assert.equal(ws.isDisposed, true, 'the continuation-called reset() tore the workspace down at the completing pump');
+  await assert.rejects(async () => broker.eval('1 + 1'), /disposed|alive/);
+  await ws.dispose();
+});
+
+test('§4.5: reset() after an immediately-resolved local await (the eval\'s OWN drain) is still THIS eval\'s request — the teardown follows that eval\'s completion', async () => {
+  const { ws, broker } = await setup();
+  // The continuation of `await Promise.resolve(0)` runs in the eval's
+  // OWN drain phase — the reset() call there belongs to THIS eval (the
+  // per-eval flag, discriminated by the continuation token), never to
+  // whichever eval's token the lease mirror held last.
+  const r = await broker.eval('await Promise.resolve(0); reset(); "done-after-local-await"');
+  assert.equal(r.result, 'done-after-local-await');
+  assert.equal(ws.isDisposed, true, 'the own-drain reset() tore the workspace down after the eval completed');
+  await assert.rejects(async () => broker.eval('1 + 1'), /disposed|alive/);
+  await ws.dispose();
+});
+
+test('§4.5/§7: agents() carries the modelSpec VERBATIM — no 200-char head/tail cap on the spec (session and followUp-turn entries alike)', async () => {
+  const { ws, broker, runner } = await setup();
+  const spec = 'pi/' + 'x'.repeat(500);
+  await broker.eval(`const h = agent(${JSON.stringify(spec)}, "task"); "started"`);
+  await tick();
+  const sessionEntry = await broker.eval(
+    `(() => { const a = agents()[0]; return a.modelSpec.length + ":" + a.modelSpec.slice(0, 3) + ":" + a.modelSpec.slice(-3); })()`,
+  );
+  assert.equal(sessionEntry.result, '503:pi/:xxx', 'the session entry carries the whole 503-char spec');
+  // The followUp-turn entry renders the founding session's spec
+  // verbatim too (the review probe read a 200-char preview back).
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  await broker.eval('const f = h.followUp("more"); "started"');
+  await tick();
+  const turnEntry = await broker.eval(
+    `(() => { const t = agents().find((a) => a.callId === "c2"); return t.modelSpec.length + ":" + (t.modelSpec === ${JSON.stringify(spec)}); })()`,
+  );
+  assert.equal(turnEntry.result, '503:true', 'the followUp-turn entry carries the whole spec verbatim');
   await ws.dispose();
 });

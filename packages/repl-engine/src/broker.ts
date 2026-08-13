@@ -671,7 +671,9 @@ export interface LiveAgentInfo {
   callId: string;
   modelSpec: string;
   task: string;
-  /** `opening` — session being opened; `running` — initial turn in
+  /** `opening` — session being opened, or a followUp turn whose
+   *  founding session is still being re-attached (listed from mint
+   *  time); `running` — initial turn in
    *  flight; `delivering` — a queued-steer turn in flight; `queued` —
    *  a followUp turn waiting for a free concurrency slot (visible and
    *  targetable before its delivery starts); `idle` — call settled, no
@@ -1085,10 +1087,36 @@ export class Broker {
    *  turn: visible in `agents()`/`liveAgents()`, targetable by
    *  `interrupt`. `queued` marks a minted turn whose delivery is
    *  waiting for a free concurrency slot (enrolled at mint time — the
-   *  turn is visible and interruptable BEFORE it starts). */
+   *  turn is visible and interruptable BEFORE it starts). `entry` is
+   *  undefined while the turn's founding session is still being
+   *  re-attached (a followUp on a drained settled handle mid-load, or
+   *  a restored queued turn whose founding session is not attached
+   *  yet) — the turn is REGISTERED from mint time either way (the
+   *  review defect: the lazy-load turn used to be registered only once
+   *  `loadSession` finished, hiding the minted call from `agents()`
+   *  and `interrupt` during a delayed load). `cancelRequested` marks
+   *  an interrupt that landed during that load: the load's completion
+   *  settles the steer with the recoverable AGENT_CANCELLED instead of
+   *  starting the turn. */
   private readonly followUpTurns = new Map<
     string,
-    { entry: SessionEntry; prompt: string; queued: boolean }
+    {
+      entry: SessionEntry | undefined;
+      /** The founding call id (the session key) — always known, even
+       *  while the session itself is being re-attached. */
+      sessionId: string;
+      prompt: string;
+      queued: boolean;
+      /** The resolved backend id for the §4.6 attribution (the
+       *  founding session's own when attached, else the founding
+       *  store record's) — carried so cancelling a not-yet-attached
+       *  turn still names the backend. */
+      backendId?: string;
+      /** An interrupt landed while the lazy re-attach load was in
+       *  flight: the load's completion must settle the steer with the
+       *  recoverable AGENT_CANCELLED — never start the turn. */
+      cancelRequested?: boolean;
+    }
   >();
   /** Live `sleep(ms)` calls, keyed by host-minted tracking ids (not
    *  guest call ids — sleeps never enter the guest registry or the call
@@ -1096,9 +1124,17 @@ export class Broker {
   private readonly sleepCalls = new Map<string, { call: GuestCall; done: boolean }>();
   private sleepSeq = 0;
   /** The `reset()` request (see the eval handler): the teardown runs
-   *  after the current eval completes. */
-  /** A reset() was requested by guest code and its teardown is owed
-   *  (consumed when the requesting eval completes — see `resetDue`). */
+   *  after the current eval completes. SCOPED to the eval being
+   *  executed: cleared at the start of every eval op, so an unrelated
+   *  later eval never inherits an earlier eval's request (the review
+   *  defect: the workspace-global flag inserted EVERY later suspending
+   *  eval into `resetOwningCompletions`, delaying the teardown behind
+   *  unrelated suspended evals — the workspace kept running guest code
+   *  after the reset-owning eval completed). A reset() called from a
+   *  RESUMED continuation is attributed to the reset-calling eval's
+   *  completion wrapper immediately, through the executing job's
+   *  continuation token (see the reset handler) — the flag is only the
+   *  code-phase snapshot. */
   private resetRequested = false;
   /** The reset-requesting evals' retained SUSPENDED completions (a
    *  reset() owes its teardown AFTER the eval completes — a reset eval
@@ -1157,6 +1193,14 @@ export class Broker {
    *  `runEval` mints it before the VM execution; `eval` attributes it
    *  to the completion wrapper when the eval suspends). */
   private lastEvalToken: string | undefined;
+  /** True while `runEval` is executing (its code phase and its own
+   *  drain) — the reset handler's attribution discriminator: a job
+   *  whose continuation token is NOT the current eval's while `runEval`
+   *  is active is a RESUMED SUSPENDED eval (attributed through its
+   *  completion wrapper); outside `runEval` every leased job is a
+   *  resumed eval (the stale `lastEvalToken` of a now-suspended eval
+   *  must never route through the per-eval flag). */
+  private inRunEval = false;
   /** The per-eval continuation-token mint counter. */
   private evalTokenSeq = 0;
   /** The per-job continuation-lease seam (see `ReplJobLease` in vm.ts):
@@ -1341,6 +1385,34 @@ export class Broker {
       workspace: () => this.workspaceJson(),
       agents: () => this.agentsJson(),
       reset: () => {
+        // The request belongs to the eval whose code/continuation is
+        // EXECUTING. A RESUMED SUSPENDED eval's continuation (the
+        // continuation IS the eval's tail — `await agent(...);
+        // reset()`) is attributed to that eval's retained completion
+        // wrapper NOW, through the executing job's continuation token
+        // (the lease mirror — set by the drain loop while the
+        // continuation segment runs): the teardown then depends ONLY
+        // on the reset-calling eval's completion (the sweep flips
+        // `resetDue` when it settles) and never leaks into an
+        // unrelated later eval's snapshot (the review defect's shape).
+        // The CURRENT eval's request — its code phase (the mirror is
+        // clean there, see `runEval`) or its own continuation in its
+        // own drain (a job carrying THIS eval's token) — takes the
+        // per-eval flag instead: the eval op's snapshot attributes it
+        // (suspension → owning set, completion → `resetDue`). A legacy
+        // workspace without the lease surface reads an empty mirror
+        // and takes the flag path (its snapshots take the §6.1
+        // auto-reset path on first touch anyway).
+        const token = this.jobLease.cell.current;
+        if (token !== undefined && (!this.inRunEval || token !== this.lastEvalToken)) {
+          for (const [completion, evalToken] of this.evalTokens) {
+            if (evalToken === token) {
+              this.resetOwningCompletions.add(completion);
+              break;
+            }
+          }
+          return;
+        }
         this.resetRequested = true;
       },
       defaultBackend: () => this.runner.defaultBackendId(),
@@ -1392,7 +1464,22 @@ export class Broker {
       if (this.resetDue) {
         await this.resetIfDue(0);
       }
+      // reset() (§4.5) SCOPING: the request belongs to THIS eval — the
+      // snapshot below captures only what this eval's execution
+      // requested. The scope starts clean (an earlier suspended eval's
+      // continuation may have called reset() during the pump's drains;
+      // that request was attributed to ITS completion wrapper through
+      // the continuation-token seam in the reset handler) so an
+      // UNRELATED later eval that suspends can never join the owning
+      // set (the review defect: the workspace-global flag inserted
+      // every later suspending eval into `resetOwningCompletions`,
+      // delaying the teardown behind unrelated suspended evals — the
+      // workspace kept running guest code after the reset-owning eval
+      // completed).
+      this.resetRequested = false;
       const { outcome, completion, interruptedInDrain } = this.runEval(code, options);
+      const resetByThisEval = this.resetRequested;
+      this.resetRequested = false;
       if (interruptedInDrain === true) {
         // The eval's OWN drain was interrupted (the armed eval-break
         // signal's target resumed by a synchronous host-callback
@@ -1464,8 +1551,10 @@ export class Broker {
         }
         // reset() (§4.5) owes its teardown after THIS eval completes —
         // a reset eval that SUSPENDED retains its completion in the
-        // owning set; the sweep flips `resetDue` when it settles.
-        if (this.resetRequested) {
+        // owning set; the sweep flips `resetDue` when it settles. ONLY
+        // this eval's own wrapper joins (the per-eval scope above): an
+        // unrelated suspended eval never gates the teardown.
+        if (resetByThisEval) {
           this.resetOwningCompletions.add(completion as JSValueHandle);
         }
       }
@@ -1474,7 +1563,7 @@ export class Broker {
       // outstanding). The disposal itself runs after the operation —
       // the serialized-op post-hook (`resetIfDue`), OUTSIDE the chain
       // slot — so this eval's result ships first.
-      if (this.resetRequested && outcome.kind !== 'pending' && this.resetOwningCompletions.size === 0) {
+      if (resetByThisEval && outcome.kind !== 'pending' && this.resetOwningCompletions.size === 0) {
         this.resetDue = true;
       }
       // The pump's deliveries first, then this eval's own synchronous
@@ -1691,7 +1780,13 @@ export class Broker {
         // at rebuild (visible in `agents()`, targetable by `interrupt`
         // — the §4.2 addressability survives the restore).
         if (queuedAnswer) {
-          this.followUpTurns.set(record.callId, { entry, prompt: payload.prompt, queued: true });
+          this.followUpTurns.set(record.callId, {
+            entry,
+            sessionId: entry.callId,
+            prompt: payload.prompt,
+            queued: true,
+            backendId: entry.backendId,
+          });
         }
         reQueued.push(record.callId);
       } else {
@@ -1699,6 +1794,35 @@ export class Broker {
         if (pending.some((item) => item.callId === record.callId)) continue;
         pending.push({ callId: record.callId, ...payload, answer: queuedAnswer });
         this.pendingSteers.set(sessionId, pending);
+        if (queuedAnswer) {
+          // A restored QUEUED followUp turn whose founding session is
+          // NOT attached (the crash happened with the handle settled
+          // and drained): the turn is registered NOW — visible in
+          // `agents()` and targetable by `interrupt` from rebuild time
+          // (the review defect: the item was parked in `pendingSteers`
+          // with no turn registered, no re-attach scheduled and no
+          // delivery scheduled — `agents()` omitted it, `interrupt`
+          // returned `none`, and it stayed pending after capacity
+          // freed) — and its delivery is scheduled through the
+          // founding handle's lazy re-attach: the load merges the
+          // pending steers into the rebuilt session and the global
+          // kick starts the turn as slots free. A load that fails
+          // settles the queued followUp with the honest `failed`
+          // (recorded durably first — never a discarded turn).
+          const founding = this.callStore.lookup(sessionId);
+          this.followUpTurns.set(record.callId, {
+            entry: undefined,
+            sessionId,
+            prompt: payload.prompt,
+            queued: true,
+            backendId:
+              founding?.backendId ??
+              (founding?.modelSpec !== null && founding?.modelSpec !== undefined && founding.modelSpec !== ''
+                ? backendSegment(founding.modelSpec)
+                : undefined),
+          });
+          this.scheduleRestoredQueuedDelivery(sessionId, record.callId);
+        }
         reQueued.push(record.callId);
       }
     }
@@ -1724,7 +1848,7 @@ export class Broker {
    *  attribution, and release the turn registry entry. One settlement
    *  drain fires the guest reactions (mirrors the pump's per-call
    *  drain); a failed drain is honest output, never a cancel failure. */
-  private settleQueuedFollowUpCancellation(callId: string, backendId: string): void {
+  private settleQueuedFollowUpCancellation(callId: string, backendId: string | undefined): void {
     this.callStore.recordDelivery(callId, 'dropped', now());
     const value = toRejectionValue(
       new WorkflowError(`followUp ${callId} was cancelled while queued for delivery`, CODE.AGENT_CANCELLED, {
@@ -1733,7 +1857,7 @@ export class Broker {
     );
     // The §4.6 attribution: the followUp's resolved backend (the
     // founding session's recorded backend id).
-    (value as { replBackend?: string }).replBackend = backendId;
+    if (backendId !== undefined) (value as { replBackend?: string }).replBackend = backendId;
     this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
     try {
       this.settleIntoGuest(callId, 'reject', value);
@@ -1748,6 +1872,46 @@ export class Broker {
     }
     this.followUpTurns.delete(callId);
     this.kickQueuedDeliveries();
+  }
+
+  /** Schedule the delivery of a restored QUEUED answer-mode followUp
+   *  whose founding session is NOT attached (see
+   *  `rebuildUndeliveredQueues`): lazily re-attach the founding
+   *  session — deduped per founding call id, capability-gated exactly
+   *  like every load — and let the global kick start the queued
+   *  delivery (the turn settles with its answer through the ordinary
+   *  record → settle → consume pump). A failed load settles the queued
+   *  followUp with the honest `failed`, recorded durably FIRST (the
+   *  dropped marker — a restore never re-queues a settled item). The
+   *  task runs OUTSIDE the serialized chain (the load is a runner
+   *  wire call, like every lazy re-attach); its outcome travels the
+   *  pump like any steer. */
+  private scheduleRestoredQueuedDelivery(sessionId: string, steerCallId: string): void {
+    const task = this.lazyReattach(sessionId).then(
+      (entry): { outcome: 'resolve' | 'reject' | 'hold'; value: unknown } => {
+        if (this.disposed) {
+          // The broker is being torn down: the guest calls are gone
+          // with the workspace — nothing to settle.
+          this.followUpTurns.delete(steerCallId);
+          return { outcome: 'hold', value: undefined };
+        }
+        if (entry === undefined) {
+          this.followUpTurns.delete(steerCallId);
+          this.callStore.recordDelivery(steerCallId, 'dropped', now());
+          this.warnLine(
+            'warn',
+            `followUp ${steerCallId} (on ${sessionId}): the founding session could not be re-attached — failed`, // eslint-disable-line max-len
+          );
+          return { outcome: 'resolve', value: 'failed' };
+        }
+        // The load merged the pending steers into the rebuilt session's
+        // queue; the global kick starts the delivery as slots free (the
+        // turn settles with its answer through the pump).
+        this.kickQueuedDeliveries();
+        return { outcome: 'hold', value: undefined };
+      },
+    );
+    this.trackInFlight(steerCallId, 'steer', task);
   }
 
   /** Did this founding call end in an orchestrator-driven cancel (the
@@ -2549,9 +2713,33 @@ export class Broker {
   ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     return (async () => {
       const entry = await this.lazyReattach(sessionId);
+      // An interrupt landed while the load was in flight (the turn was
+      // minted and targetable from the start — §4.2): the turn must
+      // NEVER start. Drop it durably (the dropped marker — a restore
+      // never re-queues it) and settle the steer with the recoverable
+      // AGENT_CANCELLED; the pump records the completion and settles
+      // the guest promise. The cancel wins over a failed load too (the
+      // interrupt reported `cancelled` — the settlement must match).
+      const minted = this.followUpTurns.get(callId);
+      if (minted?.cancelRequested === true) {
+        if (entry !== undefined) {
+          entry.queue = entry.queue.filter((item) => item.callId !== callId);
+        }
+        this.callStore.recordDelivery(callId, 'dropped', now());
+        this.followUpTurns.delete(callId);
+        const value = toRejectionValue(
+          new WorkflowError(`followUp ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
+            recoverable: true,
+          }),
+        );
+        (value as { replBackend?: string }).replBackend = entry?.backendId ?? minted.backendId;
+        return { outcome: 'reject', value };
+      }
       if (entry === undefined) {
         // Nothing was steered (the load failed through the capability
-        // gate or the session is lost).
+        // gate or the session is lost) — the minted turn registry
+        // entry (if any) is released with the honest `failed`.
+        this.followUpTurns.delete(callId);
         return { outcome: 'resolve', value: 'failed' };
       }
       if (action === 'cancel') {
@@ -2559,9 +2747,13 @@ export class Broker {
         return this.runCancelTask(callId, entry);
       }
       if (action !== 'followUp' && action !== 'steer') {
+        this.followUpTurns.delete(callId);
         return { outcome: 'resolve', value: 'failed' };
       }
       if (entry.busy) {
+        // Mid-turn semantics (the delivery-outcome vocabulary — no
+        // separate turn to answer): release the minted registry entry.
+        this.followUpTurns.delete(callId);
         if (entry.supportsSteering) {
           return this.runInjectTask(callId, entry, prompt, promptMeta);
         }
@@ -2578,7 +2770,13 @@ export class Broker {
         // Minted at enqueue like the live idle path: the queued turn is
         // visible in `agents()` and targetable before its delivery
         // starts.
-        this.followUpTurns.set(callId, { entry, prompt, queued: true });
+        this.followUpTurns.set(callId, {
+          entry,
+          sessionId: entry.callId,
+          prompt,
+          queued: true,
+          backendId: entry.backendId,
+        });
         return { outcome: 'hold', value: undefined };
       }
       return this.runFollowUpTask(callId, entry, prompt, promptMeta);
@@ -2741,6 +2939,76 @@ export class Broker {
     this.consoleBuffer.push({ level, line: message });
   }
 
+  /** Cancel a dispatch QUEUED above the concurrency cap (§4.1's
+   *  dispatch-order queue — a fresh dispatch, or a queued restore-time
+   *  re-issue): remove it from the queue (it never starts — a freed
+   *  slot must never dispatch a cancelled call) and settle it durably
+   *  as the recoverable AGENT_CANCELLED, recorded FIRST (a restore
+   *  settles it from the store, never re-issues it). The rejection
+   *  carries the §4.6 backend attribution when the call's backend
+   *  resolved. `drain` is true for the interrupt tool's id path (its
+   *  own serialized op — one settlement drain fires the guest
+   *  reactions within the operation) and false for the guest handle's
+   *  `cancel()` (it runs INSIDE the eval's code phase, where a drain
+   *  would be a reentrant VM operation — the eval's own drain phase
+   *  runs the queued reactions, and the eval's provenance pass and
+   *  state-changing boundary cover the settlement). Returns whether
+   *  the call was found queued. Runs under the serialized chain (its
+   *  callers hold it) — the shared body of the interrupt tool's id
+   *  path and the guest handle's `cancel()` (the review defect:
+   *  `h.cancel()` on a queued founding dispatch fell through to
+   *  `failed` while the dispatch later opened and prompted). */
+  private cancelQueuedDispatch(callId: string, source: string, drain: boolean): boolean {
+    const queueIndex = this.dispatchQueue.findIndex((queued) =>
+      queued.kind === 'dispatch' ? queued.callId === callId : queued.entry.id === callId,
+    );
+    if (queueIndex < 0) return false;
+    const [queued] = this.dispatchQueue.splice(queueIndex, 1);
+    const isReissue = queued.kind === 'reissue';
+    const detail = isReissue ? (queued.entry.detail ?? '') : queued.task;
+    const optionsJson = isReissue ? queued.entry.optionsJson : queued.optionsJson;
+    const modelSpec = isReissue ? (queued.entry.modelSpec ?? '') : queued.modelSpec;
+    const value = toRejectionValue(
+      new WorkflowError(
+        isReissue
+          ? `call ${callId} was cancelled (${source}) while queued for re-issue (the concurrency cap)`
+          : `call ${callId} was cancelled (${source}) while queued for dispatch (the concurrency cap)`,
+        CODE.AGENT_CANCELLED,
+        { recoverable: true },
+      ),
+    );
+    // The §4.6 attribution: the resolved backend (the recorded
+    // backend id when the store has one — a queued re-issue pins
+    // the original backend — else the admission-validated segment).
+    const backend =
+      this.recordedBackendId(callId) ?? (modelSpec !== '' ? backendSegment(modelSpec) : undefined);
+    if (backend !== undefined && this.knownBackends().includes(backend)) {
+      (value as { replBackend?: string }).replBackend = backend;
+    }
+    this.recordDispatch(callId, 'agent', detail, optionsJson, null, modelSpec !== '' ? modelSpec : null);
+    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+    if (drain) {
+      try {
+        this.settleIntoGuest(callId, 'reject', value);
+        this.drain();
+        this.provenancePass('settlement', [callId]);
+        this.sink?.boundary('settlement');
+      } catch (error) {
+        if (error instanceof DrainJobError) {
+          this.warnLine('warn', `settlement drain interrupted after cancelling queued call ${callId}: ${errorLine(error.info)}`);
+          this.sink?.boundary('settlement');
+        } else throw error;
+      }
+    } else {
+      // Inside the eval's code phase (the handle-cancel path): no
+      // drain, no settlement pass here — the eval's own drain runs the
+      // queued reactions and its provenance/boundary cover the
+      // settlement.
+      this.settleIntoGuest(callId, 'reject', value);
+    }
+    return true;
+  }
+
   /** Fence + durably settle an opening call as cancelled — the
    *  `interrupt` tool's id path (and the guest handle's `cancel()`) on
    *  a call whose `openSession` is still pending (phase-E review
@@ -2816,45 +3084,7 @@ export class Broker {
       // the queue and settles it as cancelled (recorded first, durable:
       // a restore never re-issues it). The rejection carries the §4.6
       // backend attribution when the call's backend resolved.
-      const queueIndex = this.dispatchQueue.findIndex((queued) =>
-        queued.kind === 'dispatch' ? queued.callId === callId : queued.entry.id === callId,
-      );
-      if (queueIndex >= 0) {
-        const [queued] = this.dispatchQueue.splice(queueIndex, 1);
-        const isReissue = queued.kind === 'reissue';
-        const detail = isReissue ? (queued.entry.detail ?? '') : queued.task;
-        const optionsJson = isReissue ? queued.entry.optionsJson : queued.optionsJson;
-        const modelSpec = isReissue ? (queued.entry.modelSpec ?? '') : queued.modelSpec;
-        const value = toRejectionValue(
-          new WorkflowError(
-            isReissue
-              ? `call ${callId} was cancelled while queued for re-issue (the concurrency cap)`
-              : `call ${callId} was cancelled while queued for dispatch (the concurrency cap)`,
-            CODE.AGENT_CANCELLED,
-            { recoverable: true },
-          ),
-        );
-        // The §4.6 attribution: the resolved backend (the recorded
-        // backend id when the store has one — a queued re-issue pins
-        // the original backend — else the admission-validated segment).
-        const backend =
-          this.recordedBackendId(callId) ?? (modelSpec !== '' ? backendSegment(modelSpec) : undefined);
-        if (backend !== undefined && this.knownBackends().includes(backend)) {
-          (value as { replBackend?: string }).replBackend = backend;
-        }
-        this.recordDispatch(callId, 'agent', detail, optionsJson, null, modelSpec !== '' ? modelSpec : null);
-        this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
-        try {
-          this.settleIntoGuest(callId, 'reject', value);
-          this.drain();
-          this.provenancePass('settlement', [callId]);
-          this.sink?.boundary('settlement');
-        } catch (error) {
-          if (error instanceof DrainJobError) {
-            this.warnLine('warn', `settlement drain interrupted after cancelling queued call ${callId}: ${errorLine(error.info)}`);
-            this.sink?.boundary('settlement');
-          } else throw error;
-        }
+      if (this.cancelQueuedDispatch(callId, 'interrupt', true)) {
         return { kind: 'opening-cancelled' as const };
       }
       // §4.2: a QUEUED followUp delivery (cap pressure on an idle
@@ -2880,19 +3110,39 @@ export class Broker {
       // key).
       const turn = this.followUpTurns.get(callId);
       if (turn !== undefined) {
+        if (turn.entry === undefined) {
+          // The turn's delivery still waits on the founding session's
+          // lazy re-attach load. TWO homes, both settled durably: a
+          // restored queue rebuild's item waits in `pendingSteers`
+          // (remove it there and settle the cancellation NOW), and a
+          // live followUp's load is in flight (mark it cancelled — the
+          // load's completion settles the steer with the recoverable
+          // AGENT_CANCELLED instead of starting the turn). Either way
+          // the turn is addressable from mint time, never `none`.
+          const pending = this.pendingSteers.get(turn.sessionId);
+          if (pending !== undefined && pending.some((item) => item.callId === callId)) {
+            const remaining = pending.filter((item) => item.callId !== callId);
+            if (remaining.length > 0) this.pendingSteers.set(turn.sessionId, remaining);
+            else this.pendingSteers.delete(turn.sessionId);
+            this.settleQueuedFollowUpCancellation(callId, turn.backendId);
+            return { kind: 'opening-cancelled' as const };
+          }
+          turn.cancelRequested = true;
+          return { kind: 'opening-cancelled' as const };
+        }
         if (turn.queued) {
           // A QUEUED turn whose delivery item is NOT in the founding
           // session's queue (it was re-homed into the session's pending
           // steers — the re-issue/drain path): remove it there and
           // settle the same durable cancellation (the queued turn is
           // addressable everywhere it waits).
-          const pending = this.pendingSteers.get(turn.entry.callId);
+          const pending = this.pendingSteers.get(turn.sessionId);
           if (pending !== undefined) {
             const remaining = pending.filter((item) => item.callId !== callId);
-            if (remaining.length > 0) this.pendingSteers.set(turn.entry.callId, remaining);
-            else this.pendingSteers.delete(turn.entry.callId);
+            if (remaining.length > 0) this.pendingSteers.set(turn.sessionId, remaining);
+            else this.pendingSteers.delete(turn.sessionId);
           }
-          this.settleQueuedFollowUpCancellation(callId, turn.entry.backendId);
+          this.settleQueuedFollowUpCancellation(callId, turn.backendId ?? turn.entry.backendId);
           return { kind: 'opening-cancelled' as const };
         }
         return { kind: 'cancel-live' as const, entry: turn.entry, turnId: callId };
@@ -3292,13 +3542,13 @@ export class Broker {
   liveAgents(): LiveAgentInfo[] {
     const entries: LiveAgentInfo[] = [...this.sessions.values()].map((entry) => ({
       callId: entry.callId,
-      // The modelSpec is GUEST-DERIVED (the `agent(modelSpec, …)`
-      // argument): previewed at the engine seam like the task — the
-      // phase-E review rejection round 7 finding (a 20,000-character
-      // model spec crossed status as a >20KB structured entry while
-      // only the text was capped). The same head+tail 200-char bound
-      // as the task surface.
-      modelSpec: entry.modelSpec.length > 200 ? headTail(entry.modelSpec, 200) : entry.modelSpec,
+      // The modelSpec ships VERBATIM (§7: the engine retains 200-char
+      // metadata formatting ONLY for manifest tokens, checkpoint
+      // questions and task previews — `agents()` is the §4.5
+      // guest-visible plain data, and the full spec must stay
+      // recoverable; the review defect capped it at 200 chars). The
+      // task preview keeps its 200-char bound (a retained preview).
+      modelSpec: entry.modelSpec,
       task: entry.task.length > 200 ? headTail(entry.task, 200) : entry.task,
       state: !entry.callSettled
         ? entry.busy
@@ -3318,13 +3568,20 @@ export class Broker {
     // before its delivery starts (the review probe: a cap-queued turn
     // must be visible in `agents()` while pending).
     for (const [callId, turn] of this.followUpTurns) {
+      // A turn whose founding session is still being re-attached (a
+      // drained settled handle's lazy load, or a restore whose queue
+      // rebuild re-attaches the founding session) renders the honest
+      // `opening` state from the founding store record — the turn is
+      // listed from MINT time (the review defect: a delayed load hid
+      // the minted call from `agents()`). The modelSpec is the
+      // founding session's, VERBATIM like the session entries.
       entries.push({
         callId,
-        modelSpec: turn.entry.modelSpec.length > 200 ? headTail(turn.entry.modelSpec, 200) : turn.entry.modelSpec,
+        modelSpec: turn.entry?.modelSpec ?? this.callStore.lookup(turn.sessionId)?.modelSpec ?? '',
         task: turn.prompt.length > 200 ? headTail(turn.prompt, 200) : turn.prompt,
-        state: turn.queued ? 'queued' : 'running',
-        supportsSteering: turn.entry.supportsSteering,
-        queuedSteers: turn.entry.queue.length,
+        state: turn.entry === undefined ? 'opening' : turn.queued ? 'queued' : 'running',
+        supportsSteering: turn.entry?.supportsSteering ?? false,
+        queuedSteers: turn.entry?.queue.length ?? 0,
       });
     }
     return entries;
@@ -3856,7 +4113,22 @@ export class Broker {
             // the store ALREADY holds a first completion the guest
             // settles with the STORE's completion (the store's first
             // completion is the authority — the guest must never see a
-            // different value than the store records).
+            // different value than the store records). A QUEUED
+            // answer-mode followUp (its store record carries the
+            // queued marker — a restored queue rebuild's delivery
+            // scheduler, or a cap-queued lazy re-attach) also gains the
+            // durable DROPPED marker: the cut-off turn settled `failed`
+            // here, and a restore must never re-queue it for a
+            // spurious second delivery turn.
+            const queuedRecord = this.callStore.lookup(task.callId);
+            if (
+              queuedRecord?.queuedAtMs !== null &&
+              queuedRecord?.queuedAtMs !== undefined &&
+              queuedRecord.deliveredAtMs === null &&
+              queuedRecord.droppedAtMs === null
+            ) {
+              this.callStore.recordDelivery(task.callId, 'dropped', now());
+            }
             if (this.recordCompletion(task.callId, { outcome: 'resolve', value: 'failed', completedAtMs: now() })) {
               if (this.settleIntoGuest(task.callId, 'resolve', 'failed')) settledIds.push(task.callId);
             } else {
@@ -3923,7 +4195,20 @@ export class Broker {
             if (registryEntry.kind === 'steer') {
               // The deliver() discipline: the store write first; a
               // store that already holds a first completion stays the
-              // authority.
+              // authority. A QUEUED answer-mode followUp (the store
+              // record carries the queued marker) also gains the
+              // durable DROPPED marker — the cut-off turn settled
+              // `failed` here, and a restore must never re-queue it
+              // for a spurious second delivery turn.
+              const queuedRecord = this.callStore.lookup(registryEntry.id);
+              if (
+                queuedRecord?.queuedAtMs !== null &&
+                queuedRecord?.queuedAtMs !== undefined &&
+                queuedRecord.deliveredAtMs === null &&
+                queuedRecord.droppedAtMs === null
+              ) {
+                this.callStore.recordDelivery(registryEntry.id, 'dropped', now());
+              }
               if (this.recordCompletion(registryEntry.id, { outcome: 'resolve', value: 'failed', completedAtMs: now() })) {
                 if (this.settleIntoGuest(registryEntry.id, 'resolve', 'failed')) settledIds.push(registryEntry.id);
               } else {
@@ -4332,9 +4617,19 @@ export class Broker {
    *  their delivery starts. Idempotent per turn id. */
   private registerQueuedTurns(entry: SessionEntry): void {
     for (const item of entry.queue) {
-      if (item.answer && !this.followUpTurns.has(item.callId)) {
-        this.followUpTurns.set(item.callId, { entry, prompt: item.prompt, queued: true });
-      }
+      if (!item.answer) continue;
+      // Unconditional: a turn registered BEFORE the session existed (a
+      // restore's queue rebuild whose lazy re-attach just landed, or a
+      // re-issued founding call's re-homed items) gains its entry here
+      // — the turn was addressable while the session was absent and
+      // stays addressable now that it is attached.
+      this.followUpTurns.set(item.callId, {
+        entry,
+        sessionId: entry.callId,
+        prompt: item.prompt,
+        queued: true,
+        backendId: entry.backendId,
+      });
     }
   }
 
@@ -4475,6 +4770,19 @@ export class Broker {
         this.settleSteerSync(call, callId, 'cancelled');
         return;
       }
+      // §4.1/§4.2: a founding dispatch QUEUED above the concurrency
+      // cap is neither opening nor open — it waits in the dispatch
+      // queue, invisible to `openingCalls`/`agentSlots`. The handle's
+      // cancel() must reach it there (the review defect: the cancel
+      // fell through to `failed` while the supposedly-cancelled queued
+      // dispatch later opened and prompted when a slot freed). The
+      // same durable AGENT_CANCELLED settlement as the interrupt
+      // tool's id path; the steer resolves with what actually
+      // happened: `cancelled`.
+      if (action === 'cancel' && this.cancelQueuedDispatch(sessionId, 'handle cancel', false)) {
+        this.settleSteerSync(call, callId, 'cancelled');
+        return;
+      }
       if (this.agentSlots.has(sessionId) && action !== 'cancel') {
         // The founding call is still opening (its session does not exist
         // yet — a steer in the same eval as the dispatch lands here).
@@ -4526,6 +4834,28 @@ export class Broker {
         } catch (error) {
           this.refuse(call, callId, 'steer', action, payloadJson, error);
           return;
+        }
+        // §4.2 addressability FROM MINT TIME: the followUp/steer turn
+        // is REGISTERED before the lazy load starts — visible in
+        // `agents()` and targetable by `interrupt` while the session
+        // is still being re-attached (the review defect: the turn was
+        // registered only once `loadSession` finished, so a delayed
+        // load hid the minted call and `interrupt` returned `none`).
+        // A cancel needs no turn (its outcome is the delivery
+        // vocabulary's `idle`/`cancelled`).
+        if (action === 'followUp' || action === 'steer') {
+          const founding = this.callStore.lookup(sessionId);
+          this.followUpTurns.set(callId, {
+            entry: undefined,
+            sessionId,
+            prompt,
+            queued: false,
+            backendId:
+              this.recordedBackendId(sessionId) ??
+              (founding?.modelSpec !== null && founding?.modelSpec !== undefined && founding.modelSpec !== ''
+                ? backendSegment(founding.modelSpec)
+                : undefined),
+          });
         }
         const task = this.runLazyReattachSteerTask(callId, sessionId, action, prompt, promptMeta);
         this.deferreds.set(callId, call);
@@ -4604,7 +4934,13 @@ export class Broker {
       // is visible in `agents()`/`liveAgents()` and targetable by
       // `interrupt` while it waits for a free slot — never hidden
       // behind the cap until its delivery starts.
-      this.followUpTurns.set(callId, { entry, prompt, queued: true });
+      this.followUpTurns.set(callId, {
+        entry,
+        sessionId: entry.callId,
+        prompt,
+        queued: true,
+        backendId: entry.backendId,
+      });
       return;
     }
     const task = this.runFollowUpTask(callId, entry, prompt, promptMeta);
@@ -5188,7 +5524,13 @@ export class Broker {
     prompt: string,
     promptMeta: Record<string, unknown> | undefined,
   ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
-    this.followUpTurns.set(callId, { entry, prompt, queued: false });
+    this.followUpTurns.set(callId, {
+      entry,
+      sessionId: entry.callId,
+      prompt,
+      queued: false,
+      backendId: entry.backendId,
+    });
     try {
       entry.busy = true;
       entry.delivering = entry.callSettled;
@@ -5297,22 +5639,60 @@ export class Broker {
     }
   }
 
-  /** Drop a cancelled/failed call's queued steers (their promises already
-   *  resolved `queued` at enqueue — the cancellation is the visible
-   *  reason delivery never happens). Every dropped steer is recorded
-   *  DURABLY (first-wins `dropped` marker) before the in-memory queue is
-   *  cleared: a restore must never resurrect a dropped delivery. A
-   *  failing record propagates (host-side failure) and the queue is left
-   *  untouched for the next attempt. */
+  /** Drop a cancelled/failed call's queued steers. Delivery-outcome
+   *  items already resolved `queued` at enqueue — the cancellation is
+   *  the visible reason delivery never happens. Every dropped steer is
+   *  recorded DURABLY (first-wins `dropped` marker) before the
+   *  in-memory queue is cleared: a restore must never resurrect a
+   *  dropped delivery. A failing record propagates (host-side failure)
+   *  and the queue is left untouched for the next attempt. An
+   *  ANSWER-MODE item is a minted §4.2 turn: dropping it never
+   *  discards the turn — its guest promise settles with an explicit
+   *  recoverable AGENT_CANCELLED rejection and its completion is
+   *  recorded (the review defect: a cancelled in-flight followUp's
+   *  dropQueue deleted its queued answer-mode siblings from
+   *  `agents()` with NO completion recorded and their guest promises
+   *  pending forever). */
   private dropQueue(entry: SessionEntry): void {
     for (const item of entry.queue) {
-      // A dropped answer-mode item's turn never runs: release its turn
-      // registry entry (a cancelled turn must not linger in
-      // `agents()`).
-      if (item.answer) this.followUpTurns.delete(item.callId);
       this.callStore.recordDelivery(item.callId, 'dropped', now());
+      if (item.answer) {
+        this.settleDroppedQueuedFollowUp(item.callId, entry);
+      }
     }
     entry.queue = [];
+  }
+
+  /** One dropped QUEUED answer-mode followUp (see `dropQueue`): record
+   *  the reject completion (first-wins) and settle the guest promise —
+   *  the settlement reactions fire at the next execution (the drop
+   *  runs inside a task body, outside the serialized chain, so no
+   *  drain here — a drain would race the operation; the completion and
+   *  the dropped marker are already durable, so a restore settles the
+   *  item from the store exactly once). */
+  private settleDroppedQueuedFollowUp(callId: string, entry: SessionEntry): void {
+    this.followUpTurns.delete(callId);
+    const value = toRejectionValue(
+      new WorkflowError(
+        `followUp ${callId} was dropped with the cancelled queue — the turn never ran`,
+        CODE.AGENT_CANCELLED,
+        { recoverable: true },
+      ),
+    );
+    // The §4.6 attribution: the followUp's resolved backend (the
+    // founding session's own).
+    (value as { replBackend?: string }).replBackend = entry.backendId;
+    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+    try {
+      this.settleIntoGuest(callId, 'reject', value);
+    } catch (error) {
+      // A failing settlement must not mask the drop (the completion is
+      // already durable — a restore settles from the store).
+      this.warnLine(
+        'warn',
+        `followUp ${callId}: the dropped queued turn's settlement into the guest failed: ${toRejectionValue(error).message}`, // eslint-disable-line max-len
+      );
+    }
   }
 
   /** A delivery turn failed (a queued steer's delivery or a direct
@@ -5453,8 +5833,17 @@ export class Broker {
           // the call DURABLY (recorded + guest-settled at the bound), or
           // the broker was disposed and the state owning the call is being
           // torn down. The condition was surfaced guest-visibly by the
-          // task.
-          this.inFlight.delete(entry.callId);
+          // task. ALSO the queue-scheduler shape (a restored queued
+          // followUp's delivery scheduler and the lazy re-attach arm's
+          // cap-queue): the hold entry's call id is REUSED by the
+          // delivery task that starts once a slot frees — the drop must
+          // only remove the map entry when it still holds THIS task (the
+          // review probe: the stale hold arm deleted the freshly tracked
+          // delivery task by id, leaving a completed delivery turn with
+          // no recorded completion and a pending guest promise).
+          if (this.inFlight.get(entry.callId) === entry) {
+            this.inFlight.delete(entry.callId);
+          }
           continue;
         }
         try {
@@ -5716,6 +6105,24 @@ export class Broker {
     // began now — a break armed after this instant breaks THIS eval; a
     // stale flag (armed before) is dropped on first observation.
     this.currentExecutionStartSeq = this.evalBreakChannel?.executionStartMarker() ?? 0;
+    // The continuation-lease mirror starts clean: the code phase must
+    // never read a token a PREVIOUS drain's last lease-carrying job
+    // left in the mirror (the reset handler's continuation attribution
+    // reads it — a code-phase reset() must read undefined and be
+    // attributed by the eval op's own snapshot, never by a stale
+    // token). The drain phases re-set the mirror per job.
+    this.jobLease.cell.current = undefined;
+    this.inRunEval = true;
+    try {
+      return this.runEvalInner(code, options);
+    } finally {
+      this.inRunEval = false;
+    }
+  }
+
+  /** The `runEval` body (see above): the `inRunEval` marker frames the
+   *  whole execution — code phase and own drain alike. */
+  private runEvalInner(code: string, options: ReplEvalOptions): { outcome: ReplEvalOutcome; completion?: unknown; interruptedInDrain?: boolean } {
     // The eval's CONTINUATION TOKEN (phase-E review round 5): minted
     // per eval, embedded in the instrumented code's `__replAwait(value,
     // token)` calls (see `await-instrument.ts`), and attributed to the
