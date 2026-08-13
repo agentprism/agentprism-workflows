@@ -506,8 +506,14 @@ export class ReplVm {
     this.opDepth++;
     let handle: JSValueHandle | undefined;
     try {
+      // A capture belongs to exactly one submitted eval. The generation
+      // lives inside the realm so it survives snapshot/restore; beginning
+      // an eval also invalidates any handled throw left by an older eval.
+      const throwGeneration = this.throwCaptureAvailable
+        ? this.beginThrowCaptureGeneration()
+        : undefined;
       const evaluated = this.evalTrapFree(
-        this.throwCaptureAvailable ? instrumentThrownValues(code) : code,
+        throwGeneration === undefined ? code : instrumentThrownValues(code, throwGeneration),
         options.filename ?? '<repl>',
         EvalFlags.ASYNC,
       );
@@ -550,7 +556,7 @@ export class ReplVm {
         }
         throw e; // host-side failure, not a guest outcome — fail loudly
       }
-      return this.readCompletion(handle, true, attachBridge);
+      return this.readCompletion(handle, true, attachBridge, throwGeneration);
     } finally {
       // The wrapper is disposed here on every arm except the retained-
       // pending one: `readCompletion` returns a DUP for the retained
@@ -589,6 +595,10 @@ export class ReplVm {
     this.interruptSlot.current = options.interruptHandler ?? null;
     this.opDepth++;
     try {
+      // A standalone drain is a new execution boundary. If its first job
+      // throws an uninstrumented primitive, it must not inherit a capture
+      // left by a handled throw in an earlier eval.
+      this.clearThrowCapture();
       return this.runDrain(options.jobLease);
     } finally {
       this.interruptSlot.current = previousInterrupt;
@@ -677,13 +687,24 @@ export class ReplVm {
       '(() => {' +
       'var g = this;' +
       `if (typeof g[${JSON.stringify(THROW_CAPTURE_GLOBAL)}] === "function" && ` +
-      `typeof g[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function") return true;` +
-      'var same = Object.is; var lastValue; var lastStack;' +
+      `typeof g[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function" && ` +
+      `typeof g[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}] === "function") return true;` +
+      'var same = Object.is; var generation = 0; var lastGeneration = -1; var lastValue; var lastStack;' +
       `Object.defineProperty(g, ${JSON.stringify(THROW_CAPTURE_GLOBAL)}, {` +
-      'value: function (value) { lastValue = value; lastStack = new Error().stack; return value; },' +
+      'value: function (value, captureGeneration) {' +
+      'lastValue = value; lastStack = new Error().stack; lastGeneration = captureGeneration; return value; },' +
       'writable: false, enumerable: false, configurable: false });' +
       `Object.defineProperty(g, ${JSON.stringify(THROW_STACK_GLOBAL)}, {` +
-      'value: function (value) { return same(lastValue, value) ? lastStack : undefined; },' +
+      'value: function (value, expectedGeneration) {' +
+      'return same(lastValue, value) && ' +
+      '(expectedGeneration === undefined || lastGeneration === expectedGeneration) ? lastStack : undefined; },' +
+      'writable: false, enumerable: false, configurable: false });' +
+      `Object.defineProperty(g, ${JSON.stringify(THROW_BOUNDARY_GLOBAL)}, {` +
+      'value: function (beginEval, expectedGeneration) {' +
+      'if (beginEval === true || expectedGeneration === undefined || lastGeneration === expectedGeneration) {' +
+      'lastValue = undefined; lastStack = undefined; lastGeneration = -1;' +
+      '}' +
+      'if (beginEval === true) generation++; return generation; },' +
       'writable: false, enumerable: false, configurable: false });' +
       'return true;' +
       '})()';
@@ -693,12 +714,44 @@ export class ReplVm {
     return true;
   }
 
+  /** Start one realm-persistent throw-capture generation. The helper
+   *  clears the previous slot before returning the generation id, so a
+   *  primitive handled by an older eval cannot match this eval's error. */
+  private beginThrowCaptureGeneration(): number | undefined {
+    const begun = this.evalTrapFree(
+      `this[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}](true)`,
+      '<repl-throw-boundary>',
+      0,
+    );
+    if (begun.kind === 'error') return undefined;
+    try {
+      return begun.handle.isNumber ? begun.handle.toNumber() : undefined;
+    } finally {
+      begun.handle.dispose();
+    }
+  }
+
+  /** Clear a capture at a host execution boundary without minting a new
+   *  eval generation. Best-effort: capture is supplemental metadata. */
+  private clearThrowCapture(): void {
+    if (!this.throwCaptureAvailable) return;
+    const cleared = this.evalTrapFree(
+      `this[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}](false)`,
+      '<repl-throw-boundary>',
+      0,
+    );
+    if (cleared.kind === 'ok') cleared.handle.dispose();
+  }
+
   /** Classify one thrown value trap-free, supplementing stackless values
    *  with the engine-captured throw-site stack. */
-  private readErrorInfoWithCapturedStack(handle: JSValueHandle): EvalErrorInfo {
+  private readErrorInfoWithCapturedStack(
+    handle: JSValueHandle,
+    expectedGeneration?: number,
+  ): EvalErrorInfo {
     const info = readErrorInfo(handle);
     if (info.stack === undefined) {
-      const captured = this.capturedThrowStack(handle);
+      const captured = this.capturedThrowStack(handle, expectedGeneration);
       if (captured !== undefined) info.stack = captured;
     }
     return info;
@@ -707,18 +760,29 @@ export class ReplVm {
   /** Call the immutable engine helper with the thrown value BORROWED.
    *  Its captured `Object.is` performs identity comparison without any
    *  proxy traps or guest property reads. */
-  private capturedThrowStack(handle: JSValueHandle): string | undefined {
+  private capturedThrowStack(
+    handle: JSValueHandle,
+    expectedGeneration?: number,
+  ): string | undefined {
     if (!this.throwCaptureAvailable) return undefined;
     const key = this.vm.newString(THROW_STACK_GLOBAL);
     const fn = this.vm.getProp(this.vm.global, key);
+    const generation = expectedGeneration === undefined
+      ? undefined
+      : this.vm.newNumber(expectedGeneration);
     try {
       if (!fn.isFunction) return undefined;
       const e = this.vm._getExports();
-      const argv = e.wasm_malloc(4);
+      const argv = e.wasm_malloc(8);
       let resultPtr: number;
       try {
         new DataView(e.memory.buffer).setUint32(argv, handle.ptr, true);
-        resultPtr = e.qjs_call(fn.ptr, this.vm.undefined.ptr, 1, argv);
+        new DataView(e.memory.buffer).setUint32(
+          argv + 4,
+          generation?.ptr ?? this.vm.undefined.ptr,
+          true,
+        );
+        resultPtr = e.qjs_call(fn.ptr, this.vm.undefined.ptr, 2, argv);
       } finally {
         e.wasm_free(argv);
       }
@@ -733,6 +797,7 @@ export class ReplVm {
         result.dispose();
       }
     } finally {
+      generation?.dispose();
       fn.dispose();
       key.dispose();
     }
@@ -819,13 +884,14 @@ export class ReplVm {
     handle: JSValueHandle,
     keepCompletion: boolean,
     attachBridge: boolean,
+    throwGeneration?: number,
   ): { outcome: ReplEvalOutcome; completion?: unknown } {
     try {
       // 0 pending, 1 fulfilled, 2 rejected (quickjs-wasi built-in
       // `promiseState`).
       const state = handle.promiseState;
       if (state === 0) {
-        if (attachBridge) this.attachRejectionBridge(handle);
+        if (attachBridge) this.attachRejectionBridge(handle, throwGeneration);
         if (keepCompletion) {
           // Retained-pending arm: the caller owns a DUP of the wrapper
           // promise handle (the completion stays pending — the eval
@@ -848,7 +914,12 @@ export class ReplVm {
       let callerOwnsWrapper = false;
       try {
         if (state === 2) {
-          return { outcome: { kind: 'error', error: this.readErrorInfoWithCapturedStack(result) } };
+          return {
+            outcome: {
+              kind: 'error',
+              error: this.readErrorInfoWithCapturedStack(result, throwGeneration),
+            },
+          };
         }
         // Trap-free unwrap of the engine-created `{ value }` wrapper — an
         // own-data-property descriptor read, never `[[Get]]` (R69: a guest
@@ -900,7 +971,10 @@ export class ReplVm {
    * (its own guard swallows a hostile error value — a proxy's traps
    * fire inside the renderer, never in the host's error path).
    */
-  private attachRejectionBridge(handle: JSValueHandle): void {
+  private attachRejectionBridge(
+    handle: JSValueHandle,
+    throwGeneration?: number,
+  ): void {
     const e = this.vm._getExports();
     let bridge: JSValueHandle | undefined;
     try {
@@ -932,7 +1006,7 @@ export class ReplVm {
         'var frames = [];' +
         'var stack = e !== null && e !== undefined && typeof e.stack === "string" ? e.stack : undefined;' +
         `if (typeof stack !== "string" && typeof this[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function") {` +
-        `stack = this[${JSON.stringify(THROW_STACK_GLOBAL)}](e);` +
+        `stack = this[${JSON.stringify(THROW_STACK_GLOBAL)}](e, ${throwGeneration === undefined ? 'undefined' : String(throwGeneration)});` +
         '}' +
         'if (typeof stack === "string") {' +
         'var parts = stack.split("\\n");' +
@@ -1010,9 +1084,8 @@ export class ReplVm {
       const result = e.qjs_execute_pending_job();
       // The lease-carrying job ended: clear the guest lease so a later
       // job (or a later drain) never starts under a stale lease. The
-      // mirror keeps the value until the next job's read — the only
-      // reader (the interrupted-drain release) runs right after the
-      // drain throws.
+      // mirror keeps the value until the next job's read; when this job
+      // fails, the interrupted-drain release reads it after the throw.
       if (jobLease !== undefined) lease?.clear();
       if (result < 0) {
         // The failed job's exception is the runtime's current exception.
@@ -1028,12 +1101,18 @@ export class ReplVm {
       }
       count++;
     }
+    // No job is executing after a successful drain. In particular, a
+    // later eval's synchronous code must never observe the last job's
+    // continuation token. The error arm above intentionally bypasses
+    // this clear so interrupted-drain attribution can read the token.
+    if (lease !== undefined) lease.cell.current = undefined;
     return count;
   }
 }
 
-const THROW_CAPTURE_GLOBAL = '__replCaptureThrownValue';
-const THROW_STACK_GLOBAL = '__replCapturedThrowStack';
+const THROW_CAPTURE_GLOBAL = '__replCaptureThrownValueV2';
+const THROW_STACK_GLOBAL = '__replCapturedThrowStackV2';
+const THROW_BOUNDARY_GLOBAL = '__replThrowCaptureBoundaryV2';
 const THROW_INSTRUMENT_CACHE_MAX = 256;
 const throwInstrumentCache = new Map<string, ThrowInstrumentation | null>();
 const THROW_FUNCTION_NODES = new Set([
@@ -1046,7 +1125,7 @@ const THROW_FUNCTION_NODES = new Set([
 /** Wrap each throw argument in an identity-preserving capture call. Point
  *  insertions add no newlines, so captured stacks retain submitted-code
  *  line numbers. Parse failures stay untouched for the VM to report. */
-function instrumentThrownValues(code: string): string {
+function instrumentThrownValues(code: string, generation: number): string {
   let instrumentation = throwInstrumentCache.get(code);
   if (instrumentation === undefined) {
     try {
@@ -1056,9 +1135,11 @@ function instrumentThrownValues(code: string): string {
         allowAwaitOutsideFunction: true,
       }) as unknown as ThrowNode;
       const sites: ThrowSite[] = [];
-      collectThrowSites(ast, false, sites);
+      const catchSites: CatchSite[] = [];
+      collectThrowSites(ast, false, sites, catchSites);
       instrumentation = {
         sites,
+        catchSites,
         nestedCaptureSafe: !containsPotentialCaptureShadow(ast),
       };
     } catch {
@@ -1078,7 +1159,21 @@ function instrumentThrownValues(code: string): string {
       pos: site.start,
       text: `${capture}(`,
     });
-    insertions.push({ pos: site.end, text: ')' });
+    insertions.push({ pos: site.end, text: `,${generation})` });
+  }
+  // A catch means the throw was handled and can no longer be the
+  // uncaught value classified at this eval boundary. Clear only this
+  // eval's generation so concurrent suspended evals cannot erase each
+  // other's supplemental stack metadata.
+  for (const site of instrumentation.catchSites) {
+    if (site.inFunction && !instrumentation.nestedCaptureSafe) continue;
+    const boundary = site.inFunction
+      ? THROW_BOUNDARY_GLOBAL
+      : `this[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}]`;
+    insertions.push({
+      pos: site.start,
+      text: `${boundary}(false,${generation});`,
+    });
   }
   insertions.sort((a, b) => b.pos - a.pos);
   let instrumented = code;
@@ -1098,7 +1193,10 @@ function instrumentThrownValues(code: string): string {
 function containsPotentialCaptureShadow(node: ThrowNode | null | undefined): boolean {
   if (node === null || node === undefined || typeof node !== 'object' || typeof node.type !== 'string') return false;
   const record = node as unknown as Record<string, unknown>;
-  if (node.type === 'Identifier' && record.name === THROW_CAPTURE_GLOBAL) return true;
+  if (
+    node.type === 'Identifier' &&
+    (record.name === THROW_CAPTURE_GLOBAL || record.name === THROW_BOUNDARY_GLOBAL)
+  ) return true;
   if (node.type === 'WithStatement') return true;
   if (node.type === 'CallExpression') {
     const callee = record.callee as Record<string, unknown> | null | undefined;
@@ -1118,19 +1216,29 @@ function containsPotentialCaptureShadow(node: ThrowNode | null | undefined): boo
   return false;
 }
 
-function collectThrowSites(node: ThrowNode | null | undefined, inFunction: boolean, sites: ThrowSite[]): void {
+function collectThrowSites(
+  node: ThrowNode | null | undefined,
+  inFunction: boolean,
+  sites: ThrowSite[],
+  catchSites: CatchSite[],
+): void {
   if (node === null || node === undefined || typeof node !== 'object' || typeof node.type !== 'string') return;
   if (node.type === 'ThrowStatement' && node.argument !== null && node.argument !== undefined) {
     sites.push({ start: node.argument.start, end: node.argument.end, inFunction });
+  }
+  if (node.type === 'CatchClause' && node.body !== null && node.body !== undefined) {
+    catchSites.push({ start: node.body.start + 1, inFunction });
   }
   const childInFunction = inFunction || THROW_FUNCTION_NODES.has(node.type);
   for (const key of Object.keys(node)) {
     if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
     const child = (node as unknown as Record<string, unknown>)[key];
     if (Array.isArray(child)) {
-      for (const item of child) collectThrowSites(item as ThrowNode, childInFunction, sites);
+      for (const item of child) {
+        collectThrowSites(item as ThrowNode, childInFunction, sites, catchSites);
+      }
     } else if (child !== null && typeof child === 'object') {
-      collectThrowSites(child as ThrowNode, childInFunction, sites);
+      collectThrowSites(child as ThrowNode, childInFunction, sites, catchSites);
     }
   }
 }
@@ -1141,8 +1249,14 @@ interface ThrowSite {
   inFunction: boolean;
 }
 
+interface CatchSite {
+  start: number;
+  inFunction: boolean;
+}
+
 interface ThrowInstrumentation {
   sites: ThrowSite[];
+  catchSites: CatchSite[];
   nestedCaptureSafe: boolean;
 }
 
@@ -1151,6 +1265,7 @@ interface ThrowNode {
   start: number;
   end: number;
   argument?: ThrowNode | null;
+  body?: ThrowNode | null;
 }
 
 /**

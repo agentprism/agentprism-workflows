@@ -164,6 +164,20 @@ test('parking bridge: reset() called after a suspended eval resumes is attribute
   assert.equal(ws.isDisposed, true, 'the drain that completed the reset-calling eval performed teardown');
 });
 
+test('parking bridge: a completed drain cannot misattribute a later plain reset() to an eval still suspended mid-continuation', async () => {
+  const ws = await workspace();
+  const first = await ws.eval('await sleep(20); await agent("pi/x", "hold"); 1');
+  assert.equal(first.kind, 'pending');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  ws.drainJobs();
+  assert.equal(ws.isDisposed, false, 'the first eval remains suspended on its parked agent');
+
+  const reset = await ws.eval('reset(); 2');
+  assert.equal(reset.kind, 'value');
+  if (reset.kind === 'value') assert.equal(reset.value, 2);
+  assert.equal(ws.isDisposed, true, 'the plain reset belongs to the eval that called it');
+});
+
 test('default parking bridge: workspace() checkpoint questions and agents() tasks retain their 200-character metadata previews', async () => {
   const ws = await workspace();
   const out = await ws.eval(`

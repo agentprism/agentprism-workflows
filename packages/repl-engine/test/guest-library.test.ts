@@ -297,27 +297,35 @@ test('agent() options cross the bridge as JSON (schema, cwd, configOptions, mode
   vm.dispose();
 });
 
-test('agent() validates option keys before JSON serialization can erase undefined values', async () => {
+test('agent() preserves unknown option keys with non-JSON-representable values for host validation', async () => {
   const { vm, bridge } = await createGuest();
-  bridge.script.push({
+  const rejection = {
     rejectWith: {
       message: 'agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
       code: 'SCRIPT_VALIDATION_ERROR',
       recoverable: false,
       replBackend: 'pi',
     },
-  });
-  const message = value(
-    await vm.evalCode(
-      'await agent("pi/x", "task", { bogus: undefined }).then(() => "accepted", (err) => err.code + "|" + err.message)',
-    ),
+  };
+  bridge.script.push(rejection, rejection, rejection, rejection);
+  const values = ['undefined', 'function () {}', 'Symbol("s")', '10n'];
+  for (const optionValue of values) {
+    const message = value(
+      await vm.evalCode(
+        `await agent("pi/x", "task", { bogus: ${optionValue} }).then(() => "accepted", (err) => err.code + "|" + err.message)`,
+      ),
+    );
+    assert.equal(
+      message,
+      'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+    );
+  }
+  assert.equal(bridge.agentCalls.length, 4);
+  assert.deepEqual(
+    bridge.agentCalls.map((call) => call.optionsJson),
+    ['{"bogus":null}', '{"bogus":null}', '{"bogus":null}', '{"bogus":null}'],
+    'every present unknown key survives the JSON bridge regardless of its value',
   );
-  assert.equal(
-    message,
-    'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
-  );
-  assert.equal(bridge.agentCalls.length, 1);
-  assert.equal(bridge.agentCalls[0].optionsJson, '{"bogus":null}', 'the unknown key survives the JSON bridge');
   assert.equal(readGuestSurface(vm)!.stats().pendingCalls, 0, 'the synchronous host refusal settled the registry');
   vm.dispose();
 });

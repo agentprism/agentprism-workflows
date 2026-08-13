@@ -330,6 +330,10 @@ export class Workspace {
    */
   eval(code: string, options?: ReplEvalOptions): Promise<ReplEvalOutcome> {
     this.assertAlive();
+    // `cell.current` names a continuation only while that continuation's
+    // job executes. A completed earlier drain must never make this eval's
+    // synchronous code look like the earlier suspended eval.
+    this.parkingJobLease.cell.current = undefined;
     const token = `w${++this.parkingEvalTokenSeq}`;
     this.currentParkingEvalToken = token;
     this.pendingReset = false;
@@ -355,6 +359,7 @@ export class Workspace {
       });
     } finally {
       this.inParkingEval = false;
+      this.parkingJobLease.cell.current = undefined;
     }
     const { outcome, completion } = evaluated;
     const resetByThisEval = this.pendingReset;

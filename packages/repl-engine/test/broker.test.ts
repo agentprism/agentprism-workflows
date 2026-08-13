@@ -485,7 +485,7 @@ test('agent options: the §4.1 option bag (schema, cwd, configOptions, mode) map
 });
 
 test('agent options: a relative cwd and unknown keys refuse the call with recoverable: false; the unknown-key error ENUMERATES the valid keys', async () => {
-  const { ws, broker } = await setup();
+  const { ws, broker, runner } = await setup();
   const r1 = await broker.eval('await agent("pi/x", "t", { cwd: "relative" }).catch(e => e.code + "/" + e.recoverable)');
   assert.equal(r1.result, 'SCRIPT_VALIDATION_ERROR/false');
   const r2 = await broker.eval('await agent("pi/x", "t", { bogus: 1 }).catch(e => e.code + "|" + e.message)');
@@ -502,6 +502,31 @@ test('agent options: a relative cwd and unknown keys refuse the call with recove
     'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
     'an undefined value cannot make the unknown key disappear before host admission validation',
   );
+  const r6 = await broker.eval(
+    'await agent("pi/x", "t", { bogus: function () {} }).catch(e => e.code + "|" + e.message)',
+  );
+  assert.equal(
+    r6.result,
+    'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+    'a function value cannot make the unknown key disappear before host admission validation',
+  );
+  const r7 = await broker.eval(
+    'await agent("pi/x", "t", { bogus: Symbol("s") }).catch(e => e.code + "|" + e.message)',
+  );
+  assert.equal(
+    r7.result,
+    'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+    'a symbol value cannot make the unknown key disappear before host admission validation',
+  );
+  const r8 = await broker.eval(
+    'await agent("pi/x", "t", { bogus: 10n }).catch(e => e.code + "|" + e.message)',
+  );
+  assert.equal(
+    r8.result,
+    'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+    'a bigint value cannot bypass the unknown-key schema error before host admission validation',
+  );
+  assert.equal(runner.sessions.length, 0, 'no invalid option bag reaches backend dispatch');
   await ws.dispose();
 });
 

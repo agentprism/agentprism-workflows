@@ -316,13 +316,36 @@ test('throw-site capture preserves user errors when globalThis is shadowed aroun
   assert.equal(
     value(
       await reserved.evalCode(
-        'function f(__replCaptureThrownValue) { throw new Error("R") } ' +
+        'function f(__replCaptureThrownValueV2) { throw new Error("R") } ' +
           'try { f(() => "corrupt") } catch (e) { e.message }',
       ),
     ),
     'R',
     'a local binding with the reserved helper name makes capture skip the throw instead of changing it',
   );
+});
+
+test('throw-site capture never reuses a handled primitive throw for an uninstrumented throw', async () => {
+  using acrossEvals = await vm();
+  assert.equal(value(await acrossEvals.evalCode('try { throw "boom" } catch (e) { "handled" }')), 'handled');
+  const later = error(
+    await acrossEvals.evalCode(
+      'with ({}) { 1 }\n\n\n\nfunction f() { throw "boom" }\nf();',
+    ),
+  );
+  assert.equal(later.message, 'boom');
+  assert.equal(later.stack, undefined, 'an uninstrumented throw cannot inherit a frame from an earlier eval');
+
+  using withinEval = await vm();
+  const dynamic = error(
+    await withinEval.evalCode(
+      'try { throw "boom" } catch (e) {}\n' +
+        'const f = new Function(\'throw "boom"\');\n' +
+        'f();',
+    ),
+  );
+  assert.equal(dynamic.message, 'boom');
+  assert.equal(dynamic.stack, undefined, 'a handled throw cannot leak its frame to later dynamic code');
 });
 
 test('rejected top-level awaits report the raw thrown value', async () => {

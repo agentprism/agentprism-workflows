@@ -925,14 +925,20 @@ const GUEST_LIBRARY_SOURCE = `/*
     // Options cross the bridge as JSON: plain data by construction, one
     // flat, unambiguous decoding host-side (functions or cycles in options
     // would be meaningless host-side). Preserve every PRESENT key through
-    // serialization: JSON.stringify normally erases undefined-valued keys,
-    // which used to hide an unknown undefined-valued key from the host's
-    // synchronous schema validation. Undefined normalizes to null so the
-    // host can validate the key before validating its value.
+    // serialization: JSON.stringify normally erases undefined-, function-,
+    // and symbol-valued object properties (and refuses bigint values),
+    // which used to hide a present unknown key from the host's synchronous
+    // schema validation. Values with no JSON representation normalize to
+    // null so the host validates the key before validating its value.
     var optionsJson = normalized === undefined
       ? undefined
       : JSON.stringify(normalized, function (_key, value) {
-          return value === undefined ? null : value;
+          return value === undefined ||
+            typeof value === 'function' ||
+            typeof value === 'symbol' ||
+            typeof value === 'bigint'
+            ? null
+            : value;
         });
     // The registry entry records the model spec verbatim so a restore can
     // re-issue the call against the same backend routing. The host
