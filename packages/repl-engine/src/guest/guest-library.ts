@@ -908,7 +908,24 @@ const GUEST_LIBRARY_SOURCE = `/*
     }
     var out = {};
     var keys = Object.keys(options);
-    for (var i = 0; i < keys.length; i++) out[keys[i]] = options[keys[i]];
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var optionValue = options[key];
+      var knownKey = key === 'schema' || key === 'cwd' || key === 'configOptions' || key === 'mode';
+      // Classify the top-level key BEFORE JSON serialization can erase it.
+      // Known undefined/function/symbol values keep ordinary JSON omission
+      // semantics (the host treats them as absent). An unknown key must
+      // survive long enough for host admission validation to reject it and
+      // enumerate the valid vocabulary, even when its value is otherwise
+      // not JSON-representable.
+      out[key] = !knownKey &&
+        (optionValue === undefined ||
+          typeof optionValue === 'function' ||
+          typeof optionValue === 'symbol' ||
+          typeof optionValue === 'bigint')
+        ? null
+        : optionValue;
+    }
     return out;
   }
 
@@ -924,22 +941,12 @@ const GUEST_LIBRARY_SOURCE = `/*
     var normalized = normalizeAgentOptions(options);
     // Options cross the bridge as JSON: plain data by construction, one
     // flat, unambiguous decoding host-side (functions or cycles in options
-    // would be meaningless host-side). Preserve every PRESENT key through
-    // serialization: JSON.stringify normally erases undefined-, function-,
-    // and symbol-valued object properties (and refuses bigint values),
-    // which used to hide a present unknown key from the host's synchronous
-    // schema validation. Values with no JSON representation normalize to
-    // null so the host validates the key before validating its value.
-    var optionsJson = normalized === undefined
-      ? undefined
-      : JSON.stringify(normalized, function (_key, value) {
-          return value === undefined ||
-            typeof value === 'function' ||
-            typeof value === 'symbol' ||
-            typeof value === 'bigint'
-            ? null
-            : value;
-        });
+    // would be meaningless host-side). normalizeAgentOptions has already
+    // preserved non-representable UNKNOWN top-level keys for host admission;
+    // ordinary JSON semantics intentionally erase undefined KNOWN values, so
+    // the { cwd: maybeCwd } idiom continues to mean "omit cwd" when maybeCwd is
+    // undefined.
+    var optionsJson = normalized === undefined ? undefined : JSON.stringify(normalized);
     // The registry entry records the model spec verbatim so a restore can
     // re-issue the call against the same backend routing. The host
     // receives (callId, modelSpec, task, optionsJson).

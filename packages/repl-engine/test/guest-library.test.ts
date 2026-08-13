@@ -330,6 +330,32 @@ test('agent() preserves unknown option keys with non-JSON-representable values f
   vm.dispose();
 });
 
+test('agent() omits undefined known options while still dispatching the call', async () => {
+  const { vm, bridge } = await createGuest();
+  const options = [
+    '{ schema: undefined }',
+    '{ cwd: undefined }',
+    '{ configOptions: undefined }',
+    '{ mode: undefined }',
+    '{ cwd: "/tmp", schema: undefined }',
+    '{ configOptions: { thinkingLevel: undefined } }',
+  ];
+  bridge.script.push(...options.map(() => ({ resolveWith: 'accepted' })));
+  for (const option of options) {
+    assert.equal(
+      value(await vm.evalCode(`await agent("pi/x", "task", ${option})`)),
+      'accepted',
+      `${option} dispatches`,
+    );
+  }
+  assert.deepEqual(
+    bridge.agentCalls.map((call) => call.optionsJson),
+    ['{}', '{}', '{}', '{}', '{"cwd":"/tmp"}', '{"configOptions":{}}'],
+    'known undefined values retain ordinary JSON omission semantics at every depth',
+  );
+  vm.dispose();
+});
+
 test('agent() validation: non-string modelSpec/task reject with a TypeError', async () => {
   const { vm } = await createGuest();
   const e1 = await vm.evalCode('await agent(42, "task").then(() => "no", (err) => err.message)');

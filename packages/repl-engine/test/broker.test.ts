@@ -484,6 +484,32 @@ test('agent options: the §4.1 option bag (schema, cwd, configOptions, mode) map
   await ws.dispose();
 });
 
+test('agent options: every known undefined-valued key is absent and dispatches', async () => {
+  const { ws, broker, runner } = await setup();
+  const options = [
+    '{ schema: undefined }',
+    '{ cwd: undefined }',
+    '{ configOptions: undefined }',
+    '{ mode: undefined }',
+    '{ cwd: "/tmp", schema: undefined }',
+    '{ configOptions: { thinkingLevel: undefined } }',
+  ];
+  for (const option of options) {
+    const result = await broker.eval(`agent("pi/x", "t", ${option}); "started"`);
+    assert.equal(result.result, 'started', `${option} is admitted`);
+  }
+  await tick();
+  assert.equal(runner.sessions.length, options.length, 'every known-key case reaches backend dispatch');
+  assert.ok(runner.sessions.every((session) => session.prompts.length === 1), 'every initial turn is in flight');
+  assert.equal(runner.openedWith[0].schema, undefined);
+  assert.equal(runner.openedWith[1].cwd, PROJECT);
+  assert.equal(runner.openedWith[2].configOptions, undefined);
+  assert.equal(runner.openedWith[3].mode, undefined);
+  assert.equal(runner.openedWith[4].cwd, '/tmp');
+  assert.deepEqual(runner.openedWith[5].configOptions, {});
+  await ws.dispose();
+});
+
 test('agent options: a relative cwd and unknown keys refuse the call with recoverable: false; the unknown-key error ENUMERATES the valid keys', async () => {
   const { ws, broker, runner } = await setup();
   const r1 = await broker.eval('await agent("pi/x", "t", { cwd: "relative" }).catch(e => e.code + "/" + e.recoverable)');
