@@ -356,6 +356,44 @@ test('agent() omits undefined known options while still dispatching the call', a
   vm.dispose();
 });
 
+test('handle options omit undefined promptMeta but preserve undefined unknown keys for host validation', async () => {
+  const { vm, bridge } = await createGuest();
+  bridge.script.push(
+    { resolveWith: 'initial result' },
+    { resolveWith: 'follow-up result' },
+    {
+      rejectWith: {
+        message: 'steer options: unknown option "bogus"',
+        code: 'SCRIPT_VALIDATION_ERROR',
+        recoverable: false,
+        replBackend: 'pi',
+      },
+    },
+  );
+  const result = value(
+    await vm.evalCode(`
+      const h = agent("pi/x", "task");
+      const accepted = await h.followUp("next", { promptMeta: undefined });
+      const rejected = await h.steer("redirect", { bogus: undefined })
+        .then(() => "accepted", (err) => err.code + "|" + err.message);
+      ({ accepted, rejected })
+    `),
+  );
+  assert.deepEqual(result, {
+    accepted: 'follow-up result',
+    rejected: 'SCRIPT_VALIDATION_ERROR|steer options: unknown option "bogus"',
+  });
+  assert.deepEqual(
+    bridge.steerCalls.map((call) => call.payloadJson === null ? null : JSON.parse(call.payloadJson)),
+    [
+      { prompt: 'next', options: {} },
+      { prompt: 'redirect', options: { bogus: null } },
+    ],
+    'known undefined steer options are omitted while unknown keys survive the JSON bridge',
+  );
+  vm.dispose();
+});
+
 test('agent() validation: non-string modelSpec/task reject with a TypeError', async () => {
   const { vm } = await createGuest();
   const e1 = await vm.evalCode('await agent(42, "task").then(() => "no", (err) => err.message)');

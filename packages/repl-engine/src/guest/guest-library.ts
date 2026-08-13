@@ -901,7 +901,7 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   /** Shallow-copy options (plain data by construction — they cross the
    *  bridge as JSON). */
-  function normalizeAgentOptions(options) {
+  function normalizeAgentOptions(options, knownKey1, knownKey2, knownKey3, knownKey4) {
     if (options === undefined || options === null) return undefined;
     if (typeof options !== 'object') {
       throw new TypeError('agent options must be an object');
@@ -911,7 +911,7 @@ const GUEST_LIBRARY_SOURCE = `/*
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i];
       var optionValue = options[key];
-      var knownKey = key === 'schema' || key === 'cwd' || key === 'configOptions' || key === 'mode';
+      var knownKey = key === knownKey1 || key === knownKey2 || key === knownKey3 || key === knownKey4;
       // Classify the top-level key BEFORE JSON serialization can erase it.
       // Known undefined/function/symbol values keep ordinary JSON omission
       // semantics (the host treats them as absent). An unknown key must
@@ -938,7 +938,7 @@ const GUEST_LIBRARY_SOURCE = `/*
     if (typeof task !== 'string') {
       throw new TypeError('agent(modelSpec, task, options?) needs a task string');
     }
-    var normalized = normalizeAgentOptions(options);
+    var normalized = normalizeAgentOptions(options, 'schema', 'cwd', 'configOptions', 'mode');
     // Options cross the bridge as JSON: plain data by construction, one
     // flat, unambiguous decoding host-side (functions or cycles in options
     // would be meaningless host-side). normalizeAgentOptions has already
@@ -981,7 +981,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         if (typeof prompt !== 'string') {
           throw new TypeError('handle.' + action + '(prompt, options?) needs a prompt string');
         }
-        var normalized = normalizeAgentOptions(options);
+        var normalized = normalizeAgentOptions(options, 'promptMeta');
         payloadJson = JSON.stringify({ prompt: prompt, options: normalized === undefined ? {} : normalized });
       }
       return issueCall('steer', '__host_agent_steer', action, payloadJson, foundingCallId, null, function (hostFn, id) {

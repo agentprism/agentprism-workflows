@@ -556,6 +556,36 @@ test('agent options: a relative cwd and unknown keys refuse the call with recove
   await ws.dispose();
 });
 
+test('steer options: undefined promptMeta is absent and dispatches; an undefined unknown key still rejects', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+
+  const rejected = await broker.eval(
+    'await pi.steer("redirect", { bogus: undefined }).catch(e => e.code + "|" + e.message)',
+  );
+  assert.equal(
+    rejected.result,
+    'SCRIPT_VALIDATION_ERROR|steer options: unknown option "bogus"',
+    'an undefined value cannot make an unknown steer key disappear before host admission validation',
+  );
+  assert.equal(runner.last().prompts.length, 0, 'the invalid steer options do not start a turn');
+  assert.equal(runner.last().steers.length, 0, 'the invalid steer options do not reach live steering');
+
+  const accepted = await broker.eval('pi.followUp("next", { promptMeta: undefined }); "started"');
+  assert.equal(accepted.result, 'started', 'undefined promptMeta is admitted as an absent known option');
+  await tick();
+  assert.equal(runner.last().prompts.length, 1, 'the followUp dispatches a new turn');
+  assert.equal(runner.last().prompts[0].content, 'next');
+
+  runner.last().completeTurn('follow-up result');
+  await tick();
+  await broker.pump();
+  await ws.dispose();
+});
+
 test('§4.1 admission validation: an unknown backend segment rejects SYNCHRONOUSLY, naming the segment and enumerating the known backends — never a silent route to the default backend', async () => {
   const runner = new FakeRunner();
   runner.extraBackends = ['browser'];
