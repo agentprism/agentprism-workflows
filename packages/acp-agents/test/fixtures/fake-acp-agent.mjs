@@ -727,7 +727,9 @@ class FakeAgent {
     }
     // 3.5) optional raw session updates emitted VERBATIM (in order) before the text chunks —
     // lets a test interleave tool_call / thought / plan events with message chunks to exercise
-    // final-message segmentation (schema-shaped progress messages before the final answer).
+    // final-message segmentation (schema-shaped progress messages before the final answer), or
+    // push metadata-bearing bookkeeping updates (e.g. a typed session failure on a
+    // session_info_update) mid-turn.
     const rawUpdates = Array.isArray(turn.updates) ? turn.updates : [];
     for (const update of rawUpdates) {
       await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
@@ -775,9 +777,13 @@ class FakeAgent {
       throw new RequestError(turn.throwCode ?? -32603, turn.throw, clone(turn.throwData));
     }
 
+    // 7) optional PromptResponse `_meta`. A real agent can end a turn by REPORTING a failure here
+    // rather than rejecting (codex-acp's negotiated typed-session-failures extension does exactly
+    // that), so the response metadata channel has to be scriptable to exercise it.
     return {
       stopReason: turn.stopReason ?? "end_turn",
       ...(turn.usage ? { usage: turn.usage } : {}),
+      ...(turn.responseMeta ? { _meta: clone(turn.responseMeta) } : {}),
     };
   }
 

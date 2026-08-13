@@ -25,6 +25,7 @@ import { GATED_CUSTOM_META_KEYS } from "../capabilities.js";
 import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
 import { toStrictJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
+import { TYPED_SESSION_FAILURE_CLIENT_CAPABILITY } from "../typed-failures.js";
 import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
@@ -57,6 +58,17 @@ export class CodexBackend implements Backend {
     gatedKeys: GATED_CUSTOM_META_KEYS,
   } as const;
 
+  /** Turn on codex-acp's negotiated typed-session-failures extension at `initialize` (see
+   *  typed-failures.ts). Truthful: SessionHandle consumes BOTH delivery channels the server opens
+   *  in response — the terminal failure on `PromptResponse._meta` and the asynchronous one on
+   *  `session_info_update`. An older codex-acp ignores the block and keeps its legacy behavior. */
+  readonly clientCapabilityMeta = TYPED_SESSION_FAILURE_CLIENT_CAPABILITY;
+
+  /** The LEGACY (thrown) provider-wall channel. Still load-bearing with the typed extension
+   *  negotiated: it classifies every rejection the typed channel does not cover — an older
+   *  codex-acp, and any `session/prompt` rejection raised outside a turn's terminal-failure path
+   *  (the server converts only process-exit / unexpected throws into typed responses). The typed
+   *  channel's own equivalents are mapped by `mapTypedSessionFailure`. */
   classifyProviderError(
     error: unknown,
     metadata?: ProviderErrorMetadata,

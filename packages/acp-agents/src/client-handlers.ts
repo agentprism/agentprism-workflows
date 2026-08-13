@@ -105,6 +105,10 @@ export interface ClientCapabilityOptions {
    *  construction, never per-session. Unset (or all-false) => the `auth` key is omitted entirely,
    *  which the ACP spec treats as "unsupported" — the default-OFF, zero-behavior-change baseline. */
   auth?: { terminal?: boolean; gateway?: boolean };
+  /** Backend-declared namespaced vendor-extension advertisement (`Backend.clientCapabilityMeta`),
+   *  folded into the top-level `_meta`. Same fixed-for-the-connection discipline as `elicitation`
+   *  and `auth`: it is a property of the client build, not of any one session. */
+  meta?: Readonly<Record<string, unknown>>;
 }
 
 const TERMINAL_HANDLER_METHODS = [
@@ -120,7 +124,8 @@ const MCP_HANDLER_METHODS = ["connect", "message", "disconnect"] as const;
 /** The client capability advertisement: fs/terminal derived solely from registered consumer
  *  handlers, plus the capabilities this client supports natively regardless of handlers —
  *  boolean session config options (SessionHandle drives the catalog programmatically and
- *  handles `type: "boolean"` entries, e.g. codex-acp's Fast-mode toggle). The installed ACP SDK
+ *  handles `type: "boolean"` entries, e.g. codex-acp's Fast-mode toggle) — plus the connecting
+ *  backend's declared vendor-extension `_meta` (`options.meta`). The installed ACP SDK
  *  has no ClientCapabilities field for MCP-over-ACP; support is declared by sending
  *  `mcpServers[{ type: "acp" }]` on session/new and then gated against handlers at that site. */
 export function clientCapabilitiesFor(
@@ -143,6 +148,11 @@ export function clientCapabilitiesFor(
       // {command,args,label} launch hint. Light both so all three agents reveal terminal methods.
       capabilities._meta = { ...(capabilities._meta ?? {}), "terminal-auth": true };
     }
+  }
+  // Backend-declared vendor extensions this client implements. Applied before the no-handlers
+  // early return for the same reason `auth` is: it is host/backend-declared, not handler-derived.
+  if (options.meta && Object.keys(options.meta).length > 0) {
+    capabilities._meta = { ...(capabilities._meta ?? {}), ...options.meta };
   }
   if (!handlers) return capabilities;
 
