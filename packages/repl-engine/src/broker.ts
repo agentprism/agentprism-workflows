@@ -3616,7 +3616,10 @@ export class Broker {
     return JSON.stringify({
       bindings,
       inFlight: this.inFlightIds(),
-      checkpoints: [...this.checkpoints.values()].map((c) => ({ id: c.callId, question: c.question })),
+      checkpoints: [...this.checkpoints.values()].map((c) => ({
+        id: c.callId,
+        question: headTailDescription(c.question, 200),
+      })),
       diagnostics: {
         reconcile: this.lastReconcileReport,
         drainError: this.retainedDrainError,
@@ -5015,8 +5018,29 @@ export class Broker {
     });
   }
 
-  /** Record a completion (first-wins — returns whether newly recorded). */
+  /** Record a completion (first-wins — returns whether newly recorded).
+   *  Every rejected AGENT call whose backend resolved is attributed at
+   *  this single durable boundary, covering live, restored, cancelled,
+   *  held, and disconnect-forced settlements alike. */
   private recordCompletion(callId: string, outcome: CallOutcome): boolean {
+    if (outcome.outcome === 'reject' && typeof outcome.value === 'object' && outcome.value !== null) {
+      const record = this.callStore.lookup(callId);
+      if (record?.kind === 'agent') {
+        const modelSegment =
+          record.modelSpec !== null && record.modelSpec !== ''
+            ? backendSegment(record.modelSpec)
+            : undefined;
+        const segment =
+          record.backendId ??
+          (modelSegment !== undefined && this.knownBackends().includes(modelSegment)
+            ? modelSegment
+            : undefined);
+        if (segment !== undefined) {
+          const value = outcome.value as { replBackend?: unknown };
+          if (typeof value.replBackend !== 'string') value.replBackend = segment;
+        }
+      }
+    }
     return this.callStore.recordCompleted(callId, outcome);
   }
 
@@ -5219,9 +5243,9 @@ export class Broker {
    * The [C]5 fallback body: decide whether the openSession failure was
    * the config options' doing and, when it was, guarantee the rejection
    * NAMES the offending key. The diagnostic reopen (configOptions
-   * omitted, session NOT kept open) is the only admission-unknowable
-   * vocabulary the engine can consult — it runs once, on the failure
-   * path only, before any prompt was sent (no paid spawn).
+   * omitted, session NOT kept open) establishes whether configuration
+   * caused the failure. For multiple keys, prompt-free prefix probes
+   * isolate the actual offending key. These run only on the failure path.
    */
   private async configOptionLateError(
     callId: string,
@@ -5234,6 +5258,7 @@ export class Broker {
     // The backend may already have named the key in its own message.
     if (keys.some((key) => original.message.includes(key))) return original;
     let diagnostic: BrokerSession | undefined;
+    let diagnosticOpenFailed = false;
     try {
       diagnostic = await this.runner.openSession({
         model: backendIdOverride ?? (modelSpec ?? undefined),
@@ -5246,42 +5271,88 @@ export class Broker {
         retainSessionLog: true,
       });
     } catch {
-      // The diagnostic open failed WITHOUT the config options too: the
-      // failure was not observably config-caused, but the [C]5
-      // guarantee stands — a late error on a call that carried
-      // configOptions MUST name the offending key even when the
-      // diagnostic reopen cannot decide (the review probe: an original
-      // `invalid config option` with no key and a failing diagnostic
-      // reopen produced an unchanged generic rejection). The rejection
-      // names the key(s) and reports the backend's original error
-      // verbatim.
-      const carried = keys.map((key) => `"${key}"`).join(', ');
-      const backend = backendIdOverride ?? backendSegment(modelSpec);
+      diagnosticOpenFailed = true;
+      if (keys.length > 1) {
+        // Keep going: prefix probes below can still isolate the key
+        // even when this independent diagnostic open failed.
+      } else {
+        // The diagnostic open failed WITHOUT the config option too: the
+        // failure was not observably config-caused, but the [C]5
+        // guarantee stands — a late error on a call that carried
+        // configOptions MUST name the offending key even when the
+        // diagnostic reopen cannot decide.
+        const carried = `"${keys[0]}"`;
+        const backend = backendIdOverride ?? backendSegment(modelSpec);
+        return {
+          name: 'ConfigOptionsError',
+          message:
+            `backend ${backend} rejected the call with configOptions ${carried} present — ` +
+            `the offending key is ${carried} ` +
+            `(backend error: ${original.message}; a diagnostic open without configOptions failed too)`, // eslint-disable-line max-len
+          recoverable: false,
+          // The §4.6 attribution: the [C]5 fallback's replacement error
+          // names the resolved backend too (the call id is stamped by the
+          // guest library at settlement).
+          replBackend: backend,
+        };
+      }
+    }
+    if (keys.length > 1) {
+      // Dynamic vocabularies publish no admission-time key list. Isolate
+      // the actual rejected key by adding options in caller order until
+      // the first prefix fails. Every preceding prefix was accepted, so
+      // the newly added key is the offending one; when all proper
+      // prefixes succeed, the final key is the one that turns the known
+      // failing full bag invalid. Successful probes never send a prompt
+      // and are released immediately.
+      const prefix: Record<string, string | boolean> = {};
+      let offendingKey = keys[keys.length - 1];
+      let backend = diagnostic?.backendId ?? backendIdOverride ?? backendSegment(modelSpec);
+      for (let index = 0; index < keys.length - 1; index++) {
+        const key = keys[index];
+        prefix[key] = parsed.configOptions![key];
+        let probe: BrokerSession | undefined;
+        try {
+          probe = await this.runner.openSession({
+            model: backendIdOverride ?? (modelSpec ?? undefined),
+            schema: parsed.schema as never,
+            cwd: parsed.cwd ?? this.workspace.projectDir,
+            configOptions: { ...prefix },
+            mode: parsed.mode,
+            label: `repl:${callId}`,
+            runId: callId,
+            keepSession: false,
+            retainSessionLog: true,
+          });
+          backend = probe.backendId ?? backend;
+        } catch {
+          offendingKey = key;
+          break;
+        } finally {
+          if (probe !== undefined) void Promise.resolve(probe.release()).catch(() => undefined);
+        }
+      }
+      if (diagnostic !== undefined) void Promise.resolve(diagnostic.release()).catch(() => undefined);
       return {
         name: 'ConfigOptionsError',
         message:
-          `backend ${backend} rejected the call with configOptions ${carried} present — the offending key ` +
-          (keys.length === 1 ? `is ${carried}` : `is among ${carried}`) +
-          ` (backend error: ${original.message}; a diagnostic open without configOptions failed too)`, // eslint-disable-line max-len
+          `backend ${backend} rejected the call's configOptions — offending key "${offendingKey}" ` +
+          `(backend error: ${original.message}` +
+          (diagnosticOpenFailed ? '; a diagnostic open without configOptions failed too' : '') +
+          ')',
         recoverable: false,
-        // The §4.6 attribution: the [C]5 fallback's replacement error
-        // names the resolved backend too (the call id is stamped by the
-        // guest library at settlement).
         replBackend: backend,
       };
     }
     try {
       // The config options caused the failure: name the offending key
-      // (exactly, when the call carried one; exhaustively — with the
-      // backend's own error — when it carried several and the adapter
-      // publishes no per-key seam to isolate further).
+      // (the multiple-key path above isolates by accepted prefixes).
       const carried = keys.map((key) => `"${key}"`).join(', ');
-      const backend = diagnostic.backendId ?? backendSegment(modelSpec);
+      const backend = diagnostic!.backendId ?? backendSegment(modelSpec);
       return {
         name: 'ConfigOptionsError',
         message:
-          `backend ${backend} rejected the call's configOptions — offending key ` +
-          (keys.length === 1 ? carried : `among: ${carried}`) +
+          `backend ${backend} rejected the call's configOptions — offending key ${carried}` +
           ` (backend error: ${original.message})`,
         recoverable: false,
         // The §4.6 attribution: the [C]5 fallback's replacement error
@@ -5290,7 +5361,7 @@ export class Broker {
         replBackend: backend,
       };
     } finally {
-      void Promise.resolve(diagnostic.release()).catch(() => undefined);
+      void Promise.resolve(diagnostic!.release()).catch(() => undefined);
     }
   }
 

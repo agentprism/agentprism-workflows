@@ -654,6 +654,7 @@ const GUEST_LIBRARY_SOURCE = `/*
   //   test). A bound function performs no property lookups at call time,
   //   so neither replacement can reach it.
   var arraySlice = Function.prototype.call.bind(Array.prototype.slice);
+  var arrayFrom = Array.from.bind(Array);
 
   // The continuation-lease instrumentation's pristine PROMISE intrinsics
   // (phase-E review rejection round 7): \`__replAwait\` /
@@ -923,8 +924,16 @@ const GUEST_LIBRARY_SOURCE = `/*
     var normalized = normalizeAgentOptions(options);
     // Options cross the bridge as JSON: plain data by construction, one
     // flat, unambiguous decoding host-side (functions or cycles in options
-    // would be meaningless host-side).
-    var optionsJson = normalized === undefined ? undefined : JSON.stringify(normalized);
+    // would be meaningless host-side). Preserve every PRESENT key through
+    // serialization: JSON.stringify normally erases undefined-valued keys,
+    // which used to hide an unknown undefined-valued key from the host's
+    // synchronous schema validation. Undefined normalizes to null so the
+    // host can validate the key before validating its value.
+    var optionsJson = normalized === undefined
+      ? undefined
+      : JSON.stringify(normalized, function (_key, value) {
+          return value === undefined ? null : value;
+        });
     // The registry entry records the model spec verbatim so a restore can
     // re-issue the call against the same backend routing. The host
     // receives (callId, modelSpec, task, optionsJson).
@@ -1553,8 +1562,9 @@ const GUEST_LIBRARY_SOURCE = `/*
       if (value === null) return 'null';
       if (t === 'string') {
         if (depth === 0) return value; // direct strings print whole
-        if (value.length <= REPR_NESTED_STRING_CHARS) return "'" + value + "'";
-        return "'" + value.slice(0, REPR_NESTED_STRING_CHARS) + "…'";
+        var stringChars = arrayFrom(value);
+        if (stringChars.length <= REPR_NESTED_STRING_CHARS) return "'" + value + "'";
+        return "'" + stringChars.slice(0, REPR_NESTED_STRING_CHARS).join('') + "…'";
       }
       if (t === 'undefined') return 'undefined';
       if (t === 'number') return value === 0 && 1 / value === -Infinity ? '-0' : String(value);
@@ -1598,9 +1608,10 @@ const GUEST_LIBRARY_SOURCE = `/*
             if (typeof value.replBackend === 'string') errorBody += ' on backend ' + value.replBackend;
             errorBody += ')';
           }
-          return errorBody.length <= REPR_NESTED_STRING_CHARS
+          var errorChars = arrayFrom(errorBody);
+          return errorChars.length <= REPR_NESTED_STRING_CHARS
             ? errorBody
-            : errorBody.slice(0, REPR_NESTED_STRING_CHARS) + '…';
+            : errorChars.slice(0, REPR_NESTED_STRING_CHARS).join('') + '…';
         }
         if (value instanceof Promise) return 'Promise';
         if (value instanceof Date) return 'Date';

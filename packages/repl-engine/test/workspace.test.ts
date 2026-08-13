@@ -154,6 +154,36 @@ test('parking bridge: reset() in a SUSPENDED eval tears the workspace down after
   assert.equal(ws.isDisposed, true, 'the teardown ran after the eval completed (the continuation settled at the drain)');
 });
 
+test('parking bridge: reset() called after a suspended eval resumes is attributed to that eval and tears down in the completing drain', async () => {
+  const ws = await workspace();
+  const out = await ws.eval('await sleep(30); reset(); 42');
+  assert.equal(out.kind, 'pending');
+  assert.equal(ws.isDisposed, false, 'the workspace stays alive until the reset-calling eval resumes');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  ws.drainJobs();
+  assert.equal(ws.isDisposed, true, 'the drain that completed the reset-calling eval performed teardown');
+});
+
+test('default parking bridge: workspace() checkpoint questions and agents() tasks retain their 200-character metadata previews', async () => {
+  const ws = await workspace();
+  const out = await ws.eval(`
+    checkpoint("q".repeat(300));
+    agent("pi/x", "t".repeat(300));
+    const question = workspace().checkpoints[0].question;
+    const task = agents()[0].task;
+    ({ question, task });
+  `);
+  assert.equal(out.kind, 'value');
+  if (out.kind === 'value') {
+    const value = out.value as { question: string; task: string };
+    assert.ok(value.question.length < 300, 'the raw checkpoint question is not exposed');
+    assert.ok(value.question.includes('chars elided'), value.question);
+    assert.equal(value.task.length, 200, 'the parked agent task uses the engine\'s 200-character preview');
+    assert.equal(value.task, `${'t'.repeat(99)}…${'t'.repeat(100)}`);
+  }
+  ws.dispose();
+});
+
 test('default parking bridge: checkpoint.answer settles the parked checkpoint (first-wins)', async () => {
   // Review rejection: the parking bridge's answer mode returned `false`
   // for every checkpoint.answer, so the original promise stayed pending

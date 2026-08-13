@@ -204,6 +204,7 @@ test('a thrown proxy is reported trap-free (no descriptor/prototype traps)', asy
   );
   assert.equal(e.name, 'Error');
   assert.equal(e.message, '[Proxy]');
+  assert.match(e.stack ?? '', /<repl>:\d+:\d+/, 'the proxy throw keeps its submitted-code frame');
   assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no proxy trap ran');
 });
 
@@ -252,6 +253,13 @@ test('thrown values report trap-free error info (name via prototype read)', asyn
   const e3 = error(await v.evalCode('throw "plain string"'));
   assert.equal(e3.name, 'Error');
   assert.equal(e3.message, 'plain string');
+  assert.match(e3.stack ?? '', /<repl>:1:\d+/, 'a thrown string keeps the submitted-code line');
+  const e4 = error(await v.evalCode('\nthrow null'));
+  assert.equal(e4.message, 'null');
+  assert.match(e4.stack ?? '', /<repl>:2:\d+/, 'a thrown null keeps the submitted-code line');
+  const e5 = error(await v.evalCode('\nthrow undefined'));
+  assert.equal(e5.message, 'undefined');
+  assert.match(e5.stack ?? '', /<repl>:2:\d+/, 'a thrown undefined keeps the submitted-code line');
 });
 
 test('rejected top-level awaits report the raw thrown value', async () => {

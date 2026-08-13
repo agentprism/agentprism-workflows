@@ -281,14 +281,44 @@ test('agent() round trip: the mocked host receives modelSpec + task and its resu
   vm.dispose();
 });
 
-test('agent() options cross the bridge as JSON (schema, cwd, backend config)', async () => {
+test('agent() options cross the bridge as JSON (schema, cwd, configOptions, mode)', async () => {
   const { vm, bridge } = await createGuest();
-  const options = { schema: { type: 'object', required: ['x'] }, cwd: '/tmp', backend: { model: 'm' } };
+  const options = {
+    schema: { type: 'object', required: ['x'] },
+    cwd: '/tmp',
+    configOptions: { thinkingLevel: 'high' },
+    mode: 'read-only',
+  };
   bridge.script.push({ resolveWith: { x: 1 } });
   const result = value(await vm.evalCode(`await agent("pi/default", "p", ${JSON.stringify(options)})`));
   assert.deepEqual(result, { x: 1 });
   const parsed = JSON.parse(bridge.agentCalls[0].optionsJson!);
   assert.deepEqual(parsed, options);
+  vm.dispose();
+});
+
+test('agent() validates option keys before JSON serialization can erase undefined values', async () => {
+  const { vm, bridge } = await createGuest();
+  bridge.script.push({
+    rejectWith: {
+      message: 'agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+      code: 'SCRIPT_VALIDATION_ERROR',
+      recoverable: false,
+      replBackend: 'pi',
+    },
+  });
+  const message = value(
+    await vm.evalCode(
+      'await agent("pi/x", "task", { bogus: undefined }).then(() => "accepted", (err) => err.code + "|" + err.message)',
+    ),
+  );
+  assert.equal(
+    message,
+    'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+  );
+  assert.equal(bridge.agentCalls.length, 1);
+  assert.equal(bridge.agentCalls[0].optionsJson, '{"bogus":null}', 'the unknown key survives the JSON bridge');
+  assert.equal(readGuestSurface(vm)!.stats().pendingCalls, 0, 'the synchronous host refusal settled the registry');
   vm.dispose();
 });
 
@@ -766,6 +796,16 @@ test('§4.4: nested strings (inside a collection) render head-limited at 200 cha
   assert.ok(line.includes(`long: '${'y'.repeat(200)}…'`), line);
   assert.ok(line.includes("short: 'hi'"), line);
   assert.ok(line.includes(`['${'y'.repeat(200)}…'`), line);
+  const belowLimitEmoji = '😀'.repeat(150);
+  value(await vm.evalCode(`console.log({ emoji: ${JSON.stringify(belowLimitEmoji)} }); "done"`));
+  assert.equal(
+    bridge.events[1].line,
+    `{emoji: '${belowLimitEmoji}'}`,
+    '150 Unicode characters are below the 200-character bound even though they occupy 300 UTF-16 units',
+  );
+  const aboveLimitEmoji = '😀'.repeat(250);
+  value(await vm.evalCode(`console.log({ emoji: ${JSON.stringify(aboveLimitEmoji)} }); "done"`));
+  assert.equal(bridge.events[2].line, `{emoji: '${'😀'.repeat(200)}…'}`);
   vm.dispose();
 });
 
@@ -920,7 +960,7 @@ test('surface.pending() lists parked calls oldest-first with verbatim details', 
   const { vm, bridge } = await createGuest();
   bridge.script.push({}); // park
   value(await vm.evalCode('agent("pi/deepseek-v4-flash-max", "first"); "ok"'));
-  value(await vm.evalCode('agent("codex/gpt-5.6-sol", "second", { label: "l" }); "ok"'));
+  value(await vm.evalCode('agent("codex/gpt-5.6-sol", "second", { mode: "read-only" }); "ok"'));
   value(await vm.evalCode('checkpoint("question?"); "ok"'));
   const surface = readGuestSurface(vm)!;
   assert.equal(surface.version, GUEST_LIBRARY_VERSION);
@@ -929,7 +969,7 @@ test('surface.pending() lists parked calls oldest-first with verbatim details', 
     pendingList.map((e) => ({ id: e.id, kind: e.kind, detail: e.detail, optionsJson: e.optionsJson, sessionId: e.sessionId, modelSpec: e.modelSpec })),
     [
       { id: 'c1', kind: 'agent', detail: 'first', optionsJson: null, sessionId: 'c1', modelSpec: 'pi/deepseek-v4-flash-max' },
-      { id: 'c2', kind: 'agent', detail: 'second', optionsJson: '{"label":"l"}', sessionId: 'c2', modelSpec: 'codex/gpt-5.6-sol' },
+      { id: 'c2', kind: 'agent', detail: 'second', optionsJson: '{"mode":"read-only"}', sessionId: 'c2', modelSpec: 'codex/gpt-5.6-sol' },
       { id: 'c3', kind: 'checkpoint', detail: 'question?', optionsJson: null, sessionId: 'c3', modelSpec: null },
     ],
   );

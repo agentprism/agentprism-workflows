@@ -24,8 +24,9 @@ import {
   type ProvenanceView,
 } from './provenance.js';
 import { SnapshotRestoreError } from './snapshot-envelope.js';
-import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
+import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome, type ReplJobLease } from './vm.js';
 import type { ReplSnapshot, WasmInput } from './types.js';
+import { instrumentTopLevelAwaits } from './await-instrument.js';
 import {
   GUEST_LEASE_GLOBAL,
   clearContinuationLease,
@@ -40,7 +41,7 @@ import {
   type GuestSurface,
 } from './bridge.js';
 import { rawLexicalKeys } from './global-lexical.js';
-import { inspectGlobal, manifestBinding } from './preview.js';
+import { headTailDescription, inspectGlobal, manifestBinding } from './preview.js';
 import { rawOwnKeys } from './trapfree.js';
 
 /** One user binding of the workspace manifest (see `Workspace.manifest`). */
@@ -164,16 +165,25 @@ export class Workspace {
    *  the guest asked for; never fabricated empties). */
   private readonly parkedModelSpecs = new Map<string, string>();
   private readonly parkedTasks = new Map<string, string>();
-  /** The parking bridge's `reset()` request: the teardown runs after the
-   *  current eval completes (see `eval`). */
+  /** The parking bridge's code-phase/current-eval `reset()` request. */
   private pendingReset = false;
   /** The parking bridge's retained SUSPENDED-eval completions (one per
    *  suspended eval — `eval` keeps the wrapper; the drain's sweep reads
    *  the settled value into `_` and releases it). */
   private readonly suspendedCompletions = new Set<JSValueHandle>();
-  /** The retained completion of the eval that called `reset()` while it
-   *  suspended (the teardown owes AFTER that eval completes). */
-  private pendingResetCompletion: JSValueHandle | null = null;
+  /** Continuation identity for suspended parking-bridge evals. */
+  private readonly suspendedEvalTokens = new Map<JSValueHandle, string>();
+  /** Suspended eval completions whose own code/continuation called reset. */
+  private readonly resetOwningCompletions = new Set<JSValueHandle>();
+  private parkingEvalTokenSeq = 0;
+  private currentParkingEvalToken: string | undefined;
+  private inParkingEval = false;
+  /** The guest continuation lease mirrored per drained job. */
+  private readonly parkingJobLease: ReplJobLease = {
+    read: () => this.readContinuationLease(),
+    clear: () => this.clearContinuationLease(),
+    cell: { current: undefined },
+  };
   private disposed = false;
 
   private constructor(projectDir: string, vm: ReplVm, baseline: Set<string>) {
@@ -320,7 +330,35 @@ export class Workspace {
    */
   eval(code: string, options?: ReplEvalOptions): Promise<ReplEvalOutcome> {
     this.assertAlive();
-    const { outcome, completion } = this.vm.evalCodeWithCompletion(code, options);
+    const token = `w${++this.parkingEvalTokenSeq}`;
+    this.currentParkingEvalToken = token;
+    this.pendingReset = false;
+    let instrumented = code;
+    try {
+      const surface = this.surface();
+      if (surface?.supportsContinuationLease === true) {
+        instrumented = instrumentTopLevelAwaits(code, token, {
+          wrapIterables: surface.supportsIterableLease === true,
+        });
+      }
+    } catch {
+      // A legacy/broken surface keeps native await semantics; reset()
+      // during the current eval is still handled by the local flag.
+    }
+    const usesParkingJobLease = instrumented !== code;
+    this.inParkingEval = true;
+    let evaluated: ReturnType<ReplVm['evalCodeWithCompletion']>;
+    try {
+      evaluated = this.vm.evalCodeWithCompletion(instrumented, {
+        ...options,
+        jobLease: options?.jobLease ?? (usesParkingJobLease ? this.parkingJobLease : undefined),
+      });
+    } finally {
+      this.inParkingEval = false;
+    }
+    const { outcome, completion } = evaluated;
+    const resetByThisEval = this.pendingReset;
+    this.pendingReset = false;
     if (completion !== undefined) {
       if (outcome.kind === 'value') {
         try {
@@ -339,17 +377,17 @@ export class Workspace {
         // reset-owning completion is tracked separately (a reset() the
         // eval called owes its teardown only once THIS eval completes).
         this.suspendedCompletions.add(completion as JSValueHandle);
-        if (this.pendingReset && this.pendingResetCompletion === null) {
-          this.pendingResetCompletion = completion as JSValueHandle;
-        }
+        this.suspendedEvalTokens.set(completion as JSValueHandle, token);
+        if (resetByThisEval) this.resetOwningCompletions.add(completion as JSValueHandle);
       }
     }
     // The teardown for an eval that COMPLETED within this call runs now
     // (its output above is already captured); a suspended eval's
-    // teardown runs at the drain (see `drainJobs`). A reset owed by an
-    // EARLIER still-suspended eval (`pendingResetCompletion` set) keeps
-    // the workspace alive until that eval completes.
-    if (outcome.kind !== 'pending' && this.pendingReset && this.pendingResetCompletion === null) this.dispose();
+    // teardown runs at the drain (see `drainJobs`). Earlier suspended
+    // reset-owning evals remain tracked until their own completion.
+    if (outcome.kind !== 'pending' && resetByThisEval) {
+      this.dispose();
+    }
     return Promise.resolve(outcome);
   }
 
@@ -405,7 +443,12 @@ export class Workspace {
    */
   drainJobs(options?: ReplDrainOptions): number {
     this.assertAlive();
-    const count = this.vm.drainJobs(options);
+    const count = this.vm.drainJobs({
+      ...options,
+      jobLease:
+        options?.jobLease ??
+        (this.suspendedEvalTokens.size > 0 ? this.parkingJobLease : undefined),
+    });
     this.sweepSuspendedEvals();
     return count;
   }
@@ -421,9 +464,12 @@ export class Workspace {
    */
   private sweepSuspendedEvals(): void {
     if (this.suspendedCompletions.size === 0) return;
+    let resetOwnerCompleted = false;
     for (const completion of [...this.suspendedCompletions]) {
       if (completion.promiseState === 0) continue; // still pending
       this.suspendedCompletions.delete(completion);
+      this.suspendedEvalTokens.delete(completion);
+      if (this.resetOwningCompletions.delete(completion)) resetOwnerCompleted = true;
       try {
         const value = this.vm.readRetainedCompletion(completion) as JSValueHandle | undefined;
         if (value !== undefined) {
@@ -440,12 +486,11 @@ export class Workspace {
       }
       completion.dispose();
     }
-    if (this.pendingReset && this.pendingResetCompletion !== null && !this.suspendedCompletions.has(this.pendingResetCompletion)) {
+    if (resetOwnerCompleted) {
       // The reset-requesting eval completed (its continuation settled at
       // this drain): the teardown runs now — the host-side effect the
       // deleted `reset` action performed.
       this.pendingReset = false;
-      this.pendingResetCompletion = null;
       this.dispose();
     }
   }
@@ -461,7 +506,10 @@ export class Workspace {
     this.disposed = true;
     for (const completion of this.suspendedCompletions) completion.dispose();
     this.suspendedCompletions.clear();
-    this.pendingResetCompletion = null;
+    this.suspendedEvalTokens.clear();
+    this.resetOwningCompletions.clear();
+    this.currentParkingEvalToken = undefined;
+    this.parkingJobLease.cell.current = undefined;
     this.vm.dispose();
   }
 
@@ -808,7 +856,7 @@ export class Workspace {
           inFlight: inFlightIds,
           checkpoints: [...parkedCheckpoints.keys()].map((id) => ({
             id,
-            question: parkedQuestions.get(id) ?? '',
+            question: headTailDescription(parkedQuestions.get(id) ?? '', 200),
           })),
           diagnostics: { reconcile: null, drainError: null, childrenClosed: false },
         });
@@ -821,15 +869,28 @@ export class Workspace {
               callId,
               // The §4.5 shape: the call's REAL model spec and task (the
               // parking bridge recorded them verbatim at issue — never
-              // fabricated empties).
+              // fabricated empties). The task keeps the engine seam's
+              // retained 200-character metadata preview.
               modelSpec: parkedModelSpecs.get(callId) ?? '',
-              task: parkedTasks.get(callId) ?? '',
+              task: metadataHeadTail(parkedTasks.get(callId) ?? '', 200),
               state: 'opening',
               supportsSteering: false,
               queuedSteers: 0,
             })),
         ),
       reset: () => {
+        const token = workspace.parkingJobLease.cell.current;
+        if (
+          token !== undefined &&
+          (!workspace.inParkingEval || token !== workspace.currentParkingEvalToken)
+        ) {
+          for (const [completion, evalToken] of workspace.suspendedEvalTokens) {
+            if (evalToken === token) {
+              workspace.resetOwningCompletions.add(completion);
+              return;
+            }
+          }
+        }
         workspace.pendingReset = true;
       },
       defaultBackend: () => undefined,
@@ -841,6 +902,15 @@ export class Workspace {
       throw new Error(`Workspace ${this.projectDir}: operation on a disposed workspace`);
     }
   }
+}
+
+/** Retained task metadata preview: exactly `max` UTF-16 characters,
+ *  matching the broker's existing agents() task formatting. */
+function metadataHeadTail(value: string, max: number): string {
+  if (value.length <= max) return value;
+  const keep = Math.max(0, max - 1);
+  const half = Math.floor(keep / 2);
+  return `${value.slice(0, half)}…${value.slice(value.length - (keep - half))}`;
 }
 
 /** The realm global's string-key set, trap-free (raw own-key read). */

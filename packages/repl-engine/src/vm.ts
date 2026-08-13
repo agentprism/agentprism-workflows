@@ -92,6 +92,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
+import { parse } from 'acorn';
 import { EvalFlags, JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 import { classifyError, type EvalErrorInfo } from './errors.js';
@@ -341,6 +342,8 @@ export class ReplVm {
   private readonly vm: QuickJS;
   private readonly memoryLimitBytes: number;
   private readonly interruptSlot: { current: (() => boolean) | null };
+  /** Engine-owned throw-site capture helpers installed in the realm. */
+  private readonly throwCaptureAvailable: boolean;
   /** Active-operation depth; > 0 means a VM operation is running. */
   private opDepth = 0;
   private disposed = false;
@@ -359,6 +362,7 @@ export class ReplVm {
     // and `skipLibCheck: false` type-checks the published declarations
     // cleanly — quickjs-wasi's own declarations need DOM globals.
     vmShims.set(this, vm);
+    this.throwCaptureAvailable = this.installThrowCapture();
   }
 
   /**
@@ -502,7 +506,11 @@ export class ReplVm {
     this.opDepth++;
     let handle: JSValueHandle | undefined;
     try {
-      const evaluated = this.evalTrapFree(code, options.filename ?? '<repl>', EvalFlags.ASYNC);
+      const evaluated = this.evalTrapFree(
+        this.throwCaptureAvailable ? instrumentThrownValues(code) : code,
+        options.filename ?? '<repl>',
+        EvalFlags.ASYNC,
+      );
       if (evaluated.kind === 'error') {
         return { outcome: { kind: 'error', error: evaluated.error } };
       }
@@ -660,6 +668,76 @@ export class ReplVm {
     }
   }
 
+  /** Install immutable engine helpers that capture the stack at each
+   *  instrumented `throw` while returning the exact thrown value. The
+   *  identity-preserving return keeps guest catch semantics unchanged,
+   *  including for primitives and proxies. */
+  private installThrowCapture(): boolean {
+    const source =
+      '(() => {' +
+      'var g = globalThis;' +
+      `if (typeof g[${JSON.stringify(THROW_CAPTURE_GLOBAL)}] === "function" && ` +
+      `typeof g[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function") return true;` +
+      'var same = Object.is; var lastValue; var lastStack;' +
+      `Object.defineProperty(g, ${JSON.stringify(THROW_CAPTURE_GLOBAL)}, {` +
+      'value: function (value) { lastValue = value; lastStack = new Error().stack; return value; },' +
+      'writable: false, enumerable: false, configurable: false });' +
+      `Object.defineProperty(g, ${JSON.stringify(THROW_STACK_GLOBAL)}, {` +
+      'value: function (value) { return same(lastValue, value) ? lastStack : undefined; },' +
+      'writable: false, enumerable: false, configurable: false });' +
+      'return true;' +
+      '})()';
+    const installed = this.evalTrapFree(source, '<repl-throw-capture>', 0);
+    if (installed.kind === 'error') return false;
+    installed.handle.dispose();
+    return true;
+  }
+
+  /** Classify one thrown value trap-free, supplementing stackless values
+   *  with the engine-captured throw-site stack. */
+  private readErrorInfoWithCapturedStack(handle: JSValueHandle): EvalErrorInfo {
+    const info = readErrorInfo(handle);
+    if (info.stack === undefined) {
+      const captured = this.capturedThrowStack(handle);
+      if (captured !== undefined) info.stack = captured;
+    }
+    return info;
+  }
+
+  /** Call the immutable engine helper with the thrown value BORROWED.
+   *  Its captured `Object.is` performs identity comparison without any
+   *  proxy traps or guest property reads. */
+  private capturedThrowStack(handle: JSValueHandle): string | undefined {
+    if (!this.throwCaptureAvailable) return undefined;
+    const key = this.vm.newString(THROW_STACK_GLOBAL);
+    const fn = this.vm.getProp(this.vm.global, key);
+    try {
+      if (!fn.isFunction) return undefined;
+      const e = this.vm._getExports();
+      const argv = e.wasm_malloc(4);
+      let resultPtr: number;
+      try {
+        new DataView(e.memory.buffer).setUint32(argv, handle.ptr, true);
+        resultPtr = e.qjs_call(fn.ptr, this.vm.undefined.ptr, 1, argv);
+      } finally {
+        e.wasm_free(argv);
+      }
+      const result = new JSValueHandle(this.vm, resultPtr);
+      try {
+        if (e.qjs_is_exception(result.ptr) !== 0) {
+          takeAndFreeException(e, this.vm);
+          return undefined;
+        }
+        return result.isString ? result.toString() : undefined;
+      } finally {
+        result.dispose();
+      }
+    } finally {
+      fn.dispose();
+      key.dispose();
+    }
+  }
+
   private assertAlive(): void {
     if (this.disposed) {
       throw new Error('ReplVm: eval/drain on a disposed VM');
@@ -770,7 +848,7 @@ export class ReplVm {
       let callerOwnsWrapper = false;
       try {
         if (state === 2) {
-          return { outcome: { kind: 'error', error: readErrorInfo(result) } };
+          return { outcome: { kind: 'error', error: this.readErrorInfoWithCapturedStack(result) } };
         }
         // Trap-free unwrap of the engine-created `{ value }` wrapper — an
         // own-data-property descriptor read, never `[[Get]]` (R69: a guest
@@ -852,8 +930,12 @@ export class ReplVm {
         'if (attrib !== "") { line += " " + attrib; }' +
         '}' +
         'var frames = [];' +
-        'if (e !== null && e !== undefined && typeof e.stack === "string") {' +
-        'var parts = e.stack.split("\\n");' +
+        'var stack = e !== null && e !== undefined && typeof e.stack === "string" ? e.stack : undefined;' +
+        `if (typeof stack !== "string" && typeof this[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function") {` +
+        `stack = this[${JSON.stringify(THROW_STACK_GLOBAL)}](e);` +
+        '}' +
+        'if (typeof stack === "string") {' +
+        'var parts = stack.split("\\n");' +
         'for (var i = 0; i < parts.length && frames.length < 8; i++) {' +
         'var m = /^\\s*at\\s+(?:(.+?)\\s+\\()?<repl>:(\\d+):(\\d+)\\)?\\s*$/.exec(parts[i]);' +
         'if (m !== null) {' +
@@ -939,7 +1021,7 @@ export class ReplVm {
         // the only reference; the VM stays usable after it is disposed.
         const exc = new JSValueHandle(this.vm, e.qjs_get_exception());
         try {
-          throw new DrainJobError(readErrorInfo(exc));
+          throw new DrainJobError(this.readErrorInfoWithCapturedStack(exc));
         } finally {
           exc.dispose();
         }
@@ -950,7 +1032,86 @@ export class ReplVm {
   }
 }
 
-/**
+const THROW_CAPTURE_GLOBAL = '__replCaptureThrownValue';
+const THROW_STACK_GLOBAL = '__replCapturedThrowStack';
+const THROW_INSTRUMENT_CACHE_MAX = 256;
+const throwInstrumentCache = new Map<string, ThrowSite[] | null>();
+const THROW_FUNCTION_NODES = new Set([
+  'FunctionDeclaration',
+  'FunctionExpression',
+  'ArrowFunctionExpression',
+  'StaticBlock',
+]);
+
+/** Wrap each throw argument in an identity-preserving capture call. Point
+ *  insertions add no newlines, so captured stacks retain submitted-code
+ *  line numbers. Parse failures stay untouched for the VM to report. */
+function instrumentThrownValues(code: string): string {
+  let sites = throwInstrumentCache.get(code);
+  if (sites === undefined) {
+    try {
+      const ast = parse(code, {
+        ecmaVersion: 'latest',
+        sourceType: 'script',
+        allowAwaitOutsideFunction: true,
+      }) as unknown as ThrowNode;
+      sites = [];
+      collectThrowSites(ast, false, sites);
+    } catch {
+      sites = null;
+    }
+    if (throwInstrumentCache.size >= THROW_INSTRUMENT_CACHE_MAX) throwInstrumentCache.clear();
+    throwInstrumentCache.set(code, sites);
+  }
+  if (sites === null || sites.length === 0) return code;
+  const insertions: Array<{ pos: number; text: string }> = [];
+  for (const site of sites) {
+    const base = site.inFunction ? 'globalThis' : 'this';
+    insertions.push({
+      pos: site.start,
+      text: `${base}[${JSON.stringify(THROW_CAPTURE_GLOBAL)}](`,
+    });
+    insertions.push({ pos: site.end, text: ')' });
+  }
+  insertions.sort((a, b) => b.pos - a.pos);
+  let instrumented = code;
+  for (const insertion of insertions) {
+    instrumented =
+      instrumented.slice(0, insertion.pos) + insertion.text + instrumented.slice(insertion.pos);
+  }
+  return instrumented;
+}
+
+function collectThrowSites(node: ThrowNode | null | undefined, inFunction: boolean, sites: ThrowSite[]): void {
+  if (node === null || node === undefined || typeof node !== 'object' || typeof node.type !== 'string') return;
+  if (node.type === 'ThrowStatement' && node.argument !== null && node.argument !== undefined) {
+    sites.push({ start: node.argument.start, end: node.argument.end, inFunction });
+  }
+  const childInFunction = inFunction || THROW_FUNCTION_NODES.has(node.type);
+  for (const key of Object.keys(node)) {
+    if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    const child = (node as unknown as Record<string, unknown>)[key];
+    if (Array.isArray(child)) {
+      for (const item of child) collectThrowSites(item as ThrowNode, childInFunction, sites);
+    } else if (child !== null && typeof child === 'object') {
+      collectThrowSites(child as ThrowNode, childInFunction, sites);
+    }
+  }
+}
+
+interface ThrowSite {
+  start: number;
+  end: number;
+  inFunction: boolean;
+}
+
+interface ThrowNode {
+  type: string;
+  start: number;
+  end: number;
+  argument?: ThrowNode | null;
+}
+
 /**
  * Trap-free error info: name/message/stack are read as own data
  * properties; primitives thrown as values convert natively (strings and

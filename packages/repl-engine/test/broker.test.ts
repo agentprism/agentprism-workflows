@@ -494,6 +494,14 @@ test('agent options: a relative cwd and unknown keys refuse the call with recove
   assert.equal(r3.result, 'SCRIPT_VALIDATION_ERROR', 'the deleted label/meta/promptMeta/tier/toolNames keys are unknown options');
   const r4 = await broker.eval('await agent("pi/x", "t", { schema: 42 }).catch(e => e.code)');
   assert.equal(r4.result, 'SCRIPT_VALIDATION_ERROR');
+  const r5 = await broker.eval(
+    'await agent("pi/x", "t", { bogus: undefined }).catch(e => e.code + "|" + e.message)',
+  );
+  assert.equal(
+    r5.result,
+    'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+    'an undefined value cannot make the unknown key disappear before host admission validation',
+  );
   await ws.dispose();
 });
 
@@ -539,6 +547,23 @@ test('§4.1 admission validation: configOptions keys validate against the resolv
     output(probe).some((line) => line === 'got ConfigOptionsError: backend pi rejected the call\'s configOptions — offending key "thinkinglevel" (backend error: invalid config option)'),
     output(probe).join('\n'),
   );
+  // Multiple dynamic keys still identify the ACTUAL rejected key. The
+  // accepted sibling must not be reported as merely one of several
+  // candidates (the round-4 review repro: { good: true, bad: true }
+  // rendered "offending key among: good, bad").
+  runner.failConfigKeys = new Set(['bad']);
+  const multi = await broker.eval(
+    'const m = await agent("pi/x", "t", { configOptions: { good: true, bad: true } }).catch(e => e.name + ": " + e.message); console.log("multi", m); "done"',
+  );
+  assert.equal(multi.result, undefined);
+  await tick();
+  await broker.pump();
+  const multiProbe = await broker.eval('"probe"');
+  const multiLine = output(multiProbe).find((line) => line.startsWith('multi ConfigOptionsError'));
+  assert.ok(multiLine !== undefined, output(multiProbe).join('\n'));
+  assert.ok(multiLine.includes('offending key "bad"'), multiLine);
+  assert.ok(!multiLine.includes('among'), multiLine);
+  assert.ok(!multiLine.includes('"good"'), `the accepted key is not accused: ${multiLine}`);
   await ws.dispose();
 });
 
@@ -1672,6 +1697,10 @@ test('§4.6: an uncaught eval error renders name + message + the guest stack\'s 
   // (the eval's filename is the VM default `<repl>`).
   assert.match(line, /at boom \(<repl>:1:\d+\)/, line);
   assert.match(line, /<repl>:2:\d+/, line);
+  const primitive = await broker.eval('const marker = 1;\nthrow "primitive boom";');
+  const primitiveLine = output(primitive).find((l) => l.startsWith('Error: primitive boom'));
+  assert.ok(primitiveLine !== undefined, output(primitive).join('\n'));
+  assert.match(primitiveLine, /<repl>:2:\d+/, primitiveLine);
   await ws.dispose();
 });
 
@@ -1738,6 +1767,16 @@ test('§4.5: workspace() returns the plain-value shape with the honest failed st
   await broker.pump();
   const after = await broker.eval('"probe"');
   assert.ok(output(after).some((l) => l === 'followup the answer'), output(after).join('\n'));
+  await ws.dispose();
+});
+
+test('§4.5/§7: workspace().checkpoints keeps the retained 200-character question preview', async () => {
+  const { ws, broker } = await setup();
+  await broker.eval('checkpoint("q".repeat(300)); "asked"');
+  const retained = broker.checkpointSummaries()[0].question;
+  const guest = await broker.eval('workspace().checkpoints[0].question');
+  assert.equal(guest.result, retained, 'workspace() exposes the same retained preview as checkpoint summaries');
+  assert.notEqual(guest.result, 'q'.repeat(300), 'the raw question cannot bypass the metadata preview');
   await ws.dispose();
 });
 

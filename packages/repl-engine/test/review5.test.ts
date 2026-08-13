@@ -442,12 +442,20 @@ test('review 8/6a: cancelCall cancels a call whose openSession is still pending 
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
   assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
   assert.deepEqual(
     broker.pendingCalls().map((e) => e.id),
     [],
     'the cancelled opening call is not left pending',
   );
   assert.deepEqual(broker.liveAgents(), [], 'no live session was ever registered');
+  const uncaught = await broker.eval('await p');
+  const uncaughtLine = uncaught.output.find((line) => line.includes('(call c1'));
+  assert.ok(uncaughtLine !== undefined, uncaught.output.join('\n'));
+  assert.ok(
+    uncaughtLine.includes('(call c1 on backend pi)'),
+    `the opening-call rejection renders its resolved backend: ${uncaughtLine}`,
+  );
   const got = await broker.eval('await p.catch((e) => "ERR:" + e.message)');
   assert.ok(
     (got.result ?? '').includes('was cancelled by interrupt while its session was still opening'),
@@ -511,6 +519,7 @@ test('review 8/6b: the guest handle cancel() on a still-OPENING call is the same
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
   assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
   assert.equal((broker.store().lookup('c2')!.completion!.value as string), 'cancelled', 'the steer recorded its outcome');
   assert.deepEqual(
     broker.pendingCalls().map((e) => e.id),

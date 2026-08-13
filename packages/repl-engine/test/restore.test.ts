@@ -26,7 +26,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
-import { AcpAgentRunner, LoadedTurnStillRunningError } from '@automatalabs/acp-agents';
+import { AcpAgentRunner, LoadedTurnFailedError, LoadedTurnStillRunningError } from '@automatalabs/acp-agents';
 
 import {
   Broker,
@@ -1620,6 +1620,38 @@ test('a still-running-at-load call stays attached: reconcile arms it on the park
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('a restored turn failure rejects with its resolved backend attribution', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-turn-failed-backend-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const runner = new FakeRunner();
+  const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
+  await dispatchAgent(broker, runner);
+  const snapshot = ws.snapshot();
+  await crash(ws, broker);
+
+  const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
+  const broker2 = await Broker.attach(ws2, {
+    runner: runner2,
+    store: JsonlCallStore.open(storePath),
+  });
+  await broker2.reconcile();
+  const parked = runner2.sessions[0].loadedTurns.shift();
+  assert.ok(parked, 'the restored founding turn is being observed');
+  parked.reject(new LoadedTurnFailedError('restored turn failed at the backend'));
+  await tick();
+  await broker2.pump();
+
+  const record = broker2.store().lookup('c1')!;
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
+  assert.equal((await broker2.eval('await p.catch((e) => e.replBackend + "/" + e.replCallId)')).result, 'pi/c1');
+  assert.equal(record.reissues, 0, 'a definitive backend failure is never re-issued');
+  await broker2.dispose();
+  ws2.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('a seam rejection degrades to re-issue inside the task: the loaded session is released and the fresh turn settles the SAME guest promise', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-seamreject-'));
   const storePath = join(dir, 'calls.jsonl');
@@ -1721,6 +1753,7 @@ test('a safe loaded-turn reissue whose release parks past the disconnect bound i
   const record = broker2.store().lookup('c1')!;
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
 
   // The parked release resolves LATE, after the drain reported drained.
   // The re-issue must NOT proceed: no reissue recorded, no fresh session,
@@ -2008,6 +2041,7 @@ test('a NON-re-armable still-running seam rejection settles on a CANCEL as the r
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED', 'the recoverable cancel code');
   assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
   assert.equal(record.reissues, 0, 'never re-issued');
   assert.equal(runner2.sessions[0].releases, 0, 'the loaded session stays attached (the cancel did not release it)');
   // The guest promise rejected with the recoverable cancellation (a

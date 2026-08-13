@@ -554,6 +554,7 @@ test('review 2/3c-2: a parked open that outlives the drain bound is STOPPED — 
   assert.equal(boundRecord.completion!.outcome, 'reject');
   assert.equal((boundRecord.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
   assert.equal((boundRecord.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((boundRecord.completion!.value as { replBackend?: string }).replBackend, 'pi');
   // The parked open lands LATER: the child is closed immediately — it
   // never prompts (nothing runs after the last client disconnected) —
   // and the late reject is a first-wins no-op against the bound's
@@ -613,6 +614,7 @@ test('review 7/3c-3: an openSession that NEVER resolves is settled DURABLY at th
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
   assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
   assert.deepEqual(
     broker.pendingCalls().map((e) => e.id),
     [],
