@@ -92,6 +92,7 @@ function mockBridge(): MockBridge {
       workspace: () => '{}',
       agents: () => '[]',
       reset: () => undefined,
+      defaultBackend: () => 'claude',
     },
     events: [],
     agentCalls: [],
@@ -651,18 +652,20 @@ test('verify: reviewers vote; passes when the real-share meets threshold', async
     ],
   });
   // Reviewers were spawned as schema-carrying agent calls, all routed
-  // through the reserved "default" sentinel (host policy routes it to its
-  // configured default backend). The DSL options are exactly
-  // { reviewers, threshold, lens } — there is no per-call model option
-  // (an invented opts.model was removed in review; dsl.d.ts's verify lets
-  // reviewers inherit the run's default model).
+  // through the HOST's configured default backend id (served by
+  // '__host_default_backend' — a real registered segment; the v1
+  // reserved 'default' sentinel that bypassed registry validation is
+  // deleted). The DSL options are exactly { reviewers, threshold, lens }
+  // — there is no per-call model option (an invented opts.model was
+  // removed in review; dsl.d.ts's verify lets reviewers inherit the
+  // run's default model).
   assert.equal(bridge.agentCalls.length, 3);
   for (const call of bridge.agentCalls) {
     const options = JSON.parse(call.optionsJson!);
     assert.equal(options.schema.type, 'object');
     assert.ok(call.task.includes('claim'));
   }
-  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'default'), 'reviewers route through the default sentinel');
+  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'claude'), 'reviewers route through the host default backend id');
   vm.dispose();
 });
 
@@ -697,9 +700,10 @@ test('judgePanel: highest mean score wins; stable tie-break by index', async () 
   assert.ok(Math.abs(out.score - 0.7) < 1e-9);
   assert.equal(out.judgments.length, 2);
   // Judge prompts carried the rubric, and the graders all routed through
-  // the "default" sentinel (no opts.model in the DSL's { judges, rubric }).
+  // the host's configured default backend id (no opts.model in the DSL's
+  // { judges, rubric } — the reserved 'default' sentinel is deleted).
   assert.ok(bridge.agentCalls.some((c) => c.task.includes('quality')));
-  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'default'), 'graders route through the default sentinel');
+  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'claude'), 'graders route through the host default backend id');
   vm.dispose();
 });
 

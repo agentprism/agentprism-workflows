@@ -251,6 +251,7 @@ const NOOP_HANDLERS: GuestBridgeHandlers = {
   workspace: () => '{}',
   agents: () => '[]',
   reset: () => undefined,
+  defaultBackend: () => undefined,
 };
 
 /**

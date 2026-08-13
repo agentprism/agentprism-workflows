@@ -280,6 +280,14 @@ class FakeRunner implements BrokerRunner {
   /** LoadSession calls at ordinal >= failLoadsFrom reject (1-based). */
   failLoadsFrom = Infinity;
 
+  listBackends(): string[] {
+    return ['claude', 'codex', 'opencode', 'pi'];
+  }
+
+  defaultBackendId(): string {
+    return 'claude';
+  }
+
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     if (this.failNextOpens > 0) {
       this.failNextOpens--;
@@ -557,8 +565,8 @@ test('reconcile is idempotent: a repeated reconcile never re-attaches or re-issu
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('re-issues respect the concurrency cap: an over-cap re-issue is refused with the recoverable ConcurrencyLimitError', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-capref-'));
+test('re-issues respect the concurrency cap: an over-cap re-issue QUEUES in dispatch order for the next free slot — never a rejection', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-restore-capq-'));
   const storePath = join(dir, 'calls.jsonl');
   const kinds: Array<'eval' | 'settlement'> = [];
   const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
@@ -576,7 +584,9 @@ test('re-issues respect the concurrency cap: an over-cap re-issue is refused wit
 
   // All three calls are lost at the backend. The RESTORED broker runs a
   // TIGHTER cap (server configuration can change between processes): two
-  // re-issues fit, the third is refused (recorded + settled + surfaced).
+  // re-issues fit, the third QUEUES — it stays PENDING in the guest
+  // registry (never a ConcurrencyLimitError rejection) and dispatches in
+  // dispatch order the moment a slot frees (§4.1 queue-above-cap).
   const ws2 = await Workspace.restore(PROJECT, snapshot);
   const runner2 = new FakeRunner();
   runner2.failNextLoads = 3;
@@ -587,21 +597,28 @@ test('re-issues respect the concurrency cap: an over-cap re-issue is refused wit
     snapshotSink: sink,
   });
   const report = await broker2.reconcile();
-  assert.deepEqual(report.reissued, ['c1', 'c2']);
-  assert.deepEqual(report.failedLost, ['c3'], 'the over-cap re-issue was refused');
-  assert.deepEqual(kinds, ['settlement'], 'the over-cap refusal settled the guest — its drain fired the boundary (review: refusals used to skip the changed-VM settlement boundary)');
-  const probe = await broker2.eval('"probe"');
-  assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c3') && l.includes('concurrency limit')),
-    output(probe).join('\n'),
-  );
-  // The refusal is durable and the guest call rejected recoverably.
-  const record = broker2.store().lookup('c3')!;
-  assert.equal(record.completion!.outcome, 'reject');
-  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
-  const refused = await broker2.eval('await p3.catch((e) => e.message)');
-  assert.ok(String(refused.result).includes('concurrency limit reached'), String(refused.result));
-  assert.ok(String(refused.result).includes('re-issue of call c3 refused'), String(refused.result));
+  assert.deepEqual(report.reissued, ['c1', 'c2', 'c3'], 'the over-cap re-issue QUEUED (reported re-issued, never failed-lost)');
+  assert.deepEqual(report.failedLost, []);
+  assert.deepEqual(kinds, [], 'queueing settles nothing — no settlement boundary');
+  const pending = await broker2.eval('"probe"');
+  assert.ok(pending.pending.includes('c3'), 'the queued re-issue stays PENDING in the guest registry');
+  // The store records no completion for c3 — it was never rejected.
+  assert.equal(broker2.store().lookup('c3')!.completion, null);
+  // A slot frees (c1's re-issue settles) and the queued re-issue
+  // dispatches IN ORDER for the free slot.
+  runner2.sessions[0].completeTurn('done-1');
+  await tick();
+  await broker2.pump();
+  await tick();
+  assert.equal(runner2.sessions.length, 3, 'the queued re-issue opened a fresh session once a slot freed');
+  assert.equal(broker2.store().lookup('c3')!.reissues, 1);
+  // c3's guest promise is still the same one — it settles from the
+  // re-issued turn's answer.
+  runner2.sessions[2].completeTurn('done-3');
+  await tick();
+  await broker2.pump();
+  const c3 = await broker2.eval('await p3');
+  assert.equal(c3.result, 'done-3');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -1732,7 +1749,7 @@ test('a safe loaded-turn reissue whose release parks past the disconnect bound i
 // The re-issue branches' refusal cadence (phase-D review round 2)
 // ────────────────────────────────────────────────────────────────────────
 
-test('cadence: a no-recorded-session re-issue refused by the cap settles the guest and fires the settlement boundary', async () => {
+test('cadence: a no-recorded-session re-issue QUEUED by the cap stays pending and dispatches when the slot frees — no refusal, no premature settlement boundary', async () => {
   const kinds: Array<'eval' | 'settlement'> = [];
   const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nosess-'));
@@ -1741,10 +1758,11 @@ test('cadence: a no-recorded-session re-issue refused by the cap settles the gue
   // Two pending agent calls with NO recorded backend session (parked with
   // the parking bridge — the store never saw them; reconcile adopts them,
   // the sessionId stays null → the re-issue arm). The restored broker runs
-  // cap=1: the first re-issue takes the slot, the second is REFUSED — the
-  // refusal settles the guest, so its drain must fire the settlement
-  // boundary (review regression: this branch used to drop the newly-settled
-  // flag, skipping the drain and the snapshot boundary).
+  // cap=1: the first re-issue takes the slot, the second QUEUES in
+  // dispatch order — it stays PENDING (never a ConcurrencyLimitError
+  // rejection), so nothing settles and no settlement boundary fires at
+  // reconcile (§4.1 queue-above-cap; review: the old refusal settled the
+  // guest mid-reconcile).
   const ws = await Workspace.create(PROJECT);
   await ws.eval('const p1 = agent("pi/x", "t1"); const p2 = agent("pi/y", "t2"); "started"');
   assert.equal(ws.surface()!.pending().length, 2);
@@ -1752,19 +1770,31 @@ test('cadence: a no-recorded-session re-issue refused by the cap settles the gue
   ws.dispose();
 
   const ws2 = await Workspace.restore(PROJECT, snapshot);
+  const runner2 = new FakeRunner();
   const broker2 = await Broker.attach(ws2, {
-    runner: new FakeRunner(),
+    runner: runner2,
     store: JsonlCallStore.open(storePath),
     maxConcurrentAgents: 1,
     snapshotSink: sink,
   });
   const report = await broker2.reconcile();
-  assert.deepEqual(report.reissued, ['c1']);
-  assert.deepEqual(report.failedLost, ['c2'], 'the over-cap re-issue was refused');
-  assert.deepEqual(kinds, ['settlement'], 'the refusal settled the guest — its drain fired the boundary');
+  assert.deepEqual(report.reissued, ['c1', 'c2'], 'the over-cap re-issue QUEUED (reported re-issued)');
+  assert.deepEqual(report.failedLost, []);
+  assert.deepEqual(kinds, [], 'queueing settles nothing — no settlement boundary at reconcile');
   const record = broker2.store().lookup('c2')!;
-  assert.equal(record.completion!.outcome, 'reject');
-  assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal(record.completion, null, 'the queued re-issue was never rejected');
+  // The slot frees and the queued re-issue dispatches in order.
+  runner2.sessions[0].completeTurn('done-1');
+  await tick();
+  await broker2.pump();
+  await tick();
+  assert.equal(runner2.sessions.length, 2, 'the queued re-issue opened a fresh session');
+  assert.equal(broker2.store().lookup('c2')!.reissues, 1);
+  runner2.sessions[1].completeTurn('done-2');
+  await tick();
+  await broker2.pump();
+  const p2 = await broker2.eval('await p2');
+  assert.equal(p2.result, 'done-2', 'the queued re-issue settled the SAME guest promise');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });

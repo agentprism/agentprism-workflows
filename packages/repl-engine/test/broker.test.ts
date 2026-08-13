@@ -242,6 +242,10 @@ class FakeRunner implements BrokerRunner {
     return ['claude', 'codex', 'opencode', 'pi', ...this.extraBackends];
   }
 
+  defaultBackendId(): string {
+    return 'claude';
+  }
+
   knownConfigOptionIds(backendId: string): string[] | undefined {
     return this.staticConfigOptions[backendId];
   }
@@ -1512,16 +1516,16 @@ test('review 8b: the broker-level interrupt handler bounds a DIRECT runaway eval
   await ws.dispose();
 });
 
-test('review 9: the guest "default" model sentinel maps to an OMITTED model — verify/judgePanel combinator coverage', async () => {
+test('review 9: verify/judgePanel reviewers route through the RUNNER\'S DEFAULT BACKEND id — a real registered segment, never a validation bypass', async () => {
   const { ws, broker, runner } = await setup();
-  // verify() routes its reviewers through the reserved "default"
-  // sentinel (no per-call model in the DSL options).
+  // verify() resolves its reviewers through '__host_default_backend' (no
+  // per-call model in the DSL options) — the fake's default backend id.
   await broker.eval('const v = verify("some claim", { reviewers: 2 }); "started"');
   await tick();
   assert.equal(runner.openedWith.length, 2);
   assert.ok(
-    runner.openedWith.every((o) => o.model === undefined),
-    'the sentinel never reaches the runner as a literal model selection',
+    runner.openedWith.every((o) => o.model === 'claude'),
+    'the reviewers carry the REAL default backend id (admission-validated like any agent() call)',
   );
   for (const session of runner.sessions) session.completeTurn('{"real": true, "reason": "ok"}');
   await tick();
@@ -1532,7 +1536,16 @@ test('review 9: the guest "default" model sentinel maps to an OMITTED model — 
   await broker.eval('const jp = judgePanel(["a", "b"], { judges: 2 }); "started"');
   await tick();
   assert.equal(runner.openedWith.length, 6);
-  assert.ok(runner.openedWith.slice(2).every((o) => o.model === undefined));
+  assert.ok(runner.openedWith.slice(2).every((o) => o.model === 'claude'));
+  // The deleted v1 sentinel is NOT a registered backend: a bare
+  // `agent("default", …)` rejects at admission, naming the segment and
+  // enumerating the known backends — never a silent route to the
+  // default backend.
+  const refused = await broker.eval('const m = await agent("default", "x").catch((e) => e.message); m');
+  assert.equal(
+    refused.result,
+    'unknown backend "default" in model spec "default" (known backends: claude, codex, opencode, pi)',
+  );
   await ws.dispose();
 });
 
@@ -1613,6 +1626,10 @@ test('§4.6: an uncaught error from a subagent call names the call id and the re
   const line = output(probe).find((l) => l.includes('Error: research failed'));
   assert.ok(line !== undefined, output(probe).join('\n'));
   assert.ok(line.includes('(call c1 on backend pi)'), line);
+  // [C]10: the late rejection rendering ALSO carries the guest stack's
+  // frames with LINE NUMBERS in the submitted code (the review probe
+  // reproduced only the bare name/message line).
+  assert.match(line, /<repl>:1:\d+/, line);
   await ws.dispose();
 });
 
@@ -1670,6 +1687,115 @@ test('§4.5: reset() tears the workspace down after the current eval completes (
   // After the eval, the workspace is gone (the VM disposed).
   assert.equal(ws.isDisposed, true, 'reset() tore the workspace down after the eval completed');
   await assert.rejects(async () => broker.eval('1 + 1'), /disposed|alive/);
+  await ws.dispose();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Review-fix regressions: `_` after a late completion, reset() after a
+// suspended eval, the mid-turn steer vocabulary, followUp schema answers,
+// admission-refusal attribution, and the late-rejection stack frames
+// ────────────────────────────────────────────────────────────────────────
+
+test('§4.4: `_` updates when a SUSPENDED eval completes during a pump — the settled previous eval is the previous eval', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('await sleep(10); 42');
+  assert.equal(r.result, undefined, 'the eval suspended on the sleep');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await broker.pump();
+  const probe = await broker.eval('_');
+  assert.equal(probe.result, '42', 'the late completion value became `_` (the review probe: undefined before the fix)');
+  // An empty poll (the documented eval("") idiom) leaves `_` unchanged —
+  // an undefined completion is not "a value".
+  await broker.eval('"tagged"');
+  await broker.eval('');
+  assert.equal((await broker.eval('_')).result, 'tagged');
+  await ws.dispose();
+});
+
+test('§4.5: reset() in a SUSPENDED eval tears the workspace down after the CONTINUATION completes — never while it is still in flight', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('reset(); await sleep(50); console.log("finished"); "done-after-sleep"');
+  assert.equal(r.result, undefined, 'the eval suspended on the sleep');
+  assert.equal(ws.isDisposed, false, 'the workspace is ALIVE while the reset eval is still in flight');
+  // The host timer fires; the next operation's pump runs the continuation
+  // to completion (its console output ships), THEN the teardown runs.
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).includes('finished'), output(probe).join('\n'));
+  assert.equal(probe.result, 'probe', 'the observing eval completed normally before the teardown');
+  assert.equal(ws.isDisposed, true, 'the teardown ran after the eval completed');
+  await assert.rejects(async () => broker.eval('1 + 1'), /disposed|alive/);
+  await ws.dispose();
+});
+
+test('§4.2: a MID-TURN steer resolves only the delivery-outcome vocabulary — a backend startedNewTurn maps to queued, never the bare token', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  // The founding turn is in flight: the steer is a live mid-turn
+  // injection. The backend reports startedNewTurn (the injection raced
+  // the turn's end) — the handle must resolve `queued`, never the token.
+  await broker.eval('const o = pi.steer("redirect"); "steered"');
+  await tick();
+  runner.last().completeSteer('startedNewTurn');
+  await tick();
+  await broker.pump();
+  const r = await broker.eval('await o');
+  assert.equal(r.result, 'queued');
+  // A live injection keeps its own outcome.
+  await broker.eval('const i = pi.steer("again"); "steered"');
+  await tick();
+  runner.last().completeSteer('injected');
+  await tick();
+  await broker.pump();
+  assert.equal((await broker.eval('await i')).result, 'injected');
+  await ws.dispose();
+});
+
+test('§4.2: followUp on a schema handle resolves the SCHEMA-VALIDATED object — the same value semantics as agent()', async () => {
+  const { ws, broker, runner } = await setup();
+  await broker.eval(
+    'const h = agent("pi/x", "orig", { schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } }); "started"',
+  );
+  await tick();
+  runner.last().completeTurn('{"n": 7}');
+  await tick();
+  await broker.pump();
+  const founding = await broker.eval('await h');
+  assert.equal(founding.result, '{n: 7}');
+  // The followUp turn mints its own call id and resolves with the turn's
+  // SCHEMA-VALIDATED answer (not raw text).
+  await broker.eval('const f = h.followUp("more"); "started"');
+  await tick();
+  runner.last().completeTurn('{"n": 42}');
+  await tick();
+  await broker.pump();
+  const got = await broker.eval('await f');
+  assert.equal(got.result, '{n: 42}');
+  await ws.dispose();
+});
+
+test('§4.6: a synchronous admission refusal with a RESOLVED backend names the backend in the uncaught-error rendering (call id + backend)', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('await agent("pi/x", "t", { bogus: 1 })');
+  assert.equal(r.result, undefined);
+  const line = output(r).find((l) => l.startsWith('WorkflowError'));
+  assert.ok(line !== undefined, output(r).join('\n'));
+  assert.ok(line.includes('unknown option "bogus"'), line);
+  assert.ok(line.includes('(call c1 on backend pi)'), line);
+  await ws.dispose();
+});
+
+test('§4.6: cancelling a QUEUED dispatch stamps the resolved backend on the rejection (call id + backend on every known-backend rejection path)', async () => {
+  const { ws, broker } = await setup({ maxConcurrentAgents: 1 });
+  await broker.eval('const a = agent("pi/x", "first"); "started"');
+  await tick();
+  // The second dispatch queues above the cap; the interrupt cancels it
+  // by id — the rejection carries the call id and its resolved backend.
+  await broker.eval('const q = agent("pi/y", "queued").catch((e) => e.replBackend + "/" + e.replCallId); "started"');
+  const outcome = await broker.cancelCall('c2');
+  assert.equal(outcome, 'cancelled');
+  const r = await broker.eval('await q');
+  assert.equal(r.result, 'pi/c2', 'the queued-dispatch cancellation rejection names the resolved backend');
   await ws.dispose();
 });
 

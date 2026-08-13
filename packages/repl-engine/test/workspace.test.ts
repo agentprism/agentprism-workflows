@@ -102,6 +102,56 @@ test('the guest bridge is installed at VM creation: DSL globals, console bridge,
   ws.dispose();
 });
 
+test('parking bridge: agents() serves the REAL model spec and task of parked agent calls (§4.5 plain-value shape — never fabricated empties)', async () => {
+  const ws = await workspace();
+  await ws.eval('const research = agent("pi/deepseek-v4-flash-max", "research X"); "started"');
+  const out = await ws.eval('agents()');
+  assert.equal(out.kind, 'value');
+  if (out.kind === 'value') {
+    const agents = out.value as Array<{ callId: string; modelSpec: string; task: string; state: string; supportsSteering: boolean; queuedSteers: number }>;
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].callId, 'c1');
+    assert.equal(agents[0].modelSpec, 'pi/deepseek-v4-flash-max', 'the real model spec, never ""');
+    assert.equal(agents[0].task, 'research X', 'the real task, never ""');
+  }
+  ws.dispose();
+});
+
+test('workspace-level evals maintain the §4.4 `_` result history — resolved, LATE (settled at the drain), and empty-poll evals', async () => {
+  const ws = await workspace();
+  await ws.eval('40 + 2');
+  const first = await ws.eval('_');
+  assert.equal(first.kind, 'value');
+  if (first.kind === 'value') assert.equal(first.value, 42);
+  // A suspended eval's completion value becomes `_` once its
+  // continuation settles at the drain (the parking bridge's sleep timer).
+  const suspended = await ws.eval('await sleep(10); "late"');
+  assert.equal(suspended.kind, 'pending');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  ws.drainJobs();
+  const second = await ws.eval('_');
+  assert.equal(second.kind, 'value');
+  if (second.kind === 'value') assert.equal(second.value, 'late');
+  // An empty poll (eval "") leaves `_` unchanged — an undefined
+  // completion is not "a value".
+  await ws.eval('"kept"');
+  await ws.eval('');
+  const third = await ws.eval('_');
+  assert.equal(third.kind, 'value');
+  if (third.kind === 'value') assert.equal(third.value, 'kept');
+  ws.dispose();
+});
+
+test('parking bridge: reset() in a SUSPENDED eval tears the workspace down after the continuation completes — the workspace stays alive while the eval is in flight', async () => {
+  const ws = await workspace();
+  const out = await ws.eval('reset(); await sleep(30); "finished"');
+  assert.equal(out.kind, 'pending');
+  assert.equal(ws.isDisposed, false, 'the workspace is ALIVE while the reset eval is suspended');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  ws.drainJobs();
+  assert.equal(ws.isDisposed, true, 'the teardown ran after the eval completed (the continuation settled at the drain)');
+});
+
 test('default parking bridge: checkpoint.answer settles the parked checkpoint (first-wins)', async () => {
   // Review rejection: the parking bridge's answer mode returned `false`
   // for every checkpoint.answer, so the original promise stayed pending
@@ -176,6 +226,11 @@ test('custom bridge handlers passed to create override the parking bridge', asyn
       checkpoint: () => undefined,
       steer: () => undefined,
       console: () => undefined,
+      sleep: () => undefined,
+      workspace: () => '{}',
+      agents: () => '[]',
+      reset: () => undefined,
+      defaultBackend: () => undefined,
     },
   });
   const out = await ws.eval('await agent("pi/custom", "do it")');

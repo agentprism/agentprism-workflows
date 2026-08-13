@@ -1,11 +1,11 @@
 /**
  * The host side of the guest-library bridge.
  *
- * Installs the four `__host_*` callbacks the guest library consumes
- * (the realm's entire effect surface — the dispatch table stays almost
+ * Installs the `__host_*` callbacks the guest library consumes (the
+ * realm's entire effect surface — the dispatch table stays almost
  * embarrassingly small by design), evaluates the library once at VM
  * creation, and exposes the host's doors back into the realm: the
- * reconciliation surface (post-restore settlement), the trap-free `$N`
+ * reconciliation surface (post-restore settlement), the trap-free realm
  * slot reader, and the console-event channel.
  *
  * Settlement contract (see the package README's "Guest library ⇄ host
@@ -41,6 +41,7 @@ import {
   HOST_AGENTS,
   HOST_CHECKPOINT,
   HOST_CONSOLE,
+  HOST_DEFAULT_BACKEND,
   HOST_RESET,
   HOST_SLEEP,
   HOST_STEER,
@@ -418,6 +419,17 @@ export interface GuestBridgeHandlers {
    * returns nothing meaningful.
    */
   reset(): void;
+  /**
+   * The host's configured DEFAULT backend id (a registered segment,
+   * served synchronously) — the guest library's verify/judgePanel
+   * combinators resolve their reviewer/grader model spec through it
+   * (§4.7: the DSL options carry no per-call model, so the workers
+   * inherit the run's default model; §4.1: the spec is a real
+   * registered backend, validated at admission like any `agent()`
+   * call). Return `undefined` when no backend registry is attached
+   * (the parking bridge): the combinators then reject honestly.
+   */
+  defaultBackend(): string | undefined;
 }
 
 /**
@@ -472,6 +484,7 @@ function makeCallbacks(vm: ReplVm, handlers: GuestBridgeHandlers): Array<[string
     [HOST_WORKSPACE, makeWorkspaceHostFunction(vm, handlers)],
     [HOST_AGENTS, makeAgentsHostFunction(vm, handlers)],
     [HOST_RESET, makeResetHostFunction(vm, handlers)],
+    [HOST_DEFAULT_BACKEND, makeDefaultBackendHostFunction(vm, handlers)],
   ];
 }
 
@@ -673,6 +686,22 @@ function makeResetHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostF
   return function (this: JSValueHandle): JSValueHandle {
     handlers.reset();
     return shim.undefined;
+  };
+}
+
+/**
+ * The `__host_default_backend` shape: the handler's default backend id
+ * string is returned synchronously (undefined when no registry is
+ * attached — the parking bridge; the guest's verify/judgePanel then
+ * reject honestly). A throwing handler propagates as the documented
+ * protocol-violation guest error.
+ */
+function makeDefaultBackendHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  const shim = getVmShim(vm) as QuickJS;
+  return function (this: JSValueHandle): JSValueHandle {
+    const backend = handlers.defaultBackend();
+    if (backend === undefined) return shim.undefined;
+    return shim.newString(backend);
   };
 }
 

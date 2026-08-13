@@ -153,6 +153,14 @@ class FakeRunner implements BrokerRunner {
   /** When set, loadSession rejects (the capability gate / lost session). */
   loadError: Error | null = null;
 
+  listBackends(): string[] {
+    return ['claude', 'codex', 'opencode', 'pi'];
+  }
+
+  defaultBackendId(): string {
+    return 'claude';
+  }
+
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     const session = new FakeSession(opts);
     session.backendId = 'pi';
@@ -327,13 +335,15 @@ test('review 2/2: the resolved backend id is recorded at session open and pins t
   try {
     const runner = new FakeRunner();
     const { ws, broker } = await setup({ runner, store: JsonlCallStore.open(storePath) });
-    // The guest's reserved "default" sentinel routes to the configured
-    // default backend; the RESOLVED backend id ("pi") is what the store
-    // records.
-    await broker.eval('const p = agent("default", "task"); "started"');
+    // The guest's verbatim spec rides admission validation; the RESOLVED
+    // backend id ("pi" — the fake's own backend) is what the store
+    // records, distinct from the spec's segment (the deleted 'default'
+    // sentinel used to be the only way to route off-segment — a real
+    // registered spec covers the same pin now).
+    await broker.eval('const p = agent("claude/some-model", "task"); "started"');
     await tick();
     const record = broker.store().lookup('c1')!;
-    assert.equal(record.modelSpec, 'default', 'the verbatim spec is persisted');
+    assert.equal(record.modelSpec, 'claude/some-model', 'the verbatim spec is persisted');
     assert.equal(record.backendId, 'pi', 'the resolved backend id is persisted');
     const snapshot = ws.snapshot();
     await broker.dispose();

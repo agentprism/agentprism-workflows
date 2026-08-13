@@ -40,7 +40,7 @@ import {
   type GuestSurface,
 } from './bridge.js';
 import { rawLexicalKeys } from './global-lexical.js';
-import { inspectGlobal, manifestBinding, renderGlobalLine } from './preview.js';
+import { inspectGlobal, manifestBinding } from './preview.js';
 import { rawOwnKeys } from './trapfree.js';
 
 /** One user binding of the workspace manifest (see `Workspace.manifest`). */
@@ -159,9 +159,21 @@ export class Workspace {
    *  `agents()`) serve them in the §4.5 shapes. */
   private readonly parkedKinds = new Map<string, 'agent' | 'steer' | 'checkpoint'>();
   private readonly parkedQuestions = new Map<string, string>();
+  /** The parking bridge's per-call AGENT data (the §4.5 agents() shape
+   *  serves the real model spec and task — a parked call records what
+   *  the guest asked for; never fabricated empties). */
+  private readonly parkedModelSpecs = new Map<string, string>();
+  private readonly parkedTasks = new Map<string, string>();
   /** The parking bridge's `reset()` request: the teardown runs after the
    *  current eval completes (see `eval`). */
   private pendingReset = false;
+  /** The parking bridge's retained SUSPENDED-eval completions (one per
+   *  suspended eval — `eval` keeps the wrapper; the drain's sweep reads
+   *  the settled value into `_` and releases it). */
+  private readonly suspendedCompletions = new Set<JSValueHandle>();
+  /** The retained completion of the eval that called `reset()` while it
+   *  suspended (the teardown owes AFTER that eval completes). */
+  private pendingResetCompletion: JSValueHandle | null = null;
   private disposed = false;
 
   private constructor(projectDir: string, vm: ReplVm, baseline: Set<string>) {
@@ -288,18 +300,55 @@ export class Workspace {
    * report. See `ReplVm.evalCode` for the outcome shapes. The returned
    * promise is fulfilled synchronously (the VM layer performs no `await`),
    * so an eval cannot race `dispose()`.
+   *
+   * The §4.4 result-history global is maintained HERE (the workspace
+   * level owns `_` for its own evals — the broker sets it for its evals
+   * through the same `setGlobal` seam): a RESOLVED eval's completion
+   * value becomes `_` (an undefined completion — an empty poll — leaves
+   * it unchanged, like an error); a SUSPENDED eval retains its
+   * completion wrapper and `drainJobs`'s sweep sets `_` once the
+   * continuation settles.
+   *
+   * The parking bridge's `reset()` teardown runs AFTER the current eval
+   * completes (the doc's §4.5): a completed eval disposes now; a
+   * SUSPENDED eval keeps the workspace alive until its continuation
+   * settles at the drain (`drainJobs`'s sweep), then disposes — the
+   * continuation runs to completion first, and the eval that called
+   * reset() is the one whose completion owes the teardown.
    */
   eval(code: string, options?: ReplEvalOptions): Promise<ReplEvalOutcome> {
     this.assertAlive();
-    const outcome = this.vm.evalCode(code, options);
-    // The parking bridge's `reset()` teardown: the host-side effect runs
-    // AFTER the current eval completes (the doc's §4.5 — `reset()` tears
-    // the workspace down once the eval that called it finishes; the
-    // broker honors its own flag the same way).
-    return outcome.then((result) => {
-      if (this.pendingReset) this.dispose();
-      return result;
-    });
+    const { outcome, completion } = this.vm.evalCodeWithCompletion(code, options);
+    if (completion !== undefined) {
+      if (outcome.kind === 'value') {
+        try {
+          // An undefined completion (an empty script — the documented
+          // poll idiom) is not "a value": `_` stays unchanged, like
+          // after an error.
+          if (!(completion as JSValueHandle).isUndefined) this.setGlobal('_', completion);
+        } catch {
+          // A failed `_` write must not fail the eval that produced the
+          // value.
+        }
+        (completion as JSValueHandle).dispose();
+      } else {
+        // A suspended eval: retain the wrapper — the drain's sweep reads
+        // the settled value into `_` and releases the handle. The
+        // reset-owning completion is tracked separately (a reset() the
+        // eval called owes its teardown only once THIS eval completes).
+        this.suspendedCompletions.add(completion as JSValueHandle);
+        if (this.pendingReset && this.pendingResetCompletion === null) {
+          this.pendingResetCompletion = completion as JSValueHandle;
+        }
+      }
+    }
+    // The teardown for an eval that COMPLETED within this call runs now
+    // (its output above is already captured); a suspended eval's
+    // teardown runs at the drain (see `drainJobs`). A reset owed by an
+    // EARLIER still-suspended eval (`pendingResetCompletion` set) keeps
+    // the workspace alive until that eval completes.
+    if (outcome.kind !== 'pending' && this.pendingReset && this.pendingResetCompletion === null) this.dispose();
+    return Promise.resolve(outcome);
   }
 
   /**
@@ -345,10 +394,58 @@ export class Workspace {
    * later phase) has made progress. Because a suspended eval's interrupt
    * handler is no longer armed, the drain accepts its own per-drain
    * `interruptHandler` so a resumed runaway continuation stays bounded.
+   *
+   * After the drain, the RETAINED-SUSPENDED-EVAL sweep runs: a
+   * continuation that completed during the drain is the PREVIOUS eval —
+   * its completion value becomes `_` — and a reset() the settled eval
+   * requested tears the workspace down now that the eval completed (the
+   * §4.5 host-side effect).
    */
   drainJobs(options?: ReplDrainOptions): number {
     this.assertAlive();
-    return this.vm.drainJobs(options);
+    const count = this.vm.drainJobs(options);
+    this.sweepSuspendedEvals();
+    return count;
+  }
+
+  /**
+   * One pass over the retained suspended-eval completions (the parking
+   * bridge's `_` / reset() bookkeeping): a settled wrapper's fulfilled
+   * value becomes `_` (a rejection — the eval errored late — leaves `_`
+   * unchanged), the handle is released, and when the reset-requesting
+   * eval's own completion settled the teardown runs (the workspace is
+   * disposed after its last eval completed). Runs after every drain;
+   * between VM operations only.
+   */
+  private sweepSuspendedEvals(): void {
+    if (this.suspendedCompletions.size === 0) return;
+    for (const completion of [...this.suspendedCompletions]) {
+      if (completion.promiseState === 0) continue; // still pending
+      this.suspendedCompletions.delete(completion);
+      try {
+        const value = this.vm.readRetainedCompletion(completion) as JSValueHandle | undefined;
+        if (value !== undefined) {
+          try {
+            this.setGlobal('_', value);
+          } catch {
+            // A failed `_` write must not fail the drain.
+          }
+          value.dispose();
+        }
+      } catch {
+        // Best-effort bookkeeping: a hostile completion shape must not
+        // break the drain.
+      }
+      completion.dispose();
+    }
+    if (this.pendingReset && this.pendingResetCompletion !== null && !this.suspendedCompletions.has(this.pendingResetCompletion)) {
+      // The reset-requesting eval completed (its continuation settled at
+      // this drain): the teardown runs now — the host-side effect the
+      // deleted `reset` action performed.
+      this.pendingReset = false;
+      this.pendingResetCompletion = null;
+      this.dispose();
+    }
   }
 
   /**
@@ -360,6 +457,9 @@ export class Workspace {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const completion of this.suspendedCompletions) completion.dispose();
+    this.suspendedCompletions.clear();
+    this.pendingResetCompletion = null;
     this.vm.dispose();
   }
 
@@ -392,6 +492,19 @@ export class Workspace {
   setGlobal(name: string, value: unknown): void {
     this.assertAlive();
     this.vm.setGlobal(name, value);
+  }
+
+  /**
+   * @internal Read a RETAINED suspended-eval completion wrapper after it
+   *  settled (the broker's active-eval sweep, and this workspace's own
+   *  parking-bridge sweep): the fulfilled completion value handle,
+   *  owned by the caller (dispose after use), or undefined for a
+   *  rejected/still-pending completion (`_` stays unchanged then). See
+   *  `ReplVm.readRetainedCompletion`. Called between VM operations.
+   */
+  readRetainedCompletion(completion: unknown): unknown {
+    this.assertAlive();
+    return this.vm.readRetainedCompletion(completion as JSValueHandle);
   }
 
   /**
@@ -441,19 +554,6 @@ export class Workspace {
   surface(): GuestSurface | undefined {
     this.assertAlive();
     return readGuestSurface(this.vm);
-  }
-
-  /**
-   * Render the preview line for a realm global slot (any top-level
-   * binding): `[$14 · object · 48kB] {…}` — trap-free (never executes
-   * guest getters; a slot rebound to an accessor renders the sabotage
-   * marker instead of firing it). Retained for the older tool-result
-   * seam; the 0.4.0 console path renders guest-side (no `$N` slots).
-   * `fallbackArg` is used when the slot cannot be previewed.
-   */
-  renderRef(ref: string, fallbackArg?: unknown): string {
-    this.assertAlive();
-    return renderGlobalLine(this.vm, ref, fallbackArg);
   }
 
   /**
@@ -605,11 +705,19 @@ export class Workspace {
     const parkedCheckpoints = this.parkedCheckpointCalls;
     const parkedKinds = this.parkedKinds;
     const parkedQuestions = this.parkedQuestions;
+    const parkedModelSpecs = this.parkedModelSpecs;
+    const parkedTasks = this.parkedTasks;
     const workspace = this;
     return {
-      agent: (call, callId) => {
+      agent: (call, callId, modelSpec, task) => {
         parked.set(callId, call);
         parkedKinds.set(callId, 'agent');
+        // The §4.5 agents() shape serves the call's REAL model spec and
+        // task (the parking bridge keeps them verbatim; a later broker
+        // that takes over the workspace reads them from the registry
+        // surface).
+        parkedModelSpecs.set(callId, modelSpec);
+        parkedTasks.set(callId, task);
       },
       checkpoint: (call, callId, question, _optionsJson, answerJson) => {
         if (answerJson !== null) {
@@ -631,6 +739,8 @@ export class Workspace {
           parked.delete(callId);
           parkedKinds.delete(callId);
           parkedQuestions.delete(callId);
+          parkedModelSpecs.delete(callId);
+          parkedTasks.delete(callId);
           let answer: unknown;
           try {
             answer = JSON.parse(answerJson);
@@ -707,8 +817,11 @@ export class Workspace {
             .filter(([callId]) => parkedKinds.get(callId) === 'agent')
             .map(([callId]) => ({
               callId,
-              modelSpec: '',
-              task: '',
+              // The §4.5 shape: the call's REAL model spec and task (the
+              // parking bridge recorded them verbatim at issue — never
+              // fabricated empties).
+              modelSpec: parkedModelSpecs.get(callId) ?? '',
+              task: parkedTasks.get(callId) ?? '',
               state: 'opening',
               supportsSteering: false,
               queuedSteers: 0,
@@ -717,6 +830,7 @@ export class Workspace {
       reset: () => {
         workspace.pendingReset = true;
       },
+      defaultBackend: () => undefined,
     };
   }
 

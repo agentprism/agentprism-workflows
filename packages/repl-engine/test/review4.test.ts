@@ -111,6 +111,14 @@ class FakeSession implements BrokerSession {
 class FakeRunner implements BrokerRunner {
   readonly sessions: FakeSession[] = [];
 
+  listBackends(): string[] {
+    return ['claude', 'codex', 'opencode', 'pi'];
+  }
+
+  defaultBackendId(): string {
+    return 'claude';
+  }
+
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     const session = new FakeSession(opts);
     this.sessions.push(session);

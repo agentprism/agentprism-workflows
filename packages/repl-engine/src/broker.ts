@@ -49,14 +49,16 @@
  *   "nothing is hidden, nothing hard-errors", redesigned per §4.2):
  *   followUp/steer on a SETTLED or IDLE session mint a NEW turn with its
  *   own call id (visible in `agents()`/`liveAgents()`, targetable by
- *   `interrupt`) and resolve with the TURN'S ANSWER — same value
- *   semantics as a schema-less `agent()`, never the bare
+ *   `interrupt`) and resolve with the TURN'S ANSWER — the SAME value
+ *   semantics as `agent()` (the founding handle's schema drives the
+ *   schema-validated object; a schema-less handle resolves the final
+ *   text), never the bare
  *   `startedNewTurn` token, never a discarded turn (idle-session `steer`
  *   is the followUp alias). A MID-TURN steer keeps the delivery-outcome
  *   vocabulary: `injected` where the backend advertises
- *   `_session/steering` (the backend's verbatim outcome), `queued` where
- *   it does not (next-turn delivery), `failed` on wire failure (see the
- *   steering mechanism table below).
+ *   `_session/steering` (a backend `startedNewTurn` maps to `queued`),
+ *   `queued` where it does not (next-turn delivery), `failed` on wire
+ *   failure (see the steering mechanism table below).
  *   Queued-for-next-turn delivery is DURABLE: the steer's payload and
  *   founding session id live in the call store, and the store records
  *   each delivery turn's start (the `delivered` marker — recorded in
@@ -310,9 +312,9 @@
  *
  * | Case | Mechanism | Outcome the handle resolves with |
  * |---|---|---|
- * | backend advertises `_session/steering`, turn in flight | `session.steer(content)` — live injection | the backend's verbatim outcome: `injected` \| `startedNewTurn` \| `failed` |
+ * | backend advertises `_session/steering`, turn in flight | `session.steer(content)` — live injection | `injected` (live injection); a backend `startedNewTurn` — the injection raced the turn's end and the backend started a new turn with the content — maps to `queued` (accepted for next-turn delivery; the v1 bare token never reaches the guest) |
  * | backend does NOT advertise steering, turn in flight | content enqueued for next-turn delivery | `queued` (immediately — accepted for next-turn delivery; if the call is later cancelled the queue is dropped, and a delivery-turn failure surfaces as a warn-level line in the next tool result — both documented) |
- * | ANY backend, session SETTLED or IDLE | `session.prompt(content)` — a NEW TURN with its own call id | the TURN'S ANSWER (final text — the §4.2 semantics; a turn failure rejects the call with the §4.6 attribution) |
+ * | ANY backend, session SETTLED or IDLE | `session.prompt(content)` — a NEW TURN with its own call id | the TURN'S ANSWER (the founding handle's schema drives the schema-validated object; a schema-less handle resolves the final text — the §4.2 semantics; a turn failure rejects the call with the §4.6 attribution) |
  * | ANY backend, session idle, but the workspace cap is exhausted | content enqueued for the next free slot (the same durable queue); the steer's promise stays pending | the TURN'S ANSWER once the delivery runs (a follow-up turn IS the subagent working — the six-agent ceiling is absolute) |
  * | any backend/wire failure on the steering path | — | `failed` (never a hard rejection) |
  * | the founding call is still OPENING (its session does not exist yet —
@@ -323,13 +325,13 @@
  * | `cancel()` with the session idle | no-op — the agent is already stopped | `idle` |
  * | `cancel()` while the call is still opening | the opening call is fenced + settled durably as cancelled (a late child is closed without prompting) | `cancelled` (the call rejects with the recoverable `AGENT_CANCELLED`) |
  *
- * The outcome surface therefore mirrors acp-agents' `SteeringOutcome`
- * values (`injected` / `startedNewTurn` / `failed`) for MID-TURN steers,
- * with the honest `queued` addition for the no-extension enqueue case
- * and the cancel vocabulary (`cancelled` / `idle`); IDLE-session
- * followUp/steer resolve with the turn's answer instead — the
- * orchestrator can always tell urgency delivery (injected) from
- * next-turn delivery (queued), which is the doc's stated requirement.
+ * A MID-TURN steer resolves EXACTLY the delivery-outcome vocabulary
+ * (`injected` / `queued` / `failed` — the backend's `startedNewTurn` maps
+ * to `queued`, never the bare v1 token), with the cancel vocabulary
+ * (`cancelled` / `idle`) for `cancel()`; IDLE-session followUp/steer
+ * resolve with the turn's answer instead — the orchestrator can always
+ * tell urgency delivery (injected) from next-turn delivery (queued),
+ * which is the doc's stated requirement.
  *
  * ## The guest options surface (§4.1)
  *
@@ -402,7 +404,7 @@ import type { EvalErrorInfo } from './errors.js';
 // ────────────────────────────────────────────────────────────────────────
 
 /** The outcome surface steering operations settle with (see module docs). */
-export type SteeringOutcomeValue = 'injected' | 'startedNewTurn' | 'queued' | 'cancelled' | 'idle' | 'failed';
+export type SteeringOutcomeValue = 'injected' | 'queued' | 'cancelled' | 'idle' | 'failed';
 
 /** Options for opening one subagent session (the broker's structural
  *  subset of the runner's `InteractiveSessionOptions`). */
@@ -576,11 +578,19 @@ export interface BrokerRunner {
    *  agents) — the admission-validation vocabulary for the model spec's
    *  backend segment (§4.1: an unknown segment rejects synchronously,
    *  naming the segment and enumerating the known backends — never a
-   *  silent route to the default backend). OPTIONAL for third-party
-   *  runners that do not expose their registry: validation then degrades
-   *  to the runner's own routing (the honest limit of the seam). The
+   *  silent route to the default backend). REQUIRED: every runner must
+   *  publish its registry — validation runs on every dispatch path. The
    *  real acp-agents runner exposes `listBackends()`. */
-  listBackends?(): string[];
+  listBackends(): string[];
+  /** The configured DEFAULT backend id (a REGISTERED segment) — the
+   *  host's own routing for an omitted model. The broker serves it to
+   *  the guest library (`__host_default_backend`), where the
+   *  verify/judgePanel combinators resolve their reviewer/grader spec
+   *  through it (§4.7 — the workers inherit the run's default model as
+   *  a REAL registered segment; the v1 reserved 'default' sentinel that
+   *  bypassed registry validation is deleted). The real acp-agents
+   *  runner exposes `defaultBackendId()`. */
+  defaultBackendId(): string;
   /** A backend's STATIC config-option vocabulary, when its adapter
    *  publishes one (§4.1: `configOptions` keys validate at admission
    *  against the resolved backend's known vocabulary WHERE IT IS
@@ -977,15 +987,6 @@ export const DEFAULT_EVAL_TIMEOUT_MS = 30_000;
  *  disposal and passes the remaining time instead). */
 export const DEFAULT_DISPOSE_BOUND_MS = 5_000;
 
-/** The guest library's reserved model-spec sentinel (`verify`/`judgePanel`
- *  route their spawned reviewers/graders through it — the DSL options have
- *  no per-call model, so the reviewers inherit "the run's default model").
- *  acp-agents treats an unknown bare spec as a LITERAL model selection, so
- *  the broker maps the sentinel to an omitted model — which routes to the
- *  runner's configured default backend (the guest-library contract:
- *  "host policy routes it to its configured default backend"). */
-const GUEST_DEFAULT_MODEL_SENTINEL = 'default';
-
 /** The error-code vocabulary the broker rejects with (shared-types'
  *  `WorkflowErrorCode`, kept in lockstep with the runner's own errors). */
 const CODE = WorkflowErrorCode;
@@ -1047,15 +1048,29 @@ export class Broker {
   private readonly agentSlots = new Set<string>();
   /** §4.1: dispatches QUEUED above the concurrency cap, in dispatch
    *  order — never a rejection. Each entry carries everything the
-   *  dispatch needs; `kickDispatchQueue` starts them as slots free. */
-  private readonly dispatchQueue: Array<{
-    call: GuestCall;
-    callId: string;
-    modelSpec: string;
-    task: string;
-    optionsJson: string | null;
-    parsed: ParsedAgentOptions;
-  }> = [];
+   *  dispatch needs; `kickDispatchQueue` starts them as slots free.
+   *  Restore-time RE-ISSUES queue through the same structure (a lost
+   *  call re-issued above a tightened cap stays PENDING in the guest
+   *  registry until the kick — §4.1's queue-above-cap applies to every
+   *  dispatch path, never a `ConcurrencyLimitError`). */
+  private readonly dispatchQueue: Array<
+    | {
+        kind: 'dispatch';
+        call: GuestCall;
+        callId: string;
+        modelSpec: string;
+        task: string;
+        optionsJson: string | null;
+        parsed: ParsedAgentOptions;
+      }
+    | {
+        kind: 'reissue';
+        entry: GuestSurfaceEntry;
+        parsed: ParsedAgentOptions;
+        reason: string;
+        report: ReconcileReport;
+      }
+  > = [];
   /** The cached known-backend vocabulary (see `knownBackends`). */
   private knownBackendsCache: string[] | undefined;
   /** In-flight FOLLOW-UP turns (an idle/settled session's followUp/
@@ -1070,7 +1085,19 @@ export class Broker {
   private sleepSeq = 0;
   /** The `reset()` request (see the eval handler): the teardown runs
    *  after the current eval completes. */
+  /** A reset() was requested by guest code and its teardown is owed
+   *  (consumed when the requesting eval completes — see `resetDue`). */
   private resetRequested = false;
+  /** The reset-requesting evals' retained SUSPENDED completions (a
+   *  reset() owes its teardown AFTER the eval completes — a reset eval
+   *  that suspended tears down only once its continuation settles; the
+   *  sweep observes the settlement and flips `resetDue`). */
+  private readonly resetOwningCompletions = new Set<JSValueHandle>();
+  /** The teardown owed by a completed reset eval, flipped by the sweep
+   *  (or by `eval` for an in-call completion) and consumed by the
+   *  serialized-op post-hook (`resetIfDue`) — OUTSIDE the chain slot
+   *  (the disposal acquires the chain itself). */
+  private resetDue = false;
   /** The retained last settlement-drain error (workspace().diagnostics).
    *  — the §6.2 demotion: drain failures leave the eval result surface
    *  entirely and live under the diagnostics field. */
@@ -1293,7 +1320,9 @@ export class Broker {
       },
       // The eval-plane helpers (§4.5/§4.7): sleep settles from a host
       // timer; workspace()/agents() serve the §4.5 plain-value shapes;
-      // reset() marks the teardown consumed after the current eval.
+      // reset() marks the teardown consumed after the current eval;
+      // defaultBackend() serves the runner's configured default backend
+      // id to the guest library's verify/judgePanel (§4.7).
       sleep: (call, ms) => {
         this.onSleep(call, ms);
       },
@@ -1302,6 +1331,7 @@ export class Broker {
       reset: () => {
         this.resetRequested = true;
       },
+      defaultBackend: () => this.runner.defaultBackendId(),
     };
   }
 
@@ -1362,15 +1392,23 @@ export class Broker {
       // rebound are attributed to `eval N` (the registry's snapshot-
       // durable counter).
       this.provenancePass('eval');
+      // The active-eval sweep FIRST reads late completions (a previous
+      // suspended eval settled during this operation's pump/drain):
+      // its value becomes `_` here, BEFORE this eval's own `_` write
+      // below (this eval is the most recent one — its value wins).
+      this.sweepActiveEvals();
       // The §4.4 result-history global: `_` holds the previous eval's
       // completion value, IPython-style — the sole replacement for the
       // deleted `$N` capture globals. Set only when the eval RESOLVED
-      // with a value (an error or a suspension leaves `_` unchanged,
+      // with a value (an undefined completion — an empty poll — is not
+      // "a value", and an error or a suspension leaves `_` unchanged,
       // like IPython's). The set borrows the completion handle the
       // render below still owns.
       if (outcome.kind === 'value' && completion !== undefined) {
         try {
-          this.workspace.setGlobal('_', completion as JSValueHandle);
+          if (!(completion as JSValueHandle).isUndefined) {
+            this.workspace.setGlobal('_', completion as JSValueHandle);
+          }
         } catch {
           // A failed `_` write must not fail the eval that produced the
           // value — the result line still renders.
@@ -1380,7 +1418,8 @@ export class Broker {
       // active-eval probe (the interrupt tool's eval-break target
       // surface): the wrapper is pending while the eval's continuation
       // is in flight and settles when the continuation completes or is
-      // broken — `sweepActiveEvals` releases it at the next operation.
+      // broken — `sweepActiveEvals` releases it at the next operation
+      // (reading its fulfilled value into `_` first).
       // A RESOLVED eval's completion handle is owned by `render` (it
       // previews and disposes it); an error outcome carries none. The
       // eval's CONTINUATION TOKEN is attributed alongside (see
@@ -1396,6 +1435,20 @@ export class Broker {
         if (this.lastEvalToken !== undefined) {
           this.evalTokens.set(completion as JSValueHandle, this.lastEvalToken);
         }
+        // reset() (§4.5) owes its teardown after THIS eval completes —
+        // a reset eval that SUSPENDED retains its completion in the
+        // owning set; the sweep flips `resetDue` when it settles.
+        if (this.resetRequested) {
+          this.resetOwningCompletions.add(completion as JSValueHandle);
+        }
+      }
+      // reset() (§4.5): an eval that called reset() and COMPLETED
+      // within this call owes the teardown NOW (no owning completion
+      // outstanding). The disposal itself runs after the operation —
+      // the serialized-op post-hook (`resetIfDue`), OUTSIDE the chain
+      // slot — so this eval's result ships first.
+      if (this.resetRequested && outcome.kind !== 'pending' && this.resetOwningCompletions.size === 0) {
+        this.resetDue = true;
       }
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
@@ -1405,25 +1458,6 @@ export class Broker {
       // each eval). The operation-end flush coalesces it with the
       // pump's settlement boundary into one debounced write.
       this.sink?.boundary('eval');
-      return result;
-    }).then(async (result) => {
-      // The guest's `reset()` (§4.5): the teardown runs AFTER the
-      // current eval completes — the eval that called reset() finished
-      // normally (its output shipped above), and THEN the workspace is
-      // torn down (dispose the broker's children, then the VM — the
-      // host-side effect the deleted `reset` action performed; the
-      // daemon's next touch creates a fresh workspace). The result
-      // ships after the bounded teardown, so a reset eval resolves on
-      // a workspace that is actually gone.
-      if (this.resetRequested) {
-        this.resetRequested = false;
-        // Runs OUTSIDE this eval's chain slot (the disposal acquires
-        // the chain itself — `dispose` is bounded and generation-fenced,
-        // so a concurrent operation between the two is absorbed by the
-        // first-wins/fenced paths).
-        await this.dispose();
-        this.workspace.dispose();
-      }
       return result;
     });
   }
@@ -1707,7 +1741,15 @@ export class Broker {
     } catch (error) {
       // A corrupt options bag (a hostile/foreign registry entry): the
       // same refusal a live dispatch would have produced — recorded,
-      // settled, surfaced.
+      // settled, surfaced. The §4.6 attribution rides it too: the
+      // call's recorded spec names its resolved backend (the same
+      // stamp a live admission refusal with a resolved segment gets).
+      if (entry.modelSpec !== null && entry.modelSpec !== '') {
+        const segment = backendSegment(entry.modelSpec);
+        if (this.knownBackends().includes(segment)) {
+          (error as { replBackend?: string }).replBackend = segment;
+        }
+      }
       const settled = this.refuseReconciled(entry, 'agent', error, 're-issue refused (invalid options)');
       report.failedLost.push(entry.id);
       return settled;
@@ -1748,7 +1790,7 @@ export class Broker {
       // miss the still-resumable original session).
       const model =
         record?.backendId ??
-        (entry.modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : entry.modelSpec ?? undefined);
+        (entry.modelSpec ?? undefined);
       const session = await this.runner.loadSession({
         sessionId,
         model,
@@ -2355,7 +2397,7 @@ export class Broker {
       // round 2).
       const model =
         record.backendId ??
-        (record.modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : record.modelSpec ?? undefined);
+        (record.modelSpec ?? undefined);
       const session = await this.runner.loadSession({
         sessionId: record.sessionId,
         model,
@@ -2476,13 +2518,14 @@ export class Broker {
    *  ordinary dispatch path, and the outcome settles the existing guest
    *  promise via the reconciliation surface. A store-unknown entry
    *  (foreign snapshot / wiped store) is adopted first so the replay
-   *  ledger stays complete. Re-issues respect the concurrency cap: an
-   *  over-cap re-issue is refused with the recoverable
-   *  `ConcurrencyLimitError`, recorded and settled exactly like a
-   *  dispatch-time refusal. Surfaces the reason guest-visibly. Returns
-   *  whether a guest entry was newly settled (the over-cap refusal
-   *  settles during reconcile and must participate in the changed-VM
-   *  drain and its settlement boundary). */
+   *  ledger stays complete. §4.1: an over-cap re-issue QUEUES in
+   *  dispatch order for the next free slot — the call stays PENDING in
+   *  the guest registry (never a `ConcurrencyLimitError` rejection; the
+   *  workflow engine's queue-above-cap semantics cover every dispatch
+   *  path). The queued entry reports as re-issued (it is being
+   *  re-issued — not left pending, not lost). Returns whether a guest
+   *  entry was newly settled (always false now — queueing settles
+   *  nothing). */
   private reissueCall(
     entry: GuestSurfaceEntry,
     parsed: ParsedAgentOptions,
@@ -2491,16 +2534,24 @@ export class Broker {
   ): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, 'agent');
     if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      const settled = this.refuseReconciled(entry, 'agent', {
-        name: 'ConcurrencyLimitError',
-        message:
-          `concurrency limit reached: ${this.maxConcurrentAgents} concurrent subagents per workspace ` +
-          `(re-issue of call ${entry.id} refused)`,
-        recoverable: true,
-      }, `re-issue refused: concurrency limit reached (${this.maxConcurrentAgents} concurrent subagents per workspace; ${reason})`);
-      report.failedLost.push(entry.id);
-      return settled;
+      this.dispatchQueue.push({ kind: 'reissue', entry, parsed, reason, report });
+      report.reissued.push(entry.id);
+      return false;
     }
+    this.startReissue(entry, parsed, reason, report);
+    return false;
+  }
+
+  /** The re-issue dispatch body (shared by the live path and the queued
+   *  path): record the reissue, register the concurrency token, and
+   *  start the agent task under the SAME call id (the original backend
+   *  routing pin). */
+  private startReissue(
+    entry: GuestSurfaceEntry,
+    parsed: ParsedAgentOptions,
+    reason: string,
+    report: ReconcileReport,
+  ): void {
     this.callStore.recordReissued(entry.id, now());
     this.agentSlots.add(entry.id);
     this.warnLine('warn', `call ${entry.id}: ${reason} — re-issued`);
@@ -2516,15 +2567,16 @@ export class Broker {
     );
     this.trackInFlight(entry.id, 'agent', taskPromise);
     report.reissued.push(entry.id);
-    return false;
   }
 
-  /** A reconcile-time dispatch refusal (invalid registry options, or the
-   *  concurrency cap): record dispatched-rejected FIRST (a refused call
+  /** A reconcile-time dispatch refusal (invalid registry options, or an
+   *  unrecognized pending-call kind): record dispatched-rejected FIRST
+   *  (a refused call
    *  is never re-issued again), settle, and surface the reason. Returns
    *  whether the guest entry was newly settled (a refusal mutates the
    *  VM and its caller must propagate the change into the changed-VM
-   *  drain and its settlement boundary). */
+   *  drain and its settlement boundary). (§4.1: over-cap re-issues are
+   *  NOT refused — they queue via `reissueCall`.) */
   private refuseReconciled(entry: GuestSurfaceEntry, kind: 'agent' | 'steer', error: unknown, warn: string): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, kind);
     const value = toRejectionValue(error);
@@ -2687,20 +2739,38 @@ export class Broker {
     // documented outer drain bound ineffective).
     const decision = await this.serialized(async () => {
       this.assertAlive();
-      // §4.1: a QUEUED dispatch (above the cap, not yet started) — the
-      // interrupt removes it from the queue and settles it as cancelled
-      // (recorded first, durable: a restore never re-issues it).
-      const queueIndex = this.dispatchQueue.findIndex((queued) => queued.callId === callId);
+      // §4.1: a QUEUED dispatch — a fresh call above the cap or a
+      // queued restore-time RE-ISSUE — the interrupt removes it from
+      // the queue and settles it as cancelled (recorded first, durable:
+      // a restore never re-issues it). The rejection carries the §4.6
+      // backend attribution when the call's backend resolved.
+      const queueIndex = this.dispatchQueue.findIndex((queued) =>
+        queued.kind === 'dispatch' ? queued.callId === callId : queued.entry.id === callId,
+      );
       if (queueIndex >= 0) {
         const [queued] = this.dispatchQueue.splice(queueIndex, 1);
+        const isReissue = queued.kind === 'reissue';
+        const detail = isReissue ? (queued.entry.detail ?? '') : queued.task;
+        const optionsJson = isReissue ? queued.entry.optionsJson : queued.optionsJson;
+        const modelSpec = isReissue ? (queued.entry.modelSpec ?? '') : queued.modelSpec;
         const value = toRejectionValue(
           new WorkflowError(
-            `call ${callId} was cancelled while queued for dispatch (the concurrency cap)`,
+            isReissue
+              ? `call ${callId} was cancelled while queued for re-issue (the concurrency cap)`
+              : `call ${callId} was cancelled while queued for dispatch (the concurrency cap)`,
             CODE.AGENT_CANCELLED,
             { recoverable: true },
           ),
         );
-        this.recordDispatch(callId, 'agent', queued.task, queued.optionsJson, null, queued.modelSpec);
+        // The §4.6 attribution: the resolved backend (the recorded
+        // backend id when the store has one — a queued re-issue pins
+        // the original backend — else the admission-validated segment).
+        const backend =
+          this.recordedBackendId(callId) ?? (modelSpec !== '' ? backendSegment(modelSpec) : undefined);
+        if (backend !== undefined && this.knownBackends().includes(backend)) {
+          (value as { replBackend?: string }).replBackend = backend;
+        }
+        this.recordDispatch(callId, 'agent', detail, optionsJson, null, modelSpec !== '' ? modelSpec : null);
         this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
         try {
           this.settleIntoGuest(callId, 'reject', value);
@@ -2728,6 +2798,9 @@ export class Broker {
             recoverable: true,
           }),
         );
+        // The §4.6 attribution: the followUp's resolved backend (the
+        // founding session's recorded backend id).
+        (value as { replBackend?: string }).replBackend = queuedSteer.entry.backendId;
         this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
         try {
           this.settleIntoGuest(callId, 'reject', value);
@@ -2970,6 +3043,13 @@ export class Broker {
    * between operations, since a drain that settles a continuation can
    * only run inside one. Trap-free: a raw promise-state read per
    * retained handle.
+   *
+   * The §4.4 result-history seam rides the sweep: a settled completion
+   * IS the previous eval — its FULFILLED value is read trap-free into
+   * `_` (a rejected completion leaves `_` unchanged, like IPython's).
+   * A settled completion owed by a reset-requesting eval flips
+   * `resetDue` — the teardown runs after the operation (the
+   * serialized-op post-hook), once the eval actually completed.
    */
   private sweepActiveEvals(): void {
     if (this.activeEvalCompletions.size === 0 && !this.evalBreakArmed) return;
@@ -2998,6 +3078,29 @@ export class Broker {
       this.activeEvalCompletions.delete(completion);
       this.evalTokens.delete(completion);
       this.evalBreakTargets.delete(completion);
+      if (this.resetOwningCompletions.delete(completion) && this.resetOwningCompletions.size === 0) {
+        // The reset-requesting eval completed (or, with several
+        // outstanding, the LAST one did): the teardown is owed once
+        // this operation ends.
+        this.resetDue = true;
+      }
+      // The previous eval's completion value becomes `_` (a rejected
+      // completion reads undefined — `_` stays unchanged, the error
+      // already rendered through the rejection bridge).
+      try {
+        const value = this.workspace.readRetainedCompletion(completion) as JSValueHandle | undefined;
+        if (value !== undefined) {
+          try {
+            this.workspace.setGlobal('_', value);
+          } catch {
+            // A failed `_` write must not fail the operation.
+          }
+          value.dispose();
+        }
+      } catch {
+        // Best-effort bookkeeping: a hostile completion shape must not
+        // break the operation.
+      }
       completion.dispose();
     }
   }
@@ -3042,6 +3145,12 @@ export class Broker {
         this.activeEvalCompletions.delete(completion);
         this.evalTokens.delete(completion);
         this.evalBreakTargets.delete(completion);
+        // A broken eval is finished (its continuation never settles):
+        // a reset() it requested owes its teardown all the same (the
+        // eval will never complete any other way).
+        if (this.resetOwningCompletions.delete(completion) && this.resetOwningCompletions.size === 0) {
+          this.resetDue = true;
+        }
         completion.dispose();
         released = true;
       }
@@ -3986,10 +4095,15 @@ export class Broker {
       this.stoppedOpens.clear();
       // The eval-plane additions: queued dispatches, addressable
       // followUp turns, and live sleep timers are dropped with the
-      // broker (their guest calls are gone with the workspace).
+      // broker (their guest calls are gone with the workspace). The
+      // owed-but-unconsumed reset() teardown dies with the broker (a
+      // disposed broker owns no children to tear down).
       this.dispatchQueue.length = 0;
       this.followUpTurns.clear();
       this.sleepCalls.clear();
+      this.resetDue = false;
+      this.resetRequested = false;
+      this.resetOwningCompletions.clear();
       // The retained suspended-eval completions and the eval-break
       // signal die with the broker (the handles are released before the
       // VM is disposed by the caller).
@@ -4039,12 +4153,12 @@ export class Broker {
     try {
       parsed = this.parseAgentOptions(optionsJson);
     } catch (error) {
-      this.refuse(call, callId, 'agent', task, optionsJson, error);
+      this.refuseAdmitted(call, callId, task, optionsJson, modelSpec, error);
       return;
     }
     const admissionError = this.validateAdmission(modelSpec, parsed);
     if (admissionError !== undefined) {
-      this.refuse(call, callId, 'agent', task, optionsJson, admissionError);
+      this.refuseAdmitted(call, callId, task, optionsJson, modelSpec, admissionError);
       return;
     }
     if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
@@ -4054,7 +4168,7 @@ export class Broker {
       // moment a slot frees. A snapshot taken while queued carries the
       // call in the guest registry; a restore re-issues it through the
       // ordinary reconcile arm.
-      this.dispatchQueue.push({ call, callId, modelSpec, task, optionsJson, parsed });
+      this.dispatchQueue.push({ kind: 'dispatch', call, callId, modelSpec, task, optionsJson, parsed });
       return;
     }
     this.startDispatch(call, callId, modelSpec, task, optionsJson, parsed);
@@ -4066,38 +4180,38 @@ export class Broker {
    * agents) — an unknown segment rejects synchronously, naming the
    * segment and enumerating the known backends, never a silent route to
    * the default backend; a spec with no known-backend prefix is an
-   * error. `configOptions` keys validate at admission against the
+   * error. EVERY spec validates — there is no sentinel bypass (the v1
+   * reserved 'default' sentinel is deleted; verify/judgePanel resolve
+   * their reviewers/graders through the runner's real
+   * `defaultBackendId()`, which IS a registered segment).
+   * `configOptions` keys validate at admission against the
    * resolved backend's known vocabulary WHERE IT IS KNOWABLE (the
    * runner's `knownConfigOptionIds` seam — a backend whose vocabulary
    * is genuinely dynamic returns undefined and the [C]5 fallback in
    * `runAgentTask` covers it). Returns the refusal error, or undefined
-   * when the call is admitted. The guest's reserved `'default'`
-   * sentinel (verify/judgePanel route through it) skips the backend
-   * check — host policy routes it to the configured default backend.
+   * when the call is admitted.
    */
   private validateAdmission(modelSpec: string, parsed: ParsedAgentOptions): unknown {
-    if (modelSpec !== GUEST_DEFAULT_MODEL_SENTINEL) {
-      const segment = backendSegment(modelSpec);
-      const known = this.knownBackends();
-      if (known !== undefined && !known.includes(segment)) {
-        return new WorkflowError(
-          `unknown backend "${segment}" in model spec "${modelSpec}" (known backends: ${known.join(', ')})`,
-          CODE.SCRIPT_VALIDATION_ERROR,
-          { recoverable: false },
-        );
-      }
-      if (parsed.configOptions !== undefined) {
-        const vocabulary = this.runner.knownConfigOptionIds?.(segment);
-        if (vocabulary !== undefined) {
-          for (const key of Object.keys(parsed.configOptions)) {
-            if (!vocabulary.includes(key)) {
-              return new WorkflowError(
-                `configOptions: unknown option "${key}" for backend "${segment}" ` +
-                  `(known options: ${vocabulary.length > 0 ? vocabulary.join(', ') : 'none'})`,
-                CODE.SCRIPT_VALIDATION_ERROR,
-                { recoverable: false },
-              );
-            }
+    const segment = backendSegment(modelSpec);
+    const known = this.knownBackends();
+    if (!known.includes(segment)) {
+      return new WorkflowError(
+        `unknown backend "${segment}" in model spec "${modelSpec}" (known backends: ${known.join(', ')})`,
+        CODE.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (parsed.configOptions !== undefined) {
+      const vocabulary = this.runner.knownConfigOptionIds?.(segment);
+      if (vocabulary !== undefined) {
+        for (const key of Object.keys(parsed.configOptions)) {
+          if (!vocabulary.includes(key)) {
+            return new WorkflowError(
+              `configOptions: unknown option "${key}" for backend "${segment}" ` +
+                `(known options: ${vocabulary.length > 0 ? vocabulary.join(', ') : 'none'})`,
+              CODE.SCRIPT_VALIDATION_ERROR,
+              { recoverable: false },
+            );
           }
         }
       }
@@ -4107,15 +4221,38 @@ export class Broker {
 
   /** The known backend ids (built-ins plus registered custom agents),
    *  lowercased and sorted — cached (the registry is fixed at runner
-   *  construction). Undefined when the runner exposes no registry. */
-  private knownBackends(): string[] | undefined {
+   *  construction). Every runner publishes its registry (the seam's
+   *  `listBackends` is REQUIRED — admission validation runs on every
+   *  dispatch path). */
+  private knownBackends(): string[] {
     if (this.knownBackendsCache !== undefined) return this.knownBackendsCache;
-    const list = this.runner.listBackends?.();
-    if (list === undefined) return undefined;
     const set = new Set<string>();
-    for (const id of list) set.add(id.toLowerCase());
+    for (const id of this.runner.listBackends()) set.add(id.toLowerCase());
     this.knownBackendsCache = [...set].sort();
     return this.knownBackendsCache;
+  }
+
+  /**
+   * A dispatch-time admission refusal, with the §4.6 backend attribution:
+   * a call whose backend segment RESOLVED (an option-key/config-option
+   * failure — the call was admitted to that backend) stamps `replBackend`
+   * onto the rejection so the uncaught-error rendering names the backend
+   * alongside the call id; an unknown-backend refusal has no resolved
+   * backend to name (its message enumerates the vocabulary instead).
+   */
+  private refuseAdmitted(
+    call: GuestCall,
+    callId: string,
+    task: string,
+    optionsJson: string | null,
+    modelSpec: string,
+    error: unknown,
+  ): void {
+    const segment = backendSegment(modelSpec);
+    if (this.knownBackends().includes(segment)) {
+      (error as { replBackend?: string }).replBackend = segment;
+    }
+    this.refuse(call, callId, 'agent', task, optionsJson, error);
   }
 
   /** The dispatch body (shared by the live path and the queued path):
@@ -4500,10 +4637,9 @@ export class Broker {
   /** The agent call task: open the session, run the prompt, shape the
    *  result (schema ladder or text), and report the outcome. The session
    *  stays open after the call settles — the live-handle contract. The
-   *  guest's reserved `"default"` model sentinel maps to an OMITTED model
-   *  (acp-agents routes it to the configured default backend; a bare
-   *  unknown spec would be treated as a literal model selection — review
-   *  regression). The schema rides session creation (`openSession`
+   *  model spec is admission-validated (its backend segment resolved
+   *  against the registry — §4.1) and passed verbatim. The schema rides
+   *  session creation (`openSession`
    *  folds it into the backend's native session/new channel — Claude);
    *  the per-turn channels (Codex's `outputSchema` forward, the in-band
    *  contract for pi/custom) are the runner's own, applied inside
@@ -4533,7 +4669,7 @@ export class Broker {
         // (phase-D review round 2: routing by the current default across
         // a restart could open the re-issued session on the wrong
         // backend).
-        model: backendIdOverride ?? (modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : modelSpec),
+        model: backendIdOverride ?? (modelSpec ?? undefined),
         schema: parsed.schema as never,
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
@@ -4668,14 +4804,14 @@ export class Broker {
     parsed: ParsedAgentOptions,
     original: { name: string; message: string; code?: string; recoverable?: boolean },
     backendIdOverride: string | null,
-  ): Promise<{ name: string; message: string; code?: string; recoverable?: boolean }> {
+  ): Promise<{ name: string; message: string; code?: string; recoverable?: boolean; replBackend?: string }> {
     const keys = Object.keys(parsed.configOptions!);
     // The backend may already have named the key in its own message.
     if (keys.some((key) => original.message.includes(key))) return original;
     let diagnostic: BrokerSession | undefined;
     try {
       diagnostic = await this.runner.openSession({
-        model: backendIdOverride ?? (modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : modelSpec),
+        model: backendIdOverride ?? (modelSpec ?? undefined),
         schema: parsed.schema as never,
         cwd: parsed.cwd ?? this.workspace.projectDir,
         mode: parsed.mode,
@@ -4703,6 +4839,10 @@ export class Broker {
           (keys.length === 1 ? carried : `among: ${carried}`) +
           ` (backend error: ${original.message})`,
         recoverable: false,
+        // The §4.6 attribution: the [C]5 fallback's replacement error
+        // names the resolved backend too (the call id is stamped by the
+        // guest library at settlement).
+        replBackend: backend,
       };
     } finally {
       void Promise.resolve(diagnostic.release()).catch(() => undefined);
@@ -4820,6 +4960,20 @@ export class Broker {
   ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
     try {
       const outcome = await entry.session.steer(prompt, { promptMeta });
+      // §4.2: a MID-TURN steer resolves EXACTLY the delivery-outcome
+      // vocabulary (`injected` / `queued` / `failed`). A backend
+      // `startedNewTurn` — the injection raced the turn's end and the
+      // backend started a new turn with the content — maps to `queued`
+      // (accepted for next-turn delivery); the v1 bare token never
+      // reaches the guest.
+      if (outcome === 'startedNewTurn') {
+        this.warnLine(
+          'info',
+          `steer ${callId} (on ${entry.callId}): the in-flight turn ended before the injection — ` +
+            `the backend started a new turn with the content (queued)`, // eslint-disable-line max-len
+        );
+        return { outcome: 'resolve', value: 'queued' };
+      }
       return { outcome: 'resolve', value: outcome };
     } catch {
       // Nothing hard-errors: a wire failure resolves `failed`.
@@ -4877,7 +5031,7 @@ export class Broker {
       });
       const turn = await turnPromise;
       this.assertNormalStopReason(turn.stopReason, callId);
-      return { outcome: 'resolve', value: 'startedNewTurn' };
+      return { outcome: 'resolve', value: 'queued' };
     } catch (error) {
       if (isCancellation(error)) {
         // The turn was cancelled mid-delivery — the remaining queue is
@@ -4897,8 +5051,10 @@ export class Broker {
    * session mints a NEW turn with its own call id (this steer call's
    * own id — the addressable turn, visible in `agents()`/`liveAgents()`
    * and targetable by `interrupt`) and its promise resolves with the
-   * TURN'S ANSWER — the final assistant text, the same value semantics
-   * as a schema-less `agent()` (never the bare `startedNewTurn` token,
+   * TURN'S ANSWER — the SAME value semantics as `agent()`: the
+   * schema-validated object when the founding handle was created with
+   * `schema` (its recorded options bag drives the ladder), the final
+   * assistant text otherwise (never the bare `startedNewTurn` token,
    * never a discarded turn). A turn failure rejects the call with the
    * attributed error (the §4.6 call-id + backend attribution), and a
    * cancellation rejects with the recoverable `AGENT_CANCELLED` family.
@@ -4929,8 +5085,24 @@ export class Broker {
       });
       const turn = await turnPromise;
       this.assertNormalStopReason(turn.stopReason, callId);
-      // The turn's answer: the latest turn's assistant text, shaped like
-      // a schema-less agent call (the empty-output gate included).
+      // The turn's answer, with the SAME value semantics as agent()
+      // (§4.2): the founding handle's schema — its recorded options bag
+      // — drives the schema-validated object; a schema-less handle
+      // resolves the latest turn's assistant text (the empty-output
+      // gate included). A corrupt founding record degrades to the
+      // text answer.
+      const founding = this.callStore.lookup(entry.callId);
+      let foundingParsed: ParsedAgentOptions | undefined;
+      if (founding !== undefined && founding.optionsJson !== null) {
+        try {
+          foundingParsed = this.parseAgentOptions(founding.optionsJson);
+        } catch {
+          foundingParsed = undefined;
+        }
+      }
+      if (foundingParsed?.schema !== undefined) {
+        return { outcome: 'resolve', value: await this.resolveStructuredOutput(entry, foundingParsed) };
+      }
       return { outcome: 'resolve', value: this.finalText(entry) };
     } catch (error) {
       if (isCancellation(error)) {
@@ -5065,10 +5237,15 @@ export class Broker {
   private kickQueuedDeliveries(): void {
     for (;;) {
       if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;
-      // §4.1: queued dispatches first, FIFO.
+      // §4.1: queued dispatches first, FIFO (a queued re-issue keeps its
+      // dispatch-order place alongside fresh dispatches).
       const queued = this.dispatchQueue.shift();
       if (queued !== undefined) {
-        this.startDispatch(queued.call, queued.callId, queued.modelSpec, queued.task, queued.optionsJson, queued.parsed);
+        if (queued.kind === 'dispatch') {
+          this.startDispatch(queued.call, queued.callId, queued.modelSpec, queued.task, queued.optionsJson, queued.parsed);
+        } else {
+          this.startReissue(queued.entry, queued.parsed, queued.reason, queued.report);
+        }
         continue;
       }
       let candidate: SessionEntry | undefined;
@@ -5127,6 +5304,7 @@ export class Broker {
           if (error instanceof DrainJobError) {
             this.sink?.boundary('settlement');
             this.retainedDrainError = { name: error.info.name, message: error.info.message, atMs: now() };
+            this.sweepActiveEvals();
             return { settled, drainError: error };
           }
           throw error;
@@ -5200,12 +5378,22 @@ export class Broker {
             // (retained; the eval surface reports it only as a line in
             // the next result).
             this.retainedDrainError = { name: error.info.name, message: error.info.message, atMs: now() };
+            // A suspended eval's continuation may still have completed
+            // before the drain failure — the sweep reads any settled
+            // completion into `_` and releases it.
+            this.sweepActiveEvals();
             return { settled, drainError: error };
           }
           throw error;
         }
       }
     }
+    // The pump's drains may have completed suspended evals (their
+    // continuations resumed by the deliveries): the sweep reads the
+    // settled values into `_` right here, so a `pump()` returns with
+    // the result history already updated (the §4.4 seam — `await
+    // sleep(10); 42`, pump, then `_` reads `42`).
+    this.sweepActiveEvals();
     return { settled };
   }
 
@@ -5754,14 +5942,14 @@ export class Broker {
         () => undefined,
         () => undefined,
       );
-      return run;
+      return this.afterOp(run);
     }
     for (;;) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         // The deadline is already past: run WITHOUT the chain — waiting
         // for it would exceed the absolute bound.
-        return this.runSerialized(fn);
+        return this.afterOp(this.runSerialized(fn));
       }
       const raced = this.opChain;
       let timer: NodeJS.Timeout | undefined;
@@ -5781,7 +5969,7 @@ export class Broker {
         // — run WITHOUT it and return at the bound (the caller's body
         // is first-wins/generation-fenced, so the stuck op's eventual
         // landing cannot interleave into a double settlement).
-        return this.runSerialized(fn);
+        return this.afterOp(this.runSerialized(fn));
       }
       if (this.opChain === raced) {
         // The chain we raced is still the current one — enqueue onto it
@@ -5796,12 +5984,46 @@ export class Broker {
           () => undefined,
           () => undefined,
         );
-        return run;
+        return this.afterOp(run);
       }
       // The chain CHANGED while we awaited the race (an op enqueued in
       // the microtasks between the chain's release and this continuation
       // replaced it): re-race the new chain with the remaining time.
     }
+  }
+
+  /**
+   * After a serialized operation settles: run the owed reset() teardown
+   * (§4.5 — the guest's reset() tears the workspace down once the eval
+   * that called it completed). OUTSIDE the chain slot: the disposal
+   * acquires the chain itself, and the op's own promise has settled
+   * (its result shipped) before the teardown starts. A failing op still
+   * tears down (the eval completed with an error — the teardown is
+   * owed all the same).
+   */
+  private async afterOp<T>(p: Promise<T>): Promise<T> {
+    try {
+      return await p;
+    } finally {
+      await this.resetIfDue();
+    }
+  }
+
+  /**
+   * The reset() teardown owed by a completed eval (`resetDue`, flipped
+   * by the sweep or by `eval` for an in-call completion): dispose the
+   * broker's children (bounded, generation-fenced), then the workspace
+   * VM — the host-side effect the deleted `reset` action performed; the
+   * daemon's next touch creates a fresh workspace. Idempotent: dispose
+   * is first-wins and the flags are consumed once.
+   */
+  private async resetIfDue(): Promise<void> {
+    if (!this.resetDue || this.disposed) return;
+    this.resetDue = false;
+    this.resetRequested = false;
+    this.resetOwningCompletions.clear();
+    await this.dispose();
+    this.workspace.dispose();
   }
 
   /** One serialized operation with the sink's end-of-burst flush: the
@@ -6079,26 +6301,34 @@ function requireStringArray(value: unknown, what: string): string[] {
  *  and recoverable flag; plain errors are recoverable by default; a
  *  plain rejection-shaped object (the broker's own refusals) passes
  *  through with its name/recoverable. */
-function toRejectionValue(error: unknown): { name: string; message: string; code?: string; recoverable?: boolean } {
+function toRejectionValue(error: unknown): { name: string; message: string; code?: string; recoverable?: boolean; replBackend?: string } {
+  // The §4.6 backend stamp passes THROUGH the conversion (an error
+  // pre-stamped with `replBackend` — an admission refusal whose segment
+  // resolved — keeps it on the rejection value the guest sees).
+  const backend = (error as { replBackend?: unknown } | null | undefined)?.replBackend;
+  const stamped = (value: { name: string; message: string; code?: string; recoverable?: boolean; replBackend?: string }): typeof value => {
+    if (typeof backend === 'string') value.replBackend = backend;
+    return value;
+  };
   if (isWorkflowError(error)) {
-    return {
+    return stamped({
       name: 'WorkflowError',
       message: error.message,
       code: error.code,
       recoverable: error.recoverable,
-    };
+    });
   }
   if (error instanceof Error) {
-    return { name: error.name || 'Error', message: error.message };
+    return stamped({ name: error.name || 'Error', message: error.message });
   }
   if (typeof error === 'object' && error !== null && typeof (error as { message?: unknown }).message === 'string') {
     const value = error as { name?: unknown; message: string; code?: unknown; recoverable?: unknown };
-    return {
+    return stamped({
       name: typeof value.name === 'string' ? value.name : 'Error',
       message: value.message,
       ...(typeof value.code === 'string' ? { code: value.code } : {}),
       ...(typeof value.recoverable === 'boolean' ? { recoverable: value.recoverable } : {}),
-    };
+    });
   }
   return { name: 'Error', message: String(error) };
 }

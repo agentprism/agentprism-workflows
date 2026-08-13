@@ -82,6 +82,7 @@ async function createVm(): Promise<ReplVm> {
     workspace: () => '{}',
     agents: () => '[]',
     reset: () => undefined,
+    defaultBackend: () => undefined,
   });
   return vm;
 }
@@ -352,3 +353,16 @@ test('the completion repr round-trips through a real workspace eval', async () =
 // The raw shim import is kept referenced for the trap-free handle probes.
 void getVmShim;
 void (undefined as unknown as QuickJS);
+
+test('§7: the $N capture previewer surface is DELETED from the public exports (renderRefLine / renderGlobalLine / renderPreviewLine / previewGlobal)', async () => {
+  const index = await import('../src/index.js');
+  assert.equal('renderRefLine' in index, false, 'renderRefLine must be deleted');
+  assert.equal('renderGlobalLine' in index, false, 'renderGlobalLine must be deleted');
+  assert.equal('renderPreviewLine' in index, false, 'renderPreviewLine must be deleted');
+  assert.equal('previewGlobal' in index, false, 'previewGlobal must be deleted');
+  assert.equal('Workspace' in index, true, 'the retained seams stay exported');
+  // The retained metadata-formatting tokens and the manifest seam stay.
+  assert.equal('inspectGlobal' in index, true);
+  assert.equal('stringDescription' in index, true);
+  assert.equal('renderCollapsed' in index, true);
+});

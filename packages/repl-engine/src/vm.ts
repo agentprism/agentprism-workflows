@@ -621,6 +621,45 @@ export class ReplVm {
     this.dispose();
   }
 
+  /**
+   * Read a RETAINED suspended-eval completion wrapper after it settled
+   * (the broker's active-eval sweep calls this on a wrapper whose
+   * `promiseState` left 0 — the `_` result-history seam: a suspended
+   * eval that completed during a previous drain is the PREVIOUS eval,
+   * and its completion value becomes `_`). Fully synchronous and
+   * trap-free, like `readCompletion`: for a FULFILLED completion the
+   * unwrapped value handle (the raw `qjs_promise_result` ref's
+   * `{ value }` own-data property — never a `[[Get]]`) is returned
+   * OWNED BY THE CALLER; a REJECTED completion (the eval errored late
+   * — `_` stays unchanged, the error already rendered through the
+   * rejection bridge), a still-pending wrapper, or the pollution quirk
+   * (the wrapper with no own `value` — the wrapper itself is returned,
+   * so the caller always sees *a* value) never leaves the caller
+   * owning anything unexpected. Must be called between VM operations.
+   * Both the parameter and the result are typed `unknown` (the caller
+   * casts to the shim's handle type internally) so the published
+   * declaration graph stays free of quickjs-wasi types.
+   */
+  readRetainedCompletion(handle: unknown): unknown {
+    this.assertAlive();
+    const wrapper = handle as JSValueHandle;
+    const state = wrapper.promiseState;
+    if (state === 0) return undefined; // still pending — nothing to read
+    const e = this.vm._getExports();
+    const resultPtr = e.qjs_promise_result(wrapper.ptr);
+    const result = new JSValueHandle(this.vm, resultPtr);
+    try {
+      if (state === 2) return undefined; // rejected — `_` stays unchanged
+      const valueHandle = readOwnDataProperty(result, 'value');
+      if (valueHandle !== undefined) return valueHandle;
+      // The unexpected wrapper shape (the pollution quirk the README
+      // pins): return the wrapper itself — the caller sees *a* value.
+      return result.dup();
+    } finally {
+      result.dispose();
+    }
+  }
+
   private assertAlive(): void {
     if (this.disposed) {
       throw new Error('ReplVm: eval/drain on a disposed VM');
@@ -764,25 +803,66 @@ export class ReplVm {
 
   /**
    * The uncaught-rejection bridge for a suspended eval completion (the
-   * doc's transfer lesson 3): attach `p.then(undefined, err =>
-   * console.error(err))` so a late rejection of the completion promise
-   * travels the ordinary console bridge — rendered as an error-level
-   * console line, delivered at the settlement drain's natural point —
-   * never a new intent-plane surface. Best-effort: the bridge
-   * script is evaluated with the engine's own trap-free eval, the call's
-   * result (including an exception result, whose runtime exception is
-   * taken out and freed) is disposed, and any failure leaves the pending
-   * outcome unchanged.
+   * doc's transfer lesson 3): attach `p.then(undefined, renderer)` so a
+   * late rejection of the completion promise travels the ordinary
+   * console bridge — rendered as an error-level console line, delivered
+   * at the settlement drain's natural point — never a new intent-plane
+   * surface. The renderer produces the §4.6 uncaught-error line (the
+   * same shape the broker's `errorLine` renders for an in-eval error):
+   * the error name and message, the call-id/resolved-backend attribution
+   * when the error came from a subagent call, and the guest stack's top
+   * frames with line numbers in the submitted code (`at <repl>:line:
+   * col` — the guest library augments rejected registry calls with the
+   * CALL-SITE stack, see `settleCall` in guest-library.ts; a thrown
+   * Error's own stack carries the frames natively). Best-effort: the
+   * bridge script is evaluated with the engine's own trap-free eval, the
+   * call's result (including an exception result, whose runtime
+   * exception is taken out and freed) is disposed, and any failure
+   * leaves the pending outcome unchanged. The renderer never throws
+   * (its own guard swallows a hostile error value — a proxy's traps
+   * fire inside the renderer, never in the host's error path).
    */
   private attachRejectionBridge(handle: JSValueHandle): void {
     const e = this.vm._getExports();
     let bridge: JSValueHandle | undefined;
     try {
-      const evaluated = this.evalTrapFree(
-        '(p) => { p.then(undefined, (err) => { console.error(err); }); }',
-        '<repl-rejection-bridge>',
-        0,
-      );
+      // Plain string concatenation (no template literal — the source
+      // must be exactly what the VM evaluates; every `\` below is an
+      // escaped backslash so the guest code receives the literal escape
+      // sequences).
+      const source =
+        '(p) => { p.then(undefined, (err) => { try {' +
+        'var e = err;' +
+        'var name = "Error";' +
+        'var message = "undefined";' +
+        'if (e !== null && e !== undefined) {' +
+        'if (typeof e === "string") { message = e; }' +
+        'else if (typeof e === "number" || typeof e === "boolean" || typeof e === "bigint") { message = String(e); }' +
+        'else {' +
+        'if (typeof e.name === "string") { name = e.name; }' +
+        'if (typeof e.message === "string") { message = e.message; }' +
+        'else if (typeof e.toString === "function") { try { message = e.toString(); } catch (_x) { message = "unreadable error"; } }' +
+        '} }' +
+        'var line = name + ": " + message;' +
+        'if (e !== null && e !== undefined && (typeof e === "object" || typeof e === "function")) {' +
+        'var attrib = "";' +
+        'if (typeof e.replCallId === "string") { attrib = "(call " + e.replCallId;' +
+        'if (typeof e.replBackend === "string") { attrib += " on backend " + e.replBackend; } attrib += ")"; }' +
+        'else if (typeof e.replBackend === "string") { attrib = "(on backend " + e.replBackend + ")"; }' +
+        'if (attrib !== "") { line += " " + attrib; }' +
+        '}' +
+        'var frames = [];' +
+        'if (e !== null && e !== undefined && typeof e.stack === "string") {' +
+        'var parts = e.stack.split("\\n");' +
+        'for (var i = 0; i < parts.length && frames.length < 8; i++) {' +
+        'var m = /^\\s*at\\s+(?:(.+?)\\s+\\()?<repl>:(\\d+):(\\d+)\\)?\\s*$/.exec(parts[i]);' +
+        'if (m !== null) {' +
+        'frames.push(m[1] !== undefined ? "    at " + m[1] + " (<repl>:" + m[2] + ":" + m[3] + ")" : "    at <repl>:" + m[2] + ":" + m[3]);' +
+        '} } }' +
+        'if (frames.length > 0) { line += "\\n" + frames.join("\\n"); }' +
+        'console.error(line);' +
+        '} catch (_bridge) {} }); }';
+      const evaluated = this.evalTrapFree(source, '<repl-rejection-bridge>', 0);
       if (evaluated.kind === 'error') return;
       bridge = evaluated.handle;
       // Raw `qjs_call` with one borrowed argument (the completion promise);

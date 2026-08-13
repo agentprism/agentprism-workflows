@@ -78,11 +78,7 @@ export {
   type RealmSlot,
 } from './bridge.js';
 export {
-  renderPreviewLine,
   renderCollapsed,
-  renderRefLine,
-  renderGlobalLine,
-  previewGlobal,
   inspectGlobal,
   manifestBinding,
   formatByteSize,

@@ -20,12 +20,17 @@
  * trap-counting proxy cannot influence anything rendered here.
  *
  * `estimateByteSize` is the bounded, trap-free byte-size estimate for the
- * header (FORMAT.md leaves the estimate to the caller); `renderRefLine`
- * is the tool-side seam: resolve a `$N` realm slot trap-free, preview it,
- * render the line. A slot rebound to an accessor renders an explicit
- * sabotage marker (the getter is never invoked); a slot that cannot be
- * previewed degrades to a line built from the console event's best-effort
- * `args` encoding — preview failure must never lose output.
+ * header (FORMAT.md leaves the estimate to the caller); `inspectGlobal`
+ * is the workspace-manifest seam (content-free name/type/size metadata
+ * for one realm global slot, read through its own property descriptor —
+ * an accessor-rebound slot is marked, never invoked). The v1 `$N`
+ * capture-unit previewer surface (renderRefLine/renderGlobalLine/
+ * renderPreviewLine/previewGlobal) is DELETED with the redesign's §7
+ * sweep — the retained surface is the §4.4 completion repr
+ * (`renderCompletionLine`), the retained metadata-formatting tokens
+ * (stringDescription/shortString/headTailDescription/formatNumber/
+ * formatByteSize), and the manifest seams (inspectGlobal/
+ * manifestBinding).
  */
 
 import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
@@ -236,8 +241,8 @@ function leaf(
  * shim handle, so it is not exported from this module's public surface
  * (the published declarations must stay free of quickjs-wasi types — a
  * signature naming `JSValueHandle` would drag the shim's DOM-dependent
- * declarations into the consumer's program); the public seams are
- * `renderGlobalLine`/`renderRefLine`/`inspectGlobal`, and the broker
+ * declarations into the consumer's program); the public seam is
+ * `inspectGlobal`, and the broker
  * layer reaches it through `renderCompletionLine` below.
  */
 function previewHandle(handle: JSValueHandle): ObjectPreview {
@@ -557,7 +562,7 @@ function ownStringProperties(
       // must still be disposed — an omitted property is not listed, yet
       // its handle is just as owned as a listed one's (review regression:
       // every omitted data-property handle leaked, pinning one JSValue
-      // box per preview call; a 20,000-call previewGlobal() probe on a
+      // box per preview call; a 20,000-call inspectGlobal() probe on a
       // 100-property object grew WASM memory from 1.31 MB to 30.74 MB).
       if (desc.kind === 'data') desc.value.dispose();
       overflow = true;
@@ -852,13 +857,6 @@ function reprHandle(handle: JSValueHandle, depth: number, seen: Set<number>): st
   }
 }
 
-/**
- * The header label: the CDP subtype when present, else the type.
- */
-function label(preview: ObjectPreview): string {
-  return preview.subtype ?? preview.type;
-}
-
 /** Render the collapsed preview body (everything after the header), capped
  *  at MAX_COLLAPSED_CHARS (FORMAT.md §3). */
 export function renderCollapsed(preview: ObjectPreview): string {
@@ -928,14 +926,7 @@ function renderPromise(preview: ObjectPreview): string {
 }
 
 /**
- * The full context line (FORMAT.md §2):
- * `[$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}`.
- */
-export function renderPreviewLine(address: number, byteSize: number, preview: ObjectPreview): string {
-  return `[$${address} · ${label(preview)} · ${formatByteSize(byteSize)}] ${renderCollapsed(preview)}`;
-}
-
-/** Decimal byte-size formatting (FORMAT.md §2.2): `B`, then `kB`/`MB`/`GB`/
+ * Decimal byte-size formatting (FORMAT.md §2.2): `B`, then `kB`/`MB`/`GB`/
  *  `TB` at multiples of 1000, one decimal with a trailing `.0` stripped.
  *  The DISPLAYED value is kept below 1000: a value that one-decimal
  *  rounding would render as `1000.0` (anything ≥ 999.95) moves to the next
@@ -965,7 +956,7 @@ const SIZE_MAX_DEPTH = 32;
 
 /**
  * Bounded, trap-free byte-size estimate of a guest value (internal; the
- * public seams are `renderGlobalLine`/`inspectGlobal`). Uses only the
+ * public seams are `inspectGlobal`/`manifestBinding`). Uses only the
  * introspection surface (brand checks, own-key listing, descriptor access
  * that never fires getters, engine object identity), an explicit work
  * stack (no recursion), a real VISITED SET (each object counts once,
@@ -1073,34 +1064,7 @@ function byteLength(s: string): number {
   return Buffer.byteLength(s, 'utf8');
 }
 
-// ---- The $N slot seam ----
-
-/** The explicit marker line for a `$N` slot rebound to an accessor: the
- *  preview names the sabotage instead of firing the getter (or lying with
- *  the stale logged args). */
-function sabotagedSlotLine(ref: string): string {
-  return `[${ref} · accessor · ?B] (slot rebound to a getter — not invoked; the logged value was replaced)`;
-}
-
-/** Last-resort line when the realm global is unavailable: the guest's
- *  best-effort JSON encoding, capped. */
-function fallbackLine(ref: string | undefined, arg: unknown): string {
-  const CAP = 400;
-  let body: string;
-  if (arg !== undefined) {
-    let s: string;
-    try {
-      s = JSON.stringify(arg);
-    } catch {
-      s = String(arg);
-    }
-    const chars = toChars(s);
-    body = chars.length > CAP ? chars.slice(0, CAP - 1).join('') + '…' : s;
-  } else {
-    body = '…';
-  }
-  return ref === undefined ? body : `[${ref}] ${body}`;
-}
+// ---- Trap-free global-slot reads (the manifest seam's resolver) ----
 
 /**
  * Resolve a realm global slot trap-free and return the VALUE handle, or
@@ -1147,87 +1111,10 @@ function readSlotValue(vm: ReplVm, name: string): JSValueHandle | undefined {
 }
 
 /**
- * Render the preview line for one `$N` ref: `[$14 · object · 48kB] {…}`.
- * See `renderGlobalLine` for the full resolution contract.
- */
-export function renderRefLine(vm: ReplVm, ref: string, fallbackArg?: unknown): string {
-  if (/^\$\d+$/.test(ref)) {
-    return renderGlobalLine(vm, ref, fallbackArg);
-  }
-  return fallbackLine(ref, fallbackArg);
-}
-
-/**
- * Render the preview line for any realm global slot (a `$N` ref or any
- * other top-level binding): `[name · object · 48kB] {…}`.
- *
- * Resolution is trap-free: the slot is read through its own property
- * descriptor — a slot rebound to a getter renders the explicit sabotage
- * marker (the getter is never invoked), an absent slot reads as
- * `undefined`, and any preview failure degrades to a line built from the
- * caller's best-effort fallback encoding (`fallbackArg`) — preview
- * failure must never lose output.
- */
-export function renderGlobalLine(vm: ReplVm, name: string, fallbackArg?: unknown): string {
-  const value = readSlotValue(vm, name);
-  if (value === undefined) {
-    // The slot is absent (reads as undefined — the same thing a [[Get]]
-    // would have said, minus the trap risk), an accessor (sabotage
-    // marker), or unreadable. Distinguish the accessor case for the
-    // marker line.
-    const slot = readRealmSlotKind(vm, name);
-    if (slot === 'accessor') return sabotagedSlotLine(name);
-    return fallbackLine(name, fallbackArg);
-  }
-  try {
-    const preview = previewHandle(value);
-    const size = estimateSize(value);
-    return renderPreviewLine(slotAddress(name), size, preview);
-  } catch {
-    return fallbackLine(name, fallbackArg);
-  } finally {
-    value.dispose();
-  }
-}
-
-/** The numeric address of a `$N`-style name (0 for arbitrary names — the
- *  header renders `[name · …]` in that case). */
-function slotAddress(name: string): number {
-  const n = /^\$(\d+)$/.exec(name)?.[1];
-  return n === undefined ? 0 : Number(n);
-}
-
-/**
- * The structured preview of a realm global slot — the ObjectPreview
- * object behind `renderGlobalLine`'s rendered line: the CDP model the
- * tool-result seam is built on, as plain data (JSON-serializable, with
- * the FORMAT.md §4 normative field order preserved — pinned by the
- * serialization-vector test). Trap-free by construction (module docs):
- * own-property-descriptor reads only, no guest getters, no guest code.
- * Returns `undefined` when the slot is absent, rebound to an accessor
- * (never invoked), or unreadable — the same resolution contract as
- * `renderGlobalLine` (which degrades to a fallback line; callers that
- * need the structured form instead can degrade themselves).
- */
-export function previewGlobal(vm: ReplVm, name: string): ObjectPreview | undefined {
-  const value = readSlotValue(vm, name);
-  if (value === undefined) return undefined;
-  try {
-    return previewHandle(value);
-  } catch {
-    return undefined;
-  } finally {
-    value.dispose();
-  }
-}
-
-/**
  * Metadata for one realm global slot, content-free: the CDP label (type
  * or subtype), the byte-size estimate, and the resolution kind. This is
  * the workspace-manifest seam — `ls` for the data plane (the doc: top-
- * level bindings with name, type, size; metadata, never content). The
- * full preview is available through `renderGlobalLine` (or the
- * structured form through `previewGlobal`).
+ * level bindings with name, type, size; metadata, never content).
  */
 export function inspectGlobal(vm: ReplVm, name: string): {
   kind: 'data' | 'accessor' | 'absent';

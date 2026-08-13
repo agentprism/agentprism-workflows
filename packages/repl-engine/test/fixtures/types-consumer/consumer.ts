@@ -32,10 +32,7 @@ import {
   registerGuestHostCallbacks,
   readGuestSurface,
   readRealmSlot,
-  renderRefLine,
-  renderGlobalLine,
   inspectGlobal,
-  renderPreviewLine,
   renderCollapsed,
   formatByteSize,
   formatNumber,
@@ -152,6 +149,7 @@ async function exercisePhaseB(): Promise<void> {
     workspace: () => '{}',
     agents: () => '[]',
     reset: () => undefined,
+    defaultBackend: () => undefined,
   };
   await installGuestBridge(bridgeVm, handlers);
   registerGuestHostCallbacks(bridgeVm, handlers);
@@ -165,12 +163,9 @@ async function exercisePhaseB(): Promise<void> {
     const stats = surface.stats();
     stats.pendingCalls satisfies number;
   }
-  const slot: RealmSlot = readRealmSlot(bridgeVm, '$1');
+  const slot: RealmSlot = readRealmSlot(bridgeVm, 'agent');
   slot satisfies RealmSlot;
-  const line: string = renderRefLine(bridgeVm, '$1', { fallback: true });
-  line satisfies string;
-  renderGlobalLine(bridgeVm, 'anything') satisfies string;
-  const meta = inspectGlobal(bridgeVm, '$1');
+  const meta = inspectGlobal(bridgeVm, 'agent');
   meta.kind satisfies 'data' | 'accessor' | 'absent';
   meta.label satisfies string;
   meta.sizeBytes satisfies number;
@@ -183,7 +178,6 @@ async function exercisePhaseB(): Promise<void> {
   };
   const t: PreviewType = preview.type;
   const st: PreviewSubtype | undefined = preview.subtype;
-  renderPreviewLine(7, 48000, preview) satisfies string;
   renderCollapsed(preview) satisfies string;
   formatByteSize(48000) satisfies string;
   formatNumber(-0) satisfies string;
@@ -270,6 +264,12 @@ function storeTyping(store: CallStore): void {
 function brokerSurfaceTyping(ws: Workspace): void {
   const options: BrokerOptions = {
     runner: {
+      listBackends() {
+        return ['claude', 'pi'];
+      },
+      defaultBackendId() {
+        return 'claude';
+      },
       async openSession(_opts: BrokerOpenSessionOptions): Promise<BrokerSession> {
         return {
           sessionId: 's1',

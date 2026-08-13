@@ -5,7 +5,7 @@
  *
  * `GUEST_LIBRARY_SOURCE` is a plain script evaluated exactly ONCE at VM
  * creation, inside the capability-free QuickJS realm — no modules, no
- * imports, no host assumptions beyond the four documented `__host_*`
+ * imports, no host assumptions beyond the documented `__host_*`
  * functions (see the package README's "Guest library ⇄ host contract").
  * After the first snapshot this library travels INSIDE the snapshot: it is
  * versioned with the workspace, not with the host, and a host must accept
@@ -38,7 +38,11 @@
  *   - `workspace()` / `agents()` → plain JSON-round-tripped values
  *     served by the host (`__host_workspace` / `__host_agents`);
  *     `reset()` → void, asking the host to tear the workspace down
- *     after the current eval completes (`__host_reset`).
+ *     after the current eval completes (`__host_reset`). The
+ *     verify/judgePanel reviewers/graders resolve their model spec
+ *     through `__host_default_backend` (the host's configured default
+ *     backend id — a real registered segment; the v1 reserved
+ *     'default' sentinel is deleted).
  *   - `parallel` / `pipeline` / `verify` / `judgePanel` / `gate` /
  *     `retry` / `loopUntilDry` — pure JavaScript layered on `agent()`,
  *     following `packages/workflows/src/dsl.d.ts` semantics.
@@ -120,8 +124,12 @@
  *  with the §4.4 depth-limited repr; `_` is the sole result-history global),
  *  `sleep(ms)` / `workspace()` / `agents()` / `reset()` join the guest library,
  *  rejections of registry calls carry `replCallId` (and `replBackend` when the
- *  host stamps it) for the §4.6 error attribution, and the agent options bag is
- *  narrowed to exactly `{ schema, cwd, configOptions, mode }`. The guest
+ *  host stamps it) for the §4.6 error attribution, the agent options bag is
+ *  narrowed to exactly `{ schema, cwd, configOptions, mode }`, and the
+ *  verify/judgePanel combinators resolve their reviewer/grader spec through
+ *  `__host_default_backend` (the reserved 'default' sentinel that bypassed
+ *  registry validation is deleted) while rejected calls augment their Error
+ *  with the CALL-SITE stack (the §4.6 submitted-code line numbers). The guest
  *  environment changed, so this version invalidates older stored snapshots
  *  (they take the §6.1 auto-reset path on first touch).
  *
@@ -533,6 +541,7 @@ export const HOST_SLEEP = '__host_sleep';
 export const HOST_WORKSPACE = '__host_workspace';
 export const HOST_AGENTS = '__host_agents';
 export const HOST_RESET = '__host_reset';
+export const HOST_DEFAULT_BACKEND = '__host_default_backend';
 
 /**
  * Build the injectable library script. `version` is substituted into the
@@ -762,6 +771,20 @@ const GUEST_LIBRARY_SOURCE = `/*
           err.replCallId = callId;
         } catch (_e) {}
       }
+      // The §4.6 submitted-code frames: the error was created HERE (its
+      // own stack names only library frames) — augment it with the
+      // CALL-SITE stack captured at issue time (see 'issueCall'), which
+      // carries the user's '<repl>' frames. The host's renderer filters
+      // to exactly those frames; the library frames in both halves are
+      // skipped.
+      if (entry && typeof entry.siteStack === 'string' && entry.siteStack.length > 0) {
+        try {
+          err.stack =
+            typeof err.stack === 'string' && err.stack.length > 0
+              ? err.stack + '\\n' + entry.siteStack
+              : entry.siteStack;
+        } catch (_e) {}
+      }
       entry.reject(err);
     }
     return true;
@@ -797,6 +820,21 @@ const GUEST_LIBRARY_SOURCE = `/*
           'guest code (and re-register it by name after every snapshot restore)',
       );
     }
+    // The §4.6 CALL-SITE STACK: captured HERE, synchronously inside the
+    // library function the user code invoked, so the stack carries the
+    // SUBMITTED-CODE frames (the agent()/steer()/checkpoint() call site
+    // at '<repl>') below the library's own. A rejection's Error is
+    // created at settlement time in this library (its own stack names
+    // only library frames) — settleCall AUGMENTS it with these frames so
+    // the host's uncaught-error rendering can show line numbers in the
+    // submitted code. Best-effort: a failure to capture leaves the
+    // rejection with its library-only stack.
+    var siteStack;
+    try {
+      siteStack = new Error('repl call site').stack;
+    } catch (_err) {
+      siteStack = undefined;
+    }
     var id = 'c' + ++state.callSeq;
     var resolveFn;
     var rejectFn;
@@ -809,6 +847,7 @@ const GUEST_LIBRARY_SOURCE = `/*
       kind: kind,
       detail: detail,
       optionsJson: optionsJson === undefined ? null : optionsJson,
+      siteStack: siteStack,
       createdAt: Date.now(),
       // The id the host addresses this call by: the founding session id for
       // steering calls, this call's own id for everything else. Recorded so
@@ -1233,6 +1272,37 @@ const GUEST_LIBRARY_SOURCE = `/*
   };
 
   /**
+   * The reviewer/grader model spec for verify/judgePanel: the HOST's
+   * configured default backend id, served by '__host_default_backend'
+   * (§4.7 — the DSL options carry no per-call model, so the spawned
+   * workers inherit the run's default model; §4.1 — the spec is a REAL
+   * registered backend segment, validated at admission like any agent()
+   * call; the v1 reserved 'default' sentinel that bypassed registry
+   * validation is deleted). A host with no backend registry (the parking
+   * bridge) returns undefined and the combinators reject NON-recoverably
+   * (they cannot work without a backend).
+   */
+  function defaultBackendSpec() {
+    if (typeof g.__host_default_backend !== 'function') {
+      var err = new Error(
+        '__host_default_backend is not installed — the host must register it before evaluating ' +
+          'guest code (and re-register it by name after every snapshot restore)',
+      );
+      err.recoverable = false;
+      throw err;
+    }
+    var id = g.__host_default_backend();
+    if (typeof id !== 'string' || id.length === 0) {
+      var err2 = new Error(
+        'verify/judgePanel need a default backend, but no backend registry is attached to this workspace',
+      );
+      err2.recoverable = false;
+      throw err2;
+    }
+    return id;
+  }
+
+  /**
    * Adversarial verification panel: 'reviewers' workers vote on whether
    * 'item' is real/correct; passes when the share voting real meets
    * 'threshold'. Reviewers that fail recoverably are dropped from the vote
@@ -1242,15 +1312,15 @@ const GUEST_LIBRARY_SOURCE = `/*
    * (packages/workflows/src/dsl.d.ts) — there is no per-call model option
    * (an invented opts.model was removed in review; the dsl.d.ts verify
    * lets reviewers inherit the run's default model, so the spawned
-   * reviewers always route through the reserved ''default'' sentinel,
-   * which host policy routes to its configured default backend).
+   * reviewers route through the host's configured default backend id —
+   * a real registered segment, never the deleted 'default' sentinel).
    */
   async function verify(item, opts) {
     opts = opts || {};
     var reviewers = Math.max(1, opts.reviewers !== undefined ? opts.reviewers : 2);
     var threshold = opts.threshold !== undefined ? opts.threshold : 0.5;
     var lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
-    var modelSpec = 'default';
+    var modelSpec = defaultBackendSpec();
     var claim;
     if (typeof item === 'string') {
       claim = item;
@@ -1299,14 +1369,14 @@ const GUEST_LIBRARY_SOURCE = `/*
    * as { index, attempt, score, judgments } (stable tie-break by index).
    * The DSL options are EXACTLY { judges, rubric }
    * (packages/workflows/src/dsl.d.ts) — no per-call model option; the
-   * spawned graders route through the reserved ''default'' sentinel
-   * (host-routed, same decision as verify).
+   * spawned graders route through the host's configured default backend id
+   * (same decision as verify).
    */
   async function judgePanel(attempts, opts) {
     opts = opts || {};
     var judges = Math.max(1, opts.judges !== undefined ? opts.judges : 3);
     var rubric = opts.rubric !== undefined ? opts.rubric : 'overall quality and correctness';
-    var modelSpec = 'default';
+    var modelSpec = defaultBackendSpec();
     var scored = (
       await parallel(
         (Array.isArray(attempts) ? attempts : []).map(function (att, idx) {
