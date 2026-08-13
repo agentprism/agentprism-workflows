@@ -223,7 +223,7 @@ test('review 2/1: after the client-presence drain, followUp/steer/cancel on a se
   loaded.completeTurn('follow-up answer');
   await tick();
   await broker.pump();
-  assert.equal(broker.store().lookup('c2')!.completion!.value, 'startedNewTurn', 'the followUp settled with what happened');
+  assert.equal(broker.store().lookup('c2')!.completion!.value, 'follow-up answer', 'the followUp settled with the TURN\'S ANSWER (§4.2)');
   // The lazy re-attach info line surfaces guest-visibly in the next tool
   // result.
   let sawReattachLine = false;
@@ -243,7 +243,7 @@ test('review 2/1: after the client-presence drain, followUp/steer/cancel on a se
   runner.sessions[1].completeTurn('steered answer');
   await tick();
   await broker.pump();
-  assert.equal(broker.store().lookup('c3')!.completion!.value, 'startedNewTurn');
+  assert.equal(broker.store().lookup('c3')!.completion!.value, 'steered answer', 'the re-attached followUp settles with the TURN\'S ANSWER');
   // cancelCall (the interrupt tool's engine path) reports the honest idle
   // no-op for the now-warm re-attached session (no second load — the
   // session entry is live again).
@@ -312,7 +312,7 @@ test('review 2/1c: a settled handle whose session never opened (no recorded back
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal(outcome, '"failed"');
+  assert.equal(outcome, 'failed');
   assert.equal(runner.loadedWith.length, 0, 'nothing to load — the session never opened');
   void got;
   await broker.dispose();
@@ -425,7 +425,7 @@ test('review 2/3: drainForDisconnect drains in-flight turns to completion (settl
   assert.ok(sink.boundaries.includes('settlement'), sink.boundaries.join(','));
   // Both results settled into the VM (the continuation can read them).
   const got = await broker.eval('await a + "|" + await b');
-  assert.equal(got.result, '"A done|B done"');
+  assert.equal(got.result, 'A done|B done');
   await broker.dispose();
   ws.dispose();
 });
@@ -647,8 +647,8 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
   assert.equal(byName.get('count')!.sizeBytes, 8, 'the size is exposed as its own field');
   assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1 \u00b7 151B');
   assert.equal(byName.get('research')!.provenance, 'eval 1');
-  assert.equal(manifest.logs.count, 1);
-  assert.equal(manifest.logs.first, 1);
+  assert.equal(manifest.logs.count, 0, 'the $N capture system is deleted — the logs range is always empty');
+  assert.equal(manifest.logs.first, null);
   assert.ok(manifest.inFlight.includes('c1'), manifest.inFlight.join(','));
   // The intent-plane hygiene rule: NO fragment of any bound value at ANY
   // length appears in the manifest.

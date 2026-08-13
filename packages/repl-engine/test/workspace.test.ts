@@ -64,10 +64,9 @@ test('the guest bridge is installed at VM creation: DSL globals, console bridge,
   assert.equal(logged.kind, 'value');
   const events = ws.consoleEvents();
   assert.equal(events.length, 1);
-  assert.deepEqual(events[0].refs, ['$1', '$2']);
-  // The rendered line is the previewer seam the tool layer uses.
-  assert.match(ws.renderRef('$1'), /^\[\$1 · object · \d+B\] \{a: 1\}$/);
-  assert.equal(ws.renderRef('$2'), '[$2 · string · 4B] "text"');
+  // The §4.4 one-line repr (guest-rendered): args joined with one space.
+  assert.equal(events[0].level, 'log');
+  assert.equal(events[0].line, '{a: 1} text');
 
   // The default parking bridge parks agent calls (honest no-backend state:
   // nothing is fabricated, the calls pend until a later phase attaches
@@ -437,7 +436,7 @@ test('manifest: a top-level LEXICAL `const globalThis = 7` (a legitimate user pr
     // internal references use the captured global too): a fresh eval
     // still reaches host functions and the realm globals.
     const live = await broker.eval('typeof console.log');
-    assert.equal(live.result, '"function"', 'the library internals are immune to the globalThis shadow');
+    assert.equal(live.result, 'function', 'the library internals are immune to the globalThis shadow');
   } finally {
     await broker.dispose();
     ws.dispose();
@@ -456,7 +455,7 @@ test('manifest: a SAME-TYPE overwrite of a baseline global (`Math = { userOwned:
     // registry was created in the pristine realm) is the detector that
     // catches it: the manifest lists the overwrite with its provenance.
     const r = await broker.eval('Math = { userOwned: true }; "rebound"');
-    assert.equal(r.result, '"rebound"');
+    assert.equal(r.result, 'rebound');
     let manifest = broker.workspaceManifest();
     let byName = new Map(manifest.bindings.map((b) => [b.name, b]));
     const math = byName.get('Math');

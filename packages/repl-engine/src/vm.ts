@@ -279,11 +279,11 @@ type EvalResult =
 let shippedModule: Promise<WasmModule> | null = null;
 
 // The structured-clone extension (.so) is loaded once per process and
-// attached to every VM: the guest library's $N freezing uses
-// `structuredClone` (the roadmap doc pins the mechanism), and the
-// extension travels in snapshots, so the restore path must attach the same
-// byte-identical artifact it was snapshotted with (quickjs-wasi restores
-// extension memory against the descriptors it was created with).
+// attached to every VM: older guest libraries used it for the $N
+// freezing path (deleted in 0.4.0), and the extension travels in
+// snapshots, so the restore path must attach the same byte-identical
+// artifact it was snapshotted with (quickjs-wasi restores extension
+// memory against the descriptors it was created with).
 let structuredCloneExtension: Promise<Uint8Array> | null = null;
 
 async function loadStructuredCloneExtension(): Promise<Uint8Array> {
@@ -380,10 +380,10 @@ export class ReplVm {
       wasm,
       memoryLimit: memoryLimitBytes,
       // The structured-clone extension ships with the quickjs-wasi package
-      // and is attached to every VM: the guest library's console bridge
-      // freezes logged values into the $N store via `structuredClone` (the
-      // roadmap doc's pinned mechanism). The extension also travels inside
-      // snapshots, so `restore()` attaches the same artifact.
+      // and is attached to every VM (older guest libraries used it for the
+      // deleted $N freezing path). The extension travels inside snapshots,
+      // so `restore()` attaches the same artifact — a restored pre-0.4.0
+      // workspace still carries the extension.
       extensions: [{ name: 'structured-clone', wasm: await loadStructuredCloneExtension() }],
       interruptHandler: () => interruptSlot.current?.() ?? false,
     });
@@ -596,6 +596,26 @@ export class ReplVm {
     this.vm.dispose();
   }
 
+  /**
+   * Write a live guest value into a realm GLOBAL slot by name — the
+   * engine's seam for `_` (the §4.4 result-history global: the previous
+   * eval's completion value, IPython-style; the broker sets it after
+   * every eval that resolved with a value). The value handle is
+   * BORROWED (the raw set dups it — the caller keeps ownership). Trap-
+   * free by construction: a plain `JS_SetProperty` on the global object
+   * runs no guest code. Called BETWEEN VM operations (never re-entrant
+   * — like every host-side VM read).
+   */
+  setGlobal(name: string, value: unknown): void {
+    // `value` is typed `unknown` for the published declaration graph (see
+    // `evalCodeWithCompletion`'s completion — the public surface must stay
+    // free of quickjs-wasi types); the caller passes the live completion
+    // handle, borrowed (the raw set dups it).
+    this.assertAlive();
+    const shim = getVmShim(this) as QuickJS;
+    shim.setProp(shim.global, name, value as JSValueHandle);
+  }
+
   /** Support for `using` declarations (Explicit Resource Management). */
   [Symbol.dispose](): void {
     this.dispose();
@@ -746,9 +766,9 @@ export class ReplVm {
    * The uncaught-rejection bridge for a suspended eval completion (the
    * doc's transfer lesson 3): attach `p.then(undefined, err =>
    * console.error(err))` so a late rejection of the completion promise
-   * travels the ordinary console bridge — frozen into a `$N`, previewed
-   * under the existing rules, delivered at the settlement drain's natural
-   * point — never a new intent-plane surface. Best-effort: the bridge
+   * travels the ordinary console bridge — rendered as an error-level
+   * console line, delivered at the settlement drain's natural point —
+   * never a new intent-plane surface. Best-effort: the bridge
    * script is evaluated with the engine's own trap-free eval, the call's
    * result (including an exception result, whose runtime exception is
    * taken out and freed) is disposed, and any failure leaves the pending
@@ -902,11 +922,19 @@ function readErrorInfo(handle: JSValueHandle): EvalErrorInfo {
   let nameHandle: JSValueHandle | undefined;
   let messageHandle: JSValueHandle | undefined;
   let stackHandle: JSValueHandle | undefined;
+  let replCallIdHandle: JSValueHandle | undefined;
+  let replBackendHandle: JSValueHandle | undefined;
   let protoHandle: JSValueHandle | undefined;
   try {
     nameHandle = readOwnDataProperty(handle, 'name');
     messageHandle = readOwnDataProperty(handle, 'message');
     stackHandle = readOwnDataProperty(handle, 'stack');
+    // The §4.6 error attribution (see `EvalErrorInfo`): the guest
+    // library stamps 'replCallId' onto every rejected registry call's
+    // Error and the host stamps 'replBackend' onto the rejection value
+    // it settles — both read here as own data strings, trap-free.
+    replCallIdHandle = readOwnDataProperty(handle, 'replCallId');
+    replBackendHandle = readOwnDataProperty(handle, 'replBackend');
     let name = nameHandle && nameHandle.typeof === 'string' ? nameHandle.toString() : undefined;
     if (name === undefined && handle.isError) {
       // Error constructor names live on the error prototype (`name` is not
@@ -938,11 +966,21 @@ function readErrorInfo(handle: JSValueHandle): EvalErrorInfo {
       messageHandle && messageHandle.typeof === 'string' ? messageHandle.toString() : '';
     const stack =
       stackHandle && stackHandle.typeof === 'string' ? stackHandle.toString() : undefined;
-    return classifyError(name ?? 'Error', message, stack);
+    const replCallId =
+      replCallIdHandle && replCallIdHandle.typeof === 'string'
+        ? replCallIdHandle.toString()
+        : undefined;
+    const replBackend =
+      replBackendHandle && replBackendHandle.typeof === 'string'
+        ? replBackendHandle.toString()
+        : undefined;
+    return classifyError(name ?? 'Error', message, stack, replCallId, replBackend);
   } finally {
     nameHandle?.dispose();
     messageHandle?.dispose();
     stackHandle?.dispose();
+    replCallIdHandle?.dispose();
+    replBackendHandle?.dispose();
     protoHandle?.dispose();
   }
 }

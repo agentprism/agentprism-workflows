@@ -229,11 +229,34 @@ class FakeRunner implements BrokerRunner {
   /** Load failures to inject (each one rejects loadSession once). */
   failNextLoads = 0;
   disposeCalls = 0;
+  /** Extra registered custom backends (appended to the known list). */
+  extraBackends: string[] = [];
+  /** The static config-option vocabularies the runner publishes (the
+   *  §4.1 admission seam). Empty/absent = dynamic (undefined). */
+  staticConfigOptions: Record<string, string[]> = {};
+  /** configOptions keys the backend rejects at open (the dynamic-
+   *  vocabulary late failure the [C]5 fallback covers). */
+  failConfigKeys: Set<string> = new Set();
+
+  listBackends(): string[] {
+    return ['claude', 'codex', 'opencode', 'pi', ...this.extraBackends];
+  }
+
+  knownConfigOptionIds(backendId: string): string[] | undefined {
+    return this.staticConfigOptions[backendId];
+  }
 
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     if (this.failNextOpens > 0) {
       this.failNextOpens--;
       throw new Error('spawn failed');
+    }
+    if (opts.configOptions !== undefined) {
+      for (const key of Object.keys(opts.configOptions)) {
+        if (this.failConfigKeys.has(key)) {
+          throw new Error('invalid config option');
+        }
+      }
     }
     const session = new FakeSession(opts);
     session.capabilities = { supportsSteering: this.supportsSteering };
@@ -325,10 +348,10 @@ test('eval shapes: resolved reports the previewed value; suspended lists pending
   const micro = await broker.eval('await Promise.all([1, 2]).then(([a, b]) => a + b)');
   assert.equal(micro.result, '3');
 
-  // Object completion values preview per FORMAT.md (nested values are
-  // property-level tokens, never expanded).
+  // Object completion values render the §4.4 depth-limited repr
+  // (nested collections expand to depth 2; deeper levels collapse).
   const obj = await broker.eval('({ sections: [{ title: "Auth flow" }], n: 3 })');
-  assert.equal(obj.result, '{sections: Array(1), n: 3}');
+  assert.equal(obj.result, '{sections: [{…}], n: 3}');
 
   // Rejected: the error renders as an error-level line; result is absent.
   const rejected = await broker.eval('throw new Error("boom")');
@@ -349,7 +372,7 @@ test('eval shapes: resolved reports the previewed value; suspended lists pending
 
   // Started-not-awaited handles list their pending id too.
   const started = await broker.eval('const second = agent("pi/x", "other"); "ok"');
-  assert.equal(started.result, '"ok"');
+  assert.equal(started.result, 'ok');
   assert.deepEqual(started.pending, ['c1', 'c2']);
 
   // Settle both; the suspended eval's continuation runs at settlement.
@@ -372,7 +395,7 @@ test('a suspended eval continues at settlement like a .then: its output lands in
   await broker.pump();
   const r2 = await broker.eval('"probe"');
   assert.ok(
-    output(r2).some((line) => line.includes('"hello"')) && output(r2).some((line) => line.includes('got')),
+    output(r2).some((line) => line === 'got hello'),
     `continuation output: ${output(r2).join('\n')}`,
   );
   await ws.dispose();
@@ -393,7 +416,6 @@ test('a late uncaught rejection of a suspended eval surfaces as an error-level c
   const errorLines = output(r2).filter((line) => line.startsWith('error: '));
   assert.equal(errorLines.length, 1, `one error line, got: ${output(r2)}`);
   assert.ok(errorLines[0].includes('Error: research failed'), errorLines[0]);
-  assert.ok(errorLines[0].includes('[$1 · error ·'), errorLines[0]);
   await ws.dispose();
 });
 
@@ -401,28 +423,80 @@ test('a late uncaught rejection of a suspended eval surfaces as an error-level c
 // Agent options and result shaping
 // ────────────────────────────────────────────────────────────────────────
 
-test('agent options: the guest option bag maps onto the runner (cwd default, label, runId, keepSession, retainSessionLog)', async () => {
+test('agent options: the §4.1 option bag (schema, cwd, configOptions, mode) maps onto the runner (cwd default, label, runId, keepSession, retainSessionLog)', async () => {
   const { ws, broker, runner } = await setup();
-  await dispatchAgent(broker, runner, 'const pi = agent("pi/deepseek-v4-flash-max", "research X", { configOptions: { thinking: true }, label: "my label" }); "ok"');
+  await dispatchAgent(
+    broker,
+    runner,
+    'const pi = agent("pi/deepseek-v4-flash-max", "research X", { configOptions: { thinking: true }, cwd: "/tmp/elsewhere", mode: "read-only" }); "ok"',
+  );
   const opened = runner.openedWith[0];
   assert.equal(opened.model, 'pi/deepseek-v4-flash-max');
-  assert.equal(opened.cwd, PROJECT, 'cwd defaults to the workspace project dir');
+  assert.equal(opened.cwd, '/tmp/elsewhere');
   assert.deepEqual(opened.configOptions, { thinking: true });
-  assert.equal(opened.label, 'my label');
+  assert.equal(opened.mode, 'read-only');
+  assert.equal(opened.label, 'repl:c1', 'the label is broker-owned (no guest label key)');
   assert.equal(opened.runId, 'c1');
   assert.equal(opened.keepSession, true);
   assert.equal(opened.retainSessionLog, true);
   await ws.dispose();
 });
 
-test('agent options: a relative cwd and unknown keys refuse the call with recoverable: false', async () => {
+test('agent options: a relative cwd and unknown keys refuse the call with recoverable: false; the unknown-key error ENUMERATES the valid keys', async () => {
   const { ws, broker } = await setup();
   const r1 = await broker.eval('await agent("pi/x", "t", { cwd: "relative" }).catch(e => e.code + "/" + e.recoverable)');
-  assert.equal(r1.result, '"SCRIPT_VALIDATION_ERROR/false"');
-  const r2 = await broker.eval('await agent("pi/x", "t", { bogus: 1 }).catch(e => e.code)');
-  assert.equal(r2.result, '"SCRIPT_VALIDATION_ERROR"');
-  const r3 = await broker.eval('await agent("pi/x", "t", { schema: 42 }).catch(e => e.code)');
-  assert.equal(r3.result, '"SCRIPT_VALIDATION_ERROR"');
+  assert.equal(r1.result, 'SCRIPT_VALIDATION_ERROR/false');
+  const r2 = await broker.eval('await agent("pi/x", "t", { bogus: 1 }).catch(e => e.code + "|" + e.message)');
+  assert.equal(r2.result, 'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)');
+  const r3 = await broker.eval('await agent("pi/x", "t", { label: "nope" }).catch(e => e.code)');
+  assert.equal(r3.result, 'SCRIPT_VALIDATION_ERROR', 'the deleted label/meta/promptMeta/tier/toolNames keys are unknown options');
+  const r4 = await broker.eval('await agent("pi/x", "t", { schema: 42 }).catch(e => e.code)');
+  assert.equal(r4.result, 'SCRIPT_VALIDATION_ERROR');
+  await ws.dispose();
+});
+
+test('§4.1 admission validation: an unknown backend segment rejects SYNCHRONOUSLY, naming the segment and enumerating the known backends — never a silent route to the default backend', async () => {
+  const runner = new FakeRunner();
+  runner.extraBackends = ['browser'];
+  const { ws, broker } = await setup({ runner });
+  const unknown = await broker.eval('await agent("watson/deep-v4", "t").catch(e => e.message)');
+  assert.equal(
+    unknown.result,
+    'unknown backend "watson" in model spec "watson/deep-v4" (known backends: browser, claude, codex, opencode, pi)',
+  );
+  assert.equal(runner.sessions.length, 0, 'nothing was spawned');
+  // A registered custom backend joins the known vocabulary.
+  const custom = await broker.eval('await agent("browser/x", "t").catch(e => e.message)');
+  assert.equal(custom.result, undefined);
+  await tick();
+  assert.equal(runner.sessions.length, 1, 'the custom backend dispatched');
+  await ws.dispose();
+});
+
+test('§4.1 admission validation: configOptions keys validate against the resolved backend\'s known vocabulary where it is knowable; the [C]5 fallback names the offending key when the vocabulary is dynamic', async () => {
+  const { ws, broker, runner } = await setup();
+  // Knowable vocabulary (the runner seam publishes it): a typo'd key
+  // fails in milliseconds, naming the key and the valid alternatives.
+  runner.staticConfigOptions = { pi: ['thinkingLevel', 'effort'] };
+  const typo = await broker.eval('await agent("pi/x", "t", { configOptions: { thinkinglevel: "high" } }).catch(e => e.message)');
+  assert.equal(
+    typo.result,
+    'configOptions: unknown option "thinkinglevel" for backend "pi" (known options: thinkingLevel, effort)',
+  );
+  assert.equal(runner.sessions.length, 0, 'nothing was spawned');
+  // Dynamic vocabulary (the seam returns undefined): admitted, and the
+  // late failure names the offending key.
+  runner.staticConfigOptions = {};
+  runner.failConfigKeys = new Set(['thinkinglevel']);
+  const late = await broker.eval('const p = await agent("pi/x", "t", { configOptions: { thinkinglevel: "high" } }).catch(e => e.name + ": " + e.message); console.log("got", p); "done"');
+  assert.equal(late.result, undefined, 'the late rejection arrives after the eval suspended');
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  assert.ok(
+    output(probe).some((line) => line === 'got ConfigOptionsError: backend pi rejected the call\'s configOptions — offending key "thinkinglevel" (backend error: invalid config option)'),
+    output(probe).join('\n'),
+  );
   await ws.dispose();
 });
 
@@ -431,7 +505,7 @@ test('the structured-output schema is validated by acp-agents\' own ladder (pars
   const started = await broker.eval(
     'const p = agent("pi/x", "research", { schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] } }); "started"',
   );
-  assert.equal(started.result, '"started"');
+  assert.equal(started.result, 'started');
   await tick();
   // The worker's final message is JSON: the ladder's native/prose
   // extraction validates it.
@@ -439,26 +513,31 @@ test('the structured-output schema is validated by acp-agents\' own ladder (pars
   await tick();
   await broker.pump();
   const got = await broker.eval('await p');
-  assert.deepEqual(got.result, '{answer: "42"}');
+  assert.deepEqual(got.result, "{answer: '42'}");
   await ws.dispose();
 });
 
 test('a schema miss re-prompts (the ladder), then rejects SCHEMA_NONCOMPLIANCE when exhausted', async () => {
   const { ws, broker, runner } = await setup();
   await broker.eval(
-    'const p = agent("pi/x", "research", { schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] }, maxSchemaRetries: 1 }); "started"',
+    'const p = agent("pi/x", "research", { schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] } }); "started"',
   );
   await tick();
   const session = runner.last();
-  // First turn: unparseable prose — the ladder re-prompts (max 1 retry).
+  // First turn: unparseable prose — the ladder re-prompts (the default
+  // 2 retries; the guest-visible maxSchemaRetries key is deleted with
+  // the §4.1 option narrowing).
   session.completeTurn('let me think about this...');
   await tick();
   assert.equal(session.prompts.length, 1, 'one repair turn was sent');
   session.completeTurn('still not json');
   await tick();
+  assert.equal(session.texts.length, 3, 'two repair turns total (the default budget)');
+  session.completeTurn('still not json either');
+  await tick();
   await broker.pump();
   const r = await broker.eval('await p.catch(e => e.code + "/" + e.recoverable)');
-  assert.equal(r.result, '"SCHEMA_NONCOMPLIANCE/false"');
+  assert.equal(r.result, 'SCHEMA_NONCOMPLIANCE/false');
   await ws.dispose();
 });
 
@@ -470,7 +549,7 @@ test('an empty worker result rejects with the recoverable AGENT_EMPTY_OUTPUT', a
   await tick();
   await broker.pump();
   const r = await broker.eval('await p.catch(e => e.code + "/" + e.recoverable)');
-  assert.equal(r.result, '"AGENT_EMPTY_OUTPUT/true"');
+  assert.equal(r.result, 'AGENT_EMPTY_OUTPUT/true');
   await ws.dispose();
 });
 
@@ -481,7 +560,7 @@ test('an empty worker result rejects with the recoverable AGENT_EMPTY_OUTPUT', a
 test('exactly-once settlement: a crash between the store write and the guest settlement is healed by the next pump (record→settle→consume, both first-wins)', async () => {
   const { ws, broker, runner } = await setup();
   const r1 = await broker.eval('const p = agent("pi/x", "task"); p.then((v) => console.log("settled:", v)); "started"');
-  assert.equal(r1.result, '"started"');
+  assert.equal(r1.result, 'started');
   await tick();
   runner.last().completeTurn('final');
   await tick();
@@ -496,13 +575,10 @@ test('exactly-once settlement: a crash between the store write and the guest set
   const pumped = await broker.pump();
   assert.deepEqual(pumped, ['c1']);
   const r2 = await broker.eval('await p');
-  assert.equal(r2.result, '"final"');
-  // The continuation fired exactly once (console.log(arg1, arg2) renders
-  // one line per argument).
-  const settledMarkers = output(r2).filter((line) => line.includes('settled:'));
-  const finalLines = output(r2).filter((line) => line.includes('"final"'));
+  assert.equal(r2.result, 'final');
+  // The continuation fired exactly once (one joined line per call).
+  const settledMarkers = output(r2).filter((line) => line === 'settled: final');
   assert.equal(settledMarkers.length, 1, output(r2).join('\n'));
-  assert.equal(finalLines.length, 1, output(r2).join('\n'));
   // The guest is idempotent: a second settlement of c1 is a no-op.
   assert.equal(broker.workspace.surface()!.settle('c1', 'resolve', 'again'), false);
   // The store kept the FIRST completion.
@@ -515,7 +591,7 @@ test('exactly-once settlement across a crash: the snapshot\'s registry is reconc
   const storePath = join(dir, 'calls.jsonl');
   const { ws, broker, runner } = await setup({ store: JsonlCallStore.open(storePath) });
   const r1 = await broker.eval('const p = agent("pi/x", "task"); p.then((v) => console.log("settled:", v)); "started"');
-  assert.equal(r1.result, '"started"');
+  assert.equal(r1.result, 'started');
   await tick();
   // Snapshot the live VM: the guest registry (with c1 pending) travels.
   const snapshot = ws.snapshot();
@@ -540,11 +616,9 @@ test('exactly-once settlement across a crash: the snapshot\'s registry is reconc
   assert.deepEqual(report.leftPending, []);
   // The guest continuation fired exactly once, with the stored result.
   const r2 = await broker2.eval('"probe"');
-  const settledLines = output(r2).filter((line) => line.includes('settled:'));
-  const finalLines = output(r2).filter((line) => line.includes('"final"'));
+  const settledLines = output(r2).filter((line) => line === 'settled: final');
   assert.equal(settledLines.length, 1, output(r2).join('\n'));
-  assert.equal(finalLines.length, 1, output(r2).join('\n'));
-  assert.equal((await broker2.eval('await p')).result, '"final"');
+  assert.equal((await broker2.eval('await p')).result, 'final');
   // A second reconcile has nothing left to settle.
   const report2 = await broker2.reconcile();
   assert.deepEqual(report2.settledFromStore, []);
@@ -558,25 +632,26 @@ test('exactly-once settlement across a crash: the snapshot\'s registry is reconc
 // Checkpoints
 // ────────────────────────────────────────────────────────────────────────
 
-test('checkpoint round trip: raised → previewed question in the tool result → answered in a later eval → settlement within that eval', async () => {
+test('checkpoint round trip: raised → the §4.3 output line (PLAIN question, the double-quote fix) → answered in a later eval → settlement within that eval', async () => {
   const { ws, broker } = await setup();
   const raised = await broker.eval('const q = checkpoint("What color?"); "raised"');
-  assert.deepEqual(raised.checkpoints, [{ id: 'c1', question: '"What color?"' }]);
+  assert.deepEqual(raised.checkpoints, [{ id: 'c1', question: 'What color?' }], 'the question is plain head+tail metadata text — never a double-JSON-quoted form');
   assert.deepEqual(raised.pending, ['c1']);
+  assert.ok(output(raised).some((line) => line === 'checkpoint c1: What color?'), output(raised).join('\n'));
   // The question crosses previewed/truncated — never verbatim and
-  // unbounded (the top-level string rule: quoted, elided past 200 chars).
+  // unbounded (the retained 200-char metadata preview, §7).
   const longQ = await broker.eval('const q2 = checkpoint("a".repeat(300)); "raised"');
   assert.equal(longQ.checkpoints.length, 2);
   const longQuestion = longQ.checkpoints[1].question;
-  assert.ok(longQuestion.startsWith('"'), longQuestion);
+  assert.ok(longQuestion.startsWith('a'.repeat(120)), longQuestion);
   assert.ok(longQuestion.includes('chars elided'), longQuestion);
   assert.ok(!longQuestion.includes('a'.repeat(200)), 'the verbatim question never crosses unbounded');
   // The continuation rides the answer's own eval drain.
   const answered = await broker.eval('checkpoint.answer("c1", "blue"); "delivered"');
-  assert.equal(answered.result, '"delivered"');
+  assert.equal(answered.result, 'delivered');
   assert.deepEqual(answered.checkpoints, [{ id: 'c2', question: longQuestion }]);
   const r = await broker.eval('await q');
-  assert.equal(r.result, '"blue"');
+  assert.equal(r.result, 'blue');
   // The answer was recorded in the store BEFORE the settlement (the
   // exactly-once discipline applies to answers too).
   assert.equal(broker.store().lookup('c1')!.completion!.value, 'blue');
@@ -607,8 +682,7 @@ test('steering with the _session/steering extension: a turn in flight gets live 
   await tick();
   await broker.pump();
   const r = await broker.eval('"probe"');
-  assert.ok(output(r).some((line) => line.includes('"injected"')), output(r).join('\n'));
-  assert.ok(output(r).some((line) => line.includes('steer-outcome')), output(r).join('\n'));
+  assert.ok(output(r).some((line) => line === 'steer-outcome injected'), output(r).join('\n'));
   await ws.dispose();
 });
 
@@ -619,7 +693,7 @@ test('steering WITHOUT the extension: a turn in flight queues for next-turn deli
   // No wire call, no suspension: the honest immediate outcome is
   // "queued" — accepted for next-turn delivery.
   const queued = await broker.eval('const o = await pi.steer("go deeper"); "outcome:" + o');
-  assert.equal(queued.result, '"outcome:queued"');
+  assert.equal(queued.result, 'outcome:queued');
   assert.deepEqual(queued.completed, ['c2'], 'the queued steer settled synchronously');
   await tick();
   assert.equal(runner.last().steers.length, 0, 'no _session/steering wire call');
@@ -633,41 +707,59 @@ test('steering WITHOUT the extension: a turn in flight queues for next-turn deli
   await ws.dispose();
 });
 
-test('steering an idle session starts a new turn (startedNewTurn) with and without the extension', async () => {
+test('§4.2: followUp/steer on an idle session mint a NEW turn with its own call id and resolve with the TURN\'S ANSWER (never the startedNewTurn token) — with and without the extension', async () => {
   const { ws, broker, runner } = await setup();
   await dispatchAgent(broker, runner);
   runner.last().completeTurn('done');
   await tick();
   await broker.pump();
   // Idle + extension backend.
-  const withExt = await broker.eval('const o = await pi.steer("more"); "outcome:" + o');
+  const withExt = await broker.eval('const o = await pi.steer("more"); console.log("outcome", o); "done"');
   assert.equal(withExt.result, undefined, 'a new turn is in flight — the steer suspends until it settles');
   await tick();
+  assert.equal(runner.last().prompts.length, 1, 'the followUp turn is in flight');
+  assert.equal(runner.last().prompts[0].content, 'more');
+  // The turn is ADDRESSABLE: it carries its own call id, listed in
+  // agents() while running.
+  const liveAgents = broker.liveAgents();
+  assert.ok(liveAgents.some((a) => a.callId === 'c2' && a.state === 'running'), `liveAgents: ${JSON.stringify(liveAgents)}`);
   runner.last().completeTurn('more results');
   await tick();
   await broker.pump();
-  // The steer settled with what actually happened: a new turn started.
+  // The steer settled with the TURN'S ANSWER — never the bare
+  // 'startedNewTurn' token, never a discarded turn.
   const steerRecord1 = broker.store().all().find((r) => r.kind === 'steer')!;
-  assert.equal(steerRecord1.completion!.value, 'startedNewTurn');
-  assert.equal(steerRecord1.detail, 'steer');
-  // Idle + no-extension backend: same mechanism (a fresh session, the
-  // capability is negotiated at open).
-  runner.supportsSteering = false;
-  await broker.eval('const pi2 = agent("pi/x", "second"); "ok"');
+  assert.equal(steerRecord1.completion!.value, 'more results');
+  const probe1 = await broker.eval('"probe"');
+  assert.ok(output(probe1).some((line) => line === 'outcome more results'), output(probe1).join('\n'));
+  // followUp and steer are aliases on idle sessions (the §4.2 [C]6
+  // alias): followUp gets the same answer semantics.
+  const alias = await broker.eval('const o2 = await pi.followUp("even more"); console.log("outcome", o2); "done"');
+  assert.equal(alias.result, undefined);
   await tick();
-  const noExtSession = runner.last();
-  noExtSession.completeTurn('second done');
-  await tick();
-  await broker.pump();
-  const noExt = await broker.eval('const o2 = await pi2.steer("even more"); "outcome:" + o2');
-  assert.equal(noExt.result, undefined);
-  await tick();
-  noExtSession.completeTurn('even more results');
+  runner.last().completeTurn('even more results');
   await tick();
   await broker.pump();
   const steerRecords = broker.store().all().filter((r) => r.kind === 'steer');
   assert.equal(steerRecords.length, 2);
-  assert.equal(steerRecords[1].completion!.value, 'startedNewTurn');
+  assert.equal(steerRecords[1].completion!.value, 'even more results');
+  await ws.dispose();
+});
+
+test('§4.2: a failed followUp turn rejects the steer call with the attributed error (call id + resolved backend)', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  const evaled = await broker.eval('const o = await pi.followUp("do more").catch(e => e.message + "|" + e.replCallId + "|" + e.replBackend); console.log("got", o); "done"');
+  assert.equal(evaled.result, undefined, 'the followUp suspends until its turn settles');
+  await tick();
+  runner.last().failTurn(new Error('backend exploded'));
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).some((line) => line === 'got backend exploded|c2|pi'), output(probe).join('\n'));
   await ws.dispose();
 });
 
@@ -680,15 +772,14 @@ test('steering wire failures resolve "failed" — nothing hard-errors', async ()
   await tick();
   await broker.pump();
   const r = await broker.eval('"probe"');
-  assert.ok(output(r).some((line) => line.includes('"failed"')), output(r).join('\n'));
-  assert.ok(output(r).some((line) => line.includes('steer-outcome')), output(r).join('\n'));
+  assert.ok(output(r).some((line) => line === 'steer-outcome failed'), output(r).join('\n'));
   await ws.dispose();
 });
 
 test('a steer in the same eval as the dispatch (the call is still opening) queues for next-turn delivery', async () => {
   const { ws, broker, runner } = await setup();
   const r = await broker.eval('const pi = agent("pi/x", "task"); const o = await pi.steer("same eval"); "outcome:" + o');
-  assert.equal(r.result, '"outcome:queued"', 'the steer queued while the session was still opening');
+  assert.equal(r.result, 'outcome:queued', 'the steer queued while the session was still opening');
   await tick();
   assert.equal(runner.last().prompts.length, 1, 'only the initial turn is in flight');
   runner.last().completeTurn('first pass');
@@ -709,8 +800,7 @@ test('cancel with a turn in flight: the handle resolves "cancelled" and the canc
   assert.equal(runner.last().cancelled, 1, 'ACP session/cancel went out');
   await broker.pump();
   const r = await broker.eval('"probe"');
-  assert.ok(output(r).some((line) => line.includes('"cancelled"')), output(r).join('\n'));
-  assert.ok(output(r).some((line) => line.includes('cancel-outcome')), output(r).join('\n'));
+  assert.ok(output(r).some((line) => line === 'cancel-outcome cancelled'), output(r).join('\n'));
   // The call itself rejects with the machine-readable cancellation —
   // and the rejection is RECOVERABLE (review regression: it used to be
   // recoverable: false, which the guest combinators treat as a halt
@@ -718,10 +808,10 @@ test('cancel with a turn in flight: the handle resolves "cancelled" and the canc
   // parallel()/pipeline()). One call's cancellation must never abort
   // the orchestration owning it.
   const call = await broker.eval('await pi.catch((e) => e.code + "/" + e.recoverable)');
-  assert.equal(call.result, '"AGENT_CANCELLED/true"');
+  assert.equal(call.result, 'AGENT_CANCELLED/true');
   assert.equal(runner.last().cancelled, 1, 'a second cancel of the idle session is a no-op');
   const idle = await broker.eval('await pi.cancel()');
-  assert.equal(idle.result, '"idle"');
+  assert.equal(idle.result, 'idle');
   await ws.dispose();
 });
 
@@ -751,29 +841,52 @@ test('a queued delivery turn that fails surfaces a warn line in the next tool re
 // Concurrency cap
 // ────────────────────────────────────────────────────────────────────────
 
-test('the concurrency cap refuses over-cap dispatches at dispatch time (recoverable) and releases the slot on settlement', async () => {
+test('§4.1: dispatches above the concurrency cap QUEUE in dispatch order for the next free slot — never a rejection', async () => {
   const { ws, broker, runner } = await setup({ maxConcurrentAgents: 2 });
-  // Two calls admitted; the third is refused synchronously — recorded in
-  // the store (never re-issued after a restore) and rejected recoverably.
-  const refused = await broker.eval(
-    'const a = agent("pi/x", "a"); const b = agent("pi/x", "b"); await agent("pi/x", "c").catch((e) => e.name + "/" + e.recoverable)',
-  );
-  assert.equal(refused.result, '"ConcurrencyLimitError/true"');
+  // Two calls admitted; the third and fourth QUEUE (their guest
+  // promises stay pending — the natural `parallel(items.map(...))`
+  // idiom never loses work).
+  const queued = await broker.eval('const a = agent("pi/x", "a"); const b = agent("pi/x", "b"); const c = agent("pi/x", "c"); const d = agent("pi/x", "d"); "started"');
+  assert.equal(queued.result, 'started');
   assert.equal(runner.sessions.length, 2, 'only two sessions were opened');
-  assert.equal(broker.store().lookup('c3')!.completion!.outcome, 'reject');
-  assert.ok(refused.completed.includes('c3'), 'the refusal is reported in completed');
-  // The refusal was recorded BEFORE the rejection — a restore can never
-  // re-issue it.
-  assert.ok(broker.store().lookup('c3')!.completion !== null);
-  // Settle one call: its slot is released, a new dispatch is admitted.
+  assert.deepEqual(queued.pending, ['c1', 'c2', 'c3', 'c4'], 'the queued dispatches stay pending in dispatch order');
+  assert.equal(broker.store().lookup('c3'), undefined, 'queued dispatches get their store record at dispatch time — nothing was refused');
+  // Settle c1: its slot frees and the QUEUE head (c3) dispatches first.
   await tick();
   runner.sessions[0].completeTurn('a done');
   await tick();
   await broker.pump();
-  const admitted = await broker.eval('const d = agent("pi/x", "d"); "ok"');
-  assert.equal(admitted.result, '"ok"');
   await tick();
-  assert.equal(runner.sessions.length, 3);
+  assert.equal(runner.sessions.length, 3, 'the queue head dispatched');
+  assert.equal(runner.sessions[2].openedWith.model, 'pi/x');
+  assert.equal(runner.sessions[2].texts[0], 'c', 'dispatch order preserved');
+  // Settle c2: c4 dispatches next (FIFO).
+  runner.sessions[1].completeTurn('b done');
+  await tick();
+  await broker.pump();
+  await tick();
+  assert.equal(runner.sessions.length, 4);
+  assert.equal(runner.sessions[3].texts[0], 'd');
+  // All four resolve with their answers.
+  runner.sessions[2].completeTurn('c done');
+  runner.sessions[3].completeTurn('d done');
+  await tick();
+  await broker.pump();
+  const got = await broker.eval('[await a, await b, await c, await d].join(",")');
+  assert.equal(got.result, 'a done,b done,c done,d done');
+  await ws.dispose();
+});
+
+test('§4.2: the interrupt cancels a QUEUED dispatch by its addressable id (AGENT_CANCELLED, recorded durably)', async () => {
+  const { ws, broker, runner } = await setup({ maxConcurrentAgents: 1 });
+  await broker.eval('const a = agent("pi/x", "a"); const b = agent("pi/x", "b"); "started"');
+  assert.deepEqual(broker.workspace.surface()!.pending().map((e) => e.id), ['c1', 'c2']);
+  const outcome = await broker.cancelCall('c2');
+  assert.equal(outcome, 'cancelled');
+  const r = await broker.eval('await b.catch((e) => e.code + "/" + e.recoverable)');
+  assert.equal(r.result, 'AGENT_CANCELLED/true');
+  assert.equal(broker.store().lookup('c2')!.completion!.outcome, 'reject');
+  assert.equal(runner.sessions.length, 1, 'the queued call never dispatched');
   await ws.dispose();
 });
 
@@ -781,12 +894,12 @@ test('the concurrency cap refuses over-cap dispatches at dispatch time (recovera
 // Rendering
 // ────────────────────────────────────────────────────────────────────────
 
-test('trap-free result rendering: accessor properties render as (...) and never fire; Object.prototype.value pollution cannot hijack the result', async () => {
+test('trap-free result rendering: accessor properties render as (…) and never fire; Object.prototype.value pollution cannot hijack the result', async () => {
   const { ws, broker } = await setup();
   // An accessor-valued completion renders the accessor marker — the
   // getter never runs.
   const accessor = await broker.eval('let fires = 0; const o = { get x() { fires++; return 1; } }; o');
-  assert.equal(accessor.result, '{x: (...)}');
+  assert.equal(accessor.result, '{x: (…)}');
   assert.equal((await broker.eval('fires')).result, '0');
   // The R69 regression shape: a `value` getter on Object.prototype must
   // not fabricate or hijack the completion preview.
@@ -799,21 +912,19 @@ test('trap-free result rendering: accessor properties render as (...) and never 
   await ws.dispose();
 });
 
-test('output lines are preview lines (one per logged argument, levels prefixed) and the caps truncate a large output with outputTruncated', async () => {
+test('output lines are the §4.4 one-line reprs (one joined line per console.* call, levels prefixed); §7: NO output caps — a large output ships whole', async () => {
   const { ws, broker } = await setup();
   const r = await broker.eval('console.log({ a: 1 }, "text"); console.error("boom"); "done"');
-  assert.match(output(r)[0], /^\[\$1 · object · \d+B\] \{a: 1\}$/);
-  assert.equal(output(r)[1], '[$2 · string · 4B] "text"');
-  assert.equal(output(r)[2], 'error: [$3 · string · 4B] "boom"');
+  assert.equal(output(r)[0], '{a: 1} text');
+  assert.equal(output(r)[1], 'error: boom');
   assert.equal(r.outputTruncated, false);
-  // Enough console.log calls (2 refs each → 2 preview lines) to exceed the
-  // output caps; the byte cap dominates for headered preview lines.
+  // §7: the engine applies NO caps to guest output — the Python
+  // posture (an agent CAN flood its own context). A 3000-line flood
+  // ships verbatim with outputTruncated always false.
   const big = await broker.eval('for (let i = 0; i < 3000; i++) console.log("line", i); "done"');
-  assert.equal(big.outputTruncated, true);
-  assert.ok(big.output.length < 6000, 'the caps dropped the tail');
-  assert.ok(big.output.length <= OUTPUT_MAX_LINES, 'the kept lines are within the line cap');
-  // The truncated content stays reachable through $N.
-  assert.ok(output(big).some((line) => line.startsWith('[$')) );
+  assert.equal(big.outputTruncated, false);
+  assert.equal(big.output.length, 3000);
+  assert.equal(output(big)[2999], 'line 2999');
   await ws.dispose();
 });
 
@@ -833,13 +944,13 @@ test('review 1: the store\'s FIRST completion is authoritative — a newer live 
   const pumped = await broker.pump();
   assert.deepEqual(pumped, ['c1']);
   const r = await broker.eval('await p');
-  assert.equal(r.result, '"stored-first"');
+  assert.equal(r.result, 'stored-first');
   assert.equal(broker.store().lookup('c1')!.completion!.value, 'stored-first');
   assert.equal(broker.store().lookup('c1')!.completion!.outcome, 'resolve');
   await ws.dispose();
 });
 
-test('review 1b: the cap is absolute for follow-up turns — an idle-session steer under cap pressure queues (queued) and starts only when a slot frees', async () => {
+test('review 1b: the cap is absolute for follow-up turns — an idle-session steer under cap pressure QUEUES with the §4.2 answer semantics and starts only when a slot frees', async () => {
   const { ws, broker, runner } = await setup({ maxConcurrentAgents: 1 });
   // c1 opens and settles (idle).
   await broker.eval('const a = agent("pi/x", "a"); "started"');
@@ -861,18 +972,28 @@ test('review 1b: the cap is absolute for follow-up turns — an idle-session ste
   // in flight — the cap gates turn starts, not just dispatches (review
   // regression: idle-handle follow-ups used to start unconditionally,
   // so a cap-1 workspace ran two subagent turns concurrently). The
-  // honest outcome is queued.
-  const steered = await broker.eval('const o = await b.steer("more"); "outcome:" + o');
-  assert.equal(steered.result, '"outcome:queued"');
+  // steer QUEUES for the next free slot — and, per the §4.2 answer
+  // semantics, its promise stays pending until the delivery turn runs
+  // (never the bare 'queued' token for an idle-session followUp).
+  const steered = await broker.eval('const o = await b.steer("more"); console.log("outcome", o); "done"');
+  assert.equal(steered.result, undefined, 'the followUp suspends until its queued delivery runs');
+  assert.deepEqual(steered.pending, ['c3', 'c4'], 'c4 (the queued followUp) stays pending');
   await tick();
   assert.equal(bSession.prompts.length, 0, 'no follow-up turn started under cap pressure');
-  // c3 settles; its slot frees; the queued follow-up starts its turn.
+  // c3 settles; its slot frees; the queued follow-up starts its turn —
+  // and settles with the TURN'S ANSWER.
   runner.sessions[2].completeTurn('c done');
   await tick();
   await broker.pump();
   await tick();
   assert.equal(bSession.prompts.length, 1, 'the queued follow-up started once a slot freed');
   assert.equal(bSession.prompts[0].content, 'more');
+  bSession.completeTurn('more results');
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).some((line) => line === 'outcome more results'), output(probe).join('\n'));
+  assert.equal(broker.store().lookup('c4')!.completion!.value, 'more results');
   await ws.dispose();
 });
 
@@ -925,7 +1046,7 @@ test('review 2a: queued steering is durable — payload + founding session in th
   runner.supportsSteering = false;
   await dispatchAgent(broker, runner);
   const queued = await broker.eval('await pi.steer("go deeper"); "queued"');
-  assert.equal(queued.result, '"queued"');
+  assert.equal(queued.result, 'queued');
   // The payload + founding session id live in the store (crash-durable —
   // a crash before delivery loses nothing).
   const steerRecord = broker.store().all().find((r) => r.kind === 'steer')!;
@@ -962,7 +1083,7 @@ test('review 2b: a crash between enqueue and delivery loses nothing — reconcil
   const { ws, broker } = await setup({ store: JsonlCallStore.open(storePath), runner });
   runner.supportsSteering = false;
   const r1 = await broker.eval('const pi = agent("pi/x", "task"); const o = await pi.steer("go deeper"); "outcome:" + o');
-  assert.equal(r1.result, '"outcome:queued"');
+  assert.equal(r1.result, 'outcome:queued');
   await tick();
   // Simulated crash: snapshot before any settlement; dispose without
   // delivering anything. The store durably holds the queued steer.
@@ -1252,9 +1373,9 @@ test('review 3: a failing store write during checkpoint.answer leaves the checkp
   assert.equal(broker.store().lookup('c1')!.completion, null, 'nothing was recorded');
   // The retry (with the store healthy again) delivers the answer.
   const ok = await broker.eval('checkpoint.answer("c1", "blue"); "delivered"');
-  assert.equal(ok.result, '"delivered"');
+  assert.equal(ok.result, 'delivered');
   const r = await broker.eval('await q');
-  assert.equal(r.result, '"blue"');
+  assert.equal(r.result, 'blue');
   assert.equal(broker.store().lookup('c1')!.completion!.value, 'blue');
   await ws.dispose();
 });
@@ -1286,14 +1407,20 @@ test('review 5: the concurrency cap validates — default 6, over-ceiling clamps
       new RegExp('maxConcurrentAgents must be an integer'),
     );
   }
-  // At the ceiling: six sessions open, the seventh dispatch is refused.
+  // At the ceiling: six sessions open, the seventh dispatch QUEUES for
+  // the next free slot (the §4.1 rule — never a rejection).
   const { ws: ws3, broker: broker3, runner: runner3 } = await setup();
   const r = await broker3.eval('for (let i = 0; i < 7; i++) agent("pi/x", "t" + i); "started"');
-  assert.equal(r.result, '"started"');
+  assert.equal(r.result, 'started');
   await tick();
-  assert.equal(runner3.sessions.length, 6, 'six sessions opened — never seven');
-  assert.equal(broker3.store().lookup('c7')!.completion!.outcome, 'reject');
-  assert.ok(r.completed.includes('c7'), 'the refusal is reported in completed');
+  assert.equal(runner3.sessions.length, 6, 'six sessions opened — never seven at once');
+  assert.deepEqual(r.pending.length, 7, 'the seventh stays pending (queued)');
+  // Settle one: the queued seventh dispatches.
+  runner3.sessions[0].completeTurn('done');
+  await tick();
+  await broker3.pump();
+  await tick();
+  assert.equal(runner3.sessions.length, 7, 'the queued dispatch started once a slot freed');
   await ws3.dispose();
 });
 
@@ -1308,7 +1435,7 @@ test('review 6: an agent call whose session never opens releases its concurrency
   const r = await broker.eval('await p.catch((e) => e.message)');
   assert.ok(String(r.result).includes('spawn failed'), String(r.result));
   const admitted = await broker.eval('const p2 = agent("pi/x", "ok"); "started"');
-  assert.equal(admitted.result, '"started"', 'the second dispatch was admitted after the failed open');
+  assert.equal(admitted.result, 'started', 'the second dispatch was admitted after the failed open');
   await tick();
   assert.equal(runner.sessions.length, 1);
   await ws.dispose();
@@ -1319,7 +1446,7 @@ test('review 7: same-eval steers of a call whose session never opens are dropped
   const { ws, broker } = await setup({ runner });
   runner.failNextOpens = 1;
   const r1 = await broker.eval('const pi = agent("pi/x", "task"); const o = await pi.steer("same eval"); "outcome:" + o');
-  assert.equal(r1.result, '"outcome:queued"');
+  assert.equal(r1.result, 'outcome:queued');
   await tick(); // open fails; the pending steers are dropped + warned
   await broker.pump();
   const r2 = await broker.eval('"probe"');
@@ -1400,7 +1527,7 @@ test('review 9: the guest "default" model sentinel maps to an OMITTED model — 
   await tick();
   await broker.pump();
   const v = await broker.eval('await v');
-  assert.equal(v.result, '{real: true, realCount: 2, total: 2, votes: Array(2)}');
+  assert.equal(v.result, '{real: true, realCount: 2, total: 2, votes: [{…}, {…}]}');
   // judgePanel() graders route the same way.
   await broker.eval('const jp = judgePanel(["a", "b"], { judges: 2 }); "started"');
   await tick();
@@ -1433,5 +1560,155 @@ test('review round 3: the eval result\'s pending list reports the WHOLE guest re
   assert.equal(r.pending[299], 'c300');
   assert.ok(r.pending.every((id, index) => id === `c${index + 1}`), 'dense, in registry order, no holes');
   assert.equal(r.pending.length, r.checkpoints.length);
+  await ws.dispose();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// The eval-plane redesign surface (§4.4 `_`, §4.5 workspace()/agents()/
+// reset(), §4.6 error rendering, §4.7 sleep)
+// ────────────────────────────────────────────────────────────────────────
+
+test('§4.4: `_` holds the previous eval\'s completion value (IPython-style) — the sole result-history global; an error leaves it unchanged', async () => {
+  const { ws, broker } = await setup();
+  await broker.eval('1 + 1');
+  const second = await broker.eval('_ * 10');
+  assert.equal(second.result, '20');
+  // `_` advances with every resolved eval (IPython semantics).
+  const third = await broker.eval('({ tagged: _ })');
+  assert.equal(third.result, '{tagged: 20}');
+  // An error does not move `_` (IPython behavior).
+  await broker.eval('throw new Error("no")');
+  const afterError = await broker.eval('_');
+  assert.equal(afterError.result, '{tagged: 20}', 'the failed eval left `_` unchanged');
+  // `_` is an ordinary writable global: bindings are the memory.
+  await broker.eval('_ = "mine"');
+  assert.equal((await broker.eval('_')).result, 'mine');
+  await ws.dispose();
+});
+
+test('§4.6: an uncaught eval error renders name + message + the guest stack\'s top frames with line numbers in the submitted code', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('const boom = () => { throw new TypeError("bad shape"); };\nboom();');
+  assert.equal(r.result, undefined);
+  const line = output(r).find((l) => l.startsWith('TypeError'));
+  assert.ok(line !== undefined, output(r).join('\n'));
+  assert.ok(line.includes('TypeError: bad shape'), line);
+  // The stack's top frames carry LINE NUMBERS in the submitted code
+  // (the eval's filename is the VM default `<repl>`).
+  assert.match(line, /at boom \(<repl>:1:\d+\)/, line);
+  assert.match(line, /<repl>:2:\d+/, line);
+  await ws.dispose();
+});
+
+test('§4.6: an uncaught error from a subagent call names the call id and the resolved backend', async () => {
+  const { ws, broker, runner } = await setup();
+  // Await a call that rejects; the rejection is uncaught in the eval.
+  const r = await broker.eval('await agent("pi/x", "research"); "never"');
+  assert.equal(r.result, undefined);
+  await tick();
+  runner.last().failTurn(new Error('research failed'));
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  const line = output(probe).find((l) => l.includes('Error: research failed'));
+  assert.ok(line !== undefined, output(probe).join('\n'));
+  assert.ok(line.includes('(call c1 on backend pi)'), line);
+  await ws.dispose();
+});
+
+test('§4.7: sleep(ms) is a guest helper over a HOST-side timer — the eval suspends and its continuation resumes at the next settlement drain', async () => {
+  const { ws, broker } = await setup();
+  const started = Date.now();
+  const r = await broker.eval('const t0 = Date.now(); await sleep(30); console.log("elapsed", Date.now() - t0); "slept"');
+  assert.equal(r.result, undefined, 'the eval suspended on the sleep');
+  // The host timer settles within the window; the pump drains the
+  // continuation.
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  const line = output(probe).find((l) => l.startsWith('elapsed'));
+  assert.ok(line !== undefined, output(probe).join('\n'));
+  const elapsed = Number(/elapsed (\d+)/.exec(line)![1]);
+  assert.ok(elapsed >= 20 && elapsed < 5000, `elapsed ${elapsed}`);
+  assert.ok(Date.now() - started >= 20, 'wall clock advanced');
+  await ws.dispose();
+});
+
+test('§4.5: workspace() returns the plain-value shape with the honest failed status; agents() lists live agents incl. addressable followUp turns', async () => {
+  const { ws, broker, runner } = await setup();
+  // c1 fails; c2 succeeds. Both are agent-handle bindings.
+  await broker.eval('const boom = agent("pi/x", "boom"); const ok = agent("pi/x", "ok"); "started"');
+  await tick();
+  runner.sessions[0].failTurn(new Error('nope'));
+  await tick();
+  await broker.pump();
+  runner.sessions[1].completeTurn('fine');
+  await tick();
+  await broker.pump();
+  const w = await broker.eval('const w = workspace(); w.bindings.filter((b) => b.name === "boom" || b.name === "ok").map((b) => b.name + ":" + (b.status ?? "-")).join(",")');
+  assert.equal(w.result, 'boom:failed,ok:settled', 'the honest failed status for the rejected handle call');
+  const shape = await broker.eval('(() => { const w = workspace(); return JSON.stringify({ keys: Object.keys(w).sort(), diag: Object.keys(w.diagnostics).sort(), empty: w.inFlight.length === 0 }); })()');
+  assert.deepEqual(JSON.parse(shape.result!), { keys: ['bindings', 'checkpoints', 'diagnostics', 'inFlight'], diag: ['childrenClosed', 'drainError', 'reconcile'], empty: true });
+  // agents(): a followUp turn gets its own addressable entry.
+  await broker.eval('const o = await ok.followUp("more"); console.log("followup", o); "done"');
+  await tick();
+  const a = await broker.eval('const a = agents(); a.filter((x) => x.callId === "c3").map((x) => x.state + "|" + x.task)[0]');
+  assert.equal(a.result, 'running|more');
+  runner.sessions[1].completeTurn('the answer');
+  await tick();
+  await broker.pump();
+  const after = await broker.eval('"probe"');
+  assert.ok(output(after).some((l) => l === 'followup the answer'), output(after).join('\n'));
+  await ws.dispose();
+});
+
+test('§4.5: reset() tears the workspace down after the current eval completes (the host-side effect the deleted reset action performed)', async () => {
+  const { ws, broker } = await setup();
+  const r = await broker.eval('console.log("bye"); reset(); "done"');
+  assert.equal(r.result, 'done');
+  assert.ok(output(r).includes('bye'), 'the eval that called reset() completed normally first');
+  // After the eval, the workspace is gone (the VM disposed).
+  assert.equal(ws.isDisposed, true, 'reset() tore the workspace down after the eval completed');
+  await assert.rejects(async () => broker.eval('1 + 1'), /disposed|alive/);
+  await ws.dispose();
+});
+
+test('§4.5: workspace().diagnostics carries the retained reconcile summary and the §6.2 demoted drain error; childrenClosed reflects the client-presence drain', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-broker-diag-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const store = JsonlCallStore.open(storePath);
+  const { ws, broker } = await setup({ store });
+  // A reconcile report is retained under diagnostics.
+  await broker.reconcile();
+  const d1 = await broker.eval('workspace().diagnostics.reconcile === null ? "null" : typeof workspace().diagnostics.reconcile');
+  assert.equal(d1.result, 'object');
+  const d2 = await broker.eval('workspace().diagnostics.drainError === null ? "null" : workspace().diagnostics.drainError.name');
+  assert.equal(d2.result, 'null', 'no drain error yet');
+  const closed = await broker.eval('workspace().diagnostics.childrenClosed');
+  assert.equal(closed.result, 'false');
+  await broker.dispose();
+  ws.dispose();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('§4.2: the interrupt targets an in-flight followUp TURN by its own call id — the turn cancels and the steer rejects recoverable', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  const evaled = await broker.eval('const o = await pi.followUp("long job").catch(e => e.code + "/" + e.recoverable); console.log("got", o); "done"');
+  assert.equal(evaled.result, undefined, 'the followUp turn is in flight');
+  await tick();
+  assert.ok(broker.liveAgents().some((a) => a.callId === 'c2' && a.state === 'running'));
+  // The interrupt (cancel by id) targets the TURN, not the founding call.
+  assert.equal(await broker.cancelCall('c2'), 'cancelled');
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).some((l) => l === 'got AGENT_CANCELLED/true'), output(probe).join('\n'));
+  // The founding call's session stays usable (idle — the founding call
+  // itself was settled long before).
+  assert.equal(await broker.cancelCall('c1'), 'idle');
   await ws.dispose();
 });

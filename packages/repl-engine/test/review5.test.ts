@@ -638,10 +638,11 @@ test('review 9/2: cancelling a still-OPENING call releases its concurrency slot 
   await tick();
   assert.equal(runner.sessions.length, 1, 'the second call is still opening');
   // The cap-pressure follow-up on the IDLE session queues with the
-  // honest `queued` outcome (a follow-up turn IS subagent work — the
-  // ceiling is absolute).
-  const queued = await broker.eval('const o = await pi.steer("go deeper"); "outcome:" + o');
-  assert.equal(queued.result, '"outcome:queued"', 'the cap-pressure follow-up queued');
+  // §4.2 ANSWER semantics (a follow-up turn IS subagent work — the
+  // ceiling is absolute; its promise stays pending until the delivery
+  // runs).
+  const queued = await broker.eval('const o = await pi.steer("go deeper"); console.log("outcome", o); "done"');
+  assert.equal(queued.result, undefined, 'the cap-pressure follow-up suspends (answer semantics)');
   assert.equal(runner.last().prompts.length, 0, 'no delivery turn can start while the cap is exhausted');
   // Cancel the OPENING call: its slot frees, and the slot-release kick
   // must start the queued follow-up as a delivery turn — the old code
@@ -651,6 +652,11 @@ test('review 9/2: cancelling a still-OPENING call releases its concurrency slot 
   await tick();
   assert.equal(runner.last().prompts.length, 1, 'the queued follow-up started as a delivery turn');
   assert.equal(runner.last().prompts[0].content, 'go deeper');
+  runner.last().completeTurn('deeper answer');
+  await tick();
+  await broker.pump();
+  const outcomeProbe = await broker.eval('"probe"');
+  assert.ok(outcomeProbe.output.some((l) => l === 'outcome deeper answer'), outcomeProbe.output.join('\n'));
   // The late landing of the cancelled open closes the child without
   // prompting.
   releaseOpen();

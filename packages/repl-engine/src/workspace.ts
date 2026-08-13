@@ -73,8 +73,9 @@ export interface WorkspaceBinding {
 export interface WorkspaceManifest {
   /** Every user top-level binding, sorted by name. */
   bindings: WorkspaceBinding[];
-  /** The `$N` log-ref globals as a range (mirroring the harness manifest's
-   *  logs breakdown). */
+  /** The `$N` log-ref globals as a range — always empty since 0.4.0
+   *  (the `$N` capture system is deleted); the field stays for
+   *  report-shape compatibility with the older manifest surface. */
   logs: { first: number | null; last: number | null; count: number };
   /** The registry's snapshot-durable eval counter. */
   evalSeq: number;
@@ -153,6 +154,14 @@ export class Workspace {
    *  share the id space (review regression: the bridge rejected every
    *  answer with `false`, leaving the original promise pending forever). */
   private readonly parkedCheckpointCalls = new Map<string, GuestCall>();
+  /** The parking bridge's per-call KIND (agent/steer/checkpoint) and
+   *  per-call question text — the introspection handlers (`workspace()`/
+   *  `agents()`) serve them in the §4.5 shapes. */
+  private readonly parkedKinds = new Map<string, 'agent' | 'steer' | 'checkpoint'>();
+  private readonly parkedQuestions = new Map<string, string>();
+  /** The parking bridge's `reset()` request: the teardown runs after the
+   *  current eval completes (see `eval`). */
+  private pendingReset = false;
   private disposed = false;
 
   private constructor(projectDir: string, vm: ReplVm, baseline: Set<string>) {
@@ -191,8 +200,8 @@ export class Workspace {
   /**
    * Restore a workspace from a quickjs-wasi snapshot: the VM is restored
    * and the host callbacks are re-registered by name (`registerGuestHostCallbacks`
-   * — the guest library, its pending-call registry and the `$N` store
-   * travel INSIDE the snapshot; the library is never re-evaluated). The
+   * — the guest library and its pending-call registry travel INSIDE the
+   * snapshot; the library is never re-evaluated). The
    * provenance registry travels with the snapshot too; a PRE-PROVENANCE
    * snapshot (whose library predates the registry) gets the registry
    * installed by the host bootstrap and its pre-existing bindings are
@@ -263,9 +272,9 @@ export class Workspace {
 
   /**
    * Snapshot the workspace's VM: raw WASM linear memory plus runtime
-   * pointers (the quickjs-wasi snapshot). The guest library, the `$N`
-   * store and the pending-call registry travel inside; the host callbacks
-   * do not (re-register by name after restore — `rehost`). The at-rest
+   * pointers (the quickjs-wasi snapshot). The guest library and the
+   * pending-call registry travel inside; the host callbacks do not
+   * (re-register by name after restore — `rehost`). The at-rest
    * identity envelope (wasm hash + format version + gzip) is the daemon
    * layer's wrap, a later phase; this is the raw snapshot seam.
    */
@@ -282,7 +291,15 @@ export class Workspace {
    */
   eval(code: string, options?: ReplEvalOptions): Promise<ReplEvalOutcome> {
     this.assertAlive();
-    return this.vm.evalCode(code, options);
+    const outcome = this.vm.evalCode(code, options);
+    // The parking bridge's `reset()` teardown: the host-side effect runs
+    // AFTER the current eval completes (the doc's §4.5 — `reset()` tears
+    // the workspace down once the eval that called it finishes; the
+    // broker honors its own flag the same way).
+    return outcome.then((result) => {
+      if (this.pendingReset) this.dispose();
+      return result;
+    });
   }
 
   /**
@@ -368,6 +385,16 @@ export class Workspace {
   }
 
   /**
+   * @internal Write a live guest value into a realm global slot — the
+   * `_` seam (the broker sets the previous eval's completion value; see
+   * `ReplVm.setGlobal`).
+   */
+  setGlobal(name: string, value: unknown): void {
+    this.assertAlive();
+    this.vm.setGlobal(name, value);
+  }
+
+  /**
    * @internal The continuation-lease CLEAR seam (see
    * `readContinuationLease`): the drain loop clears the lease at drain
    * start and after every lease-carrying job.
@@ -380,8 +407,8 @@ export class Workspace {
   /**
    * The console events accumulated by the default parking bridge, in
    * order (only populated when `options.handlers` was omitted — custom
-   * handlers own their events). The tool layer renders each event's
-   * `$N` refs through the previewer and caps the result.
+   * handlers own their events). Each event carries the guest-rendered
+   * ONE line per console.* call.
    */
   consoleEvents(): readonly ConsoleEvent[] {
     return this.consoleEventBuffer;
@@ -417,12 +444,12 @@ export class Workspace {
   }
 
   /**
-   * Render the preview line for a realm global slot (`$N` refs and any
-   * other top-level binding): `[$14 · object · 48kB] {…}` — trap-free
-   * (never executes guest getters; a slot rebound to an accessor renders
-   * the sabotage marker instead of firing it). This is the tool-result
-   * rendering seam; `fallbackArg` is used when the slot cannot be
-   * previewed.
+   * Render the preview line for a realm global slot (any top-level
+   * binding): `[$14 · object · 48kB] {…}` — trap-free (never executes
+   * guest getters; a slot rebound to an accessor renders the sabotage
+   * marker instead of firing it). Retained for the older tool-result
+   * seam; the 0.4.0 console path renders guest-side (no `$N` slots).
+   * `fallbackArg` is used when the slot cannot be previewed.
    */
   renderRef(ref: string, fallbackArg?: unknown): string {
     this.assertAlive();
@@ -523,13 +550,7 @@ export class Workspace {
       return false;
     });
     const bindings: WorkspaceBinding[] = [];
-    const logRefs: number[] = [];
     for (const name of user) {
-      const ref = /^\$(\d+)$/.exec(name)?.[1];
-      if (ref !== undefined) {
-        logRefs.push(Number(ref));
-        continue;
-      }
       const info = manifestBinding(this.vm, name);
       if (info === null) continue;
       const origin = view.origins.get(name);
@@ -544,14 +565,12 @@ export class Workspace {
       });
     }
     bindings.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    logRefs.sort((a, b) => a - b);
     return {
       bindings,
-      logs: {
-        first: logRefs.length > 0 ? logRefs[0] : null,
-        last: logRefs.length > 0 ? logRefs[logRefs.length - 1] : null,
-        count: logRefs.length,
-      },
+      // The `$N` capture system is deleted (0.4.0): the range is always
+      // empty. Kept for report-shape compatibility with the older
+      // manifest surface.
+      logs: { first: null, last: null, count: 0 },
       evalSeq: view.evalSeq,
     };
   }
@@ -584,11 +603,15 @@ export class Workspace {
     const events = this.consoleEventBuffer;
     const parked = this.parkedCallsBuffer;
     const parkedCheckpoints = this.parkedCheckpointCalls;
+    const parkedKinds = this.parkedKinds;
+    const parkedQuestions = this.parkedQuestions;
+    const workspace = this;
     return {
       agent: (call, callId) => {
         parked.set(callId, call);
+        parkedKinds.set(callId, 'agent');
       },
-      checkpoint: (call, callId, _question, _optionsJson, answerJson) => {
+      checkpoint: (call, callId, question, _optionsJson, answerJson) => {
         if (answerJson !== null) {
           // Answer mode: the orchestrator is delivering the user's answer
           // for a parked checkpoint. Find the matching pending checkpoint
@@ -606,6 +629,8 @@ export class Workspace {
           if (pending === undefined) return false;
           parkedCheckpoints.delete(callId);
           parked.delete(callId);
+          parkedKinds.delete(callId);
+          parkedQuestions.delete(callId);
           let answer: unknown;
           try {
             answer = JSON.parse(answerJson);
@@ -623,13 +648,74 @@ export class Workspace {
         // or takes over) and the checkpoint table (answer delivery).
         parked.set(callId, call!);
         parkedCheckpoints.set(callId, call!);
+        parkedKinds.set(callId, 'checkpoint');
+        parkedQuestions.set(callId, question ?? '');
         return undefined;
       },
       steer: (call, callId) => {
         parked.set(callId, call);
+        parkedKinds.set(callId, 'steer');
       },
       console: (event) => {
         events.push(event);
+      },
+      // The eval-plane helpers under the parking bridge: `sleep` is a
+      // real host-side timer (the VM itself stays timer-free); the
+      // introspection pair serve the parking state in the doc's §4.5
+      // shapes (no backends attached — diagnostics are all empty);
+      // `reset` marks the teardown the eval consumes after completing.
+      sleep: (call, ms) => {
+        const delay = Number.isFinite(ms) && ms > 0 ? Math.min(ms, 2 ** 31 - 1) : 0;
+        setTimeout(() => {
+          try {
+            call.resolve(undefined);
+          } catch {
+            // The workspace was disposed before the timer fired — the
+            // call is gone with it; nothing to settle.
+          }
+        }, delay);
+      },
+      workspace: () => {
+        const manifest = workspace.manifest();
+        const inFlightIds: string[] = [];
+        for (const id of parked.keys()) {
+          if (!inFlightIds.includes(id)) inFlightIds.push(id);
+        }
+        return JSON.stringify({
+          bindings: manifest.bindings.map((b) => ({
+            name: b.name,
+            type: b.type,
+            sizeBytes: b.sizeBytes,
+            provenance: b.provenance,
+            task: null,
+            ...(b.handleCallId !== null ? { callId: b.handleCallId } : {}),
+            ...(b.handleCallId !== null
+              ? { status: parked.has(b.handleCallId) ? 'pending' : 'settled' }
+              : {}),
+          })),
+          inFlight: inFlightIds,
+          checkpoints: [...parkedCheckpoints.keys()].map((id) => ({
+            id,
+            question: parkedQuestions.get(id) ?? '',
+          })),
+          diagnostics: { reconcile: null, drainError: null, childrenClosed: false },
+        });
+      },
+      agents: () =>
+        JSON.stringify(
+          [...parked.entries()]
+            .filter(([callId]) => parkedKinds.get(callId) === 'agent')
+            .map(([callId]) => ({
+              callId,
+              modelSpec: '',
+              task: '',
+              state: 'opening',
+              supportsSteering: false,
+              queuedSteers: 0,
+            })),
+        ),
+      reset: () => {
+        workspace.pendingReset = true;
       },
     };
   }

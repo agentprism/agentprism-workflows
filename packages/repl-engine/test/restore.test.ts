@@ -355,7 +355,7 @@ function output(r: ReplEvalResult): string[] {
 /** Dispatch one agent call and wait until its session is open. */
 async function dispatchAgent(broker: Broker, runner: FakeRunner, code = 'const p = agent("pi/x", "task"); "started"') {
   const r = await broker.eval(code);
-  assert.equal(r.result, '"started"', JSON.stringify(r));
+  assert.equal(r.result, 'started', JSON.stringify(r));
   await tick();
   assert.equal(runner.sessions.length, 1);
   assert.equal(runner.last().prompts.length, 1, 'the initial turn is in flight');
@@ -380,7 +380,7 @@ test('restore with all three arms: settle-from-store, re-attach, re-issue (mock 
   const r = await broker.eval(
     'const a = agent("pi/a", "task A"); const b = agent("pi/b", "task B"); const c = agent("pi/c", "task C"); "started"',
   );
-  assert.equal(r.result, '"started"');
+  assert.equal(r.result, 'started');
   await tick();
   assert.equal(runner.sessions.length, 3);
   const [sessionA, sessionB, sessionC] = runner.sessions;
@@ -434,7 +434,7 @@ test('restore with all three arms: settle-from-store, re-attach, re-issue (mock 
     output(probe).some((l) => l.startsWith('warn: ') && l.includes('c3') && l.includes('re-issued') && l.includes('session not found')),
     output(probe).join('\n'),
   );
-  assert.equal((await broker2.eval('await a')).result, '"result A"', 'the store arm settled c1 exactly once');
+  assert.equal((await broker2.eval('await a')).result, 'result A', 'the store arm settled c1 exactly once');
 
   // The re-attach went to the RECORDED backend session with the founding
   // routing (model spec + cwd recovered from the registry entry).
@@ -455,7 +455,7 @@ test('restore with all three arms: settle-from-store, re-attach, re-issue (mock 
   // next pump delivers it through the same record → settle → consume path
   // — the guest promise resolves exactly once, and the outcome is durable.
   await broker2.pump();
-  assert.equal((await broker2.eval('await b')).result, '"result B (loaded)"');
+  assert.equal((await broker2.eval('await b')).result, 'result B (loaded)');
   assert.equal(broker2.store().lookup('c2')!.completion!.value, 'result B (loaded)');
 
   // The re-issued call's fresh turn completes → the SAME guest promise
@@ -464,7 +464,7 @@ test('restore with all three arms: settle-from-store, re-attach, re-issue (mock 
   runner2.sessions[1].completeTurn('result C (re-issued)');
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await c')).result, '"result C (re-issued)"');
+  assert.equal((await broker2.eval('await c')).result, 'result C (re-issued)');
   assert.equal(broker2.store().lookup('c3')!.sessionId, runner2.sessions[1].sessionId);
 
   await broker2.dispose();
@@ -501,7 +501,7 @@ test('a custom backend without the loadSession capability degrades through the s
   runner2.sessions[0].completeTurn('custom backend result');
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await p')).result, '"custom backend result"');
+  assert.equal((await broker2.eval('await p')).result, 'custom backend result');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -628,13 +628,13 @@ test('a pending checkpoint re-surfaces across the restore: listed again, answera
   // The question is listed again in the next tool result.
   const listed = await broker2.eval('"probe"');
   assert.deepEqual(listed.checkpoints.map((c) => c.id), ['c1']);
-  assert.equal(listed.checkpoints[0].question, '"What color?"');
+  assert.equal(listed.checkpoints[0].question, 'What color?');
 
   // The answer settles the RESTORED checkpoint (no live GuestCall —
   // through the reconciliation surface), exactly once.
   const answered = await broker2.eval('checkpoint.answer("c1", "blue"); "delivered"');
-  assert.equal(answered.result, '"delivered"');
-  assert.equal((await broker2.eval('await q')).result, '"blue"');
+  assert.equal(answered.result, 'delivered');
+  assert.equal((await broker2.eval('await q')).result, 'blue');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'blue');
   // A second answer reports false (first-wins).
   assert.equal((await broker2.eval('checkpoint.answer("c1", "again")')).result, 'false');
@@ -716,7 +716,7 @@ test('cadence: a boundary fires after each eval and after each settlement drain 
   runner.last().completeTurn('second');
   await tick();
   const resumed = await broker.eval('const got = await p2; "resolved:" + got');
-  assert.equal(resumed.result, '"resolved:second"');
+  assert.equal(resumed.result, 'resolved:second');
   assert.deepEqual(kinds.splice(0), ['settlement', 'eval']);
 
   // A reconcile that settles from the store fires the settlement
@@ -739,7 +739,7 @@ test('cadence: a boundary fires after each eval and after each settlement drain 
   broker3.store().recordCompleted('c1', { outcome: 'resolve', value: 'while down', completedAtMs: Date.now() });
   await broker3.reconcile();
   assert.deepEqual(kinds.splice(0), ['settlement'], 'the reconcile drain fired its boundary');
-  assert.equal((await broker3.eval('await q')).result, '"while down"');
+  assert.equal((await broker3.eval('await q')).result, 'while down');
   await broker3.dispose();
   ws3.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -769,7 +769,7 @@ test('debounce end to end: one eval that pumps settlements and runs the eval wri
   runner.last().completeTurn('result');
   await tick();
   const r = await broker.eval('const got = await p; "resolved:" + got');
-  assert.equal(r.result, '"resolved:result"');
+  assert.equal(r.result, 'resolved:result');
   assert.equal(store.stats().snapshotWrites, 2, 'the settlement + eval boundaries of one burst coalesced into one write');
 
   // A standalone settlement drain writes once (its own burst): the
@@ -932,8 +932,8 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
   const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
   try {
     // Dispatch one call; the founding turn is in flight when we crash.
-    const r = await broker.eval('const p = agent("fake/x", "task"); "started"');
-    assert.equal(r.result, '"started"');
+    const r = await broker.eval('const p = agent("claude/x", "task"); "started"');
+    assert.equal(r.result, 'started');
     assert.deepEqual(broker.pendingCalls().map((e) => e.id), ['c1']);
     // The re-attach key: the REAL backend session id recorded at open
     // (the real runner's openSession is async — spawn + initialize).
@@ -966,7 +966,9 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
     const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
     try {
       const report = await broker2.reconcile();
-      assert.deepEqual(report.reattached, ['c1'], 'the call re-attached through the real adapter');
+      if (JSON.stringify(report.reattached) !== JSON.stringify(['c1'])) {
+        throw new Error('REPORTPROBE ' + JSON.stringify(report));
+      }
       assert.deepEqual(report.reissued, []);
       assert.deepEqual(report.failedLost, []);
       // The wire evidence: the restored process LOADED the recorded
@@ -993,7 +995,7 @@ test('restore through the REAL acp-agents adapter: a completed-while-down call r
         }
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      assert.equal(settled, '"result B (loaded)"');
+      assert.equal(settled, 'result B (loaded)');
       assert.equal(broker2.store().lookup('c1')!.completion!.value, 'result B (loaded)');
       assert.equal(broker2.store().lookup('c1')!.reissues, 0, 're-attachment is not a re-issue');
     } finally {
@@ -1048,7 +1050,7 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
     const ws = await Workspace.create(PROJECT);
     const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
     try {
-      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await broker.eval('const p = agent("claude/x", "task"); "started"');
       await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
       const recordedId = broker.store().lookup('c1')!.sessionId!;
       const snapshot = ws.snapshot();
@@ -1113,7 +1115,7 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
           }
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(result, '"live partial"', 'the authoritative completion is the turn\'s REAL accumulated text');
+        assert.equal(result, 'live partial', 'the authoritative completion is the turn\'s REAL accumulated text');
         assert.equal(broker2.store().lookup('c1')!.completion!.value, 'live partial');
         assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'the still-running turn was never re-issued');
         assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the call settled on the SAME backend session');
@@ -1166,7 +1168,7 @@ test('restore through the REAL acp-agents adapter: a founding turn that ended wi
     const ws = await Workspace.create(PROJECT);
     const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
     try {
-      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await broker.eval('const p = agent("claude/x", "task"); "started"');
       await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
       const recordedId = broker.store().lookup('c1')!.sessionId!;
       const snapshot = ws.snapshot();
@@ -1231,7 +1233,7 @@ test('restore through the REAL acp-agents adapter: a founding turn that ended wi
           }
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(result, '"fresh result"');
+        assert.equal(result, 'fresh result');
         assert.equal(broker2.store().lookup('c1')!.reissues, 1);
       } finally {
         await broker2.dispose();
@@ -1275,7 +1277,7 @@ test('restore through the REAL acp-agents adapter WITHOUT the _session/loaded_tu
     const ws = await Workspace.create(PROJECT);
     const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
     try {
-      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await broker.eval('const p = agent("claude/x", "task"); "started"');
       await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
       const recordedId = broker.store().lookup('c1')!.sessionId!;
       const snapshot = ws.snapshot();
@@ -1323,7 +1325,7 @@ test('restore through the REAL acp-agents adapter WITHOUT the _session/loaded_tu
           }
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(settled, '"result B (loaded)"');
+        assert.equal(settled, 'result B (loaded)');
         assert.equal(broker2.store().lookup('c1')!.completion!.value, 'result B (loaded)');
         assert.equal(broker2.store().lookup('c1')!.reissues, 0, 're-attachment is not a re-issue');
         assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'settled on the SAME loaded session');
@@ -1367,7 +1369,7 @@ test('restore through the REAL acp-agents adapter WITHOUT the extension: a repla
     const ws = await Workspace.create(PROJECT);
     const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
     try {
-      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await broker.eval('const p = agent("claude/x", "task"); "started"');
       await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
       const recordedId = broker.store().lookup('c1')!.sessionId!;
       const snapshot = ws.snapshot();
@@ -1426,7 +1428,7 @@ test('restore through the REAL acp-agents adapter WITHOUT the extension: a repla
           }
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(result, '"fresh result"');
+        assert.equal(result, 'fresh result');
         assert.equal(broker2.store().lookup('c1')!.reissues, 1);
       } finally {
         await broker2.dispose();
@@ -1483,7 +1485,7 @@ test('restore through the REAL acp-agents adapter WITHOUT the extension: live co
     const ws = await Workspace.create(PROJECT);
     const broker = await Broker.attach(ws, { runner, store: JsonlCallStore.open(storePath) });
     try {
-      await broker.eval('const p = agent("fake/x", "task"); "started"');
+      await broker.eval('const p = agent("claude/x", "task"); "started"');
       await waitFor(() => broker.store().lookup('c1')!.sessionId !== null);
       const recordedId = broker.store().lookup('c1')!.sessionId!;
       const snapshot = ws.snapshot();
@@ -1592,7 +1594,7 @@ test('a still-running-at-load call stays attached: reconcile arms it on the park
   parked.resolve({ stopReason: 'end_turn', text: 'completed live' });
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await p')).result, '"completed live"');
+  assert.equal((await broker2.eval('await p')).result, 'completed live');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'completed live');
   assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'kept attached — no re-issue');
   assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId);
@@ -1644,7 +1646,7 @@ test('a seam rejection degrades to re-issue inside the task: the loaded session 
   runner2.sessions[1].completeTurn('fresh result');
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await p')).result, '"fresh result"');
+  assert.equal((await broker2.eval('await p')).result, 'fresh result');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'fresh result');
   await broker2.dispose();
   ws2.dispose();
@@ -1817,8 +1819,8 @@ test('cadence: an adapter without the completion seam degrades through the doc\'
   runner2.sessions[3].completeTurn('fresh outcome 2');
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await p1')).result, '"fresh outcome 1"');
-  assert.equal((await broker2.eval('await p2')).result, '"fresh outcome 2"');
+  assert.equal((await broker2.eval('await p1')).result, 'fresh outcome 1');
+  assert.equal((await broker2.eval('await p2')).result, 'fresh outcome 2');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'both continuations settled exactly once');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'fresh outcome 1');
   assert.equal(broker2.store().lookup('c2')!.completion!.value, 'fresh outcome 2');
@@ -1872,7 +1874,7 @@ test('a RE-ARMABLE still-running seam rejection keeps the call attached and pend
   secondSeam.resolve({ stopReason: 'end_turn', text: 'completed eventually' });
   await tick();
   await broker2.pump();
-  assert.equal((await broker2.eval('await p')).result, '"completed eventually"');
+  assert.equal((await broker2.eval('await p')).result, 'completed eventually');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'completed eventually');
   assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'kept attached — no re-issue');
   assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'settled on the SAME backend session');
@@ -1932,7 +1934,7 @@ test('a NON-re-armable still-running seam rejection is NEVER re-invoked — the 
   await tick();
   await broker2.pump();
   const settleProbe = await broker2.eval('await p');
-  assert.equal(settleProbe.result, '"the turn eventually completed"');
+  assert.equal(settleProbe.result, 'the turn eventually completed');
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'the turn eventually completed');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
   await broker2.dispose();
@@ -2030,7 +2032,7 @@ test('a NON-re-armable held call whose SESSION IS RELEASED re-issues through the
   await tick();
   await broker2.pump();
   const probe = await broker2.eval('await p');
-  assert.equal(probe.result, '"the re-issued turn completed"');
+  assert.equal(probe.result, 'the re-issued turn completed');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
   await broker2.dispose();
   ws2.dispose();
@@ -2355,7 +2357,7 @@ test('a client reconnecting mid-drain ABORTS the drain: children stay warm — n
   runner.last().completeTurn('warm result');
   await broker.pump();
   const got = await broker.eval('await p');
-  assert.equal(got.result, '"warm result"');
+  assert.equal(got.result, 'warm result');
   await broker.dispose();
   ws.dispose();
 });
@@ -2500,8 +2502,8 @@ test('a bounded drain with MULTIPLE pending restored calls settles EVERY outstan
   // by the bound's pass — it stays ANSWERABLE across the cut-off restore
   // (the doc: "answering works across a restore").
   const answered = await broker2.eval('checkpoint.answer("c3", "blue"); "delivered"');
-  assert.equal(answered.result, '"delivered"');
-  assert.equal((await broker2.eval('await q')).result, '"blue"');
+  assert.equal(answered.result, 'delivered');
+  assert.equal((await broker2.eval('await q')).result, 'blue');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });

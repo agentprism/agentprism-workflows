@@ -391,12 +391,10 @@ test('review round 3: an UNRELATED finite eval whose own drain executes real byt
   // release cleared A's tracking (c1 stayed pending and UNINTERRUPTIBLE).
   const b = await bounded(
     'unrelated finite eval with a bytecode-heavy drain',
-    broker.eval('Promise.resolve().then(() => { let x = 0; for (let i = 0; i < 200000; i++) x += i; return "B-done"; });'),
+    broker.eval('Promise.resolve().then(() => { let x = 0; for (let i = 0; i < 200000; i++) x += i; globalThis.bDone = true; });'),
   );
-  assert.ok(
-    b.result !== undefined && b.result.includes('B-done'),
-    `the unrelated eval completed normally, never interrupted: ${output(b).join('\n')}`,
-  );
+  assert.ok(b.result !== undefined, `the unrelated eval completed normally, never interrupted: ${output(b).join('\n')}`);
+  assert.equal((await broker.eval('bDone')).result, 'true', 'the drain ran the microtask to completion');
   // The armed state SURVIVED B: answering c1 resumes A's runaway in the
   // answering eval's own drain, and the still-armed signal breaks it
   // MID-RUN — the exact execution the interrupt targeted.
@@ -735,18 +733,18 @@ test('review round 5: a ZERO-timeout wait on a workspace with a PENDING call rep
 test('review round 5: the top-level-await instrumenter is HYGIENIC — a guest lexical `__replAwait` shadow cannot change the program\'s semantics (the 0.2.0 transform inserted the guest-resolvable identifier `__replAwait`, so `{ const __replAwait = () => 7; globalThis.seen = await Promise.resolve(42); }` yielded 7 instead of 42; the injected seam is now `this["__replAwait"]` — the keyword base is unshadowable)', async () => {
   const { ws, broker } = await setup();
   const r = await broker.eval('{ const __replAwait = () => 7; globalThis.seen = await Promise.resolve(42); } "done"');
-  assert.equal(r.result, '"done"', `the eval completed normally: ${output(r).join('\n')}`);
+  assert.equal(r.result, 'done', `the eval completed normally: ${output(r).join('\n')}`);
   const seen = await broker.eval('seen');
   assert.equal(seen.result, '42', 'the REAL library seam ran — the guest shadow changed nothing');
   // The shadowing identifier stays usable as the guest declared it.
   const shadow = await broker.eval('{ const __replAwait = () => 7; globalThis.seen2 = __replAwait(); } "s"');
-  assert.equal(shadow.result, '"s"');
+  assert.equal(shadow.result, 's');
   const seen2 = await broker.eval('seen2');
   assert.equal(seen2.result, '7', 'the guest\'s own shadowed identifier keeps its semantics');
   // The transform injects NO persistent helper binding (a top-level
   // const would redeclare on the loop idiom): the same code runs again.
   const again = await broker.eval('{ const __replAwait = () => 7; globalThis.seen3 = await Promise.resolve(9); } "again"');
-  assert.equal(again.result, '"again"', `the loop idiom does not redeclare: ${output(again).join('\n')}`);
+  assert.equal(again.result, 'again', `the loop idiom does not redeclare: ${output(again).join('\n')}`);
   const seen3 = await broker.eval('seen3');
   assert.equal(seen3.result, '9');
   await broker.dispose();
@@ -807,7 +805,7 @@ test('review round 6: the for-await ITERABLE wrap preserves the iterable protoco
   const r = await broker.eval(
     'globalThis.forAwaitSum = 0; for await (const x of [1, 2]) { globalThis.forAwaitSum += x; } "iterated"',
   );
-  assert.equal(r.result, '"iterated"', `the for-await loop completed normally: ${output(r).join('\n')}`);
+  assert.equal(r.result, 'iterated', `the for-await loop completed normally: ${output(r).join('\n')}`);
   const sum = await broker.eval('forAwaitSum');
   assert.equal(sum.result, '3', 'the loop iterated [1, 2] — the iterable protocol is preserved');
   // An ASYNC-GENERATOR iterable still iterates across drains (each
@@ -816,7 +814,7 @@ test('review round 6: the for-await ITERABLE wrap preserves the iterable protoco
   const g = await broker.eval(
     'globalThis.g = (async function* () { yield 10; yield 20; })(); globalThis.genSum = 0; for await (const x of g) { globalThis.genSum += x; } "gen"',
   );
-  assert.equal(g.result, '"gen"', `the async-generator loop completed: ${output(g).join('\n')}`);
+  assert.equal(g.result, 'gen', `the async-generator loop completed: ${output(g).join('\n')}`);
   const genSum = await broker.eval('genSum');
   assert.equal(genSum.result, '30', 'the async generator yielded 10 then 20');
   // `for await (const x of await y)`: the iterable IS an awaited
@@ -825,7 +823,7 @@ test('review round 6: the for-await ITERABLE wrap preserves the iterable protoco
   const nested = await broker.eval(
     'globalThis.nestedSum = 0; for await (const x of await Promise.resolve([3])) { globalThis.nestedSum += x; } "nested"',
   );
-  assert.equal(nested.result, '"nested"', `the awaited-iterable shape completed: ${output(nested).join('\n')}`);
+  assert.equal(nested.result, 'nested', `the awaited-iterable shape completed: ${output(nested).join('\n')}`);
   const nestedSum = await broker.eval('nestedSum');
   assert.equal(nestedSum.result, '3', 'the awaited iterable [3] iterated once');
   await broker.dispose();
@@ -876,9 +874,9 @@ test('review round 7: the instrumented for-await over a SYNC iterable yields the
   const r = await broker.eval(
     'globalThis.round7sync = []; for await (const x of [Promise.resolve(1), Promise.resolve(2)]) { globalThis.round7sync.push(x); } "iterated"',
   );
-  assert.equal(r.result, '"iterated"', `the loop completed: ${output(r).join('\n')}`);
+  assert.equal(r.result, 'iterated', `the loop completed: ${output(r).join('\n')}`);
   const kinds = await broker.eval('round7sync.map((x) => typeof x).join(",")');
-  assert.equal(kinds.result, '"number,number"', 'the loop saw the RESOLVED numbers, never promise objects');
+  assert.equal(kinds.result, 'number,number', 'the loop saw the RESOLVED numbers, never promise objects');
   const sum = await broker.eval('round7sync[0] + round7sync[1]');
   assert.equal(sum.result, '3', 'the resolved values are `1` and `2`');
   await broker.dispose();
@@ -895,7 +893,7 @@ test('review round 7: the instrumented top-level await is semantically isolated 
   const r = await broker.eval(
     'Promise.prototype.then = function () { return 99; }; const x = await Promise.resolve(40); globalThis.round7x = x; "done"',
   );
-  assert.equal(r.result, '"done"', `the eval completed: ${output(r).join('\n')}`);
+  assert.equal(r.result, 'done', `the eval completed: ${output(r).join('\n')}`);
   const x = await broker.eval('round7x');
   assert.equal(x.result, '40', 'the instrumented await mirrors the native value under the replaced prototype');
   // The lease plumbing still works under the mutation: an eval
@@ -1043,11 +1041,11 @@ test('review round 7: a RESTORED 0.3.0 library is served WITHOUT instrumentation
     runner.sessions[0].completeTurn('result');
     await tick();
     const probe = await bounded('probe after settling the 0.3.0-copy eval', broker.eval('"probe"'));
-    assert.equal(probe.result, '"probe"', `the workspace stays healthy: ${output(probe).join('\n')}`);
+    assert.equal(probe.result, 'probe', `the workspace stays healthy: ${output(probe).join('\n')}`);
     const sibling = await broker.eval('round7sibling === undefined ? "unset" : round7sibling');
-    assert.equal(sibling.result, '"unset"', 'no instrumentation ran — the sibling never observed a continuation lease (the 0.3.0 lease-set defect was never re-armed)');
+    assert.equal(sibling.result, 'unset', 'no instrumentation ran — the sibling never observed a continuation lease (the 0.3.0 lease-set defect was never re-armed)');
     const done = await broker.eval('round7done');
-    assert.equal(done.result, '"result"', 'the continuation settled natively with the turn text');
+    assert.equal(done.result, 'result', 'the continuation settled natively with the turn text');
   } finally {
     await broker.dispose();
     ws.dispose();

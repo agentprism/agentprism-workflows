@@ -143,9 +143,15 @@ async function exercisePhaseB(): Promise<void> {
     },
     console: (event: ConsoleEvent) => {
       event.level satisfies ConsoleLevel;
-      event.refs satisfies string[];
-      event.args satisfies unknown[];
+      event.line satisfies string;
     },
+    sleep: (call: GuestCall, ms: number) => {
+      ms satisfies number;
+      call.resolve(undefined);
+    },
+    workspace: () => '{}',
+    agents: () => '[]',
+    reset: () => undefined,
   };
   await installGuestBridge(bridgeVm, handlers);
   registerGuestHostCallbacks(bridgeVm, handlers);
@@ -250,8 +256,10 @@ function storeTyping(store: CallStore): void {
     sessionId: null,
     deliveredAtMs: null,
     droppedAtMs: null,
+    queuedAtMs: null,
   });
   store.recordReissued('c1', 2);
+  store.recordQueued('c1', 4);
   store.recordAttached('c1', 'backend-session-1', 5, 'pi');
   store.recordCompleted('c1', { outcome: 'resolve', value: { ok: true }, completedAtMs: 3 }) satisfies boolean;
   store.recordDelivery('c1', 'delivered', 4);
@@ -330,7 +338,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
   recordKind satisfies string;
   const outcomeKind: CallOutcomeKind = 'reject';
   outcomeKind satisfies string;
-  const summary: CheckpointSummary = { id: 'c1', question: '"What color?"' };
+  const summary: CheckpointSummary = { id: 'c1', question: 'What color?' };
   summary satisfies { id: string; question: string };
   const info: CheckpointInfo = { id: 'c1', question: 'x', optionsJson: null, raisedAtMs: 1 };
   const live: LiveAgentInfo = {
@@ -357,7 +365,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
   fileStore.path() satisfies string;
   fileStore.close();
   const evalResult: ReplEvalResult = {
-    output: ['[$1 · number · 8B] 42'],
+    output: ['42'],
     outputTruncated: false,
     result: '42',
     pending: [],

@@ -22,9 +22,9 @@
  *
  * The BYTE cap (50 KB) is the load-bearing bound: a directly emitted
  * top-level string — a `console.log` argument or the eval result — is
- * carried whole up to this budget (see `EMISSION_STRING_MAX_CHARS` in
- * `preview.ts`), so a subagent's answer arrives in one call instead of
- * being clamped to a 200-char preview. The LINE cap is a flood guard that
+ * carried whole up to this budget, so a subagent's answer arrives in one
+ * call instead of being clamped to a 200-char preview. The LINE cap is a
+ * flood guard that
  * must therefore be generous enough not to truncate a single up-to-50 KB
  * multi-line emission before the byte cap does: a 50 KB markdown answer is
  * one rendered line whose embedded newlines make it hundreds-to-thousands

@@ -33,24 +33,30 @@
  *   (duplicated work).
  * - **Six concurrent subagents per workspace** (the doc-settled cap).
  *   The cap counts live work: unsettled agent calls plus sessions
- *   running a follow-up turn (a queued-steer delivery turn or a
- *   startedNewTurn prompt on a settled handle — a subagent is working
- *   even on a follow-up turn). The cap is ABSOLUTE for turn starts, not
- *   just dispatches: a dispatch over the cap is refused at dispatch
- *   time — recorded in the call store (dispatched + rejected, so a
- *   restore never re-issues it) and the guest call rejects with a
- *   recoverable error — and a followUp/steer on an idle session whose
- *   start would exceed the cap is queued for the next free slot with
- *   the honest `queued` outcome (never a seventh concurrent turn, never
- *   a hard error). Queued delivery turns likewise start only while a
- *   slot is free; the kick (`kickQueuedDeliveries`) runs whenever a
- *   slot frees. `maxConcurrentAgents` is configurable (server
- *   configuration, invisible to the guest).
+ *   running a follow-up turn (a queued-steer delivery turn or a §4.2
+ *   followUp turn on a settled handle — a subagent is working even on a
+ *   follow-up turn). The cap is ABSOLUTE for turn starts, not just
+ *   dispatches: a dispatch over the cap QUEUES in dispatch order for
+ *   the next free slot (§4.1 — never a rejection, matching the workflow
+ *   engine's semantics), and a followUp/steer on an idle session whose
+ *   start would exceed the cap queues on the same durable delivery
+ *   queue (never a seventh concurrent turn, never a hard error).
+ *   Queued delivery turns likewise start only while a slot is free; the
+ *   kick (`kickQueuedDeliveries`) runs whenever a slot frees.
+ *   `maxConcurrentAgents` is configurable (server configuration,
+ *   invisible to the guest).
  * - **Steering resolves with what actually happened** (the doc's
- *   "nothing is hidden, nothing hard-errors"): followUp/steer settle
- *   with the acp-agents steering-outcome vocabulary where the backend
- *   advertises `_session/steering`, with the broker's honest `queued`
- *   marker where it does not (see the steering mechanism table below).
+ *   "nothing is hidden, nothing hard-errors", redesigned per §4.2):
+ *   followUp/steer on a SETTLED or IDLE session mint a NEW turn with its
+ *   own call id (visible in `agents()`/`liveAgents()`, targetable by
+ *   `interrupt`) and resolve with the TURN'S ANSWER — same value
+ *   semantics as a schema-less `agent()`, never the bare
+ *   `startedNewTurn` token, never a discarded turn (idle-session `steer`
+ *   is the followUp alias). A MID-TURN steer keeps the delivery-outcome
+ *   vocabulary: `injected` where the backend advertises
+ *   `_session/steering` (the backend's verbatim outcome), `queued` where
+ *   it does not (next-turn delivery), `failed` on wire failure (see the
+ *   steering mechanism table below).
  *   Queued-for-next-turn delivery is DURABLE: the steer's payload and
  *   founding session id live in the call store, and the store records
  *   each delivery turn's start (the `delivered` marker — recorded in
@@ -90,18 +96,24 @@
  *   and pending steers whose wire call died with the process resolve
  *   the honest `failed` (their outcome is unknowable; re-injecting
  *   would duplicate). See "The restore path" below.
- * - **The eval tool-result shape** (`Broker.eval`): output lines
- *   (console events rendered through the previewer and capped at 256
- *   lines / 10 KB), the previewed completion value when the eval
- *   resolved, the pending call ids when it suspended (no fabricated
- *   value), the raised checkpoints (previewed questions), and the call
- *   ids this operation settled. Eval errors render as error-level lines
- *   in `output`. Every completion value crossing into the tool result is
- *   rendered trap-free (transfer lesson 2): the result line is previewed
+ * - **The eval tool-result shape** (`Broker.eval`): output lines (the
+ *   guest-rendered §4.4 one-line console reprs, raised-checkpoint lines,
+ *   and the §4.6 uncaught-error renderings — NO output caps, the §7
+ *   deletion), the repr'd completion value when the eval resolved (the
+ *   depth-limited repr: direct strings whole, objects/arrays to depth 2,
+ *   20 entries per level, nested strings head-limited at 200 chars), the
+ *   pending call ids when it suspended (no fabricated value), the raised
+ *   checkpoints (previewed questions), and the call ids this operation
+ *   settled. Eval errors render with the error name and message, the
+ *   guest stack's top frames with line numbers in the submitted code,
+ *   and — for subagent-call errors — the call id and the resolved
+ *   backend. Every completion value crossing into the tool result is
+ *   rendered trap-free (transfer lesson 2): the result line is repr'd
  *   from the live completion handle through the previewer's own
- *   own-descriptor machinery, output lines through `renderRef`, and
- *   checkpoint questions through the top-level string rule — no guest
- *   getter is ever executed while rendering.
+ *   own-descriptor machinery — no guest getter is ever executed while
+ *   rendering. The `_` result-history global is set after every eval
+ *   that resolved with a value (§4.4; the `$N` capture globals are
+ *   deleted).
  * - **Suspended-eval semantics** (transfer lesson 3, as pinned by the
  *   harness's R69 work): top-level `await` is accepted; an eval whose
  *   completion resolves within its drain reports the previewed value; one
@@ -112,13 +124,15 @@
  *   console line in the next tool result (the VM's rejection bridge,
  *   armed by the broker's `rejectionBridge` eval option); top-level
  *   `return` stays a syntax error (the VM layer's parser).
- * - **Checkpoints** (transfer lesson 4): `checkpoint(question)` parks a
- *   promise and records the dispatch in the call store; the question
- *   appears previewed in the tool result's `checkpoints` list;
- *   `checkpoint.answer(id, value)` in a later eval records the answer
- *   and settles the parked promise within that eval — root-mediated by
- *   construction, first-wins, and never delivered to anything but the
- *   matching pending checkpoint.
+ * - **Checkpoints** (transfer lesson 4, §4.3): `checkpoint(question)`
+ *   parks a promise and records the dispatch in the call store; the
+ *   raise surfaces as a `checkpoint c9: <question>` line in the eval's
+ *   output (the question as PLAIN head+tail metadata text — the
+ *   double-JSON-quote fix) and in `workspace()`; `checkpoint.answer(id,
+ *   value)` in a later eval records the answer and settles the parked
+ *   promise within that eval — root-mediated by construction, first-
+ *   wins, and never delivered to anything but the matching pending
+ *   checkpoint.
  *
  * ## The restore path (phase D, spec-owed decisions)
  *
@@ -292,15 +306,14 @@
  *
  * The per-session capability is read ONCE at session open
  * (`session.capabilities.supportsSteering`); the mechanism table for one
- * session:
+ * session (§4.2):
  *
  * | Case | Mechanism | Outcome the handle resolves with |
  * |---|---|---|
  * | backend advertises `_session/steering`, turn in flight | `session.steer(content)` — live injection | the backend's verbatim outcome: `injected` \| `startedNewTurn` \| `failed` |
- * | backend advertises `_session/steering`, session idle | `session.prompt(content)` — a new turn (there is nothing to inject into) | `startedNewTurn` |
  * | backend does NOT advertise steering, turn in flight | content enqueued for next-turn delivery | `queued` (immediately — accepted for next-turn delivery; if the call is later cancelled the queue is dropped, and a delivery-turn failure surfaces as a warn-level line in the next tool result — both documented) |
- * | backend does NOT advertise steering, session idle | `session.prompt(content)` — a new turn | `startedNewTurn` |
- * | ANY backend, session idle, but the workspace cap is exhausted | content enqueued for the next free slot (the same durable queue) | `queued` (a follow-up turn IS the subagent working — the six-agent ceiling is absolute; the steer starts the moment a slot frees) |
+ * | ANY backend, session SETTLED or IDLE | `session.prompt(content)` — a NEW TURN with its own call id | the TURN'S ANSWER (final text — the §4.2 semantics; a turn failure rejects the call with the §4.6 attribution) |
+ * | ANY backend, session idle, but the workspace cap is exhausted | content enqueued for the next free slot (the same durable queue); the steer's promise stays pending | the TURN'S ANSWER once the delivery runs (a follow-up turn IS the subagent working — the six-agent ceiling is absolute) |
  * | any backend/wire failure on the steering path | — | `failed` (never a hard rejection) |
  * | the founding call is still OPENING (its session does not exist yet —
  *   a steer in the same eval as the dispatch) | content queued for the
@@ -311,17 +324,19 @@
  * | `cancel()` while the call is still opening | the opening call is fenced + settled durably as cancelled (a late child is closed without prompting) | `cancelled` (the call rejects with the recoverable `AGENT_CANCELLED`) |
  *
  * The outcome surface therefore mirrors acp-agents' `SteeringOutcome`
- * values (`injected` / `startedNewTurn` / `failed`) with one honest
- * addition (`queued`) for the no-extension enqueue case, plus the
- * cancel vocabulary (`cancelled` / `idle`) — the orchestrator can always
- * tell urgency delivery (injected) from next-turn delivery (queued /
- * startedNewTurn), which is the doc's stated requirement.
+ * values (`injected` / `startedNewTurn` / `failed`) for MID-TURN steers,
+ * with the honest `queued` addition for the no-extension enqueue case
+ * and the cancel vocabulary (`cancelled` / `idle`); IDLE-session
+ * followUp/steer resolve with the turn's answer instead — the
+ * orchestrator can always tell urgency delivery (injected) from
+ * next-turn delivery (queued), which is the doc's stated requirement.
  *
- * ## The guest options surface (spec-owed decision)
+ * ## The guest options surface (§4.1)
  *
  * `agent(modelSpec, task, opts)` accepts EXACTLY this option bag (any
- * other key rejects the call with `recoverable: false` — an unknown
- * option is a guest bug, never silently ignored):
+ * other key rejects the call SYNCHRONOUSLY with an error that lists the
+ * valid keys — an unknown option is a guest bug, never silently
+ * ignored):
  *
  * - `schema` — a JSON Schema object; acp-agents validates per call (its
  *   own convert/check + re-prompt ladder, driven by the broker over the
@@ -339,11 +354,20 @@
  * - `cwd` — absolute working directory for the ACP session; defaults to
  *   the workspace's project directory.
  * - `configOptions` — ACP session config options (record of string |
- *   boolean, applied in sorted option-id order by the runner).
- * - `mode`, `tier`, `label`, `baseInstructions`, `developerInstructions`,
- *   `toolNames`, `disallowedToolNames`, `meta`, `promptMeta`,
- *   `maxSchemaRetries` — the runner's own RunOptions passthroughs
- *   (meta is session-scoped, promptMeta is turn-scoped).
+ *   boolean, applied in sorted option-id order by the runner). Keys
+ *   validate AT ADMISSION against the resolved backend's known option
+ *   vocabulary where it is knowable (the runner's `knownConfigOptionIds`
+ *   seam); where the vocabulary is genuinely dynamic, the [C]5 fallback
+ *   guarantees the late error names the offending key.
+ * - `mode` — the agent-advertised ACP session mode id (strict
+ *   confinement lever).
+ *
+ * The §4.1 admission validation also resolves the model spec's backend
+ * segment against the registry (built-ins plus registered custom
+ * agents): an unknown segment rejects synchronously naming the segment
+ * and enumerating the known backends — never a silent route to the
+ * default backend. The guest's reserved `'default'` sentinel
+ * (verify/judgePanel reviewers/graders) is host-routed.
  *
  * Steering payloads (`followUp`/`steer` options) accept exactly
  * `{ promptMeta }`.
@@ -364,8 +388,7 @@ import { isAbsolute } from 'node:path';
 
 import type { GuestBridgeHandlers, GuestCall, GuestSurfaceEntry } from './bridge.js';
 import { instrumentTopLevelAwaits } from './await-instrument.js';
-import { formatByteSize, headTailDescription, renderCompletionLine, stringDescription } from './preview.js';
-import { applyOutputCaps } from './caps.js';
+import { formatByteSize, headTailDescription, renderCompletionLine } from './preview.js';
 import { InMemoryCallStore, type CallOutcome, type CallRecord, type CallStore } from './store.js';
 import { DrainJobError, type ReplEvalOptions, type ReplEvalOutcome, type ReplJobLease } from './vm.js';
 import { Workspace } from './workspace.js';
@@ -549,6 +572,24 @@ export interface BrokerSession {
 /** The runner seam the broker drives (structural subset of
  *  `AcpAgentRunner` — tests inject fakes). */
 export interface BrokerRunner {
+  /** Ids of every configured backend (built-ins plus registered custom
+   *  agents) — the admission-validation vocabulary for the model spec's
+   *  backend segment (§4.1: an unknown segment rejects synchronously,
+   *  naming the segment and enumerating the known backends — never a
+   *  silent route to the default backend). OPTIONAL for third-party
+   *  runners that do not expose their registry: validation then degrades
+   *  to the runner's own routing (the honest limit of the seam). The
+   *  real acp-agents runner exposes `listBackends()`. */
+  listBackends?(): string[];
+  /** A backend's STATIC config-option vocabulary, when its adapter
+   *  publishes one (§4.1: `configOptions` keys validate at admission
+   *  against the resolved backend's known vocabulary WHERE IT IS
+   *  KNOWABLE). Returning `undefined` means the vocabulary is genuinely
+   *  dynamic (agent-advertised at initialize — the built-ins) and the
+   *  [C]5 fallback applies: the late error MUST name the offending key.
+   *  Returning an array means the vocabulary is known: an unknown key
+   *  rejects synchronously naming the key and the valid alternatives. */
+  knownConfigOptionIds?(backendId: string): string[] | undefined;
   openSession(opts: BrokerOpenSessionOptions): Promise<BrokerSession>;
   /**
    * Re-attach an existing backend session (ACP `session/load`) — the
@@ -564,15 +605,21 @@ export interface BrokerRunner {
   dispose(): Promise<void>;
 }
 
-/** The eval tool-result shape (the roadmap doc's `{ output, result?,
- *  pending, checkpoints, completed }`). */
+/** The eval tool-result shape. NOTE: the eval-plane redesign's §3.1 wire
+ *  shape (`{ output: string, result?, running? }`) lands in the tool
+ *  phase — this engine seam keeps its pre-redesign field names until the
+ *  surface phase deletes them with their consumers, but the CONTENT is
+ *  the redesigned one: `output` lines are the §4.4 reprs (one joined
+ *  line per console.* call), raised-checkpoint lines, and the §4.6
+ *  uncaught-error renderings, with NO output caps applied. */
 export interface ReplEvalResult {
-  /** Rendered console lines for this operation (error-level lines
-   *  included), capped at 256 lines / 10 KB. */
+  /** Rendered output lines for this operation (one line per console.*
+   *  call, checkpoint lines, error renderings) — NOT capped: the engine
+   *  stops applying output caps to guest output (the redesign's §7; the
+   *  Python posture — an agent CAN flood its own context). */
   output: string[];
-  /** True when output lines were dropped by the caps (the dropped
-   *  content stays reachable through the `$N` refs the kept lines
-   *  carry — the cap costs reads, never data). */
+  /** ALWAYS false (vestigial — the cap apparatus is deleted; the field
+   *  stays only until the surface phase removes it with its consumers). */
   outputTruncated: boolean;
   /** The previewed completion value when the eval resolved (FORMAT.md
    *  collapsed rendering, trap-free); absent when the eval suspended or
@@ -747,10 +794,12 @@ export interface BrokerOptions {
   store?: CallStore;
   /** The concurrency cap: max concurrent subagents per workspace
    *  (doc-settled default 6). Counts unsettled agent calls plus sessions
-   *  running a follow-up turn (a queued-steer delivery or a
-   *  startedNewTurn prompt on a settled handle). The cap gates turn
-   *  starts as well as dispatches: an idle-session follow-up that would
-   *  exceed it queues with the honest `queued` outcome. Validated as an
+   *  running a follow-up turn (a queued-steer delivery or a §4.2
+   *  followUp turn on a settled handle). The cap gates turn starts as
+   *  well as dispatches: a dispatch above it queues in dispatch order
+   *  (§4.1 — never a rejection), and an idle-session follow-up that
+   *  would exceed it queues for the next free slot (its promise stays
+   *  pending until the delivery runs). Validated as an
    *  integer in
    *  `[1, DEFAULT_MAX_CONCURRENT_AGENTS]`: invalid values (NaN,
    *  fractional, < 1) throw at attach time; values ABOVE the doc-settled
@@ -830,6 +879,10 @@ interface SessionEntry {
   callId: string;
   modelSpec: string;
   task: string;
+  /** The RESOLVED backend id (the session's own when it advertises one,
+   *  else the admission-validated model-spec segment) — the §4.6 error
+   *  attribution for followUp turns on this session. */
+  backendId: string;
   supportsSteering: boolean;
   /** True while a turn runs on this session (initial call turn or a
    *  queued-steer delivery turn). */
@@ -846,11 +899,32 @@ interface SessionEntry {
   readonly cancelWaiters: Set<() => void>;
   /** Queued followUp/steer payloads (no-extension backends with a turn
    *  in flight, and cap-pressure queues on idle sessions), in order. */
-  queue: Array<{ callId: string; prompt: string; promptMeta?: Record<string, unknown> }>;
+  queue: Array<QueuedDelivery>;
+}
+
+/** One queued delivery (a mid-turn no-extension steer, or a cap-pressure
+ *  followUp/steer on an idle session). `answer: true` marks the §4.2
+ *  followUp semantics: the steer's guest call stays PENDING until the
+ *  delivery turn runs and settles with the TURN'S ANSWER (its own call
+ *  id — the addressable turn); `answer: false` items already resolved
+ *  `queued` at enqueue (the delivery-outcome vocabulary for mid-turn
+ *  steers) and their delivery folds into the session's next turn. */
+interface QueuedDelivery {
+  callId: string;
+  prompt: string;
+  promptMeta?: Record<string, unknown>;
+  /** The GuestCall to settle with the turn's answer (answer mode only;
+   *  null for delivery-outcome items). */
+  call: GuestCall | null;
+  /** True for the §4.2 followUp-answer semantics; false for the
+   *  delivery-outcome semantics. */
+  answer: boolean;
 }
 
 /** A steer that arrived before its session existed (the founding call
- *  was still opening), delivered at the call's next-turn boundary. */
+ *  was still opening), delivered at the call's next-turn boundary. The
+ *  guest call already resolved `queued` at enqueue (the delivery-
+ *  outcome vocabulary — the founding turn has not even started). */
 interface PendingSteer {
   callId: string;
   prompt: string;
@@ -870,40 +944,20 @@ interface PendingCheckpoint {
   raisedAtMs: number;
 }
 
-/** The validated guest options bag (see the module docs for the exact
- *  surface). */
+/** The validated guest options bag (§4.1: the guest may pass EXACTLY
+ *  `{ schema, cwd, configOptions, mode }` — any other key rejects
+ *  synchronously listing the valid keys). */
 interface ParsedAgentOptions {
   schema?: Record<string, unknown>;
   cwd?: string;
   configOptions?: Record<string, string | boolean>;
   mode?: string;
-  meta?: Record<string, unknown>;
-  promptMeta?: Record<string, unknown>;
-  tier?: string;
-  toolNames?: string[];
-  disallowedToolNames?: string[];
-  maxSchemaRetries?: number;
-  label?: string;
-  baseInstructions?: string;
-  developerInstructions?: string;
 }
 
-/** The exact option keys the guest may pass (see module docs). */
-const AGENT_OPTION_KEYS = new Set([
-  'schema',
-  'cwd',
-  'configOptions',
-  'mode',
-  'meta',
-  'promptMeta',
-  'tier',
-  'toolNames',
-  'disallowedToolNames',
-  'maxSchemaRetries',
-  'label',
-  'baseInstructions',
-  'developerInstructions',
-]);
+/** The exact option keys the guest may pass (§4.1). */
+const AGENT_OPTION_KEYS = new Set(['schema', 'cwd', 'configOptions', 'mode']);
+/** The human-readable valid-keys list for admission errors. */
+const AGENT_OPTION_KEYS_TEXT = 'schema, cwd, configOptions, mode';
 
 /** The exact option keys a steering payload may carry. */
 const STEER_OPTION_KEYS = new Set(['promptMeta']);
@@ -975,7 +1029,7 @@ export class Broker {
    *  the per-eval deadline bound. */
   private readonly evalBreakReady: Promise<void>;
   private readonly sink: SnapshotSink | undefined;
-  private readonly consoleBuffer: Array<{ level: string; refs: string[]; args: unknown[] }> = [];
+  private readonly consoleBuffer: Array<{ level: string; line: string }> = [];
   private readonly sessions = new Map<string, SessionEntry>();
   /** Steers that arrived before their session existed (the founding call
    *  was still opening) — merged into the session's queue at open. */
@@ -991,9 +1045,42 @@ export class Broker {
   private readonly inFlight = new Map<string, InFlightTask>();
   /** Unsettled agent call ids — one concurrency token each. */
   private readonly agentSlots = new Set<string>();
+  /** §4.1: dispatches QUEUED above the concurrency cap, in dispatch
+   *  order — never a rejection. Each entry carries everything the
+   *  dispatch needs; `kickDispatchQueue` starts them as slots free. */
+  private readonly dispatchQueue: Array<{
+    call: GuestCall;
+    callId: string;
+    modelSpec: string;
+    task: string;
+    optionsJson: string | null;
+    parsed: ParsedAgentOptions;
+  }> = [];
+  /** The cached known-backend vocabulary (see `knownBackends`). */
+  private knownBackendsCache: string[] | undefined;
+  /** In-flight FOLLOW-UP turns (an idle/settled session's followUp/
+   *  steer), keyed by the turn's OWN call id — the §4.2 addressable
+   *  turn: visible in `agents()`/`liveAgents()`, targetable by
+   *  `interrupt`. */
+  private readonly followUpTurns = new Map<string, { entry: SessionEntry; prompt: string }>();
+  /** Live `sleep(ms)` calls, keyed by host-minted tracking ids (not
+   *  guest call ids — sleeps never enter the guest registry or the call
+   *  store). */
+  private readonly sleepCalls = new Map<string, { call: GuestCall; done: boolean }>();
+  private sleepSeq = 0;
+  /** The `reset()` request (see the eval handler): the teardown runs
+   *  after the current eval completes. */
+  private resetRequested = false;
+  /** The retained last settlement-drain error (workspace().diagnostics).
+   *  — the §6.2 demotion: drain failures leave the eval result surface
+   *  entirely and live under the diagnostics field. */
+  private retainedDrainError: { name: string; message: string; atMs: number } | null = null;
+  /** The retained last reconcile summary (workspace().diagnostics —
+   *  the §6.2 demotion). */
+  private lastReconcileReport: ReconcileReport | null = null;
   /** Sessions running a follow-up turn (a queued-steer delivery turn or
-   *  a startedNewTurn prompt on a settled handle) — one concurrency
-   *  token each (a subagent is working even on a follow-up turn). */
+   *  a §4.2 followUp turn on a settled handle) — one concurrency token
+   *  each (a subagent is working even on a follow-up turn). */
   private readonly deliverySlots = new Set<string>();
   /** Call ids settled synchronously at dispatch (refusals) since the
    *  last eval result — reported in that eval's `completed`. */
@@ -1189,7 +1276,7 @@ export class Broker {
     return broker;
   }
 
-  /** The four guest-bridge handlers (see `GuestBridgeHandlers`). */
+  /** The guest-bridge handlers (see `GuestBridgeHandlers`). */
   makeHandlers(): GuestBridgeHandlers {
     return {
       agent: (call, callId, modelSpec, task, optionsJson) => {
@@ -1202,7 +1289,18 @@ export class Broker {
         this.onSteer(call, callId, sessionId, action, payloadJson);
       },
       console: (event) => {
-        this.consoleBuffer.push({ level: event.level, refs: event.refs, args: event.args });
+        this.consoleBuffer.push(event);
+      },
+      // The eval-plane helpers (§4.5/§4.7): sleep settles from a host
+      // timer; workspace()/agents() serve the §4.5 plain-value shapes;
+      // reset() marks the teardown consumed after the current eval.
+      sleep: (call, ms) => {
+        this.onSleep(call, ms);
+      },
+      workspace: () => this.workspaceJson(),
+      agents: () => this.agentsJson(),
+      reset: () => {
+        this.resetRequested = true;
       },
     };
   }
@@ -1261,9 +1359,23 @@ export class Broker {
         this.releaseInterruptedEval();
       }
       // The eval's own provenance pass: bindings this eval created or
-      // rebound (including the `$N` refs its console.logs froze) are
-      // attributed to `eval N` (the registry's snapshot-durable counter).
+      // rebound are attributed to `eval N` (the registry's snapshot-
+      // durable counter).
       this.provenancePass('eval');
+      // The §4.4 result-history global: `_` holds the previous eval's
+      // completion value, IPython-style — the sole replacement for the
+      // deleted `$N` capture globals. Set only when the eval RESOLVED
+      // with a value (an error or a suspension leaves `_` unchanged,
+      // like IPython's). The set borrows the completion handle the
+      // render below still owns.
+      if (outcome.kind === 'value' && completion !== undefined) {
+        try {
+          this.workspace.setGlobal('_', completion as JSValueHandle);
+        } catch {
+          // A failed `_` write must not fail the eval that produced the
+          // value — the result line still renders.
+        }
+      }
       // A SUSPENDED eval's completion wrapper is retained as the
       // active-eval probe (the interrupt tool's eval-break target
       // surface): the wrapper is pending while the eval's continuation
@@ -1293,6 +1405,25 @@ export class Broker {
       // each eval). The operation-end flush coalesces it with the
       // pump's settlement boundary into one debounced write.
       this.sink?.boundary('eval');
+      return result;
+    }).then(async (result) => {
+      // The guest's `reset()` (§4.5): the teardown runs AFTER the
+      // current eval completes — the eval that called reset() finished
+      // normally (its output shipped above), and THEN the workspace is
+      // torn down (dispose the broker's children, then the VM — the
+      // host-side effect the deleted `reset` action performed; the
+      // daemon's next touch creates a fresh workspace). The result
+      // ships after the bounded teardown, so a reset eval resolves on
+      // a workspace that is actually gone.
+      if (this.resetRequested) {
+        this.resetRequested = false;
+        // Runs OUTSIDE this eval's chain slot (the disposal acquires
+        // the chain itself — `dispose` is bounded and generation-fenced,
+        // so a concurrent operation between the two is absorbed by the
+        // first-wins/fenced paths).
+        await this.dispose();
+        this.workspace.dispose();
+      }
       return result;
     });
   }
@@ -1375,6 +1506,14 @@ export class Broker {
           continue;
         }
         if (entry.kind === 'steer') {
+          // A §4.2 followUp QUEUED for delivery (queuedAtMs marker, no
+          // completion): nothing was delivered — the queue rebuild below
+          // re-queues it against its founding session (the answer
+          // semantics: the registry entry stays pending and the rebuilt
+          // delivery settles it with the turn's answer).
+          if (record?.queuedAtMs !== null && record?.queuedAtMs !== undefined && record.deliveredAtMs === null && record.droppedAtMs === null) {
+            continue;
+          }
           // The steer's wire call died with the process: its outcome is
           // unknowable, and re-issuing an injected steer would duplicate
           // the injection. The honest `failed`, durably recorded and
@@ -1445,6 +1584,9 @@ export class Broker {
         this.sink?.boundary('settlement');
         if (drainError !== undefined) throw drainError;
       }
+      // §6.2: the reconcile summary DEMOTES to workspace().diagnostics
+      // (retained; it never rides the eval result surface).
+      this.lastReconcileReport = report;
       return report;
     });
   }
@@ -1465,7 +1607,15 @@ export class Broker {
     for (const record of records) {
       if (record.kind !== 'steer') continue;
       const completion = record.completion;
-      if (completion === null || completion === undefined || completion.value !== 'queued') continue;
+      // TWO undelivered-at-crash shapes re-queue: (a) the delivery-
+      // outcome shape — a completion of `queued` and no delivered/
+      // dropped marker (v1's durable queue); (b) the §4.2 followUp-
+      // answer shape — a queuedAtMs marker and NO completion (the
+      // promise stays pending until the delivery runs; the store's
+      // first completion is the answer the turn will settle).
+      const queuedAnswer = record.queuedAtMs !== null;
+      const queuedOutcome = completion !== null && completion !== undefined && completion.value === 'queued';
+      if (!queuedAnswer && !queuedOutcome) continue;
       if (record.deliveredAtMs !== null || record.droppedAtMs !== null) continue;
       if (record.sessionId === null) continue;
       if (this.isCancelledFoundingCall(record.sessionId)) continue;
@@ -1475,7 +1625,7 @@ export class Broker {
       const entry = this.sessions.get(sessionId);
       if (entry !== undefined) {
         if (entry.queue.some((item) => item.callId === record.callId)) continue;
-        entry.queue.push({ callId: record.callId, ...payload });
+        entry.queue.push({ callId: record.callId, ...payload, call: null, answer: queuedAnswer });
         reQueued.push(record.callId);
       } else {
         const pending = this.pendingSteers.get(sessionId) ?? [];
@@ -1486,6 +1636,18 @@ export class Broker {
       }
     }
     return reQueued;
+  }
+
+  /** Find a QUEUED (cap-pressure) followUp item by its steer call id —
+   *  the interrupt tool's cancel-by-id target for undelivered followUps
+   *  (§4.2: the queued turn is addressable before it starts). */
+  private findQueuedSteer(callId: string): { entry: SessionEntry } | undefined {
+    for (const entry of this.sessions.values()) {
+      if (entry.queue.some((item) => item.callId === callId && item.answer)) {
+        return { entry };
+      }
+    }
+    return undefined;
   }
 
   /** Did this founding call end in an orchestrator-driven cancel (the
@@ -1594,14 +1756,8 @@ export class Broker {
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
         mode: parsed.mode,
-        meta: parsed.meta,
-        tier: parsed.tier,
-        toolNames: parsed.toolNames,
-        disallowedToolNames: parsed.disallowedToolNames,
-        label: parsed.label ?? `repl:${entry.id}`,
+        label: `repl:${entry.id}`,
         runId: entry.id,
-        baseInstructions: parsed.baseInstructions,
-        developerInstructions: parsed.developerInstructions,
         keepSession: true,
         retainSessionLog: true,
       });
@@ -1766,8 +1922,15 @@ export class Broker {
       delivering: false,
       callSettled: false,
       callCancelled: false,
+      backendId: session.backendId ?? backendSegment(entry.modelSpec ?? ''),
       cancelWaiters: new Set(),
-      queue: this.pendingSteers.get(entry.id) ?? [],
+      queue: (this.pendingSteers.get(entry.id) ?? []).map((steer) => ({
+        callId: steer.callId,
+        prompt: steer.prompt,
+        promptMeta: steer.promptMeta,
+        call: null,
+        answer: false,
+      })),
     };
     this.pendingSteers.delete(entry.id);
     this.sessions.set(entry.id, sessionEntry);
@@ -2200,14 +2363,8 @@ export class Broker {
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
         mode: parsed.mode,
-        meta: parsed.meta,
-        tier: parsed.tier,
-        toolNames: parsed.toolNames,
-        disallowedToolNames: parsed.disallowedToolNames,
-        label: parsed.label ?? `repl:${sessionId}`,
+        label: `repl:${sessionId}`,
         runId: sessionId,
-        baseInstructions: parsed.baseInstructions,
-        developerInstructions: parsed.developerInstructions,
         keepSession: true,
         retainSessionLog: true,
       });
@@ -2238,8 +2395,15 @@ export class Broker {
         delivering: false,
         callSettled: true,
         callCancelled: false,
+        backendId: session.backendId ?? backendSegment(record.modelSpec ?? ''),
         cancelWaiters: new Set(),
-        queue: this.pendingSteers.get(sessionId) ?? [],
+        queue: (this.pendingSteers.get(sessionId) ?? []).map((steer) => ({
+          callId: steer.callId,
+          prompt: steer.prompt,
+          promptMeta: steer.promptMeta,
+          call: null,
+          answer: false,
+        })),
       };
       this.pendingSteers.delete(sessionId);
       this.sessions.set(sessionId, entry);
@@ -2272,7 +2436,7 @@ export class Broker {
     action: string,
     prompt: string,
     promptMeta: Record<string, unknown> | undefined,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     return (async () => {
       const entry = await this.lazyReattach(sessionId);
       if (entry === undefined) {
@@ -2291,17 +2455,19 @@ export class Broker {
         if (entry.supportsSteering) {
           return this.runInjectTask(callId, entry, prompt, promptMeta);
         }
-        entry.queue.push({ callId, prompt, promptMeta });
+        entry.queue.push({ callId, prompt, promptMeta, call: null, answer: false });
         return { outcome: 'resolve', value: 'queued' };
       }
-      // The session is idle: the content starts a new turn right now —
-      // unless the workspace cap is exhausted (the six-agent ceiling is
-      // absolute; a follow-up turn IS the subagent working).
+      // The session is idle: followUp/steer mint a NEW turn with its own
+      // call id and resolve with the TURN'S ANSWER (§4.2 — the same
+      // semantics as the live idle path in `onSteer`). Cap pressure
+      // queues the delivery with the pending promise (answer mode).
       if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-        entry.queue.push({ callId, prompt, promptMeta });
-        return { outcome: 'resolve', value: 'queued' };
+        this.recordQueuedDelivery(callId);
+        entry.queue.push({ callId, prompt, promptMeta, call: null, answer: true });
+        return { outcome: 'hold', value: undefined };
       }
-      return this.runPromptTask(callId, entry, prompt, promptMeta);
+      return this.runFollowUpTask(callId, entry, prompt, promptMeta);
     })();
   }
 
@@ -2434,6 +2600,7 @@ export class Broker {
       sessionId: kind === 'steer' ? entry.sessionId : null,
       deliveredAtMs: null,
       droppedAtMs: null,
+      queuedAtMs: null,
     });
   }
 
@@ -2447,7 +2614,7 @@ export class Broker {
   /** A broker-authored console line (the restore path's guest-visible
    *  surfacing): rendered in the next tool result with its level prefix. */
   private warnLine(level: 'info' | 'warn', message: string): void {
-    this.consoleBuffer.push({ level, refs: [], args: [message] });
+    this.consoleBuffer.push({ level, line: message });
   }
 
   /** Fence + durably settle an opening call as cancelled — the
@@ -2520,10 +2687,76 @@ export class Broker {
     // documented outer drain bound ineffective).
     const decision = await this.serialized(async () => {
       this.assertAlive();
+      // §4.1: a QUEUED dispatch (above the cap, not yet started) — the
+      // interrupt removes it from the queue and settles it as cancelled
+      // (recorded first, durable: a restore never re-issues it).
+      const queueIndex = this.dispatchQueue.findIndex((queued) => queued.callId === callId);
+      if (queueIndex >= 0) {
+        const [queued] = this.dispatchQueue.splice(queueIndex, 1);
+        const value = toRejectionValue(
+          new WorkflowError(
+            `call ${callId} was cancelled while queued for dispatch (the concurrency cap)`,
+            CODE.AGENT_CANCELLED,
+            { recoverable: true },
+          ),
+        );
+        this.recordDispatch(callId, 'agent', queued.task, queued.optionsJson, null, queued.modelSpec);
+        this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+        try {
+          this.settleIntoGuest(callId, 'reject', value);
+          this.drain();
+          this.provenancePass('settlement', [callId]);
+          this.sink?.boundary('settlement');
+        } catch (error) {
+          if (error instanceof DrainJobError) {
+            this.warnLine('warn', `settlement drain interrupted after cancelling queued call ${callId}: ${errorLine(error.info)}`);
+            this.sink?.boundary('settlement');
+          } else throw error;
+        }
+        return { kind: 'opening-cancelled' as const };
+      }
+      // §4.2: a QUEUED followUp delivery (cap pressure on an idle
+      // session) — remove it from its session's queue, drop it durably,
+      // and settle the pending steer with the recoverable
+      // AGENT_CANCELLED (the interrupt's cancel-by-id contract).
+      const queuedSteer = this.findQueuedSteer(callId);
+      if (queuedSteer !== undefined) {
+        queuedSteer.entry.queue = queuedSteer.entry.queue.filter((item) => item.callId !== callId);
+        this.callStore.recordDelivery(callId, 'dropped', now());
+        const value = toRejectionValue(
+          new WorkflowError(`followUp ${callId} was cancelled while queued for delivery`, CODE.AGENT_CANCELLED, {
+            recoverable: true,
+          }),
+        );
+        this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+        try {
+          this.settleIntoGuest(callId, 'reject', value);
+          this.drain();
+          this.provenancePass('settlement', [callId]);
+          this.sink?.boundary('settlement');
+        } catch (error) {
+          if (error instanceof DrainJobError) {
+            this.warnLine('warn', `settlement drain interrupted after cancelling queued followUp ${callId}: ${errorLine(error.info)}`);
+            this.sink?.boundary('settlement');
+          } else throw error;
+        }
+        this.kickQueuedDeliveries();
+        return { kind: 'opening-cancelled' as const };
+      }
       const entry = this.sessions.get(callId);
       if (entry !== undefined) {
         if (!entry.busy) return { kind: 'idle' as const };
         return { kind: 'cancel-live' as const, entry };
+      }
+      // §4.2: an in-flight FOLLOW-UP TURN (its own addressable call id)
+      // — cancel the underlying session turn; the turn task settles the
+      // steer call with the recoverable AGENT_CANCELLED. The turn id
+      // rides the decision so phase 3 verifies against the TURN
+      // registry, not the session map (the turn id is not a session
+      // key).
+      const turn = this.followUpTurns.get(callId);
+      if (turn !== undefined) {
+        return { kind: 'cancel-live' as const, entry: turn.entry, turnId: callId };
       }
       // A call whose session is still OPENING (its `openSession` has
       // not resolved — the phase-E review rejection round 7 defect:
@@ -2583,6 +2816,7 @@ export class Broker {
     const entry =
       decision.kind === 'cancel-live' ? decision.entry : await this.lazyReattach(callId);
     if (entry === undefined) return 'failed';
+    const turnId = decision.kind === 'cancel-live' ? decision.turnId : undefined;
     await this.cancelSession(entry);
     // Phase 3 — CONSUME under the chain: the call may have settled (or
     // the session been released) while the wire cancel was in flight. A
@@ -2594,6 +2828,24 @@ export class Broker {
     // never by the guest.)
     return this.serialized(async () => {
       this.assertAlive();
+      // The §4.2 followUp-turn verify: the addressable id keys the TURN
+      // registry, not the session map — a turn that settled while the
+      // wire cancel was in flight reports idle (the settled turn's
+      // answer already shipped), exactly like the founding-call path.
+      if (turnId !== undefined) {
+        // The turn may have ended while the wire cancel was in flight.
+        // A turn that settled NATURALLY (its task resolved with the
+        // answer) reports idle — the answer shipped, the cancel was a
+        // no-op; anything else (the cancel ended it, or it is still
+        // running) reports cancelled — the pump settles the steer call
+        // with the recoverable AGENT_CANCELLED.
+        const task = this.inFlight.get(turnId);
+        if (task !== undefined && task.done) {
+          const result = await task.promise;
+          if (result.outcome === 'resolve') return 'idle';
+        }
+        return 'cancelled';
+      }
       const current = this.sessions.get(callId);
       if (current !== entry) return 'idle';
       if (!current.busy) {
@@ -2863,7 +3115,7 @@ export class Broker {
    *  task string through `structuredContent` while only the text
    *  content was capped). */
   liveAgents(): LiveAgentInfo[] {
-    return [...this.sessions.values()].map((entry) => ({
+    const entries: LiveAgentInfo[] = [...this.sessions.values()].map((entry) => ({
       callId: entry.callId,
       // The modelSpec is GUEST-DERIVED (the `agent(modelSpec, …)`
       // argument): previewed at the engine seam like the task — the
@@ -2883,6 +3135,73 @@ export class Broker {
       supportsSteering: entry.supportsSteering,
       queuedSteers: entry.queue.length,
     }));
+    // The §4.2 addressable followUp turns: each in-flight turn gets its
+    // own entry with its OWN call id (targetable by interrupt) — the
+    // session entry alone would hide the turn behind the founding call.
+    for (const [callId, turn] of this.followUpTurns) {
+      entries.push({
+        callId,
+        modelSpec: turn.entry.modelSpec.length > 200 ? headTail(turn.entry.modelSpec, 200) : turn.entry.modelSpec,
+        task: turn.prompt.length > 200 ? headTail(turn.prompt, 200) : turn.prompt,
+        state: 'running',
+        supportsSteering: turn.entry.supportsSteering,
+        queuedSteers: turn.entry.queue.length,
+      });
+    }
+    return entries;
+  }
+
+  /** The `workspace()` guest handler's JSON (§4.5): the workspace
+   *  manifest as plain data — bindings with the honest handle status
+   *  (`failed` for rejected handle calls — v1 showed rejected and
+   *  fulfilled both as `settled`), the in-flight ids, the raised
+   *  checkpoints, and the §6.2 diagnostics (reconcile summary, retained
+   *  drain error, children-closed). */
+  private workspaceJson(): string {
+    const manifest = this.workspaceManifest();
+    const bindings = manifest.bindings.map((binding) => ({
+      name: binding.name,
+      type: binding.type,
+      sizeBytes: binding.sizeBytes,
+      provenance: binding.provenance,
+      task: binding.task,
+      ...(binding.handleCallId !== null ? { callId: binding.handleCallId } : {}),
+      ...(binding.handleStatus !== null
+        ? {
+            status:
+              binding.handleStatus === 'settled'
+                ? this.isFailedCall(binding.handleCallId)
+                  ? 'failed'
+                  : 'settled'
+                : binding.handleStatus,
+          }
+        : {}),
+    }));
+    return JSON.stringify({
+      bindings,
+      inFlight: this.inFlightIds(),
+      checkpoints: [...this.checkpoints.values()].map((c) => ({ id: c.callId, question: c.question })),
+      diagnostics: {
+        reconcile: this.lastReconcileReport,
+        drainError: this.retainedDrainError,
+        childrenClosed: this.drained,
+      },
+    });
+  }
+
+  /** The `agents()` guest handler's JSON (§4.5): the live-agent entries
+   *  as plain data (v1's liveAgents entries — including the addressable
+   *  followUp turns). */
+  private agentsJson(): string {
+    return JSON.stringify(this.liveAgents());
+  }
+
+  /** Did the store record this handle call as REJECTED (the honest
+   *  `failed` handle status — §4.5)? */
+  private isFailedCall(callId: string | null): boolean {
+    if (callId === null) return false;
+    const completion = this.callStore.lookup(callId)?.completion;
+    return completion !== null && completion !== undefined && completion.outcome === 'reject';
   }
 
   /** The call store (read access for diagnostics and the crash-window
@@ -3062,13 +3381,13 @@ export class Broker {
   private renderWaitResult(completed: string[], drainErrorLine: string | undefined, pending: string[]): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {
-      lines.push(...this.renderConsoleEvent(event));
+      lines.push(this.renderConsoleEvent(event));
     }
     if (drainErrorLine !== undefined) lines.push(drainErrorLine);
-    const capped = applyOutputCaps(lines);
+    // §7: no output caps on guest output.
     return {
-      output: capped.lines,
-      outputTruncated: capped.truncated,
+      output: lines,
+      outputTruncated: false,
       pending,
       checkpoints: this.checkpointSummaries(),
       completed,
@@ -3665,6 +3984,12 @@ export class Broker {
       this.deliverySlots.clear();
       this.openingCalls.clear();
       this.stoppedOpens.clear();
+      // The eval-plane additions: queued dispatches, addressable
+      // followUp turns, and live sleep timers are dropped with the
+      // broker (their guest calls are gone with the workspace).
+      this.dispatchQueue.length = 0;
+      this.followUpTurns.clear();
+      this.sleepCalls.clear();
       // The retained suspended-eval completions and the eval-break
       // signal die with the broker (the handles are released before the
       // VM is disposed by the caller).
@@ -3700,11 +4025,14 @@ export class Broker {
   // ── Guest bridge handlers ─────────────────────────────────────────────
 
   /**
-   * `__host_agent`: validate the options, enforce the concurrency cap,
-   * record the dispatch, and start the async task. Refusals (cap
-   * breach, invalid options) settle the call SYNCHRONOUSLY — recorded
-   * first (a refused call must never be re-issued after a restore) —
-   * they never throw and never queue.
+   * `__host_agent`: ADMISSION VALIDATION (§4.1 — the backend segment
+   * against the registry, the option keys, the `configOptions`
+   * vocabulary where it is knowable; all refusals settle the call
+   * SYNCHRONOUSLY, recorded first — a refused call must never be
+   * re-issued after a restore — and never throw), then the concurrency
+   * gate: dispatches above the cap QUEUE in dispatch order for the
+   * next free slot — NEVER a rejection (the workflow engine's
+   * semantics; `parallel(items.map(...))` must not lose work).
    */
   private onAgent(call: GuestCall, callId: string, modelSpec: string, task: string, optionsJson: string | null): void {
     let parsed: ParsedAgentOptions;
@@ -3714,20 +4042,93 @@ export class Broker {
       this.refuse(call, callId, 'agent', task, optionsJson, error);
       return;
     }
-    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      // The doc deletes the budget vocabulary — `AGENT_LIMIT_EXCEEDED`/
-      // `BUDGET_EXHAUSTED` have no counterpart here (the guest sees
-      // `recoverable: true`, the one signal it needs: a resource refusal
-      // is a recoverable condition, never a hard halt).
-      this.refuse(call, callId, 'agent', task, optionsJson, {
-        name: 'ConcurrencyLimitError',
-        message:
-          `concurrency limit reached: ${this.maxConcurrentAgents} concurrent subagents per ` +
-          `workspace (call ${callId} was not dispatched)`,
-        recoverable: true,
-      });
+    const admissionError = this.validateAdmission(modelSpec, parsed);
+    if (admissionError !== undefined) {
+      this.refuse(call, callId, 'agent', task, optionsJson, admissionError);
       return;
     }
+    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
+      // §4.1: queue-above-cap — the dispatch waits for the next free
+      // slot, in dispatch order. The guest call stays pending until the
+      // dispatch runs; the kick (see `kickDispatchQueue`) starts it the
+      // moment a slot frees. A snapshot taken while queued carries the
+      // call in the guest registry; a restore re-issues it through the
+      // ordinary reconcile arm.
+      this.dispatchQueue.push({ call, callId, modelSpec, task, optionsJson, parsed });
+      return;
+    }
+    this.startDispatch(call, callId, modelSpec, task, optionsJson, parsed);
+  }
+
+  /**
+   * The admission validation (§4.1): the backend segment MUST resolve
+   * against the registry at call time (built-ins plus registered custom
+   * agents) — an unknown segment rejects synchronously, naming the
+   * segment and enumerating the known backends, never a silent route to
+   * the default backend; a spec with no known-backend prefix is an
+   * error. `configOptions` keys validate at admission against the
+   * resolved backend's known vocabulary WHERE IT IS KNOWABLE (the
+   * runner's `knownConfigOptionIds` seam — a backend whose vocabulary
+   * is genuinely dynamic returns undefined and the [C]5 fallback in
+   * `runAgentTask` covers it). Returns the refusal error, or undefined
+   * when the call is admitted. The guest's reserved `'default'`
+   * sentinel (verify/judgePanel route through it) skips the backend
+   * check — host policy routes it to the configured default backend.
+   */
+  private validateAdmission(modelSpec: string, parsed: ParsedAgentOptions): unknown {
+    if (modelSpec !== GUEST_DEFAULT_MODEL_SENTINEL) {
+      const segment = backendSegment(modelSpec);
+      const known = this.knownBackends();
+      if (known !== undefined && !known.includes(segment)) {
+        return new WorkflowError(
+          `unknown backend "${segment}" in model spec "${modelSpec}" (known backends: ${known.join(', ')})`,
+          CODE.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
+      if (parsed.configOptions !== undefined) {
+        const vocabulary = this.runner.knownConfigOptionIds?.(segment);
+        if (vocabulary !== undefined) {
+          for (const key of Object.keys(parsed.configOptions)) {
+            if (!vocabulary.includes(key)) {
+              return new WorkflowError(
+                `configOptions: unknown option "${key}" for backend "${segment}" ` +
+                  `(known options: ${vocabulary.length > 0 ? vocabulary.join(', ') : 'none'})`,
+                CODE.SCRIPT_VALIDATION_ERROR,
+                { recoverable: false },
+              );
+            }
+          }
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /** The known backend ids (built-ins plus registered custom agents),
+   *  lowercased and sorted — cached (the registry is fixed at runner
+   *  construction). Undefined when the runner exposes no registry. */
+  private knownBackends(): string[] | undefined {
+    if (this.knownBackendsCache !== undefined) return this.knownBackendsCache;
+    const list = this.runner.listBackends?.();
+    if (list === undefined) return undefined;
+    const set = new Set<string>();
+    for (const id of list) set.add(id.toLowerCase());
+    this.knownBackendsCache = [...set].sort();
+    return this.knownBackendsCache;
+  }
+
+  /** The dispatch body (shared by the live path and the queued path):
+   *  record the dispatch, register the deferred and the concurrency
+   *  token, and start the async task. */
+  private startDispatch(
+    call: GuestCall,
+    callId: string,
+    modelSpec: string,
+    task: string,
+    optionsJson: string | null,
+    parsed: ParsedAgentOptions,
+  ): void {
     this.recordDispatch(callId, 'agent', task, optionsJson, null, modelSpec);
     this.deferreds.set(callId, call);
     this.agentSlots.add(callId);
@@ -3804,6 +4205,15 @@ export class Broker {
       question: question ?? '',
       optionsJson,
       raisedAtMs: now(),
+    });
+    // The §4.3 output line: a raised checkpoint surfaces as
+    // `checkpoint c9: <question>` in the eval's output stream — the
+    // question rendered as PLAIN head+tail metadata text (the retained
+    // 200-char preview, §7; the §4.3 fix: never a double-JSON-quoted
+    // form).
+    this.consoleBuffer.push({
+      level: 'log',
+      line: `checkpoint ${callId}: ${headTailDescription(question ?? '', 200)}`,
     });
     return undefined;
   }
@@ -3946,35 +4356,68 @@ export class Broker {
         this.deferreds.set(callId, call);
         this.trackInFlight(callId, 'steer', task);
       } else {
-        // Queued for next-turn delivery — the honest immediate outcome.
-        entry.queue.push({ callId, prompt, promptMeta });
+        // Queued for next-turn delivery — the honest immediate outcome
+        // (the MID-TURN delivery-outcome vocabulary, §4.2).
+        entry.queue.push({ callId, prompt, promptMeta, call: null, answer: false });
         this.settleSteerSync(call, callId, 'queued');
       }
       return;
     }
 
-    // The session is idle: the content starts a new turn right now —
-    // UNLESS the workspace cap is exhausted (a follow-up turn IS the
-    // subagent working; the six-agent ceiling is absolute). Cap pressure
-    // queues the steer on the same durable queue with the honest
-    // `queued` outcome; `kickQueuedDeliveries` starts it the moment a
-    // slot frees (review regression: idle-handle follow-ups used to
-    // start without checking the cap, so a maxConcurrentAgents=1
-    // workspace could run two subagent turns concurrently).
+    // The session is idle: followUp/steer mint a NEW TURN with its own
+    // call id and resolve with the TURN'S ANSWER (§4.2 — idle-session
+    // steer is the followUp alias; never the bare 'startedNewTurn'
+    // token, never a discarded turn). UNLESS the workspace cap is
+    // exhausted (a follow-up turn IS the subagent working; the
+    // six-agent ceiling is absolute): the steer queues on the durable
+    // delivery queue — its promise stays PENDING until the delivery
+    // turn runs and settles with the answer; `kickQueuedDeliveries`
+    // starts it the moment a slot frees (review regression: idle-handle
+    // follow-ups used to start without checking the cap, so a
+    // maxConcurrentAgents=1 workspace could run two subagent turns
+    // concurrently).
     if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      entry.queue.push({ callId, prompt, promptMeta });
-      this.settleSteerSync(call, callId, 'queued');
+      this.recordQueuedDelivery(callId);
+      this.deferreds.set(callId, call);
+      entry.queue.push({ callId, prompt, promptMeta, call, answer: true });
       return;
     }
-    const task = this.runPromptTask(callId, entry, prompt, promptMeta);
+    const task = this.runFollowUpTask(callId, entry, prompt, promptMeta);
     this.deferreds.set(callId, call);
     this.trackInFlight(callId, 'steer', task);
   }
 
+  /** The durable QUEUED marker for a cap-pressure followUp (§4.2): the
+   *  steer's store record gains `queuedAtMs` so a restore's queue
+   *  rebuild re-queues it for delivery exactly once (the completion is
+   *  deliberately NOT recorded — the promise resolves with the turn's
+   *  ANSWER when the delivery runs, and the store's first completion is
+   *  the settlement authority). */
+  private recordQueuedDelivery(callId: string): void {
+    this.callStore.recordQueued(callId, now());
+  }
+
   /** `__host_console`: buffer the event; the next tool result renders it
-   *  (one line per `$N` ref, non-log levels prefixed). */
-  private onConsole(event: { level: string; refs: string[]; args: unknown[] }): void {
+   *  (the guest-rendered one line per call, non-log levels prefixed). */
+  private onConsole(event: { level: string; line: string }): void {
     this.consoleBuffer.push(event);
+  }
+
+  /** `__host_sleep`: settle the call from a HOST-side timer (the VM
+   *  itself stays timer-free — §4.7). The settlement is tracked under a
+   *  host-minted key (not a guest call id — sleeps never enter the
+   *  guest registry or the call store) so the pump's readiness probe
+   *  sees it; the pump resolves the guest promise and drains the
+   *  continuation. A timer firing after the broker was disposed is a
+   *  harmless no-op (the call is gone with the workspace). */
+  private onSleep(call: GuestCall, ms: number): void {
+    const key = `sleep${++this.sleepSeq}`;
+    const task = { call, done: false };
+    this.sleepCalls.set(key, task);
+    const delay = Number.isFinite(ms) && ms > 0 ? Math.min(ms, 2 ** 31 - 1) : 0;
+    setTimeout(() => {
+      task.done = true;
+    }, delay);
   }
 
   // ── Dispatch, tasks, settlement ───────────────────────────────────────
@@ -4007,6 +4450,7 @@ export class Broker {
       sessionId,
       deliveredAtMs: null,
       droppedAtMs: null,
+      queuedAtMs: null,
     });
   }
 
@@ -4094,14 +4538,8 @@ export class Broker {
         cwd: parsed.cwd ?? this.workspace.projectDir,
         configOptions: parsed.configOptions,
         mode: parsed.mode,
-        meta: parsed.meta,
-        tier: parsed.tier,
-        toolNames: parsed.toolNames,
-        disallowedToolNames: parsed.disallowedToolNames,
-        label: parsed.label ?? `repl:${callId}`,
+        label: `repl:${callId}`,
         runId: callId,
-        baseInstructions: parsed.baseInstructions,
-        developerInstructions: parsed.developerInstructions,
         keepSession: true,
         retainSessionLog: true,
       });
@@ -4143,13 +4581,20 @@ export class Broker {
         callId,
         modelSpec,
         task,
+        backendId: session.backendId ?? backendSegment(modelSpec),
         supportsSteering: session.capabilities?.supportsSteering === true,
         busy: false,
         delivering: false,
         callSettled: false,
         callCancelled: false,
         cancelWaiters: new Set(),
-        queue: this.pendingSteers.get(callId) ?? [],
+        queue: (this.pendingSteers.get(callId) ?? []).map((steer) => ({
+          callId: steer.callId,
+          prompt: steer.prompt,
+          promptMeta: steer.promptMeta,
+          call: null,
+          answer: false,
+        })),
       };
       this.pendingSteers.delete(callId);
       this.sessions.set(callId, entry);
@@ -4165,7 +4610,7 @@ export class Broker {
       // and tracked, so dispose releases it).
       this.callStore.recordAttached(callId, session.sessionId, now(), session.backendId ?? null);
       entry.busy = true;
-      const turn = await session.prompt(task, { promptMeta: parsed.promptMeta });
+      const turn = await session.prompt(task);
       this.assertNormalStopReason(turn.stopReason, callId);
       const value =
         parsed.schema !== undefined
@@ -4183,7 +4628,84 @@ export class Broker {
         this.openingCalls.delete(callId);
         this.dropPendingSteers(callId, error);
       }
-      return { outcome: 'reject', value: toRejectionValue(error) };
+      // The §4.6 attribution: the rejecting call names its resolved
+      // backend. The session's own backend id when it opened, else the
+      // admission-validated segment.
+      const value = toRejectionValue(error);
+      const backend =
+        openedSession !== undefined
+          ? (openedSession.backendId ?? backendSegment(modelSpec))
+          : backendSegment(modelSpec);
+      (value as { replBackend?: string }).replBackend = backend;
+      // The [C]5 fallback: a backend whose config-option vocabulary is
+      // genuinely dynamic cannot be validated at admission — its LATE
+      // error MUST name the offending key. When the call carried
+      // configOptions and the failure does not already name one, one
+      // bounded diagnostic reopen WITHOUT the config options decides
+      // whether the config caused the failure; if it did, the rejection
+      // names the offending key(s) explicitly.
+      if (openedSession === undefined && parsed.configOptions !== undefined && Object.keys(parsed.configOptions).length > 0) {
+        return {
+          outcome: 'reject',
+          value: await this.configOptionLateError(callId, modelSpec, parsed, value, backendIdOverride),
+        };
+      }
+      return { outcome: 'reject', value };
+    }
+  }
+
+  /**
+   * The [C]5 fallback body: decide whether the openSession failure was
+   * the config options' doing and, when it was, guarantee the rejection
+   * NAMES the offending key. The diagnostic reopen (configOptions
+   * omitted, session NOT kept open) is the only admission-unknowable
+   * vocabulary the engine can consult — it runs once, on the failure
+   * path only, before any prompt was sent (no paid spawn).
+   */
+  private async configOptionLateError(
+    callId: string,
+    modelSpec: string,
+    parsed: ParsedAgentOptions,
+    original: { name: string; message: string; code?: string; recoverable?: boolean },
+    backendIdOverride: string | null,
+  ): Promise<{ name: string; message: string; code?: string; recoverable?: boolean }> {
+    const keys = Object.keys(parsed.configOptions!);
+    // The backend may already have named the key in its own message.
+    if (keys.some((key) => original.message.includes(key))) return original;
+    let diagnostic: BrokerSession | undefined;
+    try {
+      diagnostic = await this.runner.openSession({
+        model: backendIdOverride ?? (modelSpec === GUEST_DEFAULT_MODEL_SENTINEL ? undefined : modelSpec),
+        schema: parsed.schema as never,
+        cwd: parsed.cwd ?? this.workspace.projectDir,
+        mode: parsed.mode,
+        label: `repl:${callId}`,
+        runId: callId,
+        keepSession: false,
+        retainSessionLog: true,
+      });
+    } catch {
+      // The diagnostic open failed WITHOUT the config options too — the
+      // failure was not config-caused; rethrow the original error.
+      return original;
+    }
+    try {
+      // The config options caused the failure: name the offending key
+      // (exactly, when the call carried one; exhaustively — with the
+      // backend's own error — when it carried several and the adapter
+      // publishes no per-key seam to isolate further).
+      const carried = keys.map((key) => `"${key}"`).join(', ');
+      const backend = diagnostic.backendId ?? backendSegment(modelSpec);
+      return {
+        name: 'ConfigOptionsError',
+        message:
+          `backend ${backend} rejected the call's configOptions — offending key ` +
+          (keys.length === 1 ? carried : `among: ${carried}`) +
+          ` (backend error: ${original.message})`,
+        recoverable: false,
+      };
+    } finally {
+      void Promise.resolve(diagnostic.release()).catch(() => undefined);
     }
   }
 
@@ -4202,8 +4724,7 @@ export class Broker {
         // A failing store must not silence the visible warning.
         this.consoleBuffer.push({
           level: 'warn',
-          refs: [],
-          args: [`steer ${steer.callId} (on ${callId}): queued delivery dropped, but its drop could not be recorded: ${toRejectionValue(recordError).message}`],
+          line: `steer ${steer.callId} (on ${callId}): queued delivery dropped, but its drop could not be recorded: ${toRejectionValue(recordError).message}`,
         });
       }
       this.warnDeliveryFailure(steer.callId, callId, error);
@@ -4217,11 +4738,10 @@ export class Broker {
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
   ): Promise<unknown> {
-    const promptMeta = parsed.promptMeta;
     const session = entry.session;
     const structuredSession: StructuredSession = {
       prompt: async (repromptText: string) => {
-        const turn = await session.prompt(repromptText, { promptMeta });
+        const turn = await session.prompt(repromptText);
         // A repair turn that refuses / truncates / cancels must surface
         // distinctly instead of silently continuing the ladder (the
         // runner's own ladder does the same).
@@ -4233,8 +4753,7 @@ export class Broker {
       tryNative: () => session.rawStructuredOutput() ?? parseFinalJson(session.finalMessageText()),
     };
     return resolveStructuredOutput(structuredSession, parsed.schema as never, {
-      maxSchemaRetries: parsed.maxSchemaRetries,
-      label: parsed.label ?? `repl:${entry.callId}`,
+      label: `repl:${entry.callId}`,
     });
   }
 
@@ -4308,8 +4827,13 @@ export class Broker {
     }
   }
 
-  /** The steering prompt for an idle session (extension and no-extension
-   *  alike): the content starts a new turn. */
+  /** The delivery turn for a DELIVERY-OUTCOME item (a mid-turn no-
+   *  extension steer whose guest call already resolved `queued` at
+   *  enqueue, and the still-opening-call boundary deliveries): the
+   *  content folds into the session's next turn; the turn's own result
+   *  has no separate addressable call (its promise settled at enqueue —
+   *  the §4.2 delivery-outcome vocabulary). The delivered marker rides
+   *  the session's handoff acknowledgment exactly as before. */
   private async runPromptTask(
     callId: string,
     entry: SessionEntry,
@@ -4364,6 +4888,75 @@ export class Broker {
       this.warnDeliveryFailure(callId, entry.callId, error);
       return { outcome: 'resolve', value: 'failed' };
     } finally {
+      this.endDeliveryTurn(entry);
+    }
+  }
+
+  /**
+   * The §4.2 FOLLOW-UP TURN: a followUp/steer on a settled or idle
+   * session mints a NEW turn with its own call id (this steer call's
+   * own id — the addressable turn, visible in `agents()`/`liveAgents()`
+   * and targetable by `interrupt`) and its promise resolves with the
+   * TURN'S ANSWER — the final assistant text, the same value semantics
+   * as a schema-less `agent()` (never the bare `startedNewTurn` token,
+   * never a discarded turn). A turn failure rejects the call with the
+   * attributed error (the §4.6 call-id + backend attribution), and a
+   * cancellation rejects with the recoverable `AGENT_CANCELLED` family.
+   */
+  private async runFollowUpTask(
+    callId: string,
+    entry: SessionEntry,
+    prompt: string,
+    promptMeta: Record<string, unknown> | undefined,
+  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+    this.followUpTurns.set(callId, { entry, prompt });
+    try {
+      entry.busy = true;
+      entry.delivering = entry.callSettled;
+      if (entry.delivering) this.deliverySlots.add(entry.callId);
+      const turnPromise = entry.session.prompt(prompt, {
+        promptMeta,
+        onHandoff: () => {
+          // The delivered marker for a QUEUED followUp (its store record
+          // carries the queued marker, no completion — see
+          // `recordQueuedDelivery`): once handed to the backend the
+          // payload is on the wire; a restore must not re-queue it.
+          const record = this.callStore.lookup(callId);
+          if (record !== undefined && record.queuedAtMs !== null && record.deliveredAtMs === null) {
+            this.callStore.recordDelivery(callId, 'delivered', now());
+          }
+        },
+      });
+      const turn = await turnPromise;
+      this.assertNormalStopReason(turn.stopReason, callId);
+      // The turn's answer: the latest turn's assistant text, shaped like
+      // a schema-less agent call (the empty-output gate included).
+      return { outcome: 'resolve', value: this.finalText(entry) };
+    } catch (error) {
+      if (isCancellation(error)) {
+        // The follow-up turn was cancelled (the interrupt tool's id
+        // path, or the founding handle's cancel) — the remaining queue
+        // is dropped (the turn stream it was queued onto is gone) and
+        // the call rejects recoverable, the AGENT_CANCELLED family.
+        this.dropQueue(entry);
+        return {
+          outcome: 'reject',
+          value: toRejectionValue(
+            new WorkflowError(`followUp ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
+              recoverable: true,
+              agentLabel: `repl:${callId}`,
+            }),
+          ),
+        };
+      }
+      // The §4.6 attribution: the rejecting followUp names its call id
+      // (the guest library stamps it on settlement) and its resolved
+      // backend (stamped here).
+      const value = toRejectionValue(error);
+      (value as { replBackend?: string }).replBackend = entry.backendId;
+      return { outcome: 'reject', value };
+    } finally {
+      this.followUpTurns.delete(callId);
       this.endDeliveryTurn(entry);
     }
   }
@@ -4427,8 +5020,7 @@ export class Broker {
     const message = toRejectionValue(error).message;
     this.consoleBuffer.push({
       level: 'warn',
-      refs: [],
-      args: [`steer ${steerCallId} (on ${sessionCallId}): delivery failed: ${message}`],
+      line: `steer ${steerCallId} (on ${sessionCallId}): delivery failed: ${message}`,
     });
   }
 
@@ -4447,6 +5039,17 @@ export class Broker {
     const next = entry.queue[0];
     if (next === undefined) return;
     entry.queue.shift();
+    // The §4.2 split: an answer-mode item is a followUp/steer whose
+    // guest call is still pending — the delivery turn settles it with
+    // the TURN'S ANSWER (runFollowUpTask); a delivery-outcome item
+    // already resolved `queued` at enqueue and its delivery folds into
+    // the session's next turn (runPromptTask).
+    if (next.answer) {
+      const task = this.runFollowUpTask(next.callId, entry, next.prompt, next.promptMeta);
+      if (next.call !== null) this.deferreds.set(next.callId, next.call);
+      this.trackInFlight(next.callId, 'steer', task);
+      return;
+    }
     void this.runPromptTask(next.callId, entry, next.prompt, next.promptMeta);
   }
 
@@ -4455,10 +5058,19 @@ export class Broker {
    *  call settling or a follow-up turn ending). This is the ONLY
    *  scheduler for queued payloads, including cap-pressure queues on
    *  idle sessions: without the global pass, a steer queued on an idle
-   *  session would wait forever for its own session's turn to end. */
+   *  session would wait forever for its own session's turn to end. The
+   *  §4.1 queued DISPATCHES run first (in dispatch order — an agent
+   *  dispatch queueing never loses its place to a later steering
+   *  delivery). */
   private kickQueuedDeliveries(): void {
     for (;;) {
       if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;
+      // §4.1: queued dispatches first, FIFO.
+      const queued = this.dispatchQueue.shift();
+      if (queued !== undefined) {
+        this.startDispatch(queued.call, queued.callId, queued.modelSpec, queued.task, queued.optionsJson, queued.parsed);
+        continue;
+      }
       let candidate: SessionEntry | undefined;
       for (const entry of this.sessions.values()) {
         if (!entry.busy && !entry.callCancelled && entry.queue.length > 0) {
@@ -4493,7 +5105,33 @@ export class Broker {
     const settled: string[] = [];
     for (;;) {
       const ready = [...this.inFlight.values()].filter((t) => t.done);
-      if (ready.length === 0) break;
+      const readySleeps = [...this.sleepCalls.entries()].filter(([, task]) => task.done);
+      if (ready.length === 0 && readySleeps.length === 0) break;
+      for (const [sleepKey, sleepTask] of readySleeps) {
+        // A `sleep(ms)` settlement (the host timer fired): settle the
+        // guest call directly (no store record — sleeps are never
+        // registry calls), then one drain + provenance pass like every
+        // settled call. A drain failure keeps the already-settled ids
+        // and reports the error like the agent/steer arm.
+        this.sleepCalls.delete(sleepKey);
+        try {
+          sleepTask.call.resolve(undefined);
+        } catch {
+          // The call was already settled (first-wins) — nothing to do.
+        }
+        try {
+          this.drain(boundDeadlineMs);
+          this.provenancePass('settlement');
+          this.sink?.boundary('settlement');
+        } catch (error) {
+          if (error instanceof DrainJobError) {
+            this.sink?.boundary('settlement');
+            this.retainedDrainError = { name: error.info.name, message: error.info.message, atMs: now() };
+            return { settled, drainError: error };
+          }
+          throw error;
+        }
+      }
       for (const entry of ready) {
         const outcome: { outcome: 'resolve' | 'reject' | 'hold'; value: unknown } = await entry.promise;
         if (outcome.outcome === 'hold') {
@@ -4558,6 +5196,10 @@ export class Broker {
             // changed) and the operation-end flush must have a dirty
             // boundary to persist it.
             this.sink?.boundary('settlement');
+            // §6.2: the drain error DEMOTES to workspace().diagnostics
+            // (retained; the eval surface reports it only as a line in
+            // the next result).
+            this.retainedDrainError = { name: error.info.name, message: error.info.message, atMs: now() };
             return { settled, drainError: error };
           }
           throw error;
@@ -4935,16 +5577,18 @@ export class Broker {
   ): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {
-      lines.push(...this.renderConsoleEvent(event));
+      lines.push(this.renderConsoleEvent(event));
     }
     if (pumpDrainErrorLine !== undefined) lines.push(pumpDrainErrorLine);
     if (outcome.kind === 'error') {
       lines.push(errorLine(outcome.error));
     }
-    const capped = applyOutputCaps(lines);
+    // §7: the engine applies NO output caps to guest output — the lines
+    // ship verbatim (the Python posture). `outputTruncated` is always
+    // false (vestigial until the surface phase deletes the field).
     const result: ReplEvalResult = {
-      output: capped.lines,
-      outputTruncated: capped.truncated,
+      output: lines,
+      outputTruncated: false,
       pending: this.pendingIds(),
       checkpoints: this.checkpointSummaries(),
       completed,
@@ -4959,15 +5603,11 @@ export class Broker {
     return result;
   }
 
-  /** One console event → one preview line per `$N` ref (non-log levels
-   *  prefixed `warn:`/`error:`/…), or the JSON-safe fallback when the
-   *  event carries no refs (the broker's own warn lines). */
-  private renderConsoleEvent(event: { level: string; refs: string[]; args: unknown[] }): string[] {
+  /** One console event → its guest-rendered line (non-log levels
+   *  prefixed `warn:`/`error:`/…). */
+  private renderConsoleEvent(event: { level: string; line: string }): string {
     const prefix = event.level === 'log' ? '' : `${event.level}: `;
-    if (event.refs.length === 0) {
-      return event.args.map((arg) => `${prefix}${renderFallback(arg)}`);
-    }
-    return event.refs.map((ref, index) => `${prefix}${this.workspace.renderRef(ref, event.args[index])}`);
+    return `${prefix}${event.line}`;
   }
 
   /** The pending call ids, in registry order. */
@@ -4982,7 +5622,10 @@ export class Broker {
   checkpointSummaries(): CheckpointSummary[] {
     return [...this.checkpoints.values()].map((c) => ({
       id: c.callId,
-      question: stringDescription(c.question),
+      // The §4.3 double-JSON-quote fix: the question renders as PLAIN
+      // head+tail metadata text (the retained 200-char metadata preview,
+      // §7) — never a JSON-stringified quoted form.
+      question: headTailDescription(c.question, 200),
     }));
   }
 
@@ -5009,9 +5652,13 @@ export class Broker {
     const opts = raw as Record<string, unknown>;
     for (const key of Object.keys(opts)) {
       if (!AGENT_OPTION_KEYS.has(key)) {
-        throw new WorkflowError(`agent options: unknown option "${key}"`, CODE.SCRIPT_VALIDATION_ERROR, {
-          recoverable: false,
-        });
+        // §4.1: an unknown option key rejects synchronously, and the
+        // error lists the valid keys (the enumerated teaching error).
+        throw new WorkflowError(
+          `agent options: unknown option "${key}" (valid options: ${AGENT_OPTION_KEYS_TEXT})`,
+          CODE.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
       }
     }
     const parsed: ParsedAgentOptions = {};
@@ -5035,26 +5682,6 @@ export class Broker {
       parsed.configOptions = requireStringBoolRecord(opts.configOptions, 'configOptions');
     }
     if (opts.mode !== undefined) parsed.mode = requireString(opts.mode, 'mode');
-    if (opts.meta !== undefined) parsed.meta = requireRecord(opts.meta, 'meta');
-    if (opts.promptMeta !== undefined) parsed.promptMeta = requireRecord(opts.promptMeta, 'promptMeta');
-    if (opts.tier !== undefined) parsed.tier = requireString(opts.tier, 'tier');
-    if (opts.toolNames !== undefined) parsed.toolNames = requireStringArray(opts.toolNames, 'toolNames');
-    if (opts.disallowedToolNames !== undefined) {
-      parsed.disallowedToolNames = requireStringArray(opts.disallowedToolNames, 'disallowedToolNames');
-    }
-    if (opts.maxSchemaRetries !== undefined) {
-      if (typeof opts.maxSchemaRetries !== 'number' || !Number.isFinite(opts.maxSchemaRetries) || opts.maxSchemaRetries < 0) {
-        throw new WorkflowError('agent options: "maxSchemaRetries" must be a non-negative number', CODE.SCRIPT_VALIDATION_ERROR, {
-          recoverable: false,
-        });
-      }
-      parsed.maxSchemaRetries = opts.maxSchemaRetries;
-    }
-    if (opts.label !== undefined) parsed.label = requireString(opts.label, 'label');
-    if (opts.baseInstructions !== undefined) parsed.baseInstructions = requireString(opts.baseInstructions, 'baseInstructions');
-    if (opts.developerInstructions !== undefined) {
-      parsed.developerInstructions = requireString(opts.developerInstructions, 'developerInstructions');
-    }
     return parsed;
   }
 
@@ -5483,25 +6110,51 @@ function isCancellation(error: unknown): boolean {
   return false;
 }
 
-/** The eval error line: `Name: message`, head+tail capped (the harness's
- *  "thrown-exception message" convention; the harness renders the
- *  uncaught top-level rejection via the console bridge as an `error:`
- *  preview line — this is the in-eval throw, plain). */
+/** The §4.6 uncaught-eval-error rendering: the error name and message,
+ *  the guest stack's top frames with LINE NUMBERS in the submitted code
+ *  (the eval's filename — the broker evals under the VM's default
+ *  `'<repl>'`), and — when the error came from a subagent call — the
+ *  call id and the resolved backend (the guest library stamps
+ *  `replCallId`, the broker stamps `replBackend` — see
+ *  `EvalErrorInfo`). */
 function errorLine(info: EvalErrorInfo): string {
-  return headTailDescription(`${info.name}: ${info.message}`, 120);
+  let line = `${info.name}: ${info.message}`;
+  if (info.replCallId !== undefined) {
+    line += ` (call ${info.replCallId}${info.replBackend !== undefined ? ` on backend ${info.replBackend}` : ''})`;
+  }
+  const frames = replStackFrames(info.stack);
+  if (frames.length > 0) line += '\n' + frames.join('\n');
+  return line;
 }
 
-/** The JSON-safe fallback rendering for ref-less console events (the
- *  broker's own warn lines). */
-function renderFallback(arg: unknown): string {
-  let s: string;
-  try {
-    s = JSON.stringify(arg);
-  } catch {
-    s = String(arg);
+/** The guest stack's frames with line numbers in the submitted code:
+ *  quickjs stacks are newest-first, so the FIRST matching frames are the
+ *  top of the guest stack; frames from the guest library (filename
+ *  `'<guest-library>'`) and the host are skipped. At most 8 frames — the
+ *  render is attribution, not a transcript (the §4.6 rule: name, message,
+ *  top frames with line numbers). */
+function replStackFrames(stack: string | undefined): string[] {
+  if (stack === undefined) return [];
+  const frames: string[] = [];
+  for (const raw of stack.split('\n')) {
+    if (frames.length >= 8) break;
+    const match = /^\s*at\s+(?:(.+?)\s+\()?<repl>:(\d+):(\d+)\)?\s*$/.exec(raw);
+    if (match === null) continue;
+    frames.push(
+      match[1] !== undefined
+        ? `    at ${match[1]} (<repl>:${match[2]}:${match[3]})`
+        : `    at <repl>:${match[2]}:${match[3]}`,
+    );
   }
-  if (s === undefined) return '…';
-  return s.length > 400 ? `${s.slice(0, 399)}…` : s;
+  return frames;
+}
+
+/** The backend segment of a model spec (the §4.1 grammar: `"backend/
+ *  model"` — the first `/`-delimited segment, ASCII-lowercased; a bare
+ *  `"backend"` spec is the whole string). */
+function backendSegment(modelSpec: string): string {
+  const slash = modelSpec.indexOf('/');
+  return (slash >= 0 ? modelSpec.slice(0, slash) : modelSpec).toLowerCase();
 }
 
 /** Recover a queued steer's payload from its store record (the verbatim

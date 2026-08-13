@@ -38,9 +38,13 @@ import { JSValueHandle, type HostFunction, type QuickJS } from 'quickjs-wasi';
 import {
   GUEST_SURFACE_KEY,
   HOST_AGENT,
+  HOST_AGENTS,
   HOST_CHECKPOINT,
   HOST_CONSOLE,
+  HOST_RESET,
+  HOST_SLEEP,
   HOST_STEER,
+  HOST_WORKSPACE,
   buildGuestLibrarySource,
 } from './guest/guest-library.js';
 import { getVmShim, type ReplVm } from './vm.js';
@@ -51,17 +55,16 @@ import { getPropRaw, hasOwnRaw, readOwnDataProperty, readValue, readValueComplet
 export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug';
 
 /**
- * One console event crossing the bridge: `refs` names the real realm
- * globals just created (one per logged argument, in argument order) — the
- * authoritative channel; `args` is the best-effort JSON-safe encoding
- * (capped; the full value always lives untruncated in `$N`).
+ * One console event crossing the bridge: `line` is the ONE joined line
+ * the guest rendered for this call (the arguments' §4.4 reprs joined
+ * with a single space — the per-argument `$N` capture system is
+ * deleted). The guest computed it in the realm; the handler may render
+ * it verbatim.
  */
 export interface ConsoleEvent {
   level: ConsoleLevel;
-  /** `["$14", …]` — the $N realm globals holding the frozen arguments. */
-  refs: string[];
-  /** Best-effort JSON-safe encodings of the same arguments. */
-  args: unknown[];
+  /** The rendered line (one per console.* call). */
+  line: string;
 }
 
 /**
@@ -384,13 +387,37 @@ export interface GuestBridgeHandlers {
     payloadJson: string | null,
   ): void;
   /**
-   * A console event (log/info/warn/error/debug). The frozen arguments are
-   * already stored in the realm as the `$N` globals named by
-   * `event.refs` — the handler renders them through the previewer (never
-   * guest code). A throw becomes a guest error inside the library's own
-   * swallow-guard — console never breaks guest code by contract.
+   * A console event (log/info/warn/error/debug): the guest-rendered ONE
+   * line per call (see `ConsoleEvent`). A throw becomes a guest error
+   * inside the library's own swallow-guard — console never breaks guest
+   * code by contract.
    */
   console(event: ConsoleEvent): void;
+  /**
+   * A `sleep(ms)` call: settle `call` from a HOST-side timer (the VM
+   * itself stays timer-free). The promise resolves undefined after the
+   * host timer fires; the guest's continuation resumes at the next
+   * settlement drain.
+   */
+  sleep(call: GuestCall, ms: number): void;
+  /**
+   * A `workspace()` call: return the JSON-encoded workspace value
+   * (`{ bindings, inFlight, checkpoints, diagnostics }` — see the
+   * roadmap doc's §4.5 shape). The guest parses it into a plain value.
+   */
+  workspace(): string;
+  /**
+   * An `agents()` call: return the JSON-encoded array of live-agent
+   * entries (`{ callId, modelSpec, task, state, supportsSteering,
+   * queuedSteers }`).
+   */
+  agents(): string;
+  /**
+   * A `reset()` call: mark the teardown request. The host tears the
+   * workspace down AFTER the current eval completes; the call itself
+   * returns nothing meaningful.
+   */
+  reset(): void;
 }
 
 /**
@@ -434,13 +461,17 @@ export function registerGuestHostCallbacks(vm: ReplVm, handlers: GuestBridgeHand
   }
 }
 
-/** The four (name, host function) pairs the bridge installs. */
+/** The (name, host function) pairs the bridge installs. */
 function makeCallbacks(vm: ReplVm, handlers: GuestBridgeHandlers): Array<[string, HostFunction]> {
   return [
     [HOST_AGENT, makeAgentHostFunction(vm, handlers)],
     [HOST_CHECKPOINT, makeCheckpointHostFunction(vm, handlers)],
     [HOST_STEER, makeSteerHostFunction(vm, handlers)],
     [HOST_CONSOLE, makeConsoleHostFunction(vm, handlers)],
+    [HOST_SLEEP, makeSleepHostFunction(vm, handlers)],
+    [HOST_WORKSPACE, makeWorkspaceHostFunction(vm, handlers)],
+    [HOST_AGENTS, makeAgentsHostFunction(vm, handlers)],
+    [HOST_RESET, makeResetHostFunction(vm, handlers)],
   ];
 }
 
@@ -563,7 +594,7 @@ function makeConsoleHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): Hos
         payload = undefined;
       }
       if (isConsolePayload(payload)) {
-        handlers.console({ level, refs: payload.refs, args: payload.args });
+        handlers.console({ level, line: payload.line });
       }
     }
     return shim.undefined;
@@ -574,14 +605,75 @@ function isConsoleLevel(level: string): level is ConsoleLevel {
   return level === 'log' || level === 'info' || level === 'warn' || level === 'error' || level === 'debug';
 }
 
-function isConsolePayload(value: unknown): value is { refs: string[]; args: unknown[] } {
+function isConsolePayload(value: unknown): value is { line: string } {
   if (typeof value !== 'object' || value === null) return false;
-  const v = value as { refs?: unknown; args?: unknown };
-  return (
-    Array.isArray(v.refs) &&
-    v.refs.every((r) => typeof r === 'string') &&
-    Array.isArray(v.args)
-  );
+  const v = value as { line?: unknown };
+  return typeof v.line === 'string';
+}
+
+/**
+ * The `__host_sleep` shape: same pattern as `__host_agent` — mint a
+ * `GuestCall`, hand it to the handler (which settles it from a host-side
+ * timer), return its promise handle into the realm. `ms` is validated
+ * (a non-number is a guest protocol violation, like the other host
+ * functions' string validations).
+ */
+function makeSleepHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
+    const ms = args[0];
+    if (ms === undefined || !ms.isNumber) {
+      throw new TypeError(`${HOST_SLEEP}: ms must be a number (guest protocol violation)`);
+    }
+    const call = new GuestCall(vm);
+    try {
+      handlers.sleep(call, ms.toNumber());
+    } catch (err) {
+      // Same disposal discipline as `__host_agent` (see there): a
+      // throwing sleep handler must not strand the raw promise and its
+      // resolving functions.
+      call.dispose();
+      throw err;
+    }
+    call.releaseToRealm();
+    return guestCallHandle(call);
+  };
+}
+
+/**
+ * The `__host_workspace` shape: the handler's JSON string is returned
+ * synchronously into the realm (a string handle — the guest parses it).
+ * A throwing handler propagates as the documented protocol-violation
+ * guest error.
+ */
+function makeWorkspaceHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  const shim = getVmShim(vm) as QuickJS;
+  return function (this: JSValueHandle): JSValueHandle {
+    return shim.newString(handlers.workspace());
+  };
+}
+
+/**
+ * The `__host_agents` shape: same synchronous JSON-string contract as
+ * `__host_workspace`.
+ */
+function makeAgentsHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  const shim = getVmShim(vm) as QuickJS;
+  return function (this: JSValueHandle): JSValueHandle {
+    return shim.newString(handlers.agents());
+  };
+}
+
+/**
+ * The `__host_reset` shape: the handler marks the teardown request and
+ * returns nothing. A throwing handler propagates as the documented
+ * protocol-violation guest error.
+ */
+function makeResetHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  const shim = getVmShim(vm) as QuickJS;
+  return function (this: JSValueHandle): JSValueHandle {
+    handlers.reset();
+    return shim.undefined;
+  };
 }
 
 function requireString(arg: JSValueHandle | undefined, hostFn: string, what: string): string {

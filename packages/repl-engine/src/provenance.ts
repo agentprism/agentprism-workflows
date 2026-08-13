@@ -240,13 +240,17 @@ async function computeLexicalBaseline(wasm: WasmInput): Promise<string[]> {
   }
 }
 
-/** The parking-bridge stand-in for the throwaway baseline VM: the four
- *  host functions exist (the library only needs the names). */
+/** The parking-bridge stand-in for the throwaway baseline VM: the host
+ *  functions exist (the library only needs the names). */
 const NOOP_HANDLERS: GuestBridgeHandlers = {
   agent: () => undefined,
   checkpoint: () => undefined,
   steer: () => undefined,
   console: () => undefined,
+  sleep: () => undefined,
+  workspace: () => '{}',
+  agents: () => '[]',
+  reset: () => undefined,
 };
 
 /**
