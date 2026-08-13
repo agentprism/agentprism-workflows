@@ -142,6 +142,12 @@ import {
 } from "./auth/auth-store.js";
 import type { ProviderStore } from "./provider-store.js";
 import { providerVertexMeta } from "./provider-store.js";
+import { mapTypedSessionFailure } from "./errors-map.js";
+import {
+  readTypedSessionFailure,
+  supersedesTypedSessionFailure,
+  type TypedSessionFailure,
+} from "./typed-failures.js";
 
 /** A benign client identity. NOT JetBrains/IntelliJ 2026.1 — that exact identity makes
  *  codex-acp disable session config options (including the model-selection channel). */
@@ -360,6 +366,16 @@ class SessionState {
   rawResultSuccess: RawResultSuccess | undefined;
   providerErrorMetadata: ProviderErrorMetadata | undefined;
   modes: SessionModeState | null | undefined;
+  /** The latched typed session failure (codex-acp's negotiated extension — see typed-failures.ts):
+   *  the newest failure record the server has published for THIS session over the asynchronous
+   *  `session_info_update` channel, or undefined when it never published one. Kept in the
+   *  server's own vocabulary (including the `cleared` phase) rather than collapsed to a boolean,
+   *  because the revision/identity rules are what make a duplicated or reordered frame harmless. */
+  private typedSessionFailure: TypedSessionFailure | undefined;
+  /** The latch as it stood when the current turn began. The server keeps the same snapshot for the
+   *  same reason (`recoverableSessionFailure` in its prompt path): it is what distinguishes a
+   *  failure this turn RAISED from one it merely inherited from an earlier turn. */
+  private turnStartTypedSessionFailure: TypedSessionFailure | undefined;
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
   /** The re-attach arm's transcript probe (phase D): where the LOADED
@@ -448,6 +464,7 @@ class SessionState {
     this.finalMessageStartIndex = this.turnStartIndex;
     this.rawResultSuccess = undefined;
     this.providerErrorMetadata = undefined;
+    this.turnStartTypedSessionFailure = this.typedSessionFailure;
   }
 
   currentTurnText(): string {
@@ -541,6 +558,16 @@ class SessionState {
         };
         break;
       }
+      case "session_info_update": {
+        // The ASYNCHRONOUS half of codex-acp's negotiated typed-failure channel: failures the
+        // server could not attribute to a running turn (late/idle terminal errors, and errors
+        // buffered before a turn had an identity), plus the `cleared` frame it publishes once a
+        // later turn recovers. Parsed unconditionally like the Claude `_meta` readers above — the
+        // namespace is vendor-unique, so this is inert for every other agent and for every
+        // codex-acp that did not accept our advertisement.
+        this.applyTypedSessionFailure(update._meta);
+        break;
+      }
       default:
         break;
     }
@@ -554,6 +581,42 @@ class SessionState {
     if (message && message.type === "result" && message.subtype === "success") {
       this.rawResultSuccess = message;
     }
+  }
+
+  /**
+   * Fold one typed-session-failure frame (from any ACP `_meta`) into the latch. A `_meta` that
+   * carries none — every other backend's, every older codex-acp's — leaves the latch untouched.
+   *
+   * SUPERSESSION. A frame for the same `id` at a revision we have already seen is stale and is
+   * dropped, so a duplicate or a reordered delivery can neither re-raise a cleared failure nor
+   * roll one back to an older category. A `cleared` frame that DOES supersede drops the latch
+   * outright rather than latching a cleared record: nothing downstream should ever have to ask
+   * "is the latched failure still in force?".
+   *
+   * Returns the frame that was READ (whether or not it superseded the latch), so a caller holding
+   * an authoritative frame — a turn's own terminal failure, which is authoritative for that turn
+   * by construction — can act on it without re-parsing.
+   */
+  applyTypedSessionFailure(meta: unknown): TypedSessionFailure | undefined {
+    const failure = readTypedSessionFailure(meta);
+    if (failure && supersedesTypedSessionFailure(this.typedSessionFailure, failure)) {
+      this.typedSessionFailure = failure.phase === "cleared" ? undefined : failure;
+    }
+    return failure;
+  }
+
+  /**
+   * The typed session failure this turn RAISED, or undefined when the session has none active or
+   * only carries one inherited from an earlier turn. Compared against the turn-start snapshot by
+   * the same (id, revision) rule the server uses to decide whether a failure is still the one it
+   * saw when the turn began.
+   */
+  turnTypedSessionFailure(): TypedSessionFailure | undefined {
+    const failure = this.typedSessionFailure;
+    if (!failure) return undefined;
+    const baseline = this.turnStartTypedSessionFailure;
+    if (baseline && baseline.id === failure.id && failure.revision <= baseline.revision) return undefined;
+    return failure;
   }
 
   /** The loaded-session founding-turn observability probe: whether the
@@ -1903,6 +1966,9 @@ export class PooledConnection {
               elicitation: this.advertiseElicitation,
               // Per-backend profile refinement (§1.2/§3.1); undefined => no `auth` key emitted (default-OFF).
               auth: this.effectiveAuthCapabilities(),
+              // Backend-declared vendor extensions THIS client implements (codex: typed session
+              // failures). Undefined for backends that negotiate none => byte-identical handshake.
+              ...(this.backend.clientCapabilityMeta ? { meta: this.backend.clientCapabilityMeta } : {}),
             }),
             clientInfo: { ...CLIENT_INFO },
           }),
@@ -2750,11 +2816,49 @@ export class SessionHandle implements StructuredSource {
     try {
       const response = await this.pooled.prompt(request);
       this.state.usage.recordPromptUsage(response.usage);
+      const failure = this.terminalTypedSessionFailure(response);
+      if (failure) throw this.typedSessionFailureError(failure);
       return response;
     } finally {
       if (this.activeTurn === turn) this.activeTurn = undefined;
       turn.resolveEnded();
     }
+  }
+
+  /**
+   * The typed session failure that ended this turn, if any (codex-acp's negotiated extension —
+   * see typed-failures.ts). Two channels, in priority order:
+   *
+   *  1. `PromptResponse._meta` — the TERMINAL failure. Unambiguous: the server put it there
+   *     instead of rejecting the request or streaming the provider's prose as assistant output,
+   *     so the turn resolved `end_turn` with nothing to show for itself. Always fails the turn.
+   *  2. the asynchronous latch — a failure published on `session_info_update` that this turn
+   *     RAISED (not one inherited from an earlier turn). The server does not treat these as
+   *     terminal, and neither do we while the turn still produced output: a late unattributed
+   *     error must not retroactively fail a turn that answered. It IS applied to a turn that
+   *     produced no assistant text, where it is the only account of why — strictly better than
+   *     the AGENT_EMPTY_OUTPUT / schema-repair-ladder path that would otherwise run blind.
+   *     Assistant text is the whole of this backend's output surface (its structured results are
+   *     read off the same stream), so an empty accumulator really does mean nothing came back.
+   *
+   * Usage is recorded before this runs, so a walled turn still reports the tokens it burned.
+   */
+  private terminalTypedSessionFailure(response: PromptResponse): TypedSessionFailure | undefined {
+    // Fold the terminal record into the latch as well: it is the newest state of the same
+    // failure, and a later turn's `cleared` frame is written against its (id, revision).
+    const terminal = this.state.applyTypedSessionFailure(response._meta);
+    if (terminal?.phase === "active") return terminal;
+    if (this.state.currentTurnText().trim().length > 0) return undefined;
+    return this.state.turnTypedSessionFailure();
+  }
+
+  private typedSessionFailureError(failure: TypedSessionFailure): WorkflowError {
+    return mapTypedSessionFailure(failure, {
+      label: this.opts.label,
+      backendId: this.pooled.backendId,
+      providerErrorMetadata: this.state.providerErrorMetadata,
+      authMethods: this.pooled.capabilities?.authMethods,
+    });
   }
 
   /** Inject content into the currently running prompt turn through the negotiated steering

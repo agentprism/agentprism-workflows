@@ -285,5 +285,19 @@ export {
 } from "./structured-output.js";
 export type { ResolveOptions, StructuredSession } from "./structured-output.js";
 
-export { ACP_AUTH_REQUIRED_ERROR_CODE, errorText, mapThrownError } from "./errors-map.js";
+export { ACP_AUTH_REQUIRED_ERROR_CODE, errorText, mapThrownError, mapTypedSessionFailure } from "./errors-map.js";
 export type { ErrorMapContext } from "./errors-map.js";
+
+// codex-acp's negotiated typed-session-failures extension: the client advertisement the codex
+// backend sends at initialize, plus the wire parse / supersession rules the session accumulator
+// applies to both delivery channels.
+export {
+  TYPED_SESSION_FAILURE_CLIENT_CAPABILITY,
+  readTypedSessionFailure,
+  supersedesTypedSessionFailure,
+} from "./typed-failures.js";
+export type {
+  TypedSessionFailure,
+  TypedSessionFailureAction,
+  TypedSessionFailureCategory,
+} from "./typed-failures.js";

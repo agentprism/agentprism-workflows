@@ -4,7 +4,13 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import { AcpAgentRunner, clientCapabilitiesFor, type AcpSessionContext, type ClientHandlers } from "../src/index.js";
+import {
+  AcpAgentRunner,
+  CodexBackend,
+  clientCapabilitiesFor,
+  type AcpSessionContext,
+  type ClientHandlers,
+} from "../src/index.js";
 import {
   WorkflowErrorCode,
   isWorkflowError,
@@ -39,6 +45,13 @@ function makeRunner(clientHandlers?: ClientHandlers): AcpAgentRunner {
 
 function initializeCapabilities(log: LogEntry[]): LogEntry["params"] {
   return log.find((entry) => entry.method === "initialize")?.params;
+}
+
+/** These runs route to the CODEX backend, which additionally declares its vendor-extension
+ *  `_meta` (typed session failures) — comparing against it also proves that advertisement
+ *  actually crossed the wire. */
+function expectedClientCapabilities(handlers: ClientHandlers | undefined): ReturnType<typeof clientCapabilitiesFor> {
+  return clientCapabilitiesFor(handlers, { meta: new CodexBackend().clientCapabilityMeta });
 }
 
 /** The fake agent PARSES initialize with the SDK zod schema, which default-fills absent
@@ -110,7 +123,7 @@ test("MCP-over-ACP round-trip routes with session context and returns opaque pay
   });
 
   assert.equal(out, "ok");
-  assert.deepEqual(pruneSchemaDefaults(initializeCapabilities(readLog())?.clientCapabilities), clientCapabilitiesFor(handlers));
+  assert.deepEqual(pruneSchemaDefaults(initializeCapabilities(readLog())?.clientCapabilities), expectedClientCapabilities(handlers));
   assert.equal(initializeCapabilities(readLog())?.clientCapabilities?.mcp, undefined);
   assert.deepEqual(readLog().find((entry) => entry.method === "newSession")?.params?.mcpServers, [ACP_SERVER]);
   assert.deepEqual(seen.map((entry) => entry.phase), ["connect", "message", "disconnect"]);
@@ -138,7 +151,7 @@ test("MCP-over-ACP without handlers is not advertised and mcp/connect returns -3
   const out = await makeRunner().run("hi", { model: "codex", cwd });
 
   assert.equal(out, "ok");
-  assert.deepEqual(pruneSchemaDefaults(initializeCapabilities(readLog())?.clientCapabilities), clientCapabilitiesFor(undefined));
+  assert.deepEqual(pruneSchemaDefaults(initializeCapabilities(readLog())?.clientCapabilities), expectedClientCapabilities(undefined));
   assert.equal(initializeCapabilities(readLog())?.clientCapabilities?.mcp, undefined);
   const connect = logEntry(readLog(), "mcpConnect", "unwired");
   assert.equal(connect?.response, undefined);
