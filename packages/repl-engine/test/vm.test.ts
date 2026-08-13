@@ -262,6 +262,69 @@ test('thrown values report trap-free error info (name via prototype read)', asyn
   assert.match(e5.stack ?? '', /<repl>:2:\d+/, 'a thrown undefined keeps the submitted-code line');
 });
 
+test('throw-site capture preserves user errors when globalThis is shadowed around a function', async () => {
+  using topLevel = await vm();
+  assert.equal(
+    value(
+      await topLevel.evalCode(
+        'const globalThis = 7; function f() { throw new Error("T") } try { f() } catch (e) { e.message }',
+      ),
+    ),
+    'T',
+    'a top-level lexical globalThis shadow cannot replace the thrown error',
+  );
+  assert.equal(
+    value(
+      await topLevel.evalCode(
+        'class C { m() { throw new Error("M") } } try { new C().m() } catch (e) { e.message }',
+      ),
+    ),
+    'M',
+    'a class method keeps the user error after a persistent globalThis shadow',
+  );
+
+  using parameter = await vm();
+  assert.equal(
+    value(
+      await parameter.evalCode(
+        'function f(globalThis) { throw new Error("P") } try { f(7) } catch (e) { e.message }',
+      ),
+    ),
+    'P',
+    'a globalThis parameter cannot replace the thrown error',
+  );
+
+  using local = await vm();
+  assert.equal(
+    value(
+      await local.evalCode(
+        'function f() { const globalThis = 7; throw new Error("L") } try { f() } catch (e) { e.message }',
+      ),
+    ),
+    'L',
+    'a function-local globalThis binding cannot replace the thrown error',
+  );
+
+  using uncaught = await vm();
+  const e = error(
+    await uncaught.evalCode('const globalThis = 7;\nfunction g() { throw new Error("shadowed") }\ng()'),
+  );
+  assert.equal(e.message, 'shadowed', 'the uncaught error itself is preserved');
+  assert.match(e.stack ?? '', /<repl>:2:\d+/, 'the preserved error keeps its submitted-code frame');
+
+  using reserved = await vm();
+  assert.equal(
+    value(
+      await reserved.evalCode(
+        'function f(__replCaptureThrownValue) { throw new Error("R") } ' +
+          'try { f(() => "corrupt") } catch (e) { e.message }',
+      ),
+    ),
+    'R',
+    'a local binding with the reserved helper name makes capture skip the throw instead of changing it',
+  );
+});
+
 test('rejected top-level awaits report the raw thrown value', async () => {
   using v = await vm();
   const e = error(await v.evalCode('await Promise.reject(new RangeError("too big"))'));

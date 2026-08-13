@@ -675,7 +675,7 @@ export class ReplVm {
   private installThrowCapture(): boolean {
     const source =
       '(() => {' +
-      'var g = globalThis;' +
+      'var g = this;' +
       `if (typeof g[${JSON.stringify(THROW_CAPTURE_GLOBAL)}] === "function" && ` +
       `typeof g[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function") return true;` +
       'var same = Object.is; var lastValue; var lastStack;' +
@@ -1035,7 +1035,7 @@ export class ReplVm {
 const THROW_CAPTURE_GLOBAL = '__replCaptureThrownValue';
 const THROW_STACK_GLOBAL = '__replCapturedThrowStack';
 const THROW_INSTRUMENT_CACHE_MAX = 256;
-const throwInstrumentCache = new Map<string, ThrowSite[] | null>();
+const throwInstrumentCache = new Map<string, ThrowInstrumentation | null>();
 const THROW_FUNCTION_NODES = new Set([
   'FunctionDeclaration',
   'FunctionExpression',
@@ -1047,29 +1047,36 @@ const THROW_FUNCTION_NODES = new Set([
  *  insertions add no newlines, so captured stacks retain submitted-code
  *  line numbers. Parse failures stay untouched for the VM to report. */
 function instrumentThrownValues(code: string): string {
-  let sites = throwInstrumentCache.get(code);
-  if (sites === undefined) {
+  let instrumentation = throwInstrumentCache.get(code);
+  if (instrumentation === undefined) {
     try {
       const ast = parse(code, {
         ecmaVersion: 'latest',
         sourceType: 'script',
         allowAwaitOutsideFunction: true,
       }) as unknown as ThrowNode;
-      sites = [];
+      const sites: ThrowSite[] = [];
       collectThrowSites(ast, false, sites);
+      instrumentation = {
+        sites,
+        nestedCaptureSafe: !containsPotentialCaptureShadow(ast),
+      };
     } catch {
-      sites = null;
+      instrumentation = null;
     }
     if (throwInstrumentCache.size >= THROW_INSTRUMENT_CACHE_MAX) throwInstrumentCache.clear();
-    throwInstrumentCache.set(code, sites);
+    throwInstrumentCache.set(code, instrumentation);
   }
-  if (sites === null || sites.length === 0) return code;
+  if (instrumentation === null || instrumentation.sites.length === 0) return code;
   const insertions: Array<{ pos: number; text: string }> = [];
-  for (const site of sites) {
-    const base = site.inFunction ? 'globalThis' : 'this';
+  for (const site of instrumentation.sites) {
+    if (site.inFunction && !instrumentation.nestedCaptureSafe) continue;
+    const capture = site.inFunction
+      ? THROW_CAPTURE_GLOBAL
+      : `this[${JSON.stringify(THROW_CAPTURE_GLOBAL)}]`;
     insertions.push({
       pos: site.start,
-      text: `${base}[${JSON.stringify(THROW_CAPTURE_GLOBAL)}](`,
+      text: `${capture}(`,
     });
     insertions.push({ pos: site.end, text: ')' });
   }
@@ -1080,6 +1087,35 @@ function instrumentThrownValues(code: string): string {
       instrumented.slice(0, insertion.pos) + insertion.text + instrumented.slice(insertion.pos);
   }
   return instrumented;
+}
+
+/** Nested code cannot use `this` as the realm object: methods, strict
+ *  functions, and arrows all give it user-controlled semantics. Instead
+ *  it resolves the immutable engine helper installed on the global object.
+ *  If the submitted program mentions that reserved identifier, uses
+ *  `with`, or can inject a local binding through direct eval, leave nested
+ *  throws untouched rather than risk changing the value being thrown. */
+function containsPotentialCaptureShadow(node: ThrowNode | null | undefined): boolean {
+  if (node === null || node === undefined || typeof node !== 'object' || typeof node.type !== 'string') return false;
+  const record = node as unknown as Record<string, unknown>;
+  if (node.type === 'Identifier' && record.name === THROW_CAPTURE_GLOBAL) return true;
+  if (node.type === 'WithStatement') return true;
+  if (node.type === 'CallExpression') {
+    const callee = record.callee as Record<string, unknown> | null | undefined;
+    if (callee?.type === 'Identifier' && callee.name === 'eval') return true;
+  }
+  for (const key of Object.keys(node)) {
+    if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    const child = record[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        if (containsPotentialCaptureShadow(item as ThrowNode)) return true;
+      }
+    } else if (child !== null && typeof child === 'object') {
+      if (containsPotentialCaptureShadow(child as ThrowNode)) return true;
+    }
+  }
+  return false;
 }
 
 function collectThrowSites(node: ThrowNode | null | undefined, inFunction: boolean, sites: ThrowSite[]): void {
@@ -1103,6 +1139,11 @@ interface ThrowSite {
   start: number;
   end: number;
   inFunction: boolean;
+}
+
+interface ThrowInstrumentation {
+  sites: ThrowSite[];
+  nestedCaptureSafe: boolean;
 }
 
 interface ThrowNode {
