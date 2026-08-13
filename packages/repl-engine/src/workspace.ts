@@ -304,10 +304,12 @@ export class Workspace {
    * The §4.4 result-history global is maintained HERE (the workspace
    * level owns `_` for its own evals — the broker sets it for its evals
    * through the same `setGlobal` seam): a RESOLVED eval's completion
-   * value becomes `_` (an undefined completion — an empty poll — leaves
-   * it unchanged, like an error); a SUSPENDED eval retains its
-   * completion wrapper and `drainJobs`'s sweep sets `_` once the
-   * continuation settles.
+   * value becomes `_` — an undefined completion (an empty poll) makes
+   * `_` undefined too: the previous eval's completion value IS
+   * undefined (the review probe: `42`, then `""`, then `_` must read
+   * undefined, never the stale 42). An error leaves `_` unchanged; a
+   * SUSPENDED eval retains its completion wrapper and `drainJobs`'s
+   * sweep sets `_` once the continuation settles.
    *
    * The parking bridge's `reset()` teardown runs AFTER the current eval
    * completes (the doc's §4.5): a completed eval disposes now; a
@@ -322,10 +324,10 @@ export class Workspace {
     if (completion !== undefined) {
       if (outcome.kind === 'value') {
         try {
-          // An undefined completion (an empty script — the documented
-          // poll idiom) is not "a value": `_` stays unchanged, like
-          // after an error.
-          if (!(completion as JSValueHandle).isUndefined) this.setGlobal('_', completion);
+          // Every resolved eval's completion value becomes `_` — even
+          // undefined (an empty script — the documented poll idiom —
+          // overwrites the older value with undefined).
+          this.setGlobal('_', completion);
         } catch {
           // A failed `_` write must not fail the eval that produced the
           // value.

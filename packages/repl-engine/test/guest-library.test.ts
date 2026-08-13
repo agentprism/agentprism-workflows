@@ -718,8 +718,10 @@ test('§4.4: console.log renders ONE joined line per call — args joined with a
   assert.equal(bridge.events[0].level, 'log');
   assert.equal(bridge.events[0].line, 'a b c');
   // A directly logged long string prints WHOLE — no upper bound (the
-  // Python posture; the deleted emission budget).
-  const long = 'x'.repeat(3000);
+  // Python posture). The length EXCEEDS the deleted 49 488-char
+  // emission budget: reintroducing the cap would clip this string, so
+  // the assertion is a real over-threshold probe.
+  const long = 'x'.repeat(60_000);
   value(await vm.evalCode(`console.log(${JSON.stringify(long)}); "done"`));
   assert.equal(bridge.events[1].line, long);
   vm.dispose();

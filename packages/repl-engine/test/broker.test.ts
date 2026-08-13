@@ -41,6 +41,7 @@ import {
   type CallOutcome,
   type CallStore,
   type ReplEvalResult,
+  OUTPUT_MAX_BYTES,
   OUTPUT_MAX_LINES,
 } from '../src/index.js';
 
@@ -226,6 +227,9 @@ class FakeRunner implements BrokerRunner {
   loadedTurnText: string | null = null;
   /** Open failures to inject (each one rejects openSession once). */
   failNextOpens = 0;
+  /** Diagnostic-open failures to inject (each one rejects an openSession
+   *  WITHOUT configOptions — the [C]5 fallback's reopen — once). */
+  failDiagnosticOpens = 0;
   /** Load failures to inject (each one rejects loadSession once). */
   failNextLoads = 0;
   disposeCalls = 0;
@@ -261,6 +265,10 @@ class FakeRunner implements BrokerRunner {
           throw new Error('invalid config option');
         }
       }
+    }
+    if (opts.configOptions === undefined && this.failDiagnosticOpens > 0) {
+      this.failDiagnosticOpens--;
+      throw new Error('spawn failed');
     }
     const session = new FakeSession(opts);
     session.capabilities = { supportsSteering: this.supportsSteering };
@@ -916,19 +924,35 @@ test('trap-free result rendering: accessor properties render as (…) and never 
   await ws.dispose();
 });
 
-test('output lines are the §4.4 one-line reprs (one joined line per console.* call, levels prefixed); §7: NO output caps — a large output ships whole', async () => {
+test('output lines are the §4.4 one-line reprs (one joined line per console.* call, levels prefixed); §7: NO output caps — output above the DELETED ceilings ships whole', async () => {
   const { ws, broker } = await setup();
   const r = await broker.eval('console.log({ a: 1 }, "text"); console.error("boom"); "done"');
   assert.equal(output(r)[0], '{a: 1} text');
   assert.equal(output(r)[1], 'error: boom');
   assert.equal(r.outputTruncated, false);
   // §7: the engine applies NO caps to guest output — the Python
-  // posture (an agent CAN flood its own context). A 3000-line flood
-  // ships verbatim with outputTruncated always false.
-  const big = await broker.eval('for (let i = 0; i < 3000; i++) console.log("line", i); "done"');
+  // posture (an agent CAN flood its own context). A flood ABOVE BOTH
+  // deleted ceilings — 4500 lines, >50 KB of bytes (the v1 caps:
+  // OUTPUT_MAX_LINES 4000, OUTPUT_MAX_BYTES 50 000) — ships verbatim
+  // with outputTruncated always false. Reintroducing the caps would
+  // truncate this flood; the assertions below must stay green.
+  const big = await broker.eval('for (let i = 0; i < 4500; i++) console.log("line", i, "padding", "x".repeat(20)); "done"');
   assert.equal(big.outputTruncated, false);
-  assert.equal(big.output.length, 3000);
-  assert.equal(output(big)[2999], 'line 2999');
+  assert.equal(big.output.length, 4500);
+  assert.equal(output(big)[4499], 'line 4499 padding xxxxxxxxxxxxxxxxxxxx');
+  assert.ok(
+    big.output.reduce((sum, line) => sum + Buffer.byteLength(line, 'utf8') + 1, 0) > OUTPUT_MAX_BYTES,
+    'the flood exceeds the deleted byte cap',
+  );
+  // A DIRECT console string above the deleted 49 488-char emission
+  // budget ships WHOLE (no upper bound — the Python posture).
+  const whole = 'w'.repeat(60_000);
+  const direct = await broker.eval(`console.log(${JSON.stringify(whole)}); "done"`);
+  assert.equal(output(direct)[0], whole, 'a 60 000-char direct console string ships whole');
+  // A string COMPLETION value above the same deleted budget renders
+  // whole too (§4.4: direct strings print whole — no upper bound).
+  const resultWhole = await broker.eval(`"r".repeat(60000)`);
+  assert.equal(resultWhole.result, 'r'.repeat(60_000), 'a 60 000-char string completion value renders whole');
   await ws.dispose();
 });
 
@@ -984,6 +1008,14 @@ test('review 1b: the cap is absolute for follow-up turns — an idle-session ste
   assert.deepEqual(steered.pending, ['c3', 'c4'], 'c4 (the queued followUp) stays pending');
   await tick();
   assert.equal(bSession.prompts.length, 0, 'no follow-up turn started under cap pressure');
+  // The queued turn is VISIBLE while pending: minted at enqueue, listed
+  // in agents() with the honest `queued` state (the review probe: the
+  // pending id was absent from agents() before its delivery started).
+  const queuedAgents = broker.liveAgents();
+  assert.ok(
+    queuedAgents.some((a) => a.callId === 'c4' && a.state === 'queued' && a.task === 'more'),
+    `the queued followUp turn is addressable before it starts: ${JSON.stringify(queuedAgents)}`,
+  );
   // c3 settles; its slot frees; the queued follow-up starts its turn —
   // and settles with the TURN'S ANSWER.
   runner.sessions[2].completeTurn('c done');
@@ -1704,27 +1736,34 @@ test('§4.4: `_` updates when a SUSPENDED eval completes during a pump — the s
   await broker.pump();
   const probe = await broker.eval('_');
   assert.equal(probe.result, '42', 'the late completion value became `_` (the review probe: undefined before the fix)');
-  // An empty poll (the documented eval("") idiom) leaves `_` unchanged —
-  // an undefined completion is not "a value".
+  // An empty poll (the documented eval("") idiom) COMPLETES with
+  // undefined — `_` becomes undefined: the previous eval's completion
+  // value IS undefined (the review probe: `42`, then an empty eval,
+  // then `_` must read undefined, never the stale 42).
   await broker.eval('"tagged"');
   await broker.eval('');
-  assert.equal((await broker.eval('_')).result, 'tagged');
+  assert.equal((await broker.eval('_')).result, 'undefined');
+  // The overwrite happens for the IN-CALL undefined completion too:
+  // `42`, then `undefined;` — `_` reads undefined.
+  await broker.eval('42');
+  await broker.eval('undefined');
+  assert.equal((await broker.eval('_')).result, 'undefined');
   await ws.dispose();
 });
 
-test('§4.5: reset() in a SUSPENDED eval tears the workspace down after the CONTINUATION completes — never while it is still in flight', async () => {
+test('§4.5: reset() in a SUSPENDED eval tears the workspace down BEFORE any later guest code — the reset-owning eval completed at the pump', async () => {
   const { ws, broker } = await setup();
   const r = await broker.eval('reset(); await sleep(50); console.log("finished"); "done-after-sleep"');
   assert.equal(r.result, undefined, 'the eval suspended on the sleep');
   assert.equal(ws.isDisposed, false, 'the workspace is ALIVE while the reset eval is still in flight');
   // The host timer fires; the next operation's pump runs the continuation
-  // to completion (its console output ships), THEN the teardown runs.
+  // to completion. The reset-owning eval COMPLETED — its teardown is owed
+  // BEFORE the new eval's submitted code runs: the new eval rejects on
+  // the disposed workspace and its code never executes (the review
+  // probe: the later eval returned "probe-ran" before the disposal).
   await new Promise((resolve) => setTimeout(resolve, 90));
-  const probe = await broker.eval('"probe"');
-  assert.ok(output(probe).includes('finished'), output(probe).join('\n'));
-  assert.equal(probe.result, 'probe', 'the observing eval completed normally before the teardown');
-  assert.equal(ws.isDisposed, true, 'the teardown ran after the eval completed');
-  await assert.rejects(async () => broker.eval('1 + 1'), /disposed|alive/);
+  await assert.rejects(async () => broker.eval('"probe-ran"'), /disposed/);
+  assert.equal(ws.isDisposed, true, 'the teardown ran before the later eval\'s code');
   await ws.dispose();
 });
 
@@ -1799,22 +1838,142 @@ test('§4.6: cancelling a QUEUED dispatch stamps the resolved backend on the rej
   await ws.dispose();
 });
 
-test('§4.5: workspace().diagnostics carries the retained reconcile summary and the §6.2 demoted drain error; childrenClosed reflects the client-presence drain', async () => {
+test('§4.5: workspace().diagnostics carries the retained reconcile summary, the RETAINED drain error, and childrenClosed through both state transitions', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-broker-diag-'));
   const storePath = join(dir, 'calls.jsonl');
   const store = JsonlCallStore.open(storePath);
-  const { ws, broker } = await setup({ store });
+  let interruptDrains = false;
+  const { ws, broker, runner } = await setup({ store, interruptHandler: () => interruptDrains });
   // A reconcile report is retained under diagnostics.
   await broker.reconcile();
   const d1 = await broker.eval('workspace().diagnostics.reconcile === null ? "null" : typeof workspace().diagnostics.reconcile');
   assert.equal(d1.result, 'object');
+  // No drain error yet; children open before the client-presence drain.
   const d2 = await broker.eval('workspace().diagnostics.drainError === null ? "null" : workspace().diagnostics.drainError.name');
   assert.equal(d2.result, 'null', 'no drain error yet');
-  const closed = await broker.eval('workspace().diagnostics.childrenClosed');
-  assert.equal(closed.result, 'false');
+  const closed0 = await broker.eval('workspace().diagnostics.childrenClosed');
+  assert.equal(closed0.result, 'false', 'children open before the client-presence drain');
+  // A FAILED settlement drain RETAINS its error under diagnostics: a
+  // runaway guest continuation interrupted mid-drain (the broker-level
+  // interrupt handler fires inside the pump's settlement drain) — the
+  // §6.2 demotion: the failure leaves the eval result surface and
+  // lives here; the pump reports it honestly and the VM stays usable.
+  await broker.eval('agent("pi/x", "task").then(() => { let j = 0; while (true) j++; }); "started"');
+  await tick();
+  runner.last().completeTurn('done');
+  await tick();
+  interruptDrains = true;
+  await assert.rejects(
+    () => broker.pump(),
+    (error: unknown) => (error as Error).name === 'DrainJobError',
+    'the runaway continuation interrupts the settlement drain',
+  );
+  interruptDrains = false;
+  const retained = await broker.eval(
+    'workspace().diagnostics.drainError === null ? "null" : workspace().diagnostics.drainError.name + ":" + workspace().diagnostics.drainError.message',
+  );
+  assert.equal(retained.result, 'InternalError:interrupted', 'the failed settlement drain is RETAINED under diagnostics');
+  // childrenClosed reflects the client-presence drain: the settled
+  // session releases and the latch flips.
+  const drained = await broker.drainForDisconnect(200);
+  assert.equal(drained, true, 'the drain completed within its bound');
+  const closed1 = await broker.eval('workspace().diagnostics.childrenClosed');
+  assert.equal(closed1.result, 'true', 'childrenClosed flips after the client-presence drain');
   await broker.dispose();
   ws.dispose();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('§4.2: a QUEUED followUp turn is targetable by interrupt while it waits for a slot — AGENT_CANCELLED, dropped durably, gone from agents()', async () => {
+  const { ws, broker, runner } = await setup({ maxConcurrentAgents: 1 });
+  // c1 settles (idle); c2 takes the only slot.
+  await broker.eval('const a = agent("pi/x", "a"); "started"');
+  await tick();
+  runner.sessions[0].completeTurn('a done');
+  await tick();
+  await broker.pump();
+  await broker.eval('const busy = agent("pi/x", "busy"); "started"');
+  await tick();
+  // The followUp on the idle a-handle queues behind the cap (c3) — its
+  // guest promise stays pending, and the turn is addressable NOW.
+  const steered = await broker.eval('const o = await a.followUp("more").catch(e => e.code); console.log("outcome", o); "done"');
+  assert.equal(steered.result, undefined, 'the followUp suspends until its queued delivery runs');
+  await tick();
+  assert.ok(broker.liveAgents().some((a) => a.callId === 'c3' && a.state === 'queued'), 'c3 is listed while queued');
+  assert.equal(runner.sessions[0].prompts.length, 0, 'no turn started under cap pressure');
+  // The interrupt cancels the QUEUED turn by its own id — durable drop,
+  // recoverable rejection, and the turn leaves agents().
+  assert.equal(await broker.cancelCall('c3'), 'cancelled');
+  assert.equal(broker.store().lookup('c3')!.completion!.outcome, 'reject');
+  assert.notEqual(broker.store().lookup('c3')!.droppedAtMs, null, 'the drop is recorded durably');
+  const probe = await broker.eval('"probe"');
+  assert.ok(output(probe).some((l) => l === 'outcome AGENT_CANCELLED'), output(probe).join('\n'));
+  assert.ok(!broker.liveAgents().some((a) => a.callId === 'c3'), 'the cancelled queued turn left agents()');
+  // The freed slot is NOT consumed by the cancelled turn; the session
+  // stays idle with no delivery turn.
+  assert.equal(runner.sessions[0].prompts.length, 0);
+  await ws.dispose();
+});
+
+test('§4.6: cancelling an in-flight followUp turn renders the uncaught error WITH the call id AND the resolved backend', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  runner.last().completeTurn('done');
+  await tick();
+  await broker.pump();
+  // An UNCAUGHT await of the followUp: the cancellation rejection
+  // renders through the rejection bridge in the next tool result.
+  await broker.eval('const f = pi.followUp("long job"); await f; "unreachable"');
+  await tick();
+  assert.equal(await broker.cancelCall('c2'), 'cancelled');
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  const line = output(probe).find((l) => l.includes('followUp c2 was cancelled'));
+  assert.ok(line !== undefined, output(probe).join('\n'));
+  assert.ok(line.includes('(call c2 on backend pi)'), `the rendering names the call id and the resolved backend: ${line}`);
+  await ws.dispose();
+});
+
+test('§4.2: a MID-TURN steer resolves EXACTLY the delivery-outcome vocabulary — an unrecognized backend outcome is constrained, never passed through', async () => {
+  const { ws, broker, runner } = await setup();
+  await dispatchAgent(broker, runner);
+  await broker.eval('const o = pi.steer("redirect"); "steered"');
+  await tick();
+  // A backend resolving an outcome OUTSIDE injected/queued/failed (a
+  // third-party adapter's own vocabulary): the engine constrains it to
+  // the delivery-outcome vocabulary — the wire call did not reject, so
+  // the content was accepted (mapped to `queued`, never the raw
+  // `surprise` string).
+  runner.last().completeSteer('surprise');
+  await tick();
+  await broker.pump();
+  assert.equal((await broker.eval('await o')).result, 'queued');
+  await ws.dispose();
+});
+
+test('§4.1 [C]5: the late configOptions error names the offending key EVEN WHEN the diagnostic reopen fails', async () => {
+  const { ws, broker, runner } = await setup();
+  // Dynamic vocabulary (the seam returns undefined): admitted. The
+  // first open fails with the backend's own vague error (no key named),
+  // AND the diagnostic reopen without configOptions fails too — the
+  // late error must still name the offending key.
+  runner.failConfigKeys = new Set(['thinkinglevel']);
+  runner.failDiagnosticOpens = 1;
+  const late = await broker.eval(
+    'const p = await agent("pi/x", "t", { configOptions: { thinkinglevel: "high" } }).catch(e => e.name + ": " + e.message); console.log("got", p); "done"',
+  );
+  assert.equal(late.result, undefined, 'the late rejection arrives after the eval suspended');
+  await tick();
+  await broker.pump();
+  const probe = await broker.eval('"probe"');
+  const line = output(probe).find((l) => l.startsWith('got ConfigOptionsError'));
+  assert.ok(line !== undefined, output(probe).join('\n'));
+  assert.ok(line.includes('thinkinglevel'), `the late error names the offending key: ${line}`);
+  assert.ok(line.includes('backend pi'), `the late error names the resolved backend: ${line}`);
+  assert.ok(line.includes('invalid config option'), `the original backend error is reported: ${line}`);
+  assert.ok(line.includes('diagnostic open without configOptions failed too'), `the failed diagnostic reopen is reported: ${line}`);
+  await ws.dispose();
 });
 
 test('§4.2: the interrupt targets an in-flight followUp TURN by its own call id — the turn cancels and the steer rejects recoverable', async () => {

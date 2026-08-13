@@ -495,7 +495,7 @@ const liveAgentShape = z.object({
   callId: z.string(),
   modelSpec: z.string(),
   task: z.string().max(200),
-  state: z.enum(["opening", "running", "delivering", "idle"]),
+  state: z.enum(["opening", "running", "delivering", "queued", "idle"]),
   supportsSteering: z.boolean(),
   queuedSteers: z.number().int().nonnegative(),
 });

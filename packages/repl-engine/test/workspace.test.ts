@@ -132,13 +132,15 @@ test('workspace-level evals maintain the §4.4 `_` result history — resolved, 
   const second = await ws.eval('_');
   assert.equal(second.kind, 'value');
   if (second.kind === 'value') assert.equal(second.value, 'late');
-  // An empty poll (eval "") leaves `_` unchanged — an undefined
-  // completion is not "a value".
+  // An empty poll (eval "") COMPLETES with undefined — `_` becomes
+  // undefined: the previous eval's completion value IS undefined (the
+  // review probe: `42`, then an empty eval, then `_` must read
+  // undefined, never the stale 42).
   await ws.eval('"kept"');
   await ws.eval('');
   const third = await ws.eval('_');
   assert.equal(third.kind, 'value');
-  if (third.kind === 'value') assert.equal(third.value, 'kept');
+  if (third.kind === 'value') assert.equal(third.value, undefined);
   ws.dispose();
 });
 
