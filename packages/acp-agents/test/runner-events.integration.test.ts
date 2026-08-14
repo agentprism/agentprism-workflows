@@ -52,7 +52,7 @@ test("on() bubbles agent_message_chunk + usage_update + session lifecycle with r
 
   const text = await runner.run("hi", { model: MODEL, cwd, label: "greet", runId: "run-1" });
 
-  assert.equal(text, "Hel\n\nlo"); // every assistant message chunk joins with \n\n (§5 [C]12)
+  assert.equal(text, "Hello");
   assert.deepEqual(chunks, ["Hel", "lo"], "both streamed chunks were delivered, in order");
   assert.ok(usageSeen, "usage_update event fired");
   assert.ok(

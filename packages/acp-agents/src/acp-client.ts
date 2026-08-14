@@ -378,6 +378,14 @@ class SessionState {
   private turnStartTypedSessionFailure: TypedSessionFailure | undefined;
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
+  /** Text-chunk indexes that begin a distinct assistant message. ACP's
+   *  optional `messageId` is authoritative when present; for adapters
+   *  that omit it, an intervening content update (tool/thought/plan/user)
+   *  ends the in-flight message. Streaming deltas within one message are
+   *  never recorded here and therefore concatenate verbatim. */
+  private readonly assistantMessageStartIndexes = new Set<number>();
+  private assistantMessageBoundaryPending = true;
+  private activeAssistantMessageId: string | undefined;
   /** The re-attach arm's transcript probe (phase D): where the LOADED
    *  session's founding turn starts — the assistant-text length after the
    *  LAST replayed user message (the founding turn's prompt). Tracked from
@@ -460,8 +468,10 @@ class SessionState {
       this.textChunks.length = 0;
       this.history.length = 0;
       this.turnStartIndex = 0;
+      this.assistantMessageStartIndexes.clear();
     }
     this.finalMessageStartIndex = this.turnStartIndex;
+    this.markAssistantMessageBoundary();
     this.rawResultSuccess = undefined;
     this.providerErrorMetadata = undefined;
     this.turnStartTypedSessionFailure = this.typedSessionFailure;
@@ -471,16 +481,38 @@ class SessionState {
     return this.textChunks.slice(this.turnStartIndex).join("");
   }
 
-  /** The turn's assistant text with the §5 chunk joiner: EVERY
-   *  assistant message chunk joins with "\n\n" — the bible's literal
-   *  rule ([C]12). Multi-chunk replies gain the separator instead of
-   *  gluing ("…won't modify any files.TypeScript files under…"), and
-   *  narration chunks stay apart from answer chunks. The result fold
-   *  reads ONLY assistant text (`textChunks` accumulates
-   *  `agent_message_chunk` text content and nothing else), so the
-   *  fold is the chunk stream itself. */
+  /** The turn's assistant text with the §5 message joiner: deltas of one
+   *  message concatenate verbatim; distinct messages join with "\n\n". */
   foldedTurnText(): string {
-    return this.textChunks.slice(this.turnStartIndex).join("\n\n");
+    return this.foldedTextFrom(this.turnStartIndex);
+  }
+
+  private foldedTextFrom(startIndex: number): string {
+    let folded = "";
+    for (let index = startIndex; index < this.textChunks.length; index += 1) {
+      if (index > startIndex && this.assistantMessageStartIndexes.has(index)) folded += "\n\n";
+      folded += this.textChunks[index];
+    }
+    return folded;
+  }
+
+  private markAssistantMessageBoundary(): void {
+    this.assistantMessageBoundaryPending = true;
+    this.activeAssistantMessageId = undefined;
+  }
+
+  private beginAssistantMessageChunk(messageId: string | null | undefined, hasText: boolean): void {
+    const normalizedMessageId = messageId ?? undefined;
+    const messageIdChanged =
+      normalizedMessageId !== undefined &&
+      this.activeAssistantMessageId !== undefined &&
+      normalizedMessageId !== this.activeAssistantMessageId;
+    if (messageIdChanged) this.assistantMessageBoundaryPending = true;
+    if (normalizedMessageId !== undefined) this.activeAssistantMessageId = normalizedMessageId;
+    if (hasText && this.assistantMessageBoundaryPending) {
+      this.assistantMessageStartIndexes.add(this.textChunks.length);
+      this.assistantMessageBoundaryPending = false;
+    }
   }
 
   /** The turn's FINAL assistant message: only the chunks streamed after the last content event
@@ -503,6 +535,7 @@ class SessionState {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         this.trailingContentKind = 'assistant-message';
+        this.beginAssistantMessageChunk(update.messageId, update.content.type === "text");
         if (update.content.type === "text") {
           this.textChunks.push(update.content.text);
           this.history.push({
@@ -517,6 +550,7 @@ class SessionState {
       case "tool_call": {
         this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        this.markAssistantMessageBoundary();
         this.history.push({
           role: "tool",
           kind: "toolCall",
@@ -536,6 +570,7 @@ class SessionState {
         this.loadedTurnStartIndex = this.textChunks.length;
         this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        this.markAssistantMessageBoundary();
         break;
       }
       case "agent_thought_chunk":
@@ -545,13 +580,17 @@ class SessionState {
         // working — the founding turn is not observably complete.
         this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        this.markAssistantMessageBoundary();
         break;
       }
       case "plan_update":
       case "plan_removed": {
         // Plan mutations are content progress but never a completed
-        // assistant message; they do not segment the final message.
+        // assistant message, so they do not move the structured-result
+        // final-message start. They do end the visible message for the
+        // whole-turn folded result if assistant text follows.
         this.trailingContentKind = 'other';
+        this.markAssistantMessageBoundary();
         break;
       }
       case "usage_update": {
@@ -737,19 +776,12 @@ class SessionState {
     };
   }
 
-  /** The founding turn's assistant text: the transcript accumulated after
-   *  the last user-message boundary (the outcome text the re-attach arm
-   *  resolves with). The §5 chunk joiner applies here exactly like the
-   *  live result fold (`foldedTurnText`): EVERY assistant message chunk
-   *  joins with `"\n\n"` ([C]12), so a restored/reattached multi-chunk
-   *  reply gains the separator instead of gluing ("…won't modify any
-   *  files.TypeScript files under…"), and narration chunks stay apart
-   *  from answer chunks — completed-while-down and loaded-turn-ended
-   *  results carry the same folded shape the live path records (review
-   *  finding: the restored path used to join with `""`, gluing
-   *  multi-chunk replies before the REPL broker recorded them). */
+  /** The founding turn's assistant text, folded by assistant-message
+   *  boundary exactly like `foldedTurnText()`. This keeps replayed and
+   *  post-load deltas byte-identical while separating narration from a
+   *  later answer when tool/thought/plan activity intervenes. */
   loadedTurnText(): string {
-    return this.textChunks.slice(this.loadedTurnStartIndex).join("\n\n");
+    return this.foldedTextFrom(this.loadedTurnStartIndex);
   }
 
   /** Settle every deferred permission still parked on this session. Used by release/cancel/death

@@ -477,7 +477,7 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
     assert.equal(settled, undefined, "the seam must not settle a quiet gap for a running turn");
     assert.equal(rejected, undefined, "the seam must not reject while the turn is still running");
     await wait;
-    assert.deepEqual(settled, { stopReason: "end_turn", text: "partial \n\nresult C" }, "the seam settles from the authoritative ended notification — the turn's REAL accumulated text, folded with the §5 chunk joiner (every chunk gains the separator, exactly like the live result fold)");
+    assert.deepEqual(settled, { stopReason: "end_turn", text: "partial result C" }, "the seam settles from the authoritative ended notification — consecutive replay/live deltas of one message concatenate verbatim");
     await loaded2.release();
 
     // 3) Never terminal: the backend's query answers `interrupted` (no turn running —
@@ -762,25 +762,32 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
   }
 });
 
-test("§5 [C]12 chunk joiner on the RESTORED path: a multi-chunk loaded turn folds with \"\\n\\n\" exactly like the live result fold — completed-while-down AND loaded-turn-ended results never glue chunks (the review defect: `loadedTurnText()` joined with \"\", so a restored multi-chunk reply was glued before the REPL broker recorded it)", async () => {
+test("§5 [C]12 message fold on the RESTORED path matches the live result fold", async () => {
   // The ended-notification wait's loser timer rides the max-wait knob
   // (default 15 min — it would keep the test process alive); bound it
   // like the awaitCurrentTurn suite does.
   const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
   process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = "400";
   try {
-  // 1) Completed-while-down with TWO assistant messages in the replay
-  //    (narration + answer): the restored result applies the §5 chunk
-  //    joiner — "…won't modify any files.TypeScript files…" can never
-  //    reach the broker's recorded result.
+  // 1) Completed-while-down: deltas inside each message concatenate
+  //    verbatim, while intervening tool activity contributes one message
+  //    boundary separator.
   const { cwd } = harness.configure<LogEntry>({
     loadSessionSupport: true,
     loadSession: {
       loadedTurn: { status: "completed" },
       replay: [
         { role: "user", text: "task" },
-        { role: "assistant", text: "I won't modify any files." },
-        { role: "assistant", text: "TypeScript files under src/ stay untouched." },
+        { role: "assistant", text: "I " },
+        { role: "assistant", text: "won't modify " },
+        { role: "assistant", text: "any files." },
+      ],
+      updates: [
+        { sessionUpdate: "tool_call", toolCallId: "tc-restored-fold-1", title: "search the codebase", kind: "search", status: "in_progress" },
+        { sessionUpdate: "tool_call_update", toolCallId: "tc-restored-fold-1", status: "completed" },
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Type" } },
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Script files under " } },
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "src/ stay untouched." } },
       ],
     },
   });
@@ -790,25 +797,26 @@ test("§5 [C]12 chunk joiner on the RESTORED path: a multi-chunk loaded turn fol
   assert.deepEqual(turn, {
     stopReason: "end_turn",
     text: "I won't modify any files.\n\nTypeScript files under src/ stay untouched.",
-  }, "the completed-while-down result folds every assistant chunk with \"\\n\\n\"");
+  }, "the completed-while-down result separates messages, not deltas");
   await loaded.release();
 
   // 2) The loaded-turn-ENDED path (a turn running at load that ends
-  //    later): the replayed chunks and the live continuation chunks
-  //    fold with the same joiner — the ended-notification result is
-  //    never glued.
+  //    later): replayed and live continuation deltas remain one message
+  //    when no non-text content update intervenes.
   const { cwd: cwd2 } = harness.configure<LogEntry>({
     loadSessionSupport: true,
     loadSession: {
       loadedTurn: { status: "running" },
       replay: [
         { role: "user", text: "task" },
-        { role: "assistant", text: "Analysis done." },
+        { role: "assistant", text: "LIVE" },
       ],
       continue: [
-        { afterMs: 60, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Here is the final answer." } } },
+        { afterMs: 40, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "_SM" } } },
+        { afterMs: 70, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OKE" } } },
+        { afterMs: 100, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "_OK" } } },
       ],
-      turnEnded: { afterMs: 120, stopReason: "end_turn" },
+      turnEnded: { afterMs: 140, stopReason: "end_turn" },
     },
   });
   const runner2 = harness.makeRunner();
@@ -816,8 +824,8 @@ test("§5 [C]12 chunk joiner on the RESTORED path: a multi-chunk loaded turn fol
   const turn2 = await loaded2.awaitCurrentTurn();
   assert.deepEqual(turn2, {
     stopReason: "end_turn",
-    text: "Analysis done.\n\nHere is the final answer.",
-  }, "the loaded-turn-ended result folds the replayed and continued chunks with \"\\n\\n\"");
+    text: "LIVE_SMOKE_OK",
+  }, "the loaded-turn-ended result concatenates same-message deltas byte-identically");
   await loaded2.release();
   } finally {
     if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
