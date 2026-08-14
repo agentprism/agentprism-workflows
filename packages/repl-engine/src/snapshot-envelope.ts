@@ -15,7 +15,7 @@
  *
  * header = {
  *   "format":        "repl-snapshot",   — the envelope format name
- *   "formatVersion": 1,                 — the envelope format version
+ *   "formatVersion": 2,                 — the envelope format version
  *   "wasmSha256":    "<64 hex>",        — sha256 of the wasm binary that
  *                                        laid out this memory
  *   "createdAtMs":   <unix ms>
@@ -26,7 +26,7 @@
  * compared against the hash of the binary the host is about to restore
  * with, and a mismatch REFUSES LOUDLY naming both hashes — never a silent
  * restore into garbage. The envelope format version is the second refusal
- * axis: a bump (an incompatible envelope layout, or a guest-library major
+ * axis: a bump (an incompatible envelope layout, or a guest-library surface
  * the host can no longer serve) refuses old snapshots naming both
  * versions. gzip is the compression (the doc's choice: JS runtimes
  * decompress it natively; measured at ~7.9x on real snapshots).
@@ -52,11 +52,11 @@ export const SNAPSHOT_FORMAT = 'repl-snapshot';
 /**
  * The envelope format version. Bumped when the envelope layout or the
  * snapshot payload format changes incompatibly (a quickjs-wasi upgrade,
- * a guest-library major the host cannot serve): an envelope carrying a
+ * a guest-library surface the host cannot serve): an envelope carrying a
  * different version refuses loudly naming both versions instead of
  * attempting a restore.
  */
-export const SNAPSHOT_FORMAT_VERSION = 1;
+export const SNAPSHOT_FORMAT_VERSION = 2;
 
 /** The header is one JSON line; refuse anything longer as not-our-file. */
 const MAX_HEADER_BYTES = 4096;

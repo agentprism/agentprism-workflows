@@ -864,11 +864,10 @@ export interface GuestSurface {
   /** The resident guest library version (equals `__REPL_GUEST_VERSION`). */
   version: string;
   /** True when this library copy carries the 0.2.0 eval-await tracking
-   *  surface (`__replAwait`/`awaitLog`/`promiseCallIds`). False for a
-   *  snapshot carrying an older library — the host then skips the
-   *  top-level-await instrumenter and the eval-break interrupt degrades
-   *  to the honest refusal (the doc's rule: the host serves snapshots
-   *  carrying older library versions than the one it ships). */
+   *  surface (`__replAwait`/`awaitLog`/`promiseCallIds`). False remains
+   *  the defensive fallback for direct/raw restores carrying an older
+   *  library. Stored pre-v2 snapshots never reach this fallback: their
+   *  older envelope format is refused and auto-reset on first touch. */
   supportsAwaitTracking: boolean;
   /** True when this library copy carries the 0.3.0 CONTINUATION-LEASE
    *  surface (`__replAwait(value, token)` + the `__replLease` accessor

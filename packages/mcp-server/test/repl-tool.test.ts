@@ -35,6 +35,7 @@ import {
   deserializeSnapshot,
   loadShippedWasm,
   serializeSnapshot,
+  SNAPSHOT_FORMAT_VERSION,
   wasmSha256Of,
   type BrokerLoadSessionOptions,
   type BrokerOpenSessionOptions,
@@ -610,6 +611,103 @@ test("repl eval persists to the daemon's per-project store; a later server resto
     // The restore is visible through the guest introspection surface.
     const diag = (await evalJson(second, PROJECT, "workspace().diagnostics")) as { reconcile: unknown };
     assert.ok(diag.reconcile !== null, "the restore's reconcile report lives in diagnostics");
+  } finally {
+    await second.dispose();
+  }
+});
+
+test("§9 [C]16 / §10: a pre-redesign format-v1 snapshot auto-resets on first touch, is renamed aside with the loud reason, and the fresh workspace exposes the full v2 guest API", async () => {
+  const PROJECT = freshProject();
+  const first = await connectWithRepl(new FakeRunner());
+  try {
+    const seeded = await repl(first, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'globalThis.preRedesignBinding = "must not survive"; 41',
+    });
+    assert.equal(structuredOf(seeded).result, "41", "the real stored snapshot carries user state");
+  } finally {
+    await first.dispose();
+  }
+
+  const { snapshotPath, replDir } = replStorePaths(PROJECT);
+  const currentEnvelope = readFileSync(snapshotPath);
+  const newline = currentEnvelope.indexOf(0x0a);
+  assert.ok(newline > 0, "the real snapshot has a newline-terminated envelope header");
+  const header = JSON.parse(currentEnvelope.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
+  assert.equal(header.formatVersion, SNAPSHOT_FORMAT_VERSION, "the seed snapshot starts at the running format");
+
+  // Fabricate the pre-redesign stored workspace without changing its real
+  // serialized VM payload: v1 used this same envelope version, so the
+  // format header is the compatibility boundary that must reject it.
+  const oldEnvelope = Buffer.concat([
+    Buffer.from(`${JSON.stringify({ ...header, formatVersion: 1 })}\n`, "utf8"),
+    currentEnvelope.subarray(newline + 1),
+  ]);
+  writeFileSync(snapshotPath, oldEnvelope);
+
+  const second = await connectWithRepl(new FakeRunner());
+  try {
+    const touched = await repl(second, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'await sleep(1); [typeof preRedesignBinding, 6 * 7].join(":")',
+    });
+    assert.ok(!isErrorResult(touched), textOf(touched));
+    const touchedShape = structuredOf(touched);
+    const output = touchedShape.output as string;
+    assert.ok(output.startsWith("REPL workspace auto-reset:"), `the loud notice leads output: ${output}`);
+    assert.ok(output.includes("snapshot carries format version 1"), `the notice names the old format: ${output}`);
+    assert.ok(
+      output.includes(`this engine supports version ${SNAPSHOT_FORMAT_VERSION}`),
+      `the notice names the running format: ${output}`,
+    );
+    assert.equal(touchedShape.result, "undefined:42", "old bindings are gone and sleep() ran in the fresh v2 guest");
+
+    const entries = readdirSync(replDir);
+    const refused = entries.filter((name) => name.startsWith("snapshot.bin.refused-"));
+    assert.equal(refused.length, 1, `the old snapshot was renamed aside exactly once: ${entries.join(", ")}`);
+    assert.ok(output.includes(refused[0]), `the notice names the refused file: ${output}`);
+    assert.deepEqual(
+      readFileSync(join(replDir, refused[0])),
+      oldEnvelope,
+      "the refused snapshot bytes were preserved, never deleted or overwritten",
+    );
+    assert.ok(existsSync(snapshotPath), "the fresh workspace persisted a new current-format snapshot");
+
+    const api = (await evalJson(
+      second,
+      PROJECT,
+      `(() => {
+        const w = workspace();
+        const a = agents();
+        return {
+          workspace: typeof workspace,
+          workspaceLive: Array.isArray(w.bindings),
+          agents: typeof agents,
+          agentsLive: Array.isArray(a),
+          reset: typeof reset,
+          resetLive: reset() === undefined,
+          sleep: typeof sleep,
+          underscore: _,
+        };
+      })()`,
+    )) as Record<string, unknown>;
+    assert.deepEqual(api, {
+      workspace: "function",
+      workspaceLive: true,
+      agents: "function",
+      agentsLive: true,
+      reset: "function",
+      resetLive: true,
+      sleep: "function",
+      underscore: "undefined:42",
+    });
+
+    const afterReset = await repl(second, { action: "eval", projectDir: PROJECT, code: "typeof preRedesignBinding" });
+    assert.equal(structuredOf(afterReset).result, "undefined", "reset() was live and opened another fresh v2 workspace");
+    assert.equal(structuredOf(afterReset).output, "", "the refusal notice is emitted exactly once");
+    assert.ok(existsSync(join(replDir, refused[0])), "reset() never deletes the renamed-aside snapshot");
   } finally {
     await second.dispose();
   }

@@ -798,7 +798,7 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
 
 - **The identity envelope** (`src/snapshot-envelope.ts`, transfer lesson 5): the shim's own
   `serializeSnapshot()` output wrapped in a JSON header line + gzip — the header carries the
-  format name (`repl-snapshot`), the envelope format version (`SNAPSHOT_FORMAT_VERSION = 1`),
+  format name (`repl-snapshot`), the envelope format version (`SNAPSHOT_FORMAT_VERSION = 2`),
   the **wasm-binary sha256** (`wasmSha256Of` — raw bytes hash directly; a compiled module
   hashes through the registry `loadShippedWasm` populates) and the creation time. A restore
   whose recorded hash mismatches the running binary REFUSES LOUDLY naming both hashes

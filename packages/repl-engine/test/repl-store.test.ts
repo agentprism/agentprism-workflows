@@ -28,6 +28,7 @@ import {
   CALL_STORE_FILENAME,
   REPL_STORE_SUBDIR,
   SNAPSHOT_FILENAME,
+  SNAPSHOT_FORMAT_VERSION,
   ReplWorkspaceStore,
   SnapshotEnvelopeError,
   Workspace,
@@ -116,7 +117,7 @@ test('write/load round trip: the enveloped snapshot restores the workspace; the 
   assert.equal(reopened.callStore().lookup('c1')!.completion!.value, 'done');
   const loaded = reopened.loadSnapshot(module);
   assert.equal(loaded.wasmSha256, wasmSha256Of(module));
-  assert.equal(loaded.formatVersion, 1);
+  assert.equal(loaded.formatVersion, SNAPSHOT_FORMAT_VERSION);
   const ws2 = await Workspace.restore(PROJECT, loaded.snapshot, { wasm: module });
   const outcome = await ws2.eval('durable.n + 1 + "/" + tag');
   assert.equal(outcome.kind, 'value');
@@ -173,7 +174,7 @@ test('hash-mismatch refusal PRECEDES payload interpretation: a foreign-binary pa
   const header = Buffer.from(
     JSON.stringify({
       format: 'repl-snapshot',
-      formatVersion: 1,
+      formatVersion: SNAPSHOT_FORMAT_VERSION,
       wasmSha256: foreignHash,
       createdAtMs: Date.now(),
     }) + '\n',
@@ -202,14 +203,14 @@ test('version-bump refusal through the store: an upgraded format version refuses
   const nl = raw.indexOf(0x0a);
   const header = JSON.parse(raw.subarray(0, nl).toString('utf8'));
   writeFileSync(store.snapshotPath, Buffer.concat([
-    Buffer.from(JSON.stringify({ ...header, formatVersion: 2 }) + '\n'),
+    Buffer.from(JSON.stringify({ ...header, formatVersion: SNAPSHOT_FORMAT_VERSION + 1 }) + '\n'),
     raw.subarray(nl + 1),
   ]));
   const error = captureThrows(() => store.loadSnapshot(module));
   assert.ok(error instanceof SnapshotEnvelopeError, error.message);
   assert.equal((error as SnapshotEnvelopeError).code, 'VERSION_MISMATCH');
-  assert.ok(error.message.includes('2'), error.message);
-  assert.ok(error.message.includes('1'), error.message);
+  assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION + 1)), error.message);
+  assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION)), error.message);
   assert.ok(error.message.includes(store.snapshotPath), error.message);
   teardown(dir);
 });
