@@ -225,10 +225,12 @@ test("the executable ACP extension matrix pins steering support and installed ad
       if (row.method === "_session/steering") {
         assert.match(
           dist,
-          // Anchor on the steering block's own opening braces; other `_meta` extension keys
-          // (e.g. the goal extension added upstream in #371) may follow it as siblings, so do
-          // not require `supported: true` to be the last key before the closing brace.
-          /_meta\s*:\s*\{\s*steering\s*:\s*\{\s*supported\s*:\s*true\s*,?\s*\}/,
+          // Anchor on the steering block itself; other `_meta` extension keys may precede
+          // it (the jetbrains/air block, upstream 0.67.0) or follow it (the goal extension,
+          // upstream #371) as siblings, so require neither that `steering` opens `_meta`
+          // nor that `supported: true` is `_meta`'s last entry — only that the steering
+          // block itself advertises exactly `supported: true`.
+          /steering\s*:\s*\{\s*supported\s*:\s*true\s*,?\s*\}/,
           `${row.agent} dist must advertise top-level steering support`,
         );
       } else {
