@@ -55,6 +55,11 @@
       "sha": "b51bedf60050c60fef78fc669e6ccf2ff61e3f47",
       "imported": "2026-08-12",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.2.0 — negotiated AIR typed-session-failures extension, release-please release flow, hono dev-dep bump)"
+    },
+    {
+      "sha": "c4a9311f60a638e3a4b03a475afff1d7678e594f",
+      "imported": "2026-08-14",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (feat: add versioned context compaction metadata (#396))"
     }
   ]
 }
