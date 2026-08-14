@@ -635,7 +635,7 @@ export interface RunDynamicWorkflowOptions {
   cwd?: string;
   /** The `args` value handed to the workflow script's vm-realm `args` global. */
   args?: unknown;
-  /** Per-execution options forwarded to `WorkflowManager.runSync` (timeouts, signal, budget, …). */
+  /** Per-execution options forwarded to `WorkflowManager.runSync` (timeouts, signal, …). */
   exec?: ExecOptions;
   /** Approval policy for script-declared `meta.backends` (see {@link ScriptBackendApproval}). */
   allowScriptBackends?: ScriptBackendApproval;

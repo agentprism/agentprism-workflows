@@ -1,10 +1,10 @@
 /**
- * Phase-D review round 2 at the MCP-tool boundary: the wait action's
- * same-shape output (console output drained by the wait's pumps is
- * rendered immediately, never deferred to the next eval), the status
- * action's workspace manifest (bindings with structure-only tokens,
- * provenance, and live-handle status), the single-flight first touch
- * (concurrent first-touch calls create exactly one VM and broker), the
+ * Phase-D review round 2 at the MCP-tool boundary, adapted to the
+ * eval-plane redesign surface: the fused eval's pump (a continuation's
+ * console output drains in the SAME held call), the §4.5 workspace()
+ * introspection (bindings with structure-only tokens, provenance, and
+ * live-handle status), the single-flight first touch (concurrent
+ * first-touch calls create exactly one VM and broker), the
  * client-presence drain (last-client disconnect drains in-flight turns
  * and closes idle children; the next connect's followUp re-attaches
  * lazily), and the per-eval deadline (a currently-running runaway eval
@@ -114,12 +114,20 @@ class FakeSession implements BrokerSession {
   }
 }
 
-/** The fake runner with the phase-D loadSession seam (see repl-tool.test.ts). */
+/** The fake runner with the loadSession seam (see repl-tool.test.ts). */
 class FakeRunner implements BrokerRunner {
   readonly sessions: FakeSession[] = [];
   readonly openedWith: BrokerOpenSessionOptions[] = [];
   readonly loadedWith: BrokerLoadSessionOptions[] = [];
   loadedTurnText: string | null = null;
+
+  listBackends(): string[] {
+    return ["pi"];
+  }
+
+  defaultBackendId(): string {
+    return "pi";
+  }
 
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     const session = new FakeSession(opts);
@@ -181,9 +189,23 @@ async function connectWithRepl(
 
 async function repl(
   connected: Connected,
-  input: { action: string; projectDir?: string; code?: string; ids?: string[]; timeoutMs?: number; id?: string },
+  input: { action: string; projectDir?: string; code?: string; timeoutMs?: number; id?: string },
 ) {
   return connected.client.callTool({ name: "repl", arguments: input as Record<string, unknown> });
+}
+
+function structuredOf(res: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+  return (res as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
+}
+
+/** Evaluate an expression that returns JSON (the §4.5 sliceable-
+ *  introspection idiom). */
+async function evalJson(connected: Connected, projectDir: string, expression: string): Promise<unknown> {
+  const r = await repl(connected, { action: "eval", projectDir, code: `JSON.stringify(${expression})` });
+  assert.ok(!isErrorResult(r), textOf(r));
+  const sc = structuredOf(r);
+  assert.ok(typeof sc.result === "string", `the eval resolved with a value: ${JSON.stringify(sc)}`);
+  return JSON.parse(sc.result as string);
 }
 
 function isErrorResult(res: Awaited<ReturnType<Client["callTool"]>>): boolean {
@@ -194,37 +216,36 @@ async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-test("review2: wait returns the SAME shape as eval — console output drained by its pumps renders immediately (never deferred to the next eval)", async () => {
+test("review2: the fused eval pumps a settled call's continuation INTO THE SAME held call — console output drained by the pumps renders immediately (the v1 wait's same-shape guarantee, fused into eval)", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
   const connected = await connectWithRepl(runner);
   try {
-    // The continuation of the settled call logs guest-visible output; the
-    // wait's pump drains it and must render it in the wait result.
-    const r = await repl(connected, {
+    // The eval awaits the subagent; the continuation logs guest-visible
+    // output when it settles. The tool holds the call open pumping — the
+    // turn completes mid-hold and the SAME call renders the output.
+    const held = repl(connected, {
       action: "eval",
       projectDir: PROJECT,
-      code: 'const p = agent("pi/x", "task").then((v) => { console.log("continuation ran:", v); }); "started"',
+      code: 'const p = agent("pi/x", "task").then((v) => { console.log("continuation ran:", v); return v; }); await p',
+      timeoutMs: 5000,
     });
-    assert.ok(!isErrorResult(r), textOf(r));
-    await tick();
+    for (let attempt = 0; attempt < 100 && runner.sessions.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runner.sessions.length, 1, "the founding session opened");
     runner.last().completeTurn("waited result");
-    await tick();
-    const waited = await repl(connected, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
-    assert.ok(!isErrorResult(waited), textOf(waited));
-    // The wait's pump drained the continuation's console.log and rendered
-    // it in the wait result (the preview line carries the frozen refs).
-    assert.ok(
-      textOf(waited).includes('"continuation ran:"') && textOf(waited).includes('"waited result"'),
-      `output rendered: ${textOf(waited)}`,
-    );
-    assert.ok(textOf(waited).includes("completed: c1"), textOf(waited));
+    const r = await held;
+    assert.ok(!isErrorResult(r), textOf(r));
+    const sc = structuredOf(r);
+    assert.equal(sc.output, "continuation ran: waited result", `output rendered: ${JSON.stringify(sc)}`);
+    assert.equal(sc.result, "waited result");
   } finally {
     await connected.dispose();
   }
 });
 
-test("review2: status renders the workspace manifest — bindings with structure-only tokens, provenance, and live-handle status", async () => {
+test("review2: workspace() renders the workspace manifest as plain data — bindings with structure-only types, provenance, and live-handle status", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
   const connected = await connectWithRepl(runner);
@@ -236,38 +257,52 @@ test("review2: status renders the workspace manifest — bindings with structure
     });
     assert.ok(!isErrorResult(r), textOf(r));
     await tick();
-    const status = await repl(connected, { action: "status", projectDir: PROJECT });
-    const text = textOf(status);
-    assert.ok(text.includes("bindings:"), text);
-    assert.ok(text.includes("findings = {2 keys}"), text);
-    // EVERY binding carries its byte size in the rendered token —
-    // primitives included (phase-E review rejection: the manifest's size
-    // surface used to stop at strings, containers and brands).
-    assert.ok(text.includes("n = number · 8B"), `primitive size in status: ${text}`);
-    assert.ok(text.includes("research = agent handle · pending · call c1"), text);
-    assert.ok(text.includes("· 151B"), `handle size in status: ${text}`);
-    assert.ok(text.includes("via eval 1"), text);
-    // The doc's full provenance surface (phase-D review round 3): the
-    // binding renders "from what task, when" — the founding task text and
-    // the attribution wall clock.
-    assert.ok(text.includes('· task "investigate"'), text);
-    assert.ok(text.includes("· at "), text);
-    // The live agent line carries its task too (the renderer used to omit
-    // the task already available on LiveAgentInfo).
-    assert.ok(text.includes('agent c1: running — task: "investigate"'), text);
-    // The intent-plane hygiene rule: NO value content in the manifest.
-    assert.ok(!text.includes("MARKER"), `value content leaked: ${text}`);
-    assert.ok(!text.includes("zekret"), `nested names leaked: ${text}`);
-    // The handle settles: the manifest's live-handle status follows.
+    const ws = (await evalJson(connected, PROJECT, "workspace()")) as {
+      bindings: Array<{
+        name: string;
+        type: string;
+        sizeBytes: number;
+        provenance: string | null;
+        task: string | null;
+        callId?: string;
+        status?: string;
+      }>;
+      inFlight: string[];
+    };
+    const findings = ws.bindings.find((b) => b.name === "findings");
+    assert.ok(findings, JSON.stringify(ws.bindings));
+    assert.equal(findings.type, "object", "the structure-only type");
+    assert.ok(!JSON.stringify(findings).includes("MARKER"), "no value content in the manifest");
+    assert.ok(!JSON.stringify(findings).includes("zekret"), "no nested names leak");
+    // EVERY binding carries its byte size — primitives included.
+    const n = ws.bindings.find((b) => b.name === "n");
+    assert.equal(n?.type, "number");
+    assert.ok((n?.sizeBytes ?? 0) > 0, `primitive size: ${JSON.stringify(n)}`);
+    // The doc's full provenance surface: which eval produced the value
+    // and the live-handle status + call id.
+    const research = ws.bindings.find((b) => b.name === "research");
+    assert.equal(research?.type, "agent handle");
+    assert.equal(research?.callId, "c1");
+    assert.equal(research?.status, "pending");
+    assert.equal(research?.provenance, "eval 1");
+    assert.equal(research?.task, "investigate", "the founding task text");
+    assert.deepEqual(ws.inFlight, ["c1"]);
+    // agents(): the live agent with its state and task.
+    const agents = (await evalJson(connected, PROJECT, "agents()")) as Array<{ callId: string; task: string; state: string }>;
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].callId, "c1");
+    assert.equal(agents[0].task, "investigate");
+    assert.equal(agents[0].state, "running");
+    // The handle settles: the live-handle status follows (the honest
+    // settled — the call store is the authority).
     runner.last().completeTurn("DUG-UP");
     await tick();
-    await repl(connected, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
-    const after = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(
-      textOf(after).includes("research = agent handle · settled · call c1"),
-      `settled status: ${textOf(after)}`,
-    );
-    assert.ok(!textOf(after).includes("DUG-UP"), `worker content leaked: ${textOf(after)}`);
+    await repl(connected, { action: "eval", projectDir: PROJECT, code: "await research" });
+    const wsAfter = (await evalJson(connected, PROJECT, "workspace()")) as {
+      bindings: Array<{ name: string; status?: string }>;
+    };
+    assert.equal(wsAfter.bindings.find((b) => b.name === "research")?.status, "settled", `settled status: ${JSON.stringify(wsAfter.bindings)}`);
+    assert.ok(!JSON.stringify(wsAfter).includes("DUG-UP"), "worker content never enters the manifest");
   } finally {
     await connected.dispose();
   }
@@ -280,9 +315,7 @@ test("review2: concurrent first touches create exactly ONE VM and broker for a p
   const connected = await connectWithRepl(runner, { presence });
   try {
     // Park the backend open so the first touch is slow: every concurrent
-    // first-touch eval must share the single in-flight firstTouch promise
-    // (phase-D review round 2: the async null-check race used to create
-    // two VMs and brokers for one project).
+    // first-touch eval must share the single in-flight firstTouch promise.
     let releaseOpen!: () => void;
     const parkedOpen = new Promise<void>((resolve) => {
       releaseOpen = resolve;
@@ -309,9 +342,13 @@ test("review2: concurrent first touches create exactly ONE VM and broker for a p
     // a second VM had been created and abandoned, its passes would have
     // landed on a different registry and the eval sequence would be short.
     assert.equal(runner.openedWith.length, 3, "all dispatches were served");
-    const status = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(textOf(status).includes("bindings:"), textOf(status));
-    assert.ok(textOf(status).includes("via eval 3"), `the three passes landed on one registry: ${textOf(status)}`);
+    const ws = (await evalJson(connected, PROJECT, "workspace()")) as {
+      bindings: Array<{ provenance: string | null }>;
+    };
+    assert.ok(
+      ws.bindings.some((b) => b.provenance === "eval 3"),
+      `the three passes landed on one registry: ${JSON.stringify(ws.bindings)}`,
+    );
   } finally {
     await connected.dispose();
   }
@@ -343,8 +380,10 @@ test("review2: last-client disconnect drains in-flight turns to completion and c
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(session.releases, 1, "the idle child closed after the drain");
-    const status = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(textOf(status).includes("children: closed"), textOf(status));
+    const ws = (await evalJson(connected, PROJECT, "workspace()")) as {
+      diagnostics: { childrenClosed: boolean };
+    };
+    assert.equal(ws.diagnostics.childrenClosed, true, "children closed after the drain");
     // The next connect (a new client) evaluates: the continuation already
     // fired; a followUp lazily re-attaches the recorded session.
     const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: 'p.followUp("again"); "fired"' });
@@ -368,8 +407,10 @@ test("review2: last-client disconnect drains in-flight turns to completion and c
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(reattached.releases, 1, "the re-attached child closed after the SECOND disconnect");
-    const status2 = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(textOf(status2).includes("children: closed"), textOf(status2));
+    const ws2 = (await evalJson(connected, PROJECT, "workspace()")) as {
+      diagnostics: { childrenClosed: boolean };
+    };
+    assert.equal(ws2.diagnostics.childrenClosed, true, "children closed after the second drain");
   } finally {
     await connected.dispose();
   }
@@ -430,8 +471,7 @@ test("review6: a client reconnecting mid-drain ABORTS the drain through the daem
     // presence): the drain must ABORT — the release phase must never
     // close children while any client is connected (phase-D review
     // round 6: the drain used to run to completion regardless of
-    // presence, and repl-presence.ts documented the contradictory
-    // behavior).
+    // presence).
     const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"back"' });
     assert.ok(!isErrorResult(probe), textOf(probe));
     assert.equal(session.releases, 0, "the drain aborted — the child was NOT released");
@@ -441,18 +481,20 @@ test("review6: a client reconnecting mid-drain ABORTS the drain through the daem
     session.completeTurn("warm result");
     for (let attempt = 0; attempt < 100; attempt++) {
       const got = await repl(connected, { action: "eval", projectDir: PROJECT, code: "await p" });
-      if (textOf(got).includes("warm result")) break;
+      if (structuredOf(got).result === "warm result") break;
       if (attempt === 99) assert.fail(`the turn never settled: ${textOf(got)}`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    const status = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(!textOf(status).includes("children: closed"), "the workspace is warm (the drain aborted)");
+    const ws = (await evalJson(connected, PROJECT, "workspace()")) as {
+      diagnostics: { childrenClosed: boolean };
+    };
+    assert.equal(ws.diagnostics.childrenClosed, false, "the workspace is warm (the drain aborted)");
   } finally {
     await connected.dispose();
   }
 });
 
-test("review6: a failed client-presence drain is surfaced loudly and retained — the snapshot-flush failure is recorded on the state, the next tool result reports it, and the next disconnect retries the drain", async () => {
+test("review6: a failed client-presence drain gets the §6.2 [C]14 one-line notice in the next eval's output and is retained until the next drain succeeds — the snapshot-flush failure never vanishes", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
   const presence = new ReplPresenceLedger(60_000);
@@ -473,7 +515,8 @@ test("review6: a failed client-presence drain is surfaced loudly and retained �
     // The last client disconnects: the drain runs, the in-flight turn
     // completes, and the drain's settlement flush FAILS. The failure
     // must not vanish (phase-D review round 6: the ledger used to
-    // swallow it) — it is recorded on the state and surfaced loudly.
+    // swallow it) — it is recorded on the state and the NEXT eval's
+    // output carries the one-line notice (the failure lost state).
     presence.disconnect("client-A");
     await new Promise((resolve) => setTimeout(resolve, 20));
     const session = runner.last();
@@ -488,34 +531,34 @@ test("review6: a failed client-presence drain is surfaced loudly and retained �
     assert.equal(session.releases, 1, "the release phase ran before the flush failure");
     rmSync(tmpPath, { recursive: true, force: true });
     // The next eval succeeds (its end-of-op flush retries the retained
-    // boundary — the retry, loud on failure, silent on success) and
-    // surfaces the recorded drain failure in its result; the call's
-    // settlement survived the failed flush in the live VM.
+    // boundary) and its output leads with the drain-failure notice; the
+    // call's settlement survived the failed flush in the live VM.
     const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: "await p" });
     assert.ok(!isErrorResult(probe), textOf(probe));
+    const sc = structuredOf(probe);
+    assert.equal(sc.result, "drained but not persisted", `the drained settlement survived the failed flush in the live VM: ${JSON.stringify(sc)}`);
     assert.ok(
-      textOf(probe).includes("drained but not persisted"),
-      `the drained settlement survived the failed flush in the live VM: ${textOf(probe)}`,
+      String(sc.output).includes("client-presence drain failed"),
+      `the drain failure is surfaced as the one-line notice: ${String(sc.output)}`,
     );
-    assert.ok(
-      textOf(probe).includes("client-presence drain failed"),
-      `the drain failure is surfaced guest-visibly: ${textOf(probe)}`,
-    );
-    const status = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(
-      textOf(status).includes("LAST DRAIN FAILED"),
-      `status reports the failure: ${textOf(status)}`,
-    );
+    assert.ok(String(sc.output).includes("not persisted"), `the notice names the lost state: ${String(sc.output)}`);
+    // The notice is consumed exactly once: a further eval is clean.
+    const clean = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"clean"' });
+    assert.equal(structuredOf(clean).output, "", "the notice was rendered once");
     // The next disconnect retries the drain: the broker's latch says the
     // release already completed, so the retry finishes the bookkeeping
-    // and clears the recorded failure.
+    // and clears the recorded failure — the NEXT eval after that carries
+    // no notice.
     presence.disconnect("client-A");
     for (let attempt = 0; attempt < 100 && presence.drainingCount() > 0; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    const status2 = await repl(connected, { action: "status", projectDir: PROJECT });
-    assert.ok(!textOf(status2).includes("LAST DRAIN FAILED"), `the retry cleared the failure: ${textOf(status2)}`);
-    assert.ok(textOf(status2).includes("children: closed"), textOf(status2));
+    const afterRetry = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"after retry"' });
+    assert.equal(structuredOf(afterRetry).output, "", "the retry cleared the failure — no new notice");
+    const ws = (await evalJson(connected, PROJECT, "workspace()")) as {
+      diagnostics: { childrenClosed: boolean };
+    };
+    assert.equal(ws.diagnostics.childrenClosed, true, "children closed after the retried drain");
   } finally {
     await connected.dispose();
   }
@@ -804,8 +847,8 @@ test("review-rejection: reset during a parked restore-time loadSession DETACHES 
     // and the stale first-touch flight is DETACHED (the old code left it
     // in place — every subsequent touch returned the never-resolving
     // promise and hung forever). The reset is driven directly with a
-    // short bound (the MCP tool's reset runs the same path with the
-    // default shutdown bound).
+    // short bound (the `reset()` guest function runs the same path with
+    // the default shutdown bound).
     await resetReplProjectState(state, 300);
     assert.equal(state.firstTouch, null, "the stale first-touch flight was detached by the reset");
     assert.equal(state.workspace, null, "the workspace was torn down");

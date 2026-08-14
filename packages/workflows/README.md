@@ -358,9 +358,8 @@ Every allocated call receives a terminal manifest row even when the run halts ar
 non-result occurrence remains live on resume and stays in the identity seed as an ambiguity
 blocker until reached, so completed siblings on either side can replay. Uncertain,
 ambiguous, or mismatched calls run live. Filesystem/current-environment and Node/V8 differences are
-reported as provenance without changing admission or matching. Identity hits preserve
-script-visible logical budget debit while adding zero current provider usage; replayed session
-records are rebound to the current call index/label/phase. `resumePolicy: "positional"` requests
+reported as provenance without changing admission or matching. Identity hits preserve the recorded per-call provenance while adding zero current provider usage;
+replayed session records are rebound to the current call index/label/phase. `resumePolicy: "positional"` requests
 index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. The distinct
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
@@ -625,7 +624,7 @@ ships no runtime code).
 | `agent(prompt, options?)` | Run ONE subagent to completion; returns its result (text, or the validated object with `options.schema`). The legacy `options.resume` annotation is accepted but replay-neutral. |
 | `parallel(thunks)` | Run an array of **thunks** (`() => Promise`) concurrently; resolves in input order. |
 | `pipeline(items, ...stages)` | Map `items` through sequential async stages, concurrently across items. |
-| `workflow(nameOrScript, args?)` | Run a saved (or inline) workflow nested in this run, sharing its limiter/budget. |
+| `workflow(nameOrScript, args?)` | Run a saved (or inline) workflow nested in this run, sharing its limiter. |
 | `verify(item, options?)` | Adversarial verification panel — N reviewers vote whether `item` is real/correct. |
 | `judgePanel(attempts, options?)` | LLM-judge panel — score candidates against a rubric, return the best. |
 | `loopUntilDry(options)` | Repeat a round, collecting deduped new items until it dries up. |
@@ -633,10 +632,9 @@ ships no runtime code).
 | `retry(thunk, options?)` | Bounded retry until `until(result)` holds. |
 | `gate(thunk, validator, options?)` | Validate-and-feed-back loop returning `{ ok, value, verdict, attempts }`; `verdict` is the raw last validator return on either pass or exhaustion. |
 | `checkpoint(text, options?)` | Deterministic, journaled human gate: live confirm, headless default/abort, or opt-in durable `headless: "pause"`. |
-| `phase(title, options?)` | Open a named phase (optional soft token sub-budget). |
+| `phase(title)` | Open a named phase. |
 | `log(message)` | Append a line to the run log. |
 | `args` | The input bag passed in via `{ args }`. |
-| `budget` | Live token-budget view: `budget.total`, `budget.spent()`, `budget.remaining()`. |
 
 (`console.log/info/warn/error` route to `log` too.) Pass these primitives **thunks**, not
 promises — `parallel([() => agent("a"), () => agent("b")])`, not `parallel([agent("a"), …])`.
@@ -685,8 +683,7 @@ instead of clamping. Exit codes are `0` valid, `1` parse failure, `2` dry-run or
 
 Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
 NAME and resolve nested `workflow("<name>")` calls from your folder), `--parse-only`,
-`--cwd <dir>`, `--token-budget <n>` (exercise `budget`-guarded paths; the mock reports 1000
-tokens per call), `--max-agents <n>`, `--timeout-ms <n>`, `--mock-answers <json>`,
+`--cwd <dir>`, `--max-agents <n>`, `--timeout-ms <n>`, `--mock-answers <json>`,
 `--mock-answers-file <path>`, `--json`. The two mock-answer flags are mutually exclusive.
 
 Mock answers select the final resolved agent label with case-sensitive, whole-label globs: `*`
@@ -706,8 +703,7 @@ from an untouched limitation of the simple fabricator may be accepted with a gro
 Schema-less answers must be nonblank strings. Sequences never repeat or fall back: exhaustion fails
 the dry run, while unconsumed singles/items remain non-fatal and appear in structured `unused`
 records plus grouped warnings. Supplying mock answers serializes dry-run agent service for stable
-FIFO sequence allocation, so this mode is not a concurrency/load simulator and its token-budget
-admission timing can differ from an unscripted concurrent dry run.
+FIFO sequence allocation, so this mode is not a concurrency/load simulator.
 
 Fixture input is capped at 256 KiB (raw CLI UTF-8 and canonical programmatic JSON), 256 rules,
 256 UTF-16 code units per glob, 256 sequence entries, and answer nesting depth 32. Values must be
@@ -997,8 +993,8 @@ npx skills add agentprism/agentprism-workflows
 ```
 
 It teaches the full script DSL: routing each `agent()` call to a different ACP backend inside one
-script, structured outputs across all backends, `checkpoint()` gates, budgets, worktree
-isolation, and the determinism rules that make runs resumable. `reference.md` alongside it holds
+script, structured outputs across all backends, `checkpoint()` gates, worktree isolation, and
+the determinism rules that make runs resumable. `reference.md` alongside it holds
 the exhaustive option tables.
 
 ---

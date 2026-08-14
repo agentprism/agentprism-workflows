@@ -378,6 +378,14 @@ class SessionState {
   private turnStartTypedSessionFailure: TypedSessionFailure | undefined;
   private turnStartIndex = 0;
   private finalMessageStartIndex = 0;
+  /** Assistant-MESSAGE segment starts within the current turn (the §5
+   *  chunk joiner): every content event that ends the in-flight
+   *  assistant message (a tool call, a thought, a plan, a user message)
+   *  opens a new segment. Consecutive chunks inside one message still
+   *  join with "" (mid-sentence fragments); `foldedTurnText` joins
+   *  SEPARATE messages with "\n\n" — narration and answers stay apart
+   *  instead of gluing ("…files.TypeScript…"). */
+  private readonly messageStartIndexes: number[] = [];
   /** The re-attach arm's transcript probe (phase D): where the LOADED
    *  session's founding turn starts — the assistant-text length after the
    *  LAST replayed user message (the founding turn's prompt). Tracked from
@@ -462,6 +470,7 @@ class SessionState {
       this.turnStartIndex = 0;
     }
     this.finalMessageStartIndex = this.turnStartIndex;
+    this.messageStartIndexes.length = 0;
     this.rawResultSuccess = undefined;
     this.providerErrorMetadata = undefined;
     this.turnStartTypedSessionFailure = this.typedSessionFailure;
@@ -469,6 +478,28 @@ class SessionState {
 
   currentTurnText(): string {
     return this.textChunks.slice(this.turnStartIndex).join("");
+  }
+
+  /** The turn's assistant text with the §5 chunk joiner: the result fold
+   *  joins assistant MESSAGE chunks with "\n\n" — separate messages
+   *  (split by a tool call, a thought, a plan, or a user message) stay
+   *  apart; consecutive chunks of ONE message join with "" as before
+   *  (mid-sentence fragments must never gain separators). */
+  foldedTurnText(): string {
+    const starts = this.messageStartIndexes.filter(
+      (index) => index > this.turnStartIndex && index < this.textChunks.length,
+    );
+    const segments: string[] = [];
+    let from = this.turnStartIndex;
+    for (const start of starts) {
+      segments.push(this.textChunks.slice(from, start).join(""));
+      from = start;
+    }
+    segments.push(this.textChunks.slice(from).join(""));
+    // Only non-empty assistant MESSAGES join (a boundary pair with no
+    // text between — two bookkeeping events back to back — contributes
+    // nothing, not an extra separator).
+    return segments.filter((segment) => segment.length > 0).join("\n\n");
   }
 
   /** The turn's FINAL assistant message: only the chunks streamed after the last content event
@@ -505,6 +536,7 @@ class SessionState {
       case "tool_call": {
         this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        this.messageStartIndexes.push(this.textChunks.length);
         this.history.push({
           role: "tool",
           kind: "toolCall",
@@ -524,6 +556,7 @@ class SessionState {
         this.loadedTurnStartIndex = this.textChunks.length;
         this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        this.messageStartIndexes.push(this.textChunks.length);
         break;
       }
       case "agent_thought_chunk":
@@ -533,6 +566,7 @@ class SessionState {
         // working — the founding turn is not observably complete.
         this.trailingContentKind = 'other';
         this.finalMessageStartIndex = this.textChunks.length;
+        this.messageStartIndexes.push(this.textChunks.length);
         break;
       }
       case "plan_update":
@@ -2888,6 +2922,13 @@ export class SessionHandle implements StructuredSource {
   /** StructuredSource — the latest turn's assistant text. */
   currentTurnText(): string {
     return this.state.currentTurnText();
+  }
+
+  /** The latest turn's assistant text with the §5 chunk joiner: separate
+   *  assistant MESSAGES join with "\n\n" (the result fold the runner
+   *  returns; consecutive chunks of one message join with ""). */
+  foldedTurnText(): string {
+    return this.state.foldedTurnText();
   }
 
   /** StructuredSource — the latest turn's FINAL assistant message (see SessionState). */

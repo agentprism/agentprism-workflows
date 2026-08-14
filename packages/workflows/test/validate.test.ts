@@ -23,7 +23,6 @@ import {
   fabricateFromSchema,
   formatValidateReport,
   validateWorkflowScript,
-  MOCK_TOKENS_PER_AGENT,
   ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT,
 } from "../src/validate.js";
 import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
@@ -695,18 +694,18 @@ test("script-declared backends: dry run treats them as approved, attributes call
   assert.match(report.warnings.join("\n"), /custom backends \(browser\)/);
 });
 
-test("token budget: budget-guarded loops execute and terminate against mock usage", async () => {
+test("§7: the budget surface is deleted — a script referencing `budget` fails the dry run with the undefined-global error, and `phase(title, { budget })` is a script error", async () => {
   const script = [
     'export const meta = { name: "v", description: "d" };',
     "const out = [];",
-    `while (budget.total && budget.remaining() >= ${MOCK_TOKENS_PER_AGENT}) {`,
+    "while (budget.remaining() >= 1) {",
     '  out.push(await agent("more", { label: "loop:" + out.length }));',
     "}",
     "return out.length;",
   ].join("\n");
-  const report = await validateWorkflowScript(script, { tokenBudget: 3 * MOCK_TOKENS_PER_AGENT });
-  assert.equal(report.ok, true);
-  assert.equal(report.dryRun?.result, 3);
+  const report = await validateWorkflowScript(script);
+  assert.equal(report.ok, false);
+  assert.match(report.dryRun?.reason ?? "", /budget/);
 });
 
 test("phase mismatches and agent-less scripts produce warnings, not failures", async () => {

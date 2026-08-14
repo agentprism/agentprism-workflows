@@ -276,6 +276,38 @@ test("(2b) schema result is the FINAL assistant message — a schema-shaped prog
   assert.deepEqual(out, { city: "LA", hot: true });
 });
 
+// ---- (2c) the §5 result fold: assistant MESSAGE chunks join with "\n\n" ---------------
+
+test("(2c) the §5 result fold joins assistant MESSAGE chunks with \"\\n\\n\" — narration stays apart from the answer, while consecutive chunks of ONE message join with \"\" (mid-sentence fragments never gain separators)", async () => {
+  const { cwd } = configure({
+    turns: [
+      {
+        updates: [
+          // The narration message.
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "won't modify any files." } },
+          // A tool call ends the narration and starts the answer message.
+          { sessionUpdate: "tool_call", toolCallId: "tc-fold-1", title: "search the codebase", kind: "search", status: "in_progress" },
+          { sessionUpdate: "tool_call_update", toolCallId: "tc-fold-1", status: "completed" },
+          // The answer message streams in two consecutive chunks — one message, joined with "".
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "TypeScript" } },
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " files under src stay untouched." } },
+        ],
+        text: [],
+      },
+    ],
+  });
+  const out = await makeRunner().run("check", { model: "pi", cwd });
+  assert.equal(
+    out,
+    "won't modify any files.\n\nTypeScript files under src stay untouched.",
+    "separate messages join with \\n\\n; consecutive chunks of one message join with \"\"",
+  );
+  // A single multi-chunk message gains NO separators (mid-sentence fragments).
+  const single = configure({ turns: [{ text: ["hello", " world"] }] });
+  const singleOut = await makeRunner().run("hi", { model: "pi", cwd: single.cwd });
+  assert.equal(singleOut, "hello world");
+});
+
 // ---- (3b) Claude schema channel + structured_output read ----------------------------
 
 test("(3b) Claude sets outputFormat+emitRawSDKMessages at session/new and reads structured_output", async () => {

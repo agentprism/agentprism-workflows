@@ -41,9 +41,6 @@ import {
   shortString,
   headTailDescription,
   isCanonicalIndex,
-  applyOutputCaps,
-  OUTPUT_MAX_LINES,
-  OUTPUT_MAX_BYTES,
   GUEST_LIBRARY_VERSION,
   GUEST_SURFACE_KEY,
   GUEST_VERSION_GLOBAL,
@@ -195,11 +192,6 @@ async function exercisePhaseB(): Promise<void> {
   HOST_CHECKPOINT satisfies string;
   HOST_CONSOLE satisfies string;
   HOST_STEER satisfies string;
-  const capped = applyOutputCaps(['line 1', 'line 2']);
-  capped.lines satisfies string[];
-  capped.truncated satisfies boolean;
-  OUTPUT_MAX_LINES satisfies number;
-  OUTPUT_MAX_BYTES satisfies number;
   bridgeVm.dispose();
 }
 
@@ -366,8 +358,9 @@ function brokerSurfaceTyping(ws: Workspace): void {
   fileStore.close();
   const evalResult: ReplEvalResult = {
     output: ['42'],
-    outputTruncated: false,
+    kind: 'value',
     result: '42',
+    evalToken: 'e1',
     pending: [],
     checkpoints: [],
     completed: [],

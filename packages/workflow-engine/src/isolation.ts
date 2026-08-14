@@ -1006,7 +1006,6 @@ class ReplayRunnerImplementation implements ReplayRunner {
     options?: RunOptions<import("typebox").TSchema | undefined>,
   ): unknown {
     const row = binding.row;
-    options?.onBudgetReplay?.({ settlementOrdinal: row.settlementOrdinal as number });
     options?.onResultProvenance?.({
       source: "replay",
       recordedRunId: this.recording.runId,
@@ -1025,7 +1024,6 @@ class ReplayRunnerImplementation implements ReplayRunner {
   ): Promise<unknown> {
     binding.report.attempts = (binding.report.attempts ?? 0) + 1;
     const overrideModel = binding.target.model ?? options.model;
-    options.onBudgetReplay?.({ settlementOrdinal: binding.row.settlementOrdinal as number });
     options.onResultProvenance?.({
       source: "live",
       ...(overrideModel === undefined ? {} : { overrideModel }),
@@ -1593,14 +1591,7 @@ export async function runIsolation<T = unknown>(
             ? options.agentTimeoutMs
             : recording.limits?.agentTimeoutMs,
         agentRetries: options.agentRetries ?? recording.limits?.agentRetries,
-        tokenBudget: recording.limits?.tokenBudget,
         maxAgents: recording.limits?.maxAgents,
-        budgetReplay: {
-          trajectory: (recording.calls ?? [])
-            .filter((row) => row.kind === "agent")
-            .map((row) => ({ ordinal: row.settlementOrdinal as number, debit: row.budgetDebit as number }))
-            .sort((left, right) => left.ordinal - right.ordinal),
-        },
         onNestedWorkflow: (_ordinal, childRunId) => {
           wrapper.noteNestedWorkflow(`nested workflow scope ${childRunId} was invoked during isolation`);
           stopForObservation();

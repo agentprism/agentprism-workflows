@@ -185,7 +185,6 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `concurrency` | integer > 0 | no | engine default | Max concurrent agents. **Clamped to 16** (the runtime max) by the engine — never rejected. |
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. Every retry re-arms the clock. |
-| `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
@@ -210,8 +209,7 @@ Example call arguments:
 {
   "script": "export const meta = { name: 'review', description: 'review a diff' };\nconst r = await agent('Review this diff and summarize risks:\\n' + args.diff);\nreturn r;",
   "args": { "diff": "diff --git a/x b/x\n+console.log(1)" },
-  "concurrency": 4,
-  "tokenBudget": 200000
+  "concurrency": 4
 }
 ```
 
@@ -260,8 +258,7 @@ Background start and bounded collection:
   "script": "export const meta = { name: 'review', description: 'review a change' };\nconst report = await agent('Review ' + args.target, { label: 'review' });\nreturn report;",
   "args": { "target": "src/auth.ts" },
   "background": true,
-  "concurrency": 4,
-  "tokenBudget": 200000
+  "concurrency": 4
 }
 ```
 
@@ -271,7 +268,7 @@ Background start and bounded collection:
   "status": "running",
   "limits": {
     "maxAgents": 1000,
-    "tokenBudget": 200000,
+    "tokenBudget": null,
     "concurrency": 4,
     "agentRetries": 0,
     "agentTimeoutMs": null
@@ -431,8 +428,9 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 `resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs` and a
 terminal `errorCode`; timed-out and host-cancelled calls therefore remain visible as
 `AGENT_TIMEOUT` and `AGENT_CANCELLED`. `limits`
-contains `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved
-for this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
+contains `maxAgents`, `tokenBudget` (always `null` — the token budget was deleted; the field stays
+for persisted-shape stability), `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved for
+this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
 keys and credential-shaped strings are redacted before results are structurally compacted; every
 text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
@@ -957,7 +955,7 @@ const run = await runDynamicWorkflow(
   `export const meta = { name: "demo", description: "one agent" };
    const r = await agent("Say hello in one word.");
    return r;`,
-  { exec: { concurrency: 4, tokenBudget: 100_000 } },
+  { exec: { concurrency: 4 } },
 );
 
 console.log(run.status, run.result);

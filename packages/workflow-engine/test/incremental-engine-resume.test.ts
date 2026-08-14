@@ -146,7 +146,7 @@ const values = await parallel([
   () => agent("alpha", { label: "alpha", phase: "read", resume: { filesystem: "read-only" } }),
   () => agent("beta", { label: "beta", phase: "read", resume: { filesystem: "read-only" } }),
 ])
-return { values, spent: budget.spent() }`), {
+return { values }`), {
       runId: "resume-target",
       agent: {
         async run(prompt: string, options: RunOptions) {
@@ -164,7 +164,6 @@ return { values, spent: budget.spent() }`), {
     assert.deepEqual(runnerPrompts, ["inserted"]);
     assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
       values: ["live:inserted", "recorded:alpha", "recorded:beta"],
-      spent: 17,
     });
     assert.equal(result.tokenUsage.total, 7);
     assert.deepEqual(result.resumeReport, {

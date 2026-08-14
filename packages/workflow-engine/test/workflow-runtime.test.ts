@@ -709,42 +709,6 @@ return { err }`;
   assert.match(result.result.err, /one level deep/);
 });
 
-test("runWorkflow budget gates on accumulated tokens", async () => {
-  const script = `export const meta = { name: 'budget_demo', description: 'budget' }
-const a = await agent('first', { label: 'a' })
-let second = null
-try { second = await agent('second', { label: 'b' }) } catch (e) { second = 'blocked' }
-return { a, second }`;
-
-  const result = await runWorkflow<{ a: unknown; second: unknown }>(script, {
-    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-    tokenBudget: 100,
-    persistLogs: false,
-  });
-
-  assert.equal(result.result.second, "blocked");
-});
-
-test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
-  // A warm-up agent spends the whole budget (soft gate: spent accrues after it
-  // finishes); the agent() inside parallel() then hits the gate and must
-  // propagate the non-recoverable error, not become a null in the result array.
-  const script = `export const meta = { name: 'pb', description: 'budget in parallel' }
-await agent('warmup', { label: 'w' })
-const xs = await parallel([() => agent('x', { label: '1' })])
-return xs`;
-  await assert.rejects(
-    () =>
-      runWorkflow(script, {
-        agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-        tokenBudget: 100,
-        persistLogs: false,
-      }),
-    /budget/i,
-    "exhausted budget must reject the run, not become a null in the result array",
-  );
-});
-
 test("non-recoverable agent-limit propagates out of pipeline() too", async () => {
   const script = `export const meta = { name: 'mp', description: 'agent limit pipeline' }
 const xs = await pipeline([0, 1, 2, 3], (n) => agent('x' + n, { label: 'p' + n }))
@@ -758,25 +722,6 @@ return xs`;
       }),
     /limit/i,
   );
-});
-
-test("phase sub-budget throws when a phase exceeds its ceiling (run total untouched)", async () => {
-  const script = `export const meta = { name: 'pb', description: 'phase budget' }
-phase('noisy', { budget: 100 })
-let blocked = false
-try {
-  await agent('a', { label: '1' })
-  await agent('b', { label: '2' })
-} catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
-phase('calm')
-const after = await agent('c', { label: '3' })
-return { blocked, after }`;
-  const res = await runWorkflow<{ blocked: boolean; after: unknown }>(script, {
-    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-    persistLogs: false,
-  });
-  assert.equal(res.result.blocked, true, "the 2nd agent in the phase hit the sub-budget");
-  assert.ok(res.result.after !== null, "a later phase still proceeds");
 });
 
 test("maxAgents is enforced under a parallel() fan-out (atomic slot reservation)", async () => {
@@ -967,18 +912,19 @@ return { cwd: process.cwd() }`;
   assert.ok(result.result.cwd.length > 0, "result.cwd should not be empty");
 });
 
-test("runWorkflow budget object exposes spent() and remaining()", async () => {
-  const script = `export const meta = { name: 'budget_api', description: 'budget API' }
-try { const s = budget.spent(); const r = budget.remaining(); return { spent: s, remaining: typeof r } }
-catch(e) { return { error: String(e) } }`;
+test("§7: the budget surface is deleted — `budget` is undefined in the script realm and phase() takes no budget option", async () => {
+  const script = `export const meta = { name: 'no_budget', description: 'the deleted budget surface' }
+const seen = typeof budget
+phase('noisy')
+await agent('x', { label: 'a' })
+return { seen }`;
 
-  const result = await runWorkflow<{ spent: number; remaining: string }>(script, {
-    agent: fakeAgent({ total: 100 }),
+  const result = await runWorkflow<{ seen: string }>(script, {
+    agent: fakeAgent({ total: 10 }),
     persistLogs: false,
   });
 
-  assert.equal(result.result.spent, 0); // before first agent
-  assert.equal(result.result.remaining, "number");
+  assert.equal(result.result.seen, "undefined", "the budget global is deleted from the script realm");
 });
 
 test("runWorkflow returns empty logs array when nothing logged", async () => {

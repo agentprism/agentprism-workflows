@@ -233,6 +233,21 @@ function output(result: { output: string[] }): string[] {
   return result.output;
 }
 
+/** §6.2: an interrupted drain leaves the eval result surface (the v1
+ *  "interrupted" output line is deleted) — the failure is RETAINED under
+ *  workspace().diagnostics.drainError instead. Assert the retention. */
+async function assertInterruptedRetained(broker: Broker, label: string): Promise<void> {
+  const probe = await broker.eval(
+    'workspace().diagnostics.drainError === null ? "none" : ' +
+      'workspace().diagnostics.drainError.name + ":" + workspace().diagnostics.drainError.message',
+  );
+  const message = String(probe.result ?? '');
+  assert.ok(
+    message.includes('interrupted') || message.includes('Job execution error'),
+    `${label}: the interrupted drain is retained under diagnostics — got ${message}`,
+  );
+}
+
 /** Race a broker operation against a watchdog: a regression that leaves
  *  the runaway unbroken (the deadline is disabled in this suite) must
  *  FAIL the test, not hang the run. */
@@ -313,9 +328,12 @@ test('review round 2: the no-id interrupt breaks an EXECUTING runaway eval — a
   const waited1 = await bounded('wait#1 after the mid-run break', waiting1);
   assert.equal(waited1.drained, true, 'the settled call drained the wait');
   assert.ok(waited1.result.completed.includes('c1'), `completed: ${waited1.result.completed.join(', ')}`);
+  // §6.2: the break is the wait's own drain error — demoted to
+  // workspace().diagnostics, never rendered in the wait's output lines.
+  await assertInterruptedRetained(broker, 'the executing runaway was broken mid-run');
   assert.ok(
-    output(waited1.result).some((line) => line.includes('interrupted')),
-    `the executing runaway was broken mid-run: ${output(waited1.result).join('\n')}`,
+    output(waited1.result).every((line) => !line.includes('interrupted')),
+    `the drain failure left the wait result surface: ${output(waited1.result).join('\n')}`,
   );
   // The broken eval is released and the signal was consumed: the next
   // eval runs normally, and a later arm REFUSES (no stale target — the
@@ -349,6 +367,9 @@ test('review round 2: a suspended eval\'s continuation resumed by checkpoint.ans
     broker.eval('checkpoint.answer("c1", "go"); "answered"'),
   );
   assert.equal(b.result, undefined, 'the answering eval was interrupted before producing a result');
+  // The interruption happens in the ANSWERING eval's own drain, so it
+  // renders as the eval's own §4.6 error outcome — not the demoted
+  // retained-drain-error line.
   assert.ok(
     output(b).some((line) => line.includes('interrupted')),
     `the resumed runaway was broken mid-run in the answering eval's drain: ${output(b).join('\n')}`,
@@ -373,9 +394,10 @@ test('review round 2: a suspended eval\'s continuation resumed by checkpoint.ans
   // is set by a promise continuation) before the pumping eval runs.
   await tick();
   const d = await broker.eval('"probe"');
+  await assertInterruptedRetained(broker, 'the second runaway was broken by the second arm');
   assert.ok(
-    output(d).some((line) => line.includes('interrupted')),
-    `the second runaway was broken by the second arm: ${output(d).join('\n')}`,
+    output(d).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the second runaway was broken by the second arm): ${output(d).join('\n')}`,
   );
   await broker.dispose();
   ws.dispose();
@@ -410,6 +432,8 @@ test('review round 3: an UNRELATED finite eval whose own drain executes real byt
     'eval C answering the checkpoint after the unrelated drain',
     broker.eval('checkpoint.answer("c1", "go"); "answered"'),
   );
+  // The answering eval's own drain interruption renders as its own §4.6
+  // error outcome (not the demoted retained-drain-error line).
   assert.ok(
     output(c).some((line) => line.includes('interrupted')),
     `the armed signal survived the unrelated drain and broke the target: ${output(c).join('\n')}`,
@@ -448,6 +472,8 @@ test('review round 3: an UNRELATED settlement drain (a call no tracked eval awai
   // resumes A's runaway in the answering eval's own drain and the
   // still-armed signal breaks it mid-run.
   const c = await bounded('eval C answering the checkpoint', broker.eval('checkpoint.answer("c2", "go"); "answered"'));
+  // The answering eval's own drain interruption renders as its own §4.6
+  // error outcome (not the demoted retained-drain-error line).
   assert.ok(
     output(c).some((line) => line.includes('interrupted')),
     `the armed signal survived the unrelated settlement drain: ${output(c).join('\n')}`,
@@ -567,9 +593,10 @@ test('review round 4: an UNAWAITED SIBLING call (c2.then with a bytecode-heavy c
   runner.sessions[0].completeTurn('resumed');
   await tick();
   const broken = await bounded('probe after the awaited call settled', broker.eval('"after"'));
+  await assertInterruptedRetained(broker, "the awaited call's settlement resumed the runaway continuation and the armed signal broke it");
   assert.ok(
-    output(broken).some((line) => line.includes('interrupted')),
-    `the awaited call's settlement resumed the runaway continuation and the armed signal broke it: ${output(broken).join('\n')}`,
+    output(broken).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the awaited call's settlement resumed the runaway continuation and the armed signal broke it): ${output(broken).join('\n')}`,
   );
   assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();
@@ -593,9 +620,10 @@ test('review round 4: a RUNNING eval awaiting an EARLIER eval\'s binding remains
   runner.last().completeTurn('resumed');
   await tick();
   const probe = await bounded('probe after settling the earlier binding', broker.eval('"probe"'));
+  await assertInterruptedRetained(broker, 'the resumed continuation was broken mid-run');
   assert.ok(
-    output(probe).some((line) => line.includes('interrupted')),
-    `the resumed continuation was broken mid-run: ${output(probe).join('\n')}`,
+    output(probe).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the resumed continuation was broken mid-run): ${output(probe).join('\n')}`,
   );
   assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();
@@ -676,9 +704,10 @@ test('review round 5: an UNAWAITED SIBLING reaction registered BEFORE the target
     probe.result !== undefined && probe.result.includes('sibling:resumed'),
     `the sibling continuation ran to completion, never interrupted: ${output(probe).join('\n')}`,
   );
+  await assertInterruptedRetained(broker, "the target's own continuation was broken mid-run (not the sibling's job)");
   assert.ok(
-    output(probe).some((line) => line.includes('interrupted')),
-    `the target's own continuation was broken mid-run (not the sibling's job): ${output(probe).join('\n')}`,
+    output(probe).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the target's own continuation was broken mid-run (not the sibling's job)): ${output(probe).join('\n')}`,
   );
   // The broken eval was released (the interrupted job's continuation
   // lease named it exactly): a later arm refuses.
@@ -702,9 +731,10 @@ test('review round 5: an INDIRECT wait is targetable — `await Promise.all([q])
   runner.sessions[0].completeTurn('resumed');
   await tick();
   const probe = await bounded('probe after settling the indirect chain', broker.eval('"probe"'));
+  await assertInterruptedRetained(broker, "the indirect chain's continuation was broken mid-run");
   assert.ok(
-    output(probe).some((line) => line.includes('interrupted')),
-    `the indirect chain's continuation was broken mid-run: ${output(probe).join('\n')}`,
+    output(probe).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the indirect chain's continuation was broken mid-run): ${output(probe).join('\n')}`,
   );
   assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   const after = await broker.eval('6 * 7');
@@ -794,9 +824,10 @@ test('review round 6: a sibling `q.then(...)` registered AFTER the target\'s awa
     probe.result !== undefined && probe.result.includes('sibling:resumed'),
     `the sibling reaction ran to completion, never interrupted: ${output(probe).join('\n')}`,
   );
+  await assertInterruptedRetained(broker, "the target's own continuation was broken mid-run (not the sibling's job)");
   assert.ok(
-    output(probe).some((line) => line.includes('interrupted')),
-    `the target's own continuation was broken mid-run (not the sibling's job): ${output(probe).join('\n')}`,
+    output(probe).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the target's own continuation was broken mid-run (not the sibling's job)): ${output(probe).join('\n')}`,
   );
   // The broken eval was released (the interrupted job's continuation
   // lease named it exactly): a later arm refuses — the target never
@@ -864,9 +895,10 @@ test('review round 6: a RUNNING for-await loop is breakable mid-iteration — th
   runner.sessions[0].completeTurn('tick');
   await tick();
   const probe = await bounded('probe after settling the loop iteration', broker.eval('"probe"'));
+  await assertInterruptedRetained(broker, "the loop's continuation was broken mid-run");
   assert.ok(
-    output(probe).some((line) => line.includes('interrupted')),
-    `the loop's continuation was broken mid-run: ${output(probe).join('\n')}`,
+    output(probe).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the loop's continuation was broken mid-run): ${output(probe).join('\n')}`,
   );
   assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();
@@ -917,9 +949,10 @@ test('review round 7: the instrumented top-level await is semantically isolated 
   runner.sessions[0].completeTurn('result');
   await tick();
   const probe = await bounded('probe after settling the mutated-prototype eval', broker.eval('"probe"'));
+  await assertInterruptedRetained(broker, 'the continuation was broken mid-run under the mutation');
   assert.ok(
-    output(probe).some((line) => line.includes('interrupted')),
-    `the continuation was broken mid-run under the mutation: ${output(probe).join('\n')}`,
+    output(probe).every((line) => !line.includes('interrupted')),
+    `the drain failure left the result surface (the continuation was broken mid-run under the mutation): ${output(probe).join('\n')}`,
   );
   assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();

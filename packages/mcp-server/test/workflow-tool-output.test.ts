@@ -50,7 +50,7 @@ const baseRun: WorkflowRunResult<null> = {
   replayEligibility,
   effectiveLimits: {
     maxAgents: 50,
-    tokenBudget: 100_000,
+    tokenBudget: null,
     concurrency: 3,
     agentRetries: 2,
     agentTimeoutMs: 45_000,

@@ -107,7 +107,9 @@ export {
   type PropertyPreview,
   type ObjectPreview,
 } from './preview.js';
-export { applyOutputCaps, capFinalText, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResult } from './caps.js';
+// The output-cap apparatus (applyOutputCaps / capFinalText / the caps
+// constants) was deleted with the eval-plane redesign's §7 budget sweep —
+// the engine applies NO caps to guest output.
 
 // Phase F review round 2: the out-of-band eval-break channel (the
 // interrupt tool's no-id path deliverable to a synchronously running

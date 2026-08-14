@@ -108,8 +108,8 @@ return { confirmed, missing: gaps.missing ?? [] };
 
 When the inline examples above aren't enough, study the complete, validated scripts in [`examples/`](examples/) (same directory as this file):
 
-- [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor verification panel, `gate()` where writer and reviewer are different vendors, nesting a saved workflow by name, `completenessCheck()`, budget headroom reservation, string-form `args` hardening, path guards on schema outputs, and pause-class error rethrow.
-- [`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js) — a small hunter that runs standalone *or* nested: `loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an in-round budget floor (nested runs share the parent's budget).
+- [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor verification panel, `gate()` where writer and reviewer are different vendors, nesting a saved workflow by name, `completenessCheck()`, stage gating on tracked counters, string-form `args` hardening, path guards on schema outputs, and pause-class error rethrow.
+- [`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js) — a small hunter that runs standalone *or* nested: `loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and a tracked round bound (nested runs share the parent's limiter).
 - [`examples/resume-loop-cap.workflow.js`](examples/resume-loop-cap.workflow.js) — content-addressed replay: run with a low `maxRounds`, resume with a higher one; unchanged rounds replay for zero tokens (worked through in Determinism and resume).
 
 [`examples/README.md`](examples/README.md) maps each script to what it teaches.

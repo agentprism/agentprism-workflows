@@ -2388,13 +2388,21 @@ test('the drain bound is ABSOLUTE for the GUEST DRAIN too: a settlement that res
   assert.equal(drained, true, 'the turn itself drained within the bound; the interrupted continuation is a bounded drain, not a drain failure');
   assert.ok(elapsed < 3000, `the guest drain was bounded by the remaining disconnect bound, not the eval deadline: ${elapsed} ms`);
   assert.ok(broker.isDrained);
-  // The interrupted continuation is honest output (a warn line in the
-  // next tool result — the settlement itself landed; only its
-  // continuation was bounded).
+  // §6.2: the interrupted continuation is RETAINED under
+  // workspace().diagnostics (the settlement itself landed; only its
+  // continuation was bounded) — the warn line left the eval result
+  // surface.
   const probe = await broker.eval('"probe"');
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('interrupted at the disconnect bound')),
-    output(probe).join('\n'),
+    output(probe).every((l) => !l.includes('interrupted at the disconnect bound')),
+    `the drain failure left the result surface: ${output(probe).join('\n')}`,
+  );
+  const diag = await broker.eval(
+    'workspace().diagnostics.drainError === null ? "none" : workspace().diagnostics.drainError.message',
+  );
+  assert.ok(
+    String(diag.result ?? '').includes('interrupted') || String(diag.result ?? '').includes('Job execution error'),
+    `the interrupted drain is retained in diagnostics: ${diag.result}`,
   );
   await broker.dispose();
   ws.dispose();

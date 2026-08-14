@@ -1003,7 +1003,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         return result as AgentResult<S>;
       }
 
-      const finalText = activeSession.currentTurnText().trim();
+      const finalText = activeSession.foldedTurnText().trim();
       if (!finalText) {
         throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
           recoverable: true,

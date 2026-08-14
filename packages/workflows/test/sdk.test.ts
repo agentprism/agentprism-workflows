@@ -419,7 +419,6 @@ async function recordIsolationBaseline(options: {
   const run = await manager.runSync(script, undefined, {
     runId: "sdk-isolation-baseline",
     maxAgents: 10,
-    tokenBudget: null,
     concurrency: 1,
     agentRetries: 0,
     agentTimeoutMs: null,

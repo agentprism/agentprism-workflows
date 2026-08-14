@@ -41,8 +41,6 @@ import {
   type CallOutcome,
   type CallStore,
   type ReplEvalResult,
-  OUTPUT_MAX_BYTES,
-  OUTPUT_MAX_LINES,
 } from '../src/index.js';
 
 const PROJECT = '/tmp/repl-broker-project';
@@ -431,10 +429,54 @@ test('eval shapes: resolved reports the previewed value; suspended lists pending
   await ws.dispose();
 });
 
+test('the fused-eval seam: waitForCalls reports the suspended eval\'s completion — kind/result attributed by the continuation token, with the late-error and still-pending arms', async () => {
+  const { ws, broker, runner } = await setup();
+  // The suspended eval completes during the wait's pumps: the wait
+  // reports the completion's kind and repr, attributed to THIS eval via
+  // its continuation token (a concurrent client's eval can never steal
+  // the attribution).
+  const r1 = await broker.eval('const r = await agent("pi/x", "task"); "done:" + r');
+  assert.equal(r1.kind, 'pending');
+  const waiting = broker.waitForCalls(undefined, 5000, r1.evalToken);
+  await tick();
+  runner.last().completeTurn('hello');
+  const waited = await waiting;
+  assert.equal(waited.drained, true);
+  assert.equal(waited.result.kind, 'value');
+  assert.equal(waited.result.result, 'done:hello');
+  assert.equal(waited.result.evalToken, undefined, 'wait results carry no token of their own');
+  // The settled eval's completion became `_` on the way.
+  assert.equal((await broker.eval('_')).result, 'done:hello');
+  // A LATE ERROR: the suspended eval rejects during the wait's pumps —
+  // the wait reports kind 'error' (the rendering is in the output
+  // lines) and no result.
+  const r2 = await broker.eval('const q = agent("pi/x", "task2"); await q; "never"');
+  const waiting2 = broker.waitForCalls(undefined, 5000, r2.evalToken);
+  await tick();
+  runner.last().completeTurn('');
+  const waited2 = await waiting2;
+  assert.equal(waited2.result.kind, 'error');
+  assert.equal(waited2.result.result, undefined);
+  assert.ok(
+    output(waited2.result).some((line) => line.includes('no assistant output')),
+    `the late error rendered in the wait's output: ${output(waited2.result).join('\n')}`,
+  );
+  // STILL PENDING: the eval awaits a call that never settles within
+  // the bound — kind stays 'pending' with the in-flight ids.
+  const r3 = await broker.eval('const t = agent("pi/x", "never-settles"); await t');
+  const waiting3 = broker.waitForCalls(undefined, 200, r3.evalToken);
+  const waited3 = await waiting3;
+  assert.equal(waited3.result.kind, 'pending', 'the eval is still suspended at the bound');
+  assert.ok(waited3.result.pending.length > 0, 'the in-flight ids are reported');
+  assert.equal(waited3.result.result, undefined, 'no completion value while suspended');
+  await ws.dispose();
+});
+
 test('a suspended eval continues at settlement like a .then: its output lands in the next tool result', async () => {
   const { ws, broker, runner } = await setup();
   const r1 = await broker.eval('const r = await agent("pi/x", "task"); console.log("got", r); "done:" + r');
-  assert.equal(r1.kind ?? undefined, undefined);
+  assert.equal(r1.kind, 'pending');
+  assert.match(r1.evalToken ?? '', /^e\d+$/, 'the continuation token rides the eval result (the fused-eval seam)');
   assert.deepEqual(r1.pending, ['c1']);
   await tick();
   runner.last().completeTurn('hello');
@@ -1100,19 +1142,18 @@ test('output lines are the §4.4 one-line reprs (one joined line per console.* c
   const r = await broker.eval('console.log({ a: 1 }, "text"); console.error("boom"); "done"');
   assert.equal(output(r)[0], '{a: 1} text');
   assert.equal(output(r)[1], 'error: boom');
-  assert.equal(r.outputTruncated, false);
+  assert.equal(r.kind, 'value');
   // §7: the engine applies NO caps to guest output — the Python
   // posture (an agent CAN flood its own context). A flood ABOVE BOTH
   // deleted ceilings — 4500 lines, >50 KB of bytes (the v1 caps:
-  // OUTPUT_MAX_LINES 4000, OUTPUT_MAX_BYTES 50 000) — ships verbatim
-  // with outputTruncated always false. Reintroducing the caps would
-  // truncate this flood; the assertions below must stay green.
+  // 4000 lines / 50 000 bytes — now deleted with the cap apparatus)
+  // ships verbatim. Reintroducing the caps would truncate this flood;
+  // the assertions below must stay green.
   const big = await broker.eval('for (let i = 0; i < 4500; i++) console.log("line", i, "padding", "x".repeat(20)); "done"');
-  assert.equal(big.outputTruncated, false);
   assert.equal(big.output.length, 4500);
   assert.equal(output(big)[4499], 'line 4499 padding xxxxxxxxxxxxxxxxxxxx');
   assert.ok(
-    big.output.reduce((sum, line) => sum + Buffer.byteLength(line, 'utf8') + 1, 0) > OUTPUT_MAX_BYTES,
+    big.output.reduce((sum, line) => sum + Buffer.byteLength(line, 'utf8') + 1, 0) > 50_000,
     'the flood exceeds the deleted byte cap',
   );
   // A DIRECT console string above the deleted 49 488-char emission
@@ -1677,13 +1718,20 @@ test('review 8: an interrupted continuation keeps the already-settled ids in the
   await tick();
   // The eval's OWN pump delivers c1, then its drain runs the runaway
   // continuation, which the interrupt handler breaks: the eval returns
-  // the drain-failure line AND the ids it settled before the drain
-  // failed (review regression: completed used to come back empty).
+  // the ids it settled before the drain failed (review regression:
+  // completed used to come back empty). §6.2: the drain failure itself
+  // leaves the eval result surface — it is RETAINED under
+  // workspace().diagnostics, never rendered as an output line.
   const r = await broker.eval('"probe"');
   assert.deepEqual(r.completed, ['c1'], 'the settled id survives the drain failure');
   assert.ok(
-    output(r).some((l) => l.includes('interrupted') || l.includes('Job execution error')),
-    output(r).join('\n'),
+    output(r).every((l) => !l.includes('interrupted') && !l.includes('Job execution error')),
+    `the drain failure left the surface: ${output(r).join('\n')}`,
+  );
+  const diag = await broker.eval('workspace().diagnostics.drainError === null ? "none" : workspace().diagnostics.drainError.message');
+  assert.ok(
+    String(diag.result ?? '').includes('interrupted') || String(diag.result ?? '').includes('Job execution error'),
+    `the failure is retained in diagnostics: ${diag.result}`,
   );
   // pump() still propagates the drain failure as its public contract.
   checks = 0;

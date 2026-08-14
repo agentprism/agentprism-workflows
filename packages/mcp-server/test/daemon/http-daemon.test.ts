@@ -318,6 +318,12 @@ test("the session registry signals last-connection-closed and the repl presence 
   } as import("@automatalabs/repl-engine").BrokerSession;
   const runner = {
     sessions: 0,
+    listBackends(): string[] {
+      return ["pi"];
+    },
+    defaultBackendId(): string {
+      return "pi";
+    },
     async openSession(): Promise<import("@automatalabs/repl-engine").BrokerSession> {
       this.sessions++;
       return fakeSession;

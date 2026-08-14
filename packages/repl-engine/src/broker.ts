@@ -616,25 +616,42 @@ export interface BrokerRunner {
 }
 
 /** The eval tool-result shape. NOTE: the eval-plane redesign's §3.1 wire
- *  shape (`{ output: string, result?, running? }`) lands in the tool
- *  phase — this engine seam keeps its pre-redesign field names until the
- *  surface phase deletes them with their consumers, but the CONTENT is
- *  the redesigned one: `output` lines are the §4.4 reprs (one joined
- *  line per console.* call), raised-checkpoint lines, and the §4.6
- *  uncaught-error renderings, with NO output caps applied. */
+ *  shape (`{ output: string, result?, running? }`) is assembled by the
+ *  tool phase — this engine seam carries the pieces: `output` lines are
+ *  the §4.4 reprs (one joined line per console.* call),
+ *  raised-checkpoint lines, and the §4.6 uncaught-error renderings, with
+ *  NO output caps applied; `kind` names the eval's outcome; `result` is
+ *  the completion value's §4.4 repr when the eval resolved; `evalToken`
+ *  is the eval's continuation token — the tool's fused-eval pump passes
+ *  it back to `waitForCalls`, which attributes settlements swept during
+ *  its pumps to exactly that eval. The v1 wire fields
+ *  (`pending`/`checkpoints`/`completed`/`outputTruncated`) are deleted
+ *  from the WIRE; `pending` stays on this internal seam because the
+ *  pump's drained/target bookkeeping and the engine's own tests read it. */
 export interface ReplEvalResult {
   /** Rendered output lines for this operation (one line per console.*
    *  call, checkpoint lines, error renderings) — NOT capped: the engine
    *  stops applying output caps to guest output (the redesign's §7; the
    *  Python posture — an agent CAN flood its own context). */
   output: string[];
-  /** ALWAYS false (vestigial — the cap apparatus is deleted; the field
-   *  stays only until the surface phase removes it with its consumers). */
-  outputTruncated: boolean;
+  /** The eval's outcome: `value` — resolved (its repr in `result`);
+   *  `error` — threw (the §4.6 rendering is in `output`); `pending` —
+   *  suspended on a host call. For a wait result the kind reports the
+   *  suspended eval the wait's pumps swept: `value`/`error` when that
+   *  eval's continuation completed during the pumps, `pending` when it
+   *  is still in flight. */
+  kind: 'value' | 'error' | 'pending';
   /** The previewed completion value when the eval resolved (FORMAT.md
    *  collapsed rendering, trap-free); absent when the eval suspended or
-   *  threw. */
+   *  threw — EXCEPT a wait result, whose `result` is the suspended
+   *  eval's completion repr when its continuation completed during the
+   *  wait's pumps. */
   result?: string;
+  /** The eval's continuation token (`e<N>`) — the fused-eval seam: pass
+   *  it to `waitForCalls` so the wait attributes swept settlements to
+   *  THIS eval (a concurrent client's eval can never steal the
+   *  attribution). Absent on wait results. */
+  evalToken?: string;
   /** Pending call ids (the whole guest registry, in order) — non-empty
    *  exactly when the eval suspended (or when other work is in flight). */
   pending: string[];
@@ -1153,6 +1170,16 @@ export class Broker {
   /** The retained last reconcile summary (workspace().diagnostics —
    *  the §6.2 demotion). */
   private lastReconcileReport: ReconcileReport | null = null;
+  /** The fused-eval seam: settlements of suspended evals swept during
+   *  the pumps of the CURRENT operation, keyed by the settled eval's
+   *  continuation token (`e<N>`). A wait's render reads its caller's
+   *  token and reports that eval's completion (kind + result repr);
+   *  the entry is consumed on read. Token-keyed so a concurrent
+   *  client's eval can never steal another wait's attribution. */
+  private readonly sweptEvalSettlements = new Map<
+    string,
+    { kind: 'value' | 'error'; result?: string }
+  >();
   /** Sessions running a follow-up turn (a queued-steer delivery turn or
    *  a §4.2 followUp turn on a settled handle) — one concurrency token
    *  each (a subagent is working even on a follow-up turn). */
@@ -1432,23 +1459,15 @@ export class Broker {
     return this.serialized(async () => {
       this.assertAlive();
       let completed: string[];
-      let pumpDrainErrorLine: string | undefined;
       const pumped = await this.pumpUnlocked();
       completed = pumped.settled;
       // The pump's per-call settlement boundaries already fired inside
       // `pumpUnlocked` (one per settled call's continuation drain); the
       // sink's burst bookkeeping coalesces them with the eval's own
-      // boundary into one write at the operation's flush.
-      if (pumped.drainError !== undefined) {
-        // The pump's drain ran PREVIOUS evals' continuations and one
-        // failed. The current eval did not fail; the background
-        // failure is honest output (rendered alongside the eval's own
-        // error, if it has one), the already-settled call ids are
-        // STILL reported (a continuation drain failure must never
-        // erase the deliveries it followed — review regression), and
-        // the VM stays usable.
-        pumpDrainErrorLine = errorLine(pumped.drainError.info);
-      }
+      // boundary into one write at the operation's flush. A pump drain
+      // failure is RETAINED under workspace().diagnostics (§6.2 — it
+      // leaves the eval result surface; the already-settled call ids
+      // are still reported, and the VM stays usable).
       // reset() (§4.5): the pump already swept the retained suspended
       // evals (its end-of-pump sweep reads every settlement the pump's
       // drains ran) — a reset-owning eval that COMPLETED during the
@@ -1569,7 +1588,7 @@ export class Broker {
       // The pump's deliveries first, then this eval's own synchronous
       // settlements (dispatch-time refusals).
       completed = [...completed, ...this.syncSettled.splice(0)];
-      const result = this.render(outcome, completion, completed, pumpDrainErrorLine);
+      const result = this.render(outcome, completion, completed);
       // The eval's state-changing boundary (the doc's cadence: after
       // each eval). The operation-end flush coalesces it with the
       // pump's settlement boundary into one debounced write.
@@ -3340,7 +3359,7 @@ export class Broker {
         if (token === undefined) return false;
         tokens.add(token);
       }
-      this.evalBreakArmed = true;
+this.evalBreakArmed = true;
       this.evalBreakTargets = new Set(this.activeEvalCompletions);
       this.evalBreakTokens = tokens;
       return true;
@@ -3391,6 +3410,7 @@ export class Broker {
       }
     }
     for (const completion of settled) {
+      const token = this.evalTokens.get(completion);
       this.activeEvalCompletions.delete(completion);
       this.evalTokens.delete(completion);
       this.evalBreakTargets.delete(completion);
@@ -3406,12 +3426,31 @@ export class Broker {
       try {
         const value = this.workspace.readRetainedCompletion(completion) as JSValueHandle | undefined;
         if (value !== undefined) {
+          // The fused-eval seam (tool phase): record THIS eval's
+          // completion under its continuation token, with the §4.4
+          // repr — the tool's wait reports it as the finished shape's
+          // `result` when the eval completed within the bound. The
+          // repr renders BEFORE the handle is consumed by the `_`
+          // write (which dups it) and disposed.
+          if (token !== undefined) {
+            try {
+              this.sweptEvalSettlements.set(token, { kind: 'value', result: renderCompletionLine(value) });
+            } catch {
+              this.sweptEvalSettlements.set(token, { kind: 'error' });
+            }
+          }
           try {
             this.workspace.setGlobal('_', value);
           } catch {
             // A failed `_` write must not fail the operation.
           }
           value.dispose();
+        } else if (token !== undefined) {
+          // A REJECTED completion (the eval errored late): the error
+          // already rendered through the rejection bridge into the
+          // console buffer — the seam records the error outcome so the
+          // wait reports the finished-with-error shape.
+          this.sweptEvalSettlements.set(token, { kind: 'error' });
         }
       } catch {
         // Best-effort bookkeeping: a hostile completion shape must not
@@ -3458,6 +3497,7 @@ export class Broker {
     let released = false;
     for (const completion of [...this.activeEvalCompletions]) {
       if (this.evalTokens.get(completion) === token) {
+        const evalToken = this.evalTokens.get(completion)!;
         this.activeEvalCompletions.delete(completion);
         this.evalTokens.delete(completion);
         this.evalBreakTargets.delete(completion);
@@ -3467,6 +3507,13 @@ export class Broker {
         if (this.resetOwningCompletions.delete(completion) && this.resetOwningCompletions.size === 0) {
           this.resetDue = true;
         }
+        // The fused-eval seam: the broken eval can NEVER settle (the
+        // quickjs interrupt aborts the async job without rejecting its
+        // promise), so the tool's wait must not poll it to the bound —
+        // record the break under its continuation token; the wait
+        // reports the finished-with-error outcome and the held call
+        // returns promptly.
+        this.sweptEvalSettlements.set(evalToken, { kind: 'error' });
         completion.dispose();
         released = true;
       }
@@ -3512,7 +3559,7 @@ export class Broker {
       const lease = this.jobLease.cell.current;
       if (lease === undefined) return false;
       if (this.evalBreakTokens.has(lease)) {
-        this.evalBreakArmed = false;
+this.evalBreakArmed = false;
         return true;
       }
       return false;
@@ -3657,6 +3704,17 @@ export class Broker {
     return this.drained;
   }
 
+  /** True once the broker was disposed — the reset() guest function's
+   *  teardown (which runs in the operation's post-hook, AFTER the eval
+   *  result was rendered) or the daemon's shutdown/reset path. The
+   *  daemon reads this after every tool operation: a reset eval leaves
+   *  its own broker disposed, so the project state must clear its live
+   *  workspace/broker references for the NEXT touch to create a fresh
+   *  workspace. */
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
   /** The number of sessions with a turn running (the drain's progress
    *  probe). */
   busySessionCount(): number {
@@ -3668,23 +3726,28 @@ export class Broker {
   }
 
   /**
-   * The `wait` tool's engine-side seam: pump until the target call ids
-   * settle (or `timeoutMs` elapses — "still running" on timeout), then
-   * return the SAME tool-result shape as an eval — output lines included
-   * (the wait's pumps drain console events and restored-call warn lines
-   * into the buffer; the doc requires wait to return the same shape, and
-   * deferring output to the next eval would lose immediate guest-visible
-   * restored-call output and warnings — phase-D review round 2).
+   * The fused-eval pump (the eval-plane redesign's §3.1): pump until the
+   * target call ids settle (or `timeoutMs` elapses — "still running" on
+   * timeout), then return the SAME tool-result shape as an eval — output
+   * lines included (the pumps drain console events and restored-call warn
+   * lines into the buffer, so an eval whose continuation completed in a
+   * previous drain reports its output here — phase-D review round 2).
    * `ids` omitted waits for the calls pending at ENTRY (with other
    * operations interleaving between pumps, the entry-time set is the
    * only stable "every pending call" reading — a call a concurrent eval
    * dispatches after entry is not waited on; see the phase-E review
-   * rejection round 2 note below). Returns the rendered result plus
-   * whether the target set drained within the bound.
+   * rejection round 2 note below). `evalToken` (the suspended eval's
+   * continuation token from its `ReplEvalResult`) attributes the result:
+   * when THAT eval's continuation completes during the pumps, the result
+   * carries its completion (`kind` `value`/`error`, the §4.4 repr in
+   * `result` when it resolved); the token-keyed attribution means a
+   * concurrent client's eval can never steal the seam. Returns the
+   * rendered result plus whether the target set drained within the bound.
    */
   async waitForCalls(
     ids: string[] | undefined,
     timeoutMs: number,
+    evalToken?: string,
   ): Promise<{ result: ReplEvalResult; drained: boolean }> {
     const deadline = Date.now() + Math.max(0, timeoutMs);
     // The target set is captured at ENTRY (phase-E review rejection
@@ -3736,12 +3799,11 @@ export class Broker {
         // The chain was busy for the whole budget: no pending read was
         // possible, nothing was observed to settle — the honest
         // "still running" with an empty (unreadable) pending surface.
-        return { result: this.renderWaitResult([], undefined, []), drained: false };
+        return { result: this.renderWaitResult([], [], evalToken), drained: false };
       }
       targets = captured.value!;
     }
     const completed: string[] = [];
-    let drainErrorLine: string | undefined;
     let drained = false;
     for (;;) {
       const pumped = await this.trySerialized(async () => {
@@ -3751,22 +3813,20 @@ export class Broker {
         // interrupted at the wait's bound, never at the eval deadline —
         // the wait's bound is absolute (the same posture as the
         // disconnect drain).
-        const { settled, drainError } = await this.pumpUnlocked(deadline);
+        const { settled } = await this.pumpUnlocked(deadline);
         if (settled.length > 0) {
           // The per-call settlement boundaries fired inside
           // `pumpUnlocked` (one per settled call's continuation drain).
           completed.push(...settled);
         }
-        if (drainError !== undefined) {
-          // The pump's drain broke a suspended eval's continuation (the
-          // armed eval-break signal's target, or the wait-bound): the
-          // break is honest output in the wait's result, exactly like an
-          // eval's pump-drain error line.
-          drainErrorLine = errorLine(drainError.info);
-        }
+        // A pump drain failure (the armed eval-break signal's target, or
+        // the wait-bound interrupting a continuation) is RETAINED under
+        // workspace().diagnostics (§6.2 — it leaves the eval result
+        // surface); the settled ids are still reported.
         const pending = this.pendingIds();
         lastPending = pending;
-        return [...targets].every((id) => !pending.includes(id));
+        const drainedNow = [...targets].every((id) => !pending.includes(id));
+        return drainedNow;
       }, deadline);
       if (!pumped.acquired) {
         // The chain was held past the deadline (a long eval): the wait
@@ -3805,28 +3865,33 @@ export class Broker {
       }, deadline);
       if (recheck.acquired) drained = recheck.value!;
     }
-    const result = this.renderWaitResult(completed, drainErrorLine, lastPending);
+    const result = this.renderWaitResult(completed, lastPending, evalToken);
     return { result, drained };
   }
 
   /** Render the wait result in the eval-result shape (output lines from
-   *  the console buffer, the pump-drain error line when one occurred,
-   *  pending ids, checkpoints, completed ids). `pending` is the last
-   *  pending read taken UNDER the chain (the wait's pumps capture it;
-   *  a wait that could never acquire the chain passes the empty
-   *  unreadable surface) — the renderer never re-enters the VM outside
-   *  the chain.
+   *  the console buffer — including a suspended eval's completion output
+   *  and late-error rendering, pending ids, checkpoints, completed ids).
+   *  `pending` is the last pending read taken UNDER the chain (the wait's
+   *  pumps capture it; a wait that could never acquire the chain passes
+   *  the empty unreadable surface) — the renderer never re-enters the VM
+   *  outside the chain. `evalToken` keys the fused-eval seam: when the
+   *  caller's suspended eval completed during the pumps, `kind` reports
+   *  its outcome and `result` carries the completion's §4.4 repr (the
+   *  entry is consumed on read).
    */
-  private renderWaitResult(completed: string[], drainErrorLine: string | undefined, pending: string[]): ReplEvalResult {
+  private renderWaitResult(completed: string[], pending: string[], evalToken?: string): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {
       lines.push(this.renderConsoleEvent(event));
     }
-    if (drainErrorLine !== undefined) lines.push(drainErrorLine);
     // §7: no output caps on guest output.
+    const swept = evalToken !== undefined ? this.sweptEvalSettlements.get(evalToken) : undefined;
+    if (evalToken !== undefined) this.sweptEvalSettlements.delete(evalToken);
     return {
       output: lines,
-      outputTruncated: false,
+      kind: swept?.kind ?? 'pending',
+      ...(swept?.result !== undefined ? { result: swept.result } : {}),
       pending,
       checkpoints: this.checkpointSummaries(),
       completed,
@@ -4000,9 +4065,10 @@ export class Broker {
         // `pumpUnlocked` (one per settled call's continuation drain —
         // the daemon's snapshot sink persists each drain boundary, so a
         // kill mid-drain loses nothing). A continuation the bound
-        // interrupted is honest output for the next tool result.
+        // interrupted is RETAINED under workspace().diagnostics (§6.2 —
+        // the drain error leaves the eval result surface).
         if (drainError !== undefined) {
-          this.warnLine('warn', `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`);
+          this.retainedDrainError = { name: drainError.info.name, message: drainError.info.message, atMs: now() };
         }
         if (this.busySessionCount() > 0 || this.openingCalls.size > 0 || this.pendingReattaches.size > 0) {
           // The yield is bounded by the REMAINING bound — never a fixed
@@ -4048,7 +4114,7 @@ export class Broker {
         // round 6 — the outer bound is absolute).
         const final = await this.pumpUnlocked(deadline);
         if (final.drainError !== undefined) {
-          this.warnLine('warn', `settlement drain interrupted at the disconnect bound: ${errorLine(final.drainError.info)}`);
+          this.retainedDrainError = { name: final.drainError.info.name, message: final.drainError.info.message, atMs: now() };
         }
         // The bound's forced stop settles EVERY call still pending at
         // the bound — recorded FIRST, settled into the guest, one
@@ -4251,11 +4317,13 @@ export class Broker {
               if (drainError instanceof DrainJobError) {
                 // The forced-stop settlements resumed a continuation that
                 // the disconnect bound interrupted; the failure is
-                // surfaced loudly.
-                this.warnLine(
-                  'warn',
-                  `settlement drain interrupted at the disconnect bound: ${errorLine(drainError.info)}`,
-                );
+                // RETAINED under workspace().diagnostics (§6.2 — the
+                // drain error leaves the eval result surface).
+                this.retainedDrainError = {
+                  name: drainError.info.name,
+                  message: drainError.info.message,
+                  atMs: now(),
+                };
               } else {
                 throw drainError;
               }
@@ -6377,22 +6445,23 @@ export class Broker {
     outcome: ReplEvalOutcome,
     completion: unknown,
     completed: string[],
-    pumpDrainErrorLine?: string,
   ): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {
       lines.push(this.renderConsoleEvent(event));
     }
-    if (pumpDrainErrorLine !== undefined) lines.push(pumpDrainErrorLine);
+    // §6.2: a retained settlement-drain failure is demoted to
+    // workspace().diagnostics — it no longer renders as an output line
+    // (losses are surfaced by the tool's one-line notice instead).
     if (outcome.kind === 'error') {
       lines.push(errorLine(outcome.error));
     }
     // §7: the engine applies NO output caps to guest output — the lines
-    // ship verbatim (the Python posture). `outputTruncated` is always
-    // false (vestigial until the surface phase deletes the field).
+    // ship verbatim (the Python posture).
     const result: ReplEvalResult = {
       output: lines,
-      outputTruncated: false,
+      kind: outcome.kind,
+      evalToken: this.lastEvalToken,
       pending: this.pendingIds(),
       checkpoints: this.checkpointSummaries(),
       completed,

@@ -1772,7 +1772,6 @@ export function createWorkflowServer(
           concurrency: input.concurrency,
           agentRetries: input.agentRetries,
           agentTimeoutMs: input.agentTimeoutMs,
-          tokenBudget: input.tokenBudget,
           resumeFromRunId: input.resumeFromRunId,
           resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,

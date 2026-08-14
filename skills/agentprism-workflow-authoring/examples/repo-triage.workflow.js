@@ -13,7 +13,7 @@
 //   loopUntilDry()      inside quick-wins — hunt rounds until two come up dry
 //   completenessCheck() the final "what did we not cover?" critic
 //   phase() / log()     progress grouping + the run log
-//   budget              skips the optional Hunt stage when tokens run low
+
 //   args / cwd          tuning knobs / the triage target
 export const meta = {
   name: "repo-triage",
@@ -225,17 +225,12 @@ if (unverified.length > 0)
 log(`Verify: ${confirmed.length}/${allFindings.length} findings survived cross-vendor verification`);
 
 // ── Hunt (optional) — nest the saved quick-wins workflow by NAME. It resolves
-// because the host passed `workflows: <dir>`, and it shares this run's token budget
-// and concurrency limiter. Skipped when the budget is running low. ──
+// because the host passed `workflows: <dir>`, and it shares this run's concurrency
+// limiter. Skipped when disabled by args. ──
 phase("Hunt");
 let quickWins = [];
-// The floor reserves headroom for the Report stage: budget "spent" aggregates whatever
-// each backend reports (input + output, cache included), so real runs burn tokens much
-// faster than output volume alone suggests.
 if (huntRounds === 0) {
   log("Hunt: disabled (huntRounds=0)");
-} else if (budget.total && budget.remaining() < 150_000) {
-  log(`Hunt: skipped — ${budget.remaining()} tokens left of ${budget.total}; reserving them for the Report stage`);
 } else {
   try {
     const nested = await workflow("quick-wins", {
@@ -256,7 +251,7 @@ phase("Report");
 const reportData = { target: cwd, focus, areas, confirmed, rejectedCount: allFindings.length - confirmed.length, quickWins };
 let writerIdx = 0;
 // Best-effort: the findings are the run's real product, so a Report-stage failure
-// (say, the token budget running dry mid-gate) is logged and degraded — the run still
+// (say, a provider quota wall mid-gate) is logged and degraded — the run still
 // returns everything it confirmed.
 let gated = { ok: false, value: null, verdict: null, attempts: 0 };
 try {

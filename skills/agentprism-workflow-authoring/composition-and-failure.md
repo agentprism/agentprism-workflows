@@ -42,24 +42,23 @@ const verified = (await pipeline(
 
 Fan-out also contends for the **working tree**, not just the concurrency limiter. Two agents running builds or test suites in the same checkout collide on build outputs, caches, and lockfiles, and concurrent `git fetch`es contend on the same `.git`. Give run-things agents `isolation: "worktree"` when the commits they must inspect are reachable from the run cwd's repository, or serialize them; fan out freely only the agents that just read.
 
-The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` as many items as the task needs and let the limiter schedule them. The cap counts active agent attempts, not authored branches: queued branches begin as other attempts finish, and a branch that exhausts its timeout settles to `null` and frees its slot. `workflow(nameOrScript, args)` nests another workflow inline (one level deep, sharing this run's budget and limiter) — inline script strings always work; saved names resolve when the host serves a workflows folder (see `reference.md`).
+The host caps concurrent agents per run (default 8); hand `parallel`/`pipeline` as many items as the task needs and let the limiter schedule them. The cap counts active agent attempts, not authored branches: queued branches begin as other attempts finish, and a branch that exhausts its timeout settles to `null` and frees its slot. `workflow(nameOrScript, args)` nests another workflow inline (one level deep, sharing this run's limiter) — inline script strings always work; saved names resolve when the host serves a workflows folder (see `reference.md`).
 
 ## Failure semantics — design for `null`
 
 - A **recoverable** failure (timeout, empty output, transient execution error) is retried per the call's `retries` (default 0), then the call **resolves to `null`** — inside `parallel`/`pipeline` *and* as a bare `await agent(...)`. Null-check anything load-bearing, and set `retries: 1–2` on steps you can't afford to lose.
 - A host can settle one runaway in-flight call with MCP `{ action: "stop", runId, callIndex }` or SDK `manager.cancelAgentCall(runId, callIndex)`. The call resolves to `null` with `AGENT_CANCELLED`, skips every configured retry, and does not abort the run or its siblings. Its failed call record is not cached as a journal result, so a later resume runs that occurrence live.
 - A **non-recoverable** failure (schema never validated, script bug) throws and fails the run. You *may* `try/catch` around an `agent()` call to degrade gracefully — rethrow anything you can't meaningfully handle. In particular, **always rethrow pause-class errors** (`err.code === "PROVIDER_USAGE_LIMIT"` or `"AUTH_REQUIRED"`): they must propagate out of the script so the engine can pause the run resumably — swallowing one converts that pause into a fake, lossy completion.
-- A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the budget refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
+- A **provider quota wall, missing backend authentication, or opted-in durable checkpoint pauses a managed run instead of failing it** — the journal checkpoints and the host can resume after the provider quota refills, authentication completes, or a checkpoint decision is supplied. Direct `runner.run()` calls still receive the `AUTH_REQUIRED` error because they have no manager lifecycle.
 - Per-call knobs: `timeoutMs` and `retries`. A finite `timeoutMs` may shorten the host's run-level `agentTimeoutMs` ceiling; `null` or omission is uncapped only when the host supplied no ceiling. The timeout is total wall-clock time per attempt, and every retry gets a fresh clock.
 
-## Budgets and phases
+## Phases
 
 ```js
-phase("Explore", { budget: 100_000 });   // soft per-phase token sub-budget
-// budget.total (null = unbounded) · budget.spent() · budget.remaining() (Infinity when unbounded)
+phase("Explore");   // open a named phase: subsequent agents group under it
 
 const found = [];
-while (budget.total && budget.remaining() > 50_000 && found.length < 20) {
+while (found.length < 20) {
   const r = await agent("Find one more edge case not in: " + JSON.stringify(found.map((f) => f.name)),
                         { label: `edge:${found.length}`, schema: EDGE });
   if (!r) break;
@@ -67,4 +66,4 @@ while (budget.total && budget.remaining() > 50_000 && found.length < 20) {
 }
 ```
 
-Guard budget-driven loops on `budget.total` being set — with no budget, `remaining()` is `Infinity` and only your own counters stop the loop. The run-level token budget and agent-count cap are hard: once exhausted, further `agent()` calls throw. `phase()` also groups agents in progress UIs and run logs; `log(msg)` (and `console.log`) append to the run log — narrate what matters, especially anything you drop or cap.
+There is no token-budget surface in the realm — the budget global and the per-phase budget option are deleted; your own counters and caps are the loop guards, so terminate every loop on a bound you control. The agent-count cap (`maxAgents`) is hard: once exhausted, further `agent()` calls throw `AGENT_LIMIT_EXCEEDED`. `phase()` groups agents in progress UIs and run logs; `log(msg)` (and `console.log`) append to the run log — narrate what matters, especially anything you drop or cap.
