@@ -545,12 +545,20 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         return evalResult(outputLines, result, undefined, notices);
       }
       // Suspended: hold the call open pumping settlements up to the
-      // bound. Each wait targets the calls pending at ITS entry, so a
-      // continuation that dispatches more calls is chased within the
-      // same call; a suspended eval awaiting nothing pumpable by call
-      // ids (a checkpoint, a sleep, a local promise) is re-polled on a
-      // short gap so host-timer settlements still resolve in-call. The
-      // wait's token-keyed seam reports exactly THIS eval's completion.
+      // bound. Each wait is passed the ids KNOWN to be pending at ITS
+      // entry (the eval's own suspension surface first, then each
+      // wait's last pending read), so a continuation that dispatches
+      // more calls is chased within the same call; a suspended eval
+      // awaiting nothing pumpable by call ids (a checkpoint, a sleep,
+      // a local promise) is re-polled on a short gap so host-timer
+      // settlements still resolve in-call. The wait's token-keyed seam
+      // reports exactly THIS eval's completion. Passing the KNOWN ids
+      // (never the ids-omitted form) also keeps the still-running shape
+      // honest under chain contention: a concurrent serialized
+      // operation that holds the broker through the whole remaining
+      // bound makes the broker's pending surface UNREADABLE (it would
+      // read empty) — the known in-flight ids stay reported, never
+      // replaced by an empty guess (§3.1 [D]3/[C]1).
       let lastRunning = evalOutcome.pending;
       for (;;) {
         const remaining = deadline - Date.now();
@@ -558,7 +566,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         let waitResult: Awaited<ReturnType<Broker["waitForCalls"]>>["result"];
         let drained: boolean;
         try {
-          const waited = await broker.waitForCalls(undefined, remaining, evalOutcome.evalToken);
+          const waited = await broker.waitForCalls(lastRunning, remaining, evalOutcome.evalToken);
           waitResult = waited.result;
           drained = waited.drained;
         } catch (error) {

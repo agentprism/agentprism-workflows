@@ -171,6 +171,16 @@ class FakeSession implements BrokerSession {
     return this.completedTexts[this.completedTexts.length - 1] ?? '';
   }
 
+  /** The §5 [C]12 fold, mirroring the real acp-client state: EVERY
+   *  assistant message chunk joins with "\n\n" (multi-chunk turns
+   *  record their chunk arrays; whole-text turns fold to themselves). */
+  readonly chunkedTurns: string[][] = [];
+  foldedTurnText(): string {
+    const chunks = this.chunkedTurns[this.chunkedTurns.length - 1];
+    if (chunks !== undefined) return chunks.join('\n\n');
+    return this.currentTurnText();
+  }
+
   finalMessageText(): string {
     return this.completedTexts[this.completedTexts.length - 1] ?? '';
   }
@@ -185,6 +195,18 @@ class FakeSession implements BrokerSession {
     assert.ok(pending, 'a prompt turn must be in flight');
     this.completedTexts.push(text);
     pending.resolve({ stopReason: this.stopReason, text });
+  }
+
+  /** Complete the in-flight turn from MULTIPLE assistant message chunks
+   *  (the acp-client textChunks model): `currentTurnText()` glues them
+   *  separator-free while `foldedTurnText()` joins with "\n\n" — the
+   *  broker's no-schema result must read the FOLD. */
+  completeTurnChunked(chunks: string[]): void {
+    const pending = this.prompts.shift();
+    assert.ok(pending, 'a prompt turn must be in flight');
+    this.completedTexts.push(chunks.join(''));
+    this.chunkedTurns.push(chunks);
+    pending.resolve({ stopReason: this.stopReason, text: chunks.join('') });
   }
 
   failTurn(error: unknown): void {
@@ -470,6 +492,27 @@ test('the fused-eval seam: waitForCalls reports the suspended eval\'s completion
   assert.ok(waited3.result.pending.length > 0, 'the in-flight ids are reported');
   assert.equal(waited3.result.result, undefined, 'no completion value while suspended');
   await ws.dispose();
+});
+
+test('§5 [C]12: the no-schema result fold joins assistant message chunks with "\n\n" — multi-chunk answers are never glued', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repl-broker-chunks-'));
+  const storePath = join(dir, 'calls.jsonl');
+  const { ws, broker, runner } = await setup({ store: JsonlCallStore.open(storePath) });
+  // The LIVE path: the awaited call's turn completes in THREE assistant
+  // message chunks (the acp-client textChunks model). The broker's
+  // no-schema result must read the FOLD — "\n\n" between every chunk —
+  // never the separator-free glue ("…won't modify any files.TypeScript
+  // files under…").
+  const r1 = await broker.eval('const p = agent("pi/x", "chunked"); await p');
+  assert.equal(r1.kind, 'pending');
+  await tick();
+  runner.last().completeTurnChunked(['First chunk.', 'Second chunk.', 'Third chunk.']);
+  await tick();
+  await broker.pump();
+  const got = await broker.eval('await p');
+  assert.equal(got.result, 'First chunk.\n\nSecond chunk.\n\nThird chunk.', 'the §5 fold, not the glue');
+  await ws.dispose();
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test('§3.1: the fused pump reports the finished shape the moment THIS eval settles — an unrelated long-running call elsewhere in the workspace never holds the finished shape to the bound (review finding)', async () => {

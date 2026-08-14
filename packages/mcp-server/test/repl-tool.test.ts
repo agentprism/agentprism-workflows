@@ -46,6 +46,7 @@ import {
 import { workflowProjectPaths } from "@automatalabs/workflows";
 
 import { createWorkflowServer, replToolOutputShape } from "../src/index.js";
+import { WorkflowProjectRegistry } from "../src/project-registry.js";
 import { okRunner, textOf, type Connected } from "./_harness.js";
 
 /** The fake held-open ACP session (the broker's structural seam). */
@@ -172,8 +173,11 @@ function replStorePaths(projectDir: string): { snapshotPath: string; replDir: st
 }
 
 /** Connect a workflow server with an injected repl runner (single-project mode). */
-async function connectWithRepl(replRunner: BrokerRunner): Promise<Connected & { runner: FakeRunner }> {
-  const server = createWorkflowServer(okRunner(), { replRunner });
+async function connectWithRepl(
+  replRunner: BrokerRunner,
+  options: { projects?: WorkflowProjectRegistry } = {},
+): Promise<Connected & { runner: FakeRunner; projects?: WorkflowProjectRegistry }> {
+  const server = createWorkflowServer(okRunner(), { replRunner, projects: options.projects });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "mcp-repl-test", version: "0.0.0" }, { capabilities: {} });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -181,6 +185,7 @@ async function connectWithRepl(replRunner: BrokerRunner): Promise<Connected & { 
     client,
     server,
     runner: replRunner as FakeRunner,
+    projects: options.projects,
     async dispose() {
       await client.close();
       await server.close();
@@ -363,6 +368,43 @@ test("the soft-bound eval: the bound elapses first → the STILL-RUNNING shape {
     assert.equal(structuredOf(picked).result, "slow answer");
     // `_` holds the late completion too.
     assert.equal(structuredOf(await repl(connected, { action: "eval", projectDir: PROJECT, code: "_" })).result, "slow answer");
+  } finally {
+    await connected.dispose();
+  }
+});
+
+test("chain contention: the soft-bound eval still reports the KNOWN in-flight ids when a serialized operation holds the broker through the whole remaining bound (§3.1 [D]3/[C]1 — never an empty running surface)", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const registry = new WorkflowProjectRegistry(okRunner());
+  const connected = await connectWithRepl(runner, { projects: registry });
+  try {
+    const held = repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "slow task"); const v = await p; "result:" + v',
+      timeoutMs: 500,
+    });
+    await tick();
+    // A concurrent serialized operation — the client-presence drain's
+    // yieldful pump loop — holds the broker's chain through the WHOLE
+    // remaining bound (its pumps interleave sleeps, so the wait's
+    // deadline expires while the chain stays busy). The wait can never
+    // read the pending surface: the tool must report the KNOWN ids the
+    // eval suspended with, never the empty unreadable read.
+    const context = registry.getOrCreate(PROJECT);
+    const broker = context.repl?.broker ?? null;
+    assert.ok(broker, "the touched project state has a broker");
+    const draining = broker.drainForDisconnect(3000, () => false);
+    const r = await held;
+    assert.ok(!isErrorResult(r), textOf(r));
+    const sc = structuredOf(r);
+    assert.deepEqual(Object.keys(sc).sort(), ["output", "running"], "the still-running shape has no result");
+    assert.deepEqual(sc.running, ["c1"], "the KNOWN in-flight ids — the contention must never degrade running to []");
+    assert.ok(textOf(r).includes("running: c1"), textOf(r));
+    // The drain finishes its bound (it cancels the in-flight call at its
+    // own forced stop — after the held call already returned).
+    await draining;
   } finally {
     await connected.dispose();
   }

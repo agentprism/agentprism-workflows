@@ -508,6 +508,14 @@ export interface BrokerSession {
   release(): Promise<void>;
   /** The latest turn's assistant text. */
   currentTurnText(): string;
+  /** The latest turn's assistant text with the §5 chunk joiner — EVERY
+   *  assistant message chunk joins with "\n\n" (the bible's [C]12 fold:
+   *  multi-chunk replies gain the separator instead of gluing, and
+   *  narration chunks stay apart from answer chunks). REAL on the
+   *  acp-agents adapter (`SessionHandle.foldedTurnText`); OPTIONAL for
+   *  third-party adapters — the broker degrades to `currentTurnText()`
+   *  (the adapter's own fold) when absent. */
+  foldedTurnText?(): string;
   /** The latest turn's FINAL assistant message (schema extraction). */
   finalMessageText(): string;
   /** The backend's native structured output for the latest turn, if any. */
@@ -1762,7 +1770,21 @@ export class Broker {
           ...report.failedLost,
         ]);
         this.sink?.boundary('settlement');
-        if (drainError !== undefined) throw drainError;
+        if (drainError !== undefined) {
+          // §6.2: the reconcile drain failure DEMOTES to
+          // workspace().diagnostics.drainError — the settlements landed
+          // and the state-changing boundary above persists them, so
+          // nothing was lost and the first touch resolves with its
+          // report instead of failing outside the eval result contract.
+          // The failure never rides the eval output surface (the [C]14
+          // one-line notice is reserved for drains that LOST state — the
+          // tool layer's client-presence drain rethrow).
+          this.retainedDrainError = {
+            name: drainError.info.name,
+            message: drainError.info.message,
+            atMs: now(),
+          };
+        }
       }
       // §6.2: the reconcile summary DEMOTES to workspace().diagnostics
       // (retained; it never rides the eval result surface).
@@ -1896,7 +1918,15 @@ export class Broker {
       this.sink?.boundary('settlement');
     } catch (error) {
       if (error instanceof DrainJobError) {
-        this.warnLine('warn', `settlement drain interrupted after cancelling queued followUp ${callId}: ${errorLine(error.info)}`);
+        // §6.2: the drain failure DEMOTES to workspace().diagnostics
+        // (retained) — the settlement landed and the boundary below
+        // persists it, so nothing was lost and the failure never rides
+        // the eval output surface.
+        this.retainedDrainError = {
+          name: error.info.name,
+          message: error.info.message,
+          atMs: now(),
+        };
         this.sink?.boundary('settlement');
       } else throw error;
     }
@@ -2480,7 +2510,7 @@ export class Broker {
         }
         try {
           this.assertNormalStopReason(ended.stopReason ?? 'end_turn', callId);
-          return { outcome: 'resolve', value: this.finalTextOf(session.currentTurnText(), callId) };
+          return { outcome: 'resolve', value: this.finalTextOf(this.finalTurnText(session), callId) };
         } catch (error) {
           return { outcome: 'reject', value: toRejectionValue(error) };
         }
@@ -3035,7 +3065,15 @@ export class Broker {
         this.sink?.boundary('settlement');
       } catch (error) {
         if (error instanceof DrainJobError) {
-          this.warnLine('warn', `settlement drain interrupted after cancelling queued call ${callId}: ${errorLine(error.info)}`);
+          // §6.2: the drain failure DEMOTES to workspace().diagnostics
+          // (retained) — the settlement landed and the boundary below
+          // persists it, so nothing was lost and the failure never rides
+          // the eval output surface.
+          this.retainedDrainError = {
+            name: error.info.name,
+            message: error.info.message,
+            atMs: now(),
+          };
           this.sink?.boundary('settlement');
         } else throw error;
       }
@@ -3217,11 +3255,17 @@ export class Broker {
           this.sink?.boundary('settlement');
         } catch (error) {
           if (error instanceof DrainJobError) {
-            this.warnLine('warn', `settlement drain interrupted after cancelling opening call ${callId}: ${errorLine(error.info)}`);
-            // The settlement landed even though the continuation drain
-            // failed: the boundary still fires (mirrors the pump's
-            // drain-failure arm) so the operation-end flush persists
-            // the changed VM.
+            // §6.2: the drain failure DEMOTES to workspace().diagnostics
+            // (retained) — the settlement landed even though the
+            // continuation drain failed; the boundary still fires
+            // (mirrors the pump's drain-failure arm) so the
+            // operation-end flush persists the changed VM. Nothing was
+            // lost, so the failure never rides the eval output surface.
+            this.retainedDrainError = {
+              name: error.info.name,
+              message: error.info.message,
+              atMs: now(),
+            };
             this.sink?.boundary('settlement');
           } else throw error;
         }
@@ -5570,10 +5614,18 @@ this.evalBreakArmed = false;
     });
   }
 
+  /** The no-schema result fold (§5 [C]12): the latest turn's assistant
+   *  text with the "\n\n" chunk joiner when the session exposes the
+   *  folded surface; a third-party adapter without it degrades to
+   *  `currentTurnText()` (its own fold). */
+  private finalTurnText(session: BrokerSession): string {
+    return session.foldedTurnText !== undefined ? session.foldedTurnText() : session.currentTurnText();
+  }
+
   /** The no-schema result: the latest turn's assistant text, mirroring
    *  the runner's `AGENT_EMPTY_OUTPUT` refusal. */
   private finalText(entry: SessionEntry): string {
-    return this.finalTextOf(entry.session.currentTurnText(), entry.callId);
+    return this.finalTextOf(this.finalTurnText(entry.session), entry.callId);
   }
 
   /** The shared empty-output gate for a completed turn's text (used by

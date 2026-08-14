@@ -877,13 +877,18 @@ test('cadence: a reconcile-time invalid-options refusal settles the guest and fi
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('cadence: a changed-VM settlement drain that FAILS still fires the settlement boundary (reconcile and pump)', async () => {
+test('cadence: a changed-VM settlement drain that FAILS still fires the settlement boundary, and the reconcile drain failure DEMOTES to workspace().diagnostics (reconcile and pump)', async () => {
   // The reconcile arm: the store-arm settlement changed the VM, the drain
   // runs the snapshot-carried continuation, and the continuation runs
   // away — interrupted by the broker-level handler. The boundary must
   // still fire: the settlements landed and the operation-end flush needs
   // the dirty boundary to persist them (review regression: an interrupted
-  // drain used to skip the boundary entirely).
+  // drain used to skip the boundary entirely). The DrainJobError itself
+  // DEMOTES (§6.2): the settlements landed and will persist — nothing
+  // was lost — so the reconcile RESOLVES with its report (the first
+  // touch never fails outside the eval result contract), the failure is
+  // retained under workspace().diagnostics.drainError, and it never
+  // rides the next eval's output surface.
   const kinds: Array<'eval' | 'settlement'> = [];
   const sink: SnapshotSink = { boundary: (kind) => kinds.push(kind), flush: () => {} };
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-drainfail-'));
@@ -903,14 +908,21 @@ test('cadence: a changed-VM settlement drain that FAILS still fires the settleme
     interruptHandler: () => true,
   });
   broker2.store().recordCompleted('c1', { outcome: 'resolve', value: 'while down', completedAtMs: Date.now() });
-  await assert.rejects(
-    () => broker2.reconcile(),
-    (error: unknown) => (error as Error).name === 'DrainJobError',
-  );
+  const report = await broker2.reconcile();
+  assert.deepEqual(report.failedLost, [], 'the store arm settled the call — nothing was lost');
   assert.deepEqual(kinds, ['settlement'], 'the settlement boundary fired despite the failed drain');
   // The settlement itself is durable (the store write precedes the guest
   // settle) — a fresh restore settles it from the store arm.
   assert.equal(broker2.store().lookup('c1')!.completion!.value, 'while down');
+  // §6.2: the interrupted reconcile drain is RETAINED under
+  // workspace().diagnostics.drainError — never a reconcile rejection,
+  // never an eval output line.
+  const diag = await broker2.eval(
+    'workspace().diagnostics.drainError === null ? "null" : workspace().diagnostics.drainError.name + ":" + workspace().diagnostics.drainError.message',
+  );
+  assert.ok(String(diag.result).startsWith('InternalError:'), String(diag.result));
+  const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'the reconcile drain failure never rides the eval output surface');
   await broker2.dispose();
   ws2.dispose();
 
