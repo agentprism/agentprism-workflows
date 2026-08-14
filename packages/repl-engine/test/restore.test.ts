@@ -1090,8 +1090,8 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
           loadedTurn: { status: 'running' },
           replay: [{ role: 'user', text: 'task' }],
           continue: [
-            { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
-            { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } },
+            { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', messageId: 'm-live', content: { type: 'text', text: 'live ' } } },
+            { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', messageId: 'm-partial', content: { type: 'text', text: 'partial' } } },
           ],
           turnEnded: { afterMs: 250, stopReason: 'end_turn' },
         },
@@ -1117,8 +1117,8 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
             loadedTurn: { status: 'running' },
             replay: [{ role: 'user', text: 'task' }],
             continue: [
-              { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'live ' } } },
-              { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } },
+              { afterMs: 50, update: { sessionUpdate: 'agent_message_chunk', messageId: 'm-live', content: { type: 'text', text: 'live ' } } },
+              { afterMs: 120, update: { sessionUpdate: 'agent_message_chunk', messageId: 'm-partial', content: { type: 'text', text: 'partial' } } },
             ],
             turnEnded: { afterMs: 250, stopReason: 'end_turn' },
           },
@@ -1157,10 +1157,12 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
         // regression: the old seam settled the pause as completion,
         // durably recording "live partial" as the call's outcome BEFORE
         // the notification, or re-issued the still-running turn). The
-        // restored result applies the §5 [C]12 chunk joiner like the
-        // live fold — the replayed and live-continuation chunks join
-        // with "\n\n" (review finding: the restored path glued them
-        // before the broker recorded the result).
+        // restored result applies the §5 [C]12 message-boundary fold
+        // like the live fold — the two continuation chunks carry
+        // DISTINCT messageIds, so they join with "\n\n"; same-message
+        // deltas (no boundary) would concatenate verbatim (review
+        // finding: the restored path glued them before the broker
+        // recorded the result).
         let result: string | undefined;
         for (let attempt = 0; attempt < 100; attempt++) {
           await broker2.pump();
