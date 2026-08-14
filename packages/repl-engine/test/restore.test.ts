@@ -1156,7 +1156,11 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
         // from the authoritative ended notification (the round-3
         // regression: the old seam settled the pause as completion,
         // durably recording "live partial" as the call's outcome BEFORE
-        // the notification, or re-issued the still-running turn).
+        // the notification, or re-issued the still-running turn). The
+        // restored result applies the §5 [C]12 chunk joiner like the
+        // live fold — the replayed and live-continuation chunks join
+        // with "\n\n" (review finding: the restored path glued them
+        // before the broker recorded the result).
         let result: string | undefined;
         for (let attempt = 0; attempt < 100; attempt++) {
           await broker2.pump();
@@ -1167,8 +1171,8 @@ test('restore through the REAL acp-agents adapter: a founding turn still in flig
           }
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(result, 'live partial', 'the authoritative completion is the turn\'s REAL accumulated text');
-        assert.equal(broker2.store().lookup('c1')!.completion!.value, 'live partial');
+        assert.equal(result, 'live \n\npartial', 'the authoritative completion is the turn\'s REAL accumulated text, folded with the §5 chunk joiner');
+        assert.equal(broker2.store().lookup('c1')!.completion!.value, 'live \n\npartial');
         assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'the still-running turn was never re-issued');
         assert.equal(broker2.store().lookup('c1')!.sessionId, recordedId, 'the call settled on the SAME backend session');
         const after = readWireLog(join(dir, 'log2.jsonl'));

@@ -30,12 +30,17 @@
  *   payload that passes every at-rest check but cannot be RESTORED — a
  *   corrupted in-range VM header, `SnapshotRestoreError`) → §6.1
  *   AUTO-RESET: the refused file is renamed aside (`.refused-<ts>`,
- *   NEVER deleted — auto-reset must not be silent data destruction),
- *   a fresh workspace starts, and the next eval's output leads with a
- *   loud one-line notice naming the file and the reason. The daemon
- *   never crash-loops and never silently discards the data; a version
- *   bump therefore routes old snapshots through this path on first
- *   touch, exactly as the redesign intends.
+ *   NEVER deleted — auto-reset must not be silent data destruction;
+ *   the destination is COLLISION-SAFE — a same-millisecond second
+ *   refusal bumps a counter suffix instead of overwriting an earlier
+ *   aside), the CALL LEDGER is cleared with it (a fresh VM restarts
+ *   ids at `c1`, and the store's first-wins replay must never hand a
+ *   new call an old record's completion), a fresh workspace starts,
+ *   and the next eval's output leads with a loud one-line notice
+ *   naming the file and the reason. The daemon never crash-loops and
+ *   never silently discards the data; a version bump therefore routes
+ *   old snapshots through this path on first touch, exactly as the
+ *   redesign intends.
  *
  * First touches are SINGLE-FLIGHT: concurrent first-touch calls share
  * one in-flight promise (phase-D review round 2: an asynchronous null
@@ -117,7 +122,7 @@ import {
   type WasmModule,
 } from "@automatalabs/repl-engine";
 
-import { renameSync } from "node:fs";
+import { existsSync, renameSync } from "node:fs";
 
 import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 
@@ -340,7 +345,7 @@ async function doFirstTouch(
           }
         }
         attachedWorkspace?.dispose();
-        const aside = `${state.store.snapshotPath}.refused-${Date.now()}`;
+        const aside = renameAsideNeverOverwriting(state.store.snapshotPath, Date.now());
         try {
           renameSync(state.store.snapshotPath, aside);
         } catch (renameError) {
@@ -352,6 +357,16 @@ async function doFirstTouch(
               `${renameError instanceof Error ? renameError.message : String(renameError)}`,
           );
         }
+        // §6.1 auto-reset is a FULL reset: the CALL LEDGER is cleared
+        // with the snapshot (review finding — the old code renamed only
+        // `snapshot.bin` and left `calls.jsonl` intact, so the fresh
+        // VM's ids restarting at c1 hit the store's first-wins replay
+        // and a new c1 inherited an old c1's record AND completion).
+        // `store.reset()` closes the call store and wipes the `repl/`
+        // directory ENTRY-WISE, preserving the renamed-aside
+        // `.refused-*` file (§6.1 [C]13 — never deleted), and the next
+        // `callStore()` reopens an empty ledger for the fresh ids.
+        state.store.reset();
         state.autoResetNotice = { file: aside, reason: error.message };
         // Fall through: the fresh workspace starts below.
       } else {
@@ -362,6 +377,28 @@ async function doFirstTouch(
   const workspace = await Workspace.create(state.projectDir, { wasm });
   await attach(workspace);
   state.source = "fresh";
+}
+
+/**
+ * §6.1 [C]13: the refused snapshot's rename-aside destination —
+ * collision-safe, never an overwrite. POSIX `renameSync` SILENTLY
+ * REPLACES an existing destination, so a plain
+ * `<snapshot>.refused-<Date.now()>` name could delete an earlier
+ * refused snapshot when two auto-resets land in the same millisecond
+ * (a second refusal on a fresh snapshot, or a test driving two
+ * refusals) — refused snapshots are never deleted. The daemon is
+ * single-threaded, so the existence check and the rename below cannot
+ * race; a collision bumps a counter suffix instead of replacing.
+ * Exported for the collision regression test.
+ */
+export function renameAsideNeverOverwriting(snapshotPath: string, atMs: number): string {
+  let attempt = 0;
+  for (;;) {
+    const suffix = attempt === 0 ? `${atMs}` : `${atMs}-${attempt}`;
+    const candidate = `${snapshotPath}.refused-${suffix}`;
+    if (!existsSync(candidate)) return candidate;
+    attempt += 1;
+  }
 }
 
 /** Mark an MCP session present on this project's workspace (the

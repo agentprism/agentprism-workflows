@@ -24,7 +24,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -45,7 +45,7 @@ import {
 } from "@automatalabs/repl-engine";
 import { workflowProjectPaths } from "@automatalabs/workflows";
 
-import { createWorkflowServer, replToolOutputShape } from "../src/index.js";
+import { createWorkflowServer, renameAsideNeverOverwriting, replToolOutputShape } from "../src/index.js";
 import { WorkflowProjectRegistry } from "../src/project-registry.js";
 import { okRunner, textOf, type Connected } from "./_harness.js";
 
@@ -385,15 +385,23 @@ test("chain contention: the soft-bound eval still reports the KNOWN in-flight id
       code: 'const p = agent("pi/x", "slow task"); const v = await p; "result:" + v',
       timeoutMs: 500,
     });
-    await tick();
     // A concurrent serialized operation — the client-presence drain's
     // yieldful pump loop — holds the broker's chain through the WHOLE
     // remaining bound (its pumps interleave sleeps, so the wait's
     // deadline expires while the chain stays busy). The wait can never
     // read the pending surface: the tool must report the KNOWN ids the
     // eval suspended with, never the empty unreadable read.
+    //
+    // The held call must have completed its first touch (the broker is
+    // attached) before the drain starts holding the chain — poll the
+    // registry instead of a single tick (a loaded parallel suite can
+    // starve the touch past one event-loop turn).
     const context = registry.getOrCreate(PROJECT);
-    const broker = context.repl?.broker ?? null;
+    let broker = context.repl?.broker ?? null;
+    for (let attempt = 0; attempt < 100 && broker === null; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      broker = context.repl?.broker ?? null;
+    }
     assert.ok(broker, "the touched project state has a broker");
     const draining = broker.drainForDisconnect(3000, () => false);
     const r = await held;
@@ -796,6 +804,182 @@ test("§6.1 [C]13: the auto-reset notice survives a reset() IN THE SAME FIRST EV
   }
 });
 
+test("§6.1: the auto-reset CLEARS the call ledger with the snapshot — a nonempty calls.jsonl never leaks into the fresh workspace, whose c1 is minted clean (review finding: the fresh VM restarts ids at c1 and the store's first-wins replay handed the new call the old record and its completion)", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const first = await connectWithRepl(runner);
+  try {
+    // c1's record AND its completion land in calls.jsonl before the
+    // snapshot exists (a real agent call, settled through the tool).
+    const r = await repl(first, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
+    assert.ok(!isErrorResult(r), textOf(r));
+    await tick();
+    assert.equal(runner.sessions.length, 1, "the founding session opened");
+    runner.last().completeTurn("OLD ANSWER");
+    const settled = await repl(first, { action: "eval", projectDir: PROJECT, code: "await p" });
+    assert.equal(structuredOf(settled).result, "OLD ANSWER", "c1 completed before the restart");
+  } finally {
+    await first.dispose();
+  }
+  const { snapshotPath, replDir } = replStorePaths(PROJECT);
+  const callStorePath = join(replDir, "calls.jsonl");
+  assert.ok(existsSync(snapshotPath));
+  assert.ok(
+    existsSync(callStorePath) && readFileSync(callStorePath, "utf8").includes("OLD ANSWER"),
+    "the call ledger is nonempty",
+  );
+  // Corrupt the stored snapshot: the next daemon's first touch refuses
+  // and auto-resets — the ledger must go WITH the snapshot.
+  const bytes = readFileSync(snapshotPath);
+  writeFileSync(snapshotPath, bytes.subarray(0, Math.floor(bytes.length / 2)));
+
+  const runner2 = new FakeRunner();
+  const second = await connectWithRepl(runner2);
+  try {
+    const r = await repl(second, { action: "eval", projectDir: PROJECT, code: 'const q = agent("pi/x", "task2"); "fresh-start"' });
+    assert.ok(!isErrorResult(r), textOf(r));
+    const output = structuredOf(r).output as string;
+    assert.ok(output.startsWith("REPL workspace auto-reset:"), `the notice leads the output: ${output.slice(0, 120)}`);
+    // The ledger was cleared with the snapshot: the fresh dispatch
+    // minted c1 WITHOUT inheriting the old record's completion (the
+    // first-wins replay kept the old c1 settled on the defect), and
+    // the log carries only the fresh record.
+    const agents = (await evalJson(second, PROJECT, "agents()")) as Array<{ callId: string; state: string }>;
+    assert.equal(agents.length, 1, "one live agent");
+    assert.equal(agents[0].callId, "c1", "the fresh ids restart at c1");
+    assert.equal(agents[0].state, "running", "the fresh c1 is pending — never the old settled record");
+    const log = readFileSync(callStorePath, "utf8");
+    assert.ok(!log.includes("OLD ANSWER"), "the old completion is gone from the ledger");
+    // The fresh c1 settles with ITS OWN answer, never the old one.
+    await tick();
+    runner2.last().completeTurn("NEW ANSWER");
+    const picked = await repl(second, { action: "eval", projectDir: PROJECT, code: "await q" });
+    assert.equal(structuredOf(picked).result, "NEW ANSWER", "the fresh c1 settles with its own answer");
+  } finally {
+    await second.dispose();
+  }
+});
+
+test("§6.1 [C]13: renameAsideNeverOverwriting is COLLISION-SAFE — a same-millisecond second refusal bumps a counter suffix instead of overwriting (POSIX renameSync silently replaces an existing destination), and the earlier refused snapshot is never deleted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "repl-aside-"));
+  try {
+    const snapshotPath = join(dir, "snapshot.bin");
+    writeFileSync(snapshotPath, "refused-bytes");
+    // An earlier refusal already renamed its snapshot aside under the
+    // SAME millisecond stamp — and the stamp recurs (two refusals in
+    // one millisecond): the destination must bump, never overwrite.
+    writeFileSync(`${snapshotPath}.refused-4242`, "first refusal");
+    const aside = renameAsideNeverOverwriting(snapshotPath, 4242);
+    assert.equal(aside, `${snapshotPath}.refused-4242-1`, "the collision bumps a counter suffix");
+    renameSync(snapshotPath, aside);
+    assert.ok(!existsSync(snapshotPath), "the refused snapshot moved aside");
+    assert.equal(
+      readFileSync(`${snapshotPath}.refused-4242`, "utf8"),
+      "first refusal",
+      "the earlier refused snapshot is untouched",
+    );
+    assert.equal(readFileSync(aside, "utf8"), "refused-bytes", "the second refusal landed under the bumped name");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("§6.1 [C]13: TWO auto-resets on one project keep BOTH refused snapshots renamed aside — auto-reset never deletes an earlier aside, even across fresh re-persistence", async () => {
+  const PROJECT = freshProject();
+  const first = await connectWithRepl(new FakeRunner());
+  try {
+    await repl(first, { action: "eval", projectDir: PROJECT, code: "globalThis.doomed = 1" });
+  } finally {
+    await first.dispose();
+  }
+  const { snapshotPath, replDir } = replStorePaths(PROJECT);
+  const corrupt = (): void => {
+    const bytes = readFileSync(snapshotPath);
+    writeFileSync(snapshotPath, bytes.subarray(0, Math.floor(bytes.length / 2)));
+  };
+  corrupt();
+
+  // Refusal #1: the aside lands, a fresh workspace starts and
+  // re-persists a NEW snapshot.
+  const second = await connectWithRepl(new FakeRunner());
+  try {
+    const r1 = await repl(second, { action: "eval", projectDir: PROJECT, code: "1 + 1" });
+    assert.ok((structuredOf(r1).output as string).startsWith("REPL workspace auto-reset:"), textOf(r1));
+    assert.equal(structuredOf(r1).result, "2");
+    assert.ok(existsSync(snapshotPath), "the fresh workspace re-persisted");
+  } finally {
+    await second.dispose();
+  }
+  corrupt();
+
+  // Refusal #2 (a third daemon): the SECOND aside lands under its own
+  // name — the first is never overwritten or deleted.
+  const third = await connectWithRepl(new FakeRunner());
+  try {
+    const r2 = await repl(third, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+    const output2 = structuredOf(r2).output as string;
+    assert.ok(output2.startsWith("REPL workspace auto-reset:"), `the second refusal notices too: ${output2.slice(0, 120)}`);
+    const asides = readdirSync(replDir).filter((name) => name.startsWith("snapshot.bin.refused-"));
+    assert.equal(asides.length, 2, `both refused snapshots renamed aside: ${asides.join(", ")}`);
+    assert.equal(structuredOf(r2).result, "42");
+  } finally {
+    await third.dispose();
+  }
+});
+
+test("§6.1/§6.2: pending notices survive a THROWING eval — they are consumed only by the first eval result that successfully renders them, never lost on the pump's throwing path (review finding: taking them before the held settlement pump erased them when waitForCalls threw)", async () => {
+  const PROJECT = freshProject();
+  const first = await connectWithRepl(new FakeRunner());
+  try {
+    await repl(first, { action: "eval", projectDir: PROJECT, code: "globalThis.doomed = 1" });
+  } finally {
+    await first.dispose();
+  }
+  const { snapshotPath } = replStorePaths(PROJECT);
+  const bytes = readFileSync(snapshotPath);
+  writeFileSync(snapshotPath, bytes.subarray(0, Math.floor(bytes.length / 2)));
+
+  const registry = new WorkflowProjectRegistry(okRunner());
+  const connected = await connectWithRepl(new FakeRunner(), { projects: registry });
+  try {
+    // The held eval is the FIRST touch (the auto-reset arms the notice)
+    // and SUSPENDS: the hold pumps waitForCalls. A CONCURRENT session's
+    // reset() (driven at the broker seam — the MCP SDK serves one
+    // transport per server, so the second session speaks through the
+    // registry's live broker) completes mid-hold and tears the broker
+    // down, so the held eval's waitForCalls THROWS and it renders NO
+    // result. The notice must survive that throwing path and lead the
+    // NEXT successful eval's output.
+    const held = repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'await new Promise(() => {}); "never"',
+      timeoutMs: 10_000,
+    });
+    await tick();
+    await tick();
+    const context = registry.getOrCreate(PROJECT);
+    const broker = context.repl?.broker ?? null;
+    assert.ok(broker, "the touched project state has a broker");
+    const concurrent = await broker.eval("reset()");
+    assert.equal(concurrent.result, "undefined", "the concurrent session's reset() ran");
+    const r = await held;
+    assert.ok(isErrorResult(r), "the held eval errored — its workspace was reset mid-hold");
+    // The next (fresh) workspace's eval leads with the notice — it was
+    // never consumed by the throwing eval (the defect: the next eval's
+    // output was clean, the notice gone).
+    const next = await repl(connected, { action: "eval", projectDir: PROJECT, code: "1 + 1" });
+    assert.equal(structuredOf(next).result, "2");
+    const outNext = structuredOf(next).output as string;
+    assert.ok(
+      outNext.startsWith("REPL workspace auto-reset:"),
+      `the notice survived the throwing eval and leads the next successful eval's output: ${outNext.slice(0, 120)}`,
+    );
+  } finally {
+    await connected.dispose();
+  }
+});
+
 test("§6.2 [C]14: a restore that LOST calls leads the next eval's output with the ONE aggregate notice — the per-call reconcile lines stay in diagnostics", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
@@ -912,6 +1096,43 @@ test("interrupt cancels a call by id; interrupt without an id on an IDLE workspa
     assert.ok(textOf(after).includes("result: 42"), textOf(after));
     const idleAfter = await repl(connected, { action: "interrupt", projectDir: PROJECT });
     assert.deepEqual(structuredOf(idleAfter), { interrupt: { outcome: "refused-idle" } }, "nothing is tracked after the break");
+  } finally {
+    await connected.dispose();
+  }
+});
+
+test("interrupt without an id TERMINATES a running eval suspended on nothing resumable (a never-settling local promise) — the release is reported targeted, the held eval returns promptly with the finished-with-error shape, and refused-idle stays honest only for an idle workspace (§3.2 review finding)", async () => {
+  const PROJECT = freshProject();
+  const connected = await connectWithRepl(new FakeRunner());
+  try {
+    const held = repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'await new Promise(() => {}); "never"',
+      timeoutMs: 10_000,
+    });
+    await tick();
+    await tick();
+    // The eval IS running (suspended, `pending: []`) — the no-id
+    // interrupt must terminate it, never refuse: the tracked
+    // continuation is released and the outcome is targeted.
+    const released = await repl(connected, { action: "interrupt", projectDir: PROJECT });
+    assert.ok(!isErrorResult(released), textOf(released));
+    assert.deepEqual(structuredOf(released), { interrupt: { outcome: "targeted" } });
+    assert.ok(textOf(released).includes("terminated outright"), textOf(released));
+    // The held eval returns PROMPTLY (no 10 s bound wait) with the
+    // finished-with-error shape — no result, no running ids.
+    const r = await held;
+    assert.ok(!isErrorResult(r), textOf(r));
+    const sc = structuredOf(r);
+    assert.ok(!("result" in sc) && !("running" in sc), `terminated, not still-running: ${JSON.stringify(sc)}`);
+    // Nothing is running any more: the next no-id interrupt is the
+    // honest refusal — the ONLY permitted refusal.
+    const idle = await repl(connected, { action: "interrupt", projectDir: PROJECT });
+    assert.deepEqual(structuredOf(idle), { interrupt: { outcome: "refused-idle" } });
+    // The workspace stays usable.
+    const after = await repl(connected, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+    assert.ok(textOf(after).includes("result: 42"), textOf(after));
   } finally {
     await connected.dispose();
   }

@@ -33,9 +33,16 @@
  *    unrelated settlement drain (a call no tracked eval awaits) does
  *    not fire it either — the armed state survives unrelated drains
  *    intact and breaks the target at its actual next execution.
- * 5. A no-id interrupt with NOTHING BREAKABLE — every in-flight eval
- *    suspended on no pending host call (a never-settling local
- *    promise) — refuses without arming anything.
+ * 5. A no-id interrupt TERMINATES every running eval it cannot arm — an
+ *    in-flight eval suspended on nothing resumable (a never-settling
+ *    local promise: no pending host call, no pending sleep) is
+ *    RELEASED (its tracked continuation dropped, the token-keyed seam
+ *    recording the termination) — `refused-idle` is honest only when
+ *    NOTHING is running (the review defect: the eval was still
+ *    running, so refusing was neither a break nor an honest idle
+ *    refusal). A pending `sleep` keeps an eval armable: its host
+ *    timer's settlement drain resumes the continuation like a host
+ *    call's, so the armed signal breaks it mid-run there.
  * 6. `waitForCalls` sleeps only for the REMAINING wait budget: a short
  *    `timeoutMs` returns in that budget, never a fixed 50 ms poll
  *    overshoot (~51 ms for every sub-50 ms timeout).
@@ -88,9 +95,10 @@
  *    RESTORED 0.3.0 library (whose lease-setting reaction still runs
  *    on the awaited VALUE's settlement — the carried sibling-reaction
  *    interrupt-targeting defect) reports `supportsContinuationLease:
- *    true` but is served WITHOUT instrumentation and the eval-break
- *    interrupt refuses — the flag alone would have re-armed the
- *    original defect on a supported older snapshot.
+ *    true` but is served WITHOUT instrumentation — the flag alone would
+ *    have re-armed the original defect on a supported older snapshot.
+ *    A running eval under such a library can never be armed (§3.2):
+ *    the no-id interrupt TERMINATES it (released), never refuses.
  *
  * All suites disable the per-eval deadline (`evalTimeoutMs: 0`), so
  * the ONLY thing that can break a runaway here is the armed signal —
@@ -485,19 +493,52 @@ test('review round 3: an UNRELATED settlement drain (a call no tracked eval awai
 
 // ── 5. Nothing breakable → refuse without arming ───────────────────────
 
-test('review round 3: a no-id interrupt with NOTHING BREAKABLE — an in-flight eval suspended on NO pending host call (a never-settling local promise, so no execution can ever resume it) — REFUSES and arms nothing', async () => {
+test('round 3 amended (§3.2): a no-id interrupt on an eval suspended on NOTHING RESUMABLE (a never-settling local promise — no pending host call, no pending sleep) TERMINATES it — the tracked continuation is released, the interrupt is never a refusal while an eval is running, and a later arm honestly refuses only when nothing is tracked', async () => {
   const { ws, broker } = await setup();
   // The eval suspends (its completion stays pending) with ZERO pending
-  // host calls: no settlement can ever queue its continuation, so there
-  // is no execution to break. Arming would be dead weight that lingers
-  // until reset — the guidance's refusal rule.
+  // host calls and no sleep: no execution can ever queue its
+  // continuation, so there is nothing to break mid-run. Arming would be
+  // dead weight that lingers until reset — but the eval IS running, so
+  // the interrupt must terminate it instead of refusing (the review
+  // defect: `refused-idle` for a running eval is neither a break nor an
+  // honest idle refusal).
   const a = await broker.eval('await new Promise(() => {}); "never"');
   assert.equal(a.result, undefined, 'the eval suspended — no completion value');
   assert.deepEqual(a.pending, [], 'no pending host call');
-  assert.equal(await broker.armEvalBreak(), false, 'nothing breakable — refused, nothing armed');
-  // Nothing was armed: a later eval runs normally.
+  const released = await bounded('armEvalBreak terminating the suspended eval', broker.armEvalBreak());
+  assert.equal(released, true, 'a running eval is terminated — the interrupt never refuses it');
+  // The tracked continuation was RELEASED: nothing is running any more,
+  // so the next arm honestly refuses (the ONLY permitted refusal).
+  assert.equal(await broker.armEvalBreak(), false, 'nothing is tracked after the release — honest idle refusal');
+  // The release terminated the eval (its continuation can never run):
+  // a later eval runs normally and the released eval's "never" never
+  // becomes the completion value.
   const after = await broker.eval('6 * 7');
   assert.equal(after.result, '42');
+  await broker.dispose();
+  ws.dispose();
+});
+
+test('round 3 amended (§3.2): an eval suspended on a pending SLEEP stays ARMABLE — the sleep settlement drain resumes the continuation and the armed signal breaks a runaway continuation mid-run there', async () => {
+  const { ws, broker } = await setup();
+  // `sleep` is a HOST timer (§4.7), not a registry call: the eval
+  // suspends with an empty pending surface, but its continuation IS
+  // resumable (the timer's settlement drain runs it), so arming is
+  // never dead weight — the signal breaks it at that execution.
+  const a = await broker.eval('await sleep(120); while (true) {}');
+  assert.equal(a.result, undefined, 'the eval suspended — no completion value');
+  assert.deepEqual(a.pending, [], 'no pending host call (sleep is not a registry call)');
+  assert.equal(await broker.armEvalBreak(), true, 'the sleep-suspended eval is armable — its continuation WILL execute');
+  // The sleep timer fires, and the next operation's pump (a probe
+  // eval's own pump) settles it and resumes the runaway continuation —
+  // the armed signal breaks it mid-run there. The break lands in the
+  // pump phase, so the probe eval itself runs clean and the
+  // interruption is retained under workspace().diagnostics (§6.2).
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const probe = await bounded('probe eval resuming the sleep continuation', broker.eval('"probe"'));
+  assert.equal(probe.result, 'probe', 'the probe eval runs normally — the break landed in its pump drain');
+  await assertInterruptedRetained(broker, 'the armed signal broke the sleep-resumed continuation mid-run');
+  assert.equal(await broker.armEvalBreak(), false, 'the broken eval is no longer tracked');
   await broker.dispose();
   ws.dispose();
 });
@@ -1029,7 +1070,7 @@ function guestLibrary030Source(): string {
   return flagged;
 }
 
-test('review round 7: a RESTORED 0.3.0 library is served WITHOUT instrumentation and the eval-break interrupt REFUSES — the continuation-lease availability check is VERSION-GATED on 0.3.1 (the reviewer\'s finding: the 0.3.0 copy reports `supportsContinuationLease: true` but its helper still carries the sibling-reaction interrupt-targeting defect, so the flag alone re-armed the original defect on a supported older snapshot)', async () => {
+test('review round 7: a RESTORED 0.3.0 library is served WITHOUT instrumentation and the eval-break interrupt TERMINATES the running eval — the continuation-lease availability check is VERSION-GATED on 0.3.1 (the reviewer\'s finding: the 0.3.0 copy reports `supportsContinuationLease: true` but its helper still carries the sibling-reaction interrupt-targeting defect, so the flag alone re-armed the original defect on a supported older snapshot) and §3.2 never refuses a running eval: the unkeyable tracked continuation is released instead', async () => {
   const runner = new FakeRunner();
   // Build an emulated 0.3.0 library copy, install it in a bare VM (with
   // the four __host_* globals, exactly like the pre-snapshot host the
@@ -1067,18 +1108,23 @@ test('review round 7: a RESTORED 0.3.0 library is served WITHOUT instrumentation
       'globalThis.round7sibling = null; const q = agent("pi/x", "research"); const x = await q; q.then(() => { globalThis.round7sibling = __replLease; }); globalThis.round7done = x; "waiting"',
     );
     assert.ok(a.pending.includes('c1'), `pending: ${a.pending.join(', ')}`);
+    // §3.2: the eval IS running — a no-id interrupt never refuses a
+    // running eval. The 0.3.0 copy cannot key the signal to the
+    // continuation (the version gate: arming would re-arm the
+    // sibling-reaction targeting defect), so the running eval is
+    // TERMINATED instead — its tracked continuation released.
     assert.equal(
       await broker.armEvalBreak(),
-      false,
-      'the eval-break interrupt REFUSES on the restored 0.3.0 copy — nothing is armed (the version gate)',
+      true,
+      'the running eval is terminated on the restored 0.3.0 copy — released, never refused (the version gate)',
     );
-    // A no-id interrupt with nothing armed must not have armed anything:
-    // the target stays trackable and the workspace stays healthy.
-    const still = await broker.armEvalBreak();
-    assert.equal(still, false, 'still refused');
-    // The eval completes natively when the call settles — the sibling
-    // reaction and the continuation both run, exactly like an
-    // un-instrumented workspace.
+    // Nothing is tracked any more: the next no-id interrupt is the
+    // honest idle refusal — the ONLY permitted refusal.
+    assert.equal(await broker.armEvalBreak(), false, 'nothing is tracked after the release — honest idle refusal');
+    // The released eval's guest job still completes natively when the
+    // call settles (its continuation is unreachable by any armed
+    // signal) — the sibling reaction and the continuation both run,
+    // exactly like an un-instrumented workspace.
     runner.sessions[0].completeTurn('result');
     await tick();
     const probe = await bounded('probe after settling the 0.3.0-copy eval', broker.eval('"probe"'));

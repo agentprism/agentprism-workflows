@@ -3341,15 +3341,30 @@ export class Broker {
   /**
    * Arm the eval-break signal — the `interrupt` tool's no-id path (the
    * roadmap doc: "break a runaway eval (the quickjs interrupt
-   * handler)"). Returns `false` when NO eval is in flight — the
+   * handler)"). Returns `false` ONLY when NO eval is in flight — the
    * workspace is idle, there is no continuation to break, and NOTHING
    * is armed (phase-E review rejection: the old project-wide boolean
    * was armed regardless, so an idle workspace's next eval — or an
    * unrelated drain — consumed it before the intended continuation).
-   * Also refuses when every in-flight eval is suspended on NO pending
-   * host call (a never-settling local promise — no execution can ever
-   * resume it, so there is nothing breakable): the guidance's refusal
-   * rule, nothing is armed (phase-E review round 3).
+   * `refused-idle` is honest ONLY then: a running eval is never
+   * refused.
+   *
+   * A running eval the signal cannot target — one suspended on nothing
+   * resumable (no pending host call AND no pending sleep: a
+   * never-settling local promise, so no execution can ever queue its
+   * continuation), one whose resident library predates the
+   * continuation-lease surface, or a defensive token-less suspension —
+   * is TERMINATED instead: its tracked completions are RELEASED (the
+   * eval is no longer running) and the token-keyed fused-eval seam
+   * records an error settlement so a concurrent wait pumping it
+   * reports the finished-with-error shape promptly (§3.2: an
+   * interrupt must terminate/release every running eval — arming dead
+   * weight was the phase-E round-3 refusal rule, and refusing was the
+   * review defect: the eval was still running, so it was neither a
+   * break nor an honest idle refusal). A pending SLEEP keeps an eval
+   * armable: its host timer's settlement drain resumes the
+   * continuation exactly like a host call's, so the armed signal
+   * breaks it mid-run there.
    *
    * When an eval IS in flight (a suspended eval whose continuation will
    * run at a later execution — a settlement drain, or a direct eval's
@@ -3398,37 +3413,86 @@ export class Broker {
       // rejection round 7): a workspace whose resident library predates
       // it (a restored 0.1.0/0.2.0/0.3.0 snapshot) cannot key the signal
       // to an eval's continuation — the 0.2.0 log-only targeting is the
-      // rejected settled-call-ids identity. Refuse honestly.
-      if (!this.continuationLeaseAvailable()) return false;
-      // The pending-call refusal (phase-E review round 3): a suspended
-      // eval's continuation can only ever be resumed by the settlement
-      // of a pending host call (the realm has no timers, and a
-      // promise resolved by guest code alone would have settled within
-      // the eval's own drain — a genuinely SUSPENDED eval awaits a
-      // host call, directly or through any promise chain). With the
-      // registry EMPTY no execution can ever resume a tracked
-      // continuation — arming would be dead weight that lingers until
-      // reset. Refuse. (The converse is deliberately not required: the
-      // continuation identity is the promise graph, so `await
-      // Promise.all([q])` is targetable through q even though the
-      // awaited value is not itself a registry promise — phase-E
+      // rejected settled-call-ids identity. Such an eval is RELEASED
+      // (see the module-level arm doc — never refused).
+      //
+      // Resumability (phase-E review round 3, amended for the §4.7
+      // sleep helper): a suspended eval's continuation can only ever be
+      // resumed by the settlement of a pending host call OR a pending
+      // `sleep` host timer (a promise resolved by guest code alone
+      // would have settled within the eval's own drain — a genuinely
+      // SUSPENDED eval awaits one of those, directly or through any
+      // promise chain). With the registry EMPTY AND no sleep pending no
+      // execution can ever resume a tracked continuation — arming would
+      // be dead weight that lingers until reset — so the running eval
+      // is TERMINATED (released) instead: an interrupt must never
+      // refuse a running eval. (The converse is deliberately not
+      // required: the continuation identity is the promise graph, so
+      // `await Promise.all([q])` is targetable through q even though
+      // the awaited value is not itself a registry promise — phase-E
       // review round 5.)
-      if (this.pendingIds().length === 0) return false;
+      //
       // The armed identity: the targets' continuation TOKENS (see
       // `evalTokens`). A tracked eval without a token (a suspension
       // the instrumenter never covered — a defensive corner) is not
-      // targetable: refuse rather than arm dead weight.
+      // targetable: released, never refused.
       const tokens = new Set<string>();
-      for (const completion of this.activeEvalCompletions) {
-        const token = this.evalTokens.get(completion);
-        if (token === undefined) return false;
-        tokens.add(token);
+      let targetable = this.continuationLeaseAvailable() &&
+        (this.pendingIds().length > 0 || this.sleepCalls.size > 0);
+      if (targetable) {
+        for (const completion of this.activeEvalCompletions) {
+          const token = this.evalTokens.get(completion);
+          if (token === undefined) {
+            targetable = false;
+            break;
+          }
+          tokens.add(token);
+        }
       }
-this.evalBreakArmed = true;
+      if (!targetable) {
+        this.releaseUntargetableEvals();
+        return true;
+      }
+      this.evalBreakArmed = true;
       this.evalBreakTargets = new Set(this.activeEvalCompletions);
       this.evalBreakTokens = tokens;
       return true;
     });
+  }
+
+  /**
+   * §3.2: TERMINATE every running eval the eval-break signal cannot
+   * target (see `armEvalBreak` — nothing resumable, a pre-0.3.1
+   * resident library, or a defensive token-less suspension). The
+   * tracked completions are released exactly like a broken
+   * continuation's (see `releaseInterruptedEval`): each token-keyed
+   * fused-eval seam records an error settlement so a concurrent wait
+   * pumping the eval returns the finished-with-error shape promptly
+   * instead of polling to its bound, a reset() the released eval
+   * requested still owes its teardown, and the eval-break signal's
+   * armed state is cleared with the targets it can no longer have.
+   */
+  private releaseUntargetableEvals(): void {
+    for (const completion of [...this.activeEvalCompletions]) {
+      const evalToken = this.evalTokens.get(completion);
+      this.activeEvalCompletions.delete(completion);
+      this.evalTokens.delete(completion);
+      this.evalBreakTargets.delete(completion);
+      if (this.resetOwningCompletions.delete(completion) && this.resetOwningCompletions.size === 0) {
+        this.resetDue = true;
+      }
+      if (evalToken !== undefined) {
+        // The released eval can never settle (its continuation will
+        // never run — or, for a pre-0.3.1 library, was never keyed),
+        // so the seam records the termination the same way a broken
+        // continuation's release does.
+        this.sweptEvalSettlements.set(evalToken, { kind: 'error' });
+      }
+      completion.dispose();
+    }
+    this.evalBreakArmed = false;
+    this.evalBreakTargets = new Set();
+    this.evalBreakTokens = new Set();
   }
 
   /**

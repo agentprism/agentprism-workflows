@@ -24,9 +24,11 @@
  * - `interrupt { projectDir, id? }` — the one out-of-band verb: with
  *   `id`, cancel that subagent call (the guest promise rejects
  *   recoverable, `AGENT_CANCELLED` family); without `id`, break the
- *   running eval (honest `refused-idle` when nothing is running — the
+ *   running eval — every running eval is broken mid-run (the
  *   out-of-band eval-break channel and the quickjs interrupt handler
- *   stand as built).
+ *   stand as built) or, when it is suspended on nothing resumable or
+ *   its continuation cannot be keyed, TERMINATED (released) outright;
+ *   `refused-idle` is honest only when NOTHING is running.
  *
  * Durability is kept and hidden (§6): bindings AND in-flight subagent
  * turns survive daemon restarts exactly as before, but the ceremony
@@ -411,16 +413,16 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "is \"backend/model\" (a bare \"backend\" runs its default model); an unknown backend rejects the call " +
         "immediately, naming the known backends. The opts keys are schema (a structured-output JSON schema, " +
         "validated per call), cwd, configOptions (backend-specific knobs, validated at admission), and mode — " +
-        "e.g. agent(\"pi/deepseek-v4-flash-max\", \"research X and report the top 3 findings\", { cwd: \"/repo\", " +
-        "mode: \"plan\" }). Unknown option keys reject synchronously. Start-and-don't-await is idiomatic: " +
-        "`const research = agent(...)` returns immediately and keeps running server-side; await it in a later " +
-        "eval. Handles carry followUp / steer / cancel. checkpoint(question) parks a promise for a human answer, " +
-        "resolved by checkpoint.answer(id, value) in a later eval. parallel, pipeline, verify, judgePanel, gate, " +
-        "retry, loopUntilDry, and sleep(ms) round out the guest library. Introspection is in-band: workspace() " +
-        "returns { bindings, inFlight, checkpoints, diagnostics }; agents() lists live agents with their call " +
-        "ids and states; reset() tears the workspace down. `_` holds the previous eval's completion value. No " +
-        "fs, no net, no timers beyond sleep. Subagents (6 concurrent per workspace) take stable ids c1, c2, … " +
-        "used by interrupt and reported by agents(). " +
+        "unknown option keys reject synchronously. Start-and-don't-await is idiomatic: `const research = " +
+        "agent(\"pi/deepseek-v4-flash-max\", \"research X and report the top 3 findings\", { cwd: \"/repo\", " +
+        "mode: \"plan\" })` returns immediately and keeps running server-side; await it in a later eval. Handles " +
+        "carry followUp / steer / cancel. checkpoint(question) parks a promise for a human answer, resolved by " +
+        "checkpoint.answer(id, value) in a later eval. parallel, pipeline, verify, judgePanel, gate, retry, " +
+        "loopUntilDry, and sleep(ms) round out the guest library. Introspection is in-band: workspace() returns " +
+        "{ bindings, inFlight, checkpoints, diagnostics }; agents() lists live agents with their call ids and " +
+        "states; reset() tears the workspace down. `_` holds the previous eval's completion value. No fs, no " +
+        "net, no timers beyond sleep. Subagents (6 concurrent per workspace) take stable ids c1, c2, … used by " +
+        "interrupt and reported by agents(). " +
         // The soft-bound eval loop.
         "eval { code } runs the code, then HOLDS THE CALL OPEN pumping settlements up to a soft bound (default " +
         "60 000 ms; per-call timeoutMs override; hard cap 120 000 ms). If everything the code waits on settles " +
@@ -510,21 +512,19 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         syncReplStateAfterOp(state);
         throw error;
       }
-      // §6.1/§6.2: the pending notices are taken BEFORE the post-op
-      // state sync — an eval whose guest code called reset() disposes
-      // the broker and the sync tears the store down, but the
-      // refused-snapshot/loss notice must still lead THIS eval's output
-      // (and the renamed `.refused-*` file survives the store reset —
-      // §6.1 [C]13). Consumed-on-render: a later eval never repeats
-      // them.
-      const notices = takeNotices(state);
+      // A reset-owning eval disposes the broker and the post-op sync
+      // tears the store down; the eval result may still need to render
+      // below (the renamed `.refused-*` file survives the store reset —
+      // §6.1 [C]13).
       syncReplStateAfterOp(state);
       const outputLines = [...evalOutcome.output];
+      let finalResult: string | undefined;
+      let finalRunning: string[] | undefined;
       if (evalOutcome.kind !== "pending") {
         // Finished in-eval: a value (its repr in `result`) or an error
         // (the §4.6 rendering in `output`). Nothing the code waits on
         // remains — the finished shape ships immediately.
-        let result = evalOutcome.result;
+        finalResult = evalOutcome.result;
         if (input.code === "") {
           // The empty eval IS the documented idempotent poll (§3.1
           // [C]3): its own completion is the guest `undefined` (repr
@@ -539,77 +539,94 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           if (swept !== undefined) {
             state.timedOutEvalTokens.delete(swept.token);
             if (swept.kind === "value" && swept.result !== undefined) {
-              result = swept.result;
+              finalResult = swept.result;
             }
           }
         }
-        return evalResult(outputLines, result, undefined, notices);
-      }
-      // Suspended: hold the call open pumping settlements up to the
-      // bound. Each wait is passed the ids KNOWN to be pending at ITS
-      // entry (the eval's own suspension surface first, then each
-      // wait's last pending read), so a continuation that dispatches
-      // more calls is chased within the same call; a suspended eval
-      // awaiting nothing pumpable by call ids (a checkpoint, a sleep,
-      // a local promise) is re-polled on a short gap so host-timer
-      // settlements still resolve in-call. The wait's token-keyed seam
-      // reports exactly THIS eval's completion. Passing the KNOWN ids
-      // (never the ids-omitted form) also keeps the still-running shape
-      // honest under chain contention: a concurrent serialized
-      // operation that holds the broker through the whole remaining
-      // bound makes the broker's pending surface UNREADABLE (it would
-      // read empty) — the known in-flight ids stay reported, never
-      // replaced by an empty guess (§3.1 [D]3/[C]1).
-      let lastRunning = evalOutcome.pending;
-      for (;;) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
-        let waitResult: Awaited<ReturnType<Broker["waitForCalls"]>>["result"];
-        let drained: boolean;
-        try {
-          const waited = await broker.waitForCalls(lastRunning, remaining, evalOutcome.evalToken);
-          waitResult = waited.result;
-          drained = waited.drained;
-        } catch (error) {
-          // A concurrent reset tore the broker down mid-hold — clear the
-          // state so the next touch re-creates, and surface the honest
-          // failure.
-          syncReplStateAfterOp(state);
-          throw error;
-        }
-        outputLines.push(...waitResult.output);
-        lastRunning = waitResult.pending;
-        if (syncReplStateAfterOp(state) && waitResult.kind === "pending") {
-          // A reset() tore the workspace down mid-hold (this eval's own
-          // reset completed — or a concurrent client's): the workspace
-          // is gone; report the honest still-running shape and let the
-          // next touch re-create.
-          break;
-        }
-        if (waitResult.kind !== "pending") {
-          // The eval's continuation completed during the pumps — the
-          // finished shape with its completion repr (or the late error
-          // rendering already in the output lines).
-          return evalResult(outputLines, waitResult.result, undefined, notices);
-        }
-        if (Date.now() >= deadline) break;
-        if (waitResult.pending.length === 0 || !drained) {
-          await new Promise((resolve) => setTimeout(resolve, Math.min(REPL_EVAL_POLL_GAP_MS, deadline - Date.now())));
+      } else {
+        // Suspended: hold the call open pumping settlements up to the
+        // bound. Each wait is passed the ids KNOWN to be pending at ITS
+        // entry (the eval's own suspension surface first, then each
+        // wait's last pending read), so a continuation that dispatches
+        // more calls is chased within the same call; a suspended eval
+        // awaiting nothing pumpable by call ids (a checkpoint, a sleep,
+        // a local promise) is re-polled on a short gap so host-timer
+        // settlements still resolve in-call. The wait's token-keyed seam
+        // reports exactly THIS eval's completion. Passing the KNOWN ids
+        // (never the ids-omitted form) also keeps the still-running shape
+        // honest under chain contention: a concurrent serialized
+        // operation that holds the broker through the whole remaining
+        // bound makes the broker's pending surface UNREADABLE (it would
+        // read empty) — the known in-flight ids stay reported, never
+        // replaced by an empty guess (§3.1 [D]3/[C]1).
+        let lastRunning = evalOutcome.pending;
+        let finished = false;
+        for (;;) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          let waitResult: Awaited<ReturnType<Broker["waitForCalls"]>>["result"];
+          let drained: boolean;
+          try {
+            const waited = await broker.waitForCalls(lastRunning, remaining, evalOutcome.evalToken);
+            waitResult = waited.result;
+            drained = waited.drained;
+          } catch (error) {
+            // A concurrent reset tore the broker down mid-hold — clear the
+            // state so the next touch re-creates, and surface the honest
+            // failure. The pending §6.1/§6.2 notices are NOT taken yet
+            // (they are consumed only when a result that carries them is
+            // actually returned — review finding): they stay on the state
+            // so the next successful eval still leads with them.
+            syncReplStateAfterOp(state);
+            throw error;
+          }
+          outputLines.push(...waitResult.output);
+          lastRunning = waitResult.pending;
+          if (syncReplStateAfterOp(state) && waitResult.kind === "pending") {
+            // A reset() tore the workspace down mid-hold (this eval's own
+            // reset completed — or a concurrent client's): the workspace
+            // is gone; report the honest still-running shape and let the
+            // next touch re-create.
+            break;
+          }
+          if (waitResult.kind !== "pending") {
+            // The eval's continuation completed during the pumps — the
+            // finished shape with its completion repr (or the late error
+            // rendering already in the output lines).
+            finalResult = waitResult.result;
+            finished = true;
+            break;
+          }
           if (Date.now() >= deadline) break;
+          if (waitResult.pending.length === 0 || !drained) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(REPL_EVAL_POLL_GAP_MS, deadline - Date.now())));
+            if (Date.now() >= deadline) break;
+          }
+          // `drained` with pending ids left: the continuation dispatched
+          // more calls — chase them within the remaining bound.
         }
-        // `drained` with pending ids left: the continuation dispatched
-        // more calls — chase them within the remaining bound.
+        if (!finished) {
+          // The bound elapsed first: the honest still-running shape. The
+          // eval continues server-side; any later eval (including `""`)
+          // drains what settled. Its continuation token joins the poll
+          // seam: when the eval settles later, a subsequent empty eval
+          // claims the swept settlement under this token and reports the
+          // late completion value as ITS `result` (§3.1 [C]3).
+          if (evalOutcome.evalToken !== undefined) {
+            state.timedOutEvalTokens.add(evalOutcome.evalToken);
+          }
+          finalRunning = lastRunning;
+        }
       }
-      // The bound elapsed first: the honest still-running shape. The
-      // eval continues server-side; any later eval (including `""`)
-      // drains what settled. Its continuation token joins the poll
-      // seam: when the eval settles later, a subsequent empty eval
-      // claims the swept settlement under this token and reports the
-      // late completion value as ITS `result` (§3.1 [C]3).
-      if (evalOutcome.evalToken !== undefined) {
-        state.timedOutEvalTokens.add(evalOutcome.evalToken);
-      }
-      return evalResult(outputLines, undefined, lastRunning, notices);
+      // §6.1/§6.2: the pending notices are consumed ONLY here, at the
+      // single point a result that carries them is built — a
+      // `waitForCalls` failure (or any other throwing path) above
+      // renders NO eval result, so the notices stay on the state and
+      // the NEXT successful eval still leads with them (review
+      // finding: taking them before the held settlement pump lost them
+      // on the pump's throwing path).
+      const notices = takeNotices(state);
+      return evalResult(outputLines, finalResult, finalRunning, notices);
     },
   );
 }
@@ -662,10 +679,7 @@ async function handleInterrupt(
           {
             type: "text",
             text:
-              `workspace ${projectDir}: no running eval to interrupt — no eval is in flight, the ` +
-              `in-flight evals await nothing this host can key an execution to (a never-settling local ` +
-              `promise — no pending host call's settlement can ever resume it), or the resident guest ` +
-              `library predates the continuation-lease seam (a restored older snapshot); nothing was armed`,
+              `workspace ${projectDir}: no running eval to interrupt — no eval is in flight; nothing was armed`,
           },
         ],
       };
@@ -678,9 +692,10 @@ async function handleInterrupt(
         {
           type: "text",
           text:
-            `workspace ${projectDir}: interrupting the running eval — the eval-break signal is set; ` +
-            `the eval's next execution (a settlement drain resuming its continuation, or a direct eval's drain) ` +
-            `is broken mid-run by the quickjs interrupt handler`,
+            `workspace ${projectDir}: interrupting the running eval — the eval-break signal is set and the eval's next ` +
+            `execution (a settlement drain resuming its continuation, or a direct eval's drain) is broken mid-run by the ` +
+            `quickjs interrupt handler; an eval suspended on nothing resumable (a never-settling local promise) is ` +
+            `terminated outright — its tracked continuation is released immediately`,
         },
       ],
     };

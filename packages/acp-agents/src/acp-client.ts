@@ -739,11 +739,17 @@ class SessionState {
 
   /** The founding turn's assistant text: the transcript accumulated after
    *  the last user-message boundary (the outcome text the re-attach arm
-   *  resolves with — identical to `finalMessageText()` exactly when the
-   *  trailing content event is an assistant message, which is the probe's
-   *  completeness condition). */
+   *  resolves with). The §5 chunk joiner applies here exactly like the
+   *  live result fold (`foldedTurnText`): EVERY assistant message chunk
+   *  joins with `"\n\n"` ([C]12), so a restored/reattached multi-chunk
+   *  reply gains the separator instead of gluing ("…won't modify any
+   *  files.TypeScript files under…"), and narration chunks stay apart
+   *  from answer chunks — completed-while-down and loaded-turn-ended
+   *  results carry the same folded shape the live path records (review
+   *  finding: the restored path used to join with `""`, gluing
+   *  multi-chunk replies before the REPL broker recorded them). */
   loadedTurnText(): string {
-    return this.textChunks.slice(this.loadedTurnStartIndex).join('');
+    return this.textChunks.slice(this.loadedTurnStartIndex).join("\n\n");
   }
 
   /** Settle every deferred permission still parked on this session. Used by release/cancel/death

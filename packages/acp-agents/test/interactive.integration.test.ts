@@ -477,7 +477,7 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
     assert.equal(settled, undefined, "the seam must not settle a quiet gap for a running turn");
     assert.equal(rejected, undefined, "the seam must not reject while the turn is still running");
     await wait;
-    assert.deepEqual(settled, { stopReason: "end_turn", text: "partial result C" }, "the seam settles from the authoritative ended notification — the turn's REAL accumulated text");
+    assert.deepEqual(settled, { stopReason: "end_turn", text: "partial \n\nresult C" }, "the seam settles from the authoritative ended notification — the turn's REAL accumulated text, folded with the §5 chunk joiner (every chunk gains the separator, exactly like the live result fold)");
     await loaded2.release();
 
     // 3) Never terminal: the backend's query answers `interrupted` (no turn running —
@@ -759,5 +759,68 @@ test("awaitCurrentTurn on a loaded session: the _session/loaded_turn extension m
     else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
     if (prevObserve === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS;
     else process.env.AGENTPRISM_ACP_LOADED_TURN_OBSERVE_MS = prevObserve;
+  }
+});
+
+test("§5 [C]12 chunk joiner on the RESTORED path: a multi-chunk loaded turn folds with \"\\n\\n\" exactly like the live result fold — completed-while-down AND loaded-turn-ended results never glue chunks (the review defect: `loadedTurnText()` joined with \"\", so a restored multi-chunk reply was glued before the REPL broker recorded it)", async () => {
+  // The ended-notification wait's loser timer rides the max-wait knob
+  // (default 15 min — it would keep the test process alive); bound it
+  // like the awaitCurrentTurn suite does.
+  const prevMax = process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+  process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = "400";
+  try {
+  // 1) Completed-while-down with TWO assistant messages in the replay
+  //    (narration + answer): the restored result applies the §5 chunk
+  //    joiner — "…won't modify any files.TypeScript files…" can never
+  //    reach the broker's recorded result.
+  const { cwd } = harness.configure<LogEntry>({
+    loadSessionSupport: true,
+    loadSession: {
+      loadedTurn: { status: "completed" },
+      replay: [
+        { role: "user", text: "task" },
+        { role: "assistant", text: "I won't modify any files." },
+        { role: "assistant", text: "TypeScript files under src/ stay untouched." },
+      ],
+    },
+  });
+  const runner = harness.makeRunner();
+  const loaded = await runner.loadSession({ sessionId: "fake-session-any", cwd, model: "claude" });
+  const turn = await loaded.awaitCurrentTurn();
+  assert.deepEqual(turn, {
+    stopReason: "end_turn",
+    text: "I won't modify any files.\n\nTypeScript files under src/ stay untouched.",
+  }, "the completed-while-down result folds every assistant chunk with \"\\n\\n\"");
+  await loaded.release();
+
+  // 2) The loaded-turn-ENDED path (a turn running at load that ends
+  //    later): the replayed chunks and the live continuation chunks
+  //    fold with the same joiner — the ended-notification result is
+  //    never glued.
+  const { cwd: cwd2 } = harness.configure<LogEntry>({
+    loadSessionSupport: true,
+    loadSession: {
+      loadedTurn: { status: "running" },
+      replay: [
+        { role: "user", text: "task" },
+        { role: "assistant", text: "Analysis done." },
+      ],
+      continue: [
+        { afterMs: 60, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Here is the final answer." } } },
+      ],
+      turnEnded: { afterMs: 120, stopReason: "end_turn" },
+    },
+  });
+  const runner2 = harness.makeRunner();
+  const loaded2 = await runner2.loadSession({ sessionId: "fake-session-any", cwd: cwd2, model: "claude" });
+  const turn2 = await loaded2.awaitCurrentTurn();
+  assert.deepEqual(turn2, {
+    stopReason: "end_turn",
+    text: "Analysis done.\n\nHere is the final answer.",
+  }, "the loaded-turn-ended result folds the replayed and continued chunks with \"\\n\\n\"");
+  await loaded2.release();
+  } finally {
+    if (prevMax === undefined) delete process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS;
+    else process.env.AGENTPRISM_ACP_LOADED_TURN_MAX_WAIT_MS = prevMax;
   }
 });

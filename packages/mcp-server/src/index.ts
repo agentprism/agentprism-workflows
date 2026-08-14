@@ -57,6 +57,7 @@ export {
   ensureReplWorkspace,
   disposeReplProjectState,
   resetReplProjectState,
+  renameAsideNeverOverwriting,
 } from "./repl-project.js";
 export type { ReplProjectState } from "./repl-project.js";
 export { ReplPresenceLedger } from "./repl-presence.js";
