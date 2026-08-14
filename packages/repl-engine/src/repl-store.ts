@@ -68,6 +68,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   writeSync,
@@ -314,13 +315,23 @@ export class ReplWorkspaceStore {
   }
 
   /**
-   * Teardown the store: close the call store and delete the whole
-   * `repl/` directory (the `reset` tool's engine-side — the workspace's
-   * VM and stored state are dropped together).
+   * Teardown the store: close the call store and delete the `repl/`
+   * directory's contents (the `reset()` guest function's engine-side —
+   * the workspace's VM and stored state are dropped together).
+   * §6.1 [C]13: a REFUSED snapshot renamed aside
+   * (`snapshot.bin.refused-<ts>`) is NEVER deleted — auto-reset must
+   * not be silent data destruction — so the whole-directory wipe is
+   * entry-wise and PRESERVES the renamed-aside files (a `reset()`
+   * after an auto-reset keeps the refused snapshot for inspection).
    */
   reset(): void {
     this.close();
-    rmSync(this.replDir, { recursive: true, force: true });
+    if (existsSync(this.replDir)) {
+      for (const entry of readdirSync(this.replDir)) {
+        if (entry.startsWith(`${SNAPSHOT_FILENAME}.refused-`)) continue;
+        rmSync(join(this.replDir, entry), { recursive: true, force: true });
+      }
+    }
     this.snapshotWriteCount = 0;
   }
 

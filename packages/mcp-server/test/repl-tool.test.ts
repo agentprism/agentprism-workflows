@@ -274,6 +274,31 @@ test("the output shape models finished and still-running EXACTLY: result and run
   assert.equal(resultOnlyNoOutput.success, false, "the output string is required on every eval variant");
   const runningWithInterrupt = replToolOutputShape.safeParse({ output: "", running: ["c1"], interrupt: { outcome: "idle" } });
   assert.equal(runningWithInterrupt.success, false, "an eval variant never carries the interrupt outcome");
+  // The error variant carries EXACTLY the bare error key: `error`+
+  // `result` and `error`+`running` are invalid, exactly like the
+  // runtime shapes (§3.1 [C]1 — the published schema mirrors the
+  // runtime validator).
+  const errOnly = replToolOutputShape.safeParse({ error: "boom" });
+  assert.equal(errOnly.success, true, "the bare error variant");
+  const errResult = replToolOutputShape.safeParse({ error: "boom", result: "x" });
+  assert.equal(errResult.success, false, "error+result is never a valid result");
+  const errRunning = replToolOutputShape.safeParse({ error: "boom", running: ["c1"] });
+  assert.equal(errRunning.success, false, "error+running is never a valid result");
+  const errOutput = replToolOutputShape.safeParse({ error: "boom", output: "" });
+  assert.equal(errOutput.success, false, "error+output is never a valid result");
+  // The PUBLISHED schema (what the server advertises through
+  // `outputSchema`) mirrors the same rule: the error oneOf branch
+  // excludes every other key.
+  const published = replToolOutputShape.toJSONSchema();
+  const publishedError = (
+    published.oneOf as Array<{ title?: string; not?: { anyOf?: Array<{ required?: string[] }> } }>
+  ).find((branch) => branch.title === "error");
+  const excluded = (publishedError?.not?.anyOf ?? []).map((item) => item.required?.[0] ?? "");
+  assert.deepEqual(
+    excluded.sort(),
+    ["interrupt", "output", "result", "running"],
+    "the published error branch excludes output, interrupt, result AND running",
+  );
 });
 
 test("the soft-bound eval: everything the code waits on settles within the bound → the FINISHED shape in ONE call (the v1 eval→wait→eval loop fused)", async () => {
@@ -376,6 +401,58 @@ test("the empty-eval poll picks up the LATE COMPLETION VALUE of an eval that exc
     const again = await repl(connected, { action: "eval", projectDir: PROJECT, code: "" });
     assert.equal(structuredOf(again).output, "", "the second poll drains nothing new");
     assert.equal(structuredOf(again).result, "undefined", "no late settlement left — the poll's own undefined");
+  } finally {
+    await connected.dispose();
+  }
+});
+
+test("the fused pump reports the FINISHED shape the moment the eval's own work settles — an unrelated long-running call from an earlier eval never holds the finished shape to the bound", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const connected = await connectWithRepl(runner);
+  try {
+    // An unrelated call started by an EARLIER eval (start-and-don't-await)
+    // stays in flight for the whole test.
+    const started = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const slow = agent("pi/x", "long research"); "started"',
+    });
+    assert.ok(!isErrorResult(started), textOf(started));
+    for (let attempt = 0; attempt < 100 && runner.sessions.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runner.sessions.length, 1, "the unrelated session opened");
+    // THIS eval awaits its OWN call under a long bound. Only its own
+    // call settles — the held call must return the finished shape
+    // promptly, not pump until the unrelated call drains.
+    const heldStartedAt = Date.now();
+    const held = repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "my task"); const answer = await p; "mine:" + answer',
+      timeoutMs: 5000,
+    });
+    for (let attempt = 0; attempt < 100 && runner.sessions.length < 2; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(runner.sessions.length, 2, "the eval's own session opened");
+    runner.last().completeTurn("my answer");
+    const r = await held;
+    assert.ok(!isErrorResult(r), textOf(r));
+    const sc = structuredOf(r);
+    assert.deepEqual(Object.keys(sc).sort(), ["output", "result"], "the finished shape — never the still-running shape");
+    assert.equal(sc.result, "mine:my answer", "the completion value's repr");
+    assert.ok(
+      Date.now() - heldStartedAt < 2000,
+      `the finished shape returned promptly (${Date.now() - heldStartedAt} ms), not at the 5 s bound`,
+    );
+    // The unrelated call was untouched — still in flight, and it still
+    // settles normally later.
+    assert.equal(runner.sessions.length, 2, "no cancel/reissue of the unrelated call");
+    runner.sessions[0].completeTurn("slow result");
+    const slowRead = await repl(connected, { action: "eval", projectDir: PROJECT, code: "await slow" });
+    assert.equal(structuredOf(slowRead).result, "slow result", "the unrelated call settled normally");
   } finally {
     await connected.dispose();
   }
@@ -518,6 +595,18 @@ test("a pending call with a recorded backend session re-attaches on restore thro
     const r = await repl(second, { action: "eval", projectDir: PROJECT, code: 'await p.catch((e) => "ERR:" + e.message)' });
     assert.ok(!isErrorResult(r), textOf(r));
     assert.ok(structuredOf(r).result!.includes("loaded result"), textOf(r));
+    // §6.2: the reconcile surfacing DEMOTES to diagnostics — the eval
+    // output carries NO per-call reconciliation lines (only the [C]14
+    // aggregate loss notice may ride an eval's output).
+    assert.equal(structuredOf(r).output, "", "no re-attach line rides the eval output");
+    const notes = (await evalJson(second, PROJECT, "workspace().diagnostics.reconcileNotes")) as Array<{
+      level: string;
+      line: string;
+    }>;
+    assert.ok(
+      notes.some((n) => n.level === "info" && n.line.includes("c1") && n.line.includes("re-attached")),
+      JSON.stringify(notes),
+    );
     const diag = (await evalJson(second, PROJECT, "workspace().diagnostics")) as {
       reconcile: { reattached: string[] } | null;
     };
@@ -611,6 +700,105 @@ test("a STRUCTURALLY VALID corrupted snapshot (a corrupted in-range VM header th
     const entries = readdirSync(replDir);
     assert.equal(entries.filter((name) => name.startsWith("snapshot.bin.refused-")).length, 1, `renamed aside: ${entries.join(", ")}`);
     assert.equal(sc.result, "2", "the fresh workspace evaluated");
+  } finally {
+    await second.dispose();
+  }
+});
+
+test("§6.1 [C]13: the auto-reset notice survives a reset() IN THE SAME FIRST EVAL — the notice still leads the output and the renamed-aside refused snapshot is never deleted", async () => {
+  const PROJECT = freshProject();
+  const first = await connectWithRepl(new FakeRunner());
+  try {
+    await repl(first, { action: "eval", projectDir: PROJECT, code: "globalThis.doomed = 1" });
+  } finally {
+    await first.dispose();
+  }
+  const { snapshotPath, replDir } = replStorePaths(PROJECT);
+  assert.ok(existsSync(snapshotPath));
+  const bytes = readFileSync(snapshotPath);
+  writeFileSync(snapshotPath, bytes.subarray(0, Math.floor(bytes.length / 2)));
+
+  // The FIRST eval after the refused-snapshot auto-reset runs guest
+  // reset(): the teardown must not erase the pending notice or the
+  // renamed-aside file (the review finding).
+  const second = await connectWithRepl(new FakeRunner());
+  try {
+    const r = await repl(second, { action: "eval", projectDir: PROJECT, code: "reset()" });
+    assert.ok(!isErrorResult(r), textOf(r));
+    const sc = structuredOf(r);
+    const output = sc.output as string;
+    assert.ok(
+      output.startsWith("REPL workspace auto-reset:"),
+      `the notice leads the output despite the reset(): ${output.slice(0, 120)}`,
+    );
+    const refused = readdirSync(replDir).filter((name) => name.startsWith("snapshot.bin.refused-"));
+    assert.equal(
+      refused.length,
+      1,
+      `the renamed-aside refused snapshot survives the reset(): ${readdirSync(replDir).join(", ")}`,
+    );
+    assert.ok(output.includes(refused[0]), `the notice names the renamed file: ${output}`);
+    // The reset tore the workspace down — the next eval starts fresh,
+    // the notice was consumed exactly once, and the refused file
+    // persists even across the fresh workspace's re-persisting.
+    const fresh = await repl(second, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
+    assert.equal(structuredOf(fresh).result, "42", "the fresh workspace works");
+    assert.equal(structuredOf(fresh).output, "", "the notice was consumed exactly once");
+    assert.equal(
+      readdirSync(replDir).filter((name) => name.startsWith("snapshot.bin.refused-")).length,
+      1,
+      "the refused snapshot is still renamed aside — never deleted",
+    );
+  } finally {
+    await second.dispose();
+  }
+});
+
+test("§6.2 [C]14: a restore that LOST calls leads the next eval's output with the ONE aggregate notice — the per-call reconcile lines stay in diagnostics", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const first = await connectWithRepl(runner);
+  try {
+    await repl(first, { action: "eval", projectDir: PROJECT, code: 'const pi = agent("pi/x", "task"); "started"' });
+    for (let attempt = 0; attempt < 100 && runner.sessions.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // A steer whose wire call is in flight when the daemon dies: its
+    // outcome is unknowable, so the restore settles it `failed` (lost).
+    const steered = await repl(first, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'await pi.steer("deeper")',
+      timeoutMs: 200,
+    });
+    assert.ok(!isErrorResult(steered), textOf(steered));
+    assert.ok("running" in structuredOf(steered), "the steer eval suspended (still-running)");
+  } finally {
+    await first.dispose();
+  }
+
+  const second = await connectWithRepl(new FakeRunner());
+  try {
+    const r = await repl(second, { action: "eval", projectDir: PROJECT, code: "1 + 1" });
+    assert.ok(!isErrorResult(r), textOf(r));
+    const output = structuredOf(r).output as string;
+    assert.ok(
+      output.startsWith("restore lost 1 call(s) (c2)"),
+      `the aggregate loss notice leads the output: ${output.slice(0, 200)}`,
+    );
+    // ONLY the aggregate notice rides the output — the per-call
+    // lost-steer line stays in diagnostics (§6.2 [C]14).
+    assert.equal(output.split("\n").length, 1, "exactly the one aggregate notice line");
+    assert.ok(!output.includes("steer c2:"), "no per-call reconcile line rides the output");
+    const notes = (await evalJson(second, PROJECT, "workspace().diagnostics.reconcileNotes")) as Array<{
+      level: string;
+      line: string;
+    }>;
+    assert.ok(
+      notes.some((n) => n.level === "warn" && n.line.includes("c2") && n.line.includes("unknowable")),
+      JSON.stringify(notes),
+    );
+    assert.equal(structuredOf(r).result, "2", "the eval itself ran normally");
   } finally {
     await second.dispose();
   }

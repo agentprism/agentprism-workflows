@@ -1170,6 +1170,14 @@ export class Broker {
   /** The retained last reconcile summary (workspace().diagnostics —
    *  the §6.2 demotion). */
   private lastReconcileReport: ReconcileReport | null = null;
+  /** The retained per-call reconciliation lines (§6.2): the re-attach /
+   *  re-issue / refusal / lost-steer surfacing v1 wrote into the
+   *  console buffer demotes to workspace().diagnostics with the
+   *  reconcile summary — ordinary reconciliation is diagnostics-only,
+   *  and the eval result surface carries ONLY the [C]14 aggregate loss
+   *  notice (never per-call reconciliation lines). Replaced at each
+   *  reconcile. */
+  private reconcileNotes: { level: 'info' | 'warn'; line: string; atMs: number }[] = [];
   /** The fused-eval seam: settlements of suspended evals swept during
    *  the pumps of the CURRENT operation, keyed by the settled eval's
    *  continuation token (`e<N>`). A wait's render reads its caller's
@@ -1654,6 +1662,9 @@ export class Broker {
         leftPending: [],
         reQueuedUndelivered: [],
       };
+      // §6.2: this reconcile's per-call surfacing lines are retained
+      // under diagnostics (replaced per reconcile, like the summary).
+      this.reconcileNotes = [];
       let changedVm = false;
       for (const entry of surface.pending()) {
         const record = this.callStore.lookup(entry.id);
@@ -1917,7 +1928,7 @@ export class Broker {
         if (entry === undefined) {
           this.followUpTurns.delete(steerCallId);
           this.callStore.recordDelivery(steerCallId, 'dropped', now());
-          this.warnLine(
+          this.reconcileNote(
             'warn',
             `followUp ${steerCallId} (on ${sessionId}): the founding session could not be re-attached — failed`, // eslint-disable-line max-len
           );
@@ -2065,7 +2076,7 @@ export class Broker {
           // immediately, and the call stays pending in the guest
           // (leftPending — the state owning it is being torn down anyway;
           // it is never settled from a quiet gap and never re-issued).
-          this.warnLine(
+          this.reconcileNote(
             'info',
             `call ${entry.id}: restore re-attach of backend session ${sessionId} landed after the broker ` +
               `was disposed — the child was closed without registering`, // eslint-disable-line max-len
@@ -2228,7 +2239,7 @@ export class Broker {
     this.agentSlots.add(entry.id);
     this.registerQueuedTurns(sessionEntry);
     this.drained = false; // children are warm again
-    this.warnLine('info', `call ${entry.id}: re-attached to backend session ${session.sessionId}`);
+    this.reconcileNote('info', `call ${entry.id}: re-attached to backend session ${session.sessionId}`);
     const taskPromise = this.runReattachedTask(entry.id, sessionEntry, parsed);
     this.trackInFlight(entry.id, 'agent', taskPromise);
   }
@@ -2319,7 +2330,7 @@ export class Broker {
           // built-ins authoritatively, and re-issue is reserved for the
           // observably-dead classes below).
           if (error.rearmable === false) {
-            this.warnLine(
+            this.reconcileNote(
               'warn',
               `call ${callId}: ${toRejectionValue(error).message} — the seam can never observe the terminal state; ` +
                 `the loaded session stays attached and the call settles on a cancel, the backend's ended ` +
@@ -2327,7 +2338,7 @@ export class Broker {
             );
             return this.waitForNonRearmableSettlement(callId, entry, parsed);
           }
-          this.warnLine('warn', `call ${callId}: ${toRejectionValue(error).message} — re-armed on the attached session`);
+          this.reconcileNote('warn', `call ${callId}: ${toRejectionValue(error).message} — re-armed on the attached session`);
           return this.runReattachedTask(callId, entry, parsed);
         }
         if (isLoadedTurnFailedError(error)) {
@@ -2344,7 +2355,7 @@ export class Broker {
           // call DURABLY at its bound (recorded AGENT_CANCELLED,
           // guest-settled), and a disposed broker's state is being torn
           // down. Surfaced guest-visibly.
-          this.warnLine(
+          this.reconcileNote(
             'warn',
             `call ${callId}: ${toRejectionValue(error).message} — the broker is draining; the call stays ` +
               `pending (never re-issued after the last client disconnected)`, // eslint-disable-line max-len
@@ -2420,7 +2431,7 @@ export class Broker {
         // about to settle) the call durably at the bound — never a
         // re-issue after the last client disconnected, and never a
         // settlement from a torn-down state.
-        this.warnLine(
+        this.reconcileNote(
           'warn',
           `call ${callId}: the held re-attach's settlement wait was cut off by the client-presence drain (or ` +
             `the broker was disposed) — the call stays as the drain/disposal left it`, // eslint-disable-line max-len
@@ -2545,7 +2556,7 @@ export class Broker {
     // would open a fresh child after the last client disconnected (or
     // on a torn-down broker) — the call stays as the drain left it.
     if (this.draining || this.disposed || this.generation !== generation) {
-      this.warnLine(
+      this.reconcileNote(
         'warn',
         `call ${callId}: ${toRejectionValue(error).message} — the loaded session's release outlived the ` +
           `client-presence drain (or the broker was disposed); the call stays as the drain/disposal left it, ` +
@@ -2559,7 +2570,7 @@ export class Broker {
       entry.queue = [];
     }
     this.callStore.recordReissued(callId, now());
-    this.warnLine(
+    this.reconcileNote(
       'warn',
       `call ${callId}: re-attached session ${entry.session.sessionId} released (${toRejectionValue(error).message}) — re-issued`, // eslint-disable-line max-len
     );
@@ -2843,7 +2854,7 @@ export class Broker {
   ): void {
     this.callStore.recordReissued(entry.id, now());
     this.agentSlots.add(entry.id);
-    this.warnLine('warn', `call ${entry.id}: ${reason} — re-issued`);
+    this.reconcileNote('warn', `call ${entry.id}: ${reason} — re-issued`);
     // The re-issue opens a fresh session: the opening-call registry covers
     // it like any dispatch (the drain waits for opens, not just sessions).
     this.openingCalls.add(entry.id);
@@ -2871,7 +2882,7 @@ export class Broker {
     const value = toRejectionValue(error);
     this.recordCompletion(entry.id, { outcome: 'reject', value, completedAtMs: now() });
     const newlySettled = this.settleIntoGuest(entry.id, 'reject', value);
-    this.warnLine('warn', `call ${entry.id}: ${warn}`);
+    this.reconcileNote('warn', `call ${entry.id}: ${warn}`);
     return newlySettled;
   }
 
@@ -2887,7 +2898,7 @@ export class Broker {
       completedAtMs: now(),
     });
     const newlySettled = this.settleIntoGuest(entry.id, 'resolve', 'failed');
-    this.warnLine(
+    this.reconcileNote(
       'warn',
       `steer ${entry.id}: was in flight when the process died; its outcome is unknowable — failed`,
     );
@@ -2952,10 +2963,20 @@ export class Broker {
     return this.inFlight.has(callId) || this.sessions.has(callId) || this.deferreds.has(callId);
   }
 
-  /** A broker-authored console line (the restore path's guest-visible
-   *  surfacing): rendered in the next tool result with its level prefix. */
+  /** A broker-authored console line (live-operation surfacing):
+   *  rendered in the next tool result with its level prefix. */
   private warnLine(level: 'info' | 'warn', message: string): void {
     this.consoleBuffer.push({ level, line: message });
+  }
+
+  /** A restore/reconcile-machinery line (§6.2): the re-attach /
+   *  re-issue / refusal / lost-steer surfacing — retained under
+   *  workspace().diagnostics.reconcileNotes with the reconcile summary,
+   *  NEVER pushed into the console buffer. Ordinary reconciliation is
+   *  diagnostics-only; only the [C]14 LOSS cases surface in the eval
+   *  output, as the tool's single aggregate notice. */
+  private reconcileNote(level: 'info' | 'warn', message: string): void {
+    this.reconcileNotes.push({ level, line: message, atMs: now() });
   }
 
   /** Cancel a dispatch QUEUED above the concurrency cap (§4.1's
@@ -3669,6 +3690,7 @@ this.evalBreakArmed = false;
       })),
       diagnostics: {
         reconcile: this.lastReconcileReport,
+        reconcileNotes: this.reconcileNotes,
         drainError: this.retainedDrainError,
         childrenClosed: this.drained,
       },
@@ -3736,7 +3758,13 @@ this.evalBreakArmed = false;
    * operations interleaving between pumps, the entry-time set is the
    * only stable "every pending call" reading — a call a concurrent eval
    * dispatches after entry is not waited on; see the phase-E review
-   * rejection round 2 note below). `evalToken` (the suspended eval's
+   * rejection round 2 note below). **The eval-token settlement is the
+   * authoritative "the code's own work settled" signal and SHORT-CIRCUITS
+   * the target set**: the moment THIS eval's continuation completes
+   * during a pump, the wait returns the finished shape — an unrelated
+   * long-running call elsewhere in the workspace (a start-and-don't-await
+   * from an earlier eval) can never hold the finished shape to the bound
+   * (§3.1; review finding).** `evalToken` (the suspended eval's
    * continuation token from its `ReplEvalResult`) attributes the result:
    * when THAT eval's continuation completes during the pumps, the result
    * carries its completion (`kind` `value`/`error`, the §4.4 repr in
@@ -3826,7 +3854,16 @@ this.evalBreakArmed = false;
         const pending = this.pendingIds();
         lastPending = pending;
         const drainedNow = [...targets].every((id) => !pending.includes(id));
-        return drainedNow;
+        // §3.1: THIS eval's own settlement is the authoritative
+        // "everything the code waits on settled" signal — the
+        // token-keyed seam is set when its continuation completes.
+        // When it settles, the wait reports the finished shape
+        // IMMEDIATELY: an unrelated long-running call elsewhere in the
+        // workspace (a start-and-don't-await from an earlier eval)
+        // must never hold the finished shape to the bound (review
+        // finding: the pump captured the WHOLE pending registry and
+        // waited for all of it).
+        return drainedNow || (evalToken !== undefined && this.sweptEvalSettlements.has(evalToken));
       }, deadline);
       if (!pumped.acquired) {
         // The chain was held past the deadline (a long eval): the wait
@@ -3861,7 +3898,14 @@ this.evalBreakArmed = false;
         this.assertAlive();
         const pending = this.pendingIds();
         lastPending = pending;
-        return [...targets].every((id) => !pending.includes(id));
+        // The token short-circuit applies to the re-check too: the
+        // deadline may have tripped in the same window this eval's
+        // continuation settled — the finished shape wins over a stale
+        // "still running".
+        return (
+          [...targets].every((id) => !pending.includes(id)) ||
+          (evalToken !== undefined && this.sweptEvalSettlements.has(evalToken))
+        );
       }, deadline);
       if (recheck.acquired) drained = recheck.value!;
     }

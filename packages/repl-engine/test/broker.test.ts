@@ -472,6 +472,40 @@ test('the fused-eval seam: waitForCalls reports the suspended eval\'s completion
   await ws.dispose();
 });
 
+test('§3.1: the fused pump reports the finished shape the moment THIS eval settles — an unrelated long-running call elsewhere in the workspace never holds the finished shape to the bound (review finding)', async () => {
+  const { ws, broker, runner } = await setup();
+  // An unrelated long-running call from an EARLIER eval (never awaited)
+  // stays pending for the whole wait.
+  await broker.eval('const slow = agent("pi/x", "long research"); "started"');
+  await tick();
+  assert.equal(runner.sessions.length, 1, 'the unrelated session opened');
+  // THIS eval awaits its own call; the wait pumps with a long bound.
+  const r1 = await broker.eval('const mine = await agent("pi/x", "my task"); "mine:" + mine');
+  assert.equal(r1.kind, 'pending');
+  const waiting = broker.waitForCalls(undefined, 5000, r1.evalToken);
+  await tick();
+  assert.equal(runner.sessions.length, 2, 'the eval\'s own session opened');
+  // Only the eval's own call settles — the unrelated one is still in
+  // flight. The wait must return the finished shape IMMEDIATELY, not
+  // pump until the unrelated call drains (and never to the bound).
+  const startedAt = Date.now();
+  runner.last().completeTurn('my answer');
+  const waited = await waiting;
+  assert.equal(waited.drained, true, 'the wait reported drained');
+  assert.equal(waited.result.kind, 'value', 'the finished shape');
+  assert.equal(waited.result.result, 'mine:my answer');
+  assert.ok(Date.now() - startedAt < 2000, `prompt return: ${Date.now() - startedAt} ms`);
+  // The unrelated call was untouched and is still pending (the wait
+  // did NOT wait for it).
+  assert.deepEqual(waited.result.pending, ['c1'], 'the unrelated call stays in flight');
+  // And it still settles normally afterwards.
+  runner.sessions[0].completeTurn('slow result');
+  await tick();
+  await broker.pump();
+  assert.equal((await broker.eval('await slow')).result, 'slow result');
+  await ws.dispose();
+});
+
 test('a suspended eval continues at settlement like a .then: its output lands in the next tool result', async () => {
   const { ws, broker, runner } = await setup();
   const r1 = await broker.eval('const r = await agent("pi/x", "task"); console.log("got", r); "done:" + r');
@@ -1920,7 +1954,7 @@ test('§4.5: workspace() returns the plain-value shape with the honest failed st
   const w = await broker.eval('const w = workspace(); w.bindings.filter((b) => b.name === "boom" || b.name === "ok").map((b) => b.name + ":" + (b.status ?? "-")).join(",")');
   assert.equal(w.result, 'boom:failed,ok:settled', 'the honest failed status for the rejected handle call');
   const shape = await broker.eval('(() => { const w = workspace(); return JSON.stringify({ keys: Object.keys(w).sort(), diag: Object.keys(w.diagnostics).sort(), empty: w.inFlight.length === 0 }); })()');
-  assert.deepEqual(JSON.parse(shape.result!), { keys: ['bindings', 'checkpoints', 'diagnostics', 'inFlight'], diag: ['childrenClosed', 'drainError', 'reconcile'], empty: true });
+  assert.deepEqual(JSON.parse(shape.result!), { keys: ['bindings', 'checkpoints', 'diagnostics', 'inFlight'], diag: ['childrenClosed', 'drainError', 'reconcile', 'reconcileNotes'], empty: true });
   // agents(): a followUp turn gets its own addressable entry.
   await broker.eval('const o = await ok.followUp("more"); console.log("followup", o); "done"');
   await tick();

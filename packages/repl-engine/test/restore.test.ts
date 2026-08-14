@@ -360,6 +360,15 @@ function output(r: ReplEvalResult): string[] {
   return r.output;
 }
 
+/** §6.2: the re-attach / re-issue / refusal / lost-steer surfacing lines
+ *  demote to workspace().diagnostics.reconcileNotes — read them through
+ *  the guest introspection surface. */
+async function reconcileNotesOf(broker: Broker): Promise<Array<{ level: string; line: string; atMs: number }>> {
+  const r = await broker.eval('JSON.stringify(workspace().diagnostics.reconcileNotes)');
+  assert.equal(r.kind, 'value', 'the diagnostics read resolved');
+  return JSON.parse(r.result ?? '[]') as Array<{ level: string; line: string; atMs: number }>;
+}
+
 /** Dispatch one agent call and wait until its session is open. */
 async function dispatchAgent(broker: Broker, runner: FakeRunner, code = 'const p = agent("pi/x", "task"); "started"') {
   const r = await broker.eval(code);
@@ -430,17 +439,23 @@ test('restore with all three arms: settle-from-store, re-attach, re-issue (mock 
   assert.deepEqual(report.requeuedCheckpoints, []);
   assert.deepEqual(report.leftPending, [], 'the full three-way reconcile leaves nothing pending');
 
-  // Guest-visible surfacing: the re-attach info line and the re-issue
-  // warn line are in the next tool result (before any later eval
-  // consumes the buffer).
+  // Guest-visible surfacing (§6.2): the re-attach info line and the
+  // re-issue warn line leave the eval result surface entirely — they
+  // are retained under workspace().diagnostics.reconcileNotes with the
+  // reconcile summary (only the [C]14 LOSS notice may ride an eval's
+  // output).
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'ordinary reconciliation never rides the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('info: ') && l.includes('c2') && l.includes('re-attached')),
-    output(probe).join('\n'),
+    notes.some((n) => n.level === 'info' && n.line.includes('c2') && n.line.includes('re-attached')),
+    JSON.stringify(notes),
   );
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c3') && l.includes('re-issued') && l.includes('session not found')),
-    output(probe).join('\n'),
+    notes.some(
+      (n) => n.level === 'warn' && n.line.includes('c3') && n.line.includes('re-issued') && n.line.includes('session not found'),
+    ),
+    JSON.stringify(notes),
   );
   assert.equal((await broker2.eval('await a')).result, 'result A', 'the store arm settled c1 exactly once');
 
@@ -499,12 +514,14 @@ test('a custom backend without the loadSession capability degrades through the s
   assert.equal(runner2.loadedWith.length, 1, 'the load WAS attempted — the runner enforces the gate');
   assert.equal(broker2.store().lookup('c1')!.reissues, 1);
 
-  // The re-issued call completes normally; the guest sees the result AND
-  // the capability-degradation warn line.
+  // The re-issued call completes normally; the guest sees the result,
+  // and the capability-degradation line demotes to diagnostics (§6.2).
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('loadSession') && l.includes('re-issued')),
-    output(probe).join('\n'),
+    notes.some((n) => n.line.includes('c1') && n.line.includes('loadSession') && n.line.includes('re-issued')),
+    JSON.stringify(notes),
   );
   runner2.sessions[0].completeTurn('custom backend result');
   await tick();
@@ -531,9 +548,11 @@ test('a session lost at the backend (loadSession fails) degrades to re-issue, su
   const report = await broker2.reconcile();
   assert.deepEqual(report.reissued, ['c1']);
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('not resumable') && l.includes('session not found')),
-    output(probe).join('\n'),
+    notes.some((n) => n.line.includes('not resumable') && n.line.includes('session not found')),
+    JSON.stringify(notes),
   );
   await broker2.dispose();
   ws2.dispose();
@@ -660,7 +679,7 @@ test('a pending checkpoint re-surfaces across the restore: listed again, answera
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a steer whose wire call died with the process resolves the honest failed, with a warn line', async () => {
+test('a steer whose wire call died with the process resolves the honest failed, demoted to diagnostics (§6.2)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-steer-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
@@ -681,9 +700,11 @@ test('a steer whose wire call died with the process resolves the honest failed, 
   assert.deepEqual(report.reattached, ['c1'], 'the founding call re-attaches');
   assert.deepEqual(report.failedLost, ['c2'], 'the in-flight steer settles failed');
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'the lost-steer line demotes to diagnostics — never an eval output line');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c2') && l.includes('unknowable')),
-    output(probe).join('\n'),
+    notes.some((n) => n.level === 'warn' && n.line.includes('c2') && n.line.includes('unknowable')),
+    JSON.stringify(notes),
   );
   // The failed settle is durable: a second restore settles it from the
   // store (never re-failed, never re-injected).
@@ -840,9 +861,11 @@ test('cadence: a reconcile-time invalid-options refusal settles the guest and fi
   assert.deepEqual(report.failedLost, ['c1'], 'the invalid options refused the re-issue');
   assert.deepEqual(kinds, ['settlement'], 'the refusal settled the guest — its drain fired the boundary (review: refusals used to skip the changed-VM settlement boundary)');
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'the refusal line demotes to diagnostics — never an eval output line');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('invalid options')),
-    output(probe).join('\n'),
+    notes.some((n) => n.level === 'warn' && n.line.includes('c1') && n.line.includes('invalid options')),
+    JSON.stringify(notes),
   );
   // The refusal is durable and the guest call rejected (never re-issued).
   assert.equal(broker2.store().lookup('c1')!.completion!.outcome, 'reject');
@@ -1225,17 +1248,18 @@ test('restore through the REAL acp-agents adapter: a founding turn that ended wi
           JSON.stringify(entries),
         );
         assert.ok(entries.some((e) => e.method === 'newSession'), 'the re-issue opened a fresh session');
-        // The degradation is surfaced guest-visibly, naming the condition.
+        // The degradation demotes to diagnostics (§6.2), naming the condition.
         const probe = await broker2.eval('"probe"');
+        assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+        const notes = await reconcileNotesOf(broker2);
         assert.ok(
-          output(probe).some(
-            (l) =>
-              l.startsWith('warn: ') &&
-              l.includes('c1') &&
-              l.includes('ended without a terminal assistant message') &&
-              l.includes('re-issued'),
+          notes.some(
+            (n) =>
+              n.line.includes('c1') &&
+              n.line.includes('ended without a terminal assistant message') &&
+              n.line.includes('re-issued'),
           ),
-          output(probe).join('\n'),
+          JSON.stringify(notes),
         );
         // The re-issued call's fresh turn completes and settles the SAME
         // guest promise exactly once.
@@ -1422,15 +1446,16 @@ test('restore through the REAL acp-agents adapter WITHOUT the extension: a repla
           'no extension query — the observation path classifies from the replay + stream',
         );
         const probe = await broker2.eval('"probe"');
+        assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+        const notes = await reconcileNotesOf(broker2);
         assert.ok(
-          output(probe).some(
-            (l) =>
-              l.startsWith('warn: ') &&
-              l.includes('c1') &&
-              l.includes('without a terminal assistant message') &&
-              l.includes('re-issue'),
+          notes.some(
+            (n) =>
+              n.line.includes('c1') &&
+              n.line.includes('without a terminal assistant message') &&
+              n.line.includes('re-issue'),
           ),
-          output(probe).join('\n'),
+          JSON.stringify(notes),
         );
         // The re-issued call's fresh turn completes and settles the SAME
         // guest promise exactly once.
@@ -1682,13 +1707,13 @@ test('a seam rejection degrades to re-issue inside the task: the loaded session 
   assert.equal(runner2.sessions.length, 2, 'a fresh session opened for the re-issue');
   assert.equal(broker2.store().lookup('c1')!.reissues, 1);
   assert.equal(broker2.store().lookup('c1')!.sessionId, runner2.sessions[1].sessionId, 'the re-issue\'s session is the new attach key');
-  // The degradation is surfaced guest-visibly, naming the reason.
+  // The degradation demotes to diagnostics (§6.2), naming the reason.
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some(
-      (l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('re-issued') && l.includes('released'),
-    ),
-    output(probe).join('\n'),
+    notes.some((n) => n.line.includes('c1') && n.line.includes('re-issued') && n.line.includes('released')),
+    JSON.stringify(notes),
   );
   // The re-issued call's fresh turn completes and settles the SAME guest
   // promise exactly once.
@@ -1859,14 +1884,14 @@ test('cadence: an adapter without the completion seam degrades through the doc\'
   assert.deepEqual(report.reissued, ['c1', 'c2'], 'both calls degrade to re-issue — the doc\'s honest fallback for a capability-omitting backend');
   assert.deepEqual(report.failedLost, []);
   assert.equal(runner2.loadedWith.length, 2, 'both sessions loaded — the seam absence is discovered after a successful load');
-  // The degradation is surfaced guest-visibly in the next tool result.
+  // The degradation demotes to diagnostics (§6.2) — never the eval result surface.
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'no reconcile lines leak into the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).filter((l) => l.startsWith('warn: ')).length >= 2 &&
-      output(probe).some(
-        (l) => l.includes('c1') && l.includes('not observable') && l.includes('re-issued'),
-      ),
-    output(probe).join('\n'),
+    notes.filter((n) => n.line.includes('re-issued')).length >= 2 &&
+      notes.some((n) => n.line.includes('c1') && n.line.includes('not observable') && n.line.includes('re-issued')),
+    JSON.stringify(notes),
   );
   assert.equal(runner2.sessions[0].releases, 1, 'c1\'s seam-less loaded session was released before the re-issue');
   assert.equal(runner2.sessions[2].releases, 1, 'c2\'s seam-less loaded session was released before the re-issue');
@@ -1914,9 +1939,10 @@ test('a RE-ARMABLE still-running seam rejection keeps the call attached and pend
   assert.deepEqual(report.reattached, ['c1']);
   // The seam rejects with the re-armable still-running class (a `running`
   // turn whose terminal notification did not arrive within the max-wait
-  // bound): the broker warns, KEEPS the loaded session attached, and
-  // re-arms the seam — the call is never settled from a quiet gap and
-  // never re-issued while the backend turn may still be running.
+  // bound): the broker retains the line under diagnostics (§6.2), KEEPS
+  // the loaded session attached, and re-arms the seam — the call is
+  // never settled from a quiet gap and never re-issued while the
+  // backend turn may still be running.
   const firstSeam = runner2.sessions[0].loadedTurns.shift();
   assert.ok(firstSeam, 'the seam is parked on the loaded session');
   firstSeam.reject(new LoadedTurnStillRunningError('the loaded session\'s founding turn is still running at the backend', true));
@@ -1926,9 +1952,11 @@ test('a RE-ARMABLE still-running seam rejection keeps the call attached and pend
   assert.equal(broker2.store().lookup('c1')!.reissues, 0, 'reissues counter untouched');
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call stays pending');
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('still running')),
-    output(probe).join('\n'),
+    notes.some((n) => n.line.includes('c1') && n.line.includes('still running')),
+    JSON.stringify(notes),
   );
   // The seam was re-armed on the SAME loaded session: a later
   // authoritative completion still settles the call exactly once.
@@ -1986,9 +2014,11 @@ test('a NON-re-armable still-running seam rejection is NEVER re-invoked — the 
   assert.deepEqual(broker2.pendingCalls().map((e) => e.id), ['c1'], 'the call is still pending — partial output is never settled');
   assert.equal(runner2.sessions[0].loadedTurns.length, 0, 'the seam was NOT re-invoked — no loop');
   const probe = await broker2.eval('"probe"');
+  assert.deepEqual(output(probe), [], 'no reconcile line leaks into the eval output');
+  const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    output(probe).some((l) => l.startsWith('warn: ') && l.includes('c1') && l.includes('can never observe')),
-    output(probe).join('\n'),
+    notes.some((n) => n.line.includes('c1') && n.line.includes('can never observe')),
+    JSON.stringify(notes),
   );
   // The SESSION-LEVEL ended notification settles the call (a seam-less
   // backend that pushes `_session/loaded_turn/ended` anyway) with the

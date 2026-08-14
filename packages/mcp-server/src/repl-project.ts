@@ -509,9 +509,12 @@ export async function disposeReplProjectState(
 }
 
 /** The `reset()` guest function's host-side effect: teardown the
- *  workspace and delete the whole `repl/` directory. The broker
+ *  workspace and delete the `repl/` store's contents. The broker
  *  teardown is bounded like the shutdown path's (a hung backend must
- *  not hang it either). The stale first-touch flight is detached
+ *  not hang it either). Renamed-aside refused snapshots
+ *  (`snapshot.bin.refused-*`) survive the wipe (§6.1 [C]13 — never
+ *  deleted; the store's `reset()` preserves them). The stale
+ *  first-touch flight is detached
  *  like the shutdown path's (see `disposeReplProjectState`): a reset
  *  during a parked restore-time reconcile must not leave every
  *  subsequent touch awaiting the never-resolving promise forever.

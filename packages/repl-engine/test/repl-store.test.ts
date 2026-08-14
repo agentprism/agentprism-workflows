@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -364,7 +364,7 @@ test('THE REVIEW REGRESSION: a failed flush RETAINS the dirty boundary — the n
   teardown(dir);
 });
 
-test('reset tears the repl/ directory down (the reset tool\'s engine-side)', async () => {
+test('reset tears the repl/ directory down (the reset() guest function\'s engine-side) — §6.1 [C]13: a renamed-aside refused snapshot is NEVER deleted', async () => {
   const { dir, module, store } = await setup();
   const ws = await Workspace.create(PROJECT, { wasm: module });
   store.writeSnapshot(ws.snapshot(), module);
@@ -381,15 +381,24 @@ test('reset tears the repl/ directory down (the reset tool\'s engine-side)', asy
     droppedAtMs: null,
   });
   assert.equal(store.hasSnapshot(), true);
+  // A refused snapshot that auto-reset renamed aside survives the wipe
+  // (the §6.1 data-safety guarantee — auto-reset is never silent data
+  // destruction, and neither is a later reset()).
+  const refusedAside = `${store.snapshotPath}.refused-1720000000000`;
+  writeFileSync(refusedAside, 'refused bytes');
   store.reset();
   assert.equal(store.hasSnapshot(), false, 'the snapshot is gone');
   assert.equal(store.stats().snapshotWrites, 0, 'the counters reset');
-  const { existsSync } = await import('node:fs');
-  assert.equal(existsSync(store.replDir), false, 'the whole repl/ directory is gone');
+  assert.equal(existsSync(store.replDir), true, 'the repl/ directory itself stays');
+  assert.deepEqual(
+    [...readdirSync(store.replDir)],
+    ['snapshot.bin.refused-1720000000000'],
+    'every store file was dropped — EXCEPT the renamed-aside refused snapshot',
+  );
   // The store is usable again from scratch.
   store.writeSnapshot(ws.snapshot(), module);
   assert.equal(store.hasSnapshot(), true);
-  assert.equal(store.callStore().lookup('c1'), undefined, 'the call log was dropped with the directory');
+  assert.equal(store.callStore().lookup('c1'), undefined, 'the call log was dropped with the directory contents');
   ws.dispose();
   teardown(dir);
 });

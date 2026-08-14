@@ -5,8 +5,8 @@
 //   npx agentprism-workflows validate quick-wins --workflows-dir workflows
 //
 // Demonstrates loopUntilDry(): keep spawning hunt rounds — each on the next vendor
-// in the pool — until two consecutive rounds add nothing new (or the round cap /
-// token budget stops it first). Workflow scripts are self-contained strings with no
+// in the pool — until two consecutive rounds add nothing new (or the round cap
+// stops it first). Workflow scripts are self-contained strings with no
 // imports, so the vendor pool is repeated here rather than shared with repo-triage.
 export const meta = {
   name: "quick-wins",
@@ -59,12 +59,9 @@ phase("Hunt");
 const seen = [];
 const wins = await loopUntilDry({
   round: async (i) => {
-    // Budget floor: leave headroom for whatever runs after this hunt. When nested
-    // inside repo-triage, budget.* reads the PARENT run's shared budget.
-    if (budget.total && budget.remaining() < 30_000) {
-      log(`Hunt round ${i + 1}: stopping — only ${budget.remaining()} tokens left`);
-      return [];
-    }
+    // The §7 budget sweep deleted the token-budget surface — there is no
+    // `budget` global to consult, and the round cap (`rounds`) is the
+    // hunt's bound.
     const v = POOL[i % POOL.length];
     const r = await agent(
       `Hunt round ${i + 1}: find up to 3 quick wins in this repository — ${focus}. ` +

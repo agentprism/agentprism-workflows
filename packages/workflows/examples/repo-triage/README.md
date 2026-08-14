@@ -20,7 +20,7 @@ markdown report to disk.
 │ Verify  every finding adversarially re-checked by the TWO     │
 │         vendors that did not produce it; unanimity to survive │
 └─────────────────────────────┬─────────────────────────────────┘
-                              ▼   skipped when the token budget runs low
+                              ▼   runs whenever huntRounds > 0
 ┌───────────────────────────────────────────────────────────────┐
 │ Hunt    workflow("quick-wins") — the saved sibling script,    │
 │         nested by name: loopUntilDry() rounds, rotating       │
@@ -44,7 +44,7 @@ would put a `checkpoint()` before the irreversible step — see the SDK README.)
 | SDK / DSL surface | where |
 |---|---|
 | `openWorkflowDir` + `runDynamicWorkflow` (list saved workflows, run one by **name**) | `src/main.ts` |
-| `exec` knobs: `tokenBudget`, `agentTimeoutMs`, `agentRetries`, `onProgress` | `src/main.ts` |
+| `exec` knobs: `agentTimeoutMs`, `agentRetries`, `onProgress` | `src/main.ts` |
 | Per-call **backend routing** (`model`) with registered prefixes and live-catalog-verified ids sent verbatim | the vendor pool in both scripts |
 | **Read-only session modes** (`mode: "plan"` / `"read-only"`) on pinned calls | the vendor pool in both scripts |
 | `pipeline()` (barrier-less multi-stage flow) + `parallel()` (verification panel) | `repo-triage.workflow.js` |
@@ -53,7 +53,7 @@ would put a `checkpoint()` before the irreversible step — see the SDK README.)
 | `workflow()` nesting a saved sibling script by name | Hunt stage |
 | `loopUntilDry()` unknown-size discovery | `quick-wins.workflow.js` |
 | `completenessCheck()` final gap critic | Report stage |
-| `phase()`, `log()`, `args` hardening (string-form args), `budget` guards | both scripts |
+| `phase()`, `log()`, `args` hardening (string-form args) | both scripts |
 | Null-safe degradation (a failed agent resolves to `null`, the run continues) | Map, Sweep + Verify stages |
 
 ## Layout
@@ -104,13 +104,11 @@ with `--out`). The run result also exposes the terminal review as `reportVerdict
 Exit code 0 = the run completed.
 
 Runs are **unbounded by default** — an autonomous triage should finish, not die at an
-arbitrary cap. Pass `--budget <tokens>` to set a hard cap and watch the budget support
-APIs engage: the workflow checks `budget.remaining()`, skips the optional Hunt stage
-to reserve headroom for the Report stage (logging why), and if the cap is hit anyway,
-Report and the completeness critic degrade gracefully — the confirmed findings always
-come back. Size caps generously: budget "spent" aggregates whatever the backends
-report (input **and** output, cache reads included), so a capped run burns budget far
-faster than output volume alone suggests.
+arbitrary cap, and the token-budget surface was removed from the whole SDK (§7 of the
+eval-plane redesign: no `tokenBudget` execution knob, no `budget` script global). The
+optional Hunt stage is controlled by the `--hunt-rounds` flag instead (`0` disables it), and
+the script's null-safe degradation — a failed agent resolves to `null`, the stage is logged
+and skipped — keeps the confirmed findings coming back regardless.
 
 ## Validate before you run
 
@@ -122,7 +120,7 @@ npx @automatalabs/workflows validate repo-triage --workflows-dir workflows \
   --mock-answers-file report-gate.mock-answers.json
 ```
 
-Zero tokens: a static parse plus a dry run of **both** scripts in the real engine realm against a
+Cost-free validation: a static parse plus a dry run of **both** scripts in the real engine realm against a
 mock backend, followed by one no-prompt config-options probe per routed harness (an unavailable
 harness only warns). `--workflows-dir` is what lets the
 nested `workflow("quick-wins")` call resolve). `report-gate.mock-answers.json` partially

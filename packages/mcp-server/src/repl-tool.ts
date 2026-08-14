@@ -248,7 +248,15 @@ function takeNotices(state: ReplProjectState): string[] {
  *  project state's live references and drop the whole repl/ store (the
  *  deleted v1 `reset` action's engine-side) so the NEXT touch creates a
  *  FRESH workspace, never a restore of the torn-down one. Returns true
- *  when a reset tore the workspace down. */
+ *  when a reset tore the workspace down.
+ *
+ *  The pending §6.1/§6.2 notices are deliberately NOT cleared here:
+ *  they belong to the STORE's refusal history (the renamed-aside
+ *  `.refused-*` file survives `store.reset()` — §6.1 [C]13, never
+ *  deleted) and are consumed exactly once when an eval's output
+ *  renders them (the review finding: the sync ran before the render,
+ *  so a first-eval `reset()` after an auto-reset erased the leading
+ *  refusal notice). */
 function syncReplStateAfterOp(state: ReplProjectState): boolean {
   if (state.broker !== null && state.broker.isDisposed) {
     state.broker = null;
@@ -256,8 +264,6 @@ function syncReplStateAfterOp(state: ReplProjectState): boolean {
     state.store.reset();
     state.source = null;
     state.reconcileReport = null;
-    state.autoResetNotice = null;
-    state.lossNotices = [];
     state.drained = false;
     state.drainError = null;
     state.timedOutEvalTokens.clear();
@@ -344,7 +350,18 @@ export const replToolOutputShape = z
         title: "error",
         required: ["error"],
         properties: { error: { type: "string" } },
-        not: { anyOf: [{ required: ["output"] }, { required: ["interrupt"] }] },
+        // The runtime validator accepts ONLY the bare `error` key — the
+        // published branch must mirror it exactly, so `error`+`result`
+        // and `error`+`running` objects are advertised-invalid too
+        // (§3.1 [C]1: the published schema mirrors the runtime shape).
+        not: {
+          anyOf: [
+            { required: ["output"] },
+            { required: ["interrupt"] },
+            { required: ["result"] },
+            { required: ["running"] },
+          ],
+        },
       },
     ],
   });
@@ -486,10 +503,20 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         // A reset-owning eval that completed during this eval's pump
         // tears the workspace down BEFORE the submitted code runs (the
         // engine's documented order) — clear the state so the NEXT
-        // touch re-creates, and surface the honest failure.
+        // touch re-creates, and surface the honest failure. The pending
+        // notices stay on the state: no output was rendered to consume
+        // them, so the NEXT eval still leads with them.
         syncReplStateAfterOp(state);
         throw error;
       }
+      // §6.1/§6.2: the pending notices are taken BEFORE the post-op
+      // state sync — an eval whose guest code called reset() disposes
+      // the broker and the sync tears the store down, but the
+      // refused-snapshot/loss notice must still lead THIS eval's output
+      // (and the renamed `.refused-*` file survives the store reset —
+      // §6.1 [C]13). Consumed-on-render: a later eval never repeats
+      // them.
+      const notices = takeNotices(state);
       syncReplStateAfterOp(state);
       const outputLines = [...evalOutcome.output];
       if (evalOutcome.kind !== "pending") {
@@ -515,7 +542,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
             }
           }
         }
-        return evalResult(outputLines, result, undefined, takeNotices(state));
+        return evalResult(outputLines, result, undefined, notices);
       }
       // Suspended: hold the call open pumping settlements up to the
       // bound. Each wait targets the calls pending at ITS entry, so a
@@ -554,7 +581,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
           // The eval's continuation completed during the pumps — the
           // finished shape with its completion repr (or the late error
           // rendering already in the output lines).
-          return evalResult(outputLines, waitResult.result, undefined, takeNotices(state));
+          return evalResult(outputLines, waitResult.result, undefined, notices);
         }
         if (Date.now() >= deadline) break;
         if (waitResult.pending.length === 0 || !drained) {
@@ -573,7 +600,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       if (evalOutcome.evalToken !== undefined) {
         state.timedOutEvalTokens.add(evalOutcome.evalToken);
       }
-      return evalResult(outputLines, undefined, lastRunning, takeNotices(state));
+      return evalResult(outputLines, undefined, lastRunning, notices);
     },
   );
 }
