@@ -47,7 +47,7 @@ snapshots restorable.
   eval **and its drain**, and `drainJobs({ interruptHandler })` arms for the duration of a
   standalone settlement drain, then restores. Handlers never leak across operations. Returning
   `true` aborts with `InternalError: interrupted` (`EvalErrorInfo.interrupted === true`). Note the
-  interrupt budget is instruction-based (quickjs's built-in check interval), so against a
+  interrupt check is instruction-based (quickjs's built-in check interval), so against a
   tiny loop body the handler fires comparatively rarely — that is the shim's native behavior.
   **Why the drain takes its own handler:** a suspended eval's handler is removed when the eval
   returns, and a settlement drain that later resumes a runaway continuation (a continuation left
@@ -117,8 +117,7 @@ result). This package follows the rule from its first line of engine code, and i
   pins guest memory**; review measured a 1 MiB VM exhausting after ~3,128 accessor-valued
   completions), proxies and branded objects (`[Promise]`, `[Date]`, `[Map]`, …) rendered as
   markers, depth ≤ 4, ≤ 256 properties per level, cycle-guarded. This shallow read is the
-  conservative seed of the ObjectPreview rendering a later phase owns; the tool-result caps
-  live there.
+  conservative seed of the ObjectPreview rendering a later phase owns.
 - Error names come from the error prototype's own `name` data property when instances carry
   none (quickjs-ng stores `name` on the prototype) — still trap-free; a guest-installed
   accessor or proxy prototype is skipped and the name falls back to `'Error'`.
@@ -174,16 +173,14 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
 - `console.{log,info,warn,error,debug}` — the bridge: ONE joined line per call — the
   arguments' §4.4 reprs joined with a single space (strings passed directly print whole;
   objects/arrays render to depth 2, 20 entries per level, nested strings head-limited at
-  200 chars). The per-argument `$N` capture system and the `{ refs, args }` payload are
-  DELETED — the line itself is forwarded as `{ line }` to `__host_console`, never capped.
+  200 chars). The line itself is forwarded as `{ line }` to `__host_console` without a
+  byte ceiling.
 - `parallel` / `pipeline` / `verify` / `judgePanel` / `gate` / `retry` / `loopUntilDry` —
   pure JavaScript layered on `agent()`, following `packages/workflows/src/dsl.d.ts` semantics.
   A rejection with `recoverable: false` halts the surrounding orchestration; any other
   rejection is recoverable (a `null` slot in `parallel`/`pipeline`, reported via
-  `console.warn`). **There is no budget surface**: no `budget()` global, no ledger, no caps
-  vocabulary — resource limits are server configuration, invisible to the guest (the host's
-  non-recoverable signal is exclusively `recoverable: false`). `phase()` is deleted per the
-  doc.
+  `console.warn`). Resource limits are server configuration, invisible to the guest; the
+  host's non-recoverable signal is exclusively `recoverable: false`.
 
 ### Guest library ⇄ host contract
 
@@ -192,7 +189,7 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
 | `__host_agent(callId, modelSpec, task, optionsJson)` | Kick off one worker run against the backend routed by `modelSpec`. May return a thenable (the bridge's `GuestCall` promise) — the guest chains onto it — or `undefined` (settle later via the surface). |
 | `__host_checkpoint(callId, question, optionsJson, answerJson?)` | Question mode: three arguments, like `__host_agent`. Answer mode: a PRESENT fourth argument (the JSON-encoded answer) — the host settles the pending checkpoint and returns a boolean synchronously; nothing new pends. |
 | `__host_agent_steer(callId, sessionId, action, payloadJson)` | Steering: `callId` is the operation's OWN registry id (the settlement key), `sessionId` the FOUNDING call id of the session being steered (the dispatch and post-restore re-issue target); `action` is `"followUp"` \| `"steer"` \| `"cancel"` and `payloadJson` is `{ prompt, options }` or `null` for cancel. The host settles with the steering outcome. |
-| `__host_console(level, payloadJson)` | The console bridge, called synchronously with the rendered `{ line }` payload (one joined line per call — the `$N` capture system is deleted, §4.4). |
+| `__host_console(level, payloadJson)` | The console bridge, called synchronously with the rendered `{ line }` payload (one joined line per call). |
 
 Settlement is first-wins idempotent by call id, through two always-valid routes: the live
 `GuestCall` (a promise created via the raw `qjs_new_promise` export whose parts the call
@@ -292,12 +289,9 @@ now: state, the pending-call registry and the version marker survive a snapshot/
 ### The console bridge and the §4.4 repr
 
 Every `console.*` call renders **ONE joined output line**: the arguments' reprs joined
-with a single space (§4.4 [D]) — the per-argument `$N` capture system, the `[$14 · object ·
-48kB]` address annotations, and the `{ refs, args }` bridge payload are **deleted** with the
-eval-plane redesign. The repr is depth-limited and predictable — printing conventions, not
-budgets, with **no byte ceiling and no enforcement machinery anywhere on the path** (the
-Python posture: an agent CAN flood its own context by printing something enormous; accepted
-and documented):
+with a single space (§4.4 [D]). The repr is depth-limited and predictable, with no byte
+ceiling on the rendered stream (the Python posture: an agent can flood its own context by
+printing something enormous; accepted and documented):
 
 - strings passed **directly** to `console.log`, and a string **completion value**, print
   **whole** — they are the output the orchestrator asked for;
@@ -305,9 +299,8 @@ and documented):
 - collections render their first **20 entries** per level, then `… +N more`;
 - **nested** strings (inside a collection) render head-limited at **200 chars**;
 - everything deeper/longer is reached by evaluating a narrower expression — the values are
-  alive in the VM; slicing is the API. There is no `$N` store: the sole result-history
-  global is `_` (the previous eval's completion value, IPython-style); bindings are the
-  memory.
+  alive in the VM; slicing is the API. The sole result-history global is `_` (the previous
+  eval's completion value, IPython-style); bindings are the memory.
 
 The repr is generated **side-effect-free by construction** (engine brand checks only,
 own-property-descriptor reads only, proxies detected first and previewed *as* proxies,
@@ -318,15 +311,11 @@ so symbols render as the bare brand `Symbol` everywhere, including thrown-symbol
 messages, and `qjs_get_array_buffer`'s raw data pointer is never passed to
 `qjs_is_exception` (a guest-controlled buffer must not be able to forge a failed read).
 
-### Output caps — deleted (§7)
+### Unbounded guest output
 
-The output-cap apparatus (`applyOutputCaps` / `capFinalText`, the 256-line / 10 KB wire
-enforcement, the CDP-style per-argument capture preview) is **deleted** with the
-eval-plane redesign's §7 budget sweep. The engine applies **no caps to guest output** —
-console lines and completion reprs ship verbatim. The bounded previewer is retained
-*internally* where the engine needs a bounded token — manifest tokens, checkpoint-question
-previews, task previews at the engine seam (their 200-char bounds stay as metadata
-formatting, §7 [C]) — never caller-facing budget machinery.
+Console lines and completion reprs ship verbatim. The previewer is also used internally for
+bounded metadata tokens such as manifest entries and checkpoint/task previews; those 200-character
+metadata renderings do not alter guest output.
 
 ## The workspace (phase B)
 
@@ -364,8 +353,8 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
   live-handle contract) and are opened with `keepSession: true`, so the ACP session persists on the
   backend for the restore path's lazy re-attach.
 - **Six concurrent subagents per workspace** (doc-settled; `maxConcurrentAgents` configurable —
-  server configuration, invisible to the guest). The cap counts live work: unsettled agent calls
-  plus sessions running a queued-steer delivery turn. Dispatches above the cap **QUEUE for the
+  server configuration, invisible to the guest). The limit counts live work: unsettled agent calls
+  plus sessions running a queued-steer delivery turn. Additional dispatches **QUEUE for the
   next free slot in dispatch order** (§4.1 [D]) — never a rejection, matching the workflow
   engine's semantics (`parallel(items.map(...))` never loses work).
 - **Steering resolves with what actually happened** (the doc's "nothing is hidden, nothing
@@ -476,11 +465,9 @@ Phase C decisions (the broker, the call store, the eval tool-result semantics):
   structured output, else the generic parse-final-JSON dialect) — the one divergence from
   `run()`: the client-hosted StructuredOutput MCP capture tool is not injected on the
   interactive path.
-- **The concurrency cap counts live work** — unsettled agent calls plus sessions running a
-  queued-steer delivery turn (a follow-up turn is a subagent working). Over-cap dispatches
-  QUEUE in dispatch order for the next free slot (§4.1 [D] — never a rejection; the v1
-  dispatch-time `ConcurrencyLimitError` refusal is deleted with it, and the
-  `AGENT_LIMIT_EXCEEDED`/`BUDGET_EXHAUSTED` budget vocabulary has no counterpart here).
+- **The concurrency limit counts live work** — unsettled agent calls plus sessions running a
+  queued-steer delivery turn (a follow-up turn is a subagent working). Additional dispatches
+  QUEUE in dispatch order for the next free slot (§4.1 [D]).
   `recoverable: true` remains the one signal the guest needs.
 - **The steering mechanism table** (the doc's spec-owed decision): extension backend + turn in
   flight → live `_session/steering` wire call, resolving with the §4.2 delivery-outcome
@@ -502,9 +489,7 @@ Phase C decisions (the broker, the call store, the eval tool-result semantics):
   urgency delivery (`injected`) is always distinguishable from next-turn delivery
   (`queued`); the v1 bare `startedNewTurn` token never reaches the guest.
 - **The store records refused calls too** (dispatched + rejected with the refusal error):
-  without the record, a restore would re-issue a call that was deliberately refused. `admitted`
-  is deliberately absent from the record shape — it was the budget ledger's bookkeeping, and
-  the ledger is deleted vocabulary.
+  without the record, a restore would re-issue a call that was deliberately refused.
 - **`completed` excludes checkpoint answers** (the harness's pump convention): an answered id
   leaves the `checkpoints` list — that is its visibility; `completed` reports delegated work
   (pump deliveries + dispatch-time refusals).
@@ -690,10 +675,10 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   reads only, sanitized at render), and live-handle status (`agent handle ·
   pending|settled · call cN` — the call id maps to the task and timestamps in the
   store) and the doc's full provenance surface — `task` (the founding `agent()` call's
-  task text for `worker cN` and handle bindings, capped at 200 chars) and
+  task text for `worker cN` and handle bindings, limited to 200 chars) and
   `provenanceAtMs` (the attribution wall clock; phase-D review round 3: bindings used
-  to carry only the label and an internal timestamp). There is no `$N` capture store — the
-  sole result-history global is `_` (the previous eval's completion value, §4.4).
+  to carry only the label and an internal timestamp). The sole result-history global is `_`
+  (the previous eval's completion value, §4.4).
 - **Pending steers whose wire call died with the process resolve `failed`** (recorded +
   settled; the reason demotes to workspace().diagnostics.reconcileNotes, §6.2): their outcome
   is unknowable and re-injecting would duplicate; the one
@@ -702,15 +687,15 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   (`PendingCheckpoint.call` is null on that path; answers settle through the reconciliation
   surface). Reconcile is idempotent (an `isTracked` guard never re-attaches/re-issues twice)
   and adopts store-unknown entries (foreign snapshot / wiped store) so the replay ledger
-  stays complete. Re-issues respect the concurrency cap (over-cap re-issues QUEUE for the
+  stays complete. Re-issues respect the concurrency limit (additional re-issues QUEUE for the
   next free slot — never a rejection).
 
 Phase E review round 3 decisions (the carried review's three defects, as re-verified in
 round 5):
 
 - **The eval-break signal is keyed to the armed target's CONTINUATION, not to whichever drain runs next.** The carried defect: the drain-phase interrupt handler was installed on every later eval's drain without checking whether that drain resumed an armed target — an unrelated finite eval B (or an unrelated settlement drain) consumed the signal and the interrupted-drain release cleared the target's tracking while its checkpoint stayed pending and uninterruptible. The armed identity is the target's CONTINUATION TOKEN (round 5): the guest library's `__replAwait(value, token)` wrap sets the continuation lease to the eval's token in the job immediately before the eval's continuation segment, the drain loop mirrors the lease per job, and the signal fires only while the executing JOB holds an armed token — the executing job IS the target's continuation. An unrelated drain — and an unrelated JOB inside a drain that settled a target's call (an unawaited sibling `.then` registered before the target's await runs first, before the lease-setting reaction: it can neither fire nor consume the signal) — leaves the armed state intact; an indirect wait (`await Promise.all([q])`) is targetable through the promise graph (round 5's regressions). The interrupted-drain release (`releaseInterruptedEval`) is exact the same way: the interrupted job's lease names the eval whose continuation was actually executing — exactly that eval is released (a deadline-broken resumed runaway releases its tracked eval even when no signal was armed — a stale target would make a later arm target a dead eval); an unrelated interrupted drain leaves the armed state and every tracked eval intact. A no-id interrupt with NOTHING BREAKABLE — no eval in flight, or every in-flight eval suspended with NO pending host call (a never-settling local promise — no execution can ever resume it; a suspended eval's continuation is always queued by a pending call's settlement, directly or through any promise chain) — REFUSES and arms nothing.
-- **The bounded wait sleeps only for the REMAINING budget**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches. A zero `timeoutMs` still performs ONE immediately available state read (round 5's regression: the chain acquisition used to return unacquired with the deadline already past, so an idle workspace reported `drained: false` and a pending call's surface read as empty).
-- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array cap silently truncated the guest surface's `pending()` list, and its `[ArrayTruncated]` marker mapped to `undefined` in the broker's id lists (a hole in the tool's structured `pending`). `readValue` still bounds the general preview read (default 256); the host-owned metadata surfaces (`readValueComplete` — the pending registry, the await log, the provenance registry's `read()` result) read with NO array-length or object-key cap: they are the frozen guest library's own metadata, bounded by the VM's memory like the metadata itself.
+- **The bounded wait sleeps only for the remaining time**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches. A zero `timeoutMs` still performs ONE immediately available state read (round 5's regression: the chain acquisition used to return unacquired with the deadline already past, so an idle workspace reported `drained: false` and a pending call's surface read as empty).
+- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array limit once shortened the guest surface's `pending()` list, and its marker mapped to `undefined` in the broker's id list. `readValue` still bounds general preview reads (default 256); host-owned metadata surfaces (`readValueComplete` — the pending registry, the await log, and the provenance registry's `read()` result) read the complete arrays/objects because they are the frozen guest library's own metadata, bounded by VM memory like the metadata itself.
 
 Phase E review round 6 decisions (the carried review's three defects):
 
@@ -723,9 +708,8 @@ Phase B decisions (the guest library, bridge, previewer):
 - **`repl.guest` as the surface key** (`Symbol.for("repl.guest")`, marker global
   `__REPL_GUEST_VERSION`) — a fresh namespace for this product's own library (the harness's
   `agentprism.guest`/`__AGENTPRISM_GUEST_VERSION` are its sibling project's).
-- **Four host callbacks, no budget function**: `__host_agent`, `__host_checkpoint`,
-  `__host_console`, `__host_agent_steer`. The harness's `__host_budget` is deleted with the
-  budget surface; `__host_agent_steer` carries the doc's handle methods
+- **Four host callbacks**: `__host_agent`, `__host_checkpoint`, `__host_console`, and
+  `__host_agent_steer`. The steering callback carries the handle methods
   (`followUp`/`steer`/`cancel`) as a new host-callback name in the initial major.
 - **`agent(modelSpec, task, opts?)` carries the model spec as a first-class argument** — the
   roadmap doc's own signature (`agent("pi/deepseek-v4-flash-max", "research X")`). The spec
@@ -750,8 +734,7 @@ Phase B decisions (the guest library, bridge, previewer):
   await, per the doc (`const research = agent(...)`; end the eval; check in next call). No
   `agent.start`/`agent.continue` variants (the doc does not carry them; `followUp` is the
   continuation vector).
-- **Non-recoverable = `recoverable: false` exclusively** — the harness's reserved
-  `BUDGET_EXHAUSTED`/`AGENT_LIMIT_EXCEEDED` codes are budget vocabulary, deleted per the doc.
+- **Non-recoverable = `recoverable: false` exclusively.**
 - **`retry` mirrors the workflow engine exactly**: without `until`, the FIRST attempt's
   result is returned (`workflow.ts`: `if (!opts.until || opts.until(last)) return last` —
   "stopping early once `until(result)` holds" holds trivially when there is no predicate);
@@ -761,8 +744,8 @@ Phase B decisions (the guest library, bridge, previewer):
 - **`loopUntilDry` dedupes within rounds too** (the harness dedupes across rounds only) —
   "collecting fresh (deduped by `key`) items" is honored completely; the default key degrades
   to a safe string for non-serializable items instead of throwing.
-- **The repr handles hostile values without ever throwing** (the `$N` capture system is
-  deleted — the §4.4 repr renders each console argument under its own guard): proxies render
+- **The repr handles hostile values without ever throwing** (the §4.4 repr renders each
+  console argument under its own guard): proxies render
   *as* proxies, cycles are preserved by a per-render `seen` set, and an unstringifiable
   value degrades to the `[unstringifiable]` marker — `console.*` NEVER throws by contract,
   so a hostile value cannot take down guest code. (Pinned by the repr tests.)
@@ -788,14 +771,12 @@ Phase B decisions (the guest library, bridge, previewer):
   `Function.prototype.call.bind` at installation — no property lookups at call time, so
   replacing either prototype method with a throwing function cannot make `console.*` or
   `pipeline()` throw; `console.*` NEVER throws by contract; review regression, pinned by
-  test). There is no `$N` freeze path — the capture system is deleted (§4.4).
+  test).
 - **`readGuestSurface` returns a surface that pins no guest memory**: every handle is
   acquired per call and disposed on the spot (review regression: the surface used to capture
   three owned function handles in closures with no disposal contract).
 - **The console payload is `{ line }`** — the guest renders ONE joined line per call
-  (§4.4) and forwards it verbatim; the harness's `{ refs, args }` shape and the `$N`
-  reference channel are DELETED with the capture system, and the line is never truncated
-  (§7 — no output caps).
+  (§4.4) and forwards it verbatim.
 - **`ReplSnapshot` is a self-contained structural stand-in** for the shim's `Snapshot` type,
   so the public `ReplVm.restore` declaration stays checkable by a non-DOM `skipLibCheck:
   false` consumer; snapshots produced through the shim satisfy it without conversion.
@@ -897,17 +878,11 @@ Every `repl` result also carries the doc's MACHINE-READABLE shape as
 oneOf-branch pattern) mirrors the TWO actions exactly — eval as
 `{ output, result? }` (finished), `{ output, running: [ids] }`
 (bound elapsed), or the bare `{ output }` of a thrown eval (the §4.6
-rendering — `result` and `running` are mutually exclusive, and the
-v1 `pending`/`completed`/`checkpoints` fields are deleted from the
-wire), interrupt as its honest outcome (`targeted` / `refused-idle` /
+rendering — `result` and `running` are mutually exclusive), interrupt
+as its honest outcome (`targeted` / `refused-idle` /
 `cancelled` / `idle` / `failed`), and the error variant carrying a
 bare structured error string (`{ error }` — exactly one key, mirroring
-the runtime validator). There is NO `wait`/`status`/`reset` action, NO
-`drained`/`timedOut` flags, NO `refs` input parameter, NO
-`truncated`/`referenced`/`outputTruncated` fields, and NO
-`structuredContent` cap — the §7 budget sweep deleted the whole
-truncation-ref apparatus (the agent CAN flood its own context; the
-Python posture). `output` is ONE newline-joined string: console lines
+the runtime validator). `output` is one unbounded, newline-joined string: console lines
 (one per call), raised checkpoint lines (`checkpoint c9: <question>`),
 uncaught-error renderings (§4.6), and the §6.1/§6.2 one-line notices
 (auto-reset; a restore that lost calls or a drain failure that lost
@@ -981,7 +956,7 @@ consumer compiles the published declarations — including `@ts-expect-error` ne
 pinning the opaque `WasmModule` boundary.
 
 Phase B pins the guest library and bridge: install/version-marker/idempotence (re-eval and
-re-install are no-ops), the deleted vocabulary (`phase`, the whole budget surface), agent
+re-install are no-ops), agent
 round trips with the model-spec signature and JSON options, rejections normalizing to Errors
 carrying `code`/`recoverable`, the live handle (`id`/`followUp`/`steer`/`cancel`,
 non-enumerable, steering addressed to the founding session id), synchronous host-refusal
@@ -1030,13 +1005,13 @@ the answer recorded before settlement), steering outcome visibility (extension b
 injection with the backend's verbatim outcome and wire failures resolving `failed`;
 no-extension backend: `queued` at enqueue and next-turn delivery, delivery-failure warn
 lines; idle sessions start new turns with and without the extension; cancel → `cancelled` +
-the call's `AGENT_CANCELLED` rejection, idle cancel → `idle`), the concurrency cap
-(dispatch-above-cap QUEUES in dispatch order — never a rejection; slot release on
+the call's `AGENT_CANCELLED` rejection, idle cancel → `idle`), the concurrency limit
+(additional dispatches QUEUE in dispatch order — never a rejection; slot release on
 settlement), the §3.1 fused pump (the eval-token settlement short-circuits the target set —
 an unrelated pending call never holds the finished shape to the bound), trap-free result
 rendering (accessor completions render `(...)` and never fire; the `Object.prototype.value`
 pollution cannot hijack the result line), and the console rendering (one joined line per
-`console.*` call with level prefixes; no output caps). The consumer fixture
+`console.*` call with level prefixes). The consumer fixture
 exercises the whole phase-C public surface (`Broker`, the store classes, the self-contained
 `BrokerRunner`/`BrokerSession` stand-ins, the eval-result types) under the non-DOM
 `skipLibCheck: false` configuration. The previewer suite pins the FORMAT.md rules (primitives incl.
@@ -1053,8 +1028,7 @@ the `Object.prototype.value` pollution case; proxy traps never fire; a guest tha
 thrown-symbol rendering; the byte-size estimate is bounded and cycle-safe), the FORMAT.md §6
 degradation (a corrupted key materialization lists nothing and flags overflow — typed arrays
 included), and bounded-memory previews (3,000 revoked-proxy and typed-array previews leave a
-2 MiB VM healthy). The §7 output-cap suite (`caps.test.ts`) was DELETED with the cap
-machinery itself — the engine applies no caps to guest output.
+2 MiB VM healthy).
 
 Phase D adds the snapshot + restore suites: `snapshot-envelope.test.ts` (the envelope round
 trip — serialize → deserialize → restore with state intact, gzip actually compressing —

@@ -227,10 +227,7 @@ The worktree and its edits are discarded; return the diff as data. Both calls re
 journal rows without a filesystem-safety declaration.
 
 `maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run.
-The token budget is **deleted** (§7): there is no `tokenBudget` input, no per-phase
-sub-budget (`phase(title, { budget })` is a script error), and no `budget` global in
-the script realm — the agent count, concurrency, and timeout rails above are the
-retained safety bounds. `agentTimeoutMs` is a
+`phase(title)` groups subsequent calls under a named phase. `agentTimeoutMs` is a
 total wall-clock ceiling for each attempt. A finite per-call `timeoutMs` can tighten the ceiling but
 cannot raise or disable it; with no host ceiling, per-call `null`/omission is uncapped. Every retry
 gets a fresh clock (at most `(retries + 1) × timeout`, with retries clamped to 3). Exhaustion is a

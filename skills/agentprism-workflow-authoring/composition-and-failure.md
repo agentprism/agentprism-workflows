@@ -66,4 +66,4 @@ while (found.length < 20) {
 }
 ```
 
-There is no token-budget surface in the realm — the budget global and the per-phase budget option are deleted; your own counters and caps are the loop guards, so terminate every loop on a bound you control. The agent-count cap (`maxAgents`) is hard: once exhausted, further `agent()` calls throw `AGENT_LIMIT_EXCEEDED`. `phase()` groups agents in progress UIs and run logs; `log(msg)` (and `console.log`) append to the run log — narrate what matters, especially anything you drop or cap.
+Terminate every loop on a bound the script controls. The agent-count limit (`maxAgents`) is hard: once exhausted, further `agent()` calls throw `AGENT_LIMIT_EXCEEDED`. `phase()` groups agents in progress UIs and run logs; `log(msg)` (and `console.log`) append to the run log — narrate what matters, especially anything you drop.

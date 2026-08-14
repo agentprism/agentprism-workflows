@@ -25,7 +25,7 @@ available as an isolated, first-class ACP leaf:
   (instead of Pi's in-process `createAgentSession`).
 
 The deterministic orchestration engine (the JS `vm` realm, `parallel`/`pipeline`, the
-journal/resume machinery, token budget, git-worktree isolation) is **reused essentially
+journal/resume machinery, and git-worktree isolation) is **reused essentially
 unchanged** from `pi-dynamic-workflows` — only the *leaf* (how one subagent runs) and the
 *shell* (how the tool is exposed) change.
 
@@ -99,7 +99,7 @@ work **with no MCP server at all** — while the facade and integration leaves s
  ┌──────────────────┐  ┌────────────────────────────┐
  │ workflow-engine  │  │ acp-agents                 │◄── repl-engine
  │ vm, journal,     │  │ pooled built-in ACP agents │
- │ budgets, resume  │  │ + custom ACP, auth, sessions│
+ │ resume           │  │ + custom ACP, auth, sessions│
  └────────┬─────────┘  └──────────────┬─────────────┘
           └──────────────┬────────────┘
                          ▼
@@ -162,8 +162,8 @@ await runner.dispose();
 ### `workflow-engine` — the lifted Pi engine
 
 `runWorkflow` (the `vm` realm + determinism prelude; the
-`agent`/`parallel`/`pipeline`/`phase`/`log`/`budget` globals), the journal/resume, per-phase
-budgets, the limiter, the run manager + persistence, and the worktree helper. It depends on an
+`agent`/`parallel`/`pipeline`/`phase`/`log` globals), the journal/resume, the limiter, the run
+manager + persistence, and the worktree helper. It depends on an
 **injected `AgentRunner`** — *not* on `acp-agents` — so it runs against a real ACP runner, a mock,
 or any other backend (exactly how the Pi tests drive it today via `options.agent`). The seam:
 `runWorkflow` requires `options.agent: AgentRunner` and only ever calls
@@ -206,11 +206,10 @@ outside the engine/runner dependency chain.
 
 | Concern | Source (`pi-dynamic-workflows`) | Notes |
 |---|---|---|
-| Script execution | [`src/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts) — `runWorkflow`, `vm.createContext`/`vm.Script` (`:835`,`:866`) | Node `vm` realm; globals `agent`/`parallel`/`pipeline`/`phase`/`log`/`budget` injected |
+| Script execution | [`src/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts) — `runWorkflow`, `vm.createContext`/`vm.Script` (`:835`,`:866`) | Node `vm` realm; globals `agent`/`parallel`/`pipeline`/`phase`/`log` injected |
 | Determinism | [`src/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts) `DETERMINISM_PRELUDE` (`:227`), parse blocklist (`:212`,`:890`) | neuters `Date.now`/`Math.random`/`new Date()` for resume reproducibility |
 | Fan-out | `parallel` (`:555`, barrier), `pipeline` (`:579`, no *inter-stage* barrier — but still `Promise.all`-joins all items at `:588`, so don't drop that on a port), `createLimiter` (`:1013`) | concurrency gate |
 | Journal / resume | [`src/run-persistence.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/run-persistence.ts), journal in [`workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts) (`hashAgentCall` `:1045`, `firstMiss` longest-unchanged-prefix `:407`) | crash recovery + resume |
-| Budget | `budget` object (`:315`), per-phase sub-budgets (`:303`) | soft token gate |
 | Worktree isolation | [`src/worktree.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/worktree.ts) — `git worktree add` per agent | engine creates it (deterministic name) and passes `cwd` to `agent.run({cwd})` |
 | Model tiering logic | [`src/model-routing.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/model-routing.ts), [`src/model-tier-config.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/model-tier-config.ts) | pure logic; resolution *target* becomes an ACP session config option (§5.4) |
 | Schema validate/extract | [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) `resolveStructuredOutput` (`:113`), `extractValidated` (`:47`) | lifted into **`acp-agents`** (not the engine) as the schema guard (§6) |
@@ -287,7 +286,7 @@ The `workflow` tool grew from Pi's single-form input
   defaulting to the server's own project under `--in-process`. Agent-less deterministic scripts are
   valid; the validator warns when a script has neither `agent()` nor `checkpoint()`. Other run
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
-  (clamped to ≤3), `agentTimeoutMs` (default none), `tokenBudget` (default none), the explicit-resume
+  (clamped to ≤3), `agentTimeoutMs` (default none), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
 - **Inspect / await / stop** — take a `runId` and never execution fields; `await` adds `waitMs`
   (default 20 000), `stop` adds an optional `callIndex` that cancels one in-flight agent (its slot
@@ -812,7 +811,7 @@ after transcript replay and reports only the continuation-turn delta. Continuati
 provenance is reported before post-open setup, and the engine turns it into a guarded audit notice
 plus a replay-neutral journal marker.
 
-Everything above this method — `parallel`/`pipeline`, the journal, budget, phases, resume — is
+Everything above this method — `parallel`/`pipeline`, the journal, phases, and resume — is
 the unchanged engine.
 
 ---
@@ -858,14 +857,11 @@ typed fatal divergence. Once latched, every later arrival rethrows before servin
 strict posture is what makes "held fixed" meaningful: propagation mode remains the correct tool for
 scripts that cannot prove isolated correspondence.
 
-**Budget trajectory and gate freedom.** Every recorded call has a dense settlement ordinal and
-every agent call a sealed budget debit. Replay forces the recording's token/agent limits and feeds
-those debits back in settlement order, reproducing both `budget.spent()`/`remaining()` and
-pre-allocation token gates even when served calls settle at different wall-clock speeds. Baselines
-at the agent-limit boundary, with abort residue, or without limits/trajectory facts are refused
-before spend because those gates cannot otherwise be proven inactive. Concurrency reproduces the
-scheduling envelope, not timing; timeout and retry settings affect only the live target because
-served calls resolve at the replay seam.
+**Settlement trajectory and gate freedom.** Every recorded call has a dense settlement ordinal and
+every agent call retains its sealed token-accounting debit for record compatibility. Baselines at
+the agent-limit boundary, with abort residue, or without complete limits/trajectory facts are
+refused before provider use. Concurrency reproduces the scheduling envelope, not timing; timeout
+and retry settings affect only the live target because served calls resolve at the replay seam.
 
 Isolation artifacts carry an initial run-level `executionMode` marker, per-call provenance, and a
 persisted `ReplayReport`; they cannot be resumed or selected as later baselines. See
@@ -989,7 +985,7 @@ resurrect a snapshot or sidecar after the run was removed.
 - Extensibility (`_meta`, `_`-methods) — https://agentclientprotocol.com/protocol/v1/extensibility
 
 **Reused engine (lifted from [`pi-dynamic-workflows`](https://github.com/QuintinShaw/pi-dynamic-workflows)):**
-- [`src/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts) — engine, vm, determinism, journal, `agent`/`parallel`/`pipeline`, budget
+- [`src/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow.ts) — engine, vm, determinism, journal, `agent`/`parallel`/`pipeline`
 - [`src/workflow-manager.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-manager.ts) — run lifecycle, persistence, resume
 - [`src/run-persistence.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/run-persistence.ts) — disk journal + leases
 - [`src/worktree.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/worktree.ts) — git-worktree isolation

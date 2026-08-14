@@ -409,10 +409,9 @@ the other side of a nested workflow can still replay. This remains true when a w
 a live host checkpoint callback runs. The engine never uses ambient/world effects as an implicit
 dependency graph.
 
-Identity replays preserve the source logical debit on the record, but current `tokenUsage`,
-provider cost, and the current physical `WorkflowCallRecord.budgetDebit` remain zero (the script-visible
-budget surface — the `budget` global and per-phase sub-budgets — was deleted with the §7 budget
-removal; the persisted debit fields stay for record-shape stability). Replayed agent sessions open no new
+Identity replays preserve the source accounting debit on the record, but current `tokenUsage`,
+provider cost, and the current physical `WorkflowCallRecord.budgetDebit` remain zero; the debit
+field remains for record-shape stability. Replayed agent sessions open no new
 session: their record keeps source session/backend/cwd/reopen fields and rebinds only the current
 call index, label, and phase. Completed checkpoint decisions use the same identity rules plus an
 equal fingerprint of `default`, `headless`, and `timeoutMs`, regardless of host/headless origin.
@@ -533,7 +532,7 @@ interface WorkflowRunStatus {
 
 interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: number | null;
+  tokenBudget: number | null; // persisted compatibility field; new runs report null
   concurrency: number;
   agentRetries: number;
   agentTimeoutMs: number | null;
@@ -1324,7 +1323,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
 | `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
 | `CHECKPOINT_REQUIRED` | no | `checkpoint(..., { headless: "pause" })` has no live channel → the run **pauses** with non-secret `checkpointContext`; resume with `checkpointReplies` or a live `confirm`. |
-| `AGENT_LIMIT_EXCEEDED` | no | Run caps hit. (`TOKEN_BUDGET_EXHAUSTED` is deleted with the token budget — the §7 budget removal.) |
+| `AGENT_LIMIT_EXCEEDED` | no | The run's agent-call limit was reached. |
 | `AGENT_EXECUTION_ERROR` | yes | Other agent-level failure (refusal/truncation are non-recoverable variants). |
 | `PERSISTENCE_ERROR`, `UNKNOWN` | no | Storage / unexpected host-level failure. |
 
@@ -1453,7 +1452,7 @@ Terminal `outcome` is live-first and reconstructed from project-scoped persisten
 normalizing legacy missing `cost` to zero. Completed outcomes contain the exact authored result and
 raw full logs; paused outcomes carry existing non-secret `authContext`/`checkpointContext` and resume
 guidance. Retrieval has no TTL and remains available until SDK/manual deletion, corruption, or store
-loss. The inherited status portion retains its 24,576-byte/redaction budget and await text its
+loss. The inherited status portion retains its 24,576-byte/redaction bound and await text its
 8,192-byte cap; raw terminal `outcome` intentionally has no new envelope cap and is never duplicated
 into text.
 
@@ -1490,7 +1489,7 @@ type ReplToolInput =
   | { action: "interrupt"; projectDir?: string; id?: string };
 ```
 
-`projectDir` is required on the shared daemon for **both** actions, and defaults to the server's own project on `--in-process`. The input schema is **strict**: a missing required field and **every key outside the action's exact set** — the deleted v1 `wait`/`status`/`reset` actions, `ids`, `refs`, … included — are rejected as Invalid Params (`-32602`), never silently discarded. Every result carries `structuredContent` (the exact same shape as the published `outputSchema`) alongside the human text. `eval` holds the call open pumping settlements up to the soft bound: the **finished** shape `{ output, result }` when everything the code waits on settles within the bound, the **still-running** shape `{ output, running: [call ids] }` when the bound elapses (the eval continues server-side; any later eval — including `""`, the documented idempotent poll — drains what settled, and a poll picks a drained timed-out eval's completion repr up as its own `result`), or the **thrown** shape `{ output }` (the §4.6 error rendering, no completion value). `output` is ONE newline-joined string — console lines, raised checkpoint lines, error renderings, and the one-line durability notices — with **no caps anywhere** (the v1 `pending`/`completed`/`checkpoints`/`outputTruncated`/`truncated`/`referenced` fields and the whole cap/ref apparatus are deleted with the §7 budget sweep):
+`projectDir` is required on the shared daemon for **both** actions, and defaults to the server's own project on `--in-process`. The input schema is **strict**: a missing required field and every key outside the selected action's exact set are rejected as Invalid Params (`-32602`), never silently discarded. Every result carries `structuredContent` (the exact same shape as the published `outputSchema`) alongside the human text. `eval` holds the call open pumping settlements up to the soft bound: the **finished** shape `{ output, result }` when everything the code waits on settles within the bound, the **still-running** shape `{ output, running: [call ids] }` when the bound elapses (the eval continues server-side; any later eval — including `""`, the documented idempotent poll — drains what settled, and a poll picks a drained timed-out eval's completion repr up as its own `result`), or the **thrown** shape `{ output }` (the §4.6 error rendering, no completion value). `output` is one newline-joined string — console lines, raised checkpoint lines, error renderings, and one-line durability notices — and is forwarded without a byte ceiling:
 
 ```ts
 type ReplToolOutput =
@@ -1501,7 +1500,7 @@ type ReplToolOutput =
   | { error: string };                                                  // isError: true — a missing project context
 ```
 
-`interrupt` keeps v1's semantics: with `id` it cancels that subagent call (the guest promise rejects recoverable, `AGENT_CANCELLED` family); without `id` it breaks the running eval, honestly `refused-idle` when nothing is running. Introspection went in-band as guest functions returning ordinary values: `workspace()` (`{ bindings, inFlight, checkpoints, diagnostics }` — `diagnostics` carries the §6.2 demotions: the last reconcile summary, a retained drain error, `childrenClosed`), `agents()` (the live-agent entries), and `reset()` (teardown after the current eval). A stored snapshot that **refuses** (corrupt, format bump, wasm-hash mismatch) now **auto-resets**: the refused file is renamed aside (`.refused-<ts>`, never deleted) and the next eval's output leads with a one-line notice; a restore that **lost calls** or a drain failure that **lost state** gets the same one-line-notice treatment (losses are never silent). Printing follows the §4.4 repr rules (direct strings whole; depth 2; 20 entries per level; nested strings 200 chars head+tail) with no byte ceilings — the Python posture. Subagent `agent()` calls and `checkpoint()` draw from **one shared per-workspace id sequence** — `c1`, `c2`, … — answered by `checkpoint.answer("c2", value)` in a later eval; raised checkpoints surface as output lines. Subagents are [`acp-agents`](#acpagentrunner-createacprunner) sessions, 6 concurrent per workspace (dispatches above the cap queue); the workspace snapshots to the per-project store at every state-changing boundary and restores **lazily on first touch** with a three-way call reconcile (settle / re-attach / re-issue). `repl` shares the `workflow` tool's project model and daemon lifetime.
+With `id`, `interrupt` cancels that subagent call (the guest promise rejects recoverable, `AGENT_CANCELLED` family); without `id`, it breaks the running eval and reports `refused-idle` when nothing is running. Introspection is in-band through guest functions returning ordinary values: `workspace()` (`{ bindings, inFlight, checkpoints, diagnostics }` — `diagnostics` carries the last reconcile summary, a retained drain error, and `childrenClosed`), `agents()` (the live-agent entries), and `reset()` (teardown after the current eval). A stored snapshot that **refuses** (corrupt, format bump, wasm-hash mismatch) auto-resets: the refused file is renamed aside (`.refused-<ts>`, never deleted) and the next eval's output leads with a one-line notice; a restore that lost calls or a drain failure that lost state gets the same one-line-notice treatment. Printing follows the repr rules (direct strings whole; depth 2; 20 entries per level; nested strings 200 chars head+tail) with no byte ceiling. Subagent `agent()` calls and `checkpoint()` draw from **one shared per-workspace id sequence** — `c1`, `c2`, … — answered by `checkpoint.answer("c2", value)` in a later eval; raised checkpoints surface as output lines. Subagents are [`acp-agents`](#acpagentrunner-createacprunner) sessions, 6 concurrent per workspace (additional dispatches queue); the workspace snapshots to the per-project store at every state-changing boundary and restores **lazily on first touch** with a three-way call reconcile (settle / re-attach / re-issue). `repl` shares the `workflow` tool's project model and daemon lifetime.
 
 ## `@automatalabs/repl-engine`
 
@@ -1510,7 +1509,7 @@ The engine tier the `repl` tool registers over (unreleased at `0.0.0`; imported 
 - **`Workspace`** / **`WorkspaceRegistry`** (`WorkspaceOptions`, `WorkspaceRegistryOptions`, `WorkspaceManifest`, `WorkspaceBinding`) — one VM per workspace, owning the lifecycle (`create` → `eval` → `drainJobs` → `dispose`) and the manifest surface. `ReplVm` (`loadShippedWasm`, `ReplVmOptions`, `ReplEvalOptions`, `ReplDrainOptions`, `ReplEvalOutcome`, `DrainJobError`) is the raw quickjs-wasi shim tier.
 - **`Broker`** (`DEFAULT_MAX_CONCURRENT_AGENTS`, `DEFAULT_EVAL_TIMEOUT_MS`, `DEFAULT_DISPOSE_BOUND_MS`, `BrokerOptions`, `BrokerRunner`, `ReplEvalResult`, `CheckpointSummary`, `LiveAgentInfo`, `ReconcileReport`, `WorkspaceManifestReport`, …) — drives subagents as ACP sessions, records results by call id, and reconciles on restore. The call store is `InMemoryCallStore` / `JsonlCallStore` (`CallStore`, `CallRecord`, `CallOutcome`, …).
 - **Snapshots and durability** — `serializeSnapshot` / `deserializeSnapshot` / `wasmSha256Of`, `SNAPSHOT_FORMAT` / `SNAPSHOT_FORMAT_VERSION`, `SnapshotEnvelopeError` / `SnapshotRestoreError`, and the per-project `ReplWorkspaceStore` (`REPL_STORE_SUBDIR`, `SNAPSHOT_FILENAME`, `CALL_STORE_FILENAME`).
-- **The previewer** — `renderPreviewLine` / `renderCollapsed` / `renderGlobalLine` / `manifestBinding` / `formatByteSize` and the CDP preview types (`ObjectPreview`, `PropertyPreview`, …). The output-cap apparatus (`applyOutputCaps` / `capFinalText`, `OUTPUT_MAX_LINES` / `OUTPUT_MAX_BYTES`) is deleted with the §7 budget sweep — the engine applies no caps to guest output; the previewer stays for internal metadata bounds (manifest tokens, checkpoint/task previews).
+- **The previewer** — `renderPreviewLine` / `renderCollapsed` / `renderGlobalLine` / `manifestBinding` / `formatByteSize` and the CDP preview types (`ObjectPreview`, `PropertyPreview`, …). Guest output is forwarded as rendered; the previewer also supplies bounded internal metadata such as manifest tokens and checkpoint/task previews.
 - **The guest bridge and provenance** — `installGuestBridge`, `GUEST_LIBRARY_VERSION`, the `HOST_*` callback names; `provenanceRecord` / `provenanceView` (`eval N` / `worker cN` / `session restore` labels).
 - **The out-of-band eval-break channel** — `createEvalBreakChannel` / `EvalBreakChannel` (the worker-thread relay the MCP shim fires to break a synchronous runaway).
 
@@ -1524,7 +1523,7 @@ The full engine contract (guest library, host-call surface, FORMAT.md preview ru
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`. (`budget` and the per-phase budget option are deleted with the §7 budget removal; `phase(title, { budget })` is a script error.)
+`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`.
 
 `gate()` validators may return `{ ok: boolean, feedback?: string, ... }`, a bare boolean, or
 `null`. A fulfilled gate returns exactly `{ ok, value, verdict, attempts }`: `value` is the final

@@ -428,8 +428,8 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 `resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs` and a
 terminal `errorCode`; timed-out and host-cancelled calls therefore remain visible as
 `AGENT_TIMEOUT` and `AGENT_CANCELLED`. `limits`
-contains `maxAgents`, `tokenBudget` (always `null` — the token budget was deleted; the field stays
-for persisted-shape stability), `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved for
+contains `maxAgents`, `tokenBudget` (a persisted-shape compatibility field that is always `null`
+for new runs), `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved for
 this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
 keys and credential-shaped strings are redacted before results are structurally compacted; every
@@ -449,7 +449,7 @@ No workflow run found for runId "<runId>" in this server's project-scoped run st
 Inspecting an existing failed/aborted run is still a successful read (`isError: false`); branch on
 the payload `status`.
 
-Await inherits that exact safe status projection. Its status fields retain the 24,576-byte budget,
+Await inherits that exact safe status projection. Its status fields retain the 24,576-byte bound,
 redaction, compaction, filtering, and truncation counters, and its text is capped at 8,192 bytes.
 Before terminal state, optional `tokenUsage` is the cumulative live work observed in this execution;
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
@@ -615,18 +615,18 @@ The second model-facing tool is **`repl`**: one persistent **QuickJS-in-WASM Jav
 
 The VM is capability-free: no filesystem, no network, no timers beyond the `sleep(ms)` guest helper. Its entire effect surface is the host bridge — `agent(modelSpec, task, opts?)`, `checkpoint()` / `checkpoint.answer()`, `console`, and the agent-handle methods `followUp` / `steer` / `cancel`. Everything else this repo's workflow authors already know — `parallel`, `pipeline`, `verify`, `judgePanel`, `gate`, `retry`, `loopUntilDry` — is pure JavaScript layered on `agent()`, injected as the in-VM guest library. The full guest surface (and the engine internals) live in the engine package, [`@automatalabs/repl-engine`](../repl-engine#the-guest-library-and-the-bridge-phase-b).
 
-Every result carries a machine-readable `structuredContent` — the exact same shape as the published `outputSchema` — alongside a human-readable text block. Guest output is **one newline-joined string** and is **never capped**: there is no byte ceiling and no truncation/continuation-ref machinery anywhere on the path, so an agent *can* flood its own context by printing something enormous. This is accepted and documented — the Python REPL posture.
+Every result carries a machine-readable `structuredContent` — the exact same shape as the published `outputSchema` — alongside a human-readable text block. Guest output is **one newline-joined string** with no byte ceiling, so an agent can flood its own context by printing something enormous. This is accepted and documented — the Python REPL posture.
 
 ### Input parameters
 
-The tool is an **action union** of exactly two actions. The input schema is **strict**: the MCP SDK validates the primitive fields, then the discriminator enforces each action's exact field set, and **every key outside that set is rejected** as MCP Invalid Params (`-32602`) — including the deleted v1 surfaces (`wait`/`status`/`reset` actions, `ids`, `refs`, …), which never exist on this tool's wire contract.
+The tool is an **action union** of exactly two actions. The input schema is **strict**: the MCP SDK validates the primitive fields, then the discriminator enforces each action's exact field set, and every key outside that set is rejected as MCP Invalid Params (`-32602`).
 
 | Param | Type | Actions | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `action` | `"eval" \| "interrupt"` | all | — | Required. Selects the operation. |
 | `projectDir` | absolute path string | all | daemon: **required**; in-process: the server's own project | The workspace key — one VM per `projectDir`, resolved through the same validated, realpathed per-project context as the `workflow` tool. Workspace state survives MCP-session churn and daemon restarts. |
 | `code` | string | `eval` | — | The JavaScript to evaluate. Top-level `await` is accepted; top-level `return` is a syntax error; `console` output is captured. An empty string is valid — the documented idempotent poll (see below). |
-| `timeoutMs` | integer 0–120,000 | `eval` | `60000` | The soft bound the eval holds the call open for (hard cap 120 000 ms — the same numbers v1's `wait` used). |
+| `timeoutMs` | integer 0–120,000 | `eval` | `60000` | The soft bound the eval holds the call open for; values above 120 000 ms are rejected. |
 | `id` | string | `interrupt` | — | The call id to cancel. Omitted: break the running eval. |
 
 `projectDir` is required on the shared daemon for **both** actions. On a single-project (`--in-process`) server it defaults to that server's own project.
@@ -635,7 +635,7 @@ The tool is an **action union** of exactly two actions. The input schema is **st
 
 The examples below run against one workspace, `/work/acme`, in sequence — the state each call leaves is what the next one sees.
 
-**`eval`** runs `code` in the workspace VM, then **holds the call open pumping settlements server-side** up to the soft bound — the fusion of v1's `eval` with v1's `wait` pump. Exactly one of three shapes returns:
+**`eval`** runs `code` in the workspace VM, then **holds the call open pumping settlements server-side** up to the soft bound. Exactly one of three shapes returns:
 
 - **The finished shape** — everything the code waits on settled within the bound:
 
@@ -651,7 +651,7 @@ The examples below run against one workspace, `/work/acme`, in sequence — the 
   { "output": "…", "running": ["c1"] }
   ```
 
-  `running` lists the in-flight call ids (the stable `c1, c2, …` vocabulary — what `interrupt` targets and `agents()` reports). **Any later eval drains what settled in the meantime**, and `eval` with `""` is the documented idempotent poll: a no-op script that only reports. A poll whose drained timed-out eval **settled** in the meantime reports that eval's completion repr as its own `result` (a poll with nothing new reports its own `"undefined"`). Re-sending the poll never re-executes work — the idempotence property v1's `wait` had.
+  `running` lists the in-flight call ids (the stable `c1, c2, …` vocabulary — what `interrupt` targets and `agents()` reports). **Any later eval drains what settled in the meantime**, and `eval` with `""` is the documented idempotent poll: a no-op script that only reports. A poll whose drained timed-out eval **settled** in the meantime reports that eval's completion repr as its own `result` (a poll with nothing new reports its own `"undefined"`). Re-sending the poll never re-executes work.
 
 - **The thrown-eval shape** — the code threw (or was broken mid-run by `interrupt`): `output` carries the §4.6 error rendering (name + message, the guest stack's top frames with **line numbers in the submitted code**, and — for a subagent-call error — the call id and resolved backend), with **no `result`**:
 
@@ -726,8 +726,6 @@ interface ReplErrorResult {         // isError: true — a missing project conte
   error: string;
 }
 ```
-
-The v1 fields — `pending`, `completed`, `checkpoints`, `outputTruncated`, `truncated`, `referenced`, plus the `wait`/`status`/`reset` actions and the daemon-wide workspace listing — are **deleted from the wire** (§7 budget-removal sweep). Introspection replaced `status` in-band: `workspace()` and `agents()` return ordinary values, sliceable in the same eval (the `dir()` / `%who` idiom).
 
 ### The guest API, printing, and checkpoints
 

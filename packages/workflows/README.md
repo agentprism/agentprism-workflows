@@ -99,7 +99,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: total-wall-clock-per-attempt `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … (`tokenBudget` is deleted — the §7 budget removal; it is not an `ExecOptions` field anymore). |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: total-wall-clock-per-attempt `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 

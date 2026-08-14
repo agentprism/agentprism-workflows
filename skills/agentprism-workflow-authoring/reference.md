@@ -425,7 +425,7 @@ interface WorkflowRunStatus {
 
 interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: null; // always null — the token budget was deleted; the field stays for persisted-shape stability
+  tokenBudget: null; // persisted-shape compatibility field; new runs always report null
   concurrency: number;
   agentRetries: number;
   agentTimeoutMs: number | null;
